@@ -103,12 +103,16 @@ s32 cellSailPlayerCreate(const CellSailPlayerAttribute* attr,
     return (s32)CELL_SAIL_ERROR_OUT_OF_MEMORY;
 }
 
+static s32 sail_release_player_descriptors(u32 player);
+
 s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
 {
     printf("[cellSail] PlayerDestroy(%u)\n", handle);
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    const s32 release = sail_release_player_descriptors((u32)handle);
+    if (release) return release;
     s_sail_players[_sp].in_use = 0;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_CLOSED;
     return CELL_OK;
@@ -345,11 +349,55 @@ s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode, voi
 typedef struct {
     int in_use;
     s32 streamType;
+    int registered;
     CellSailPlayerHandle player;
     char uri[512];
 } SailDescriptor;
 
 static SailDescriptor s_descs[MAX_DESCRIPTORS];
+
+/* Accurate errors for descriptor registration; legacy aliases are unchanged. */
+#define SAIL_DESC_INVALID_ARG ((s32)0x80610701u)
+#define SAIL_DESC_INVALID_STATE ((s32)0x80610702u)
+#define SAIL_DESC_NOT_AVAILABLE ((s32)0x80610708u)
+#define SAIL_DESC_MEMORY ((s32)0x806107F0u)
+
+static int sail_desc_range(u64 ea, u64 size)
+{
+    extern u32 ppu_vm_size;
+    const u64 limit = ppu_vm_size ? (u64)ppu_vm_size : (1ull << 32);
+    return vm_base && ea && ea <= limit && size <= limit - ea;
+}
+
+static int sail_owned_descriptor(u32 player, u32 desc)
+{
+    return sail_player_slot(player) >= 0 && desc < MAX_DESCRIPTORS &&
+           s_descs[desc].in_use && s_descs[desc].player == player;
+}
+
+/* Local HLE cleanup policy: never discard registered descriptors, and release
+ * unregistered host records when their player is successfully destroyed. */
+static s32 sail_release_player_descriptors(u32 player)
+{
+    for (int i = 0; i < MAX_DESCRIPTORS; ++i)
+        if (s_descs[i].in_use && s_descs[i].player == player && s_descs[i].registered)
+            return SAIL_DESC_INVALID_STATE;
+    for (int i = 0; i < MAX_DESCRIPTORS; ++i)
+        if (s_descs[i].in_use && s_descs[i].player == player)
+            memset(&s_descs[i], 0, sizeof(s_descs[i]));
+    return CELL_OK;
+}
+
+s32 cellSailPlayerGetDescriptorCount(CellSailPlayerHandle handle)
+{
+    if (sail_player_slot((u32)handle) < 0) return SAIL_DESC_INVALID_ARG;
+    s32 count = 0;
+    for (int i = 0; i < MAX_DESCRIPTORS; ++i)
+        if (s_descs[i].in_use && s_descs[i].player == handle && s_descs[i].registered)
+            ++count;
+    return count;
+}
+
 
 s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
                                      s32 streamType, void* mediaInfo,
@@ -357,6 +405,9 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
                                      CellSailDescriptorHandle* desc)
 {
     (void)mediaInfo;
+    const u64 output = (u64)(uintptr_t)desc;
+    if (sail_player_slot((u32)handle) < 0 || (output & 3u) || !sail_desc_range(output, 4))
+        return SAIL_DESC_INVALID_ARG;
 
     /* uri is a GUEST address. Printing it as a host char* faulted the moment
      * the title opened a movie -- the log line stopped mid-token at
@@ -369,6 +420,7 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
         u32 ea = (u32)(uintptr_t)uri;
         size_t n = 0;
         while (n < sizeof(uri_host) - 1) {
+            if (!sail_desc_range((u64)ea + n, 1)) return SAIL_DESC_INVALID_ARG;
             char c = (char)vm_read8(ea + (u32)n);
             if (!c) break;
             uri_host[n++] = c;
@@ -378,7 +430,6 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
 
     printf("[cellSail] CreateDescriptor(player=%u, type=%d, uri=\"%s\")\n", handle,
            streamType, uri ? uri_host : "null");
-    if (!desc) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
 
     for (int i = 0; i < MAX_DESCRIPTORS; i++) {
         if (!s_descs[i].in_use) {
@@ -391,36 +442,35 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
             return CELL_OK;
         }
     }
-    return (s32)CELL_SAIL_ERROR_OUT_OF_MEMORY;
+    return SAIL_DESC_MEMORY;
 }
 
 s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
                                       CellSailDescriptorHandle desc)
 {
-    (void)handle;
-    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    s_descs[desc].in_use = 0;
+    if (!sail_owned_descriptor(handle, desc)) return SAIL_DESC_INVALID_ARG;
+    if (s_descs[desc].registered) return SAIL_DESC_INVALID_STATE;
+    memset(&s_descs[desc], 0, sizeof(s_descs[desc]));
     return CELL_OK;
 }
 
 s32 cellSailPlayerAddDescriptor(CellSailPlayerHandle handle,
                                   CellSailDescriptorHandle desc)
 {
-    (void)handle;
-    printf("[cellSail] AddDescriptor(player=%u, desc=%u)\n", handle, desc);
-    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (!sail_owned_descriptor(handle, desc)) return SAIL_DESC_INVALID_ARG;
+    if (s_descs[desc].registered) return SAIL_DESC_INVALID_STATE;
+    s_descs[desc].registered = 1;
     return CELL_OK;
 }
 
 s32 cellSailPlayerRemoveDescriptor(CellSailPlayerHandle handle,
-                                     CellSailDescriptorHandle desc)
+                                     CellSailDescriptorHandle unknownOutput)
 {
-    (void)handle;
-    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    return CELL_OK;
+    /* The second argument's output contract is unverified. Do not interpret
+     * it as a descriptor index or report a removal that never occurred. */
+    (void)unknownOutput;
+    if (sail_player_slot((u32)handle) < 0) return SAIL_DESC_INVALID_ARG;
+    return SAIL_DESC_NOT_AVAILABLE;
 }
 
 s32 cellSailDescriptorCreateDatabase(CellSailDescriptorHandle desc,
