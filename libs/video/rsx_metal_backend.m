@@ -2709,6 +2709,71 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 static void eng_set_stencil_ref(void* user, u32 ref)
 { (void)user; s_eng_pending.stencil_ref = ref; }
 
+/* Opt-in evidence only. Reserve six records for the period after the first
+ * queued draw, so startup heartbeat presents cannot consume the whole budget.
+ * Pixel statistics reuse capture's existing readback; this adds no GPU wait. */
+static struct {
+    int active, seen_draw;
+    unsigned attempts, pre_logs, post_logs, post_attempts;
+    u32 surface, queued_draws, selected_draws, encoded_draws;
+    const char* reason;
+    const char* readback;
+    size_t rgb_nonzero;
+    unsigned rgb_max;
+    int have_rgb;
+} s_eng_diag;
+static id<MTLCommandBuffer> s_eng_diag_cb;
+
+static void eng_diag_begin(u32 surface)
+{
+    s_eng_diag.active = 0;
+    s_eng_diag_cb = nil;
+    const char* opt = getenv("PS3RECOMP_METAL_PRESENT_DIAGNOSTICS");
+    if (!opt || strcmp(opt, "1")) return;
+    unsigned draws = 0, selected = 0;
+    for (u32 i = 0; i < s_eng_rec_count; ++i) {
+        const EngRecord* r = &s_eng_rec[i];
+        if (r->kind != ENG_REC_DRAW) continue;
+        ++draws;
+        for (u32 j = 0; j < r->nrt; ++j)
+            if (r->rt[j] == surface) { ++selected; break; }
+    }
+    ++s_eng_diag.attempts;
+    if (draws) s_eng_diag.seen_draw = 1;
+    if (s_eng_diag.seen_draw) {
+        unsigned n = s_eng_diag.post_attempts++;
+        if (s_eng_diag.post_logs >= 6 || n % 120) return;
+        ++s_eng_diag.post_logs;
+    } else {
+        if (s_eng_diag.pre_logs >= 2 || (s_eng_diag.attempts != 1 && s_eng_diag.attempts != 120)) return;
+        ++s_eng_diag.pre_logs;
+    }
+    s_eng_diag.active = 1;
+    s_eng_diag.surface = surface;
+    s_eng_diag.queued_draws = draws;
+    s_eng_diag.selected_draws = selected;
+    s_eng_diag.encoded_draws = 0;
+    s_eng_diag.have_rgb = 0;
+    s_eng_diag.reason = "submitted";
+    s_eng_diag.readback = "not_requested";
+}
+
+static void eng_diag_end(void)
+{
+    if (!s_eng_diag.active) return;
+    long status = s_eng_diag_cb ? (long)[s_eng_diag_cb status] : -1;
+    NSError* error = [s_eng_diag_cb error];
+    if (status == MTLCommandBufferStatusError) s_eng_diag.reason = "gpu_error";
+    fprintf(stderr, "[rsx present diagnostic] attempt=%u surface=%u queued_draws=%u selected_draws=%u encoded_draws=%u reason=%s readback=%s gpu_status=%ld gpu_error=%ld rgb_available=%d rgb_nonzero=%zu rgb_max=%u\n",
+            s_eng_diag.attempts, s_eng_diag.surface, s_eng_diag.queued_draws,
+            s_eng_diag.selected_draws, s_eng_diag.encoded_draws, s_eng_diag.reason, s_eng_diag.readback,
+            status, error ? (long)[error code] : 0L, s_eng_diag.have_rgb,
+            s_eng_diag.have_rgb ? s_eng_diag.rgb_nonzero : 0,
+            s_eng_diag.have_rgb ? s_eng_diag.rgb_max : 0);
+    s_eng_diag.active = 0;
+    s_eng_diag_cb = nil;
+}
+
 static void eng_draw(void* user, rsx_topology topology, const void* vertices,
                      u32 vertex_count, u32 stride, const u32* indices,
                      u32 index_count)
@@ -2731,6 +2796,8 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
     r->vertex_count = vertex_count;
     r->ib_off       = ib_off;
     r->index_count  = indices ? index_count : 0;
+    /* A report flush may submit these records before the next presentation. */
+    s_eng_diag.seen_draw = 1;
 }
 
 static void eng_clear_color(void* user, u32 surface, const float rgba[4])
@@ -2773,6 +2840,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     if (!r->pipeline || r->pipeline > s_eng_pipe_count) return;
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
     if (!p->pso) return;
+    if (s_eng_diag.active) ++s_eng_diag.encoded_draws;
     [enc setRenderPipelineState:p->pso];
     [enc setDepthStencilState:p->ds];
     [enc setCullMode:p->cull];
@@ -3041,6 +3109,7 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
             } else {
                 drawable = [s_layer nextDrawable];
                 if (!drawable) {           /* compositor is busy; skip */
+                    if (s_eng_diag.active) s_eng_diag.reason = "no_drawable";
                     dispatch_semaphore_signal(s_inflight);
                     return 0;
                 }
@@ -3053,8 +3122,10 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
             stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
                                       options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        if (s_eng_diag.active) s_eng_diag_cb = cb;
         eng_encode_records(cb, stage);
         int presented = eng_blit_to_display(cb, present_dst, dst);
+        if (s_eng_diag.active && !presented && present_dst) s_eng_diag.reason = "blit_skipped";
         if (drawable) [cb presentDrawable:drawable];
         if (windowed_present) {
             dispatch_semaphore_t sem = s_inflight;
@@ -3092,15 +3163,30 @@ static void eng_dump_frame(id<MTLTexture> src, int presented)
     const int first_nonblack = mode && strcmp(mode, "1") == 0;
     /* A skipped drawable is not a presentation. After a successful one-shot
      * capture, do not fence the GPU or read any subsequent texture. */
-    if (first_nonblack && (first_nonblack_saved || !presented)) return;
+    if (first_nonblack && (first_nonblack_saved || !presented)) {
+        if (s_eng_diag.active && first_nonblack_saved) s_eng_diag.readback = "already_captured";
+        return;
+    }
     ++frame;
-    if (!first_nonblack && (frame % 120) != 0) return;
+    if (!first_nonblack && (frame % 120) != 0) {
+        if (s_eng_diag.active) s_eng_diag.readback = "periodic_readback_skipped";
+        return;
+    }
     if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
-        [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
+        [src pixelFormat] != MTLPixelFormatBGRA8Unorm) {
+        if (s_eng_diag.active) s_eng_diag.readback = "unsupported_readback_format";
+        return;
+    }
     size_t w = [src width], h = [src height];
-    if (!w || !h || w > 16384 || h > 16384) return;
+    if (!w || !h || w > 16384 || h > 16384) {
+        if (s_eng_diag.active) s_eng_diag.readback = "invalid_readback_size";
+        return;
+    }
     unsigned char* rgba = malloc(w * h * 4);
-    if (!rgba) return;
+    if (!rgba) {
+        if (s_eng_diag.active) s_eng_diag.readback = "readback_allocation_failed";
+        return;
+    }
     if (!s_headless) {
         id<MTLCommandBuffer> fence = [s_queue commandBuffer];
         [fence commit];
@@ -3108,6 +3194,20 @@ static void eng_dump_frame(id<MTLTexture> src, int presented)
     }
     [src getBytes:rgba bytesPerRow:w * 4
       fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    if (s_eng_diag.active) {
+        size_t nonzero = 0; unsigned maximum = 0;
+        for (size_t p = 0; p < w * h; ++p) {
+            unsigned a = rgba[p*4], b = rgba[p*4+1], c = rgba[p*4+2];
+            if (a || b || c) ++nonzero;
+            if (a > maximum) maximum = a;
+            if (b > maximum) maximum = b;
+            if (c > maximum) maximum = c;
+        }
+        s_eng_diag.have_rgb = 1;
+        s_eng_diag.rgb_nonzero = nonzero;
+        s_eng_diag.rgb_max = maximum;
+        s_eng_diag.readback = nonzero ? "nonblack" : "black";
+    }
     if (first_nonblack) {
         size_t p;
         /* Both supported formats put RGB in the first three bytes; alpha
@@ -3139,9 +3239,16 @@ static void eng_present(void* user, u32 surface)
 {
     (void)user;
     id<MTLTexture> src = eng_obj(surface);
-    if (!src) { eng_encode_and_commit(nil); return; }
+    eng_diag_begin(surface);
+    if (!src) {
+        if (s_eng_diag.active) s_eng_diag.reason = "no_surface";
+        eng_encode_and_commit(nil);
+        eng_diag_end();
+        return;
+    }
     int presented = eng_encode_and_commit(src);
     eng_dump_frame(src, presented);
+    eng_diag_end();
 }
 
 static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
