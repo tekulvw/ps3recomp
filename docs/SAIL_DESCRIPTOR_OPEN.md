@@ -1,0 +1,17 @@
+# Local PAMF descriptor setup
+
+This branch implements metadata setup for local `x-cell-fs:///...` PAMF 0040/0041 sources. `cellSailDescriptorOpen(desc)` resolves the URI through the existing CellFs mappings, opens the file read-only, and validates its complete resident header with the PAMF reader. The descriptor owns an open host file and guest header/reader/URI storage allocated through its player's actual registered allocator. No payload decoding or playback notifications are introduced.
+
+The public allocator is `{be32 callbacksEA, be32 pArg}`; callbacks are `{be32 allocOPD, be32 freeOPD}`. Allocation uses `(pArg,128,size)` and free uses `(pArg,128,memoryEA)`. The synchronous runtime `ppu_guest_call` bridge supplies allocation results and performs free calls. The stored free OPD and argument remain tied to each allocation even if the caller later changes its allocator record. This relies on the bridge's successful synchronous normal return; invalid/unregistered code and callback-stack behavior outside descriptor reentry remain runtime limitations.
+
+A nonblocking atomic gate serializes descriptor operations and rejects callback reentry, including initialization/destruction of the modern guest-pointer player. It protects descriptor ownership; it does not establish thread safety for every legacy Sail player API or every runtime callback. Header storage is capped at 2 MiB; larger metadata is explicitly unavailable. Unsupported protocols/container types and missing files do not become successful opens. Malformed nested metadata is rejected by the real PAMF parser and its allocation is freed. Repeated open is invalid state.
+
+`cellSailDescriptorCreateDatabase(desc,guestReaderEA,size,arg)` requires a successful open, at least128 bytes, aligned/range-valid output and arg0. It initializes a real caller-owned128-byte PAMF reader pointing into the descriptor's retained header. The copied reader borrows that storage and expires when the descriptor is destroyed. No host-reader registry is required.
+
+Retail caller evidence establishes direct returns: `003C9998` consumes GetStreamType in r3 and compares PAMF0/MP4 1/AVI2; the event-poll URI path in `003D2658` consumes the returned guest URI pointer. GetStreamType has one descriptor argument; GetUri has one argument and returns the retained guest URI after successful open. Before open, GetUri returns0 because no stable guest URI copy exists. RPCS3's current untyped TODO bodies are not used as ABI evidence for these two exports.
+
+Destruction releases the file and guest allocation exactly once. Player destruction retains the existing policy rejecting registered descriptors. Term releases all descriptor records, including registered ones, as shutdown cleanup. Database destruction performs no deallocation because reader storage belongs to its caller.
+
+Dependencies: `fix/sail-memory-allocator-layout`, `fix/sail-descriptor-registration`, `fix/pamf-reader-metadata`. The source branch stacks those commits so its standalone tests exercise the actual PAMF implementation.
+
+Run `python3 tools/test_sail_descriptor_open.py` for synthetic public-format media. An optional local PAMF path runs the same tests with that file; no game assets are committed. Tests cover mapped source opening, real128-reader output and canaries, duplicate/unsupported/missing opens, malformed/truncated media, null/misaligned/out-of-range allocations, callback reentry, changed source URI and allocator identity, and shutdown cleanup.
