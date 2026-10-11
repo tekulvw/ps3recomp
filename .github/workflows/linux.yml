@@ -153,6 +153,9 @@ jobs:
           CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
         run: python tools/check_ppu_scaffold.py
 
+      - name: Test PPU directory entries
+        run: python tools/test_ppu_directory.py
+
       # ...and this one RUNS it, which the ratchet cannot. The smoke title is a
       # synthetic lifted program that drives the loader, the NID bridge, the
       # lv2 syscalls, a guest thread, the frame clock and the RSX backend from
