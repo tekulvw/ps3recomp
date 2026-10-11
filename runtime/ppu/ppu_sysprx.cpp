@@ -333,7 +333,8 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
  * and reacquires the semaphore on every supported host. It is not a full
  * condition-variable implementation (signals and timed waits remain limited).
  * sys_lwcond_t is 8 bytes: +0x00 u32 lwmutex EA, +0x04 u32 lwcond queue id.
- * Titles read +0x00 themselves (a zero lwmutex EA is treated as invalid). */
+ * Titles read +0x00 themselves (a zero lwmutex EA is treated as invalid).
+ * Writing a host-sized pointer here corrupts the following guest object. */
 static void sys_lwcond_create(ppu_context* ctx)
 {
     static uint32_t s_lwcond_id = 0x4C000000u;
