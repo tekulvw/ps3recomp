@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -3266,6 +3267,11 @@ static uint16_t be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); 
 static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
 static uint64_t be64(const uint8_t* p) { return ((uint64_t)be32(p) << 32) | be32(p + 4); }
 
+/* Loaded image ranges remain live while the entry stack is constructed. BSS is
+ * included: putting arguments in a zero-filled segment corrupts the image too. */
+struct ppu_image_range { uint64_t begin, end; };
+static std::vector<ppu_image_range> g_ppu_image_ranges;
+
 extern "C" uint32_t ppu_load_elf(const char* path)
 {
     FILE* f = fopen(path, "rb");
@@ -3286,6 +3292,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
     uint16_t phentsize = be16(file + 54);
     uint16_t phnum = be16(file + 56);
 
+    g_ppu_image_ranges.clear();
     int loaded = 0;
     for (uint16_t i = 0; i < phnum; i++) {
         uint64_t ph_off = phoff + (uint64_t)i * phentsize;
@@ -3327,6 +3334,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
         memcpy(vm_base + (uint32_t)p_vaddr, file + p_offset, (size_t)p_filesz);
         if (p_memsz > p_filesz)
             memset(vm_base + (uint32_t)p_vaddr + (uint32_t)p_filesz, 0, (size_t)(p_memsz - p_filesz));
+        g_ppu_image_ranges.push_back({p_vaddr, p_vaddr + (p_memsz > p_filesz ? p_memsz : p_filesz)});
         loaded++;
     }
     free(file);
@@ -3735,10 +3743,37 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
             }
         }
 
-        uint32_t argv_base = 0x00B00000u;          /* scratch in the .data/heap gap */
-        /* argc_n argv pointers, a NULL argv terminator, then a NULL envp. */
-        uint32_t slots     = (argc_n + 2u) * 8u;
-        uint32_t str_addr  = argv_base + ((slots + 0x1Fu) & ~0x1Fu);
+        /* Reserve entry arguments at the top of the caller-provided main
+         * stack, above a fresh ABI frame. Guest frames grow down from the new
+         * SP, so the strings live until process exit without claiming a fixed
+         * "gap" inside an ELF or the title's heap. The caller already owns this
+         * stack reservation; no later thread/heap allocation may reuse it.
+         * Bound the reservation to 64 KiB of the normal 1 MiB main stack. */
+        uint32_t slots = (argc_n + 2u) * 8u;
+        uint64_t strings_offset = (slots + 0x1Fu) & ~uint64_t(0x1F);
+        uint64_t bytes = strings_offset;
+        for (uint32_t a = 0; a < argc_n; a++)
+            bytes += (strlen(argp[a]) + 1u + 0xFu) & ~uint64_t(0xF);
+        const uint32_t entry_frame = 0x80;  /* linkage + register argument area */
+        uint64_t reserve = (entry_frame + bytes + 0x1Fu) & ~uint64_t(0x1F);
+        uint64_t top = stack_top & ~uint64_t(0x1F);
+        uint64_t vm_end = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+        if (reserve > 0x10000 || top > vm_end || top < VM_MAIN_MEM_BASE + reserve) {
+            fprintf(stderr, "[ppu] invalid entry argument stack reservation\n");
+            return -1;
+        }
+        uint32_t entry_sp = (uint32_t)(top - reserve);
+        for (const auto& range : g_ppu_image_ranges) {
+            if (entry_sp < range.end && top > range.begin) {
+                fprintf(stderr, "[ppu] entry argument stack overlaps loaded image\n");
+                return -1;
+            }
+        }
+        ctx.gpr[1] = entry_sp;
+        for (uint32_t off = 0; off < entry_frame; off += 8)
+            vm_write64(entry_sp + off, 0);
+        uint32_t argv_base = entry_sp + entry_frame;
+        uint32_t str_addr = argv_base + (uint32_t)strings_offset;
         uint32_t sp_cur    = str_addr;
         for (uint32_t a = 0; a < argc_n; a++) {
             uint32_t j = 0;
@@ -3771,7 +3806,7 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
         }
         fprintf(stderr, "[ppu] argc=%u argv=0x%08X\n", argc_n, argv_base);
     }
-    fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, stack_top);
+    fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, (uint32_t)ctx.gpr[1]);
     g_active_ctx = &ctx;
     ppu_resv_register(&ctx);   /* main/entry thread: join the reservation set too */
     fn(&ctx);
