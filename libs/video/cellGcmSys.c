@@ -321,15 +321,14 @@ static CellGcmZcullInfo s_zcull[CELL_GCM_MAX_ZCULL_COUNT];
 
 /* Report data area (256 slots, each 16 bytes) */
 static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
+/* NV4097_SET_CONTEXT_DMA_REPORT (byte method 0x1A8). Report-main uses
+ * a dedicated IO window; HOST_BUFFER uses ordinary IO offsets. */
+#define GCM_REPORT_DMA_LOCAL 0x66626660u
+#define GCM_REPORT_DMA_MAIN  0xBAD68000u
+#define GCM_REPORT_DMA_HOST  0xFEED0001u
+static u32 s_report_dma = GCM_REPORT_DMA_LOCAL;
 
-/* NV4097_SET_CONTEXT_DMA_REPORT (0x1A8): where NV4097_GET_REPORT writes.
- * Local (0xFEED0000, the default): the s_report_data slots above, read back
- * through cellGcmGetReport* / cellGcmGetReportDataAddress. Main memory
- * (0xFEED0001, or CELL_GCM_CONTEXT_DMA_REPORT_LOCATION_MAIN 0xBAD68000): the
- * report's 24-bit offset is an IO offset, and the 16-byte report goes to
- * guest memory at gcm_io2ea(offset), where the title reads it itself.
- * Killzone 3 sets 0xFEED0001 and keeps its reports in its own frame data. */
-static u32 s_report_dma = 0xFEED0000u;
+/* Preserve the legacy FEED0000 local-context alias at FIFO selection. */
 static u64 s_report_last_ts;
 
 /* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
@@ -484,7 +483,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
-    s_report_dma = 0xFEED0000u;
+    s_report_dma = GCM_REPORT_DMA_LOCAL;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
@@ -868,6 +867,76 @@ static u32 gcm_io2ea(u32 io)
 
 /* For the RSX method layer: semaphores aimed at main memory carry IO offsets. */
 u32 gcm_io_offset_to_ea(u32 io) { return gcm_io2ea(io); }
+
+/* Publish a report only to a complete mapped guest record. The local-report
+ * context retains the legacy host table: this SDK does not reserve a guest
+ * local-report window, and placing one beside the labels would overwrite the
+ * control register/offset tables. Sample values remain approximate. */
+static void gcm_get_report(u32 argument)
+{
+    const u32 offset = argument & 0xFFFFFFu;
+    const u32 index = offset / 16u;
+    u32 ea = 0;
+    if (offset & 15u) goto invalid;
+    if (s_report_dma == GCM_REPORT_DMA_MAIN || s_report_dma == GCM_REPORT_DMA_HOST) {
+        const u32 io = offset + (s_report_dma == GCM_REPORT_DMA_MAIN ? 0x0E000000u : 0u);
+        const u32 page = s_ea_address_table[io >> 20];
+        /* 16-byte alignment prevents page crossings. Do not truncate a bad
+         * table entry into a valid 32-bit guest address. EA zero is valid. */
+        if (!vm_base || page >= 0x1000u) goto invalid;
+        ea = (page << 20) | (io & 0xFFFFFu);
+        const u64 limit = ppu_vm_size ? (u64)ppu_vm_size : 0x100000000ULL;
+        if ((u64)ea + 16u > limit) goto invalid;
+    } else if (s_report_dma != GCM_REPORT_DMA_LOCAL || index >= CELL_GCM_MAX_REPORT_COUNT) {
+        goto invalid;
+    }
+
+    { static unsigned reports;
+      if (reports < 6) {
+          ++reports;
+          printf("[GET_REPORT] type=%u idx=%u context=%08X ea=%08X%s\n",
+                 argument >> 24, index, s_report_dma, ea,
+                 s_report_dma == GCM_REPORT_DMA_LOCAL ? " host-only" : "");
+      } }
+
+    /* Completion can release guest buffers. Both active backend flush APIs
+     * synchronously finish queued draws; never publish while work is pending.
+     * This preserves the existing conservative ZPASS value, not a measured
+     * occlusion query result. */
+    if (rsx_live_draw_enabled()) rsx_live_draw_flush();
+    if (rsx_draw_engine_enabled()) rsx_draw_engine_flush();
+    const u64 timestamp = gcm_report_timestamp();
+    const u32 value = (argument >> 24) == 1u ? 0xFFFFu : 0u;
+    if (index < CELL_GCM_MAX_REPORT_COUNT) {
+        s_report_data[index].timestamp = timestamp;
+        s_report_data[index].value = value;
+    }
+    if (s_report_dma == GCM_REPORT_DMA_LOCAL) return;
+
+    /* Serialize with GETLLAR/PUTLLC. The completion word is the final store,
+     * and one notification after the complete record wakes lock-line waiters.
+     * Raw stores avoid recursively taking this lock in vm_write*. */
+    spu_lockline_lock();
+    const u32 words[4] = {(u32)(timestamp >> 32), (u32)timestamp, value, 0};
+    for (u32 i = 0; i < 4; ++i) {
+        const u32 address = ea + i * 4u;
+        const u32 raw = ps3_bswap32(words[i]);
+        if (i == 3) atomic_thread_fence(memory_order_release);
+        PS3_WW_CHECK(address, words[i], 4);
+        memcpy(vm_base + address, &raw, sizeof(raw));
+        if (g_resv_store_active > 0) ppu_resv_break_store(address);
+    }
+    spu_coh_notify_write(ea);
+    spu_lockline_unlock();
+    return;
+invalid:
+    { static unsigned warnings;
+      if (warnings < 8) {
+          ++warnings;
+          fprintf(stderr, "[cellGcmSys] GET_REPORT rejected context=%08X offset=%06X\n",
+                  s_report_dma, offset);
+      } }
+}
 
 /* RSX get pointer (IO offset) + one-deep CALL return slot. The FIFO-wrap
  * recycle path teleports these when it resets a ring without a JUMP command. */
@@ -2292,31 +2361,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
                     if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
-                    /* NV4097_GET_REPORT: (type << 24) | offset into the report
-                     * area. Sample counts are not measured, so a ZPASS query
-                     * reports "visible" -- the conservative answer; reading 0
-                     * tells the title every queried object is occluded. */
-                    if (m == 0x1A8) s_report_dma = vm_read32(dea);
-                    if (m == 0x1800) {
-                        const u32 v = vm_read32(dea), off = v & 0xFFFFFFu, idx = off / 16u;
-                        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
-                        const u64 ts = gcm_report_timestamp();
-                        const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
-                        { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
-                        if (main_mem) {
-                            /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
-                            const u32 rea = gcm_io2ea(off);
-                            if (rea) {
-                                vm_write32(rea, (u32)(ts >> 32));
-                                vm_write32(rea + 4u, (u32)ts);
-                                vm_write32(rea + 8u, val);
-                                vm_write32(rea + 12u, 0u);
-                            } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
-                        } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
-                            s_report_data[idx].timestamp = ts;
-                            s_report_data[idx].value = val;
-                        }
+                    if (m == 0x1A8u) {
+                        u32 dma = vm_read32(dea);
+                        s_report_dma = dma == 0xFEED0000u ? GCM_REPORT_DMA_LOCAL : dma;
                     }
+                    if (m == 0x1800u) gcm_get_report(vm_read32(dea));
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
@@ -3691,7 +3740,7 @@ void cellGcmTerminate(void)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
-    s_report_dma = 0xFEED0000u;
+    s_report_dma = GCM_REPORT_DMA_LOCAL;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
