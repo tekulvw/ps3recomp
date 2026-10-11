@@ -20,16 +20,11 @@ left the scalar and receiver zero. Layout comes from
 [RPCS3's structures](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellSpurs.h#L278)
 and its SPURS initializer.
 
-## Receiver support remains separate
+## Receiver support
 
-This getter does not implement workload-flag scheduling. RPCS3's
-`_cellSpursWorkloadFlagReceiver` validates the workload and exception state, updates
-receiver ownership atomically, rejects an occupied receiver with `BUSY` and an
-incorrect releasing owner with `PERM`, and resets the scalar when changing
-ownership. Its scheduler recognizes a zero flag for the selected receiver.
-The existing ps3recomp poller only considers ready counts and signals; receiver
-selection and consumption require separate synchronization and scheduling work.
-No receiver is selected and no readiness is manufactured by this change.
+The getter does not select a receiver or manufacture readiness. The separate
+`_cellSpursWorkloadFlagReceiver` implementation and SPURS1 policy notification
+path are documented in [SPURS_FLAG_RECEIVER.md](SPURS_FLAG_RECEIVER.md).
 
 ## Validation
 
