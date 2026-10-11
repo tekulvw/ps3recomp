@@ -432,6 +432,18 @@ static s32 sail_release_player_descriptors(u32 player)
     return sail_descriptor_result(CELL_OK);
 }
 
+/* NID 0x18B4629D. Bounded host-player teardown: preserve registered
+ * descriptors and return INVALID_STATE until their lifecycle is resolved.
+ * No private guest layout or playback completion is fabricated. */
+s32 cellSailPlayerFinalize(u32 pSelf)
+{
+    const s32 result = sail_release_player_descriptors(pSelf);
+    fprintf(stderr, "[cellSail] PlayerFinalize(self=%08X) -> %08X%s\n",
+            pSelf, (u32)result, result == SAIL_DESC_INVALID_STATE ?
+            " (registered descriptors or callback in progress)" : "");
+    return result;
+}
+
 s32 cellSailPlayerGetDescriptorCount(CellSailPlayerHandle handle)
 {
     if (!sail_descriptor_enter()) return SAIL_DESC_INVALID_STATE;
