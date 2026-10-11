@@ -6,6 +6,9 @@ import subprocess
 from pathlib import Path
 
 def main():
+    if os.name == 'nt':
+        print('SKIP: regression requires the POSIX PPU test toolchain')
+        return
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=Path('build/ps3recomp_boot_smoke'))
     parser.add_argument('--elf', type=Path, default=Path('build/smoke/smoke.elf'))
