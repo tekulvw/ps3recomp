@@ -107,6 +107,10 @@ typedef struct rsx_dispatch_sink {
     void (*inline_array)(void* user, const rsx_dispatch* rsx,
                          const u8* data, u32 bytes);
     void (*flip)(void* user, const rsx_dispatch* rsx, u32 arg);
+    /* A completed ATTR0 DATA3F/DATA4F inside BEGIN emits one vertex.
+     * Snapshot the current attributes now; later register writes replace them.
+     * Array formats, offsets and frequencies do not describe this stream. */
+    void (*immediate_vertex)(void* user, const rsx_dispatch* rsx);
 } rsx_dispatch_sink;
 
 struct rsx_dispatch {

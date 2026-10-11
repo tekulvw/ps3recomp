@@ -195,6 +195,11 @@ static struct {
     u64 verts_cap;
     u32 n_verts;
 
+    /* Canonical ATTR0..15 float4 snapshots for register-based vertices.
+     * Bounded separately from compact GPU staging; never fetch stale arrays. */
+    float (*immediate)[RSX_DSP_NUM_VERTEX_ATTR][4];
+    u32 n_immediate, cap_immediate;
+
     rsx_vertex_layout_plan layout;
     rsx_vertex_fetch_plan fetch_plan;
     int fetch_ok;
@@ -1458,6 +1463,7 @@ static void dc_reset(void)
     dc.fetch_ok = 1;
     dc.inl = NULL;
     dc.inl_bytes = 0;
+    dc.n_immediate = 0;
 }
 
 static int dc_push_ref(u32 vertex_id, u32 base_index)
@@ -1506,6 +1512,19 @@ static int dc_reserve_indices(u32 count)
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
+    if (dc.n_immediate) {
+        dc.n_source_refs = dc.n_immediate;
+        if (!dc_reserve_verts((u64)dc.n_immediate * layout->stride)) {
+            dc.fetch_ok = 0;
+            return;
+        }
+        for (u32 v = 0; v < dc.n_immediate; v++)
+            for (u32 slot = 0; slot < layout->count; slot++)
+                memcpy(dc.verts + (u64)v * layout->stride + slot * 16u,
+                       dc.immediate[v][layout->attrs[slot]], 16u);
+        dc.n_verts = dc.n_immediate;
+        return;
+    }
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
             if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
@@ -1584,6 +1603,37 @@ static void sink_begin(void* user, const rsx_dispatch* r, u32 prim)
 {
     (void)user; (void)r; (void)prim;
     dc_reset();
+}
+
+/* A malformed/unbounded group must not render a truncated primitive. */
+#define ENG_MAX_IMMEDIATE_VERTICES 4096u
+static void sink_immediate_vertex(void* user, const rsx_dispatch* r)
+{
+    (void)user;
+    dc.n_packets++;
+    if (!dc.fetch_ok) return;
+    if (dc.n_immediate == ENG_MAX_IMMEDIATE_VERTICES) {
+        dc.fetch_ok = 0;
+        return;
+    }
+    if (dc.n_immediate == dc.cap_immediate) {
+        const u32 next = dc.cap_immediate ? dc.cap_immediate * 2u : 64u;
+        void* p = realloc(dc.immediate, (size_t)next * sizeof(*dc.immediate));
+        if (!p) { dc.fetch_ok = 0; return; }
+        dc.immediate = p;
+        dc.cap_immediate = next;
+    }
+    for (u32 attr = 0; attr < RSX_DSP_NUM_VERTEX_ATTR; attr++) {
+        float* value = dc.immediate[dc.n_immediate][attr];
+        rsx_dsp_vertex_default(r, attr, value);
+        /* The legacy default getter treats all-zero words as unwritten.
+         * Direct DATA4F writes may explicitly set W/alpha to zero. */
+        const u32 base = (0x1C00u + attr * 16u) >> 2;
+        if (r->seen[base] || r->seen[base + 1] ||
+            r->seen[base + 2] || r->seen[base + 3])
+            memcpy(value, &r->regs[base], 16u);
+    }
+    dc.n_immediate++;
 }
 
 static void sink_draw_arrays(void* user, const rsx_dispatch* r, u32 first, u32 count)
@@ -2060,7 +2110,10 @@ static void pd_present(u32 presented)
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
-    if (!g.ready || !dc.n_packets) return;
+    if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
+    /* Mixed geometry sources have no defined concatenation here. Reject the
+     * whole group instead of drawing partial/misordered geometry. */
+    if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes)) return;
 
     const u32 prim = g.rsx.current_primitive;
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
@@ -2402,6 +2455,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.draw_arrays      = sink_draw_arrays;
     sink.draw_index_array = sink_draw_index;
     sink.inline_array     = sink_inline_array;
+    sink.immediate_vertex = sink_immediate_vertex;
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
@@ -2428,7 +2482,7 @@ void rsx_draw_engine_shutdown(void)
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);
-    free(dc.refs); free(dc.cuts); free(dc.verts);
+    free(dc.refs); free(dc.cuts); free(dc.verts); free(dc.immediate);
     rsx_vertex_remap_destroy(&dc.ref_remap);
     memset(&dc, 0, sizeof dc);
     free(g.tex_staging); free(g.vp_cb); free(g.fp_cb); free(g.indices);

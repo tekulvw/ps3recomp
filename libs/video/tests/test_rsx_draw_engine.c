@@ -83,6 +83,8 @@ typedef struct {
     u32 pipeline_rt_count;
     u32 bound_surface, bound_depth, bound_pipeline;
     u32 draw_vertices, draw_indices, draw_stride;
+    float captured_vertices[16][64];
+    u32 captured_indices[24];
     float draw_first_vertex[4];   /* ATTR0 of the first vertex handed over */
     rsx_topology draw_topology;
     u32 scissor[4];
@@ -217,6 +219,14 @@ static void stub_draw(void* u, rsx_topology topology, const void* verts,
     memset(stub.draw_first_vertex, 0, sizeof stub.draw_first_vertex);
     if (verts && stride >= sizeof stub.draw_first_vertex)
         memcpy(stub.draw_first_vertex, verts, sizeof stub.draw_first_vertex);
+    memset(stub.captured_vertices, 0, sizeof stub.captured_vertices);
+    memset(stub.captured_indices, 0, sizeof stub.captured_indices);
+    if (verts && stride <= sizeof stub.captured_vertices[0])
+        for (u32 i = 0; i < count && i < 16; i++)
+            memcpy(stub.captured_vertices[i], (const u8*)verts + i * stride, stride);
+    if (indices)
+        memcpy(stub.captured_indices, indices,
+               (index_count < 24 ? index_count : 24) * sizeof(u32));
     stub.draw_topology = topology;
     stub.draw_vertices = count;
     stub.draw_stride = stride;
@@ -1148,6 +1158,94 @@ static void test_color_read_as_float(void)
     engine_down();
 }
 
+/* The register-based fullscreen compositor has no array or inline stream.
+ * Capture each position completion with the attributes current at that time. */
+static void immediate_vertex(float x, float y, float u, float v)
+{
+    m(0x18C0, f32_bits(u)); m(0x18C4, f32_bits(v)); /* ATTR8 DATA2F */
+    m(0x1500, f32_bits(x)); m(0x1504, f32_bits(y));
+    m(0x1508, f32_bits(-1.0f));                    /* ATTR0 DATA3F */
+}
+
+static void test_immediate_compositor(void)
+{
+    engine_up();
+    /* Leave array declarations pointing outside readable guest memory. */
+    m(M_VTXBUF_OFFSET, 0xFFFFFFF0u);
+    m(0x1738, 0x7FFFFFF0u); m(0x173C, 0x7FFFFFF0u);
+    m(M_VTXFMT, 2u | (4u << 4) | (16u << 8) | (7u << 16));
+    immediate_vertex(99, 98, 97, 96); /* constants outside BEGIN do not draw */
+    m(M_BEGIN_END, 6u);              /* retail fullscreen TRIANGLE_STRIP */
+    immediate_vertex(-1, -1, 0, 1);
+    immediate_vertex(3, -1, 2, 1);
+    immediate_vertex(-1, 3, 0, -1);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 1, "register fullscreen triangle issues a draw");
+    CHECK(stub.draw_vertices == 3 && stub.draw_indices == 3,
+          "register triangle uploads 3 vertices/indices, got %u/%u",
+          stub.draw_vertices, stub.draw_indices);
+    CHECK(stub.draw_topology == RSX_TOPOLOGY_TRIANGLES, "strip rebuilt as triangles");
+    const float expected[3][4] = {{-1,-1,0,1}, {3,-1,2,1}, {-1,3,0,-1}};
+    for (u32 i = 0; i < 3; i++) {
+        CHECK(stub.captured_vertices[i][0] == expected[i][0] &&
+              stub.captured_vertices[i][1] == expected[i][1] &&
+              stub.captured_vertices[i][2] == -1 && stub.captured_vertices[i][3] == 1,
+              "immediate position %u preserved independently of arrays", i);
+        CHECK(stub.captured_vertices[i][32] == expected[i][2] &&
+              stub.captured_vertices[i][33] == expected[i][3] &&
+              stub.captured_vertices[i][34] == 0 && stub.captured_vertices[i][35] == 1,
+              "immediate UV %u preserved at position completion", i);
+        CHECK(stub.captured_indices[i] == i, "immediate strip index %u", i);
+    }
+    m(M_BEGIN_END, 8u);
+    immediate_vertex(-1,-1,0,0); immediate_vertex(1,-1,1,0);
+    immediate_vertex(1,1,1,1); immediate_vertex(-1,1,0,1);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 2 && stub.draw_vertices == 4 && stub.draw_indices == 6,
+          "immediate quad rebuilt without previous group vertices");
+    m(M_BEGIN_END, 6u);
+    m(0x18C0, f32_bits(8)); m(0x18C4, f32_bits(9));
+    m(0x1500, f32_bits(8)); m(0x1504, f32_bits(9)); /* incomplete position */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 2, "UV and incomplete position do not emit a vertex");
+    /* DATA4F completes on W and preserves an explicit W. */
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) {
+        m(0x1C00, f32_bits((float)i)); m(0x1C04, f32_bits(2));
+        m(0x1C08, f32_bits(3)); m(0x1C0C, f32_bits(4));
+    }
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 3 && stub.draw_vertices == 3 &&
+          stub.captured_vertices[2][0] == 2 && stub.captured_vertices[2][3] == 4,
+          "DATA4F position emits once at W with explicit W preserved");
+    m(M_BEGIN_END, 5u);
+    immediate_vertex(1,2,3,4);
+    m(M_DRAW_ARRAYS, 2u << 24);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 3, "mixed immediate and arrays reject the entire group");
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 4098; i++) immediate_vertex(1,2,3,4);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 3, "oversized immediate group never draws a truncated prefix");
+    m(M_BEGIN_END, 6u);
+    immediate_vertex(-1,-1,0,1); immediate_vertex(3,-1,2,1);
+    immediate_vertex(-1,3,0,-1);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 4 && stub.draw_vertices == 3,
+          "BEGIN recovers after oversized or mixed groups");
+    m(M_BEGIN_END, 5u);
+    for (u32 attr = 0; attr < 16; attr++)
+        for (u32 lane = 0; lane < 4; lane++) m(0x1C00 + attr * 16 + lane * 4, 0);
+    /* The ATTR0 above emits the first vertex, then emit two more zero positions. */
+    for (u32 v = 0; v < 2; v++)
+        for (u32 lane = 0; lane < 4; lane++) m(0x1C00 + lane * 4, 0);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 5 && stub.captured_vertices[1][3] == 0 &&
+          stub.captured_vertices[1][35] == 0,
+          "explicit all-zero DATA4F preserves position W and attribute alpha");
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1176,6 +1274,8 @@ int main(void)
     test_depth_clear_value();
     test_depth_read_as_color();
     test_color_read_as_float();
+
+    test_immediate_compositor();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

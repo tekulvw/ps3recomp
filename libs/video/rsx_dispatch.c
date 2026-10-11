@@ -322,6 +322,13 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         (method >= 0x0A80 && method < 0x0B00))
         vtx_const_fold(rsx, method, arg);
 
+    /* Completing a floating-point position emits a register-based vertex.
+     * Other attributes update the current values copied with that position.
+     * Keep these writes as ordinary constant state outside BEGIN/END. */
+    if (rsx->in_begin_end && (method == 0x1508 || method == 0x1C0C) &&
+        rsx->sink.immediate_vertex)
+        rsx->sink.immediate_vertex(rsx->sink.user, rsx);
+
     /* Transform program upload window: word goes to instruction slot
      * VP_UPLOAD_FROM_ID; the load pointer advances after every completed
      * vec4 (hardware auto-increment, confirmed against the RPCS3 oracle). */
