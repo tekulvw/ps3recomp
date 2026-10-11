@@ -73,6 +73,7 @@ extern "C" {
 
 /* IO mapping limits */
 #define CELL_GCM_MAX_IO_MAPPINGS        16
+#define CELL_GCM_IOMAP_FLAG_STRICT_ORDERING 2u
 
 /* Debug output levels */
 #define CELL_GCM_DEBUG_LEVEL0           0
@@ -306,6 +307,9 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset);
 
 /* NID: 0x5A41C10F */
 s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size);
+
+/* NID: 0x626E8518 */
+s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags);
 
 /* NID: 0xDB23E867 (disambiguation by context) */
 s32 cellGcmUnmapEaIoAddress(u32 ea);

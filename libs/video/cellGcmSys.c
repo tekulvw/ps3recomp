@@ -2727,6 +2727,37 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
     return CELL_OK;
 }
 
+/* NID: 0x626E8518 */
+s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags)
+{
+    /* RPCS3 cellGcmSys.cpp accepts exactly STRICT_ORDERING (not an arbitrary
+     * bit mask). The software FIFO already reads shared guest memory in FIFO
+     * order after its acquire fence; there is no relaxed DMA mapping path to
+     * select here. Preserve that path rather than pretending to enable a new
+     * ordering mode by storing an unused flag. */
+    if (flags != CELL_GCM_IOMAP_FLAG_STRICT_ORDERING)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    if ((ea | io | size) & 0xFFFFFu || !size)
+        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+    const u64 ea_end = (u64)ea + size;
+    const u64 io_end = (u64)io + size;
+    /* The HLE models the standard 256 MiB RSX IO aperture. Widen sums before
+     * checking bounds so wrapping inputs cannot publish aliases at page 0. */
+    if (ea_end > 0x100000000ull || io_end > 0x10000000ull)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    /* The legacy mapper checks only an identical EA base. Preflight complete
+     * intervals on both sides so a rejected flagged map changes neither the
+     * mapping list nor either direction of the translation table. */
+    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+        const IoMapping* m = &s_io_mappings[i];
+        if (m->active &&
+            (((u64)ea < (u64)m->ea + m->size && ea_end > m->ea) ||
+             ((u64)io < (u64)m->io + m->size && io_end > m->io)))
+            return CELL_GCM_ERROR_ADDRESS_OVERWRAP;
+    }
+    return cellGcmMapEaIoAddress(ea, io, size);
+}
+
 /* NID: 0xDB23E867 (disambiguation by context) */
 s32 cellGcmUnmapEaIoAddress(u32 ea)
 {
