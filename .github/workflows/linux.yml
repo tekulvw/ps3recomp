@@ -148,6 +148,9 @@ jobs:
       # compiled it and the POSIX port is unfinished. This ratchets the error
       # count: it fails if the scaffold gets WORSE, which is what keeps the
       # port from sliding backwards while it is being done.
+      - name: Test timezone syscall ABI
+        run: python tools/test_time_timezone.py
+
       - name: Check the PPU boot scaffold (ratchet)
         env:
           CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}

@@ -243,6 +243,9 @@ jobs:
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
       # baseline yet, so this reports its numbers and passes; the first run's
       # output is what to record with --update.
+      - name: Test timezone syscall ABI
+        run: python tools/test_time_timezone.py
+
       - name: Check the PPU boot scaffold (ratchet)
         run: python tools/check_ppu_scaffold.py
 
