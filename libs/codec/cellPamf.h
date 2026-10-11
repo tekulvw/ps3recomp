@@ -19,11 +19,17 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define CELL_PAMF_ERROR_INVALID_ARG          0x80610301
-#define CELL_PAMF_ERROR_INVALID_HEADER       0x80610302
-#define CELL_PAMF_ERROR_STREAM_NOT_FOUND     0x80610303
-#define CELL_PAMF_ERROR_EP_NOT_FOUND         0x80610304
-#define CELL_PAMF_ERROR_NOT_AVAILABLE        0x80610305
+#define CELL_PAMF_ERROR_STREAM_NOT_FOUND     0x80610501
+#define CELL_PAMF_ERROR_INVALID_HEADER       0x80610502
+#define CELL_PAMF_ERROR_INVALID_ARG          0x80610503
+#define CELL_PAMF_ERROR_UNKNOWN_TYPE         0x80610504
+#define CELL_PAMF_ERROR_UNSUPPORTED_VERSION  0x80610505
+#define CELL_PAMF_ERROR_EP_NOT_FOUND         0x80610507
+#define CELL_PAMF_ERROR_NOT_AVAILABLE        0x80610508
+#define CELL_PAMF_ATTRIBUTE_VERIFY_ON        1
+#define CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER   2
+#define CELL_PAMF_STREAM_TYPE_VIDEO          20
+#define CELL_PAMF_STREAM_TYPE_AUDIO          21
 
 /* ---------------------------------------------------------------------------
  * Stream types
@@ -46,40 +52,33 @@ extern "C" {
  * PAMF header magic
  * -----------------------------------------------------------------------*/
 #define CELL_PAMF_MAGIC         0x50414D46   /* "PAMF" */
-#define CELL_PAMF_VERSION       0x00040100   /* v4.1.0 */
+#define CELL_PAMF_VERSION       0x30303431   /* ASCII "0041" */
 
 /* ---------------------------------------------------------------------------
  * Types
  * -----------------------------------------------------------------------*/
 
-typedef struct CellPamfReader {
-    void* pamfAddr;       /* base address of PAMF data */
-    u32   pamfSize;       /* total size */
-    u32   dataOffset;     /* offset to mux data */
-    u32   dataSize;       /* mux data size */
-    u32   streamTableOffset; /* offset to stream descriptor table */
-    u8    numStreams;      /* number of streams */
-    u8    currentStream;  /* current stream index */
-    u8    reserved[2];
-    u32   currentEP;      /* current entry point */
-} CellPamfReader;
+/* Guest ABI bytes, not host-native pointers or integers. Copyable as 128 bytes.
+ * The backing PAMF header must remain resident for the reader's lifetime. */
+typedef struct CellPamfReader { u8 guest[128]; } CellPamfReader;
 
 typedef struct CellPamfAvcInfo {
-    u8   profileIdc;
-    u8   levelIdc;
-    u16  horizontalSize;
-    u16  verticalSize;
-    u8   frameCropLeftOffset;
-    u8   frameCropRightOffset;
-    u8   frameCropTopOffset;
-    u8   frameCropBottomOffset;
-    u8   frameMbsOnlyFlag;
-    u8   videoSignalInfoFlag;
-    u8   frameRateCode;
-    u8   aspectRatioIdc;
-    u16  sarWidth;
-    u16  sarHeight;
+    u8 profileIdc, levelIdc, frameMbsOnlyFlag, videoSignalInfoFlag;
+    u8 frameRateInfo, aspectRatioIdc;
+    u16 sarWidth, sarHeight, horizontalSize, verticalSize;
+    u16 frameCropLeftOffset, frameCropRightOffset, frameCropTopOffset, frameCropBottomOffset;
+    u8 videoFormat, videoFullRangeFlag, colourPrimaries, transferCharacteristics;
+    u8 matrixCoefficients, entropyCodingModeFlag, deblockingFilterFlag;
+    u8 minNumSlicePerPictureIdc, nfwIdc, maxMeanBitrate;
 } CellPamfAvcInfo;
+
+typedef struct CellPamfM2vInfo {
+    u8 profileAndLevelIndication, progressiveSequence, videoSignalInfoFlag, frameRateInfo;
+    u8 aspectRatioIdc;
+    u16 sarWidth, sarHeight, horizontalSize, verticalSize;
+    u16 horizontalSizeValue, verticalSizeValue;
+    u8 videoFormat, videoFullRangeFlag, colourPrimaries, transferCharacteristics, matrixCoefficients;
+} CellPamfM2vInfo;
 
 typedef struct CellPamfAtrac3plusInfo {
     u32 samplingFrequency;
@@ -89,7 +88,7 @@ typedef struct CellPamfAtrac3plusInfo {
 typedef struct CellPamfLpcmInfo {
     u32 samplingFrequency;
     u8  numberOfChannels;
-    u8  bitsPerSample;
+    u16 bitsPerSample;
 } CellPamfLpcmInfo;
 
 typedef struct CellPamfAc3Info {
@@ -115,7 +114,7 @@ typedef struct CellPamfStreamInfo {
 
 /* Reader lifecycle */
 s32 cellPamfReaderInitialize(CellPamfReader* reader, void* pamfAddr,
-                              u32 pamfSize, u32 attribute);
+                              u64 pamfSize, u32 attribute);
 s32 cellPamfReaderGetPresentationStartTime(CellPamfReader* reader, u64* startTime);
 s32 cellPamfReaderGetPresentationEndTime(CellPamfReader* reader, u64* endTime);
 u32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader);
@@ -124,6 +123,7 @@ u32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader);
 s32 cellPamfReaderGetNumberOfStreams(CellPamfReader* reader);
 s32 cellPamfReaderGetNumberOfSpecificStreams(CellPamfReader* reader, u8 streamType);
 s32 cellPamfReaderSetStreamWithType(CellPamfReader* reader, u8 streamType, u32 streamIndex);
+s32 cellPamfReaderSetStreamWithTypeAndIndex(CellPamfReader* reader, u8 streamType, u8 streamIndex);
 s32 cellPamfReaderSetStreamWithTypeAndChannel(CellPamfReader* reader, u8 streamType, u32 channel);
 s32 cellPamfReaderSetStreamWithIndex(CellPamfReader* reader, u32 streamIndex);
 s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize);
@@ -134,7 +134,7 @@ s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 streamIndex,
                                      void* esFilterId);
 
 /* Entry point navigation */
-s32 cellPamfReaderGetNumberOfEp(CellPamfReader* reader, s32* numEp);
+u32 cellPamfReaderGetNumberOfEp(CellPamfReader* reader);
 s32 cellPamfReaderGetEp(CellPamfReader* reader, u32 epIndex, CellPamfEp* ep);
 
 #ifdef __cplusplus
