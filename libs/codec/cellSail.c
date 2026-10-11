@@ -532,6 +532,8 @@ s32 cellSailDescriptorOpen(CellSailDescriptorHandle desc)
     FILE* media = NULL;
     u8* header = NULL;
     u32 owned = 0, free_opd = 0, free_arg = 0;
+    u32 allocator_seen = 0, callbacks_seen = 0, alloc_opd_seen = 0;
+    const char* stage = "source";
     if (d->opened) { result = SAIL_DESC_INVALID_STATE; goto done; }
     if (d->streamType != 0 || strncmp(d->uri, "x-cell-fs://", 12)) goto done;
     const char* path = d->uri + 12;
@@ -557,13 +559,18 @@ s32 cellSailDescriptorOpen(CellSailDescriptorHandle desc)
     header = (u8*)malloc((size_t)header_bytes);
     if (!header) { result = SAIL_DESC_MEMORY; goto done; }
     if (fseek(media, 0, SEEK_SET) || fread(header, 1, (size_t)header_bytes, media) != header_bytes) goto done;
+    stage = "allocator";
     const int player_slot = sail_player_slot(d->player);
     if (player_slot < 0) { result = SAIL_DESC_INVALID_STATE; goto done; }
     const u32 allocator = s_sail_players[player_slot].allocator_ea;
+    allocator_seen = allocator;
     if (!sail_desc_range(allocator, 8) || (allocator & 3)) { result = SAIL_DESC_INVALID_ARG; goto done; }
     const u32 callbacks = vm_read32(allocator);
+    callbacks_seen = callbacks;
     if (!sail_desc_range(callbacks, 8) || (callbacks & 3)) { result = SAIL_DESC_INVALID_ARG; goto done; }
     const u32 alloc_opd = vm_read32(callbacks);
+    alloc_opd_seen = alloc_opd;
+    stage = "allocator-opds";
     free_opd = vm_read32(callbacks + 4); free_arg = vm_read32(allocator + 4);
     if (!sail_desc_range(alloc_opd, 12) || !sail_desc_range(free_opd, 12) ||
         (alloc_opd & 3) || (free_opd & 3) || !vm_read32(alloc_opd) || !vm_read32(free_opd)) {
@@ -571,6 +578,7 @@ s32 cellSailDescriptorOpen(CellSailDescriptorHandle desc)
     }
     const u32 uri_offset = (u32)header_bytes + 128;
     const u32 bytes = (uri_offset + (u32)strlen(d->uri) + 1 + 127) & ~127u;
+    stage = "allocation";
     const u64 address = ppu_guest_call(alloc_opd, free_arg, 128, bytes, 0, 0, 0, 0, 0);
     if (!address) { result = SAIL_DESC_MEMORY; goto done; }
     if (address > 0xFFFFFFFFu) { result = SAIL_DESC_MEMORY; goto done; }
@@ -578,6 +586,7 @@ s32 cellSailDescriptorOpen(CellSailDescriptorHandle desc)
     if ((owned & 127) || !sail_desc_range(owned, bytes)) { result = SAIL_DESC_MEMORY; goto done; }
     memcpy(vm_base + owned, header, (size_t)header_bytes);
     const u32 reader = owned + (u32)header_bytes;
+    stage = "pamf-reader";
     result = cellPamfReaderInitialize((CellPamfReader*)(uintptr_t)reader,
                                      (void*)(uintptr_t)owned, (u64)length, 0);
     if (result) goto done;
@@ -590,6 +599,7 @@ s32 cellSailDescriptorOpen(CellSailDescriptorHandle desc)
             desc, (unsigned long long)d->file_size, (unsigned long long)header_bytes, d->header_ea);
     result = CELL_OK;
 done:
+    if (result) fprintf(stderr, "[cellSail] DescriptorOpen(desc=%u) -> %08X stage=%s allocator=%08X callbacks=%08X alloc=%08X free=%08X uri=%s\n", desc, (u32)result, stage, allocator_seen, callbacks_seen, alloc_opd_seen, free_opd, d->uri);
     if (owned) (void)ppu_guest_call(free_opd, free_arg, 128, owned, 0, 0, 0, 0, 0);
     free(header);
     if (media) fclose(media);
