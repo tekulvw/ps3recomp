@@ -22,6 +22,8 @@
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
+#include <mutex>
+#include <string.h>
 #include <stdlib.h>       /* getenv, atoi (boot trace) */
 
 /* Single flat NID -> handler table (all modules share it; resolution is by
@@ -121,60 +123,42 @@ extern "C" void flow_spurs_kernel_spawn_postinit(void) __attribute__((weak));
 extern "C" void flow_spurs_kernel_spawn_postinit(void) {}
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 
-/* An unresolved NID is a firmware import we never registered. Returning
- * CELL_OK "so the game keeps going" is the single biggest source of
- * days-long debugging in this project: the title reads back untouched
- * out-params and proceeds on fabricated state, then deadlocks or crashes
- * far from the actual gap. The unregistered mouse (a phantom device polled
- * forever) and six whole modules whose names never matched a source file
- * all reached the game this way.
- *
- * So: report every DISTINCT unresolved NID exactly once (not a global
- * first-40 cap that hides everything after the 40th unique import), count
- * how often each is hit, and make the fabricated return an explicit CHOICE
- * rather than the silent default.
- *
- * The default stays CELL_OK, because faking is currently LOAD-BEARING: LBP
- * calls cellFsSdataOpen (0xB1840B53, its encrypted data file) and cellHttpsInit
- * (0x522180BC) during early boot and shuts down cleanly if either fails, so
- * PS3_HLE_UNRESOLVED=fail dies at 144 log lines vs ~148,000. The days-long
- * debugging was never caused by the fake per se -- it was caused by the fake
- * being SILENT (a global first-40-line cap hid every import past the 40th). So
- * the fix is visibility: report each DISTINCT unresolved NID once, with a hit
- * count, always. `fail` remains available to A/B which missing import is
- * load-bearing -- run it and read the two or three NIDs it reports.
- *
- *   PS3_HLE_UNRESOLVED = ok   (default): r3 = CELL_OK, reported once per NID.
- *                        = fail: r3 = CELL_ERROR_ERROR, to find load-bearing
- *                                imports (expect an early, clean shutdown).
- */
+/* Unknown imports preserve the legacy success default. Diagnostic callers
+ * can request a guest error (fail) or stop at the exact missing import (halt).
+ * The first-seen set is shared by guest threads; protect it during reporting. */
+static bool ps3_hle_should_halt()
+{
+    const char* mode = getenv("PS3_HLE_UNRESOLVED");
+    return mode && strcmp(mode, "halt") == 0;
+}
+
 static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 {
-    enum { CELL_ERROR_ERROR = (int)0x8001003Fu };  /* generic CELL failure */
-    static int s_fake = -1;
-    if (s_fake < 0) {
-        const char* m = getenv("PS3_HLE_UNRESOLVED");
-        s_fake = (m && (m[0]=='f' || m[0]=='F')) ? 0 : 1;   /* "fail" -> error, else fake */
+    if (ps3_hle_should_halt()) {
+        fprintf(stderr, "[hle] UNRESOLVED NID 0x%08X lr=0x%08X "
+                        "r3..r6=%016llX %016llX %016llX %016llX; halting\n",
+                nid, (uint32_t)ctx->lr,
+                (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
+                (unsigned long long)ctx->gpr[5], (unsigned long long)ctx->gpr[6]);
+        fflush(stderr);
+        _Exit(88);
     }
-    /* First-seen set: report each NID once, then count silently. Linear scan
-     * over a small array -- the count of DISTINCT unresolved NIDs a title hits
-     * is tens, not thousands (the log-flooders are all the SAME NID). */
+    const char* mode = getenv("PS3_HLE_UNRESOLVED");
+    const bool fail = mode && (mode[0] == 'f' || mode[0] == 'F');
+    static std::mutex lock;
     static uint32_t seen[512];
-    static uint32_t hits[512];
-    static uint32_t n_seen = 0;
-    uint32_t i = 0;
-    for (; i < n_seen; i++) if (seen[i] == nid) break;
-    if (i == n_seen && n_seen < 512) { seen[n_seen] = nid; hits[n_seen] = 0; n_seen++; }
-    uint32_t count = (i < 512) ? ++hits[i] : 0;
-    (void)count;
-    if (count == 1)
-        fprintf(stderr, "[hle] UNRESOLVED NID 0x%08X -> faking %s "
-                        "(unregistered import%s)\n",
-                nid, s_fake ? "CELL_OK" : "CELL_ERROR_ERROR",
-                s_fake ? "; PS3_HLE_UNRESOLVED=fail to find load-bearing ones"
-                       : "");
-
-    ctx->gpr[3] = s_fake ? 0u : (uint64_t)(uint32_t)CELL_ERROR_ERROR;
+    static uint32_t count = 0;
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        uint32_t i = 0;
+        for (; i < count; ++i) if (seen[i] == nid) break;
+        if (i == count) {
+            if (count < 512) seen[count++] = nid;
+            fprintf(stderr, "[hle] UNRESOLVED NID 0x%08X -> %s (unregistered import)\n",
+                    nid, fail ? "CELL_ERROR_ERROR" : "CELL_OK");
+        }
+    }
+    ctx->gpr[3] = fail ? 0x8001003Fu : 0u;
 }
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
@@ -646,6 +630,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * early. An import moving between resolved and unresolved is exactly the
          * kind of change the gate exists to catch. */
         ps3_msf("hle:unresolved:0x%08X", nid);
+        if (ps3_hle_should_halt()) ps3_hle_unresolved(nid, ctx);
         /* YDKJ_TUNERFIX: sysPrxForUser 0xE0998DBF is the profiler-presence query called
          * by libsre _cellSpursIsLaunchedFromTuner (0x3000D318). On a normal (non-tuner)
          * run it must return 0x8001112E ("profiler not loaded"); an unresolved-NID error
@@ -658,8 +643,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
-        static int logged = 0;
-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */
@@ -706,7 +689,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               ctx->gpr[3] = 0x80010002u; /* generic failure (net unavailable) */
               return;
           } } }
-        ctx->gpr[3] = 0;   /* CELL_OK-ish so the game keeps going */
+        ps3_hle_unresolved(nid, ctx);
         return;
     }
     g_last_hle_name = e->name;

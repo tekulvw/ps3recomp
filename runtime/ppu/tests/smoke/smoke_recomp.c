@@ -439,6 +439,12 @@ void func_00010100(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 void func_00010000(ppu_context* ctx)
 {
+    if (getenv("PS3RECOMP_SMOKE_UNKNOWN_HLE")) {
+        ctx->lr = 0x12345678u;
+        ps3_hle_call(0xDEADBEEFu, ctx);
+        fprintf(stderr, "[smoke] unknown HLE returned %08X\n", (uint32_t)ctx->gpr[3]);
+        exit(ctx->gpr[3] == 0 ? 0 : 1);
+    }
     uint32_t argc = (uint32_t)ctx->gpr[3];
     uint32_t argv = (uint32_t)ctx->gpr[4];
     uint32_t toc  = (uint32_t)ctx->gpr[2];
