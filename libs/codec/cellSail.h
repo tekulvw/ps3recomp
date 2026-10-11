@@ -70,6 +70,13 @@ typedef void (*CellSailPlayerCallback)(CellSailPlayerHandle handle,
                                          void* arg);
 
 /* Functions */
+/* Guest-EA APIs for the known 24-byte CellSailFuture record.
+ * Pending Get currently returns NOT_AVAILABLE without changing pResult. */
+s32 cellSailFutureInitialize(u32 pSelf);
+s32 cellSailFutureSet(u32 pSelf, s32 result);
+s32 cellSailFutureGet(u32 pSelf, u64 timeout, u32 pResult);
+s32 cellSailFutureFinalize(u32 pSelf);
+
 s32 cellSailInit(void);
 s32 cellSailTerm(void);
 
