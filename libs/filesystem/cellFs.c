@@ -70,7 +70,9 @@ static void init_default_mappings(void)
     s_initialized = 1;
 
     cellfs_add_path_mapping("/dev_hdd0/",  "gamedata/dev_hdd0/");
-    cellfs_add_path_mapping("/dev_bdvd/",  "gamedata/dev_bdvd/");
+    const char* disc_root = getenv("PS3_VFS_ROOT");
+    cellfs_add_path_mapping("/dev_bdvd/",
+                           disc_root && *disc_root ? disc_root : "gamedata/dev_bdvd/");
     cellfs_add_path_mapping("/dev_flash/", "gamedata/dev_flash/");
     cellfs_add_path_mapping("/app_home/",  "gamedata/app_home/");
     cellfs_add_path_mapping("/dev_usb000/","gamedata/dev_usb/");
@@ -117,7 +119,15 @@ void cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path)
     }
 }
 
-/* Translate a PS3 path to a host path. Returns 0 on success, -1 if no mapping found.
+static int host_path_is_absolute(const char* path)
+{
+    return path[0] == '/' || path[0] == '\\' ||
+           (((path[0] >= 'A' && path[0] <= 'Z') ||
+             (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' &&
+            (path[2] == '/' || path[2] == '\\'));
+}
+
+/* Translate a PS3 path to a host path. Returns 0 on success, -1 on failure.
  * Also exposed publicly as cellfs_translate_path() for use by other modules. */
 static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 {
@@ -157,20 +167,34 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
         return -1;
 
     const char* remainder = ps3_path + best_len;
-    snprintf(host_buf, buf_size, "%s/%s%s", s_root_path,
-             s_path_mappings[best].host_path, remainder);
+    const char* mapped = s_path_mappings[best].host_path;
+    const size_t mapped_len = strlen(mapped);
+    const char* separator = *remainder && mapped_len &&
+        mapped[mapped_len - 1] != '/' && mapped[mapped_len - 1] != '\\' ? "/" : "";
+    /* Work in a full-size path buffer: the shared fallback can expand a path
+     * by inserting PS3_GAME. Copy only after its final size is known. */
+    char translated[CELL_FS_MAX_FS_PATH_LENGTH];
+    const int length = host_path_is_absolute(mapped)
+        ? snprintf(translated, sizeof(translated), "%s%s%s", mapped, separator, remainder)
+        : snprintf(translated, sizeof(translated), "%s/%s%s%s", s_root_path,
+                   mapped, separator, remainder);
+    if (length < 0 || (size_t)length >= sizeof(translated)) {
+        host_buf[0] = '\0';
+        return -1;
+    }
 
     /* A mapped path with an empty remainder ends in a separator ("…/dev_hdd0/"),
      * and stat() rejects that on Windows -- so the directory a game asks about
      * reads as missing even when it is right there. Trim it. */
-    { size_t hl = strlen(host_buf);
-      while (hl > 1 && (host_buf[hl-1] == '/' ||
-                        host_buf[hl-1] == '\\')) {
-          host_buf[hl-1] = '\0'; hl--;
+    { size_t hl = strlen(translated);
+      const size_t root_len = translated[1] == ':' && host_path_is_absolute(translated) ? 3 : 1;
+      while (hl > root_len && (translated[hl-1] == '/' ||
+                               translated[hl-1] == '\\')) {
+          translated[hl-1] = '\0'; hl--;
       } }
 
     /* Normalize slashes */
-    for (char* p = host_buf; *p; p++) {
+    for (char* p = translated; *p; p++) {
 #ifdef _WIN32
         if (*p == '/') *p = '\\';
 #else
@@ -179,7 +203,13 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
     }
 
     extern void ps3_vfs_ps3game_fallback(char* path, size_t cap);
-    ps3_vfs_ps3game_fallback(host_buf, buf_size);
+    ps3_vfs_ps3game_fallback(translated, sizeof(translated));
+    const size_t final_size = strlen(translated) + 1;
+    if (final_size > buf_size) {
+        host_buf[0] = '\0';
+        return -1;
+    }
+    memcpy(host_buf, translated, final_size);
     return 0;
 }
 
