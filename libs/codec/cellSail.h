@@ -142,6 +142,14 @@ typedef struct CellSailMemAllocatorFuncs {
 s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
                               u32 pUserParam, u32 pAttribute, u32 pResource);
 s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
+/* Guest effective addresses; GetFrame writes exactly 24 big-endian bytes.
+ * Zero means no frame. The current backend does not decode video. */
+#define CELL_SAIL_SYNC_NO_FRAME 0
+s32 cellSailGraphicsAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
+s32 cellSailGraphicsAdapterFinalize(u32 pSelf);
+s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo);
+s32 cellSailGraphicsAdapterUpdateAvSync(u32 pSelf, u32 tag, u64 time);
+
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
                                      CellSailMemAllocatorFuncs* pFuncs);
 
