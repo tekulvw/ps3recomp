@@ -26,7 +26,7 @@
 #include "spu_coherency.h"
 #include "../platform/win32_compat.h"
 #include "spu_workload.h"
-#include "spu_coherency.h"
+#include "spurs_workload_flag.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -286,7 +286,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;
     ctx->gpr[4]._u32[2] = 0;
     ctx->gpr[4]._u32[3] = 0;
-    ctx->gpr[5]._u32[0] = 0;                           /* poll status */
+    ctx->gpr[5]._u32[0] = spurs_flag_status(spurs_ea, wid, 1); /* FLAG poll reason */
 
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;

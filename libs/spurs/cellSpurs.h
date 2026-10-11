@@ -31,6 +31,12 @@ extern "C" {
 #define CELL_SPURS_CORE_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x09)
 
 /* Policy-module errors are a separate facility from the core errors. */
+#define CELL_SPURS_POLICY_MODULE_ERROR_INVAL         0x80410802
+#define CELL_SPURS_POLICY_MODULE_ERROR_NOSYS         0x80410803
+#define CELL_SPURS_POLICY_MODULE_ERROR_SRCH          0x80410805
+#define CELL_SPURS_POLICY_MODULE_ERROR_PERM          0x80410809
+#define CELL_SPURS_POLICY_MODULE_ERROR_BUSY          0x8041080A
+#define CELL_SPURS_POLICY_MODULE_ERROR_STAT          0x8041080F
 #define CELL_SPURS_POLICY_MODULE_ERROR_FAULT         0x8041080D
 #define CELL_SPURS_POLICY_MODULE_ERROR_ALIGN         0x80410810
 #define CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER  0x80410811
@@ -211,6 +217,7 @@ s32 cellSpursFinalize(CellSpurs* spurs);
 /* Both arguments carry guest EAs through the generic HLE adapter. The output
  * is a guest BE32 pointer to the instance's 16-byte CellSpursWorkloadFlag. */
 s32 cellSpursGetWorkloadFlag(CellSpurs* spurs, CellSpursWorkloadFlag** flag);
+s32 _cellSpursWorkloadFlagReceiver(CellSpurs* spurs, u32 wid, u32 is_set);
 
 s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
                                  s32 spuPriority, s32 ppuPriority,
