@@ -2019,7 +2019,20 @@ static int spu_smc_microstep(spu_context* ctx)
         /* Stop at the drain's return point too: it sits mid-function, so it is
          * no lifted entry, and a job's return would otherwise run on through
          * the caller's code (GH3's song-freeze; see drain_ret_pc). */
-        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
+        const uint32_t return_pc = ctx->drain_ret_pc;
+        uint32_t result = spu_interp_run_until(ctx, pc, return_pc);
+        /* A live interpreter rejoin is a transfer, not a host return. Nested
+         * drains can repair an empty trampoline, but the top-level driver
+         * otherwise ends the run before executing the lifted target.
+         * An already-owning drain must retain its own host continuation;
+         * stopped states and diagnostic exits keep their existing behavior. */
+        if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
+            (!return_pc || (ctx->pc & SPU_LS_MASK) != return_pc) &&
+            spu_lifted_lookup(ctx, ctx->pc)) {
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1;
+        }
+        return result ? 1 : 0;
     }
     { static int _n = 0; if (_n++ < 4)
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
