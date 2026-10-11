@@ -110,6 +110,7 @@ s32 cellSailPlayerIsPaused(CellSailPlayerHandle handle);
 s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode, void* command);
 
 /* Descriptor management (for multi-stream sources) */
+s32 cellSailPlayerGetDescriptorCount(CellSailPlayerHandle handle);
 typedef u32 CellSailDescriptorHandle;
 
 s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
@@ -121,7 +122,7 @@ s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
 s32 cellSailPlayerAddDescriptor(CellSailPlayerHandle handle,
                                   CellSailDescriptorHandle desc);
 s32 cellSailPlayerRemoveDescriptor(CellSailPlayerHandle handle,
-                                     CellSailDescriptorHandle desc);
+                                     CellSailDescriptorHandle unknownOutput);
 
 s32 cellSailDescriptorCreateDatabase(CellSailDescriptorHandle desc,
                                        void* dbAddr, u32 dbSize,
