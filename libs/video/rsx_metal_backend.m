@@ -2774,6 +2774,76 @@ static void eng_diag_end(void)
     s_eng_diag_cb = nil;
 }
 
+/* Opt-in first-draw evidence across both report flushes and presentation.
+ * Texture reads add a bounded GPU wait only while this flag is enabled. */
+static unsigned s_eng_trace_draws, s_eng_trace_submits;
+static int eng_trace_enabled(void)
+{
+    const char* opt = getenv("PS3RECOMP_METAL_DRAW_DIAGNOSTICS");
+    return opt && !strcmp(opt, "1");
+}
+static void eng_trace_draw(const EngRecord* r)
+{
+    if (!eng_trace_enabled() || s_eng_trace_draws >= 32) return;
+    float vertex[4] = {0};
+    size_t bytes = r->stride < sizeof vertex ? r->stride : sizeof vertex;
+    if ((u64)r->vb_off + bytes <= s_eng_stage_used)
+        memcpy(vertex, s_eng_stage + r->vb_off, bytes);
+    fprintf(stderr, "[rsx draw diagnostic] draw=%u pipeline=%u vertices=%u indices=%u stride=%u rt=",
+            ++s_eng_trace_draws, r->pipeline, r->vertex_count, r->index_count, r->stride);
+    for (u32 k=0; k<r->nrt; ++k) fprintf(stderr, "%s%u", k ? "," : "", r->rt[k]);
+    fprintf(stderr, " depth=%u tex0=%u vp=%g,%g,%g,%g sc=%u,%u,%u,%u vertex0=%g,%g,%g,%g vs_bytes=%u ps_bytes=%u\n",
+            r->depth, r->tex[0], r->vp[0], r->vp[1], r->vp[2], r->vp[3],
+            r->sc[0], r->sc[1], r->sc[2], r->sc[3],
+            vertex[0], vertex[1], vertex[2], vertex[3], r->vs_cb_bytes, r->ps_cb_bytes);
+}
+static u32 eng_trace_targets(u32 handles[16], id<MTLTexture> present)
+{
+    if (!eng_trace_enabled() || !s_eng_trace_draws || s_eng_trace_submits >= 8) return 0;
+    u32 count=0;
+    for (u32 i=0; i<s_eng_rec_count; ++i) {
+        const EngRecord* r=&s_eng_rec[i];
+        if (r->kind != ENG_REC_DRAW && r->kind != ENG_REC_CLEAR_COLOR) continue;
+        for (u32 k=0; k<r->nrt && count<16; ++k) {
+            u32 j=0; while (j<count && handles[j]!=r->rt[k]) ++j;
+            if (j==count && r->rt[k]) handles[count++]=r->rt[k];
+        }
+    }
+    for (u32 i=0; present && i<s_eng_obj_count && count<16; ++i) {
+        if (s_eng_obj[i] != present) continue;
+        u32 j=0; while (j<count && handles[j]!=i+1) ++j;
+        if (j==count) handles[count++]=i+1;
+        break;
+    }
+    if (count) ++s_eng_trace_submits;
+    return count;
+}
+static void eng_trace_pixels(const u32* handles, u32 count, id<MTLCommandBuffer> cb)
+{
+    for (u32 i=0; i<count; ++i) {
+        id<MTLTexture> t=eng_obj(handles[i]);
+        const size_t w=[t width],h=[t height];
+        const MTLPixelFormat fmt=[t pixelFormat];
+        size_t nonzero=0; unsigned maximum=0; int available=0;
+        if ([cb status] == MTLCommandBufferStatusCompleted && [t storageMode] == MTLStorageModeShared && w && h &&
+            w<=16384 && h<=16384 && w*h<=16*1024*1024 &&
+            (fmt==MTLPixelFormatRGBA8Unorm || fmt==MTLPixelFormatBGRA8Unorm)) {
+            u8* pixels=malloc(w*h*4);
+            if (pixels) {
+                [t getBytes:pixels bytesPerRow:w*4 fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+                for (size_t p=0; p<w*h; ++p) {
+                    if (pixels[p*4] || pixels[p*4+1] || pixels[p*4+2]) ++nonzero;
+                    for (unsigned c=0; c<3; ++c) if (pixels[p*4+c]>maximum) maximum=pixels[p*4+c];
+                }
+                free(pixels); available=1;
+            }
+        }
+        fprintf(stderr, "[rsx target diagnostic] submission=%u surface=%u size=%zux%zu format=%lu storage=%lu gpu_status=%ld rgb_available=%d rgb_nonzero=%zu rgb_max=%u\n",
+                s_eng_trace_submits, handles[i], w, h, (unsigned long)fmt,
+                (unsigned long)[t storageMode], (long)[cb status], available, nonzero, maximum);
+    }
+}
+
 static void eng_draw(void* user, rsx_topology topology, const void* vertices,
                      u32 vertex_count, u32 stride, const u32* indices,
                      u32 index_count)
@@ -2796,6 +2866,7 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
     r->vertex_count = vertex_count;
     r->ib_off       = ib_off;
     r->index_count  = indices ? index_count : 0;
+    eng_trace_draw(r);
     /* A report flush may submit these records before the next presentation. */
     s_eng_diag.seen_draw = 1;
 }
@@ -3123,6 +3194,8 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
                                       options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         if (s_eng_diag.active) s_eng_diag_cb = cb;
+        u32 trace_handles[16];
+        const u32 trace_count=eng_trace_targets(trace_handles, present_dst);
         eng_encode_records(cb, stage);
         int presented = eng_blit_to_display(cb, present_dst, dst);
         if (s_eng_diag.active && !presented && present_dst) s_eng_diag.reason = "blit_skipped";
@@ -3137,6 +3210,11 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
         } else {
             [cb commit];
             [cb waitUntilCompleted];
+        }
+
+        if (trace_count) {
+            [cb waitUntilCompleted];
+            eng_trace_pixels(trace_handles, trace_count, cb);
         }
 
         if (s_eng_dropped) {
