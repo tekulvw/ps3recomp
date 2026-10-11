@@ -6,6 +6,9 @@ import tempfile
 
 
 def main():
+    if os.name == "nt":
+        print("SKIP: neutral C fixture requires the POSIX toolchain; run on macOS/Linux")
+        return
     root = Path(__file__).resolve().parents[1]
     sources = ["tests/test_rsx_draw_engine.c", "rsx_draw_engine.c",
                "rsx_dispatch.c", "rsx_vertex_compact.c", "rsx_texture_layout.c",
