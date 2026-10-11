@@ -55,6 +55,11 @@ extern sys_mem_container_info   g_sys_mem_containers[SYS_MEMORY_CONTAINER_MAX];
 extern sys_mmapper_shared_info  g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
 extern uint32_t                 g_sys_mem_bump_ptr;  /* bump allocator pointer */
 
+/* Snapshot live container availability under the container/allocator lock.
+ * Returns 1 on success, otherwise 0 without modifying *available. This is a
+ * host query, not an allocation or a reference that prevents destruction. */
+int sys_memory_container_available(uint32_t container_id, uint32_t* available);
+
 /* Syscall handlers */
 int64_t sys_memory_allocate(ppu_context* ctx);
 int64_t sys_memory_free(ppu_context* ctx);

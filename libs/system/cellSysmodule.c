@@ -4,6 +4,8 @@
 
 #include "cellSysmodule.h"
 #include <stdio.h>
+#include <stdatomic.h>
+#include "../../runtime/syscalls/sys_memory.h"
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -13,6 +15,29 @@
  * (core) and 0xF0xx (extended: NP_TROPHY=0xF035, GIFDEC=0xF010, ...). The old
  * `id >= MAX_ID -> ERROR_UNKNOWN` check rejected every 0xF0xx load — LBP's
  * trophy-module load failed at boot. Map both ranges into one table. */
+/* HLE modules are compiled into the host and do not allocate PRX images.
+ * Preserve the selected real container as loader metadata without charging
+ * fictitious bytes. 0xFFFFFFFF selects the ordinary/default memory source. */
+static atomic_uint s_memory_container = 0xFFFFFFFFu;
+
+u32 ps3_sysmodule_memcontainer(void)
+{
+    return atomic_load_explicit(&s_memory_container, memory_order_acquire);
+}
+
+/* NID: 0xA193143C */
+s32 cellSysmoduleSetMemcontainer(u32 container_id)
+{
+    u32 available = 0;
+    const int valid = container_id == 0xFFFFFFFFu ||
+        (sys_memory_container_available(container_id, &available) && available >= 0x60000u);
+    atomic_store_explicit(&s_memory_container, valid ? container_id : 0xFFFFFFFFu,
+                          memory_order_release);
+    fprintf(stderr, "[cellSysmodule] SetMemcontainer(id=%08X available=%u) -> %s; HLE modules allocate no PRX image\n",
+            container_id, available, valid ? "OK" : "INVALID_MEMCONTAINER");
+    return valid ? CELL_OK : (s32)CELL_SYSMODULE_ERROR_INVALID_MEMCONTAINER;
+}
+
 static int s_module_loaded[2 * CELL_SYSMODULE_MAX_ID];
 static int sysmodule_slot(u16 id)
 {
@@ -86,8 +111,8 @@ s32 cellSysmoduleFinalize(void)   { return CELL_OK; }
 
 s32 cellSysmoduleLoadModule(u16 id)
 {
-    printf("[cellSysmodule] LoadModule(id=0x%04X '%s')\n",
-           id, sysmodule_id_to_name(id));
+    printf("[cellSysmodule] LoadModule(id=0x%04X '%s' container=%08X)\n",
+           id, sysmodule_id_to_name(id), ps3_sysmodule_memcontainer());
 
     int slot = sysmodule_slot(id);
     if (slot < 0)

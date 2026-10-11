@@ -126,6 +126,10 @@ extern "C" {
 s32 cellSysmoduleInitialize(void);
 s32 cellSysmoduleFinalize(void);
 s32 cellSysmoduleLoadModule(u16 id);
+s32 cellSysmoduleSetMemcontainer(u32 container_id);
+/* Host loader metadata; not a guest firmware export. No PRX allocation occurs
+ * in the current HLE loader. A later allocator must revalidate the container. */
+u32 ps3_sysmodule_memcontainer(void);
 
 /* NID: 0x112A5EE9 */
 s32 cellSysmoduleUnloadModule(u16 id);
