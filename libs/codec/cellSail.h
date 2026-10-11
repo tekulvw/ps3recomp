@@ -142,6 +142,11 @@ typedef struct CellSailMemAllocatorFuncs {
 s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
                               u32 pUserParam, u32 pAttribute, u32 pResource);
 s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
+/* GetFrame writes a 24-byte guest CellSailSoundFrameInfo. No frame is zero;
+ * this backend never supplies decoded audio. Arguments are guest EAs. */
+#define CELL_SAIL_SYNC_NO_FRAME 0
+s32 cellSailSoundAdapterFinalize(u32 pSelf);
+s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo);
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
                                      CellSailMemAllocatorFuncs* pFuncs);
 
