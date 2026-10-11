@@ -4,6 +4,9 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+if os.name == 'nt':
+    print('SKIP: network-dialog fixture requires the POSIX toolchain')
+    raise SystemExit(0)
 root=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='ps3-netctl-') as tmp:
     binary=Path(tmp)/'test'
