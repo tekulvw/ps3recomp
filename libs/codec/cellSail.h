@@ -86,6 +86,8 @@ s32 cellSailPlayerCreate(const CellSailPlayerAttribute* attr,
                            void* callbackArg,
                            CellSailPlayerHandle* handle);
 s32 cellSailPlayerDestroy(CellSailPlayerHandle handle);
+/* Registered descriptors must be resolved before bounded host teardown. */
+s32 cellSailPlayerFinalize(u32 pSelf);
 
 s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam);
 s32 cellSailPlayerReplaceEventHandler(u32 pSelf, u32 pCallback, u32 pArg,
