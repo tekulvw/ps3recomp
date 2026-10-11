@@ -123,17 +123,15 @@ s32 cellSailDescriptorSetAutoSelection(CellSailDescriptorHandle desc, s32 enable
 s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLen);
 
 /* Memory allocator */
+/* Public 32-bit, big-endian guest records. These declarations describe
+ * storage only; C entry points accept guest effective addresses. */
 typedef struct CellSailMemAllocator {
-    void* (*alloc)(void* arg, u32 boundary, u32 size);
-    void  (*free)(void* arg, u32 boundary, void* ptr);
-    void* arg;
+    u32 callbacks;
+    u32 pArg;
 } CellSailMemAllocator;
-
-/* Mirrors RPCS3's CellSailMemAllocatorFuncs: a guest struct of two callback
- * pointers, passed as one pointer arg (not two separate function pointers). */
 typedef struct CellSailMemAllocatorFuncs {
-    void* pAlloc;
-    void* pFree;
+    u32 pAlloc;
+    u32 pFree;
 } CellSailMemAllocatorFuncs;
 
 /* Named pFuncs (not "callbacks") so the import-bridge generator's naming
