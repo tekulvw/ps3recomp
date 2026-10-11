@@ -16,5 +16,6 @@ with tempfile.TemporaryDirectory(prefix='ps3-sysmodule-query-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=c17', '-UNDEBUG',
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/system'),
                     str(root / 'tests/test_sysmodule_is_loaded_ex.c'),
-                    str(root / 'libs/system/cellSysmodule.c'), '-o', str(binary)], check=True)
+                    str(root / 'libs/system/cellSysmodule.c'),
+                    str(root / 'tests/sysmodule_memory_fixture.c'), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=10)
