@@ -69,7 +69,7 @@ int main(int argc,char**argv) {
  CHECK(argc==2);CHECK(ps3_hle_has(SET));CHECK(ps3_hle_has(DROP));
  vm_write32(0x3000,0x1234);vm_write32(0x3010,0x5678);
  vm_write32(0x2000,0x3000);vm_write32(0x2004,0x3010);vm_write32(0x2104,0x11223344);
- CHECK(call(ALLOC,0x2100,0x2000)==0);CHECK(call(INIT,0x1000,0x2100,0x3200,0x1234)==0);
+ CHECK(call(ALLOC,0x2100,0x2000,0x11223344)==0);CHECK(call(INIT,0x1000,0x2100,0x3200,0x1234)==0);
  std::snprintf((char*)memory+0x4000,512,"x-cell-fs:///dev_bdvd/%s",argv[1]);
  CHECK(call(CREATE,0x1000,0,0,0x4000,0x4200)==0);uint32_t desc=vm_read32(0x4200);CHECK(desc==0);
  CHECK(call(SET,99,0,0,1,0x4300)==ARG);CHECK(call(SET,desc,0,0,1,0x4300)==STATE);
