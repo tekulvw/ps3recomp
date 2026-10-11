@@ -439,6 +439,14 @@ void func_00010100(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 void func_00010000(ppu_context* ctx)
 {
+    /* Diagnostic-policy regression: run before graphics or ordinary smoke work. */
+    if (getenv("PS3RECOMP_SMOKE_UNKNOWN_SYSCALL")) {
+        ctx->gpr[11] = 1023; /* deliberately unregistered */
+        ctx->lr = 0x12345678;
+        lv2_syscall(ctx);
+        fprintf(stderr, "[smoke] unknown syscall returned %llu\n", (unsigned long long)ctx->gpr[3]);
+        _Exit(ctx->gpr[3] == 0 ? 0 : 1);
+    }
     uint32_t argc = (uint32_t)ctx->gpr[3];
     uint32_t argv = (uint32_t)ctx->gpr[4];
     uint32_t envp = (uint32_t)ctx->gpr[5];

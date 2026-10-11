@@ -249,6 +249,9 @@ jobs:
       - name: Test PPU lightweight locks on POSIX
         run: python tools/test_ppu_lwmutex.py
 
+      - name: Test unresolved syscall diagnostic policy
+        run: python tools/test_unknown_syscall.py
+
       # ...and this one RUNS it. The ratchet above only compiles the scaffold;
       # the smoke title is a synthetic lifted program that drives the loader,
       # the NID bridge, the lv2 syscalls, a guest thread, the frame clock and
