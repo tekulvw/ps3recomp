@@ -3287,6 +3287,27 @@ static int eng_trace_sync(id<MTLCommandBuffer> cb, const u32* handles, u32 count
     if (blit) [blit endEncoding];
     return 1;
 }
+/* Optional intermediate image: sampled targets are not necessarily displayed. */
+static void eng_trace_capture(u32 handle, const u8* pixels, size_t w, size_t h, MTLPixelFormat fmt)
+{
+    static int saved;
+    const char* path = getenv("PS3RECOMP_METAL_TARGET_DUMP");
+    if (saved || !path || !*path) return;
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%zu %zu\n255\n", w, h);
+    const int bgra = fmt == MTLPixelFormatBGRA8Unorm;
+    for (size_t p=0; p<w*h; ++p) {
+        u8 rgb[3] = {pixels[p*4+(bgra ? 2 : 0)], pixels[p*4+1], pixels[p*4+(bgra ? 0 : 2)]};
+        fwrite(rgb, 1, 3, f);
+    }
+    int failed = ferror(f);
+    if (fclose(f)) failed = 1;
+    if (!failed) {
+        saved = 1;
+        fprintf(stderr, "[rsx engine/metal] captured target surface=%u size=%zux%zu to %s (intermediate; display not proven)\n", handle, w, h, path);
+    }
+}
 static void eng_trace_pixels(const u32* handles, u32 count, id<MTLCommandBuffer> cb)
 {
     for (u32 i=0; i<count; ++i) {
@@ -3304,6 +3325,7 @@ static void eng_trace_pixels(const u32* handles, u32 count, id<MTLCommandBuffer>
                     if (pixels[p*4] || pixels[p*4+1] || pixels[p*4+2]) ++nonzero;
                     for (unsigned c=0; c<3; ++c) if (pixels[p*4+c]>maximum) maximum=pixels[p*4+c];
                 }
+                if (nonzero) eng_trace_capture(handles[i], pixels, w, h, fmt);
                 free(pixels); available=1;
             }
         }
