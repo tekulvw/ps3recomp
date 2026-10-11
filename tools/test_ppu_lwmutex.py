@@ -10,6 +10,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 def main():
+    if os.name == 'nt':
+        print('SKIP: regression requires the POSIX PPU test toolchain')
+        return
     with tempfile.TemporaryDirectory(prefix='ps3-lwmutex-') as tmp:
         out=Path(tmp)
         subprocess.run([sys.executable, str(ROOT/'tools/make_smoke_elf.py'),
