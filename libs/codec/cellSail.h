@@ -127,7 +127,10 @@ s32 cellSailPlayerRemoveDescriptor(CellSailPlayerHandle handle,
 s32 cellSailDescriptorCreateDatabase(CellSailDescriptorHandle desc,
                                        void* dbAddr, u32 dbSize,
                                        u64 arg);
-s32 cellSailDescriptorDestroyDatabase(CellSailDescriptorHandle desc);
+s32 cellSailDescriptorDestroyDatabase(CellSailDescriptorHandle desc, void* database);
+/* Observed PAMF form; only slot zero / unknownMode one are supported. */
+s32 cellSailDescriptorSetEs(CellSailDescriptorHandle desc, u32 category,
+                            u32 destinationSlot, u32 unknownMode, void* database);
 s32 cellSailDescriptorGetStreamType(CellSailDescriptorHandle desc);
 s32 cellSailDescriptorOpen(CellSailDescriptorHandle desc);
 s32 cellSailDescriptorSetAutoSelection(CellSailDescriptorHandle desc, s32 enable);
