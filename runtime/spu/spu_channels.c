@@ -16,6 +16,7 @@
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
+#include "spurs_workload_flag.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include <stdint.h>
 #include <stdio.h>
@@ -2093,7 +2094,16 @@ void spu_indirect_branch(spu_context* ctx)
             if (n <= 4 || (n % 4096) == 0)
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                         n, ctx->gpr[3]._u32[0]);
-            ctx->gpr[3] = spu_make_preferred_u32(0);
+            /* The kernel ABI returns {selected wid, poll reason} in the
+             * preferred doubleword. Keep this runtime's current workload;
+             * returning all zero falsely requests a switch for every wid>0.
+             * Only its registered receiver may consume a pending flag. */
+            uint32_t ea_hi = spu_ls_read32(ctx, 0x1C0);
+            uint32_t ea = spu_ls_read32(ctx, 0x1C4);
+            uint32_t wid = spu_ls_read32(ctx, 0x1DC);
+            uint32_t status = ea_hi ? 0 : spurs_flag_status(ea, wid, 1);
+            ctx->gpr[3] = spu_make_preferred_u32(wid);
+            ctx->gpr[3]._u32[1] = status;
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }

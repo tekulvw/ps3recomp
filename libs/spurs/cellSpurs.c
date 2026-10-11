@@ -13,6 +13,7 @@
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
+#include "spurs_workload_flag.h"
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
@@ -509,6 +510,42 @@ s32 cellSpursGetWorkloadFlag(CellSpurs* spurs, CellSpursWorkloadFlag** flag)
         return CELL_SPURS_POLICY_MODULE_ERROR_FAULT;
     vm_write32((u32)out_ea, (u32)spurs_ea + SPURS_WKL_FLAG);
     return CELL_OK;
+}
+
+/* NID: 0xA73BF47E. One receiver owns the flag; changing ownership resets it.
+ * Use the same lock-line transaction as guest PPU/SPU atomic accesses. */
+s32 _cellSpursWorkloadFlagReceiver(CellSpurs* spurs, u32 wid, u32 is_set)
+{
+    uint64_t address = (uintptr_t)spurs;
+    if (!address) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+    if (address & 127) return CELL_SPURS_POLICY_MODULE_ERROR_ALIGN;
+    if (!spurs_flag_range(address)) return CELL_SPURS_POLICY_MODULE_ERROR_FAULT;
+    u32 ea = (u32)address;
+    u32 max_wid = (vm_base[ea + 0x74] & 0x40) ? 32 : 16;
+    if (wid >= max_wid) return CELL_SPURS_POLICY_MODULE_ERROR_INVAL;
+    if (!(vm_read32(ea + SPURS_WKL_ENABLED) & (0x80000000u >> wid)))
+        return CELL_SPURS_POLICY_MODULE_ERROR_SRCH;
+    if (vm_read32(ea + 0xD6C)) return CELL_SPURS_POLICY_MODULE_ERROR_STAT;
+    if (max_wid != 16) {
+        fprintf(stderr, "[cellSpurs] unsupported workload flag receiver: SPURS2 scheduler\n");
+        return CELL_SPURS_POLICY_MODULE_ERROR_NOSYS;
+    }
+    s32 result = CELL_OK;
+    spu_lockline_lock();
+    /* NULL marks the shared line coherent without registering a fake SPU. */
+    spu_coh_reserve(NULL, ea);
+    u8 receiver = vm_base[ea + SPURS_WKL_FLAG_RECEIVER];
+    if (is_set && receiver != 0xFF)
+        result = CELL_SPURS_POLICY_MODULE_ERROR_BUSY;
+    else if (!is_set && receiver != wid)
+        result = CELL_SPURS_POLICY_MODULE_ERROR_PERM;
+    else {
+        memset(vm_base + ea + SPURS_WKL_FLAG_VALUE, 0xFF, 4);
+        vm_base[ea + SPURS_WKL_FLAG_RECEIVER] = is_set ? (u8)wid : 0xFF;
+        spurs_flag_notify(ea, 1);
+    }
+    spu_lockline_unlock();
+    return result;
 }
 
 s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
@@ -1486,7 +1523,28 @@ s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
+    uint64_t address = (uintptr_t)spurs;
+    if (!spurs_flag_range(address)) return CELL_SPURS_POLICY_MODULE_ERROR_FAULT;
+    u32 ea = (u32)address;
+    if (s_workloads[wid].spurs_ea != ea) return CELL_SPURS_CORE_ERROR_SRCH;
+    /* Release receiver ownership before making this workload unavailable.
+     * Keep a nonowner's pending flag intact. Publish removal in guest state
+     * too, otherwise the removed wid could immediately register again. */
+    spu_lockline_lock();
+    spu_coh_reserve(NULL, ea);
+    spu_coh_reserve(NULL, ea + 0x80);
+    if (vm_base[ea + SPURS_WKL_FLAG_RECEIVER] == wid) {
+        memset(vm_base + ea + SPURS_WKL_FLAG_VALUE, 0xFF, 4);
+        vm_base[ea + SPURS_WKL_FLAG_RECEIVER] = 0xFF;
+        spurs_flag_notify(ea, 1);
+    }
+    vm_base[ea + SPURS_WKL_ENABLED + (wid >> 3)] &= (u8)~(0x80u >> (wid & 7));
+    vm_base[ea + SPURS_WKL_STATE1 + wid] = 0;
+    spu_coh_notify_write(ea + 0x80);
+    ppu_resv_break_store(ea + SPURS_WKL_ENABLED);
+    ppu_resv_break_store(ea + SPURS_WKL_STATE1 + wid);
     s_workloads[wid].in_use = 0;
+    spu_lockline_unlock();
     printf("[cellSpurs] RemoveWorkload(wid=%u)\n", wid);
     return CELL_OK;
 }
@@ -1681,7 +1739,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * consume one unit so a kick-driven title paces the same as before. */
             volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
             u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
-            int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0);
+            int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0) ||
+                         spurs_flag_status(ea, wid, 0);
             if (*rdy) (*rdy)--;
             if (sig & (0x8000u >> wid))
                 vm_write32(ea + SPURS_WKL_SIGNAL1,
