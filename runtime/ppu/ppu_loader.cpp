@@ -3281,6 +3281,23 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 return;
             }
         }
+        /* Preserve the compatibility default; diagnostic ports can stop at the
+         * first gap instead of deriving later failures from a fabricated OK.
+         * Function-local initialization is thread-safe, including ARM hosts. */
+        static const bool halt_unresolved = [] {
+            const char* mode = getenv("PS3_SYSCALL_UNRESOLVED");
+            return mode && strcmp(mode, "halt") == 0;
+        }();
+        if (halt_unresolved) {
+            fprintf(stderr, "[ppu] UNRESOLVED syscall %llu lr=0x%08X tid=%llu "
+                            "r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX\n",
+                    (unsigned long long)num, (unsigned)ctx->lr,
+                    (unsigned long long)ctx->thread_id,
+                    (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
+                    (unsigned long long)ctx->gpr[5], (unsigned long long)ctx->gpr[6]);
+            fflush(stderr);
+            _Exit(87);
+        }
         static int logged = 0;
         if (logged < 30) {
             fprintf(stderr, "[ppu] lv2_syscall %llu (stub)\n", (unsigned long long)num);
