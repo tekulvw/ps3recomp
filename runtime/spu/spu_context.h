@@ -416,6 +416,11 @@ typedef struct spu_context {
 /* ---------------------------------------------------------------------------
  * Initialization
  * -----------------------------------------------------------------------*/
+/* Release private DMA state only when the execution owner has stopped using
+ * the context. Pair with spu_coh_unregister before a reset or destruction. */
+void spu_mfc_release(spu_context* ctx);
+void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
+
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 {
     memset(ctx, 0, sizeof(*ctx));

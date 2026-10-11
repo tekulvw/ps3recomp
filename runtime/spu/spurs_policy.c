@@ -24,6 +24,7 @@
  */
 #include "spu_context.h"
 #include "spu_workload.h"
+#include "spu_coherency.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,6 +108,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                         (unsigned long long)wkl_data);
         }
         first = 1;
+        spu_coh_unregister(ctx);
+        spu_mfc_release(ctx);
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
     }
@@ -546,7 +549,8 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
         memcpy(out_2700, ctx->ls + 0x2700, n);
     }
     int st = (int)ctx->status;
-    { extern void spu_coh_unregister(spu_context*); spu_coh_unregister(ctx); }
+    spu_coh_unregister(ctx);
+    spu_mfc_release(ctx);
     free(ctx);
     return st;
 }
