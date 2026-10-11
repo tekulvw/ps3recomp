@@ -196,6 +196,27 @@ static int sail_player_slot(u32 self_ea)
     return -1;
 }
 
+/* Only the observed five-register form with both trailing arguments zero is
+ * supported. Their semantics are unknown: never invent output writes. */
+s32 cellSailPlayerReplaceEventHandler(u32 pSelf, u32 pCallback, u32 pArg,
+                                     u64 unknownArg3, u64 unknownArg4)
+{
+    enum { REPLACE_INVALID_ARG = 0x80610701u, REPLACE_NOT_AVAILABLE = 0x80610708u };
+    extern u32 ppu_vm_size;
+    const u64 limit = ppu_vm_size ? (u64)ppu_vm_size : (1ull << 32);
+    const int slot = sail_player_slot(pSelf);
+    /* Local conservative policy: require a live player and an aligned guest
+     * OPD covering its entry and TOC words. The opaque argument is not read. */
+    if (slot < 0 || !vm_base || !pCallback || (pCallback & 3u) ||
+        (u64)pCallback + 8u > limit)
+        return (s32)REPLACE_INVALID_ARG;
+    if (unknownArg3 || unknownArg4)
+        return (s32)REPLACE_NOT_AVAILABLE;
+    s_sail_players[slot].callback_ea = pCallback;
+    s_sail_players[slot].arg_ea = pArg;
+    return CELL_OK;
+}
+
 /* Lifecycle */
 
 s32 cellSailInit(void)
