@@ -65,7 +65,19 @@ int main(int argc,char**argv) {
  CHECK(argc==2);CHECK(ps3_hle_has(OPEN));
  vm_write32(0x3000,0x1234);vm_write32(0x3010,0x5678);
  vm_write32(0x2000,0x3000);vm_write32(0x2004,0x3010);vm_write32(0x2104,0x11223344);
- CHECK(call(ALLOC,0x2100,0x2000)==0);CHECK(call(INIT,0x1000,0x2100)==0);
+ CHECK(call(ALLOC,0x2100,0x2000,0x11223344)==0);
+ std::memset(memory+0x1100,0x5A,256);
+ for(uint32_t bad:{0xFFFCu,0x2101u}) CHECK(call(INIT,0x1100,bad)==ARG);
+ vm_write32(0x2100,0xFFFC);CHECK(call(INIT,0x1100,0x2100)==ARG);
+ vm_write32(0x2100,0x2000);vm_write32(0x2000,0);CHECK(call(INIT,0x1100,0x2100)==ARG);
+ vm_write32(0x2000,0xFFFC);CHECK(call(INIT,0x1100,0x2100)==ARG);
+ vm_write32(0x2000,0x3000);vm_write32(0x2004,0x3011);CHECK(call(INIT,0x1100,0x2100)==ARG);
+ vm_write32(0x2004,0x3010);CHECK(memory[0x1100]==0x5A);CHECK(memory[0x11FF]==0x5A);
+ CHECK(call(0x752F8585,0x1100)==ARG);CHECK(alloc_count==0);
+ CHECK(call(INIT,0x1000,0x2100)==0);
+ // InitSail's callback table goes out of scope before media opens. Both it and
+ // the allocator input may be reused; the player must retain callback identity.
+ std::memset(memory+0x2000,0xA5,8);std::memset(memory+0x2100,0xA5,8);
  std::snprintf((char*)memory+0x4000,512,"x-cell-fs:///dev_bdvd/%s",argv[1]);
  CHECK(call(CREATE,0x1000,0,0,0x4000,0x4200)==0);uint32_t desc=vm_read32(0x4200);
  CHECK(call(URI,desc)==0);CHECK(call(OPEN,99)==ARG);CHECK(call(OPEN,desc)==0);CHECK(alloc_count==1);
@@ -93,5 +105,9 @@ int main(int argc,char**argv) {
  CHECK(call(OPEN,desc)==0);CHECK(call(0x7C8DFF3B,0x1000,desc)==0);
  CHECK(call(0xF220E64F)==0); // verified Term NID substituted by script
  CHECK(call(OPEN,desc)==ARG);CHECK(free_count==5); // successful opens + malformed nested-header cleanup
+ // The legacy no-allocator player remains usable for metadata registration,
+ // but cannot allocate descriptor storage. Never fabricate an allocation.
+ CHECK(call(0x24F4E900,0x1000)==0);CHECK(call(INIT,0x1000)==0);CHECK(call(CREATE,0x1000,0,0,0x4000,0x4200)==0);desc=vm_read32(0x4200);
+ CHECK(call(OPEN,desc)==ARG);CHECK(call(DEL,0x1000,desc)==0);CHECK(free_count==5);
  std::printf("%u descriptor open checks PASS\n",checks);return 0;
 }

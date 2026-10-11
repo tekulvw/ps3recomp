@@ -34,7 +34,12 @@ static SailPlayer s_players[CELL_SAIL_PLAYER_MAX];
 /* Players registered by cellSailPlayerInitialize2, keyed by the guest struct EA
  * the title passed as `pSelf`. Declared here because the adapter setters below
  * need it -- they take that same pointer, not an index into s_players[]. */
-static struct { u32 self_ea, allocator_ea, callback_ea, arg_ea; int in_use; int state; }
+static struct {
+    u32 self_ea, allocator_ea, callback_ea, arg_ea;
+    /* The input callback table may live on the initialization caller's stack. */
+    u32 allocator_callbacks_ea, allocator_alloc_opd, allocator_free_opd, allocator_arg;
+    int in_use; int state;
+}
     s_sail_players[CELL_SAIL_PLAYER_MAX];
 
 /* A CellSailPlayer is a GUEST POINTER, not a small integer handle.
@@ -564,14 +569,14 @@ s32 cellSailDescriptorOpen(CellSailDescriptorHandle desc)
     if (player_slot < 0) { result = SAIL_DESC_INVALID_STATE; goto done; }
     const u32 allocator = s_sail_players[player_slot].allocator_ea;
     allocator_seen = allocator;
-    if (!sail_desc_range(allocator, 8) || (allocator & 3)) { result = SAIL_DESC_INVALID_ARG; goto done; }
-    const u32 callbacks = vm_read32(allocator);
-    callbacks_seen = callbacks;
-    if (!sail_desc_range(callbacks, 8) || (callbacks & 3)) { result = SAIL_DESC_INVALID_ARG; goto done; }
-    const u32 alloc_opd = vm_read32(callbacks);
+    callbacks_seen = s_sail_players[player_slot].allocator_callbacks_ea;
+    const u32 alloc_opd = s_sail_players[player_slot].allocator_alloc_opd;
     alloc_opd_seen = alloc_opd;
     stage = "allocator-opds";
-    free_opd = vm_read32(callbacks + 4); free_arg = vm_read32(allocator + 4);
+    free_opd = s_sail_players[player_slot].allocator_free_opd;
+    free_arg = s_sail_players[player_slot].allocator_arg;
+    /* Retain callback identity, not the borrowed table; OPDs themselves remain
+     * guest-owned executable descriptors and are revalidated before use. */
     if (!sail_desc_range(alloc_opd, 12) || !sail_desc_range(free_opd, 12) ||
         (alloc_opd & 3) || (free_opd & 3) || !vm_read32(alloc_opd) || !vm_read32(free_opd)) {
         result = SAIL_DESC_INVALID_ARG; goto done;
@@ -696,6 +701,22 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
         return sail_descriptor_result((s32)CELL_SAIL_ERROR_INVALID_ARGUMENT);
     }
 
+    u32 callbacks = 0, alloc_opd = 0, free_opd = 0, allocator_arg = 0;
+    if (pAllocator) {
+        if ((pAllocator & 3) || !sail_desc_range(pAllocator, 8))
+            return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
+        callbacks = vm_read32(pAllocator);
+        allocator_arg = vm_read32(pAllocator + 4);
+        if ((callbacks & 3) || !sail_desc_range(callbacks, 8))
+            return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
+        alloc_opd = vm_read32(callbacks); free_opd = vm_read32(callbacks + 4);
+        if ((alloc_opd & 3) || (free_opd & 3) ||
+            !sail_desc_range(alloc_opd, 12) || !sail_desc_range(free_opd, 12) ||
+            !vm_read32(alloc_opd) || !vm_read32(free_opd))
+            return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
+    }
+    /* Null allocator preserves the existing registration-only player policy.
+     * DescriptorOpen cannot allocate until a player has real callbacks. */
     sail_zero_guest(pSelf, SAIL_PLAYER_CLEAR);
 
     for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++) {
@@ -703,6 +724,10 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
             s_sail_players[i].in_use       = 1;
             s_sail_players[i].self_ea      = pSelf;
             s_sail_players[i].allocator_ea = pAllocator;
+            s_sail_players[i].allocator_callbacks_ea = callbacks;
+            s_sail_players[i].allocator_alloc_opd = alloc_opd;
+            s_sail_players[i].allocator_free_opd = free_opd;
+            s_sail_players[i].allocator_arg = allocator_arg;
             s_sail_players[i].callback_ea  = pCallback;
             s_sail_players[i].arg_ea       = pUserParam;
             break;
@@ -753,11 +778,11 @@ s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat)
 }
 
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
-                                     CellSailMemAllocatorFuncs* pFuncs)
+                                     CellSailMemAllocatorFuncs* pFuncs, void* pArg)
 {
-    /* The public guest record is {u32 callbacks, u32 pArg}. Initialization
-     * stores the callback-table EA; pArg remains caller-owned. Copying the two
-     * callback OPDs here corrupts pArg and loses the table indirection. */
+    /* Preserve the eight-byte public {callbacks, pArg} record. Retail explicitly
+     * passes pArg in r5. PlayerInitialize2 captures callbacks before this input
+     * table can leave scope; no borrowed callback-table reads happen at Open. */
     const u64 alloc_ea = (u64)(uintptr_t)allocator;
     const u64 funcs_ea = (u64)(uintptr_t)pFuncs;
     extern u32 ppu_vm_size;
@@ -767,5 +792,6 @@ s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
         8 > limit - alloc_ea || 8 > limit - funcs_ea)
         return (s32)0x80610701u;
     vm_write32((u32)alloc_ea, (u32)funcs_ea);
+    vm_write32((u32)alloc_ea + 4, (u32)(uintptr_t)pArg);
     return CELL_OK;
 }
