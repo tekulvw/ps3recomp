@@ -795,7 +795,8 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     /* Nothing on this stack may stay in the lock-line reserver set. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
-      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi); }
+      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
+      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
     return 0;
 }
 #else
