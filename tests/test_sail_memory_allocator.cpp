@@ -51,9 +51,9 @@ static uint32_t call(uint32_t nid,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_
 int main() {
  static uint8_t memory[0x10000];vm_base=memory;ppu_hle_register_all();
  constexpr uint32_t INIT=0x346EBBA3,ARG=0x80610701;
- vm_write32(0x1000,0xDEADBEEF);vm_write32(0x1004,0x11223344);vm_write32(0x1008,0x55667788);
+ vm_write32(0x1000,0xDEADBEEF);vm_write32(0x1004,0xDEADBEEF);vm_write32(0x1008,0x55667788);
  vm_write32(0x2000,0x3000);vm_write32(0x2004,0x4000);
- CHECK(ps3_hle_has(INIT));CHECK(call(INIT,0x1000,0x2000)==0);
+ CHECK(ps3_hle_has(INIT));CHECK(call(INIT,0x1000,0x2000,0x11223344)==0);
  CHECK(vm_read32(0x1000)==0x2000);CHECK(vm_read32(0x1004)==0x11223344);CHECK(vm_read32(0x1008)==0x55667788);
  CHECK(call(INIT,0,0x2000)==ARG);CHECK(call(INIT,0x1001,0x2000)==ARG);
  CHECK(call(INIT,0xFFFC,0x2000)==ARG);CHECK(call(INIT,0x1000,0)==ARG);

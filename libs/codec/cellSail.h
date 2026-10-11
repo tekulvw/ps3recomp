@@ -168,7 +168,7 @@ s32 cellSailSoundAdapterFinalize(u32 pSelf);
 s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo);
 
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
-                                     CellSailMemAllocatorFuncs* pFuncs);
+                                     CellSailMemAllocatorFuncs* pFuncs, void* pArg);
 
 #ifdef __cplusplus
 }
