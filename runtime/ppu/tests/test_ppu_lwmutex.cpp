@@ -46,7 +46,11 @@ int main() {
     assert(failures==0);
 
     // Existing polling lwcond fallback must release the lock for another thread.
+    vm_write32(0x208, 0xA5A5A5A5); // The next guest object begins after 8 bytes.
     c=context(1,0x200); c.gpr[4]=0x100; sys_lwcond_create(&c);
+    assert(vm_read32(0x200)==0x100); // PS3 pointers are 32-bit even on the PPU.
+    assert(vm_read32(0x204)!=0);
+    assert(vm_read32(0x208)==0xA5A5A5A5);
     c=context(1); sys_lwmutex_lock(&c);
     std::atomic<bool> ready{false}, got{false};
     std::thread signaler([&] {
