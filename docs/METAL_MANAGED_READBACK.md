@@ -1,0 +1,9 @@
+# Managed texture readback on macOS
+
+The dispatch backend creates render targets using Metal's default texture storage, which is managed on the observed macOS native MAG run. Waiting for a command buffer does not by itself synchronize GPU changes into managed CPU backing. Before this change, frame capture and engine readback called getBytes without that synchronization; target diagnostics explicitly marked managed pixels unavailable.
+
+Frame capture and engine readback now synchronize managed resources with a blit command on the same serial queue and wait for successful completion before accessing CPU bytes. Shared resources retain the existing frame-capture headless behavior; windowed capture and direct engine readback fence the queue. Private resources return unavailable instead of calling getBytes. The opt-in bounded target sampler encodes its managed synchronization after render/display encoding and before commit, then reads after successful completion. Normal draws and guest data are unchanged. Capture remains opt-in.
+
+The Managed diagnostic regression failed before the fix because all sampled managed targets reported rgb_available=0. It now verifies shared and managed sampling, real GPU clears, RGB excluding alpha and sampling budgets. Additional real GPU fixtures clear an initially black managed texture to green and verify direct readback and first-nonblack captures in headless, windowed and BGRA modes. Unified-memory hardware may happen to expose unsynchronized bytes; these tests do not claim a deterministic stale-byte reproduction on every Mac. Existing presentation and capture regressions remain required.
+
+Apple documents managed GPU-to-CPU synchronization at https://developer.apple.com/documentation/metal/synchronizing-a-managed-resource-in-macos . Source branch is stacked on fix/metal-draw-target-diagnostics, d33087b30387ed07f82a0af7270dc529328f5900.

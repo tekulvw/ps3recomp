@@ -7,7 +7,7 @@ static id<MTLTexture> texture(MTLPixelFormat format, const unsigned char* pixels
 {
     MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
         width:2 height:1 mipmapped:NO];
-    d.storageMode = MTLStorageModeShared;
+    d.storageMode = getenv("TEST_MANAGED") ? MTLStorageModeManaged : MTLStorageModeShared;
     d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     id<MTLTexture> t = [s_dev newTextureWithDescriptor:d];
     assert(t);
@@ -31,7 +31,9 @@ int main(int argc, char** argv)
     @autoreleasepool {
         s_dev = MTLCreateSystemDefaultDevice(); assert(s_dev);
         s_queue = [s_dev newCommandQueue]; assert(s_queue);
-        s_headless = strcmp(argv[1], "windowed") != 0;
+        s_headless = !strstr(argv[1], "windowed");
+        const int managed = !strncmp(argv[1], "managed", 7);
+        if (managed) setenv("TEST_MANAGED", "1", 1);
         const char* path = argv[2];
         setenv("PS3RECOMP_METAL_FRAME_DUMP", path, 1);
         const unsigned char black[] = {0,0,0,255, 0,0,0,255};
@@ -40,8 +42,46 @@ int main(int argc, char** argv)
         const unsigned char bgr[] = {0,0,0, 31,23,17};
         const unsigned char zero[] = {0,0,0,0,0,0};
         id<MTLTexture> dark = texture(MTLPixelFormatRGBA8Unorm, black);
-        int bgra = strcmp(argv[1], "bgra") == 0;
+        int bgra = strstr(argv[1], "bgra") != NULL;
         id<MTLTexture> light = texture(bgra ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm, colored);
+        if (managed) {
+            /* Establish CPU black, then write green only on the GPU. */
+            light = texture(bgra ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm, black);
+            id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = light;
+            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0.25, 0, 1);
+            id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+            [enc endEncoding]; [cb commit];
+            u32 handle = eng_obj_add(light);
+            unsigned char readback[8] = {0};
+            eng_readback(NULL, handle, 0, 0, 2, 1, readback, 8);
+            const unsigned char green[] = {0,64,0,255,0,64,0,255};
+            assert(!memcmp(readback, green, sizeof green));
+            setenv("PS3RECOMP_METAL_FRAME_DUMP_FIRST_NONBLACK", "1", 1);
+            /* Capture must synchronize a new GPU write, independently of the
+             * earlier direct readback. Headless submissions already complete. */
+            cb = [s_queue commandBuffer];
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0.5, 1);
+            enc = [cb renderCommandEncoderWithDescriptor:pass];
+            [enc endEncoding]; [cb commit];
+            if (s_headless) [cb waitUntilCompleted];
+            MTLTextureDescriptor* private_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:2 height:1 mipmapped:NO];
+            private_desc.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> private_tex = [s_dev newTextureWithDescriptor:private_desc];
+            assert(private_tex);
+            unsigned char untouched[8]; memset(untouched, 0xA5, sizeof untouched);
+            eng_readback(NULL, eng_obj_add(private_tex), 0, 0, 2, 1, untouched, 8);
+            for (unsigned i=0; i<sizeof untouched; ++i) assert(untouched[i] == 0xA5);
+            eng_dump_frame(private_tex, 1);
+            assert(access(path, F_OK) != 0);
+            eng_dump_frame(light, 1);
+            expect_image(path, (unsigned char[]){0,0,128,0,0,128});
+            printf("Metal managed GPU readback/capture %s PASS\n", argv[1]);
+            return 0;
+        }
         if (!strcmp(argv[1], "default") || !strcmp(argv[1], "disabled")) {
             if (!strcmp(argv[1], "disabled"))
                 setenv("PS3RECOMP_METAL_FRAME_DUMP_FIRST_NONBLACK", "0", 1);

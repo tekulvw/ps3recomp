@@ -8,7 +8,7 @@ static id<MTLTexture> texture(MTLPixelFormat format, const unsigned char* pixels
 {
     MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
         width:2 height:1 mipmapped:NO];
-    d.storageMode = MTLStorageModeShared;
+    d.storageMode = getenv("TEST_MANAGED") ? MTLStorageModeManaged : MTLStorageModeShared;
     d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     id<MTLTexture> t = [s_dev newTextureWithDescriptor:d];
     assert(t);
@@ -31,6 +31,7 @@ int main(int argc,char**argv) {
  assert(argc==2);
  @autoreleasepool {
   s_dev=MTLCreateSystemDefaultDevice();assert(s_dev);s_queue=[s_dev newCommandQueue];assert(s_queue);s_headless=1;
+  if(!strcmp(argv[1],"managed"))setenv("TEST_MANAGED","1",1);
   if(strcmp(argv[1],"disabled"))setenv("PS3RECOMP_METAL_DRAW_DIAGNOSTICS","1",1);else unsetenv("PS3RECOMP_METAL_DRAW_DIAGNOSTICS");
   const unsigned char pixels[]={0,0,0,255,17,23,31,255};
   const unsigned char black[]={0,0,0,255,0,0,0,255};

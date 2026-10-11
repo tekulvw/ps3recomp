@@ -7,13 +7,14 @@ def main():
  with tempfile.TemporaryDirectory(prefix="ps3-metal-draw-") as tmp:
   binary=pathlib.Path(tmp)/"fixture"
   subprocess.run(["clang","-fobjc-arc","-I","include","-I","libs/video","libs/video/tests/test_metal_draw_diagnostics.m","libs/video/rsx_texture_layout.c","-Wl,-dead_strip","-framework","Metal","-framework","Cocoa","-framework","QuartzCore","-o",str(binary)],cwd=ROOT,check=True,timeout=120)
-  for mode in ("disabled","enabled"):
+  for mode in ("disabled","enabled","managed"):
    p=subprocess.run([str(binary),mode],check=True,capture_output=True,text=True,timeout=60)
    draws=[x for x in p.stderr.splitlines() if "[rsx draw diagnostic]" in x]
    targets=[x for x in p.stderr.splitlines() if "[rsx target diagnostic]" in x]
    if mode=="disabled":assert not draws and not targets,p.stderr;continue
    assert len(draws)==32,(len(draws),p.stderr)
    assert "rt=1" in draws[0] and "vertex0=1,2,3,4" in draws[0],draws[0]
+   assert all("rgb_available=1" in x for x in targets),targets
    assert len(targets)==10,(len(targets),p.stderr)
    assert sum("rgb_nonzero=1" in x and "rgb_max=31" in x for x in targets)==8,targets
    assert any("surface=2" in x and "rgb_nonzero=2" in x and "rgb_max=64" in x for x in targets),targets
