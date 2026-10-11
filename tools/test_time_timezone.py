@@ -6,6 +6,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+if os.name == 'nt':
+    print('SKIP: timezone fixture requires the POSIX toolchain')
+    raise SystemExit(0)
+
 root=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='ps3-timezone-') as tmp:
     binary=Path(tmp)/'test'
