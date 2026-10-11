@@ -30,6 +30,11 @@ extern "C" {
 #define CELL_SPURS_CORE_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x11)
 #define CELL_SPURS_CORE_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x09)
 
+/* Policy-module errors are a separate facility from the core errors. */
+#define CELL_SPURS_POLICY_MODULE_ERROR_FAULT         0x8041080D
+#define CELL_SPURS_POLICY_MODULE_ERROR_ALIGN         0x80410810
+#define CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER  0x80410811
+
 #define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS | 0x21)
 #define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS | 0x22)
 #define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_ERROR_BASE_SPURS | 0x23)
@@ -88,6 +93,7 @@ typedef struct CellSpursTaskAttribute CellSpursTaskAttribute;
 typedef struct CellSpursTaskExitCode CellSpursTaskExitCode;
 typedef struct CellSpursEventFlag CellSpursEventFlag;
 typedef struct CellSpursWorkloadAttribute CellSpursWorkloadAttribute;
+typedef struct CellSpursWorkloadFlag CellSpursWorkloadFlag;
 
 typedef u32 CellSpursWorkloadId;
 typedef u32 CellSpursTaskId;
@@ -202,6 +208,9 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
 s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
                                      const CellSpursAttribute* attr);
 s32 cellSpursFinalize(CellSpurs* spurs);
+/* Both arguments carry guest EAs through the generic HLE adapter. The output
+ * is a guest BE32 pointer to the instance's 16-byte CellSpursWorkloadFlag. */
+s32 cellSpursGetWorkloadFlag(CellSpurs* spurs, CellSpursWorkloadFlag** flag);
 
 s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
                                  s32 spuPriority, s32 ppuPriority,
