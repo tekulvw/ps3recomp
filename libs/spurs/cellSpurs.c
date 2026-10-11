@@ -47,6 +47,7 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 
 typedef struct {
     int         in_use;
+    int         is_taskset;   /* tasks dispatch separately; no policy-module thread */
     const void* pm;            /* policy-module image EA (guest) */
     u32         sizePm;
     u64         data;          /* workload data (e.g. joblist EA) */
@@ -867,13 +868,31 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
     if (!spurs_guest_range_valid(taskset_ea, taskset_size))
         return (s32)0x8041090Du; /* host backing safety, before writes */
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
+    /* Tasksets occupy the same workload namespace as AddWorkload. Queue
+     * notifications carry (wid << 8) | taskId and firmware resolves wid via
+     * the guest workload info's data field. A hardcoded wid=0 is insufficient. */
+    u32 wid;
+    for (wid = 0; wid < CELL_SPURS_MAX_WORKLOAD; ++wid)
+        if (!s_workloads[wid].in_use) break;
+    if (wid == CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_NOMEM;
     memset(taskset, 0, taskset_size);
 
     /* Write the REAL big-endian CellSpursTaskset layout (fork Option-B) so the lifted
      * SPU leaf + spurs_pm_build_context read valid data (the native writes above are
      * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
-    spurs_taskset_init(taskset_ea, spurs_ea, args, /*wid*/0,
+    spurs_taskset_init(taskset_ea, spurs_ea, args, wid,
                        taskset_size, /*evf1*/0, /*evf2*/0);
+    SpursWorkload* w = &s_workloads[wid];
+    memset(w, 0, sizeof(*w));
+    w->is_taskset = 1;
+    w->data = taskset_ea;
+    w->spurs_ea = spurs_ea;
+    w->in_use = 1;
+    vm_write64(spurs_ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8, taskset_ea);
+    vm_write32(spurs_ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x14, wid << 24);
+    *(vm_base + spurs_ea + SPURS_WKL_STATE1 + wid) = 2;
+    vm_write32(spurs_ea + SPURS_WKL_ENABLED,
+               vm_read32(spurs_ea + SPURS_WKL_ENABLED) | (0x80000000u >> wid));
     g_ydkj_real_taskset_ea = taskset_ea;
 
     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
@@ -904,11 +923,19 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
 {
-    taskset = GUEST_PTR(taskset, CellSpursTaskset*);
-    if (!taskset)
-        return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-
-    printf("[cellSpurs] DestroyTaskset()\n");
+    u32 ea = (u32)(uintptr_t)taskset;
+    if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    u32 wid = vm_read32(ea + CSTS_WID);
+    u32 spurs_ea = (u32)vm_read64(ea + CSTS_SPURS);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use ||
+        !s_workloads[wid].is_taskset || s_workloads[wid].data != ea ||
+        s_workloads[wid].spurs_ea != spurs_ea)
+        return CELL_SPURS_TASK_ERROR_SRCH;
+    vm_write32(spurs_ea + SPURS_WKL_ENABLED,
+               vm_read32(spurs_ea + SPURS_WKL_ENABLED) & ~(0x80000000u >> wid));
+    *(vm_base + spurs_ea + SPURS_WKL_STATE1 + wid) = 0;
+    vm_write64(spurs_ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8, 0);
+    memset(&s_workloads[wid], 0, sizeof(s_workloads[wid]));
     return CELL_OK;
 }
 
@@ -1371,6 +1398,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             ef_w16(spurs_ea + SPURS_WKL_SIGNAL1,
                    (u16)(vm_read16(spurs_ea + SPURS_WKL_SIGNAL1) & ~(0x8000u >> i)));
             ef_line_end(spurs_ea);
+            s_workloads[i].is_taskset = 0;
             s_workloads[i].in_use = 1;
             s_workloads[i].pm = pm;
             s_workloads[i].sizePm = sizePm;
@@ -1732,7 +1760,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 si->cursor = (wid + 1) & 15;
                 if (!(enabled & (0x80000000u >> wid)) ||
                     vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
-                    !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
+                    !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea ||
+                    s_workloads[wid].is_taskset)
                     continue;
                 if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn))
                     continue; /* priority zero makes this physical lane ineligible */
