@@ -141,3 +141,34 @@ s32 cellSysmoduleIsLoadedEx(u16 id)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
     return cellSysmoduleIsLoaded(id);
 }
+
+/* NID: 0x1A267F98. Ex accepts a subset of the internal namespace, not the
+ * whole IsLoadedEx range. Reference: RPCS3 cellSysmodule.cpp,
+ * LOADABLE_INTERNAL_MODULES_EX and cellSysmoduleLoadModuleEx.
+ * Preserve the existing HLE tracker's idempotent load semantics; this does
+ * not implement firmware loading or claim that a module's APIs exist. */
+s32 cellSysmoduleLoadModuleEx(u16 id)
+{
+    switch (id) {
+    case 0xF005: case 0xF00A:
+    case 0xF010: case 0xF013: case 0xF019: case 0xF01B:
+    case 0xF01D: case 0xF01E:
+    case 0xF021: case 0xF022: case 0xF023: case 0xF026:
+    case 0xF028: case 0xF029: case 0xF02A: case 0xF02B:
+    case 0xF02C: case 0xF02E: case 0xF02F:
+    case 0xF030: case 0xF032: case 0xF033: case 0xF034:
+    case 0xF035: case 0xF036: case 0xF039: case 0xF03A:
+    case 0xF03D: case 0xF03F:
+    case 0xF040: case 0xF041: case 0xF043: case 0xF044:
+    case 0xF045: case 0xF046: case 0xF047: case 0xF048:
+    case 0xF049: case 0xF04A: case 0xF04D: case 0xF04E: case 0xF04F:
+    case 0xF050: case 0xF051: case 0xF052: case 0xF054:
+    case 0xF055: case 0xF056:
+        return cellSysmoduleLoadModule(id);
+    /* These IDs additionally require process-PARAM.SFO permission checks in
+     * LoadModuleInternal. Until supported, do not manufacture permission. */
+    case 0xF020: case 0xF024: case 0xF03E:
+    default:
+        return CELL_SYSMODULE_ERROR_UNKNOWN;
+    }
+}
