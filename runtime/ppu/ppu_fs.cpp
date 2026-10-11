@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
@@ -642,6 +643,59 @@ static void cellFsReaddir(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
+/* CellFsDirectoryEntry is a 52-byte stat followed by a 258-byte dirent,
+ * rounded to four-byte alignment: 312 bytes. entries_size is bytes, while
+ * data_count is a big-endian u32 count of complete entries. The stream is
+ * shared with cellFsReaddir and cellFsClosedir. */
+static void cellFsGetDirectoryEntries(ppu_context* ctx)
+{
+    const uint32_t fd = (uint32_t)ctx->gpr[3];
+    const uint32_t entries = (uint32_t)ctx->gpr[4];
+    const uint32_t bytes = (uint32_t)ctx->gpr[5];
+    const uint32_t count_ptr = (uint32_t)ctx->gpr[6];
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    if (!entries || !count_ptr || uint64_t(entries) + bytes > limit ||
+        uint64_t(count_ptr) + 4 > limit) {
+        ctx->gpr[3] = 0x8001000Du; // CELL_EFAULT
+        return;
+    }
+    if (fd < 3 || fd >= FS_MAX || !g_dirs[fd]) {
+        ctx->gpr[3] = 0x8001002Au; // CELL_EBADF
+        return;
+    }
+    uint32_t count = 0;
+    ctx->gpr[3] = CELL_OK;
+    for (; count < bytes / 312; ++count) {
+        errno = 0;
+        struct dirent* entry = readdir(g_dirs[fd]);
+        if (!entry) {
+            if (errno) ctx->gpr[3] = 0x8001002Bu; // CELL_EIO
+            break;
+        }
+        char path[1300];
+        snprintf(path, sizeof path, "%s/%s", g_dir_path[fd], entry->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            ctx->gpr[3] = 0x8001002Bu; // entry disappeared or cannot be inspected
+            break;
+        }
+        uint32_t out = entries + count * 312;
+        memset(vm_base + out, 0, 312);
+        bool directory = (st.st_mode & S_IFDIR) != 0;
+        write_stat(out, (directory ? CELL_FS_S_IFDIR : CELL_FS_S_IFREG) |
+                        (uint32_t(st.st_mode) & 0777), uint64_t(st.st_size));
+        vm_write64(out + 0x0C, uint64_t(st.st_atime));
+        vm_write64(out + 0x14, uint64_t(st.st_mtime));
+        vm_write64(out + 0x1C, uint64_t(st.st_ctime));
+        size_t length = strlen(entry->d_name);
+        if (length > 255) length = 255;
+        vm_base[out + 52] = directory ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;
+        vm_base[out + 53] = uint8_t(length);
+        memcpy(vm_base + out + 54, entry->d_name, length);
+    }
+    vm_write32(count_ptr, count);
+}
+
 static void cellFsClosedir(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
@@ -787,6 +841,7 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsStat"),     "cellFsStat",     cellFsStat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFstat"),    "cellFsFstat",    cellFsFstat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpendir"),  "cellFsOpendir",  cellFsOpendir);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsGetDirectoryEntries"), "cellFsGetDirectoryEntries", cellFsGetDirectoryEntries);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsReaddir"),  "cellFsReaddir",  cellFsReaddir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsClosedir"), "cellFsClosedir", cellFsClosedir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsMkdir"),    "cellFsMkdir",    cellFsMkdir);
