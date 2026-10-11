@@ -329,11 +329,11 @@ s32 cellNetCtlDelHandler(s32 hid)
  *
  * Real hardware shows a system dialog and signals progress asynchronously
  * through the cellSysutil callback queue (LOADED -> FINISHED), after which the
- * game calls UnloadAsync to retrieve the result. In an offline native recomp
- * there is nothing to show and we are already "connected", so we immediately
- * post LOADED + FINISHED to every registered sysutil callback slot and report a
- * successful result on unload. This unblocks the common boot-time "connecting
- * to network" gate without requiring a real PSN session.
+ * game calls UnloadAsync to retrieve the result. The headless dialog posts
+ * LOADED + FINISHED immediately. Unload must match the configured network
+ * state: reporting success while disconnected strands titles waiting for a
+ * connection that never happened. An offline dialog completes as canceled;
+ * the explicit online mode retains its existing successful result.
  * -----------------------------------------------------------------------*/
 
 static void netstart_broadcast(u32 status)
@@ -347,7 +347,7 @@ static void netstart_broadcast(u32 status)
 s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param)
 {
     (void)param;
-    printf("[cellNetCtl] NetStartDialogLoadAsync() -> auto-connect\n");
+    printf("[cellNetCtl] NetStartDialogLoadAsync() -> headless completion\n");
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_LOADED);
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED);
     return CELL_OK;
@@ -361,11 +361,10 @@ s32 cellNetCtlNetStartDialogAbortAsync(void)
 
 s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
 {
-    if (result) {
-        result = GUEST_PTR(result, CellNetCtlNetStartDialogResult*);
-        result->result = 0;   /* 0 = connected; endian-safe */
-    }
-    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0 (connected)\n");
+    u32 dialog_result = netctl_online() ? CELL_OK : CELL_NET_CTL_ERROR_DIALOG_CANCELED;
+    if (result)
+        vm_write32((u32)(uintptr_t)result + 4, dialog_result);
+    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0x%08x\n", dialog_result);
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED);
     return CELL_OK;
 }
