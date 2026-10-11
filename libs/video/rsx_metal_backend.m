@@ -2818,6 +2818,43 @@ static u32 eng_trace_targets(u32 handles[16], id<MTLTexture> present)
     if (count) ++s_eng_trace_submits;
     return count;
 }
+/* GPU writes to managed textures need an explicit GPU-to-CPU copy before
+ * getBytes. Queue completion alone does not make their CPU backing coherent. */
+static int eng_cpu_readable(id<MTLTexture> t)
+{
+    return t && ([t storageMode] == MTLStorageModeShared ||
+                 [t storageMode] == MTLStorageModeManaged);
+}
+static int eng_prepare_cpu_read(id<MTLTexture> t, int fence_shared)
+{
+    if (!eng_cpu_readable(t)) return 0;
+    const int managed = [t storageMode] == MTLStorageModeManaged;
+    if (!managed && !fence_shared) return 1;
+    id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+    if (!cb) return 0;
+    if (managed) {
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        if (!blit) return 0;
+        [blit synchronizeResource:t];
+        [blit endEncoding];
+    }
+    [cb commit];
+    [cb waitUntilCompleted];
+    return [cb status] == MTLCommandBufferStatusCompleted;
+}
+static int eng_trace_sync(id<MTLCommandBuffer> cb, const u32* handles, u32 count)
+{
+    id<MTLBlitCommandEncoder> blit = nil;
+    for (u32 i=0; i<count; ++i) {
+        id<MTLTexture> t = eng_obj(handles[i]);
+        if (!t || [t storageMode] != MTLStorageModeManaged) continue;
+        if (!blit) blit = [cb blitCommandEncoder];
+        if (!blit) return 0;
+        [blit synchronizeResource:t];
+    }
+    if (blit) [blit endEncoding];
+    return 1;
+}
 static void eng_trace_pixels(const u32* handles, u32 count, id<MTLCommandBuffer> cb)
 {
     for (u32 i=0; i<count; ++i) {
@@ -2825,7 +2862,7 @@ static void eng_trace_pixels(const u32* handles, u32 count, id<MTLCommandBuffer>
         const size_t w=[t width],h=[t height];
         const MTLPixelFormat fmt=[t pixelFormat];
         size_t nonzero=0; unsigned maximum=0; int available=0;
-        if ([cb status] == MTLCommandBufferStatusCompleted && [t storageMode] == MTLStorageModeShared && w && h &&
+        if ([cb status] == MTLCommandBufferStatusCompleted && eng_cpu_readable(t) && w && h &&
             w<=16384 && h<=16384 && w*h<=16*1024*1024 &&
             (fmt==MTLPixelFormatRGBA8Unorm || fmt==MTLPixelFormatBGRA8Unorm)) {
             u8* pixels=malloc(w*h*4);
@@ -3199,6 +3236,7 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
         eng_encode_records(cb, stage);
         int presented = eng_blit_to_display(cb, present_dst, dst);
         if (s_eng_diag.active && !presented && present_dst) s_eng_diag.reason = "blit_skipped";
+        const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
         if (drawable) [cb presentDrawable:drawable];
         if (windowed_present) {
             dispatch_semaphore_t sem = s_inflight;
@@ -3214,7 +3252,7 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
 
         if (trace_count) {
             [cb waitUntilCompleted];
-            eng_trace_pixels(trace_handles, trace_count, cb);
+            if (trace_synced) eng_trace_pixels(trace_handles, trace_count, cb);
         }
 
         if (s_eng_dropped) {
@@ -3265,10 +3303,10 @@ static void eng_dump_frame(id<MTLTexture> src, int presented)
         if (s_eng_diag.active) s_eng_diag.readback = "readback_allocation_failed";
         return;
     }
-    if (!s_headless) {
-        id<MTLCommandBuffer> fence = [s_queue commandBuffer];
-        [fence commit];
-        [fence waitUntilCompleted];
+    if (!eng_prepare_cpu_read(src, !s_headless)) {
+        if (s_eng_diag.active) s_eng_diag.readback = "unavailable_readback_storage_or_gpu";
+        free(rgba);
+        return;
     }
     [src getBytes:rgba bytesPerRow:w * 4
       fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
@@ -3336,6 +3374,7 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
     id<MTLTexture> t = eng_obj(surface);
     if (!t || !out || !out_pitch || !w || !h) return;
     if (x + w > [t width] || y + h > [t height]) return;
+    if (!eng_prepare_cpu_read(t, 1)) return;
     [t getBytes:out bytesPerRow:out_pitch
      fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
 }
