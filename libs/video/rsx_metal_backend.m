@@ -2537,7 +2537,7 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
 
 /* ---- staging ------------------------------------------------------------- */
 
-static void eng_encode_and_commit(id<MTLTexture> present_dst);
+static int eng_encode_and_commit(id<MTLTexture> present_dst);
 
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
@@ -3543,10 +3543,10 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
  * With PS3_AA=fxaa the surface goes through FXAA first, at its own size; with
  * PS3_SHARPEN this pass sharpens it as it samples. Either one that is off or
  * fails is skipped. */
-static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
                                 id<MTLTexture> dst)
 {
-    if (!src || !dst || !s_eng_helper_lib) return;
+    if (!cb || !src || !dst || !s_eng_helper_lib) return 0;
     eng_post_options();
     if (s_eng_fxaa) { id<MTLTexture> t = eng_fxaa(cb, src); if (t) src = t; }
     if (!s_eng_blit_pso || s_eng_blit_pso_fmt != [dst pixelFormat]) {
@@ -3559,7 +3559,7 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
         if (!s_eng_blit_pso) {
             fprintf(stderr, "[rsx engine/metal] present pipeline failed: %s\n",
                     [[err localizedDescription] UTF8String]);
-            return;
+            return 0;
         }
         s_eng_blit_pso_fmt = [dst pixelFormat];
     }
@@ -3568,7 +3568,7 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
-    if (!e) return;
+    if (!e) return 0;
     [e setRenderPipelineState:s_eng_blit_pso];
     [e setFragmentTexture:src atIndex:0];
     [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
@@ -3582,6 +3582,7 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
       [e setFragmentBytes:&p length:sizeof p atIndex:0]; }
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
+    return 1;
 }
 
 /* Encode everything recorded so far and commit it.
@@ -3594,7 +3595,7 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
  * in-flight semaphore instead, the same bound the vtable path uses, because
  * waiting on every frame is the one pattern where a driver cannot hide its
  * encoding work. */
-static void eng_encode_and_commit(id<MTLTexture> present_dst)
+static int eng_encode_and_commit(id<MTLTexture> present_dst)
 {
     s_eng_checked_completed = 0;
     @autoreleasepool {
@@ -3612,7 +3613,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 drawable = [s_layer nextDrawable];
                 if (!drawable) {           /* compositor is busy; skip */
                     dispatch_semaphore_signal(s_inflight);
-                    return;
+                    return 0;
                 }
                 dst = [drawable texture];
             }
@@ -3626,12 +3627,12 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         if (!cb || (s_eng_stage_used && !stage)) {
             s_eng_encoding_failed = 1;
             if (windowed_present) dispatch_semaphore_signal(s_inflight);
-            return;
+            return 0;
         }
         const uint64_t ft_e0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         const u32 ft_nrec = s_eng_rec_count;
         eng_encode_records(cb, stage);
-        if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
+        int presented = eng_blit_to_display(cb, present_dst, dst);
         if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
         if (windowed_present) {
@@ -3676,17 +3677,25 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         s_eng_rec_count  = 0;
         s_eng_stage_used = 0;
         eng_collect_retired_objects();
+        return presented;
     }
 }
 
 /* Opt-in readback of the game surface, useful on a locked Mac or in CI.
  * Headless submits have completed; windowed captures fence the same queue. */
-static void eng_dump_frame(id<MTLTexture> src)
+static void eng_dump_frame(id<MTLTexture> src, int presented)
 {
     const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
     if (!path || !*path) return;
     static unsigned frame;
-    if ((++frame % 120) != 0) return;
+    static int first_nonblack_saved;
+    const char* mode = getenv("PS3RECOMP_METAL_FRAME_DUMP_FIRST_NONBLACK");
+    const int first_nonblack = mode && strcmp(mode, "1") == 0;
+    /* A skipped drawable is not a presentation. After a successful one-shot
+     * capture, do not fence the GPU or read any subsequent texture. */
+    if (first_nonblack && (first_nonblack_saved || !presented)) return;
+    ++frame;
+    if (!first_nonblack && (frame % 120) != 0) return;
     if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
         [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
     size_t w = [src width], h = [src height];
@@ -3700,6 +3709,14 @@ static void eng_dump_frame(id<MTLTexture> src)
     }
     [src getBytes:rgba bytesPerRow:w * 4
       fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    if (first_nonblack) {
+        size_t p;
+        /* Both supported formats put RGB in the first three bytes; alpha
+         * alone must not qualify a black startup/heartbeat surface. */
+        for (p = 0; p < w * h; ++p)
+            if (rgba[p*4] || rgba[p*4+1] || rgba[p*4+2]) break;
+        if (p == w * h) { free(rgba); return; }
+    }
     FILE* f = fopen(path, "wb");
     if (f) {
         fprintf(f, "P6\n%zu %zu\n255\n", w, h);
@@ -3709,8 +3726,12 @@ static void eng_dump_frame(id<MTLTexture> src)
                                     rgba[p*4 + (bgra ? 0 : 2)]};
             fwrite(rgb, 1, 3, f);
         }
-        fclose(f);
-        fprintf(stderr, "[rsx engine/metal] captured frame %u to %s\n", frame, path);
+        int failed = ferror(f);
+        if (fclose(f) != 0) failed = 1;
+        if (!failed) {
+            if (first_nonblack) first_nonblack_saved = 1;
+            fprintf(stderr, "[rsx engine/metal] captured frame %u to %s\n", frame, path);
+        }
     }
     free(rgba);
 }
@@ -3720,8 +3741,8 @@ static void eng_present(void* user, u32 surface)
     (void)user;
     id<MTLTexture> src = eng_obj(surface);
     if (!src) { eng_encode_and_commit(nil); return; }
-    eng_encode_and_commit(src);
-    eng_dump_frame(src);
+    int presented = eng_encode_and_commit(src);
+    eng_dump_frame(src, presented);
 }
 
 static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
