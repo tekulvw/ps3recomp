@@ -11,8 +11,8 @@
 #include "cellSail.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_read32 / vm_write32 */
 #include <stdio.h>
-#include <string.h>
 #include <stdatomic.h>
+#include <string.h>
 #include <stdlib.h>   /* getenv -- Clang errors on the implicit declaration MSVC allows */
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
@@ -174,6 +174,44 @@ static void sail_graphics_reset(void)
     sail_graphics_unlock();
 }
 
+/* The sound backend has no decoder and therefore owns no frame buffers.
+ * Track initialization separately from the opaque guest adapter bytes. These
+ * ABI errors deliberately do not reuse this file's older, misnumbered aliases.
+ */
+#define SAIL_SOUND_INVALID_ARG   ((s32)0x80610701u)
+#define SAIL_SOUND_INVALID_STATE ((s32)0x80610702u)
+#define SAIL_SOUND_MEMORY        ((s32)0x806107F0u)
+#define SAIL_SOUND_MAX 16
+static u32 s_sound_adapters[SAIL_SOUND_MAX];
+static atomic_flag s_sound_lock = ATOMIC_FLAG_INIT;
+extern u32 ppu_vm_size; /* zero denotes the full 4 GiB guest address space */
+
+static void sail_sound_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_sound_lock, memory_order_acquire)) {}
+}
+static void sail_sound_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_sound_lock, memory_order_release);
+}
+static int sail_sound_range(u32 ea, u32 bytes)
+{
+    const u64 limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    return vm_base && ea && (u64)ea + bytes <= limit;
+}
+static int sail_sound_slot(u32 ea)
+{
+    for (int i = 0; i < SAIL_SOUND_MAX; ++i)
+        if (s_sound_adapters[i] == ea) return i;
+    return -1;
+}
+static void sail_sound_reset(void)
+{
+    sail_sound_lock();
+    memset(s_sound_adapters, 0, sizeof(s_sound_adapters));
+    sail_sound_unlock();
+}
+
 /* A CellSailPlayer is a GUEST POINTER, not a small integer handle.
  *
  * Every player entry point below used to validate its first argument as an
@@ -235,6 +273,7 @@ s32 cellSailTerm(void)
     s_initialized = 0;
     sail_graphics_reset();
     sail_future_clear();
+    sail_sound_reset();
     return CELL_OK;
 }
 
@@ -737,15 +776,64 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
     return CELL_OK;
 }
 
-/* cellSailSoundAdapterInitialize(pSelf, pCallbacks, pArg) -- NID 0x3D0D3B72.
- * Same reasoning: zero it rather than leave the guest reading stale memory. */
+/* Opaque sound adapters are keyed by guest EA; no decoded buffers exist. */
 s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
 {
+    (void)pArg;
     printf("[cellSail] SoundAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
            pSelf, pCallbacks);
-    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (!sail_sound_range(pSelf, SAIL_ADAPTER_CLEAR))
+        return SAIL_SOUND_INVALID_ARG;
+    sail_sound_lock();
+    if (sail_sound_slot(pSelf) >= 0) {
+        sail_sound_unlock();
+        return SAIL_SOUND_INVALID_STATE;
+    }
+    const int slot = sail_sound_slot(0);
+    if (slot < 0) {
+        sail_sound_unlock();
+        return SAIL_SOUND_MEMORY;
+    }
     sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
+    s_sound_adapters[slot] = pSelf;
+    sail_sound_unlock();
     return CELL_OK;
+}
+
+s32 cellSailSoundAdapterFinalize(u32 pSelf)
+{
+    if (!sail_sound_range(pSelf, SAIL_ADAPTER_CLEAR))
+        return SAIL_SOUND_INVALID_ARG;
+    sail_sound_lock();
+    const int slot = sail_sound_slot(pSelf);
+    if (slot >= 0) s_sound_adapters[slot] = 0;
+    sail_sound_unlock();
+    return slot >= 0 ? CELL_OK : SAIL_SOUND_INVALID_STATE;
+}
+
+/* GetFrame returns synchronization flags, not a CELL_OK/frame-ready boolean.
+ * CELL_SAIL_SYNC_NO_FRAME is zero; frame-bearing statuses begin at 0x100.
+ * The 24-byte guest record is {u32 buffer, session, tag; s32 status; u64 pts}.
+ * With no audio decoder, every valid poll explicitly reports no frame and no buffer.
+ */
+s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo)
+{
+    if (!sail_sound_range(pSelf, SAIL_ADAPTER_CLEAR) ||
+        !sail_sound_range(pInfo, 24) || samples > 2048)
+        return SAIL_SOUND_INVALID_ARG;
+    sail_sound_lock();
+    const int slot = sail_sound_slot(pSelf);
+    if (slot >= 0) sail_zero_guest(pInfo, 24);
+    /* Bounded stderr evidence survives a later strict-HLE halt. No per-frame
+     * log flood and no change to player events, playback state, or callbacks. */
+    static unsigned logged;
+    if (logged < 6) {
+        ++logged;
+        fprintf(stderr, "[cellSail] SoundAdapterGetFrame(self=%08X samples=%u info=%08X) -> %s\n",
+                pSelf, samples, pInfo, slot >= 0 ? "NO_FRAME (decoder unavailable)" : "INVALID_STATE");
+    }
+    sail_sound_unlock();
+    return slot >= 0 ? CELL_SAIL_SYNC_NO_FRAME : SAIL_SOUND_INVALID_STATE;
 }
 
 /* cellSailGraphicsAdapterInitialize(pSelf, pCallbacks, pArg)
