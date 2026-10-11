@@ -133,6 +133,9 @@ s32 cellSysmoduleUnloadModule(u16 id);
 /* NID: 0x5A59E258 */
 s32 cellSysmoduleIsLoaded(u16 id);
 
+/* NID: 0x70E319B5; query the extended 0xF000..0xF056 namespace. */
+s32 cellSysmoduleIsLoadedEx(u16 id);
+
 #ifdef __cplusplus
 }
 #endif

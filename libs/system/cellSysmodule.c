@@ -129,3 +129,15 @@ s32 cellSysmoduleIsLoaded(u16 id)
 
     return s_module_loaded[slot] ? CELL_OK : CELL_SYSMODULE_ERROR_UNLOADED;
 }
+
+/* NID: 0x70E319B5. Extended-ID query only; shares the existing HLE module
+ * tracker and does not load firmware or imply that a module's APIs exist.
+ * The internal namespace is 0xF000..0xF056 (87 module IDs).
+ * ABI reference: RPCS3 rpcs3/Emu/Cell/Modules/cellSysmodule.cpp,
+ * cellSysmoduleIsLoadedEx and INTERNAL_MODULES_COUNT. */
+s32 cellSysmoduleIsLoadedEx(u16 id)
+{
+    if (id < 0xF000 || id >= 0xF057)
+        return CELL_SYSMODULE_ERROR_UNKNOWN;
+    return cellSysmoduleIsLoaded(id);
+}
