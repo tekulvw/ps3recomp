@@ -227,70 +227,76 @@ int64_t sys_memory_container_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
     uint32_t size        = LV2_ARG_U32(ctx, 1);
-
+    bump_lock();
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_CONTAINER_MAX; i++) {
         if (!g_sys_mem_containers[i].active) { slot = i; break; }
     }
-    if (slot < 0)
+    if (slot < 0) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
-
+    }
     sys_mem_container_info* c = &g_sys_mem_containers[slot];
     c->active     = 1;
     c->total_size = size;
     c->used_size  = 0;
-
-    uint32_t container_id = (uint32_t)(slot + 1);
-    if (id_out_addr != 0) {
-        write_be32(id_out_addr, container_id);
-    }
-
+    const uint32_t container_id = (uint32_t)(slot + 1);
+    bump_unlock();
+    if (id_out_addr != 0) write_be32(id_out_addr, container_id);
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_memory_container_destroy
- *
- * r3 = container_id
- * -----------------------------------------------------------------------*/
+/* Snapshot under the same lock as create/destroy, then release before guest
+ * output writes. This does not pin lifetime across later module allocation. */
+static int memory_container_snapshot(uint32_t id, sys_mem_container_info* out)
+{
+    if (!id || id > SYS_MEMORY_CONTAINER_MAX) return 0;
+    bump_lock();
+    const sys_mem_container_info value = g_sys_mem_containers[id - 1];
+    bump_unlock();
+    if (!value.active) return 0;
+    *out = value;
+    return 1;
+}
+
+int sys_memory_container_available(uint32_t id, uint32_t* available)
+{
+    sys_mem_container_info value;
+    if (!available || !memory_container_snapshot(id, &value) ||
+        value.used_size > value.total_size) return 0;
+    *available = value.total_size - value.used_size;
+    return 1;
+}
+
+/* r3 = container_id */
 int64_t sys_memory_container_destroy(ppu_context* ctx)
 {
     uint32_t container_id = LV2_ARG_U32(ctx, 0);
-
     if (container_id == 0 || container_id > SYS_MEMORY_CONTAINER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
-
+    bump_lock();
     sys_mem_container_info* c = &g_sys_mem_containers[container_id - 1];
-    if (!c->active)
+    if (!c->active) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
-
+    }
     c->active = 0;
+    bump_unlock();
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_memory_container_get_size
- *
- * r3 = container_id
- * r4 = pointer to output struct: { u32 total, u32 used }
- * -----------------------------------------------------------------------*/
+/* r3 = container_id, r4 = output { u32 total, u32 used } */
 int64_t sys_memory_container_get_size(ppu_context* ctx)
 {
     uint32_t container_id = LV2_ARG_U32(ctx, 0);
     uint32_t out_addr     = LV2_ARG_PTR(ctx, 1);
-
-    if (container_id == 0 || container_id > SYS_MEMORY_CONTAINER_MAX)
+    sys_mem_container_info value;
+    if (!memory_container_snapshot(container_id, &value))
         return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_mem_container_info* c = &g_sys_mem_containers[container_id - 1];
-    if (!c->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
     if (out_addr != 0) {
-        write_be32(out_addr + 0, c->total_size);
-        write_be32(out_addr + 4, c->used_size);
+        write_be32(out_addr + 0, value.total_size);
+        write_be32(out_addr + 4, value.used_size);
     }
-
     return CELL_OK;
 }
 
@@ -493,11 +499,13 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 void sys_memory_init(lv2_syscall_table* tbl)
 {
+    bump_lock();
     memset(g_sys_mem_allocs,     0, sizeof(g_sys_mem_allocs));
     memset(g_sys_mem_containers, 0, sizeof(g_sys_mem_containers));
     memset(g_sys_mmapper_shared, 0, sizeof(g_sys_mmapper_shared));
     g_sys_mem_bump_ptr = 0;
     s_total_allocated  = 0;
+    bump_unlock();
 
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
     lv2_syscall_register(tbl, SYS_MEMORY_FREE,                 sys_memory_free);
