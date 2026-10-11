@@ -12,8 +12,109 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_read32 / vm_write32 */
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <stdlib.h>   /* getenv -- Clang errors on the implicit declaration MSVC allows */
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
+
+/* Callback-completed futures. The 24-byte public record layout is known, but
+ * SDK mutex IDs and private flag values are not. Keep completion/lifecycle
+ * state on the host; only the documented result field is published to guest
+ * memory after a real Set. No decoder or player readiness is inferred. */
+#define SAIL_FUTURE_BYTES 24u
+#define SAIL_FUTURE_MAX 64
+#define SAIL_FUTURE_INVALID_ARG   ((s32)0x80610701u)
+#define SAIL_FUTURE_INVALID_STATE ((s32)0x80610702u)
+#define SAIL_FUTURE_NOT_AVAILABLE ((s32)0x80610708u)
+#define SAIL_FUTURE_MEMORY        ((s32)0x806107F0u)
+static struct { u32 ea; s32 result; int done; } s_futures[SAIL_FUTURE_MAX];
+static atomic_flag s_future_lock = ATOMIC_FLAG_INIT;
+extern u32 ppu_vm_size; /* zero denotes a full 4-GiB guest address space */
+static void sail_future_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_future_lock, memory_order_acquire)) {}
+}
+static void sail_future_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_future_lock, memory_order_release);
+}
+static int sail_future_range(u32 ea, u32 bytes, u32 alignment)
+{
+    const u64 limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    return vm_base && ea && !(ea & (alignment - 1u)) && (u64)ea + bytes <= limit;
+}
+static int sail_future_find(u32 ea)
+{
+    for (int i = 0; i < SAIL_FUTURE_MAX; ++i)
+        if (s_futures[i].ea == ea) return i;
+    return -1;
+}
+static void sail_future_clear(void)
+{
+    sail_future_lock();
+    memset(s_futures, 0, sizeof(s_futures));
+    sail_future_unlock();
+}
+
+/* NID 0x4CC54F8E */
+s32 cellSailFutureInitialize(u32 pSelf)
+{
+    if (!sail_future_range(pSelf, SAIL_FUTURE_BYTES, 8)) return SAIL_FUTURE_INVALID_ARG;
+    sail_future_lock();
+    if (sail_future_find(pSelf) >= 0) {
+        sail_future_unlock(); return SAIL_FUTURE_INVALID_STATE;
+    }
+    int i = sail_future_find(0);
+    if (i < 0) { sail_future_unlock(); return SAIL_FUTURE_MEMORY; }
+    for (u32 off = 0; off < SAIL_FUTURE_BYTES; off += 4) vm_write32(pSelf + off, 0);
+    s_futures[i].ea = pSelf;
+    s_futures[i].result = 0;
+    s_futures[i].done = 0;
+    sail_future_unlock();
+    return CELL_OK;
+}
+
+/* NID 0xA37FED15 */
+s32 cellSailFutureSet(u32 pSelf, s32 result)
+{
+    if (!sail_future_range(pSelf, SAIL_FUTURE_BYTES, 8)) return SAIL_FUTURE_INVALID_ARG;
+    sail_future_lock();
+    int i = sail_future_find(pSelf);
+    if (i < 0 || s_futures[i].done) {
+        sail_future_unlock(); return SAIL_FUTURE_INVALID_STATE;
+    }
+    vm_write32(pSelf + 12, (u32)result);
+    s_futures[i].result = result;
+    s_futures[i].done = 1;
+    sail_future_unlock();
+    return CELL_OK;
+}
+
+/* NID 0x3A2D806C */
+s32 cellSailFutureGet(u32 pSelf, u64 timeout, u32 pResult)
+{
+    (void)timeout; /* Pending waits are not implemented; never fabricate completion. */
+    if (!sail_future_range(pSelf, SAIL_FUTURE_BYTES, 8) ||
+        !sail_future_range(pResult, 4, 4)) return SAIL_FUTURE_INVALID_ARG;
+    sail_future_lock();
+    int i = sail_future_find(pSelf);
+    if (i < 0) { sail_future_unlock(); return SAIL_FUTURE_INVALID_STATE; }
+    if (!s_futures[i].done) { sail_future_unlock(); return SAIL_FUTURE_NOT_AVAILABLE; }
+    vm_write32(pResult, (u32)s_futures[i].result);
+    sail_future_unlock();
+    return CELL_OK;
+}
+
+/* NID 0x9553AF65 */
+s32 cellSailFutureFinalize(u32 pSelf)
+{
+    if (!sail_future_range(pSelf, SAIL_FUTURE_BYTES, 8)) return SAIL_FUTURE_INVALID_ARG;
+    sail_future_lock();
+    int i = sail_future_find(pSelf);
+    if (i < 0) { sail_future_unlock(); return SAIL_FUTURE_INVALID_STATE; }
+    memset(&s_futures[i], 0, sizeof(s_futures[i]));
+    sail_future_unlock();
+    return CELL_OK;
+}
 
 /* Internal state */
 
@@ -72,6 +173,7 @@ s32 cellSailTerm(void)
 {
     printf("[cellSail] Term()\n");
     s_initialized = 0;
+    sail_future_clear();
     return CELL_OK;
 }
 
