@@ -394,7 +394,7 @@ void spurs_ef_set_from_spu(uint32_t flag_ea, uint16_t bits)
 /* =========================================================================
  * SPURS core
  *
- * The CellSpurs instance (0x2000 bytes of GAME-owned guest memory) is real
+ * The CellSpurs instance (0x1000 bytes of GAME-owned guest memory) is real
  * shared state: the game's engine pokes it with INLINED atomics (readyCount
  * stores, signal bits) and the policy modules DMA it from the SPU side. So
  * it must hold the REAL big-endian kernel layout — never a host struct.
@@ -404,9 +404,10 @@ void spurs_ef_set_from_spu(uint32_t flag_ea, uint16_t bits)
  *   +0x20 wklCurrentContention[16]      +0xA0 wklEvent1[16]
  *   +0x40 wklMinContention[16]          +0xB0 wklEnabled (be u32, bit 31-wid)
  *   +0x50 wklMaxContention[16]          +0xBD sysSrvMsgUpdateWorkload (u8)
- *   +0x60 wklFlag (be u64)              +0xB00 wklInfo1[16] (32B each:
- *   +0x70 wklSignal1 (be u16)                  addr u64, arg u64, size u32,
- *   +0x76 nSpus (u8)                           uniqueId u8, prio[8] @+0x18)
+ *   +0x60 wklFlag (16-byte object)     +0xB00 wklInfo1[16] (32B each:
+ *   +0x6C wklFlag.flag (be u32)                addr u64, arg u64, size u32,
+ *   +0x70 wklSignal1 (be u16)                  uniqueId u8, prio[8] @+0x18)
+ *   +0x76 nSpus (u8), +0x77 wklFlagReceiver (u8)
  * Our own bookkeeping lives in a host side-table keyed by instance EA.
  * A host "kernel" thread per instance polls readyCount/signal and runs the
  * workload's policy module (spurs_policy.c) — the virtual SPU.
@@ -418,6 +419,8 @@ enum {
     SPURS_WKL_MINCONT  = 0x40,
     SPURS_WKL_MAXCONT  = 0x50,
     SPURS_WKL_FLAG     = 0x60,
+    SPURS_WKL_FLAG_VALUE = 0x6C,
+    SPURS_WKL_FLAG_RECEIVER = 0x77,
     SPURS_WKL_SIGNAL1  = 0x70,
     SPURS_NSPUS        = 0x76,
     SPURS_WKL_STATE1   = 0x80,
@@ -468,7 +471,10 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
      * instances before adding workloads to any of them.) */
     memset(vm_base + spurs_ea, 0, SPURS_INST_SIZE);
     *(vm_base + spurs_ea + SPURS_NSPUS) = (u8)si->nspus;
-    vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
+    /* CellSpursWorkloadFlag has 12 reserved bytes followed by a BE32 flag.
+     * The receiver is a separate byte, not part of the flag object. */
+    vm_write32(spurs_ea + SPURS_WKL_FLAG_VALUE, 0xFFFFFFFFu);
+    vm_write8(spurs_ea + SPURS_WKL_FLAG_RECEIVER, 0xFF);
 
     if (!si->kernel_live) {
         si->kernel_live = 1;
@@ -476,6 +482,32 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     }
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
            si->prefix, spurs_ea, si->nspus);
+    return CELL_OK;
+}
+
+/* Runtime backing limit: zero denotes the full 32-bit guest address space. */
+extern uint32_t ppu_vm_size;
+
+/* NID: 0xC765B995. This returns the existing guest object; it neither creates
+ * a host flag nor resets state. RPCS3's cellSpursGetWorkloadFlag contract checks
+ * null arguments and 128-byte instance alignment, not output alignment or the
+ * HLE instance registry. See rpcs3/Emu/Cell/Modules/cellSpurs.{cpp,h}. */
+s32 cellSpursGetWorkloadFlag(CellSpurs* spurs, CellSpursWorkloadFlag** flag)
+{
+    const uint64_t spurs_ea = (uintptr_t)spurs;
+    const uint64_t out_ea = (uintptr_t)flag;
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : UINT64_C(0x100000000);
+    if (!spurs_ea || !out_ea)
+        return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+    if (spurs_ea & 127)
+        return CELL_SPURS_POLICY_MODULE_ERROR_ALIGN;
+    /* HLE safety checks use widened arithmetic before narrowing guest EAs.
+     * Only the returned 16-byte object and the four-byte output are required;
+     * this getter does not access the remaining instance fields. */
+    if (!vm_base || spurs_ea > UINT32_MAX || out_ea > UINT32_MAX ||
+        spurs_ea + SPURS_WKL_FLAG + 16 > limit || out_ea + 4 > limit)
+        return CELL_SPURS_POLICY_MODULE_ERROR_FAULT;
+    vm_write32((u32)out_ea, (u32)spurs_ea + SPURS_WKL_FLAG);
     return CELL_OK;
 }
 
