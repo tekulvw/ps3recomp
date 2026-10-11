@@ -136,6 +136,9 @@ s32 cellSysmoduleIsLoaded(u16 id);
 /* NID: 0x70E319B5; query the extended 0xF000..0xF056 namespace. */
 s32 cellSysmoduleIsLoadedEx(u16 id);
 
+/* NID: 0x1A267F98; load a permitted extended module in the HLE tracker. */
+s32 cellSysmoduleLoadModuleEx(u16 id);
+
 #ifdef __cplusplus
 }
 #endif

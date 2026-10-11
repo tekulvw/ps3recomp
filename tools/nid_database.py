@@ -416,6 +416,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellSysmodule", "cellSysmoduleUnloadModule"),
     ("cellSysmodule", "cellSysmoduleIsLoaded"),
     ("cellSysmodule", "cellSysmoduleIsLoadedEx"),
+    ("cellSysmodule", "cellSysmoduleLoadModuleEx"),
     ("cellSysmodule", "cellSysmoduleInitialize"),
     ("cellSysmodule", "cellSysmoduleFinalize"),
 
