@@ -21,7 +21,7 @@ def main():
             "-framework", "Metal", "-framework", "Cocoa", "-framework", "QuartzCore",
             "-o", str(binary),
         ], cwd=ROOT, check=True, timeout=120)
-        for mode in ("first", "black", "bgra", "windowed", "presentation", "retry", "default", "disabled"):
+        for mode in ("first", "black", "bgra", "windowed", "presentation", "retry", "default", "disabled", "managed-headless", "managed-windowed", "managed-bgra"):
             subprocess.run([str(binary), mode, str(pathlib.Path(tmp) / f"{mode}.ppm")],
                            check=True, timeout=30)
 
