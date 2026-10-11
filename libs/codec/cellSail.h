@@ -128,9 +128,10 @@ s32 cellSailDescriptorCreateDatabase(CellSailDescriptorHandle desc,
                                        void* dbAddr, u32 dbSize,
                                        u64 arg);
 s32 cellSailDescriptorDestroyDatabase(CellSailDescriptorHandle desc);
-s32 cellSailDescriptorGetStreamType(CellSailDescriptorHandle desc, s32* type);
+s32 cellSailDescriptorGetStreamType(CellSailDescriptorHandle desc);
+s32 cellSailDescriptorOpen(CellSailDescriptorHandle desc);
 s32 cellSailDescriptorSetAutoSelection(CellSailDescriptorHandle desc, s32 enable);
-s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLen);
+u32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc);
 
 /* Memory allocator */
 /* Public 32-bit, big-endian guest records. These declarations describe
