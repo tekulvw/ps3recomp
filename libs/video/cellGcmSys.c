@@ -2295,8 +2295,15 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * it spins on `ref` for good. Safe when the walker has left the head of
      * the ring well behind, which is the region the guest writes next. */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
+    const u32 io_last = end > begin ? gcm_ea2io(end - 1) : 0xFFFFFFFFu;
+    /* A title can switch this context to another segment before GET leaves
+     * the previous one. A numerically higher GET outside this ring proves
+     * nothing about consumption of its head. Do not rewind that new segment
+     * or the closing SET_REFERENCE can be written behind the consumer. */
     if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
-        s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
+        io_last != 0xFFFFFFFFu && io_last >= io_begin && cur >= begin &&
+        (uint64_t)s_fifo_getoff >= (uint64_t)io_begin + GCM_RECYCLE_MARGIN &&
+        (uint64_t)s_fifo_getoff <= io_last) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
         return 1;
