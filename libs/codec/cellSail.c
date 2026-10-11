@@ -356,6 +356,9 @@ typedef struct {
     u64 file_size;
     FILE* media;
     int opened;
+    /* Audio/video destination slot zero. Reader and stream bytes are snapshots;
+     * the header pointers inside reader remain descriptor-owned until release. */
+    struct { int valid; u8 reader[128]; u8 stream[48]; } selections[2];
 } SailDescriptor;
 
 static SailDescriptor s_descs[MAX_DESCRIPTORS];
@@ -610,12 +613,60 @@ s32 cellSailDescriptorCreateDatabase(CellSailDescriptorHandle desc,
         (void*)(uintptr_t)s_descs[desc].header_ea, s_descs[desc].file_size, 0));
 }
 
-s32 cellSailDescriptorDestroyDatabase(CellSailDescriptorHandle desc)
+/* Validate the public copied reader using PAMF's parser, then bind it to this
+ * descriptor's owned header. All pointer arithmetic is checked before reads. */
+static s32 sail_descriptor_reader(SailDescriptor* d, void* database, u32* stream)
+{
+    const u64 ea = (u64)(uintptr_t)database;
+    if ((ea & 3) || !sail_desc_range(ea, 128)) return SAIL_DESC_INVALID_ARG;
+    if (vm_read32(ea + 0x24) != d->header_ea) return SAIL_DESC_INVALID_ARG;
+    const s32 index = cellPamfReaderGetStreamIndex((CellPamfReader*)database);
+    if (index < 0) return SAIL_DESC_INVALID_ARG;
+    const u64 selected = (u64)d->header_ea + 0x88 + 48ull * (u32)index;
+    if (!sail_desc_range(selected, 48)) return SAIL_DESC_INVALID_ARG;
+    *stream = (u32)selected;
+    return CELL_OK;
+}
+
+/* Bounded observed PAMF form. unknownMode's firmware meaning is not established;
+ * only the retail value one and destination slot zero are supported here. */
+s32 cellSailDescriptorSetEs(CellSailDescriptorHandle desc, u32 category,
+                            u32 destinationSlot, u32 unknownMode, void* database)
 {
     if (!sail_descriptor_enter()) return SAIL_DESC_INVALID_STATE;
-    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use) return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
-    /* Caller-owned copied readers require no separate database allocation. */
+    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
+        return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
+    SailDescriptor* d = &s_descs[desc];
+    if (!d->opened) return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
+    if (category > 2) return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
+    if (d->streamType != 0 || category == 2 || destinationSlot || unknownMode != 1)
+        return sail_descriptor_result(SAIL_DESC_NOT_AVAILABLE);
+    u32 stream;
+    s32 rc = sail_descriptor_reader(d, database, &stream);
+    if (rc) return sail_descriptor_result(rc);
+    const u8 coding = vm_base[stream];
+    const int is_audio = coding == 0xdc || coding == 0x80 || coding == 0x81;
+    const int is_video = coding == 0x1b || coding == 0x02;
+    if ((category == 0 && !is_audio) || (category == 1 && !is_video))
+        return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
+    memcpy(d->selections[category].reader, vm_base + (uintptr_t)database, 128);
+    memcpy(d->selections[category].stream, vm_base + stream, 48);
+    d->selections[category].valid = 1;
     return sail_descriptor_result(CELL_OK);
+}
+
+s32 cellSailDescriptorDestroyDatabase(CellSailDescriptorHandle desc, void* database)
+{
+    if (!sail_descriptor_enter()) return SAIL_DESC_INVALID_STATE;
+    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
+        return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
+    SailDescriptor* d = &s_descs[desc];
+    if (!d->opened) return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
+    u32 stream;
+    const s32 rc = sail_descriptor_reader(d, database, &stream);
+    /* Caller owns the copied reader; no allocation to release or bytes to erase.
+     * Previously selected ES snapshots survive reuse of the caller's stack. */
+    return sail_descriptor_result(rc);
 }
 
 s32 cellSailDescriptorGetStreamType(CellSailDescriptorHandle desc)
