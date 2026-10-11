@@ -12,6 +12,7 @@
  */
 #include "ppu_recomp.h"     /* ppu_context */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
+#include <atomic>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -147,7 +148,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * we stamp (only the holder ever writes owner=self, so the re-lock check is
  * race-free). Keyed by guest address in an open-addressed table. */
 #define LWM_HASH 65536u
-static struct LwmSlot { volatile long addr; HANDLE sem;
+static struct LwmSlot { std::atomic<uint32_t> addr; HANDLE sem;
     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
     volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
@@ -172,7 +173,7 @@ static struct LwmSlot* lwm_find(uint32_t addr){
     if(!addr) return nullptr;
     uint32_t h=(addr*2654435761u)&(LWM_HASH-1);
     for(uint32_t i=0;i<LWM_HASH;i++){ uint32_t idx=(h+i)&(LWM_HASH-1);
-        long cur=g_lwm[idx].addr;
+        uint32_t cur=g_lwm[idx].addr.load(std::memory_order_acquire);
         if((uint32_t)cur==addr) return &g_lwm[idx];
         if(cur==0) return nullptr; }
     return nullptr;
@@ -183,14 +184,14 @@ static HANDLE lwm_sem(uint32_t addr)
     uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
     for (uint32_t i = 0; i < LWM_HASH; i++) {
         uint32_t idx = (h + i) & (LWM_HASH - 1);
-        long cur = g_lwm[idx].addr;
+        uint32_t cur = g_lwm[idx].addr.load(std::memory_order_acquire);
         if ((uint32_t)cur == addr) return g_lwm[idx].sem;
         if (cur == 0) {
             while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
             HANDLE r = nullptr;
             if (g_lwm[idx].addr == 0) {
                 g_lwm[idx].sem = CreateSemaphoreA(NULL, 1, 1, NULL); /* free */
-                g_lwm[idx].addr = (long)addr;   /* publish AFTER init (x86 TSO: readers see init) */
+                g_lwm[idx].addr.store(addr, std::memory_order_release); /* publish the handle on ARM too */
                 r = g_lwm[idx].sem;
             } else if ((uint32_t)g_lwm[idx].addr == addr) {
                 r = g_lwm[idx].sem;
@@ -326,8 +327,9 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
  * sys_lwmutex above, model it directly in guest memory so the args stay GUEST
  * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
  * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
- * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
- * handshakes, not long-term blocking. sys_lwcond_t: +0x00 lwmutex EA (be64),
+ * insufficient once workers need the lock; the polling fallback below releases
+ * and reacquires the semaphore on every supported host. It is not a full
+ * condition-variable implementation (signals and timed waits remain limited). sys_lwcond_t: +0x00 lwmutex EA (be64),
  * +0x08 lwcond_queue id. */
 static void sys_lwcond_create(ppu_context* ctx)
 {
