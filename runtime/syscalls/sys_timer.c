@@ -2,7 +2,11 @@
  * ps3recomp - Timer and time syscalls (implementation)
  */
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE /* tm_gmtoff on glibc */
+#endif
 #include "sys_timer.h"
+#include <time.h>
 #include "sys_event.h"
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -280,6 +284,43 @@ int64_t sys_timer_sleep(ppu_context* ctx)
  * r3 = pointer to receive seconds (u64*)
  * r4 = pointer to receive nanoseconds (u64*)
  * -----------------------------------------------------------------------*/
+/* LV2 144: r3/r4 point to signed BE32 minute offsets. The first is the
+ * standard UTC offset; the second is the current seasonal adjustment.
+ * Derive the adjustment instead of assuming every DST shift is 60 minutes. */
+int64_t sys_time_get_timezone(ppu_context* ctx)
+{
+    uint32_t zone_addr = LV2_ARG_PTR(ctx, 0);
+    uint32_t dst_addr = LV2_ARG_PTR(ctx, 1);
+    if (!zone_addr || !dst_addr || zone_addr > UINT32_MAX - 3 || dst_addr > UINT32_MAX - 3)
+        return (int32_t)CELL_EFAULT;
+
+    time_t now = time(NULL);
+    struct tm local;
+    int32_t standard_minutes, daylight_minutes;
+#ifdef _WIN32
+    _tzset();
+    long west_seconds, daylight_bias;
+    if (localtime_s(&local, &now) || _get_timezone(&west_seconds) || _get_dstbias(&daylight_bias))
+        return (int32_t)CELL_EAGAIN;
+    standard_minutes = (int32_t)(-west_seconds / 60);
+    daylight_minutes = local.tm_isdst > 0 ? (int32_t)(-daylight_bias / 60) : 0;
+#else
+    if (!localtime_r(&now, &local)) return (int32_t)CELL_EAGAIN;
+    daylight_minutes = 0;
+    if (local.tm_isdst > 0) {
+        struct tm standard = local;
+        standard.tm_isdst = 0;
+        time_t standard_epoch = mktime(&standard);
+        if (standard_epoch == (time_t)-1) return (int32_t)CELL_EAGAIN;
+        daylight_minutes = (int32_t)(difftime(standard_epoch, now) / 60);
+    }
+    standard_minutes = (int32_t)(local.tm_gmtoff / 60) - daylight_minutes;
+#endif
+    write_be32(zone_addr, (uint32_t)standard_minutes);
+    write_be32(dst_addr, (uint32_t)daylight_minutes);
+    return CELL_OK;
+}
+
 int64_t sys_time_get_current_time(ppu_context* ctx)
 {
     uint32_t sec_addr  = LV2_ARG_PTR(ctx, 0);
@@ -672,6 +713,7 @@ void sys_timer_init(lv2_syscall_table* tbl)
      * The runtime should dispatch timer_usleep/sleep/get_current_time
      * via direct function calls instead. */
     lv2_syscall_register(tbl, SYS_TIME_GET_TIMEBASE_FREQUENCY, sys_time_get_timebase_frequency);
+    lv2_syscall_register(tbl, SYS_TIME_GET_TIMEZONE, sys_time_get_timezone);
 
     /* Register these but be aware of collisions */
     lv2_syscall_register(tbl, SYS_TIMER_USLEEP,            sys_timer_usleep);
