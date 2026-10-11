@@ -873,11 +873,12 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
  *     taskset's `signalled` bitset (BE, in the GUEST CellSpursTaskset) and
  *     wake it if sleeping.
  *   - The WAIT_SIGNAL taskset syscall consumes a pending signal, or sleeps
- *     the task until one arrives (POLL_SIGNAL-then-wait, no lost wakeups:
- *     the guest bit is set under the same lock the waiter checks it).
+ *     the task until one arrives (POLL_SIGNAL-then-wait: guest writes and
+ *     predicate checks share lock-line, with a CV handshake before parking).
  * The bitset is guest state (SPU-visible); the host lock/condvar exist only
  * to block and wake the task's host thread. */
 #include "../../libs/spurs/spurs_taskset.h"
+#include "spu_coherency.h"
 
 #ifdef _WIN32
 static SRWLOCK            s_sig_lock = SRWLOCK_INIT;
@@ -886,6 +887,38 @@ static CONDITION_VARIABLE s_sig_cv;   /* zero-init == CONDITION_VARIABLE_INIT */
 static pthread_mutex_t s_sig_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
 #endif
+
+/* Called by coherence with lock-line held. Every path takes lock-line before
+ * s_sig_lock, never the reverse. The callback only wakes; the guest bit remains
+ * the sole predicate, including when a write changed another task's bit. */
+static void spu_taskset_wake_written(void* opaque)
+{
+    (void)opaque;
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_sig_lock);
+    WakeAllConditionVariable(&s_sig_cv);
+    ReleaseSRWLockExclusive(&s_sig_lock);
+#else
+    pthread_mutex_lock(&s_sig_lock);
+    pthread_cond_broadcast(&s_sig_cv);
+    pthread_mutex_unlock(&s_sig_lock);
+#endif
+}
+
+/* The caller holds lock-line. vm_write32 would re-enter that lock now that
+ * the line is watched. Preserve other tasks' bits in the same word and report
+ * the real store to both reservation domains. */
+static void spu_taskset_signal_update(uint32_t taskset_ea, uint32_t taskId, int set)
+{
+    uint32_t ea = taskset_ea + CSTS_SIGNALLED + 4u * (taskId / 32);
+    uint32_t mask = 0x80000000u >> (taskId % 32);
+    uint32_t value = vm_read32(ea);
+    value = set ? value | mask : value & ~mask;
+    uint32_t raw = ps3_bswap32(value);
+    memcpy(vm_base + ea, &raw, sizeof(raw));
+    ppu_resv_break_store(ea);
+    spu_coh_notify_write(ea);
+}
 
 /* Which (taskset, task) pairs are currently parked in WAIT_SIGNAL.
  *
@@ -1003,17 +1036,10 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return;
-#ifdef _WIN32
-    AcquireSRWLockExclusive(&s_sig_lock);
-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
-    WakeAllConditionVariable(&s_sig_cv);
-    ReleaseSRWLockExclusive(&s_sig_lock);
-#else
-    pthread_mutex_lock(&s_sig_lock);
-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
-    pthread_cond_broadcast(&s_sig_cv);
-    pthread_mutex_unlock(&s_sig_lock);
-#endif
+    spu_lockline_lock();
+    spu_coh_reserve(NULL, taskset_ea + CSTS_SIGNALLED);
+    spu_taskset_signal_update(taskset_ea, taskId, 1);
+    spu_lockline_unlock();
     { static int _n = 0; if (_n++ < 24)
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
@@ -1129,10 +1155,20 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     /* Release the global SPU-serial lock while parked so another SPU task can
      * run (and possibly signal us); re-acquired before returning to resume. */
     spu_serial_release();
+    spu_coh_watch watch;
+    spu_lockline_lock();
+    spu_coh_watch_add(&watch, taskset_ea + CSTS_SIGNALLED,
+                       spu_taskset_wake_written, NULL);
 #ifdef _WIN32
-    AcquireSRWLockExclusive(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
-        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
+        /* Holding the CV mutex while dropping lock-line closes the window
+         * between the guest predicate check and actually going to sleep. */
+        AcquireSRWLockExclusive(&s_sig_lock);
+        spu_lockline_unlock();
+        int timed_out = !SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0);
+        ReleaseSRWLockExclusive(&s_sig_lock);
+        spu_lockline_lock();
+        if (timed_out) {
             static int _n = 0;
             if (++secs && _n < 16) { _n++;
                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
@@ -1140,13 +1176,15 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
-    ReleaseSRWLockExclusive(&s_sig_lock);
 #else
-    pthread_mutex_lock(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
-        if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
+        pthread_mutex_lock(&s_sig_lock);
+        spu_lockline_unlock();
+        int timed_out = pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0;
+        pthread_mutex_unlock(&s_sig_lock);
+        spu_lockline_lock();
+        if (timed_out) {
             static int _n = 0;
             if (++secs && _n < 16) { _n++;
                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
@@ -1154,9 +1192,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
-    pthread_mutex_unlock(&s_sig_lock);
 #endif
+    spu_coh_watch_remove(&watch);
+    if (!drained) spu_taskset_signal_update(taskset_ea, taskId, 0);
+    spu_lockline_unlock();
     if (drained) { static int _d = 0; if (_d++ < 24)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
