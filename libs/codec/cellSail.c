@@ -1259,9 +1259,8 @@ s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat)
 
 /* No actual session exists until a decoder publishes a concrete format.
  * Leave output untouched on failure; preferred dimensions are not readiness. */
-s32 cellSailGraphicsAdapterGetFormat(u32 pSelf, u32 sessionId, u32 pFormat)
+s32 cellSailGraphicsAdapterGetFormat(u32 pSelf, u32 pFormat)
 {
-    (void)sessionId;
     if (!sail_graphics_range(pSelf, SAIL_ADAPTER_CLEAR) ||
         (pFormat & 3) || !sail_graphics_range(pFormat, 32))
         return SAIL_GRAPHICS_INVALID_ARG;
