@@ -91,6 +91,29 @@ typedef struct spu_coh_entry {
 static spu_coh_entry* s_coh_ctxs;
 static spu_coh_watch* s_coh_watches;
 
+/* Only PPU reservation lines need epochs. Entries contain no context pointers
+ * and live for the process, like the existing reserved-line bitmap. */
+typedef struct coh_epoch { uint32_t line; uint64_t value; struct coh_epoch* next; } coh_epoch;
+static coh_epoch* s_epochs[1024];
+static coh_epoch** epoch_bucket(uint32_t line) { return &s_epochs[(line >> 7) & 1023u]; }
+uint64_t spu_coh_line_epoch(uint32_t ea)
+{
+    uint32_t line = ea & ~127u;
+    coh_epoch** bucket = epoch_bucket(line);
+    for (coh_epoch* p = *bucket; p; p = p->next)
+        if (p->line == line) return p->value;
+    coh_epoch* p = (coh_epoch*)malloc(sizeof(*p));
+    if (!p) abort();
+    p->line = line; p->value = 0; p->next = *bucket; *bucket = p;
+    spu_coh_reserve(NULL, line);
+    return 0;
+}
+static void epoch_written(uint32_t line)
+{
+    for (coh_epoch* p = *epoch_bucket(line); p; p = p->next)
+        if (p->line == line) { ++p->value; return; }
+}
+
 unsigned long g_spu_lr_raise = 0;
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
@@ -217,6 +240,7 @@ int spu_coh_is_reserved(uint32_t addr)
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
+    epoch_written(line);
     spu_coh_wake_watches(line);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
@@ -233,6 +257,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
+    epoch_written(line);
     spu_coh_wake_watches(line);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
