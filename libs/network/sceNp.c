@@ -288,6 +288,19 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
  * Imported by most online-capable titles.
  * -----------------------------------------------------------------------*/
 
+/* No purchased content is provisioned by the local NP implementation.
+ * The API returns the number of IDs, so an empty list requires no guest write.
+ * In particular, (NULL, 0) is a valid count query. */
+s32 sceNpManagerGetEntitlementIdList(void* entIdList, u32 entIdListNum)
+{
+    (void)entIdList;
+    (void)entIdListNum;
+    if (!np_is_initialized())
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+    printf("[sceNp] GetEntitlementIdList -> 0 (no purchased content)\n");
+    return 0;
+}
+
 s32 sceNpManagerGetStatus(s32* status)
 {
     if (!np_is_initialized())
