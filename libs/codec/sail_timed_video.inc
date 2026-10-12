@@ -64,6 +64,7 @@ static s32 sail_timed_release_locked(u32 player) {
     if(slot<0)return SAIL_DESC_INVALID_ARG;
     SailTimedVideo* t=&s_timed[slot];SailHeldFrame* h=&t->callbacks;
     if(!h->active)return CELL_OK;
+    sail_audio_hide(player);
     sail_graphics_unpublish_frame(player);
     if(h->uncertain)return SAIL_DESC_INVALID_STATE;
     for(int i=0;i<4;++i){s32 rc=sail_timed_free_slot(t,i);if(rc)return rc;}
@@ -195,6 +196,7 @@ static s32 sail_timed_start(u32 player,u32 command,u64 token) {
     h->free_opd=s_sail_players[slot].allocator_free_opd;h->allocator_arg=s_sail_players[slot].allocator_arg;
     const u64 offset=(u64)vm_read32(d->header_ea+8)*2048,length=(u64)vm_read32(d->header_ea+12)*2048;
     t->origin=((u64)vm_base[d->header_ea+0x56]<<40)|((u64)vm_base[d->header_ea+0x57]<<32)|vm_read32(d->header_ea+0x58);
+    rc=sail_audio_start(player,d,offset,length,t->origin,h->session);if(rc)return sail_timed_reject(slot,player,token,rc);
     if(sail_video_open(d->media,offset,length,0x1E0,&t->decoder))return sail_timed_reject(slot,player,token,SAIL_DESC_NOT_AVAILABLE);
     rc=sail_timed_next(t);if(rc)return sail_timed_reject(slot,player,token,rc);
     u64 result=0;
@@ -215,7 +217,7 @@ static s32 sail_timed_start(u32 player,u32 command,u64 token) {
     if(owned<3)return sail_timed_reject(slot,player,token,SAIL_DESC_MEMORY);
     rc=sail_held_invoke(h,h->graphics.callbacks[2],h->graphics.arg_ea,h->scratch,h->session,0,&result);
     if(rc)return sail_timed_reject(slot,player,token,rc);
-    t->anchor=ppu_system_time_us();t->final_deadline=t->anchor+(u64)t->profile->pictures*1001000/30;
+    t->anchor=ppu_system_time_us();sail_audio_activate(player,t->anchor);t->final_deadline=t->anchor+(u64)t->profile->pictures*1001000/30;
     rc=sail_timed_publish(t,0);if(rc)return sail_timed_reject(slot,player,token,rc);
     s_sail_players[slot].state=CELL_SAIL_PLAYER_STATE_RUNNING;s_sail_players[slot].stream_event_busy=1;
     sail_descriptor_result(CELL_OK);
