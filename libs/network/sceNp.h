@@ -29,6 +29,10 @@ extern "C" {
 #define SCE_NP_ERROR_ABORTED                    0x8002aa0b
 #define SCE_NP_ERROR_OFFLINE                    0x8002aa0c
 #define SCE_NP_ERROR_INTERNAL                   0x8002aaff
+#define SCE_NP_ERROR_INSUFFICIENT_BUFFER        0x8002aa0f
+#define SCE_NP_ERROR_DIFFERENT_USER             0x8002aa16
+#define SCE_NP_AUTH_EBUSY                       0x8002a00a
+#define SCE_NP_AUTH_EINVALID_ARGUMENT           0x8002a015
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -115,8 +119,8 @@ s32 sceNpGetAccountRegion(s32 userId, u32* region);
 s32 sceNpGetAccountAge(s32 userId, s32* age);
 s32 sceNpGetMyLanguages(SceNpMyLanguages* langs);
 
-/* --- NP Manager (sign-in state). We run permanently offline: GetStatus reports
- * OFFLINE so games cleanly skip online flows instead of blocking on sign-in. --- */
+/* --- NP Manager: offline by default; PSNR or an explicit local-ticket
+ * provider can enable the online flow. Local tickets are not PSN credentials. --- */
 #define SCE_NP_MANAGER_STATUS_OFFLINE          (-1)
 #define SCE_NP_MANAGER_STATUS_GETTING_TICKET    0
 #define SCE_NP_MANAGER_STATUS_GETTING_PROFILE   1
@@ -124,6 +128,8 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs);
 #define SCE_NP_MANAGER_STATUS_ONLINE            3
 
 typedef void (*SceNpManagerCallback)(s32 event, s32 result, void* arg);
+#define SCE_NP_MANAGER_EVENT_GOT_TICKET         255
+typedef struct SceNpTicketVersion { u16 major, minor; } SceNpTicketVersion;
 
 s32 sceNpManagerGetStatus(s32* status);
 s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg);
@@ -138,6 +144,13 @@ s32 sceNpManagerGetAccountAge(s32* age);
  * decrypts that title's files on open. Always CELL_OK (licence present). */
 s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path);
 s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path);
+
+/* Optional local development payload, not a signed Sony ticket. Enable with
+ * PS3RECOMP_NP_LOCAL_TICKET=1 and configure identity via PS3_NP_ONLINE_ID. */
+s32 sceNpManagerRequestTicket2(const SceNpId* npId, const SceNpTicketVersion* version,
+    const char* serviceId, const void* cookie, u32 cookieSize,
+    const char* entitlementId, u32 consumedCount);
+s32 sceNpManagerGetTicket(void* buffer, u32* bufferSize);
 
 /* Set the fake PSN username (call before sceNpInit if desired) */
 void sceNpSetFakeUsername(const char* username);

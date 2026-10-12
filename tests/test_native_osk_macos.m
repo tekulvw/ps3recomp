@@ -13,6 +13,7 @@ void vm_write32(uint64_t a,uint32_t v){assert(a+4<=65536);v=__builtin_bswap32(v)
 void vm_write8(uint64_t a,uint8_t v){assert(a<65536);vm_base[a]=v;}
 int spu_coh_is_reserved(uint32_t a){return 0;}void spu_lockline_lock(void){}void spu_lockline_unlock(void){}void spu_coh_notify_write(uint32_t a){}
 void cellMsgDialog_tick(void){}void np_psnr_pump(void){}
+void ps3_np_ticket_tick(void){}
 static unsigned events;static uint32_t codes[20];
 static void cb(u32 opd,u64 code,u64 param,u64 user,u64 d,u64 e,u64 f,u64 g,u64 h){codes[events++]=(uint32_t)code;}
 static void run_ui(void){for(int i=0;i<100;i++)[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.002]];}
