@@ -48,3 +48,6 @@ int main(void)
  CHECK(vm_read32(0x108)==0x110000);
  free(vm_base);printf("GCM flip-wrap checks: %d, failures: %d\n",checks,failures);return failures?1:0;
 }
+
+int rsx_draw_engine_checked_ready(void) { return 1; }
+int rsx_draw_engine_flush_checked(void) { return 0; }
