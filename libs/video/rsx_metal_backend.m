@@ -3504,7 +3504,7 @@ static int eng_encode_clear(id<MTLCommandBuffer> cb, const EngRecord* r)
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     if (r->kind == ENG_REC_CLEAR_COLOR) {
         id<MTLTexture> t = eng_obj(r->rt[0]);
-        if (!t) return 0;
+        if (!t) { eng_checked_fail(); return 0; }
         rp.colorAttachments[0].texture = t;
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -3512,7 +3512,7 @@ static int eng_encode_clear(id<MTLCommandBuffer> cb, const EngRecord* r)
             r->clear_rgba[0], r->clear_rgba[1], r->clear_rgba[2], r->clear_rgba[3]);
     } else if (r->kind == ENG_REC_CLEAR_DS) {
         id<MTLTexture> t = eng_obj(r->depth);
-        if (!t) return 0;
+        if (!t) { eng_checked_fail(); return 0; }
         rp.depthAttachment.texture = t;
         rp.depthAttachment.loadAction = (r->clear_flags & RSX_BE_CLEAR_DEPTH)
             ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -3526,10 +3526,11 @@ static int eng_encode_clear(id<MTLCommandBuffer> cb, const EngRecord* r)
         rp.renderTargetWidth = [t width];
         rp.renderTargetHeight = [t height];
     } else {
+        eng_checked_fail();
         return 0;
     }
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-    if (!enc) return 0;
+    if (!enc) { eng_checked_fail(); return 0; }
     [enc endEncoding];
     return 1;
 }
