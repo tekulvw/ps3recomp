@@ -19,6 +19,7 @@
 
 static int  s_osk_initialized = 0;
 static int  s_osk_loaded = 0;
+static _Atomic(u32) s_osk_key_layout_option = CELL_OSKDIALOG_10KEY_PANEL;
 static char s_default_response[CELL_OSK_MAX_TEXT_LENGTH + 1] = "";
 
 /* Stored input result (UTF-16) */
@@ -236,6 +237,18 @@ s32 cellOskDialogSetInitialKeyLayout(u32 layout)
 {
     (void)layout;
     printf("[cellOskDialog] SetInitialKeyLayout(%u)\n", layout);
+    return CELL_OK;
+}
+
+/* This is pre-load configuration, so it does not require the legacy Init
+ * stub. The two supported panel bits may be selected individually or together. */
+s32 cellOskDialogSetKeyLayoutOption(u32 option)
+{
+    const u32 allowed = CELL_OSKDIALOG_10KEY_PANEL | CELL_OSKDIALOG_FULLKEY_PANEL;
+    if (!option || (option & ~allowed))
+        return (s32)CELL_OSKDIALOG_ERROR_PARAM;
+    atomic_store(&s_osk_key_layout_option, option);
+    printf("[cellOskDialog] SetKeyLayoutOption(0x%X)\n", option);
     return CELL_OK;
 }
 
