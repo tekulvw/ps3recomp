@@ -3072,6 +3072,43 @@ static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
     return 1;
 }
 
+/* A clear names a surface independently of any later draw's attachment set.
+ * Replay it alone when it cannot be folded into that draw's load actions. */
+static void eng_encode_clear(id<MTLCommandBuffer> cb, const EngRecord* r)
+{
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (r->kind == ENG_REC_CLEAR_COLOR) {
+        id<MTLTexture> t = eng_obj(r->rt[0]);
+        if (!t) { eng_checked_fail(); return; }
+        rp.colorAttachments[0].texture = t;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(
+            r->clear_rgba[0], r->clear_rgba[1], r->clear_rgba[2], r->clear_rgba[3]);
+    } else if (r->kind == ENG_REC_CLEAR_DS) {
+        id<MTLTexture> t = eng_obj(r->depth);
+        if (!t) { eng_checked_fail(); return; }
+        rp.depthAttachment.texture = t;
+        rp.depthAttachment.loadAction = (r->clear_flags & RSX_BE_CLEAR_DEPTH)
+            ? MTLLoadActionClear : MTLLoadActionLoad;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        rp.depthAttachment.clearDepth = r->clear_depth;
+        rp.stencilAttachment.texture = t;
+        rp.stencilAttachment.loadAction = (r->clear_flags & RSX_BE_CLEAR_STENCIL)
+            ? MTLLoadActionClear : MTLLoadActionLoad;
+        rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        rp.stencilAttachment.clearStencil = r->clear_stencil;
+        rp.renderTargetWidth = [t width];
+        rp.renderTargetHeight = [t height];
+    } else {
+        eng_checked_fail();
+        return;
+    }
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!enc) { eng_checked_fail(); return; }
+    [enc endEncoding];
+}
+
 /* One pass per contiguous run of draws against the same attachments, with any
  * clears immediately ahead of it folded into its load actions. A clear whose
  * targets the following draw does not share becomes a pass of its own, which
@@ -3103,6 +3140,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          * surface and an MRT set arrives as one clear per target, so they are
          * collected rather than compared: they become load actions on the
          * pass below when the draw that follows writes the same targets. */
+        const u32 clear_start = i;
         u32 n_cc = 0;
         u32 cc_surf[RSX_BE_MAX_COLOR_TARGETS];
         float cc_rgba[RSX_BE_MAX_COLOR_TARGETS][4];
@@ -3140,6 +3178,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         u32 nrt = n_cc;
         for (u32 k = 0; k < n_cc; k++) rt[k] = cc_surf[k];
         u32 depth = have_clear_ds ? cd : 0;
+        int fold_clears = 0;
         if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
             (!have_clear_ds || s_eng_rec[i].depth == cd)) {
             const EngRecord* d = &s_eng_rec[i];
@@ -3151,10 +3190,19 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                 covered = found;
             }
             if (covered) {
+                fold_clears = 1;
                 nrt = d->nrt;
                 for (u32 k = 0; k < nrt; k++) rt[k] = d->rt[k];
                 depth = d->depth;
             }
+        }
+
+        /* Without a covering draw these are independent clear operations,
+         * not a synthetic MRT. In particular, differently sized surfaces
+         * must each be cleared over their full extent, in record order. */
+        if (!fold_clears && i > clear_start) {
+            for (u32 c = clear_start; c < i; c++) eng_encode_clear(cb, &s_eng_rec[c]);
+            continue;
         }
 
         /* Metal wants every attachment the same size, and the engine registers
