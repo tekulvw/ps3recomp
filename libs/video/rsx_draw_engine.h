@@ -106,6 +106,7 @@ typedef struct rsx_be_render_state {
 
 /* ---- the backend interface ---------------------------------------------- */
 
+#define RSX_BE_HAS_CHECKED_COMPLETION 1
 typedef struct rsx_draw_backend {
     void* user;
 
@@ -205,6 +206,9 @@ typedef struct rsx_draw_backend {
     void (*present)(void* user, u32 surface);
     void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                      void* out, u32 out_pitch);
+    /* Optional certificate: 1 only after accepted work completes without error.
+     * Appended for source compatibility; the old void callback is not proof. */
+    int (*submit_and_wait_checked)(void* user, u32 reason);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -233,6 +237,8 @@ void rsx_draw_engine_shutdown(void);
  * SPU-built command lists bind NV4097 to another subchannel would otherwise
  * write its state into the wrong register bank. */
 void rsx_draw_engine_method(u32 method, u32 arg);
+#define RSX_ENGINE_HAS_PICTURE_IDENTITIES 1
+void rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea);
 
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */
@@ -242,6 +248,11 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 /* The guest's SET_REFERENCE sync point: submit and wait, so a title spinning
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
+int rsx_draw_engine_flush_checked(void);
+int rsx_draw_engine_checked_ready(void);
+/* Publish a CPU write before exposing its guest allocation. Cache work stays
+ * on the renderer consumer; this conservative generation invalidates all hashes. */
+void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes);
 
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */

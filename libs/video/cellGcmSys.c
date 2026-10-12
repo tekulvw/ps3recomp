@@ -266,6 +266,12 @@ static CellGcmZcullInfo s_zcull[CELL_GCM_MAX_ZCULL_COUNT];
 
 /* Report data area (256 slots, each 16 bytes) */
 static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
+/* NV4097_SET_CONTEXT_DMA_REPORT (byte method 0x1A8). Report-main uses
+ * a dedicated IO window; HOST_BUFFER uses ordinary IO offsets. */
+#define GCM_REPORT_DMA_LOCAL 0x66626660u
+#define GCM_REPORT_DMA_MAIN  0xBAD68000u
+#define GCM_REPORT_DMA_HOST  0xFEED0001u
+static u32 s_report_dma = GCM_REPORT_DMA_LOCAL;
 
 /* Label area (256 labels, each u32). Labels live in GUEST memory so the
  * recompiled game can poll them via vm_read32; cellGcmGetLabelAddress returns a
@@ -409,6 +415,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
+    s_report_dma = GCM_REPORT_DMA_LOCAL;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
@@ -752,6 +759,76 @@ static u32 gcm_io2ea(u32 io)
     u16 ea_page = s_ea_address_table[page];
     if (ea_page == 0xFFFF) return 0;
     return ((u32)ea_page << 20) | (io & 0xFFFFFu);
+}
+
+/* Publish a report only to a complete mapped guest record. The local-report
+ * context retains the legacy host table: this SDK does not reserve a guest
+ * local-report window, and placing one beside the labels would overwrite the
+ * control register/offset tables. Sample values remain approximate. */
+static void gcm_get_report(u32 argument)
+{
+    const u32 offset = argument & 0xFFFFFFu;
+    const u32 index = offset / 16u;
+    u32 ea = 0;
+    if (offset & 15u) goto invalid;
+    if (s_report_dma == GCM_REPORT_DMA_MAIN || s_report_dma == GCM_REPORT_DMA_HOST) {
+        const u32 io = offset + (s_report_dma == GCM_REPORT_DMA_MAIN ? 0x0E000000u : 0u);
+        const u32 page = s_ea_address_table[io >> 20];
+        /* 16-byte alignment prevents page crossings. Do not truncate a bad
+         * table entry into a valid 32-bit guest address. EA zero is valid. */
+        if (!vm_base || page >= 0x1000u) goto invalid;
+        ea = (page << 20) | (io & 0xFFFFFu);
+        const u64 limit = ppu_vm_size ? (u64)ppu_vm_size : 0x100000000ULL;
+        if ((u64)ea + 16u > limit) goto invalid;
+    } else if (s_report_dma != GCM_REPORT_DMA_LOCAL || index >= CELL_GCM_MAX_REPORT_COUNT) {
+        goto invalid;
+    }
+
+    { static unsigned reports;
+      if (reports < 6) {
+          ++reports;
+          printf("[GET_REPORT] type=%u idx=%u context=%08X ea=%08X%s\n",
+                 argument >> 24, index, s_report_dma, ea,
+                 s_report_dma == GCM_REPORT_DMA_LOCAL ? " host-only" : "");
+      } }
+
+    /* Completion can release guest buffers. Both active backend flush APIs
+     * synchronously finish queued draws; never publish while work is pending.
+     * This preserves the existing conservative ZPASS value, not a measured
+     * occlusion query result. */
+    if (rsx_live_draw_enabled()) rsx_live_draw_flush();
+    if (rsx_draw_engine_enabled()) rsx_draw_engine_flush();
+    const u64 timestamp = get_timestamp_ns();
+    const u32 value = (argument >> 24) == 1u ? 0xFFFFu : 0u;
+    if (index < CELL_GCM_MAX_REPORT_COUNT) {
+        s_report_data[index].timestamp = timestamp;
+        s_report_data[index].value = value;
+    }
+    if (s_report_dma == GCM_REPORT_DMA_LOCAL) return;
+
+    /* Serialize with GETLLAR/PUTLLC. The completion word is the final store,
+     * and one notification after the complete record wakes lock-line waiters.
+     * Raw stores avoid recursively taking this lock in vm_write*. */
+    spu_lockline_lock();
+    const u32 words[4] = {(u32)(timestamp >> 32), (u32)timestamp, value, 0};
+    for (u32 i = 0; i < 4; ++i) {
+        const u32 address = ea + i * 4u;
+        const u32 raw = ps3_bswap32(words[i]);
+        if (i == 3) atomic_thread_fence(memory_order_release);
+        PS3_WW_CHECK(address, words[i], 4);
+        memcpy(vm_base + address, &raw, sizeof(raw));
+        if (g_resv_store_active > 0) ppu_resv_break_store(address);
+    }
+    spu_coh_notify_write(ea);
+    spu_lockline_unlock();
+    return;
+invalid:
+    { static unsigned warnings;
+      if (warnings < 8) {
+          ++warnings;
+          fprintf(stderr, "[cellGcmSys] GET_REPORT rejected context=%08X offset=%06X\n",
+                  s_report_dma, offset);
+      } }
 }
 
 /* RSX get pointer (IO offset) + one-deep CALL return slot. The FIFO-wrap
@@ -1191,6 +1268,25 @@ static u32 s_tr_i = 0;
  * are lost, but the next frame is written from a clean boundary and the
  * FIFO lives. */
 static void gcm_ref_push_at(u32 v, u32 getoff);
+static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
+static atomic_int s_checked_ref_failed;
+static u64 s_checked_ref_receipt;
+static u64 s_ref_receipts[GCM_REF_QLEN];
+static int gcm_checked_ref_mode(void)
+{
+    const char* e = getenv("PS3RECOMP_GCM_CHECKED_REF");
+    return e && !strcmp(e, "1");
+}
+static void gcm_checked_ref_fail(const char* why, u32 io)
+{
+    if (!atomic_exchange(&s_checked_ref_failed, 1))
+        fprintf(stderr, "[gcm checked REF] failed reason=%s io=%08X; reclamation frozen\n", why, io);
+}
+int cellGcm_checked_reference_ready(void)
+{
+    return gcm_checked_ref_mode() && !atomic_load(&s_checked_ref_failed) &&
+        rsx_draw_engine_checked_ready();
+}
 
 /* ---- SPU-built pushbuffers ------------------------------------------------
  * Some titles do not build the RSX command stream on the PPU at all. The
@@ -1281,6 +1377,7 @@ static u32 gcm_spu_block_for_put(u32 put)
  * is not, it deadlocks the title. Sweep the skipped range first. */
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
+    if (gcm_checked_ref_mode()) { gcm_checked_ref_fail(why, *getoff); return; }
     static int n = 0;
     if (n++ < 8)
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
@@ -1341,16 +1438,26 @@ static void gcm_fifo_dump_around(u32 getoff)
 
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
-    { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
-      if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
+    AcquireSRWLockExclusive(&s_ref_pub_lock);
+    if (gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed)) {
+        ReleaseSRWLockExclusive(&s_ref_pub_lock); return;
+    }
     u32 t = s_ref_qtail;
-    if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
+    if (t - s_ref_qhead >= GCM_REF_QLEN) {
+        if (gcm_checked_ref_mode()) {
+            gcm_checked_ref_fail("reference-queue-overflow", getoff);
+            ReleaseSRWLockExclusive(&s_ref_pub_lock); return;
+        }
         s_ref_qhead++;
-        static int _o = 0;
-        if (_o++ < 4) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
+        static int o; if(o++<4)fprintf(stderr,"[cellGcmSys] fence queue overflow -- oldest dropped\n");
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
+    s_ref_receipts[t % GCM_REF_QLEN] = gcm_checked_ref_mode() ? ++s_checked_ref_receipt : 0;
     s_ref_qtail = t + 1;
+    if (gcm_checked_ref_mode() && getenv("PS3RECOMP_GCM_CHECKED_REF_LOG"))
+        fprintf(stderr,"[gcm checked REF] completed receipt=%llu io=%08X ref=%08X\n",
+            (unsigned long long)s_checked_ref_receipt,getoff,v);
+    ReleaseSRWLockExclusive(&s_ref_pub_lock);
 }
 
 /* Global fence-publication counter: lets the lwmutex convoy trace correlate a
@@ -1370,6 +1477,7 @@ unsigned long long ps3_qpc_us(void)
 
 static void gcm_ref_publish_one(void)
 {
+    if (gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed)) return;
     u32 h = s_ref_qhead;
     if (h == s_ref_qtail) return;
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
@@ -1382,6 +1490,9 @@ static void gcm_ref_publish_one(void)
                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
     s_ref_qhead = h + 1;
     g_gcm_ref_pub_count++;
+    if (gcm_checked_ref_mode() && getenv("PS3RECOMP_GCM_CHECKED_REF_LOG"))
+        fprintf(stderr,"[gcm checked REF] published receipt=%llu ref=%08X\n",
+            (unsigned long long)s_ref_receipts[h % GCM_REF_QLEN],s_ref_q[h % GCM_REF_QLEN]);
 }
 
 /* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the
@@ -1434,8 +1545,6 @@ void cellGcm_fifo_kick_wait(unsigned ms)
  * multi-threaded; the SPSC queue head raced and publication order broke --
  * boot froze with all threads parked on fences that were never published in
  * order). TryAcquire: a contended poll just reads the current ref. */
-static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
-
 void cellGcm_ref_on_poll(void)
 {
     /* Pace: leave each published value observable for >= ~200us of spins
@@ -1490,6 +1599,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * that does read the context (the ring-recycle heuristic) is separately guarded
      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
+    if (gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed)) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
@@ -1583,6 +1693,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
     while (s_fifo_getoff != put && budget-- > 0) {
+        if(gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed))break;
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
             /* get is sitting on an IO offset with no mapping -- the title
@@ -1601,6 +1712,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             "mapping -- resyncing to put=0x%08X\n",
                             s_fifo_getoff, put);
             }
+            if (gcm_checked_ref_mode()) { gcm_checked_ref_fail("no-io-mapping", s_fifo_getoff); break; }
             s_fifo_getoff = put;
             why = "no-io-mapping";
             break;
@@ -1701,6 +1813,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
+            if (gcm_checked_ref_mode() && method == 0x50 && (count != 1 || subch != 0 || type != 0)) {
+                gcm_checked_ref_fail("malformed-reference", s_fifo_getoff); break;
+            }
+            if (gcm_checked_ref_mode()) {
+                if(s_fifo_getoff < put && (u64)s_fifo_getoff+4+(u64)count*4 > put) {
+                    gcm_checked_ref_fail("packet-past-put",s_fifo_getoff);break;
+                }
+                int mapped=1;
+                for (u32 j=0;j<count;j++) if(!gcm_io2ea(s_fifo_getoff+4+j*4)){mapped=0;break;}
+                if(!mapped){gcm_checked_ref_fail("unmapped-packet",s_fifo_getoff);break;}
+            }
             /* TCONST_FIFO=1: how the title actually streams vertex constants.
              * NV4097_SET_TRANSFORM_CONSTANT is a 32-register window; if a block
              * arrives NON-INCREMENTING then every dword carries the same method
@@ -1850,7 +1973,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * same reason the live engine does, and masks them itself. */
                 { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  if (eng) rsx_draw_engine_method_at((subch << 13) | m, vm_read32(dea),dea); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -1882,19 +2005,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
-                    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
-                    /* NV4097_GET_REPORT: (type << 24) | offset into the report
-                     * area. Sample counts are not measured, so a ZPASS query
-                     * reports "visible" -- the conservative answer; reading 0
-                     * tells the title every queried object is occluded. */
-                    if (m == 0x1800) {
-                        const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
-                        { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
-                        if (idx < CELL_GCM_MAX_REPORT_COUNT) {
-                            s_report_data[idx].timestamp = get_timestamp_ns();
-                            s_report_data[idx].value = (v >> 24) == 1u ? 0xFFFFu : 0u;
-                        }
+                    if (m == 0x50) {
+                        if(gcm_checked_ref_mode() && (count!=1 || method!=0x50)){gcm_checked_ref_fail("malformed-reference",s_fifo_getoff);continue;}
+                        if (gcm_checked_ref_mode() &&
+                            (!rsx_draw_engine_enabled() || rsx_draw_engine_flush_checked() != 1))
+                            gcm_checked_ref_fail("backend-completion", s_fifo_getoff);
+                        else gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
                     }
+                    if (m == 0x1A8u) s_report_dma = vm_read32(dea);
+                    if (m == 0x1800u) gcm_get_report(vm_read32(dea));
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
@@ -1904,6 +2023,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
+        if(gcm_checked_ref_mode()){gcm_checked_ref_fail("unknown-word",s_fifo_getoff);break;}
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
 
@@ -1981,7 +2101,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      *
      * ponytail: append the JUMP at `current` the way the SDK's own callback
      * does, rather than tracking a second copy of the ring's geometry. */
-    if (s_gcm_ctx_out_ea) {
+    if (s_gcm_ctx_out_ea && !gcm_checked_ref_mode()) {
         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
@@ -2057,7 +2177,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * If the overflow survives this, `get` is not what it consults. */
     { static int eq = -1;
       if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
-      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, (eq && !gcm_checked_ref_mode()) ? put : s_fifo_getoff); }
 
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
@@ -2295,8 +2415,15 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * it spins on `ref` for good. Safe when the walker has left the head of
      * the ring well behind, which is the region the guest writes next. */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
+    const u32 io_last = end > begin ? gcm_ea2io(end - 1) : 0xFFFFFFFFu;
+    /* A title can switch this context to another segment before GET leaves
+     * the previous one. A numerically higher GET outside this ring proves
+     * nothing about consumption of its head. Do not rewind that new segment
+     * or the closing SET_REFERENCE can be written behind the consumer. */
     if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
-        s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
+        io_last != 0xFFFFFFFFu && io_last >= io_begin && cur >= begin &&
+        (uint64_t)s_fifo_getoff >= (uint64_t)io_begin + GCM_RECYCLE_MARGIN &&
+        (uint64_t)s_fifo_getoff <= io_last) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
         return 1;
@@ -3087,6 +3214,7 @@ void cellGcmTerminate(void)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
+    s_report_dma = GCM_REPORT_DMA_LOCAL;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));

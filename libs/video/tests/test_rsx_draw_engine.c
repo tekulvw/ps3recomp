@@ -243,7 +243,7 @@ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
     if (w == 1 && h == 1) memcpy(out, g_stub_pixel, 4);
 }
 
-static const rsx_draw_backend g_stub_backend = {
+static rsx_draw_backend g_stub_backend = {
     .user = NULL,
     .init = stub_init,
     .shutdown = stub_shutdown,
