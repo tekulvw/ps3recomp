@@ -1700,6 +1700,84 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
  * render-to-texture read back through a texture unit), a unit naming a
  * tracked zeta in DEPTH24_D8 samples its snapshot, and everything else is a
  * guest upload (rsx_live_draw.c:5986-6062). */
+/* Bounded opt-in evidence. A trigger file permits arming after a menu opens;
+ * only metadata is logged, once per distinct descriptor and binding source. */
+static void eng_texture_descriptor_log(u32 unit, const rsx_dsp_texture* t,
+                                       u32 handle, const char* source,
+                                       const eng_surface* surface)
+{
+    enum { MAX_DESCRIPTORS = 512 };
+    static int configured, enabled, armed;
+    static u32 start_frame, limit = 128, count, checked_frame = UINT32_MAX;
+    static const char* trigger;
+    static u64 seen[MAX_DESCRIPTORS];
+    if (!configured) {
+        configured = 1;
+        const char* opt = getenv("PS3RECOMP_RSX_TEXTURE_DIAGNOSTICS");
+        enabled = opt && !strcmp(opt, "1");
+        if (!enabled) return;
+        trigger = getenv("PS3RECOMP_RSX_TEXTURE_DIAGNOSTICS_TRIGGER");
+        const char* frame = getenv("PS3RECOMP_RSX_TEXTURE_DIAGNOSTICS_START_FRAME");
+        const char* budget = getenv("PS3RECOMP_RSX_TEXTURE_DIAGNOSTICS_LIMIT");
+        char* end;
+        if (frame && *frame) {
+            unsigned long n = strtoul(frame, &end, 10);
+            if (!*end && n <= UINT32_MAX) start_frame = (u32)n;
+        }
+        if (budget && *budget) {
+            unsigned long n = strtoul(budget, &end, 10);
+            if (!*end && n && n <= MAX_DESCRIPTORS) limit = (u32)n;
+        }
+        armed = !trigger || !*trigger;
+    }
+    if (!enabled || count >= limit || g.frames < start_frame) return;
+    if (!armed && checked_frame != g.frames) {
+        checked_frame = g.frames;
+        FILE* f = fopen(trigger, "rb");
+        if (f) { fclose(f); armed = 1; }
+    }
+    if (!armed) return;
+    u64 key = eng_fnv1a(t, sizeof *t, 1469598103934665603ull);
+    key = eng_fnv1a(source, (u32)strlen(source), key);
+    if (surface) {
+        key = eng_fnv1a(&surface->w, sizeof surface->w, key);
+        key = eng_fnv1a(&surface->h, sizeof surface->h, key);
+        key = eng_fnv1a(&surface->fmt, sizeof surface->fmt, key);
+    }
+    for (u32 i = 0; i < count; i++) if (seen[i] == key) return;
+    seen[count++] = key;
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    const u32 n = t->width <= ENG_MAX_TEX_DIM && t->height <= ENG_MAX_TEX_DIM
+        ? rsx_texture_mip_chain(t->format, t->width, t->height,
+                               t->mipmaps, t->pitch, lv) : 0;
+    u64 hash = 0, generation = 0;
+    for (u32 i = 0; i < g.n_textures; i++)
+        if (g.textures[i].handle == handle) {
+            hash = g.textures[i].content_hash;
+            generation = g.textures[i].dirty_generation;
+            break;
+        }
+    fprintf(stderr, "[rsx texture descriptor] frame=%u unit=%u source=%s handle=%u "
+            "loc=%u offset=%08X fmt=%02X size=%ux%u pitch=%u "
+            "advertised_mips=%u effective_mips=%u compressed=%d "
+            "linear=%u unnormalized=%u dimension=%u cube=%u "
+            "filter=%08X control0=%08X remap=%08X wrap=%08X "
+            "surface_size=%ux%u surface_format=%u picture_identity=%llu "
+            "hash=%016llX generation=%llu mips=",
+            g.frames, unit, source, handle, t->location, t->offset, t->format,
+            t->width, t->height, t->pitch, t->mipmaps, n,
+            n ? lv[0].tl.compressed : 0, !!(t->format & 0x20u),
+            !!(t->format & 0x40u), t->dimension, t->cubemap,
+            t->filter, t->control0, t->remap, t->wrap,
+            surface ? surface->w : 0, surface ? surface->h : 0,
+            surface ? (u32)surface->fmt : 0,
+            (unsigned long long)s_picture_bound[unit],
+            (unsigned long long)hash, (unsigned long long)generation);
+    for (u32 m = 0; m < n; m++)
+        fprintf(stderr, "%s%u:%u:%u", m ? "," : "", m, lv[m].offset, lv[m].tl.row_bytes);
+    fputc('\n', stderr);
+}
+
 static void eng_picture_resolve(u32 unit)
 {
     if(!s_picture_offset_pending[unit])return;
@@ -1731,6 +1809,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         if(s_picture_bound[u] || pic_requires_identity(t.location,t.offset,eng_texture_span(t.format,t.width,t.height,t.mipmaps,t.pitch,(int)t.cubemap))){
             textures[u]=eng_texture_slot(t.location,t.offset,t.format,t.width,t.height,
                 t.mipmaps,t.pitch,(int)t.cubemap,t.remap & 0xffffu,s_picture_bound[u]);
+            eng_texture_descriptor_log(u, &t, textures[u], "picture", NULL);
             continue;
         }
 
@@ -1789,6 +1868,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                      t.remap & 0xFFFFu, t.format)
                 : 0;
             textures[u] = view ? view : g.surfaces[sampled].handle;
+            eng_texture_descriptor_log(u, &t, textures[u], "surface", &g.surfaces[sampled]);
             continue;
         }
         if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
@@ -1799,11 +1879,15 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                     if (snap) textures[u] = snap;
                     break;
                 }
-            if (textures[u]) continue;
+            if (textures[u]) {
+                eng_texture_descriptor_log(u, &t, textures[u], "depth", NULL);
+                continue;
+            }
         }
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                        t.width, t.height, t.mipmaps, t.pitch,
                                        (int)t.cubemap, t.remap & 0xFFFFu,s_picture_bound[u]);
+        eng_texture_descriptor_log(u, &t, textures[u], "upload", NULL);
     }
     return mask;
 }
