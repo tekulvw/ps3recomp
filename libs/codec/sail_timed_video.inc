@@ -1,16 +1,25 @@
-/* Opt-in bounded retail THX producer. Every callback runs on the caller's
+/* Opt-in bounded retail THX and MAG intro producer. Every callback runs on the caller's
  * original guest thread, under the descriptor mutation guard, outside locks. */
 #if defined(PS3RECOMP_SAIL_FFMPEG) && PS3RECOMP_SAIL_FFMPEG
 extern int sail_video_open(FILE*,uint64_t,uint64_t,unsigned,SailVideoDecoder**);
 extern int sail_video_next(SailVideoDecoder*,SailVideoFrame*);
 extern void sail_video_close(SailVideoDecoder*);
 #define SAIL_THX_BYTES (5120u*720u)
-#define SAIL_THX_PICTURES 179u
+typedef struct SailTimedProfile {
+    const char* name;
+    u32 pictures;
+} SailTimedProfile;
+/* Verified retail profiles share format and cadence. Neither a basename nor
+ * header duration alone admits an arbitrary frame count or terminal timestamp. */
+static const SailTimedProfile s_timed_profiles[] = {
+    {"thx.pam",179u}, {"mag_intro.pam",1806u}
+};
 typedef struct SailTimedSlot {
     u32 buffer, location, offset;
     u64 identity, retire_poll;
 } SailTimedSlot;
 typedef struct SailTimedVideo {
+    const SailTimedProfile* profile;
     SailHeldFrame callbacks;
     SailVideoDecoder* decoder;
     SailVideoFrame pending;
@@ -117,18 +126,18 @@ static s32 sail_timed_allocate(SailTimedVideo* t,unsigned requested) {
     }
     return CELL_OK;
 }
-static int sail_timed_metadata(const SailVideoFrame* p,unsigned ordinal) {
-    return p->rgba && p->ordinal==ordinal && ordinal<=SAIL_THX_PICTURES &&
+static int sail_timed_metadata(const SailTimedVideo* t,const SailVideoFrame* p,unsigned ordinal) {
+    return p->rgba && p->ordinal==ordinal && ordinal<=t->profile->pictures &&
         p->width==1280 && p->height==720 && p->pitch==5120 && p->colorspace==1 &&
         p->color_range==1 && !p->interlaced && p->time_base_num==1 && p->time_base_den==90000 &&
         p->rate_num==30000 && p->rate_den==1001 && p->duration==3003 &&
-        ((ordinal<SAIL_THX_PICTURES && p->pts_valid && p->pts==90000+(s64)(ordinal-1)*3003) ||
-         (ordinal==SAIL_THX_PICTURES && !p->pts_valid && p->pts==INT64_MIN));
+        ((ordinal<t->profile->pictures && p->pts_valid && p->pts==90000+(s64)(ordinal-1)*3003) ||
+         (ordinal==t->profile->pictures && !p->pts_valid && p->pts==INT64_MIN));
 }
 static s32 sail_timed_next(SailTimedVideo* t) {
     const int result=sail_video_next(t->decoder,&t->pending);
-    if(result || !sail_timed_metadata(&t->pending,t->ordinal+1))return SAIL_DESC_NOT_AVAILABLE;
-    if(t->pending.ordinal==SAIL_THX_PICTURES){
+    if(result || !sail_timed_metadata(t,&t->pending,t->ordinal+1))return SAIL_DESC_NOT_AVAILABLE;
+    if(t->pending.ordinal==t->profile->pictures){
         SailVideoFrame extra={0};const int tail=sail_video_next(t->decoder,&extra);
         sail_video_frame_release(&extra);
         if(tail!=SAIL_VIDEO_EOF)return SAIL_DESC_NOT_AVAILABLE;
@@ -146,8 +155,8 @@ static s32 sail_timed_publish(SailTimedVideo* t,int n) {
     if(rc)return rc;
     if(t->current>=0)t->slots[t->current].retire_poll=sail_timed_poll(t->callbacks.player)+2;
     t->current=n;t->ordinal=frame->ordinal;
-    fprintf(stderr,"[cellSail] TimedFrame publish ordinal=%u buffer=%08X identity=%llu pts=%lld ptsValid=%d clock=%llu deadline=%llu terminalCadence=%d\n",
-        t->ordinal,p->buffer,(unsigned long long)p->identity,(long long)frame->pts,frame->pts_valid,
+    fprintf(stderr,"[cellSail] TimedFrame publish movie=%s ordinal=%u buffer=%08X identity=%llu pts=%lld ptsValid=%d clock=%llu deadline=%llu terminalCadence=%d\n",
+        t->profile->name,t->ordinal,p->buffer,(unsigned long long)p->identity,(long long)frame->pts,frame->pts_valid,
         (unsigned long long)ppu_system_time_us(),(unsigned long long)(t->anchor+(u64)(t->ordinal-1)*1001000/30),!frame->pts_valid);
     sail_video_frame_release(frame);return CELL_OK;
 }
@@ -172,11 +181,14 @@ static s32 sail_timed_start(u32 player,u32 command,u64 token) {
     }
     if(!d)return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
     const char* base=strrchr(d->uri,'/');
-    if(sail_held_enabled() || !base || strcmp(base+1,"thx.pam") || !d->media || !d->selections[1].valid ||
+    const SailTimedProfile* profile=NULL;
+    if(base)for(unsigned i=0;i<sizeof(s_timed_profiles)/sizeof(s_timed_profiles[0]);++i)
+        if(!strcmp(base+1,s_timed_profiles[i].name)){profile=&s_timed_profiles[i];break;}
+    if(sail_held_enabled() || !profile || !d->media || !d->selections[1].valid ||
         d->selections[1].stream[0]!=2 || d->selections[1].stream[4]!=0xE0 || !g_ps3_guest_caller ||
         !s_sail_players[slot].callback_ea || !sail_video_available() || !cellGcm_checked_reference_ready())
         return sail_timed_reject(slot,player,token,SAIL_DESC_NOT_AVAILABLE);
-    memset(t,0,sizeof(*t));t->current=-1;
+    memset(t,0,sizeof(*t));t->current=-1;t->profile=profile;
     s32 rc=sail_graphics_begin_session(player,&h->graphics,&h->session);
     if(rc)return sail_timed_reject(slot,player,token,rc);
     h->active=1;h->player=player;h->alloc_opd=s_sail_players[slot].allocator_alloc_opd;
@@ -203,7 +215,7 @@ static s32 sail_timed_start(u32 player,u32 command,u64 token) {
     if(owned<3)return sail_timed_reject(slot,player,token,SAIL_DESC_MEMORY);
     rc=sail_held_invoke(h,h->graphics.callbacks[2],h->graphics.arg_ea,h->scratch,h->session,0,&result);
     if(rc)return sail_timed_reject(slot,player,token,rc);
-    t->anchor=ppu_system_time_us();t->final_deadline=t->anchor+(u64)SAIL_THX_PICTURES*1001000/30;
+    t->anchor=ppu_system_time_us();t->final_deadline=t->anchor+(u64)t->profile->pictures*1001000/30;
     rc=sail_timed_publish(t,0);if(rc)return sail_timed_reject(slot,player,token,rc);
     s_sail_players[slot].state=CELL_SAIL_PLAYER_STATE_RUNNING;s_sail_players[slot].stream_event_busy=1;
     sail_descriptor_result(CELL_OK);
@@ -220,20 +232,21 @@ static void sail_timed_pump(u32 player) {
     if(!sail_descriptor_enter())return;
     t->pumping=1;s32 rc=CELL_OK;
     if(!cellGcm_checked_reference_ready()){rc=SAIL_DESC_NOT_AVAILABLE;goto failed;}
-    if(t->ordinal==SAIL_THX_PICTURES){
+    if(t->ordinal==t->profile->pictures){
         if(!t->eof){rc=SAIL_DESC_NOT_AVAILABLE;goto failed;}
         const u64 selected=sail_timed_first_poll(player);
         const u64 hold_end=selected+(1001000+29)/30;
         if(!selected || ppu_system_time_us()<t->final_deadline || ppu_system_time_us()<hold_end)goto done;
-        fprintf(stderr,"[cellSail] TimedTHX final duration nominalEnd=%llu selected=%llu holdEnd=%llu clock=%llu\n",
-            (unsigned long long)t->final_deadline,(unsigned long long)selected,(unsigned long long)hold_end,(unsigned long long)ppu_system_time_us());
+        fprintf(stderr,"[cellSail] TimedVideo final duration movie=%s nominalEnd=%llu selected=%llu holdEnd=%llu clock=%llu\n",
+            t->profile->name,(unsigned long long)t->final_deadline,(unsigned long long)selected,(unsigned long long)hold_end,(unsigned long long)ppu_system_time_us());
+        const SailTimedProfile* completed=t->profile;
         rc=sail_timed_release_locked(player);if(rc)goto failed;
         s_sail_players[slot].state=CELL_SAIL_PLAYER_STATE_FINISHED;s_sail_players[slot].stream_event_busy=1;
         sail_descriptor_result(CELL_OK);
         sail_stream_notify(slot,SAIL_EV_STATE_CHANGED,0,SAIL_ST_STOP_TRANSITION,0);
         sail_stream_notify(slot,SAIL_EV_STATE_CHANGED,0,SAIL_ST_OPENED,0);
         s_sail_players[slot].stream_event_busy=0;
-        fprintf(stderr,"[cellSail] TimedTHX genuine EOF cleanup pictures=179 clock=%llu\n",(unsigned long long)ppu_system_time_us());return;
+        fprintf(stderr,"[cellSail] TimedVideo genuine EOF cleanup movie=%s pictures=%u clock=%llu\n",completed->name,completed->pictures,(unsigned long long)ppu_system_time_us());return;
     }
     /* Retire only replaced pictures after two frame-bearing polls. Immutable
      * descriptor/command references remain independent after original free. */
@@ -255,7 +268,7 @@ done:
     t->pumping=0;sail_descriptor_result(CELL_OK);return;
 failed:
     t->pumping=0;
-    fprintf(stderr,"[cellSail] TimedTHX failed=%08X ordinal=%u\n",(u32)rc,t->ordinal);
+    fprintf(stderr,"[cellSail] TimedVideo failed=%08X movie=%s ordinal=%u\n",(u32)rc,t->profile?t->profile->name:"none",t->ordinal);
     sail_timed_reject(slot,player,0,rc);
 }
 static s32 sail_timed_stop(u32 player,u64 token) {
