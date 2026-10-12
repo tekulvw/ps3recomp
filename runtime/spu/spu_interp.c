@@ -113,6 +113,7 @@ static int spu_step(spu_context* ctx) {
                   | ((uint32_t)p[m+2] << 8) | p[m+3];
     spu_ins d; spu_decode1(insn, pc, &d);
     uint32_t next = pc + 4;
+    int indirect_taken = 0;
 
     switch (d.op) {
     /* immediates / loads */
@@ -293,13 +294,15 @@ static int spu_step(spu_context* ctx) {
     case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
     case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
     case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) next = d.tgt; break;
-    case SPU_bi:   next = PREF(A) & 0x3FFFC; break;
-    case SPU_bisl: DST = spu_link(pc + 4); next = PREF(A) & 0x3FFFC; break;
-    case SPU_iret: next = ctx->srr0 & 0x3FFFC; break;
-    case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) next = PREF(A) & 0x3FFFC; break;
+    case SPU_bi:   indirect_taken = 1; next = PREF(A) & 0x3FFFC; break;
+    case SPU_bisl:
+        indirect_taken = 1; next = PREF(A) & 0x3FFFC;
+        DST = spu_link(pc + 4); break; /* RA may alias the link destination. */
+    case SPU_iret: indirect_taken = 1; next = ctx->srr0 & 0x3FFFC; break;
+    case SPU_biz:  if (PREF(DST) == 0) { indirect_taken = 1; next = PREF(A) & 0x3FFFC; } break;
+    case SPU_binz: if (PREF(DST) != 0) { indirect_taken = 1; next = PREF(A) & 0x3FFFC; } break;
+    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) { indirect_taken = 1; next = PREF(A) & 0x3FFFC; } break;
+    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) { indirect_taken = 1; next = PREF(A) & 0x3FFFC; } break;
     case SPU_stop: case SPU_stopd:
         ctx->pc = next; ctx->stop_code = (uint32_t)I;
         ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
@@ -318,6 +321,14 @@ static int spu_step(spu_context* ctx) {
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
                 d.op < SPU_OP_COUNT ? spu_op_name[d.op] : "?", insn, pc);
         ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1;
+    }
+    /* SPU ISA v1.2 pp178-179,181,186-189,251: E/D applies on a taken
+     * indirect branch, including a target equal to fallthrough. E/D=11 is
+     * reserved; this interpreter makes no guarantee for that encoding. */
+    if (indirect_taken) {
+        unsigned ed = (insn >> 18) & 3u;
+        if (ed == 1) ctx->int_enable = 1;
+        else if (ed == 2) ctx->int_enable = 0;
     }
     ctx->pc = next;
     return 0;
