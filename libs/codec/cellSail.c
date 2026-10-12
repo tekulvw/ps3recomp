@@ -251,6 +251,13 @@ static s32 sail_graphics_detach_player(u32 player)
 #define SAIL_SOUND_MEMORY        ((s32)0x806107F0u)
 #define SAIL_SOUND_MAX 16
 static u32 s_sound_adapters[SAIL_SOUND_MAX];
+static struct {u32 player,arg,callbacks[3];} s_sound_configs[SAIL_SOUND_MAX];
+static s32 sail_audio_get_frame_locked(int,u32,u32);
+static s32 sail_audio_get_format_locked(int,u32);
+static s32 sail_audio_time_locked(int,u64,u32);
+static int sail_audio_busy_locked(int);
+static s32 sail_audio_release_locked(u32);
+
 static atomic_flag s_sound_lock = ATOMIC_FLAG_INIT;
 extern u32 ppu_vm_size; /* zero denotes the full 4 GiB guest address space */
 
@@ -277,6 +284,7 @@ static void sail_sound_reset(void)
 {
     sail_sound_lock();
     memset(s_sound_adapters, 0, sizeof(s_sound_adapters));
+    memset(s_sound_configs,0,sizeof(s_sound_configs));
     sail_sound_unlock();
 }
 
@@ -543,12 +551,15 @@ s32 cellSailPlayerGetStreamInfo(CellSailPlayerHandle handle, u32 streamIndex,
  * going to exit. Look the player up the way Initialize2 stored it. */
 s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
 {
-    (void)index; (void)adapter;
-    u32 self_ea = (u32)handle;
-    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
-        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
-            return CELL_OK;
-    return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if(sail_player_slot((u32)handle)<0)return SAIL_SOUND_INVALID_ARG;
+    if(index!=0)return ((s32)0x80610708u);
+    const u32 ea=(u32)(uintptr_t)adapter;
+    sail_sound_lock();const int slot=sail_sound_slot(ea);
+    s32 rc=SAIL_SOUND_INVALID_STATE;
+    if(ea && slot>=0 && !sail_audio_busy_locked(slot)){
+        s_sound_configs[slot].player=(u32)handle;rc=CELL_OK;
+    }
+    sail_sound_unlock();return rc;
 }
 
 /* r3 is a CellSailPlayer* -- a GUEST POINTER, the same `pSelf` that
@@ -714,6 +725,8 @@ static s32 sail_stream_lifecycle(u32 player, u64 userParam, int close_stream)
     if (!g_ps3_guest_caller || !s_sail_players[slot].callback_ea)
         return sail_descriptor_result(SAIL_DESC_NOT_AVAILABLE);
     if (close_stream) {
+        const s32 audio_release=sail_audio_release_locked(player);
+        if(audio_release)return sail_descriptor_result(audio_release);
         const s32 timed_release=sail_timed_release_locked(player);
         if(timed_release)return sail_descriptor_result(timed_release);
         const s32 held_release = sail_held_release_locked(player);
@@ -1151,7 +1164,6 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
 /* Opaque sound adapters are keyed by guest EA; no decoded buffers exist. */
 s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
 {
-    (void)pArg;
     printf("[cellSail] SoundAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
            pSelf, pCallbacks);
     if (!sail_sound_range(pSelf, SAIL_ADAPTER_CLEAR))
@@ -1166,7 +1178,11 @@ s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
         sail_sound_unlock();
         return SAIL_SOUND_MEMORY;
     }
+    if(pCallbacks && !sail_sound_range(pCallbacks,12)){sail_sound_unlock();return SAIL_SOUND_INVALID_ARG;}
     sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
+    memset(&s_sound_configs[slot],0,sizeof(s_sound_configs[slot]));
+    s_sound_configs[slot].arg=pArg;
+    if(pCallbacks)for(int i=0;i<3;++i)s_sound_configs[slot].callbacks[i]=vm_read32(pCallbacks+4*i);
     s_sound_adapters[slot] = pSelf;
     sail_sound_unlock();
     return CELL_OK;
@@ -1178,7 +1194,8 @@ s32 cellSailSoundAdapterFinalize(u32 pSelf)
         return SAIL_SOUND_INVALID_ARG;
     sail_sound_lock();
     const int slot = sail_sound_slot(pSelf);
-    if (slot >= 0) s_sound_adapters[slot] = 0;
+    if(slot>=0 && sail_audio_busy_locked(slot)){sail_sound_unlock();return SAIL_SOUND_INVALID_STATE;}
+    if (slot >= 0){s_sound_adapters[slot] = 0;memset(&s_sound_configs[slot],0,sizeof(s_sound_configs[slot]));}
     sail_sound_unlock();
     return slot >= 0 ? CELL_OK : SAIL_SOUND_INVALID_STATE;
 }
@@ -1196,16 +1213,21 @@ s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo)
     sail_sound_lock();
     const int slot = sail_sound_slot(pSelf);
     if (slot >= 0) sail_zero_guest(pInfo, 24);
-    /* Bounded stderr evidence survives a later strict-HLE halt. No per-frame
-     * log flood and no change to player events, playback state, or callbacks. */
-    static unsigned logged;
-    if (logged < 6) {
-        ++logged;
-        fprintf(stderr, "[cellSail] SoundAdapterGetFrame(self=%08X samples=%u info=%08X) -> %s\n",
-                pSelf, samples, pInfo, slot >= 0 ? "NO_FRAME (decoder unavailable)" : "INVALID_STATE");
-    }
-    sail_sound_unlock();
-    return slot >= 0 ? CELL_SAIL_SYNC_NO_FRAME : SAIL_SOUND_INVALID_STATE;
+    const s32 rc=slot>=0?sail_audio_get_frame_locked(slot,samples,pInfo):SAIL_SOUND_INVALID_STATE;
+    sail_sound_unlock();return rc;
+}
+
+/* Original firmware sound exports copy 24-byte PCM format and convert the
+ * PAMF-origin-relative PTS using the same wrapping arithmetic as graphics. */
+s32 cellSailSoundAdapterGetFormat(u32 pSelf,u32 pFormat){
+    if(!sail_sound_range(pSelf,SAIL_ADAPTER_CLEAR) || !sail_sound_range(pFormat,24))return SAIL_SOUND_INVALID_ARG;
+    sail_sound_lock();int i=sail_sound_slot(pSelf);s32 rc=i<0?SAIL_SOUND_INVALID_STATE:sail_audio_get_format_locked(i,pFormat);
+    sail_sound_unlock();return rc;
+}
+s32 cellSailSoundAdapterPtsToTimePosition(u32 pSelf,u64 pts,u32 pTime){
+    if(!sail_sound_range(pSelf,SAIL_ADAPTER_CLEAR) || !sail_sound_range(pTime,8))return SAIL_SOUND_INVALID_ARG;
+    sail_sound_lock();int i=sail_sound_slot(pSelf);s32 rc=i<0?SAIL_SOUND_INVALID_STATE:sail_audio_time_locked(i,pts,pTime);
+    sail_sound_unlock();return rc;
 }
 
 /* cellSailGraphicsAdapterInitialize(pSelf, pCallbacks, pArg)
@@ -1583,4 +1605,5 @@ s32 sail_graphics_unpublish_frame(u32 player)
 
 #include "sail_held_frame.inc"
 
+#include "sail_audio_adapter.inc"
 #include "sail_timed_video.inc"

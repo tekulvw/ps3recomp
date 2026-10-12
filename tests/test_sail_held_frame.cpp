@@ -189,3 +189,6 @@ int main(int argc,char**argv) {
  CHECK(call(0x18B4629D,0x1000)==0);CHECK(call(0x76488BB1,0x1800)==0);
  std::printf("%u held frame callback/lifetime checks PASS\n",checks);return 0;
 }
+
+extern "C" int sail_audio_decode_pcm(FILE*,uint64_t,uint64_t,unsigned,SailAudioPCM*){return SAIL_VIDEO_UNAVAILABLE;}
+extern "C" void sail_audio_pcm_release(SailAudioPCM*a){std::free(a->samples);std::memset(a,0,sizeof(*a));}
