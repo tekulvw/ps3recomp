@@ -3,6 +3,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
+#ifndef RSX_PICTURE_HAS_RETAIN
+int rsx_picture_retain(u64 token){(void)token;return 0;}
+#endif
 #ifdef RSX_HAS_PICTURE_IDENTITIES
 #include "../rsx_picture_identity.inc"
 #else
@@ -45,6 +48,7 @@ int main(int argc,char**argv){
 #endif
     u64 first=rsx_picture_create(0x1000,1,0x2000,32,a);assert(first);
 #ifdef RSX_HAS_PICTURE_IDENTITIES
+    assert(rsx_picture_retain(first)==1);rsx_picture_release(first);
     assert(rsx_picture_bind_descriptor(0x3000,first)==1);
     assert(rsx_picture_capture_command(0x4004,0x3000,1,0x2000)==1);assert(pic_pending_command(0x4004));
     rsx_picture_release(first);
