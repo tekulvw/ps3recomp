@@ -31,6 +31,11 @@ static u64 sail_timed_poll(u32 player) {
         }
     sail_graphics_unlock();return tag;
 }
+static u64 sail_timed_first_poll(u32 player) {
+    u64 time=0;sail_graphics_lock();
+    for(int i=0;i<SAIL_GRAPHICS_MAX;++i)if(s_graphics_adapters[i] && s_graphics_configs[i].player_ea==player){time=s_graphics_frames[i].first_poll_us;break;}
+    sail_graphics_unlock();return time;
+}
 static s32 sail_timed_free_slot(SailTimedVideo* t,int n) {
     SailTimedSlot* p=&t->slots[n];
     if(!p->buffer)return CELL_OK;
@@ -217,7 +222,11 @@ static void sail_timed_pump(u32 player) {
     if(!cellGcm_checked_reference_ready()){rc=SAIL_DESC_NOT_AVAILABLE;goto failed;}
     if(t->ordinal==SAIL_THX_PICTURES){
         if(!t->eof){rc=SAIL_DESC_NOT_AVAILABLE;goto failed;}
-        if(ppu_system_time_us()<t->final_deadline)goto done;
+        const u64 selected=sail_timed_first_poll(player);
+        const u64 hold_end=selected+(1001000+29)/30;
+        if(!selected || ppu_system_time_us()<t->final_deadline || ppu_system_time_us()<hold_end)goto done;
+        fprintf(stderr,"[cellSail] TimedTHX final duration nominalEnd=%llu selected=%llu holdEnd=%llu clock=%llu\n",
+            (unsigned long long)t->final_deadline,(unsigned long long)selected,(unsigned long long)hold_end,(unsigned long long)ppu_system_time_us());
         rc=sail_timed_release_locked(player);if(rc)goto failed;
         s_sail_players[slot].state=CELL_SAIL_PLAYER_STATE_FINISHED;s_sail_players[slot].stream_event_busy=1;
         sail_descriptor_result(CELL_OK);
