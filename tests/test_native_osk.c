@@ -35,7 +35,62 @@ static uint16_t read16(uint32_t a){uint16_t x;memcpy(&x,memory+a,2);return __bui
 static int32_t load(void){return cellOskDialogLoadAsync(-1,(void*)0x1100,(void*)0x1000);}
 static void result_at(uint32_t capacity){vm_write32(0x1200,0xA5A5A5A5);vm_write32(0x1204,capacity);vm_write32(0x1208,0x2200);}
 static void* background_finish(void* text){osk_native_did_finish(request.token,0,text,4);return NULL;}
-int main(void){
+static void guest_name(void){
+ const uint16_t name[]={'P','l','a','y','e','r',0};
+ for(unsigned i=0;i<sizeof(name)/sizeof(name[0]);i++)put16(0x2100+i*2,name[i]);
+}
+static void assert_initial(const uint16_t* want){
+ unsigned i=0;do {assert(request.initial[i]==want[i]);}while(want[i++]);
+}
+static void abort_and_unload(void){
+ assert(!cellOskDialogAbort());cellSysutilCheckCallback();result_at(32);
+ assert(!cellOskDialogUnloadAsync((void*)0x1200));cellSysutilCheckCallback();
+}
+/* Request/mailbox boundary test: an explicit host prefill must not submit text,
+ * change the guest default, affect secure fields, or overwrite later input. */
+static int initial_text_case(const char* mode){
+ const uint16_t original[]={'P','l','a','y','e','r',0};
+ const uint16_t ascii[]={'P','l','a','y','e','r','R','e','t','a','i','l',0};
+ const uint16_t unicode[]={'A',0xA2,0x03A9,0x20AC,0xD83D,0xDE80,0};
+ const uint16_t pair[]={'A',0xD83D,0xDE80,0},prefix[]={'A',0},empty[]={0};
+ const uint16_t edited[]={'E','d','i','t',0};
+ const uint16_t* want=ascii;uint32_t limit=32;uint16_t maximum[512]={0};
+ if(!strcmp(mode,"unicode"))want=unicode;
+ else if(!strcmp(mode,"pair")){want=pair;limit=3;}
+ else if(!strcmp(mode,"split")){want=prefix;limit=2;}
+ else if(!strcmp(mode,"zero")){want=empty;limit=0;}
+ else if(!strcmp(mode,"empty"))want=empty;
+ else if(!strcmp(mode,"unchanged"))want=original;
+ else if(!strcmp(mode,"maximum")){
+  for(unsigned i=0;i<510;i++)maximum[i]='a';want=maximum;limit=512;
+ }
+ else assert(!strcmp(mode,"ascii"));
+ memset(memory,0,sizeof(memory));
+ vm_write32(0x1000,0x2000);vm_write32(0x1004,0x2100);vm_write32(0x1008,32);
+ put16(0x2000,'N');guest_name();
+ vm_write32(0x1100,0x20000000);assert(!load());assert_initial(original);
+ vm_write32(0x1100,0);assert(load()==(int32_t)0x8002B105); // busy cannot consume the option
+ abort_and_unload();
+ vm_write32(0x1008,513);assert(load()==(int32_t)0x8002B504);
+ vm_write32(0x1008,limit);available=0;assert(load()==(int32_t)0x8002B503);available=1;
+ assert(!load());assert_initial(want);
+ for(unsigned i=0;i<7;i++)assert(read16(0x2100+i*2)==original[i]); // copied host default only
+ osk_native_did_open(request.token);cellSysutilCheckCallback();
+ for(unsigned i=0;i<10;i++)cellSysutilCheckCallback();
+ result_at(32);assert(!cellOskDialogGetInputText((void*)0x1200));assert(read32(0x1200)==3);
+ assert(cellOskDialogUnloadAsync((void*)0x1200)==(int32_t)0x8002B105); // still needs confirmation
+ osk_native_did_finish(request.token,1,NULL,0);cellSysutilCheckCallback();
+ assert(!cellOskDialogUnloadAsync((void*)0x1200));assert(read32(0x1200)==1);cellSysutilCheckCallback();
+ assert(!setenv("PS3RECOMP_OSK_INITIAL_TEXT","Late replacement",1));
+ vm_write32(0x1008,32);assert(!load());assert_initial(original);
+ osk_native_did_open(request.token);cellSysutilCheckCallback();
+ osk_native_did_finish(request.token,0,edited,4);cellSysutilCheckCallback();result_at(32);
+ assert(!cellOskDialogUnloadAsync((void*)0x1200));assert(read32(0x1200)==0);
+ for(unsigned i=0;i<5;i++)assert(read16(0x2200+i*2)==edited[i]);cellSysutilCheckCallback();
+ printf("Native OSK initial text case %s passed\n",mode);return 0;
+}
+int main(int argc,char** argv){
+ if(argc==2)return initial_text_case(argv[1]);
  memset(memory,0xA5,sizeof(memory));
  vm_write32(0x1000,0x2000);vm_write32(0x1004,0x2100);vm_write32(0x1008,32);
  put16(0x2000,'N');put16(0x2002,0);put16(0x2100,0);
