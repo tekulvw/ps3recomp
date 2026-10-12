@@ -663,6 +663,30 @@ static void test_remap_g8b8_lanes(void)
     for (int i = 0; i < 4; i++) CHECK_EQ(n[i], m[i]);
 }
 
+/* B8 uploads its one byte to host R, while RSX presents {1,B,B,B}.
+ * Treating it as RGBA makes MAG's 0x02FF font crossbar read absent host B
+ * into alpha, so every glyph disappears despite nonempty atlas bytes. */
+static void test_remap_b8_lanes(void)
+{
+    const u32 formats[] = {FMT_B8, FMT_B8 | FMT_LN, FMT_B8 | 0x40u};
+    for (u32 f = 0; f < sizeof(formats) / sizeof(formats[0]); ++f) {
+        u8 m[4];
+        rsx_texture_component_remap(0xAAE4u, formats[f], m);
+        CHECK_EQ(m[A_], RSX_REMAP_ONE);
+        CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0);
+        rsx_texture_component_remap(0x02FFu, formats[f], m);
+        CHECK_EQ(m[A_], 0);
+        CHECK_EQ(m[R_], RSX_REMAP_ZERO);
+        CHECK_EQ(m[G_], RSX_REMAP_ZERO);
+        CHECK_EQ(m[B_], RSX_REMAP_ZERO);
+        /* Selecting guest alpha must produce constant one, not the byte. */
+        rsx_texture_component_remap(0xAA00u, formats[f], m);
+        for (int i = 0; i < 4; ++i) CHECK_EQ(m[i], RSX_REMAP_ONE);
+        rsx_texture_component_remap(0x55FFu, formats[f], m);
+        for (int i = 0; i < 4; ++i) CHECK_EQ(m[i], RSX_REMAP_ONE);
+    }
+}
+
 /* Compressed formats decode to RGBA, so they use the same lanes as A8R8G8B8 --
  * NOT a bent table cancelling a reversed crossbar, which is how the old bug
  * hid on DXT while breaking everything else. */
@@ -705,6 +729,7 @@ int main(void)
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();
+    test_remap_b8_lanes();
     test_remap_dxt_matches_argb();
     test_remap_rejects_null();
 
