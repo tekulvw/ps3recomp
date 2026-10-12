@@ -83,8 +83,8 @@ s32 cellSailPlayerDestroy(CellSailPlayerHandle handle);
 s32 cellSailPlayerFinalize(u32 pSelf);
 
 s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam);
-s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, const char* path);
-s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle);
+s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, u64 userParam);
+s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle, u64 userParam);
 
 s32 cellSailPlayerStart(CellSailPlayerHandle handle);
 s32 cellSailPlayerStop(CellSailPlayerHandle handle);

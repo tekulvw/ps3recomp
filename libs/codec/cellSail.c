@@ -39,6 +39,7 @@ static struct {
     /* The input callback table may live on the initialization caller's stack. */
     u32 allocator_callbacks_ea, allocator_alloc_opd, allocator_free_opd, allocator_arg;
     int in_use; int state;
+    atomic_int stream_event_busy;
 }
     s_sail_players[CELL_SAIL_PLAYER_MAX];
 
@@ -172,39 +173,17 @@ s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
     return CELL_OK;
 }
 
-s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, const char* path)
+/* The URI belongs to an added descriptor. r4 is the asynchronous user token,
+ * not a guest string. Only one already-opened local PAMF source is supported. */
+static s32 sail_stream_lifecycle(u32 player, u64 userParam, int close_stream);
+s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, u64 userParam)
 {
-    /* path is a GUEST address; printing it as a host char* faulted here the
-     * same way it did in CreateDescriptor. Copy it out of guest memory. */
-    char path_host[512];
-    path_host[0] = '\0';
-    if (path) {
-        u32 ea = (u32)(uintptr_t)path;
-        size_t n = 0;
-        while (n < sizeof(path_host) - 1) {
-            char c = (char)vm_read8(ea + (u32)n);
-            if (!c) break;
-            path_host[n++] = c;
-        }
-        path_host[n] = '\0';
-    }
-    printf("[cellSail] PlayerOpenStream(%u, \"%s\") - stub\n", handle,
-           path ? path_host : "null");
-    const int _sp = sail_player_slot((u32)handle);
-    if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    /* Stub: don't actually open anything */
-    sail_call(_sp, SAIL_CALL_OPEN_STREAM, SAIL_ST_OPEN_TRANSITION, SAIL_ST_OPENED);
-    return CELL_OK;
+    return sail_stream_lifecycle(handle, userParam, 0);
 }
 
-s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
+s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle, u64 userParam)
 {
-    const int _sp = sail_player_slot((u32)handle);
-    if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    sail_call(_sp, SAIL_CALL_CLOSE_STREAM, SAIL_ST_CLOSE_TRANSITION, SAIL_ST_CLOSED);
-    return CELL_OK;
+    return sail_stream_lifecycle(handle, userParam, 1);
 }
 
 s32 cellSailPlayerStart(CellSailPlayerHandle handle)
@@ -361,6 +340,8 @@ typedef struct {
     u64 file_size;
     FILE* media;
     int opened;
+    int stream_open, close_pending;
+    atomic_int close_notified;
 } SailDescriptor;
 
 static SailDescriptor s_descs[MAX_DESCRIPTORS];
@@ -406,11 +387,76 @@ static int sail_owned_descriptor(u32 player, u32 desc)
            s_descs[desc].in_use && s_descs[desc].player == player;
 }
 
+/* A metadata-backed stream is not a decoder. These events describe source
+ * open/close only; Start remains a separate, currently stubbed playback API.
+ * Close retains guest metadata until the queued STREAM_CLOSED consumer calls
+ * DestroyDescriptor. No descriptor lock is held while invoking guest code. */
+static void sail_stream_notify(int slot, u32 major, u32 minor, u64 arg0, u64 arg1)
+{
+    if (g_ps3_guest_caller && s_sail_players[slot].callback_ea)
+        g_ps3_guest_caller(s_sail_players[slot].callback_ea,
+            s_sail_players[slot].arg_ea, ((u64)major << 32) | minor,
+            arg0, arg1, 0, 0, 0, 0);
+}
+
+static s32 sail_stream_lifecycle(u32 player, u64 userParam, int close_stream)
+{
+    if (!sail_descriptor_enter()) return SAIL_DESC_INVALID_STATE;
+    const int slot = sail_player_slot(player);
+    if (slot < 0) return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
+    if (s_sail_players[slot].stream_event_busy)
+        return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
+    int desc = -1;
+    for (int i = 0; i < MAX_DESCRIPTORS; ++i) {
+        SailDescriptor* d = &s_descs[i];
+        if (!d->in_use || d->player != player) continue;
+        if (d->close_pending) return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
+        if (close_stream ? d->stream_open : d->registered) {
+            if (desc >= 0) return sail_descriptor_result(SAIL_DESC_NOT_AVAILABLE);
+            desc = i;
+        }
+    }
+    if (desc < 0) return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
+    SailDescriptor* d = &s_descs[desc];
+    if (!d->opened || (!close_stream && d->stream_open))
+        return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
+    if (!g_ps3_guest_caller || !s_sail_players[slot].callback_ea)
+        return sail_descriptor_result(SAIL_DESC_NOT_AVAILABLE);
+    if (close_stream) {
+        if (d->media) { fclose(d->media); d->media = NULL; }
+        d->stream_open = 0;
+        d->registered = 0;
+        d->close_pending = 1;
+    } else {
+        d->stream_open = 1;
+    }
+    s_sail_players[slot].stream_event_busy = 1;
+    sail_descriptor_result(CELL_OK);
+    sail_stream_notify(slot, SAIL_EV_STATE_CHANGED, 0,
+        close_stream ? SAIL_ST_CLOSE_TRANSITION : SAIL_ST_OPEN_TRANSITION, 0);
+    if (close_stream) d->close_notified = 1;
+    sail_stream_notify(slot, close_stream ? 5 : 4, 0, (u32)desc, 0);
+    sail_stream_notify(slot, SAIL_EV_CALL_COMPLETED,
+        close_stream ? SAIL_CALL_CLOSE_STREAM : SAIL_CALL_OPEN_STREAM, 0, userParam);
+    sail_stream_notify(slot, SAIL_EV_STATE_CHANGED, 0,
+        close_stream ? SAIL_ST_CLOSED : SAIL_ST_OPENED, 0);
+    s_sail_players[slot].stream_event_busy = 0;
+    fprintf(stderr, "[cellSail] Player%sStream(self=%08X desc=%u) -> 00000000\n",
+        close_stream ? "Close" : "Open", player, (u32)desc);
+    return CELL_OK;
+}
+
 /* Local HLE cleanup policy: never discard registered descriptors, and release
  * unregistered host records when their player is successfully destroyed. */
 static s32 sail_terminate_descriptors(void)
 {
     if (!sail_descriptor_enter()) return SAIL_DESC_INVALID_STATE;
+    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; ++i)
+        if (s_sail_players[i].in_use && s_sail_players[i].stream_event_busy)
+            return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
+    for (int i = 0; i < MAX_DESCRIPTORS; ++i)
+        if (s_descs[i].in_use && (s_descs[i].stream_open || s_descs[i].close_pending))
+            return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
     for (int i = 0; i < MAX_DESCRIPTORS; ++i)
         if (s_descs[i].in_use) sail_descriptor_release(&s_descs[i]);
     return sail_descriptor_result(CELL_OK);
@@ -421,8 +467,10 @@ static s32 sail_release_player_descriptors(u32 player)
     if (!sail_descriptor_enter()) return SAIL_DESC_INVALID_STATE;
     const int slot = sail_player_slot(player);
     if (slot < 0) return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
+    if (s_sail_players[slot].stream_event_busy) return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
     for (int i = 0; i < MAX_DESCRIPTORS; ++i)
-        if (s_descs[i].in_use && s_descs[i].player == player && s_descs[i].registered)
+        if (s_descs[i].in_use && s_descs[i].player == player &&
+            (s_descs[i].registered || s_descs[i].close_pending))
             return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
     for (int i = 0; i < MAX_DESCRIPTORS; ++i)
         if (s_descs[i].in_use && s_descs[i].player == player)
@@ -510,7 +558,9 @@ s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
 {
     if (!sail_descriptor_enter()) return SAIL_DESC_INVALID_STATE;
     if (!sail_owned_descriptor(handle, desc)) return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
-    if (s_descs[desc].registered) return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
+    if (s_descs[desc].registered ||
+        (s_descs[desc].close_pending && !s_descs[desc].close_notified))
+        return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
     sail_descriptor_release(&s_descs[desc]);
     return sail_descriptor_result(CELL_OK);
 }
@@ -520,7 +570,8 @@ s32 cellSailPlayerAddDescriptor(CellSailPlayerHandle handle,
 {
     if (!sail_descriptor_enter()) return SAIL_DESC_INVALID_STATE;
     if (!sail_owned_descriptor(handle, desc)) return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
-    if (s_descs[desc].registered) return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
+    if (s_descs[desc].registered || s_descs[desc].close_pending)
+        return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
     s_descs[desc].registered = 1;
     return sail_descriptor_result(CELL_OK);
 }
@@ -545,6 +596,7 @@ s32 cellSailDescriptorOpen(CellSailDescriptorHandle desc)
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
         return sail_descriptor_result(SAIL_DESC_INVALID_ARG);
     SailDescriptor* d = &s_descs[desc];
+    if (d->stream_open || d->close_pending) return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
     s32 result = SAIL_DESC_NOT_AVAILABLE;
     FILE* media = NULL;
     u8* header = NULL;
@@ -702,6 +754,9 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
     printf("[cellSail] PlayerInitialize2(self=0x%08X alloc=0x%08X cb=0x%08X)\n",
            pSelf, pAllocator, pCallback);
     if (!pSelf) return sail_descriptor_result((s32)CELL_SAIL_ERROR_INVALID_ARGUMENT);
+    const int existing = sail_player_slot(pSelf);
+    if (existing >= 0 && s_sail_players[existing].stream_event_busy)
+        return sail_descriptor_result(SAIL_DESC_INVALID_STATE);
 
     /* PS3_NO_SAIL=1: report that the player cannot be created. On hardware
      * this call spawns the SAIL player's own worker threads, and a title that
