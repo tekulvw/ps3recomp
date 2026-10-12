@@ -155,6 +155,96 @@ static mutex_t       s_audio_mutex;
 
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+static inline float ld_be_f32(const float* p);
+
+/* Mixer-thread-owned observation windows. Disabled unless explicitly requested;
+ * capture guest PCM before consumption without altering its bytes or routing. */
+typedef struct {
+    u64 blocks, nonzero, read_index, nonfinite;
+    u32 channels, address;
+    float peaks[8];
+} AudioDiagnosticPort;
+static int s_audio_diag_on;
+static AudioDiagnosticPort s_audio_diag_ports[CELL_AUDIO_PORT_MAX];
+static u64 s_audio_diag_since, s_audio_diag_blocks, s_audio_diag_submit, s_audio_diag_errors;
+static float s_audio_diag_mix[2];
+static u64 s_audio_diag_nonfinite;
+static u32 s_audio_diag_queue_frames;
+static char s_audio_diag_error[128];
+
+static void audio_diagnostics_init(void)
+{
+    const char* value = getenv("AUDIO_DIAGNOSTICS");
+    s_audio_diag_on = value && !strcmp(value, "1");
+    memset(s_audio_diag_ports, 0, sizeof(s_audio_diag_ports));
+    memset(s_audio_diag_mix, 0, sizeof(s_audio_diag_mix));
+    s_audio_diag_since = s_audio_diag_blocks = s_audio_diag_submit = s_audio_diag_errors = 0;
+    s_audio_diag_nonfinite = s_audio_diag_queue_frames = 0;
+    s_audio_diag_error[0] = 0;
+}
+
+static void audio_diagnostics_port(int p, const AudioPortSlot* port, const float* src)
+{
+    AudioDiagnosticPort* d = &s_audio_diag_ports[p];
+    d->channels = (u32)port->param.nChannel;
+    d->address = (u32)port->port_addr;
+    d->read_index = port->read_index;
+    d->blocks++;
+    int nonzero = 0;
+    for (u32 n = 0; n < CELL_AUDIO_BLOCK_SAMPLES; ++n) {
+        for (u32 c = 0; c < d->channels && c < 8; ++c) {
+            const float sample = ld_be_f32(&src[n * d->channels + c]);
+            if (!isfinite(sample)) { d->nonfinite++; continue; }
+            const float a = fabsf(sample);
+            if (a > d->peaks[c]) d->peaks[c] = a;
+            if (a != 0.0f) nonzero = 1;
+        }
+    }
+    d->nonzero += nonzero;
+}
+
+static void audio_diagnostics_report(u64 now)
+{
+    if (!s_audio_diag_on) return;
+    if (!s_audio_diag_since) { s_audio_diag_since = now; return; }
+    if (now < s_audio_diag_since || now - s_audio_diag_since < 1000000) return;
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX; ++p) {
+        AudioDiagnosticPort* d = &s_audio_diag_ports[p];
+        if (!d->blocks) continue;
+        fprintf(stderr, "[audio-diag] time_us=%llu port=%d address=%08X channels=%u "
+                "ridx=%llu blocks=%llu nonzero=%llu nonfinite=%llu peaks=[",
+                (unsigned long long)now, p, d->address, d->channels,
+                (unsigned long long)d->read_index, (unsigned long long)d->blocks,
+                (unsigned long long)d->nonzero, (unsigned long long)d->nonfinite);
+        for (u32 c = 0; c < d->channels && c < 8; ++c)
+            fprintf(stderr, "%s%.4g", c ? "," : "", d->peaks[c]);
+        fprintf(stderr, "]\n");
+    }
+    fprintf(stderr, "[audio-diag] time_us=%llu duration_us=%llu blocks=%llu mix=[%.4g,%.4g] "
+            "nonfinite=%llu backend=%s submit=%llu errors=%llu queue_frames=%u error=\"%s\"\n",
+            (unsigned long long)now, (unsigned long long)(now - s_audio_diag_since),
+            (unsigned long long)s_audio_diag_blocks, s_audio_diag_mix[0], s_audio_diag_mix[1],
+            (unsigned long long)s_audio_diag_nonfinite,
+            AUDIO_BACKEND_SDL2 ? "SDL" : "WASAPI",
+            (unsigned long long)s_audio_diag_submit, (unsigned long long)s_audio_diag_errors,
+            s_audio_diag_queue_frames, s_audio_diag_error);
+    memset(s_audio_diag_ports, 0, sizeof(s_audio_diag_ports));
+    memset(s_audio_diag_mix, 0, sizeof(s_audio_diag_mix));
+    s_audio_diag_blocks = s_audio_diag_submit = s_audio_diag_errors = s_audio_diag_nonfinite = 0;
+    s_audio_diag_error[0] = 0;
+    s_audio_diag_since = now;
+}
+
+static u64 audio_diagnostics_now(void)
+{
+#ifdef _WIN32
+    return (u64)GetTickCount64() * 1000;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000 + (u64)ts.tv_nsec / 1000;
+#endif
+}
 
 /* ---------------------------------------------------------------------------
  * Host audio output backend
@@ -202,8 +292,16 @@ static void audio_backend_shutdown(void)
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
     if (s_sdl_audio_dev) {
-        SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
+        const int rc = SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
                        num_samples * 2 * sizeof(float));
+        if (s_audio_diag_on) {
+            s_audio_diag_submit++;
+            if (rc < 0) {
+                s_audio_diag_errors++;
+                snprintf(s_audio_diag_error, sizeof(s_audio_diag_error), "%s", SDL_GetError());
+            }
+            s_audio_diag_queue_frames = SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
+        }
     }
 }
 
@@ -447,6 +545,7 @@ static void audio_mix_one_block(void)
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+        if (s_audio_diag_on) audio_diagnostics_port(p, port, src);
 
         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
          * vs which block the read cursor is on -- distinguishes "writer never
@@ -512,7 +611,13 @@ static void audio_mix_one_block(void)
     for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
         if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
         if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
+        if (s_audio_diag_on) {
+            const float a = fabsf(s_mix_buffer[i]);
+            if (!isfinite(a)) s_audio_diag_nonfinite++;
+            else if (a > s_audio_diag_mix[i & 1]) s_audio_diag_mix[i & 1] = a;
+        }
     }
+    if (s_audio_diag_on) s_audio_diag_blocks++;
 }
 
 /* ---------------------------------------------------------------------------
@@ -597,6 +702,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 
         /* Notify event queues */
         audio_notify_event_queues();
+        if (s_audio_diag_on) audio_diagnostics_report(audio_diagnostics_now());
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
@@ -612,6 +718,7 @@ static void* audio_mix_thread_func(void* arg)
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
+        if (s_audio_diag_on) audio_diagnostics_report(audio_diagnostics_now());
 
         u32 queued = audio_backend_queued_samples();
         if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
@@ -688,6 +795,8 @@ s32 cellAudioInit(void)
 
     if (s_audio_initialized)
         return CELL_AUDIO_ERROR_ALREADY_INIT;
+
+    audio_diagnostics_init();
 
     memset(s_ports, 0, sizeof(s_ports));
     memset(s_notify_queues, 0, sizeof(s_notify_queues));
