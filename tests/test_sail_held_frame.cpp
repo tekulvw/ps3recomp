@@ -102,6 +102,16 @@ extern "C" int32_t cellGcmGetOffsetTable(void* out) {
  uint32_t ea=uintptr_t(out);vm_write32(ea,0x30000);std::memset(vm_base+0x30000,0xFF,8192);
  vm_base[0x30008]=0;vm_base[0x30009]=1;return 0;
 }
+extern "C" int cellGcm_checked_reference_ready(){return 0;}
+extern "C" uint64_t ppu_system_time_us(){std::abort();}
+extern "C" uint64_t rsx_picture_create(uint32_t,uint32_t,uint32_t,uint32_t,const uint8_t*){std::abort();}
+extern "C" void rsx_picture_release(uint64_t){std::abort();}
+extern "C" int rsx_picture_retain(uint64_t){std::abort();}
+// This fixture implements only the held decoder boundary. Timed playback
+// remains explicitly unavailable rather than being fabricated by this fake.
+extern "C" int sail_video_open(FILE*,uint64_t,uint64_t,unsigned,SailVideoDecoder**) {return SAIL_VIDEO_UNAVAILABLE;}
+extern "C" int sail_video_next(SailVideoDecoder*,SailVideoFrame*) {return SAIL_VIDEO_UNAVAILABLE;}
+extern "C" void sail_video_close(SailVideoDecoder*) {std::abort();}
 extern "C" int sail_video_available() {return 1;}
 extern "C" int sail_video_decode_picture(FILE*,uint64_t off,uint64_t length,unsigned sid,unsigned ordinal,SailVideoFrame*out) {
  if(is_mode("decode-failure"))return SAIL_VIDEO_DECODE;
