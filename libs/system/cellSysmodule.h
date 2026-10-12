@@ -143,6 +143,9 @@ s32 cellSysmoduleIsLoadedEx(u16 id);
 /* NID: 0x1A267F98; load a permitted extended module in the HLE tracker. */
 s32 cellSysmoduleLoadModuleEx(u16 id);
 
+/* NID: 0xFD0E1CAC; unload a permitted extended module in the HLE tracker. */
+s32 cellSysmoduleUnloadModuleEx(u16 id);
+
 #ifdef __cplusplus
 }
 #endif
