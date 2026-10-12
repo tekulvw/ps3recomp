@@ -167,12 +167,10 @@ s32 cellSysmoduleIsLoadedEx(u16 id)
     return cellSysmoduleIsLoaded(id);
 }
 
-/* NID: 0x1A267F98. Ex accepts a subset of the internal namespace, not the
- * whole IsLoadedEx range. Reference: RPCS3 cellSysmodule.cpp,
- * LOADABLE_INTERNAL_MODULES_EX and cellSysmoduleLoadModuleEx.
- * Preserve the existing HLE tracker's idempotent load semantics; this does
- * not implement firmware loading or claim that a module's APIs exist. */
-s32 cellSysmoduleLoadModuleEx(u16 id)
+/* RPCS3 LOADABLE_INTERNAL_MODULES_EX policy shared by the Ex entry points.
+ * The permission-dependent IDs are valid for unload; only loading them needs
+ * the process-PARAM.SFO permission check that this HLE does not yet provide. */
+static int sysmodule_ex_permitted(u16 id)
 {
     switch (id) {
     case 0xF005: case 0xF00A:
@@ -189,11 +187,29 @@ s32 cellSysmoduleLoadModuleEx(u16 id)
     case 0xF049: case 0xF04A: case 0xF04D: case 0xF04E: case 0xF04F:
     case 0xF050: case 0xF051: case 0xF052: case 0xF054:
     case 0xF055: case 0xF056:
-        return cellSysmoduleLoadModule(id);
-    /* These IDs additionally require process-PARAM.SFO permission checks in
-     * LoadModuleInternal. Until supported, do not manufacture permission. */
     case 0xF020: case 0xF024: case 0xF03E:
+        return 1;
     default:
-        return CELL_SYSMODULE_ERROR_UNKNOWN;
+        return 0;
     }
+}
+
+/* NID: 0x1A267F98. Preserve the existing HLE tracker's idempotent load
+ * semantics. This records module state; it does not load firmware. */
+s32 cellSysmoduleLoadModuleEx(u16 id)
+{
+    if (!sysmodule_ex_permitted(id) || id == 0xF020 || id == 0xF024 || id == 0xF03E)
+        return CELL_SYSMODULE_ERROR_UNKNOWN;
+    return cellSysmoduleLoadModule(id);
+}
+
+/* NID: 0xFD0E1CAC. One u16 argument; extra PPU GPRs are not output pointers.
+ * Reference: RPCS3 cellSysmodule.cpp, cellSysmoduleUnloadModuleEx and
+ * LOADABLE_INTERNAL_MODULES_EX. Reuse the HLE tracker and preserve its
+ * UNKNOWN / UNLOADED errors. No PRX unloading or module finalizer is implied. */
+s32 cellSysmoduleUnloadModuleEx(u16 id)
+{
+    if (!sysmodule_ex_permitted(id))
+        return CELL_SYSMODULE_ERROR_UNKNOWN;
+    return cellSysmoduleUnloadModule(id);
 }
