@@ -187,6 +187,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_rotmai:DST = spu_rotmai(A,I); break;
     case SPU_roth: DST = spu_roth(A,B); break;
     case SPU_rothi:DST = spu_rothi(A,I); break;
+    case SPU_rothmi:DST = spu_rothmi(A,I); break;
     case SPU_shlqbi: DST = spu_shlqbi(A,B); break;
     case SPU_shlqbii:DST = spu_shlqbii(A,I); break;
     case SPU_shlqby: DST = spu_shlqby(A,B); break;
