@@ -11,6 +11,12 @@
  */
 
 #include <time.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if !TARGET_OS_IPHONE
+#include "pad_macos.h"
+#endif
+#endif
 #include "cellPad.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -441,6 +447,29 @@ static void pad_poll_backend(void)
 #endif
 #ifdef _WIN32
     if (!s_host_state[0].connected) pad_poll_keyboard();
+#endif
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
+    /* Native Metal windows do not publish their key events through SDL. A
+     * physical controller still wins; keyboard only fills the vacant port. */
+    static int keyboard_off = -1;
+    if (keyboard_off < 0) keyboard_off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    if (!keyboard_off && !s_host_state[0].connected) {
+        PadHostState* hs = &s_host_state[0];
+        u16 btns = ps3recomp_pad_macos_buttons();
+        memset(hs, 0, sizeof(*hs));
+        hs->buttons = btns;
+        static int trace = -1;
+        static u16 previous = 0;
+        if (trace < 0) trace = getenv("PAD_KEYBOARD_TRACE") ? 1 : 0;
+        if (trace && btns != previous) {
+            printf("[cellPad] macOS keyboard port 0 buttons=0x%04X\n", btns);
+            fflush(stdout);
+        }
+        previous = btns;
+        hs->analog_lx = (btns & CELL_PAD_CTRL_LEFT) ? 0 : (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128;
+        hs->analog_ly = (btns & CELL_PAD_CTRL_UP) ? 0 : (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128;
+        hs->analog_rx = hs->analog_ry = 128;
+    }
 #endif
 }
 

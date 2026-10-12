@@ -17,7 +17,7 @@ def main():
         subprocess.run([
             "clang", "-fobjc-arc", "-I", "include", "-I", "libs/video",
             "libs/video/tests/test_metal_first_nonblack.m",
-            "libs/video/rsx_texture_layout.c", "-Wl,-dead_strip",
+            "libs/video/rsx_texture_layout.c", "libs/input/pad_macos.m", "-Wl,-dead_strip",
             "-framework", "Metal", "-framework", "Cocoa", "-framework", "QuartzCore",
             "-o", str(binary),
         ], cwd=ROOT, check=True, timeout=120)
