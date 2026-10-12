@@ -28,6 +28,37 @@ static int sail_held_enabled(void) {
     return value && !strcmp(value, "1");
 }
 
+static s32 sail_timed_start(u32 player,u32 command,u64 token);
+static s32 sail_timed_stop(u32 player,u64 token);
+static s32 sail_timed_release_locked(u32 player);
+static void sail_timed_pump(u32 player);
+static int sail_timed_enabled(void) {
+    const char* value=getenv("PS3RECOMP_SAIL_TIMED_THX");
+    return value && !strcmp(value,"1");
+}
+/* Decoder-enabled builds use the SDK renderer/clock. Disabled builds retain
+ * linkable metadata-only Sail with no new renderer dependency. */
+#if defined(PS3RECOMP_SAIL_FFMPEG) && PS3RECOMP_SAIL_FFMPEG
+extern int cellGcm_checked_reference_ready(void);
+extern u64 ppu_system_time_us(void);
+extern u64 rsx_picture_create(u32,u32,u32,u32,const u8*);
+extern void rsx_picture_release(u64);
+extern int rsx_picture_retain(u64);
+static _Thread_local unsigned s_picture_capture;
+static _Thread_local u64 s_picture_selected[8];
+void sail_graphics_picture_capture_begin(void) {
+    if(s_picture_capture>=8)abort();
+    s_picture_selected[s_picture_capture++]=0;
+}
+u64 sail_graphics_picture_capture_end(void) {
+    if(!s_picture_capture)return 0;
+    const u64 token=s_picture_selected[--s_picture_capture];
+    s_picture_selected[s_picture_capture]=0;return token;
+}
+#else
+void sail_graphics_picture_capture_begin(void) {}
+u64 sail_graphics_picture_capture_end(void) {return 0;}
+#endif
 /* Internal state */
 
 static int s_initialized = 0;
@@ -67,7 +98,7 @@ static SailGraphicsConfig s_graphics_configs[SAIL_GRAPHICS_MAX];
 typedef struct {
     int active, published, has_picture, new_frame, origin_cached, timed_poll, publication_closed;
     u32 buffer, session, tag, picture_id;
-    u64 pts, origin;
+    u64 pts, origin, picture_token;
     u8 format[32];
 } SailGraphicsFrame;
 static SailGraphicsFrame s_graphics_frames[SAIL_GRAPHICS_MAX];
@@ -265,6 +296,7 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle, u64 userParam)
 
 s32 cellSailPlayerStart(CellSailPlayerHandle handle, u32 command, u64 userParam)
 {
+    if (sail_timed_enabled()) return sail_timed_start((u32)handle,command,userParam);
     if (sail_held_enabled()) return sail_held_start((u32)handle, command, userParam);
     (void)command; (void)userParam;
     printf("[cellSail] PlayerStart(%u)\n", handle);
@@ -285,6 +317,7 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle, u32 command, u64 userParam)
 
 s32 cellSailPlayerStop(CellSailPlayerHandle handle, u64 userParam)
 {
+    if (sail_timed_enabled()) return sail_timed_stop((u32)handle,userParam);
     if (sail_held_enabled()) return sail_held_stop((u32)handle, userParam);
     (void)userParam;
     printf("[cellSail] PlayerStop(%u)\n", handle);
@@ -311,6 +344,7 @@ s32 cellSailPlayerGetState(CellSailPlayerHandle handle, s32* state)
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     if (!state) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if(sail_timed_enabled())sail_timed_pump((u32)handle);
     vm_write32((u32)(uintptr_t)state, (u32)s_sail_players[_sp].state);
     return CELL_OK;
 }
@@ -519,6 +553,8 @@ static s32 sail_stream_lifecycle(u32 player, u64 userParam, int close_stream)
     if (!g_ps3_guest_caller || !s_sail_players[slot].callback_ea)
         return sail_descriptor_result(SAIL_DESC_NOT_AVAILABLE);
     if (close_stream) {
+        const s32 timed_release=sail_timed_release_locked(player);
+        if(timed_release)return sail_descriptor_result(timed_release);
         const s32 held_release = sail_held_release_locked(player);
         if (held_release) return sail_descriptor_result(held_release);
         if (d->media) { fclose(d->media); d->media = NULL; }
@@ -1039,6 +1075,13 @@ s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
     if (!sail_graphics_range(pSelf, SAIL_ADAPTER_CLEAR) ||
         !sail_graphics_range(pInfo, 24))
         return SAIL_GRAPHICS_INVALID_ARG;
+    if(sail_timed_enabled()) {
+        sail_graphics_lock();
+        const int at=sail_graphics_slot(pSelf);
+        const u32 player=at>=0?s_graphics_configs[at].player_ea:0;
+        sail_graphics_unlock();
+        if(player)sail_timed_pump(player);
+    }
     sail_graphics_lock();
     const int slot = sail_graphics_slot(pSelf);
     s32 result = SAIL_GRAPHICS_INVALID_STATE;
@@ -1047,6 +1090,15 @@ s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
         SailGraphicsFrame* frame = &s_graphics_frames[slot];
         result = CELL_SAIL_SYNC_NO_FRAME;
         if (frame->published) {
+#if defined(PS3RECOMP_SAIL_FFMPEG) && PS3RECOMP_SAIL_FFMPEG
+            if(s_picture_capture) {
+                u64* selected=&s_picture_selected[s_picture_capture-1];
+                if(*selected)rsx_picture_release(*selected);
+                *selected=0;
+                if(frame->picture_token && rsx_picture_retain(frame->picture_token))
+                    *selected=frame->picture_token;
+            }
+#endif
             if(frame->timed_poll) ++frame->tag;
             vm_write32(pInfo, frame->buffer);
             vm_write32(pInfo + 4, frame->session);
@@ -1225,8 +1277,8 @@ s32 sail_graphics_publish_frame(u32 player, u32 buffer, const u8 format[32],
     return result;
 }
 
-s32 sail_graphics_replace_frame(u32 player,u32 buffer,const u8 format[32],
-                                u64 pts,u64 origin,u32 picture_id)
+static s32 sail_graphics_replace_identity(u32 player,u32 buffer,const u8 format[32],
+                                u64 pts,u64 origin,u32 picture_id,u64 picture_token)
 {
     if(!format || !picture_id || sail_player_slot(player)<0)return SAIL_GRAPHICS_INVALID_ARG;
     const u32 width=((u32)format[4]<<8)|format[5];
@@ -1243,7 +1295,7 @@ s32 sail_graphics_replace_frame(u32 player,u32 buffer,const u8 format[32],
         result=SAIL_GRAPHICS_INVALID_STATE;
         if(frame->active && !frame->publication_closed && (!frame->has_picture || (frame->published && frame->timed_poll &&
              picture_id>frame->picture_id && frame->origin==origin && !memcmp(frame->format,format,32)))){
-            frame->buffer=buffer;frame->pts=pts;frame->origin=origin;frame->picture_id=picture_id;
+            frame->buffer=buffer;frame->pts=pts;frame->origin=origin;frame->picture_id=picture_id;frame->picture_token=picture_token;
             memcpy(frame->format,format,32);
             frame->timed_poll=frame->has_picture=frame->new_frame=frame->published=1;
             result=CELL_OK;
@@ -1252,6 +1304,9 @@ s32 sail_graphics_replace_frame(u32 player,u32 buffer,const u8 format[32],
     }
     sail_graphics_unlock();return result;
 }
+
+s32 sail_graphics_replace_frame(u32 player,u32 buffer,const u8 format[32],u64 pts,u64 origin,u32 id)
+{ return sail_graphics_replace_identity(player,buffer,format,pts,origin,id,0); }
 
 s32 sail_graphics_withdraw_frame(u32 player)
 {
@@ -1314,3 +1369,5 @@ s32 sail_graphics_unpublish_frame(u32 player)
 }
 
 #include "sail_held_frame.inc"
+
+#include "sail_timed_video.inc"
