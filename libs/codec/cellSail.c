@@ -65,7 +65,7 @@ static struct {
 static u32 s_graphics_adapters[SAIL_GRAPHICS_MAX];
 static SailGraphicsConfig s_graphics_configs[SAIL_GRAPHICS_MAX];
 typedef struct {
-    int active, published, has_picture, new_frame, origin_cached, timed_poll;
+    int active, published, has_picture, new_frame, origin_cached, timed_poll, publication_closed;
     u32 buffer, session, tag, picture_id;
     u64 pts, origin;
     u8 format[32];
@@ -1204,7 +1204,7 @@ s32 sail_graphics_publish_frame(u32 player, u32 buffer, const u8 format[32],
         if (!s_graphics_adapters[i] || s_graphics_configs[i].player_ea != player) continue;
         SailGraphicsFrame* frame = &s_graphics_frames[i];
         result = SAIL_GRAPHICS_INVALID_STATE;
-        if (!frame->has_picture) {
+        if (!frame->has_picture && !frame->publication_closed) {
             if (!frame->active) {
                 memset(frame, 0, sizeof(*frame));
                 if (++s_graphics_session == UINT32_MAX) s_graphics_session = 1;
@@ -1241,7 +1241,7 @@ s32 sail_graphics_replace_frame(u32 player,u32 buffer,const u8 format[32],
         if(!s_graphics_adapters[i] || s_graphics_configs[i].player_ea!=player)continue;
         SailGraphicsFrame* frame=&s_graphics_frames[i];
         result=SAIL_GRAPHICS_INVALID_STATE;
-        if(frame->active && (!frame->has_picture || (frame->published && frame->timed_poll &&
+        if(frame->active && !frame->publication_closed && (!frame->has_picture || (frame->published && frame->timed_poll &&
              picture_id>frame->picture_id && frame->origin==origin && !memcmp(frame->format,format,32)))){
             frame->buffer=buffer;frame->pts=pts;frame->origin=origin;frame->picture_id=picture_id;
             memcpy(frame->format,format,32);
@@ -1303,6 +1303,7 @@ s32 sail_graphics_unpublish_frame(u32 player)
     for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i) {
         if (s_graphics_adapters[i] && s_graphics_configs[i].player_ea == player) {
             s_graphics_frames[i].published = 0;
+            s_graphics_frames[i].publication_closed = 1;
             s_graphics_frames[i].origin_cached = 0;
             result = CELL_OK;
             break;
