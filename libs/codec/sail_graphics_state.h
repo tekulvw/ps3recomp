@@ -18,6 +18,10 @@ s32 sail_graphics_begin_session(u32 player, SailGraphicsConfig* out, u32* sessio
  * that pin through free callbacks; withdraw ends the resolved ownership pin.
  * Producer owns and initializes buffer, never overwriting published pixels. */
 s32 sail_graphics_publish_frame(u32 player, u32 buffer, const u8 format[32], u64 pts, u64 origin, u32 tag);
+#define SAIL_GRAPHICS_HAS_REPLACEMENT 1
+/* Same pinned format/session; increasing picture id is distinct from poll tags.
+ * After unpublish, only withdraw/begin can reopen publication. */
+s32 sail_graphics_replace_frame(u32 player,u32 buffer,const u8 format[32],u64 pts,u64 origin,u32 picture_id);
 s32 sail_graphics_unpublish_frame(u32 player);
 s32 sail_graphics_withdraw_frame(u32 player);
 s32 sail_graphics_config_for_player(u32 player, SailGraphicsConfig* out);
