@@ -179,6 +179,30 @@ int main(void)
     assert((uint32_t)call("inet_addr", STR, 0, 0, 0, 0, 0) == 0x01020304u);
     uint32_t s = (uint32_t)call("inet_ntoa", LOOP, 0, 0, 0, 0, 0);
     assert(strcmp((const char*)vm_base + s, "127.0.0.1") == 0);
+    /* Real retail NID8AF3825E: AF_INET, source string, raw network bytes.
+     * Guard bytes catch host-endian stores and output-length mistakes. */
+    assert(ps3_compute_nid("inet_pton") == 0x8AF3825Eu);
+    const char* addresses[] = {"127.0.0.1", "1.2.3.4", "0.0.0.0", "255.255.255.255"};
+    const uint8_t expected[][4] = {{127,0,0,1},{1,2,3,4},{0,0,0,0},{255,255,255,255}};
+    for (unsigned i=0;i<4;i++) {
+        strcpy((char*)vm_base + STR, addresses[i]);
+        memset(vm_base + BUF, 0xA5, 8);
+        assert(C3("inet_pton", SYS_NET_AF_INET, STR, BUF+1) == 1);
+        assert(memcmp(vm_base + BUF+1, expected[i], 4) == 0);
+        assert(vm_base[BUF] == 0xA5 && vm_base[BUF+5] == 0xA5);
+    }
+    const char* invalid[] = {"", "1.2.3", "256.2.3.4", "127.1", "1.2.3.4 ", "::1", "host.example"};
+    for (unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++) {
+        strcpy((char*)vm_base + STR, invalid[i]);
+        memset(vm_base + BUF, 0xA5, 8);
+        assert(C3("inet_pton", SYS_NET_AF_INET, STR, BUF+1) == 0);
+        for (unsigned j=0;j<8;j++) assert(vm_base[BUF+j] == 0xA5);
+    }
+    /* Unknown families and invalid pointers fail; no fake valid address. */
+    assert(C3("inet_pton", 99, STR, BUF+1) == -1 && errno_cell() == 47);
+    assert(C3("inet_pton", SYS_NET_AF_INET, 0, BUF+1) == -1 && errno_cell() == 14);
+    assert(C3("inet_pton", SYS_NET_AF_INET, STR, 0) == -1 && errno_cell() == 14);
+    for (unsigned j=0;j<8;j++) assert(vm_base[BUF+j] == 0xA5);
     strcpy((char*)vm_base + STR, "localhost");
     uint32_t h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
     assert(h && vm_read32(h + 12) == 4);
