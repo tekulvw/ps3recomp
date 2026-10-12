@@ -106,6 +106,7 @@ typedef struct rsx_be_render_state {
 
 /* ---- the backend interface ---------------------------------------------- */
 
+#define RSX_BE_HAS_CHECKED_COMPLETION 1
 typedef struct rsx_draw_backend {
     void* user;
 
@@ -218,6 +219,10 @@ typedef struct rsx_draw_backend {
      * DEPTH16); left NULL, such a texture reads guest memory as it is. */
     int  (*depth_readback)(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                            float* out, u32 out_pitch);
+
+    /* Optional certificate: 1 only after accepted work completes without error.
+     * Appended for source compatibility; the old void callback is not proof. */
+    int (*submit_and_wait_checked)(void* user, u32 reason);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -255,6 +260,11 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 /* The guest's SET_REFERENCE sync point: submit and wait, so a title spinning
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
+int rsx_draw_engine_flush_checked(void);
+int rsx_draw_engine_checked_ready(void);
+/* Publish a CPU write before exposing its guest allocation. Cache work stays
+ * on the renderer consumer; this conservative generation invalidates all hashes. */
+void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes);
 
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */

@@ -1317,6 +1317,25 @@ static u32 s_tr_i = 0;
  * are lost, but the next frame is written from a clean boundary and the
  * FIFO lives. */
 static void gcm_ref_push_at(u32 v, u32 getoff);
+static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
+static atomic_int s_checked_ref_failed;
+static u64 s_checked_ref_receipt;
+static u64 s_ref_receipts[GCM_REF_QLEN];
+static int gcm_checked_ref_mode(void)
+{
+    const char* e = getenv("PS3RECOMP_GCM_CHECKED_REF");
+    return e && !strcmp(e, "1");
+}
+static void gcm_checked_ref_fail(const char* why, u32 io)
+{
+    if (!atomic_exchange(&s_checked_ref_failed, 1))
+        fprintf(stderr, "[gcm checked REF] failed reason=%s io=%08X; reclamation frozen\n", why, io);
+}
+int cellGcm_checked_reference_ready(void)
+{
+    return gcm_checked_ref_mode() && !atomic_load(&s_checked_ref_failed) &&
+        rsx_draw_engine_checked_ready();
+}
 
 /* ---- SPU-built pushbuffers ------------------------------------------------
  * Some titles do not build the RSX command stream on the PPU at all. The
@@ -1407,6 +1426,7 @@ static u32 gcm_spu_block_for_put(u32 put)
  * is not, it deadlocks the title. Sweep the skipped range first. */
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
+    if (gcm_checked_ref_mode()) { gcm_checked_ref_fail(why, *getoff); return; }
     static int n = 0;
     if (n++ < 8)
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
@@ -1467,16 +1487,26 @@ static void gcm_fifo_dump_around(u32 getoff)
 
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
-    { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
-      if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
+    AcquireSRWLockExclusive(&s_ref_pub_lock);
+    if (gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed)) {
+        ReleaseSRWLockExclusive(&s_ref_pub_lock); return;
+    }
     u32 t = s_ref_qtail;
-    if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
+    if (t - s_ref_qhead >= GCM_REF_QLEN) {
+        if (gcm_checked_ref_mode()) {
+            gcm_checked_ref_fail("reference-queue-overflow", getoff);
+            ReleaseSRWLockExclusive(&s_ref_pub_lock); return;
+        }
         s_ref_qhead++;
-        static int _o = 0;
-        if (_o++ < 4) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
+        static int o; if(o++<4)fprintf(stderr,"[cellGcmSys] fence queue overflow -- oldest dropped\n");
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
+    s_ref_receipts[t % GCM_REF_QLEN] = gcm_checked_ref_mode() ? ++s_checked_ref_receipt : 0;
     s_ref_qtail = t + 1;
+    if (gcm_checked_ref_mode() && getenv("PS3RECOMP_GCM_CHECKED_REF_LOG"))
+        fprintf(stderr,"[gcm checked REF] completed receipt=%llu io=%08X ref=%08X\n",
+            (unsigned long long)s_checked_ref_receipt,getoff,v);
+    ReleaseSRWLockExclusive(&s_ref_pub_lock);
 }
 
 /* Global fence-publication counter: lets the lwmutex convoy trace correlate a
@@ -1496,6 +1526,7 @@ unsigned long long ps3_qpc_us(void)
 
 static void gcm_ref_publish_one(void)
 {
+    if (gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed)) return;
     u32 h = s_ref_qhead;
     if (h == s_ref_qtail) return;
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
@@ -1508,6 +1539,9 @@ static void gcm_ref_publish_one(void)
                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
     s_ref_qhead = h + 1;
     g_gcm_ref_pub_count++;
+    if (gcm_checked_ref_mode() && getenv("PS3RECOMP_GCM_CHECKED_REF_LOG"))
+        fprintf(stderr,"[gcm checked REF] published receipt=%llu ref=%08X\n",
+            (unsigned long long)s_ref_receipts[h % GCM_REF_QLEN],s_ref_q[h % GCM_REF_QLEN]);
 }
 
 /* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the
@@ -1560,8 +1594,6 @@ void cellGcm_fifo_kick_wait(unsigned ms)
  * multi-threaded; the SPSC queue head raced and publication order broke --
  * boot froze with all threads parked on fences that were never published in
  * order). TryAcquire: a contended poll just reads the current ref. */
-static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
-
 void cellGcm_ref_on_poll(void)
 {
     /* Pace: leave each published value observable for >= ~200us of spins
@@ -1616,6 +1648,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * that does read the context (the ring-recycle heuristic) is separately guarded
      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
+    if (gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed)) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
@@ -1709,6 +1742,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
     while (s_fifo_getoff != put && budget-- > 0) {
+        if(gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed))break;
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
             /* get is sitting on an IO offset with no mapping -- the title
@@ -1727,6 +1761,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             "mapping -- resyncing to put=0x%08X\n",
                             s_fifo_getoff, put);
             }
+            if (gcm_checked_ref_mode()) { gcm_checked_ref_fail("no-io-mapping", s_fifo_getoff); break; }
             s_fifo_getoff = put;
             why = "no-io-mapping";
             break;
@@ -1827,6 +1862,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
+            if (gcm_checked_ref_mode() && method == 0x50 && (count != 1 || subch != 0 || type != 0)) {
+                gcm_checked_ref_fail("malformed-reference", s_fifo_getoff); break;
+            }
+            if (gcm_checked_ref_mode()) {
+                if(s_fifo_getoff < put && (u64)s_fifo_getoff+4+(u64)count*4 > put) {
+                    gcm_checked_ref_fail("packet-past-put",s_fifo_getoff);break;
+                }
+                int mapped=1;
+                for (u32 j=0;j<count;j++) if(!gcm_io2ea(s_fifo_getoff+4+j*4)){mapped=0;break;}
+                if(!mapped){gcm_checked_ref_fail("unmapped-packet",s_fifo_getoff);break;}
+            }
             /* TCONST_FIFO=1: how the title actually streams vertex constants.
              * NV4097_SET_TRANSFORM_CONSTANT is a 32-register window; if a block
              * arrives NON-INCREMENTING then every dword carries the same method
@@ -2008,7 +2054,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
-                    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+                    if (m == 0x50) {
+                        if(gcm_checked_ref_mode() && (count!=1 || method!=0x50)){gcm_checked_ref_fail("malformed-reference",s_fifo_getoff);continue;}
+                        if (gcm_checked_ref_mode() &&
+                            (!rsx_draw_engine_enabled() || rsx_draw_engine_flush_checked() != 1))
+                            gcm_checked_ref_fail("backend-completion", s_fifo_getoff);
+                        else gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+                    }
                     if (m == 0x1A8u) s_report_dma = vm_read32(dea);
                     if (m == 0x1800u) gcm_get_report(vm_read32(dea));
                 } else
@@ -2020,6 +2072,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
+        if(gcm_checked_ref_mode()){gcm_checked_ref_fail("unknown-word",s_fifo_getoff);break;}
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
 
@@ -2097,7 +2150,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      *
      * ponytail: append the JUMP at `current` the way the SDK's own callback
      * does, rather than tracking a second copy of the ring's geometry. */
-    if (s_gcm_ctx_out_ea) {
+    if (s_gcm_ctx_out_ea && !gcm_checked_ref_mode()) {
         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
@@ -2173,7 +2226,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * If the overflow survives this, `get` is not what it consults. */
     { static int eq = -1;
       if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
-      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, (eq && !gcm_checked_ref_mode()) ? put : s_fifo_getoff); }
 
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();

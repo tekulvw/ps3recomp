@@ -18,6 +18,7 @@
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,6 +117,7 @@ typedef struct {
     u32 handle;
     u64 content_hash;
     u32 last_hash_frame;
+    u64 dirty_generation;
     u64 last_use_serial;
 } eng_texture;
 
@@ -172,6 +174,8 @@ static struct {
 } g;
 
 /* The decompilers' HLSL. The VP decompiler builds bodies up to 192 KB. */
+static atomic_int s_checked_ready, s_checked_failed;
+static atomic_uint_fast64_t s_dirty_generation;
 static char s_vs_hlsl[256 * 1024];
 static char s_ps_hlsl[256 * 1024];
 
@@ -552,6 +556,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     /* Never destroy a usable render target because one malformed command
      * decoded a guest pointer as clip dimensions. */
     if (want_w > ENG_MAX_SURFACE_DIM || want_h > ENG_MAX_SURFACE_DIM) {
+        atomic_store(&s_checked_failed,1);
         static u32 logs = 0;
         if (logs++ < 8)
             fprintf(stderr, "[rsx engine] rejected implausible surface 0x%X %ux%u;"
@@ -560,7 +565,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         return slot < ENG_MAX_SURFACES ? slot : ENG_INVALID;
     }
     if (slot == ENG_MAX_SURFACES) {
-        if (g.n_surfaces >= ENG_MAX_SURFACES) return ENG_INVALID;
+        if (g.n_surfaces >= ENG_MAX_SURFACES) {atomic_store(&s_checked_failed,1);return ENG_INVALID;}
         slot = g.n_surfaces;
     }
 
@@ -569,8 +574,8 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                                         want_fmt, &seed_row);
     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
                                                  want_w, want_h, seed, seed_row);
-    if (!handle)
-        return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
+    if (!handle) {atomic_store(&s_checked_failed,1);
+        return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;}
 
     eng_surface* s = &g.surfaces[slot];
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
@@ -617,13 +622,13 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
         const u32 slot = eng_surface_get(sf.color_location[i + 1],
                                          sf.color_offset[i + 1],
                                          sf.clip_w, sf.clip_h, fmt);
-        if (slot == ENG_INVALID) break;
+        if (slot == ENG_INVALID) {atomic_store(&s_checked_failed,1);break;}
         g.surfaces[slot].pitch = sf.color_pitch[i + 1];
         /* A set naming one buffer twice would attach the same target twice,
          * which no host API allows. */
         int seen = 0;
         for (u32 k = 0; k < n; k++) if (slots[k] == slot) seen = 1;
-        if (seen) break;
+        if (seen) {atomic_store(&s_checked_failed,1);break;}
         slots[n++] = slot;
     }
     return n;
@@ -787,13 +792,13 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         }
     }
     if (slot == ENG_MAX_ZDEPTHS) {
-        if (g.n_zdepths >= ENG_MAX_ZDEPTHS) return ENG_INVALID;
+        if (g.n_zdepths >= ENG_MAX_ZDEPTHS) {atomic_store(&s_checked_failed,1);return ENG_INVALID;}
         slot = g.n_zdepths;
     }
 
     const u32 handle = g.be->depth_target_create(g.be->user, want_w, want_h);
-    if (!handle)
-        return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
+    if (!handle) {atomic_store(&s_checked_failed,1);
+        return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;}
 
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
@@ -939,6 +944,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                             u32 levels, u32 pitch, int cube, u32 remap)
 {
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
+    const u64 generation = atomic_load_explicit(&s_dirty_generation, memory_order_acquire);
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     if (!span) return 0;
 
@@ -949,11 +955,13 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             e->pitch != pitch || e->remap != remap ||
             e->cubemap != (u32)(cube != 0))
             continue;
-        if (e->handle && e->last_hash_frame != g.frames) {
+        if (e->handle && (e->last_hash_frame != g.frames || e->dirty_generation != generation)) {
             int readable = 0;
             const u64 hash = eng_texture_content_hash(location, offset, span,
                                                       &readable);
             e->last_hash_frame = g.frames;
+            e->dirty_generation = generation;
+            if(!readable){atomic_store(&s_checked_failed,1);return 0;}
             if (readable && hash != e->content_hash) {
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap);
@@ -961,7 +969,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
                     e->content_hash = hash;
-                }
+                } else {atomic_store(&s_checked_failed,1);return 0;}
             }
         }
         e->last_use_serial = ++g.texture_use_serial;
@@ -986,11 +994,13 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.width = w; e.height = h; e.pitch = pitch;
     e.remap = remap; e.cubemap = (u32)(cube != 0);
     e.last_hash_frame = g.frames;
+    e.dirty_generation = generation;
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap);
+    if (!e.handle) atomic_store(&s_checked_failed,1);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) g.textures[index] = e;
     return e.handle;
@@ -1640,7 +1650,7 @@ static void sink_draw_arrays(void* user, const rsx_dispatch* r, u32 first, u32 c
 {
     (void)user; (void)r;
     dc.n_packets++;
-    if (dc.n_arr >= ENG_MAX_BATCHES) return;
+    if (dc.n_arr >= ENG_MAX_BATCHES) {atomic_store(&s_checked_failed,1);return;}
     dc.arr[dc.n_arr].first = first;
     dc.arr[dc.n_arr].count = count;
     dc.n_arr++;
@@ -1654,11 +1664,11 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
 {
     (void)user;
     const u32 stride = rsx_vertex_inline_layout(r, NULL);
-    if (!stride || bytes < stride) return;
+    if (!stride || bytes < stride) {atomic_store(&s_checked_failed,1);return;}
     dc.inl = data;
     dc.inl_bytes = bytes;
     dc.n_packets++;
-    if (dc.n_arr >= ENG_MAX_BATCHES) return;
+    if (dc.n_arr >= ENG_MAX_BATCHES) {atomic_store(&s_checked_failed,1);return;}
     dc.arr[dc.n_arr].first = 0;
     dc.arr[dc.n_arr].count = bytes / stride;
     dc.n_arr++;
@@ -1668,7 +1678,7 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
 {
     (void)user; (void)r;
     dc.n_packets++;
-    if (dc.n_idx >= ENG_MAX_BATCHES) return;
+    if (dc.n_idx >= ENG_MAX_BATCHES) {atomic_store(&s_checked_failed,1);return;}
     dc.idx[dc.n_idx].first = first;
     dc.idx[dc.n_idx].count = count;
     dc.n_idx++;
@@ -2128,15 +2138,15 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int scratch = 0;
     const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
     if (!rebuild) {
-        if (rsx_primitive_needs_expansion(prim)) return;
+        if (rsx_primitive_needs_expansion(prim)) {atomic_store(&s_checked_failed,1);return;}
         topology = rsx_primitive_topology(prim);
-        if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
+        if (topology == RSX_TOPOLOGY_UNSUPPORTED) {atomic_store(&s_checked_failed,1);return;}
     }
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
     dc_fetch(&layout, rebuild);
-    if (!dc.n_verts || !dc.fetch_ok) return;
+    if (!dc.n_verts || !dc.fetch_ok) {atomic_store(&s_checked_failed,1);return;}
 
     int indexed = 0;
     u32 n_draw = dc.n_source_refs;
@@ -2154,7 +2164,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
-    if (!n_targets) return;
+    if (!n_targets) {atomic_store(&s_checked_failed,1);return;}
     const u32 target = targets[0];
 
     rsx_dsp_surface sf;
@@ -2173,7 +2183,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used);
-    if (!pipeline) return;
+    if (!pipeline) {atomic_store(&s_checked_failed,1);return;}
 
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */
@@ -2191,7 +2201,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
                                                     vsamplers);
 
     if (indexed) {
-        if (!dc_reserve_indices(n_draw)) return;
+        if (!dc_reserve_indices(n_draw)) {atomic_store(&s_checked_failed,1);return;}
         rsx_draw_engine_write_topology_indices(
             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
             dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
@@ -2221,7 +2231,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 fp_bytes = (nslots + 1u) * 16u;
     if (g.fp_cb_cap < fp_bytes) {
         u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
-        if (!n) return;
+        if (!n) {atomic_store(&s_checked_failed,1);return;}
         g.fp_cb = n;
         g.fp_cb_cap = fp_bytes;
     }
@@ -2302,7 +2312,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     if (!g.ready) return;
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
-    if (!n_targets) return;
+    if (!n_targets) {atomic_store(&s_checked_failed,1);return;}
     if (pd_capturing()) {
         rsx_dsp_surface zs;
         rsx_dsp_get_surface(&g.rsx, &zs);
@@ -2332,7 +2342,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         rsx_dsp_get_surface(&g.rsx, &sf);
         const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                          sf.clip_w, sf.clip_h);
-        if (zslot == ENG_INVALID) return;
+        if (zslot == ENG_INVALID) {atomic_store(&s_checked_failed,1);return;}
         u32 flags = 0;
         if (mask & RSX_CLEAR_DEPTH)   flags |= RSX_BE_CLEAR_DEPTH;
         if (mask & RSX_CLEAR_STENCIL) flags |= RSX_BE_CLEAR_STENCIL;
@@ -2459,6 +2469,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
+    atomic_store(&s_checked_failed, 0);
+    atomic_store(&s_checked_ready, g.be->submit_and_wait_checked != NULL);
     /* Display buffers the title registered before the backend came up. */
     cellGcm_replay_display_buffers_to_engine();
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
@@ -2468,6 +2480,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
 
 void rsx_draw_engine_shutdown(void)
 {
+    atomic_store(&s_checked_ready, 0);
     if (!g.be) return;
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
@@ -2521,6 +2534,31 @@ void rsx_draw_engine_flush(void)
 {
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+}
+
+void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes)
+{
+    if (!bytes || (u64)ea + bytes > 0x100000000ull) {
+        atomic_store(&s_checked_failed,1); return;
+    }
+    if(atomic_fetch_add_explicit(&s_dirty_generation,1,memory_order_release)==UINT64_MAX)
+        atomic_store(&s_checked_failed,1);
+}
+
+int rsx_draw_engine_checked_ready(void)
+{
+    return atomic_load(&s_checked_ready) && !atomic_load(&s_checked_failed);
+}
+
+int rsx_draw_engine_flush_checked(void)
+{
+    if (!rsx_draw_engine_checked_ready()) return 0;
+    if (!g.ready || !g.be || !g.be->submit_and_wait_checked || g.rsx.in_begin_end ||
+        g.be->submit_and_wait_checked(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE) != 1) {
+        atomic_store(&s_checked_failed, 1);
+        return 0;
+    }
+    return 1;
 }
 
 void rsx_draw_engine_present(void)
