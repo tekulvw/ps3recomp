@@ -18,6 +18,12 @@ typedef struct SailVideoFrame {
 } SailVideoFrame;
 #define SAIL_VIDEO_HAS_STREAMING 1
 typedef struct SailVideoDecoder SailVideoDecoder;
+#define SAIL_AUDIO_HAS_PCM 1
+/* Bounded selected ATRAC3+ PAMF track, decoded float PCM in FFmpeg channel order.
+ * This host record has no guest ABI. File is borrowed and position restored. */
+typedef struct SailAudioPCM { float* samples; uint32_t channels,rate,count; uint64_t pts; } SailAudioPCM;
+int sail_audio_decode_pcm(FILE*,uint64_t,uint64_t,unsigned,SailAudioPCM*);
+void sail_audio_pcm_release(SailAudioPCM*);
 int sail_video_available(void);
 /* Borrow validated FILE; close restores original position and never fclose.
  * next returns one picture (OK), verified demux+decoder drain (EOF), or error.
