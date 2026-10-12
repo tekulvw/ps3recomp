@@ -144,6 +144,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_cg:   DST = spu_cg(A,B); break;
     case SPU_cgx:  DST = spu_cgx(A,B,DST); break;
     case SPU_mpyi: DST = spu_mpyi(A,I); break;
+    case SPU_mpyui: DST = spu_mpyui(A,I); break;
     /* logical */
     case SPU_and: DST = spu_and(A,B); break;
     case SPU_or:  DST = spu_or(A,B); break;
