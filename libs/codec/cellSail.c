@@ -199,7 +199,7 @@ static SailGraphicsConfig s_graphics_configs[SAIL_GRAPHICS_MAX];
 typedef struct {
     int active, published, has_picture, new_frame, origin_cached, timed_poll, publication_closed;
     u32 buffer, session, tag, picture_id;
-    u64 pts, origin, picture_token;
+    u64 pts, origin, picture_token, first_poll_us;
     u8 format[32];
 } SailGraphicsFrame;
 static SailGraphicsFrame s_graphics_frames[SAIL_GRAPHICS_MAX];
@@ -1309,6 +1309,9 @@ s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
                     *selected=frame->picture_token;
             }
 #endif
+#if defined(PS3RECOMP_SAIL_FFMPEG) && PS3RECOMP_SAIL_FFMPEG
+            if(frame->picture_token && !frame->first_poll_us)frame->first_poll_us=ppu_system_time_us();
+#endif
             if(frame->timed_poll) ++frame->tag;
             vm_write32(pInfo, frame->buffer);
             vm_write32(pInfo + 4, frame->session);
@@ -1505,7 +1508,7 @@ static s32 sail_graphics_replace_identity(u32 player,u32 buffer,const u8 format[
         result=SAIL_GRAPHICS_INVALID_STATE;
         if(frame->active && !frame->publication_closed && (!frame->has_picture || (frame->published && frame->timed_poll &&
              picture_id>frame->picture_id && frame->origin==origin && !memcmp(frame->format,format,32)))){
-            frame->buffer=buffer;frame->pts=pts;frame->origin=origin;frame->picture_id=picture_id;frame->picture_token=picture_token;
+            frame->buffer=buffer;frame->pts=pts;frame->origin=origin;frame->picture_id=picture_id;frame->picture_token=picture_token;frame->first_poll_us=0;
             memcpy(frame->format,format,32);
             frame->timed_poll=frame->has_picture=frame->new_frame=frame->published=1;
             result=CELL_OK;
