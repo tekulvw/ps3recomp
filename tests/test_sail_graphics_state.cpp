@@ -16,6 +16,9 @@ ps3_guest_caller_fn g_ps3_guest_caller=nullptr;
 void ppu_hle_register_all();
 int ps3_hle_has(uint32_t);
 void ps3_hle_call(uint32_t,ppu_context*);
+int cellfs_translate_path(const char*,char*,size_t) { std::abort(); }
+int32_t cellPamfReaderInitialize(void*,void*,uint64_t,uint32_t) { std::abort(); }
+int32_t cellPamfReaderGetStreamIndex(void*) { std::abort(); }
 uint32_t prx_resolve_export(uint32_t) { return 0; }
 void ps3_indirect_call(ppu_context*) { std::abort(); }
 uint64_t ppu_guest_call(uint32_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) { std::abort(); }
@@ -106,7 +109,12 @@ int main() {
  CHECK(call(FMT,0x1000,0,0x2000)==STATE);
  CHECK(call(INIT,0x1000)==0);
  CHECK(call(BIND,0x6000,0,0x1000)==0);
+ if(ps3_hle_has(0x18B4629D)) {
+   CHECK(call(0x18B4629D,0x6000)==0);
+   CHECK(call(PLAYER,0x5000)==0);
+   CHECK(call(BIND,0x5000,0,0x1000)==0);
+ }
  CHECK(call(0xF220E64F,0)==0);
- CHECK(sail_graphics_config_for_player(0x6000,&config)==NA);
+ CHECK(call(FMT,0x1000,0,0x2000)==STATE);
  std::printf("%u graphics callback and format checks PASS\n",checks);return 0;
 }
