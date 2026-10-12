@@ -17,6 +17,9 @@ with tempfile.TemporaryDirectory(prefix="macos-pad-") as tmp:
     if bridge.exists(): cmd.append(str(bridge))
     cmd += [*sdl,"-framework","AppKit","-framework","Metal","-framework","QuartzCore","-Wl,-dead_strip","-o",str(tmp/"test")]
     subprocess.run(cmd,check=True,timeout=60)
+    if "--build-only" in sys.argv:
+        print("native Metal window input fixture compiled (not launched)")
+        raise SystemExit(0)
     subprocess.run([str(tmp/"test")],check=True,timeout=20)
     subprocess.run([str(tmp/"test"),"controller"],check=True,timeout=20)
     subprocess.run([str(tmp/"test"),"disabled"],env={**os.environ,"PAD_NO_KEYBOARD":"1"},check=True,timeout=20)
