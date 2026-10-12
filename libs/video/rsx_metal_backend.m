@@ -49,12 +49,15 @@
  */
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/QuartzCore.h>
 #if !TARGET_OS_IPHONE
 #  import <AppKit/AppKit.h>
 #  import "../input/pad_macos.h"
 #endif
 
 #include <stdatomic.h>
+#include <pthread.h>
+#include "metal_frame_rate.h"
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 #include "rsx_vertex_fetch.h"
@@ -80,6 +83,90 @@ static int                 s_closed;
 static int                 s_ready;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
+
+/* Each initialization owns its counters. A drawable callback retained by the
+ * compositor can outlive shutdown without writing into a later session. */
+@interface MetalFrameRateSession : NSObject {
+@public
+    pthread_mutex_t lock;
+    MetalFrameRate stats;
+}
+@end
+@implementation MetalFrameRateSession
+- (instancetype)init {
+    if ((self=[super init])) {
+        pthread_mutex_init(&lock,NULL);
+        metal_frame_rate_reset(&stats,CACurrentMediaTime());
+    }
+    return self;
+}
+- (void)dealloc { pthread_mutex_destroy(&lock); }
+@end
+static MetalFrameRateSession *s_fps_session;
+static dispatch_source_t s_fps_timer;
+static pthread_mutex_t s_fps_session_lock=PTHREAD_MUTEX_INITIALIZER;
+static MetalFrameRateSession *fps_session(void)
+{
+    pthread_mutex_lock(&s_fps_session_lock);
+    MetalFrameRateSession *session=s_fps_session;
+    pthread_mutex_unlock(&s_fps_session_lock);
+    return session;
+}
+
+static void fps_track_drawable(id<CAMetalDrawable> drawable)
+{
+    MetalFrameRateSession *session=fps_session();
+    if (!session || !drawable) return;
+    [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+        pthread_mutex_lock(&session->lock);
+        metal_frame_rate_presented(&session->stats,shown.presentedTime);
+        pthread_mutex_unlock(&session->lock);
+    }];
+}
+
+void rsx_metal_backend_note_guest_frame(void)
+{
+    MetalFrameRateSession *session=fps_session();
+    if (!session) return;
+    pthread_mutex_lock(&session->lock);
+    metal_frame_rate_guest(&session->stats);
+    pthread_mutex_unlock(&session->lock);
+}
+
+/* Main queue timer continues to report zero FPS even when frame submission
+ * blocks. It changes only the title, with no extra GPU work or image readback. */
+static void fps_stop(void)
+{
+    if (s_fps_timer) { dispatch_source_cancel(s_fps_timer); s_fps_timer=nil; }
+    pthread_mutex_lock(&s_fps_session_lock);
+    s_fps_session=nil;
+    pthread_mutex_unlock(&s_fps_session_lock);
+}
+static void fps_start(void)
+{
+    fps_stop();
+    const char *enabled=getenv("PS3RECOMP_METAL_FPS");
+    if (!enabled || strcmp(enabled,"1") || s_headless || !s_window) return;
+    MetalFrameRateSession *session=[MetalFrameRateSession new];
+    pthread_mutex_lock(&s_fps_session_lock);
+    s_fps_session=session;
+    pthread_mutex_unlock(&s_fps_session_lock);
+    NSWindow *window=s_window;
+    NSString *title=[window.title copy];
+    s_fps_timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_main_queue());
+    dispatch_source_set_timer(s_fps_timer,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),NSEC_PER_SEC,50*NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(s_fps_timer,^{
+        if (fps_session()!=session) return;
+        pthread_mutex_lock(&session->lock);
+        MetalFrameRateSample r=metal_frame_rate_sample(&session->stats,CACurrentMediaTime());
+        pthread_mutex_unlock(&session->lock);
+        window.title=[NSString stringWithFormat:@"%@ | display %.1f FPS | guest %.1f FPS | %.1f ms avg / %.1f p95 / %.1f max | age %.1f s",
+            title,r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds];
+        fprintf(stderr,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f\n",
+            r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds);
+    });
+    dispatch_resume(s_fps_timer);
+}
 
 /* ---- vertex layout ----------------------------------------------------------
  * Every draw carries all 16 RSX vertex attributes as float4, fetched on the
@@ -496,6 +583,7 @@ static int create_window_impl(const char* title)
     osk_native_macos_set_window((__bridge void*)s_window);
 #endif
     [NSApp activateIgnoringOtherApps:YES];
+    fps_start();
     return 0;
 }
 
@@ -3368,7 +3456,7 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
         int presented = eng_blit_to_display(cb, present_dst, dst);
         if (s_eng_diag.active && !presented && present_dst) s_eng_diag.reason = "blit_skipped";
         const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
-        if (drawable) [cb presentDrawable:drawable];
+        if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
         if (windowed_present) {
             eng_track_submission(cb);
             dispatch_semaphore_t sem = s_inflight;
@@ -3661,6 +3749,8 @@ void rsx_metal_backend_shutdown(void)
             s_inflight = nil;
         }
 #if !TARGET_OS_IPHONE
+        if ([NSThread isMainThread]) fps_stop();
+        else dispatch_sync(dispatch_get_main_queue(), ^{ fps_stop(); });
         if (s_window) { [s_window close]; s_window = nil; }
 #endif
         free(s_verts); s_verts = NULL;
@@ -3803,7 +3893,7 @@ void rsx_metal_backend_present(void)
         }
         if (enc) [enc endEncoding];
 
-        if (drawable) [cb presentDrawable:drawable];
+        if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
 
         if (s_headless) {
             /* The readback below must see a completed frame. */
