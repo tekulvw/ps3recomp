@@ -42,7 +42,7 @@ def main():
         b=bytearray((tmp/'thx.pam').read_bytes());b[0x87]=255;(tmp/'bad-inner.pam').write_bytes(b)
         (tmp/'truncated.pam').write_bytes(b[:100])
         env['PS3RECOMP_SAIL_TIMED_THX']='1'
-        for mode in ('happy','partial-three','partial-two','stop','bad-command','unsupported-source','checked-failure','decode-failure','allocation-failure','invalid-buffer','duplicate-buffer','unmapped-tail','unknown-nonterminal','truncated','drain-failure','negative-free','uncertain-free'):
+        for mode in ('delayed-final','happy','backpressure','partial-three','partial-two','stop','bad-command','unsupported-source','checked-failure','decode-failure','allocation-failure','invalid-buffer','duplicate-buffer','unmapped-tail','unknown-nonterminal','truncated','drain-failure','negative-free','uncertain-free'):
             env['SAIL_TEST_MODE']=mode
             subprocess.run([str(tmp/'fixture'),'thx.pam'],cwd=tmp,env=env,check=True,timeout=10)
     return 0

@@ -190,6 +190,14 @@ int main(int argc,char**argv) {
  sail_graphics_picture_capture_begin();CHECK(call(0x0247C69E,0x1800,0x4600)==0x100);
  uint64_t old=sail_graphics_picture_capture_end();CHECK(old && rsx_picture_bind_descriptor(0x6000,old)==1);
  rsx_picture_release(old);events.clear();
+ if(is_mode("backpressure")){
+  fake_clock+=10000000;
+  for(unsigned i=0;i<8;++i)CHECK(call(0x9e0b7aa6,0x1000,0x4700)==0); // actual GetState NID below
+  CHECK(allocations==1 && frame_frees==0);
+  CHECK(memory[buffer_ea(0)]==1 && memory[buffer_ea(1)]==2 && memory[buffer_ea(2)]==3 && memory[buffer_ea(3)]==4);
+  CHECK(call(STOP,0x1000,0x12345678)==0);
+  CHECK(frame_frees==4 && decoder_closes==1);return 0;
+ }
  if(is_mode("stop") || is_mode("uncertain-free") || is_mode("negative-free")){
   try {uint32_t rc=call(STOP,0x1000,0xFEDCBA9876543210ULL);
    if(is_mode("negative-free")){CHECK(rc==0x80610702);CHECK(call(STOP,0x1000,0)==0x80610702);return 0;}
@@ -201,6 +209,7 @@ int main(int argc,char**argv) {
   fake_clock=5000000+uint64_t(ordinal-1)*1001000/30-1;
   CHECK(call(0x0247C69E,0x1800,0x4600)==0x100);
   fake_clock+=1;
+  if(is_mode("delayed-final") && ordinal==179)fake_clock+=250000;
   uint32_t status=call(0x0247C69E,0x1800,0x4600);
   if((is_mode("truncated") && ordinal==70) || (is_mode("unknown-nonterminal") && ordinal==15) ||
      (is_mode("drain-failure") && ordinal==179)){
@@ -217,7 +226,8 @@ int main(int argc,char**argv) {
  uint64_t captured=0;CHECK(rsx_picture_take_command(0x7000,0,0,&captured)==1);
  CHECK(rsx_picture_data(captured,0,0,3686400)[0]==1);rsx_picture_release(captured);
  CHECK(events.empty());
- fake_clock=5000000+179ULL*1001000/30-1;
+ if(is_mode("delayed-final")){CHECK(call(0x0247C69E,0x1800,0x4600)==0x100);CHECK(events.empty());}
+ fake_clock=5000000+179ULL*1001000/30-1+(is_mode("delayed-final")?250000:0);
  CHECK(call(0x0247C69E,0x1800,0x4600)==0x100);CHECK(events.empty());
  fake_clock+=1;CHECK(call(0x0247C69E,0x1800,0x4600)==0);
  CHECK(events.size()==2 && events[0].major==3 && events[0].arg0==7 && events[1].arg0==4);
