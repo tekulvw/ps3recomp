@@ -68,7 +68,8 @@ endif()
 # rather than globbed. It needs no platform #ifdef of its own as a result.
 if(APPLE)
     enable_language(OBJC)
-    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m")
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_macos.m")
 endif()
 # The HLSL -> MSL translator is C++ (it drives glslang's C++ API) and compiles
 # to a stub wherever the shader tools are absent, so it is part of the
@@ -175,6 +176,7 @@ if(APPLE)
     )
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_macos.m"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
 endif()
