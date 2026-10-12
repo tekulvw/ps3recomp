@@ -196,6 +196,7 @@ typedef enum {
     SPU_sync,
     SPU_wrch,
     SPU_xor,
+    SPU_xorbi,
     SPU_xori,
     SPU_xsbh,
     SPU_xshw,
@@ -397,6 +398,7 @@ static const char* const spu_op_name[SPU_OP_COUNT] = {
     [SPU_sync] = "sync",
     [SPU_wrch] = "wrch",
     [SPU_xor] = "xor",
+    [SPU_xorbi] = "xorbi",
     [SPU_xori] = "xori",
     [SPU_xsbh] = "xsbh",
     [SPU_xshw] = "xshw",
@@ -461,6 +463,7 @@ static spu_op spu_dec_ri10(uint32_t op8) {
     case 0x24: return SPU_stqd;
     case 0x34: return SPU_lqd;
     case 0x44: return SPU_xori;
+    case 0x46: return SPU_xorbi;
     case 0x4C: return SPU_cgti;
     case 0x4D: return SPU_cgthi;
     case 0x4E: return SPU_cgtbi;

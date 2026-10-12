@@ -157,6 +157,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_andi:DST = spu_andi(A,I); break;
     case SPU_ori: DST = spu_ori(A,I); break;
     case SPU_xori:DST = spu_xori(A,I); break;
+    case SPU_xorbi:DST = spu_xorbi(A,I); break;
     case SPU_andbi:DST = spu_andbi(A,I); break;
     case SPU_andhi:DST = spu_andhi(A,I); break;
     case SPU_orhi: DST = spu_orhi(A,I); break;

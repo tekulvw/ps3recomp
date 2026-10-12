@@ -147,6 +147,7 @@ RI10_TABLE: dict[int, str] = {
     0b00010101: "andhi",  # and halfword immediate           (op8 0x15)
     0b00010110: "andbi",  # and byte immediate               (op8 0x16)
     0b01000100: "xori",   # xor word immediate
+    0b01000110: "xorbi",  # xor byte immediate (GNU SPU RI10 opcode 0x230)
     0b01111100: "ceqi",   # compare equal word immediate
     0b01111101: "ceqhi",  # compare equal halfword immediate
     0b01111110: "ceqbi",  # compare equal byte immediate
