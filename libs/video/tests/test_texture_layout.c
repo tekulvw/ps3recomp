@@ -663,7 +663,7 @@ static void test_remap_g8b8_lanes(void)
     for (int i = 0; i < 4; i++) CHECK_EQ(n[i], m[i]);
 }
 
-/* B8 has one channel, presented as {1,B,B,B}. A crossbar taking every output
+8 has one channel, presented as {1,B,B,B}. A crossbar taking every output
  * from B (0xAAFF, a distance-field font atlas) must read that channel, not
  * component 2 of a one-channel resource. */
 static void test_remap_b8_lanes(void)
@@ -677,6 +677,30 @@ static void test_remap_b8_lanes(void)
     rsx_texture_component_remap(0xAAE4u, FMT_B8, n);
     CHECK_EQ(n[A_], RSX_REMAP_ONE); CHECK_EQ(n[R_], 0);
     CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], 0);
+}
+
+/* B8 uploads its one byte to host R, while RSX presents {1,B,B,B}.
+ * Treating it as RGBA makes the 0x02FF font crossbar read absent host B
+ * into alpha, so every glyph disappears despite nonempty atlas bytes. */
+static void test_remap_b8_variants(void)
+{
+    const u32 formats[] = {FMT_B8, FMT_B8 | FMT_LN, FMT_B8 | 0x40u};
+    for (u32 f = 0; f < sizeof(formats) / sizeof(formats[0]); ++f) {
+        u8 m[4];
+        rsx_texture_component_remap(0xAAE4u, formats[f], m);
+        CHECK_EQ(m[A_], RSX_REMAP_ONE);
+        CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0);
+        rsx_texture_component_remap(0x02FFu, formats[f], m);
+        CHECK_EQ(m[A_], 0);
+        CHECK_EQ(m[R_], RSX_REMAP_ZERO);
+        CHECK_EQ(m[G_], RSX_REMAP_ZERO);
+        CHECK_EQ(m[B_], RSX_REMAP_ZERO);
+        /* Selecting guest alpha must produce constant one, not the byte. */
+        rsx_texture_component_remap(0xAA00u, formats[f], m);
+        for (int i = 0; i < 4; ++i) CHECK_EQ(m[i], RSX_REMAP_ONE);
+        rsx_texture_component_remap(0x55FFu, formats[f], m);
+        for (int i = 0; i < 4; ++i) CHECK_EQ(m[i], RSX_REMAP_ONE);
+    }
 }
 
 /* Compressed formats decode to RGBA, so they use the same lanes as A8R8G8B8 --
@@ -719,9 +743,12 @@ int main(void)
     test_remap_identity();
     test_remap_identity_packs_to_d3d_default();
     test_remap_b8_lanes();
+    test_remap_b8_variants();
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();
+    test_remap_b8_lanes();
+    test_remap_b8_variants();
     test_remap_dxt_matches_argb();
     test_remap_rejects_null();
 
