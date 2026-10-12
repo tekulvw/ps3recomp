@@ -224,6 +224,7 @@ s32 cellSysutilCheckCallback(void)
      * same poll delivers them. A no-op when no psnr server is configured. */
     { extern void np_psnr_pump(void); np_psnr_pump(); }
     { extern void ps3_np_eula_tick(void); ps3_np_eula_tick(); }
+    { extern void ps3_np_ticket_tick(void); ps3_np_ticket_tick(); }
     drain_guest_completions();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
      * drain_guest_completions() above, deferring a dialog answer to this poll
