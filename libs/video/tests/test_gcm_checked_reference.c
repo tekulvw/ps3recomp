@@ -69,6 +69,33 @@ int main(int argc,char**argv) {
         assert(peek_ref()==0xA5A5A5A5u);assert(s_ref_qhead==s_ref_qtail);
         released=1;pthread_cond_broadcast(&hold_cond);pthread_mutex_unlock(&hold_mutex);
         assert(!pthread_join(t,NULL));assert(peek_ref()==0xCAFEBABE);
+    } else if(!strcmp(argv[1],"park_patch") || !strcmp(argv[1],"park_branch") || !strcmp(argv[1],"park_wrap")) {
+        /* A producer parks the GPU while its next segment is incomplete.
+         * put can be ahead, or behind the park after a ring wrap. */
+        int wrap=!strcmp(argv[1],"park_wrap");
+        u32 park=wrap?0x100:0, put=wrap?8:16;
+        raw32(0x100000+park,0x20000000u|park);
+        raw32(0x100008,0x00040050);raw32(0x10000C,0xCAFEBABE);
+        cellGcm_syscall_set_fifo(put,park);
+        for(unsigned i=0;i<3;i++) {
+            cellGcm_rsx_process_fifo();
+            assert(s_fifo_getoff==park && !checked_calls);
+            assert(peek_ref()==0xA5A5A5A5u);
+            assert(s_ref_qhead==s_ref_qtail);
+            assert(!atomic_load(&s_checked_ref_failed));
+            assert(cellGcm_checked_reference_ready());
+        }
+        if(!strcmp(argv[1],"park_patch")) {
+            raw32(0x100000,0x00040050);raw32(0x100004,0xCAFEBABE);
+            cellGcm_syscall_set_fifo(8,park);
+        } else if(wrap) {
+            raw32(0x100000,0x00040050);raw32(0x100004,0xCAFEBABE);
+            raw32(0x100000+park,0x20000000u);
+        } else raw32(0x100000,0x20000008u);
+        cellGcm_rsx_process_fifo();
+        assert(s_fifo_getoff==(wrap||!strcmp(argv[1],"park_patch")?8:16));
+        assert(checked_calls==1 && peek_ref()==0xCAFEBABE);
+        assert(s_checked_ref_receipt==1 && !atomic_load(&s_checked_ref_failed));
     } else if(!strcmp(argv[1],"repeat_wrap")) {
         u32 values[]={0xFFFFFFFFu,0xFFFFFFFFu,0,1};
         for(unsigned i=0;i<4;i++){raw32(0x100000+8*i,0x00040050);raw32(0x100004+8*i,values[i]);}

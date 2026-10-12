@@ -2101,7 +2101,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * patch time to arrive, and resync only for a park that
                    * has stood with the same put for longer than any title
                    * takes between the two stores. */
-                  if (put != s_fifo_getoff) {
+                  /* Checked streams must never skip a producer park. */
+                  if (put != s_fifo_getoff && !gcm_checked_ref_mode()) {
                       extern unsigned long long ps3_ms_now(void);
                       static u32 park_off, park_put;
                       static unsigned long long park_since;
