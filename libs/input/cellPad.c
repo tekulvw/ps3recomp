@@ -519,7 +519,8 @@ static void pad_poll_backend(void)
     if (keyboard_off < 0) keyboard_off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
     if (!keyboard_off && !s_host_state[0].connected) {
         PadHostState* hs = &s_host_state[0];
-        u16 btns = ps3recomp_pad_macos_buttons();
+        PS3RecompMacOSPadState keyboard = ps3recomp_pad_macos_state();
+        u16 btns = keyboard.buttons;
         memset(hs, 0, sizeof(*hs));
         hs->buttons = btns;
         static int trace = -1;
@@ -530,9 +531,10 @@ static void pad_poll_backend(void)
             fflush(stdout);
         }
         previous = btns;
-        hs->analog_lx = (btns & CELL_PAD_CTRL_LEFT) ? 0 : (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128;
-        hs->analog_ly = (btns & CELL_PAD_CTRL_UP) ? 0 : (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128;
-        hs->analog_rx = hs->analog_ry = 128;
+        hs->analog_lx = keyboard.analog_lx;
+        hs->analog_ly = keyboard.analog_ly;
+        hs->analog_rx = keyboard.analog_rx;
+        hs->analog_ry = keyboard.analog_ry;
     }
 #endif
 }
