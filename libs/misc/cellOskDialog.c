@@ -1,13 +1,15 @@
 /*
  * ps3recomp - cellOskDialog HLE implementation
  *
- * Provides an on-screen keyboard stub.  When a game requests text input,
+ * macOS uses a native user-operated sheet and a deferred sysutil lifecycle.
+ * Other hosts retain the legacy on-screen keyboard stub. When a game requests text input,
  * the prompt is logged and an empty string (or configurable default) is
  * returned immediately.  In a full implementation this would show an
  * actual input dialog.
  */
 
 #include "cellOskDialog.h"
+#include "osk_native.h"
 #include <stdio.h>
 #include <string.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
@@ -124,6 +126,9 @@ s32 cellOskDialogLoadAsync(u32 container,
                            const CellOskDialogParam* dialogParam,
                            const CellOskDialogInputFieldInfo* inputFieldInfo)
 {
+#ifdef PS3RECOMP_NATIVE_OSK
+    return osk_native_load(GUEST_EA(dialogParam),GUEST_EA(inputFieldInfo));
+#endif
     (void)container; (void)dialogParam;
 
     if (!s_osk_initialized)
@@ -180,6 +185,9 @@ s32 cellOskDialogLoadAsync(u32 container,
 
 s32 cellOskDialogUnloadAsync(CellOskDialogCallbackReturnParam* result)
 {
+#ifdef PS3RECOMP_NATIVE_OSK
+    return osk_native_unload(GUEST_EA(result));
+#endif
     if (!s_osk_initialized)
         return CELL_OSK_ERROR_NOT_INITIALIZED;
 
@@ -218,6 +226,9 @@ s32 cellOskDialogGetSize(u32* width, u32* height)
 
 s32 cellOskDialogAbort(void)
 {
+#ifdef PS3RECOMP_NATIVE_OSK
+    return osk_native_abort();
+#endif
     printf("[cellOskDialog] Abort()\n");
 
     if (!s_osk_loaded)
@@ -267,6 +278,9 @@ s32 cellOskDialogSetSeparateWindowOption(u32 option)
 
 s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* result)
 {
+#ifdef PS3RECOMP_NATIVE_OSK
+    return osk_native_get_text(GUEST_EA(result));
+#endif
     if (!s_osk_initialized)
         return CELL_OSK_ERROR_NOT_INITIALIZED;
 
