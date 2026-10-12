@@ -1,0 +1,11 @@
+SPDX-License-Identifier: CC0-1.0
+
+The original formula-generated image content, synthetic MPEG-2 program-stream
+fixture, generator and fixture verifier in this directory are dedicated to the
+public domain under Creative Commons CC0 1.0 Universal:
+https://creativecommons.org/publicdomain/zero/1.0/
+
+No MAG, THX, Sony, Zipper or other game asset bytes were used to generate this
+fixture. The MPEG-2 stream was encoded from original numeric pixel formulas.
+FFmpeg itself and the separately located libraries retain their own licenses;
+they are not relicensed by this notice and are not included in this fixture.
