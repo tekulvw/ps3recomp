@@ -31,6 +31,7 @@ extern "C" {
 #define SYS_NET_EBADF               9
 #define SYS_NET_ENOMEM              12
 #define SYS_NET_EINVAL              22
+#define SYS_NET_EPIPE               32
 #define SYS_NET_EWOULDBLOCK         35
 #define SYS_NET_EINPROGRESS         36
 #define SYS_NET_EALREADY            37
