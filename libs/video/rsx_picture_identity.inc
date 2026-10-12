@@ -43,6 +43,7 @@ fail:pic_failed=1;
 done:pic_leave();return result;
 }
 void rsx_picture_release(u64 token){if(!token)return;pic_enter();pic_drop(token);pic_leave();}
+int rsx_picture_retain(u64 token){pic_enter();int result=!pic_failed && pic_hold(token);pic_leave();return result;}
 int rsx_picture_bind_descriptor(u32 ea,u64 token)
 {
     if(!ea)return -1;pic_enter();int result=-1,empty=-1;

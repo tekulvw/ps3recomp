@@ -2,6 +2,7 @@
 #define PS3RECOMP_RSX_PICTURE_IDENTITY_H
 #include "ps3emu/ps3types.h"
 #define RSX_HAS_PICTURE_IDENTITIES 1
+#define RSX_PICTURE_HAS_RETAIN 1
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -13,6 +14,7 @@ int rsx_picture_take_command(u32 data_ea,u32 location,u32 offset,u64* token);
  * never release that ownership concurrently. */
 const u8* rsx_picture_data(u64 token,u32 location,u32 offset,u32 bytes);
 void rsx_picture_release(u64 token);
+int rsx_picture_retain(u64 token);
 int rsx_picture_ready(void);
 int rsx_picture_live_count(void);
 int rsx_picture_reset(void);
