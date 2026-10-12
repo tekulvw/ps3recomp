@@ -31,6 +31,7 @@ void spu_lockline_unlock(void) { assert(locked); locked=0; }
 int rsx_draw_engine_enabled(void) { return 1; }
 int rsx_live_draw_enabled(void) { return 1; }
 void rsx_draw_engine_method(u32 m, u32 v) { (void)m; (void)v; }
+void rsx_draw_engine_method_at(u32 m,u32 v,u32 ea){(void)ea;rsx_draw_engine_method(m,v);}
 void rsx_live_draw_method(u32 m, u32 v) { (void)m; (void)v; }
 void rsx_draw_engine_flush(void) { assert(!locked); assert(vm_read32(watched+12)==0x00010000); flushed++; }
 void rsx_live_draw_flush(void) { assert(!locked); assert(vm_read32(watched+12)==0x00010000); live_flushed++; }
