@@ -19,6 +19,15 @@
 #include <stdlib.h>   /* getenv -- Clang errors on the implicit declaration MSVC allows */
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
+/* Internal explicit diagnostic; not normal timed playback. */
+static s32 sail_held_start(u32 player, u32 command, u64 token);
+static s32 sail_held_stop(u32 player, u64 token);
+static s32 sail_held_release_locked(u32 player);
+static int sail_held_enabled(void) {
+    const char* value = getenv("PS3RECOMP_SAIL_HELD_FRAME");
+    return value && !strcmp(value, "1");
+}
+
 /* Internal state */
 
 static int s_initialized = 0;
@@ -254,8 +263,10 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle, u64 userParam)
     return sail_stream_lifecycle(handle, userParam, 1);
 }
 
-s32 cellSailPlayerStart(CellSailPlayerHandle handle)
+s32 cellSailPlayerStart(CellSailPlayerHandle handle, u32 command, u64 userParam)
 {
+    if (sail_held_enabled()) return sail_held_start((u32)handle, command, userParam);
+    (void)command; (void)userParam;
     printf("[cellSail] PlayerStart(%u)\n", handle);
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
@@ -272,8 +283,10 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle)
     return CELL_OK;
 }
 
-s32 cellSailPlayerStop(CellSailPlayerHandle handle)
+s32 cellSailPlayerStop(CellSailPlayerHandle handle, u64 userParam)
 {
+    if (sail_held_enabled()) return sail_held_stop((u32)handle, userParam);
+    (void)userParam;
     printf("[cellSail] PlayerStop(%u)\n", handle);
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
@@ -506,6 +519,8 @@ static s32 sail_stream_lifecycle(u32 player, u64 userParam, int close_stream)
     if (!g_ps3_guest_caller || !s_sail_players[slot].callback_ea)
         return sail_descriptor_result(SAIL_DESC_NOT_AVAILABLE);
     if (close_stream) {
+        const s32 held_release = sail_held_release_locked(player);
+        if (held_release) return sail_descriptor_result(held_release);
         if (d->media) { fclose(d->media); d->media = NULL; }
         d->stream_open = 0;
         d->registered = 0;
@@ -1040,6 +1055,9 @@ s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
             vm_write64(pInfo + 16, frame->pts);
             frame->origin_cached = 1;
             result = frame->new_frame ? 0x200 : 0x100;
+            if (frame->new_frame)
+                fprintf(stderr, "[cellSail] GraphicsFrame consumed self=%08X buffer=%08X session=%u tag=%u status=0 pts=%llu\n",
+                    pSelf, frame->buffer, frame->session, frame->tag, (unsigned long long)frame->pts);
             frame->new_frame = 0;
         }
     }
@@ -1264,3 +1282,5 @@ s32 sail_graphics_unpublish_frame(u32 player)
     sail_graphics_unlock();
     return result;
 }
+
+#include "sail_held_frame.inc"
