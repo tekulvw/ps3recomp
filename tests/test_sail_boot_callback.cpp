@@ -59,7 +59,7 @@ static bool event_is(size_t i,uint64_t major,uint64_t minor,uint64_t arg0,uint64
 }
 int main() {
     static uint8_t memory[0x10000];vm_base=memory;ppu_hle_register_all();g_ps3_guest_caller=callback;
-    constexpr uint32_t INIT=0x23654375,BOOT=0xBDF21B0F,CLOSE=0x85BEFFCC,STOP=0xEBA8D4EC,DESTROY=0x24F4E900;
+    constexpr uint32_t INIT=0x23654375,BOOT=0xBDF21B0F,STOP=0xEBA8D4EC,DESTROY=0x24F4E900;
     CHECK(ps3_hle_has(INIT));CHECK(ps3_hle_has(BOOT));
     CHECK(call(INIT,0x1000,0,0x4000,0x4567)==0);
     for(uint64_t param : {UINT64_C(0xFEDCBA9876543210),UINT64_C(0),UINT64_C(0x0FEF7800)}) {
@@ -70,8 +70,8 @@ int main() {
     }
     events.clear();CHECK(call(STOP,0x1000)==0);CHECK(events.size()==3);
     CHECK(event_is(0,3,0,7,0));CHECK(event_is(1,2,11,0,0));CHECK(event_is(2,3,0,4,0));
-    events.clear();CHECK(call(CLOSE,0x1000)==0);CHECK(events.size()==3);
-    CHECK(event_is(0,3,0,8,0));CHECK(event_is(1,2,3,0,0));CHECK(event_is(2,3,0,2,0));
+    // Actual close source/descriptor events belong to the descriptor lifecycle
+    // fixture; boot completion must not require a fabricated sourceless close.
     CHECK(call(INIT,0x2000,0,0x5000,0x9876)==0);
     events.clear();CHECK(call(BOOT,0x2000,UINT64_C(0x1234567800000001))==0);CHECK(events.size()==3);
     CHECK(event_is(1,2,1,0,UINT64_C(0x1234567800000001),0x5000,0x9876));
