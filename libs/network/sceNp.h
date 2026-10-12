@@ -131,6 +131,7 @@ typedef void (*SceNpManagerCallback)(s32 event, s32 result, void* arg);
 #define SCE_NP_MANAGER_EVENT_GOT_TICKET         255
 typedef struct SceNpTicketVersion { u16 major, minor; } SceNpTicketVersion;
 
+s32 sceNpManagerGetEntitlementIdList(void* entIdList, u32 entIdListNum);
 s32 sceNpManagerGetStatus(s32* status);
 s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg);
 s32 sceNpManagerUnregisterCallback(void);
