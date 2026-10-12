@@ -234,6 +234,10 @@ void     vm_write64(uint64_t addr, uint64_t val);
  * threads -- a plain conditional write races and corrupts under real concurrency. */
 int      ppu_stwcx32(uint64_t addr, uint32_t expected, uint32_t val);
 int      ppu_stdcx64(uint64_t addr, uint64_t expected, uint64_t val);
+uint32_t ppu_load_reserve32(ppu_context* ctx, uint64_t addr);
+uint64_t ppu_load_reserve64(ppu_context* ctx, uint64_t addr);
+int ppu_store_conditional32(ppu_context* ctx, uint64_t addr, uint32_t val);
+int ppu_store_conditional64(ppu_context* ctx, uint64_t addr, uint64_t val);
 #ifdef __cplusplus
 }
 #endif
@@ -2176,37 +2180,33 @@ class PPULifter:
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"ctx->gpr[{rd}] = vm_read32(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->gpr[{rd}] = ppu_load_reserve32(ctx, ea); }}")
 
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             # Atomic store-conditional: succeed only if the reservation address
-            # matches AND the guest word is unchanged since lwarx (ppu_stwcx32 does
+            # matches AND its coherent line epoch and word are unchanged (the runtime does
             # the atomic CAS). A plain conditional write loses concurrent updates
             # (lock-free free-list/refcount corruption under real host threads).
             return (f"{{ uint64_t ea = {ea}; "
-                    f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
-                    f"ppu_stwcx32(ea, (uint32_t)ctx->reserve_value, (uint32_t)ctx->gpr[{rs}]); "
+                    f"int _sc = ppu_store_conditional32(ctx, ea, (uint32_t)ctx->gpr[{rs}]); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u); "  # CR0 EQ = success
-                    f"ctx->reserve_addr = 0; }}")
+                    f"}}")
 
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"ctx->gpr[{rd}] = vm_read64(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->gpr[{rd}] = ppu_load_reserve64(ctx, ea); }}")
 
         if mn == "stdcx" or mn == "stdcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
-                    f"ppu_stdcx64(ea, ctx->reserve_value, ctx->gpr[{rs}]); "
+                    f"int _sc = ppu_store_conditional64(ctx, ea, ctx->gpr[{rs}]); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u); "
-                    f"ctx->reserve_addr = 0; }}")
+                    f"}}")
 
         # ------- Trap (tw) — used for assertions, safe to no-op in recomp -------
         if mn == "tw" or mn == "twi" or mn == "td" or mn == "tdi":
