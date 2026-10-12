@@ -1,3 +1,4 @@
+#include "../misc/osk_native.h"
 /*
  * ps3recomp - RSX -> Metal backend (macOS / Apple Silicon)
  *
@@ -612,6 +613,9 @@ static int create_window_impl(const char* title)
 
     [s_window makeKeyAndOrderFront:nil];
     [s_window makeFirstResponder:view];
+#ifndef PS3RECOMP_DISABLE_NATIVE_OSK
+    osk_native_macos_set_window((__bridge void*)s_window);
+#endif
     [NSApp activateIgnoringOtherApps:YES];
     fps_start();
     return 0;

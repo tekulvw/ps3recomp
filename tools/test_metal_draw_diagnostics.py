@@ -6,7 +6,7 @@ def main():
  if platform.system()!="Darwin":print("SKIP: Metal diagnostics require macOS");return
  with tempfile.TemporaryDirectory(prefix="ps3-metal-draw-") as tmp:
   binary=pathlib.Path(tmp)/"fixture"
-  subprocess.run(["clang","-fobjc-arc","-I","include","-I","libs/video","libs/video/tests/test_metal_draw_diagnostics.m","libs/video/rsx_texture_layout.c", "libs/input/pad_macos.m","-Wl,-dead_strip","-framework","Metal","-framework","Cocoa","-framework","QuartzCore","-o",str(binary)],cwd=ROOT,check=True,timeout=120)
+  subprocess.run(["clang","-fobjc-arc", "-DPS3RECOMP_DISABLE_NATIVE_OSK","-I","include","-I","libs/video","libs/video/tests/test_metal_draw_diagnostics.m","libs/video/rsx_texture_layout.c", "libs/input/pad_macos.m","-Wl,-dead_strip","-framework","Metal","-framework","Cocoa","-framework","QuartzCore","-o",str(binary)],cwd=ROOT,check=True,timeout=120)
   for mode in ("disabled","enabled","managed"):
    capture=pathlib.Path(tmp)/(mode+".ppm")
    env=dict(os.environ,PS3RECOMP_METAL_TARGET_DUMP=str(capture))

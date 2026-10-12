@@ -215,6 +215,7 @@ int cellSysutil_pump_seen(void) { return s_pump_seen; }
 
 s32 cellSysutilCheckCallback(void)
 {
+    { extern void cellOskDialog_tick(void); cellOskDialog_tick(); }
     /* Give a no-button dialog the title has left open past its grace period
      * its dismissal. Done before the drain so the callback it queues is
      * delivered on this same poll. */
