@@ -4,12 +4,15 @@
 #include <string.h>
 #include <limits.h>
 
+void sail_audio_pcm_release(SailAudioPCM* a) { if(a){free(a->samples);memset(a,0,sizeof(*a));} }
 void sail_video_frame_release(SailVideoFrame* frame)
 {
     if (frame) { free(frame->rgba); memset(frame, 0, sizeof(*frame)); }
 }
 #ifndef PS3RECOMP_SAIL_FFMPEG
 int sail_video_available(void) { return 0; }
+int sail_audio_decode_pcm(FILE*f,uint64_t o,uint64_t n,unsigned t,SailAudioPCM*a)
+{(void)f;(void)o;(void)n;(void)t;(void)a;return SAIL_VIDEO_UNAVAILABLE;}
 int sail_video_open(FILE*f,uint64_t o,uint64_t n,unsigned s,SailVideoDecoder**d)
 { (void)f;(void)o;(void)n;(void)s;if(d)*d=NULL;return SAIL_VIDEO_UNAVAILABLE; }
 int sail_video_next(SailVideoDecoder*d,SailVideoFrame*out)
@@ -385,4 +388,93 @@ fail:
     d->failed=result;sail_video_frame_release(out);av_frame_unref(d->frame);return result;
 }
 
+#endif
+
+#ifdef PS3RECOMP_SAIL_FFMPEG
+/* Parse top-level MPEG program packets. Never scan PES payloads for start codes:
+ * compressed video may contain a byte sequence resembling a private audio PES. */
+int sail_audio_decode_pcm(FILE* file,uint64_t offset,uint64_t length,unsigned track,SailAudioPCM* out)
+{
+    if(!out || out->samples || !file || track>9 || !length || length>SAIL_VIDEO_MAX_PAYLOAD ||
+        offset>INT64_MAX || length>(uint64_t)INT64_MAX-offset)return SAIL_VIDEO_INVALID;
+    if(!sail_video_available())return SAIL_VIDEO_ABI;
+    const int64_t saved=sail_tell(file); if(saved<0)return SAIL_VIDEO_IO;
+    int result=SAIL_VIDEO_INVALID;uint8_t* compressed=NULL;float* pcm=NULL;
+    AVCodecContext* codec=NULL;AVPacket* packet=NULL;AVFrame* frame=NULL;
+    size_t used=0;uint64_t pos=offset,end=offset+length,first_pts=UINT64_MAX;
+    if(sail_seek(file,0,SEEK_END) || sail_tell(file)<0 || end>(uint64_t)sail_tell(file))goto done;
+    compressed=malloc(8u<<20);if(!compressed){result=SAIL_VIDEO_LIMIT;goto done;}
+    uint8_t bytes[65536];unsigned packets=0;
+    while(pos+6<=end){
+        if(++packets>SAIL_VIDEO_MAX_PACKETS){result=SAIL_VIDEO_LIMIT;goto done;}
+        if(sail_seek(file,pos,SEEK_SET) || fread(bytes,1,6,file)!=6){result=SAIL_VIDEO_IO;goto done;}
+        if(bytes[0] || bytes[1] || bytes[2]!=1){
+            /* Zero alignment padding is allowed outside packets only. */
+            if(bytes[0])goto done;++pos;continue;
+        }
+        const unsigned code=bytes[3];
+        if(code==0xb9){pos+=4;break;}
+        if(code==0xba){
+            if(end-pos<14 || fread(bytes+6,1,8,file)!=8)goto done;
+            pos+=14+(bytes[13]&7);if(pos>end)goto done;continue;
+        }
+        if(code<0xbb)goto done;
+        const unsigned n=((unsigned)bytes[4]<<8)|bytes[5];
+        if(!n || pos+6+n>end)goto done;
+        if(code==0xbd){
+            if(fread(bytes,1,n,file)!=n){result=SAIL_VIDEO_IO;goto done;}
+            if(n<7 || (bytes[0]&0xc0)!=0x80)goto done;
+            const unsigned payload=3+bytes[2];if(payload+4>n)goto done;
+            if(bytes[payload]==track){
+                if(first_pts==UINT64_MAX){
+                    if(!(bytes[1]&0x80) || bytes[2]<5)goto done;
+                    const uint8_t* p=bytes+3;
+                    if(!(p[0]&1) || !(p[2]&1) || !(p[4]&1))goto done;
+                    first_pts=((uint64_t)((p[0]>>1)&7)<<30)|((uint64_t)p[1]<<22)|
+                        ((uint64_t)(p[2]>>1)<<15)|((uint64_t)p[3]<<7)|(p[4]>>1);
+                }
+                const unsigned count=n-payload-4;
+                if(count>(8u<<20)-used){result=SAIL_VIDEO_LIMIT;goto done;}
+                memcpy(compressed+used,bytes+payload+4,count);used+=count;
+            }
+        }
+        pos+=6+n;
+    }
+    if(used<8 || compressed[0]!=0x0f || compressed[1]!=0xd0 || first_pts==UINT64_MAX)goto done;
+    const unsigned block=((((unsigned)compressed[2]&3)<<8)|compressed[3])*8+8;
+    const unsigned map[8]={0,1,2,3,4,6,7,8},channels=map[(compressed[2]>>2)&7];
+    if((channels!=2 && channels!=6) || used%(block+8))goto done;
+    const size_t blocks=used/(block+8),samples=blocks*2048;
+    if(samples>4000000){result=SAIL_VIDEO_LIMIT;goto done;}
+    pcm=malloc(samples*channels*sizeof(float));if(!pcm){result=SAIL_VIDEO_LIMIT;goto done;}
+    const AVCodec* decoder=avcodec_find_decoder(AV_CODEC_ID_ATRAC3P);
+    if(!decoder){result=SAIL_VIDEO_UNAVAILABLE;goto done;}
+    codec=avcodec_alloc_context3(decoder);packet=av_packet_alloc();frame=av_frame_alloc();
+    if(!codec || !packet || !frame){result=SAIL_VIDEO_LIMIT;goto done;}
+    codec->block_align=block;codec->sample_rate=48000;av_channel_layout_default(&codec->ch_layout,channels);
+    if(avcodec_open2(codec,decoder,NULL)<0){result=SAIL_VIDEO_DECODE;goto done;}
+    size_t written=0;
+    for(size_t b=0;b<blocks;++b){
+        const uint8_t* p=compressed+b*(block+8);
+        if(memcmp(p,compressed,8)){result=SAIL_VIDEO_INVALID;goto done;}
+        if(av_new_packet(packet,block)<0){result=SAIL_VIDEO_LIMIT;goto done;}
+        memcpy(packet->data,p+8,block);
+        if(avcodec_send_packet(codec,packet)<0){result=SAIL_VIDEO_DECODE;goto done;}
+        av_packet_unref(packet);
+        int rc=avcodec_receive_frame(codec,frame);
+        if(rc<0 || frame->format!=AV_SAMPLE_FMT_FLTP || frame->nb_samples!=2048 ||
+            frame->ch_layout.nb_channels!=(int)channels){result=SAIL_VIDEO_DECODE;goto done;}
+        for(unsigned i=0;i<2048;++i)for(unsigned c=0;c<channels;++c)
+            pcm[(written+i)*channels+c]=((float*)frame->extended_data[c])[i];
+        written+=2048;av_frame_unref(frame);
+        if(avcodec_receive_frame(codec,frame)!=AVERROR(EAGAIN)){result=SAIL_VIDEO_DECODE;goto done;}
+    }
+    if(avcodec_send_packet(codec,NULL)<0 || avcodec_receive_frame(codec,frame)!=AVERROR_EOF){result=SAIL_VIDEO_DECODE;goto done;}
+    out->samples=pcm;pcm=NULL;out->channels=channels;out->rate=48000;out->count=(uint32_t)written;out->pts=first_pts;
+    result=SAIL_VIDEO_OK;
+done:
+    av_frame_free(&frame);av_packet_free(&packet);avcodec_free_context(&codec);free(compressed);free(pcm);
+    if(sail_seek(file,saved,SEEK_SET)){sail_audio_pcm_release(out);return SAIL_VIDEO_IO;}
+    return result;
+}
 #endif

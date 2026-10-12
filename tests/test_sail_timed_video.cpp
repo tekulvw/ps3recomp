@@ -90,7 +90,8 @@ extern "C" int ppu_guest_call_ct_checked(uint32_t code,uint32_t toc,
  uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t*out) {
  if(!out||toc!=0x12345678)std::abort();*out=0;
  if(code==0x5678) {++scratch_frees;return 1;}
- if(code==0x1234) {*out=0x20000;return 1;}
+ if(code==0x1234) {*out=b==128 && c==128?0x20000:0x24000;return 1;}
+ if(code>=0x200&&code<=0x202){if(a!=0xAABBCC || (code==0x202 && (!b || c!=1)))std::abort();return 1;}
  if(code==0x104&&missing_free)return 0;
  if(code<0x100||code>0x104||a!=0xABCDEF)std::abort();
  graphics.push_back(code);
@@ -168,13 +169,20 @@ int main(int argc,char**argv) {
  for(unsigned i=0;i<5;++i){vm_write32(0x2200+4*i,0x2300+16*i);vm_write32(0x2300+16*i,0x100+i);vm_write32(0x2304+16*i,0x12345678);}
  CHECK(call(0x1C983864,0x1800,0x2200,0xABCDEF)==0);CHECK(call(0x18BCD21B,0x1000,0,0x1800)==0);
  for(unsigned pass=0;pass<(is_mode("sequence")?2u:1u);++pass) {
- picture_count=(pass || !std::strncmp(mode,"intro",5))?1806:179;
+ picture_count=(pass || !std::strncmp(mode,"intro",5) || is_mode("audio-intro"))?1806:179;
  expected_session=pass+1;test_anchor=fake_clock;
  std::snprintf((char*)memory+0x4000,512,"x-cell-fs:///dev_bdvd/%s",is_mode("unsupported-source")?"other.pam":picture_count==1806?"mag_intro.pam":argv[1]);
  CHECK(call(CREATE,0x1000,0,0,0x4000,0x4200)==0);active_desc=vm_read32(0x4200);
  CHECK(call(OPEN,active_desc)==0);CHECK(call(0x7C8DFF3B,0x1000,active_desc)==0);
  CHECK(call(0x0ABB318B,active_desc,0x4400,128,0)==0);
  CHECK(call(0x0D0C2F0C,active_desc,1,0,1,0x4400)==0); // SetEs replaced below
+ if(!std::strncmp(mode,"audio",5)){
+  for(unsigned i=0;i<3;++i){vm_write32(0x2500+i*4,0x2600+i*16);vm_write32(0x2600+i*16,0x200+i);vm_write32(0x2604+i*16,0x12345678);}
+  CHECK(call(0x3D0D3B72,0x1900,0x2500,0xAABBCC)==0);CHECK(call(0x1139A206,0x1000,0,0x1900)==0);
+  extern int32_t fixture_select_audio(uint32_t);
+  vm_write32(vm_read32(0x4424)+0x58,90000);
+  CHECK(fixture_select_audio(0x4400)==0);CHECK(call(0x0D0C2F0C,active_desc,0,0,1,0x4400)==0);
+ }
  CHECK(call(0x34ECC1B9,0x1000,0x1111222233334444ULL)==0);events.clear();
  vm_write32(0x4500,1);
  if(is_mode("bad-command"))vm_write32(0x4504,1);
@@ -188,6 +196,20 @@ int main(int argc,char**argv) {
   CHECK(started!=0);CHECK(!owned[0]&&!owned[1]&&!owned[2]&&!owned[3]);return 0;
  }
  CHECK(started==0);
+ if(!std::strncmp(mode,"audio",5)){
+  CHECK(call(0xD1462438,0x1900)==0x80610702);
+  CHECK(call(0xF25F197D,0x1900,0x4a00)==0);CHECK(memory[0x4a00]==1 && memory[0x4a01]==(picture_count==179?2:6));
+  CHECK(memory[0x4a02]==1 && memory[0x4a03]==0 && vm_read32(0x4a04)==48000);
+  CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);uint32_t pcm=vm_read32(0x4a40);CHECK(pcm && vm_read64(0x4a50)==85470);
+  CHECK(call(0x4AE979DF,0x1900,85470,0x4a80)==0);CHECK(int64_t(vm_read64(0x4a80))==-50333);
+  CHECK(vm_read32(pcm)==0x3f000000);if(picture_count==1806){CHECK(vm_read32(pcm+4)==0x3f800000);CHECK(vm_read32(pcm+8)==0x3f400000);}
+  CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);CHECK(vm_read32(0x4a40)==pcm && vm_read64(0x4a50)==85950);
+  fake_clock+=1000000;for(unsigned k=0;k<188;++k)CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);
+  CHECK(call(0x4AE979DF,0x1900,vm_read64(0x4a50),0x4a80)==0);CHECK(int64_t(vm_read64(0x4a80))>950000);
+  CHECK(call(STOP,0x1000,0x1122)==0);CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0 && vm_read32(0x4a40)==0);
+  CHECK(call(0x85BEFFCC,0x1000,0x3344)==0);CHECK(scratch_frees==2);CHECK(call(0xD1462438,0x1900)==0);
+  printf("PASS bounded real sound adapter lifecycle, scratch reuse, PCM lanes, preroll and advancing movie clock (%u checks)\n",checks);return 0;
+ }
  CHECK(events.size()==3 && events[1].major==2 && events[1].arg1==0xAABBCCDDEEFF0011ULL);
  CHECK(call(0x0247C69E,0x1800,0x4600)==0x200);
  CHECK(vm_read32(0x4600)!=0 && memory[vm_read32(0x4600)]==1);
@@ -250,3 +272,12 @@ int main(int argc,char**argv) {
  }
  std::printf("%u timed playback checks PASS, %u pictures, true drain, final duration and close\n",checks,picture_count);return 0;
 }
+
+extern "C" int sail_audio_decode_pcm(FILE*,uint64_t,uint64_t,unsigned,SailAudioPCM*a){
+ a->channels=picture_count==179?2:6;a->rate=48000;a->count=picture_count==179?290816:2897920;a->pts=85470;
+ a->samples=(float*)std::malloc(size_t(a->count)*a->channels*4);if(!a->samples)return SAIL_VIDEO_LIMIT;
+ for(unsigned n=0;n<a->count;++n)for(unsigned c=0;c<a->channels;++c)a->samples[n*a->channels+c]=0.5f+c*0.25f;return 0;
+}
+extern "C" int32_t cellPamfReaderSetStreamWithIndex(void*,uint32_t);
+int32_t fixture_select_audio(uint32_t p){return cellPamfReaderSetStreamWithIndex((void*)(uintptr_t)p,1);}
+extern "C" void sail_audio_pcm_release(SailAudioPCM*a){std::free(a->samples);std::memset(a,0,sizeof(*a));}
