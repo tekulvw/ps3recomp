@@ -1095,6 +1095,17 @@ s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo)
     sail_sound_unlock();return rc;
 }
 
+/* NID EEC22809. Original libsail5C38 forwards to1ACDC; tag0 returns
+ * zero at1AD18..1AD44 before accessing AV-sync clock state. Nonzero feedback
+ * requires the shared estimator, which this bounded wall-clock producer lacks. */
+s32 cellSailSoundAdapterUpdateAvSync(u32 pSelf,u32 tag,u64 time){
+    (void)time;
+    if(!sail_sound_range(pSelf,SAIL_ADAPTER_CLEAR))return SAIL_SOUND_INVALID_ARG;
+    sail_sound_lock();const int i=sail_sound_slot(pSelf);sail_sound_unlock();
+    if(i<0)return SAIL_SOUND_INVALID_STATE;
+    return tag?((s32)0x80610708u):CELL_OK;
+}
+
 /* Original firmware sound exports copy 24-byte PCM format and convert the
  * PAMF-origin-relative PTS using the same wrapping arithmetic as graphics. */
 s32 cellSailSoundAdapterGetFormat(u32 pSelf,u32 pFormat){
