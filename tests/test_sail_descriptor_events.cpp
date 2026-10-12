@@ -76,7 +76,7 @@ static void event_callback(uint32_t opd,uint64_t arg,uint64_t ev,uint64_t a,uint
   if(a!=active_desc||call(0x0ABB318B,a,0x4400,128,0)!=0||call(0x4C191088,a)==0)callback_ok=false;
  }
  if((ev>>32)==5) {
-  if(a!=active_desc||call(0x28336E89,a)!=0||call(0x4C191088,a)==0||call(0x752F8585,0x1000)!=0)callback_ok=false;
+  if(a!=active_desc||call(0x28336E89,a,0x4400)!=0||call(0x4C191088,a)==0||call(0x752F8585,0x1000)!=0)callback_ok=false;
   // Real callbacks may consume synchronously, or merely queue this event.
   if(destroy_on_close && call(0xFC839BD4,0x1000,a)!=0)callback_ok=false;
  }
