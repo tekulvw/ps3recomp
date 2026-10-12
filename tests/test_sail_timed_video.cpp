@@ -202,6 +202,7 @@ int main(int argc,char**argv) {
   CHECK(memory[0x4a02]==1 && memory[0x4a03]==0 && vm_read32(0x4a04)==48000);
   CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);uint32_t pcm=vm_read32(0x4a40);CHECK(pcm && vm_read64(0x4a50)==85470);
   CHECK(call(0x4AE979DF,0x1900,85470,0x4a80)==0);CHECK(int64_t(vm_read64(0x4a80))==-50333);
+  CHECK(call(0xEEC22809,0x1900,0,fake_clock)==0);
   CHECK(vm_read32(pcm)==0x3f000000);if(picture_count==1806){CHECK(vm_read32(pcm+4)==0x3f800000);CHECK(vm_read32(pcm+8)==0x3f400000);}
   CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);CHECK(vm_read32(0x4a40)==pcm && vm_read64(0x4a50)==85950);
   fake_clock+=1000000;for(unsigned k=0;k<188;++k)CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);

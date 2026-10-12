@@ -171,6 +171,7 @@ s32 cellSailGraphicsAdapterUpdateAvSync(u32 pSelf, u32 tag, u64 time);
  * this backend never supplies decoded audio. Arguments are guest EAs. */
 s32 cellSailSoundAdapterFinalize(u32 pSelf);
 s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo);
+s32 cellSailSoundAdapterUpdateAvSync(u32 pSelf,u32 tag,u64 time);
 s32 cellSailSoundAdapterGetFormat(u32 pSelf,u32 pFormat);
 s32 cellSailSoundAdapterPtsToTimePosition(u32 pSelf,u64 pts,u32 pTime);
 
