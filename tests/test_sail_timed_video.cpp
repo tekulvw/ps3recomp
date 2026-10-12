@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <cstdint>
 #include <initializer_list>
 #include <vector>
@@ -180,7 +181,7 @@ int main(int argc,char**argv) {
   for(unsigned i=0;i<3;++i){vm_write32(0x2500+i*4,0x2600+i*16);vm_write32(0x2600+i*16,0x200+i);vm_write32(0x2604+i*16,0x12345678);}
   CHECK(call(0x3D0D3B72,0x1900,0x2500,0xAABBCC)==0);CHECK(call(0x1139A206,0x1000,0,0x1900)==0);
   extern int32_t fixture_select_audio(uint32_t);
-  vm_write32(vm_read32(0x4424)+0x58,90000);
+  vm_write32(vm_read32(0x4424)+0x58,89310);
   CHECK(fixture_select_audio(0x4400)==0);CHECK(call(0x0D0C2F0C,active_desc,0,0,1,0x4400)==0);
  }
  CHECK(call(0x34ECC1B9,0x1000,0x1111222233334444ULL)==0);events.clear();
@@ -200,11 +201,12 @@ int main(int argc,char**argv) {
   CHECK(call(0xD1462438,0x1900)==0x80610702);
   CHECK(call(0xF25F197D,0x1900,0x4a00)==0);CHECK(memory[0x4a00]==1 && memory[0x4a01]==(picture_count==179?2:6));
   CHECK(memory[0x4a02]==1 && memory[0x4a03]==0 && vm_read32(0x4a04)==48000);
-  CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);uint32_t pcm=vm_read32(0x4a40);CHECK(pcm && vm_read64(0x4a50)==85470);
-  CHECK(call(0x4AE979DF,0x1900,85470,0x4a80)==0);CHECK(int64_t(vm_read64(0x4a80))==-50333);
+  CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);uint32_t pcm=vm_read32(0x4a40);CHECK(pcm && vm_read64(0x4a50)==89310);
+  CHECK(call(0x4AE979DF,0x1900,85470,0x4a80)==0);CHECK(int64_t(vm_read64(0x4a80))==-42666);
   CHECK(call(0xEEC22809,0x1900,0,fake_clock)==0);
-  CHECK(vm_read32(pcm)==0x3f000000);if(picture_count==1806){CHECK(vm_read32(pcm+4)==0x3f800000);CHECK(vm_read32(pcm+8)==0x3f400000);}
-  CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);CHECK(vm_read32(0x4a40)==pcm && vm_read64(0x4a50)==85950);
+  uint32_t firstbits=vm_read32(pcm);float first;std::memcpy(&first,&firstbits,4);CHECK(std::fabs(first-0.502048f)<0.0000001f);
+  if(picture_count==1806){uint32_t bits=vm_read32(pcm+4);float center;std::memcpy(&center,&bits,4);CHECK(std::fabs(center-1.002048f)<0.0000001f);}
+  CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);CHECK(vm_read32(0x4a40)==pcm && vm_read64(0x4a50)==89790);
   fake_clock+=1000000;for(unsigned k=0;k<188;++k)CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);
   CHECK(call(0x4AE979DF,0x1900,vm_read64(0x4a50),0x4a80)==0);CHECK(int64_t(vm_read64(0x4a80))>950000);
   CHECK(call(STOP,0x1000,0x1122)==0);CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0 && vm_read32(0x4a40)==0);
@@ -277,7 +279,7 @@ int main(int argc,char**argv) {
 extern "C" int sail_audio_decode_pcm(FILE*,uint64_t,uint64_t,unsigned,SailAudioPCM*a){
  a->channels=picture_count==179?2:6;a->rate=48000;a->count=picture_count==179?290816:2897920;a->pts=85470;
  a->samples=(float*)std::malloc(size_t(a->count)*a->channels*4);if(!a->samples)return SAIL_VIDEO_LIMIT;
- for(unsigned n=0;n<a->count;++n)for(unsigned c=0;c<a->channels;++c)a->samples[n*a->channels+c]=0.5f+c*0.25f;return 0;
+ for(unsigned n=0;n<a->count;++n)for(unsigned c=0;c<a->channels;++c)a->samples[n*a->channels+c]=0.5f+c*0.25f+n/1000000.0f;return 0;
 }
 extern "C" int32_t cellPamfReaderSetStreamWithIndex(void*,uint32_t);
 int32_t fixture_select_audio(uint32_t p){return cellPamfReaderSetStreamWithIndex((void*)(uintptr_t)p,1);}
