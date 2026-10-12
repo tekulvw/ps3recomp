@@ -770,6 +770,54 @@ extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" void spu_coh_notify_write(uint32_t addr);
+extern "C" uint64_t spu_coh_line_epoch(uint32_t addr);
+
+/* The architectural reservation belongs to the executing host thread. No
+ * pointers are registered in coherence, so short-lived guest contexts cannot
+ * leave watchers pointing at reclaimed stacks. New lifts use these helpers;
+ * old lifts retain their value-CAS compatibility until regenerated. */
+static PPU_THREAD_LOCAL struct {
+    ppu_context* ctx;
+    uint32_t addr;
+    uint64_t epoch;
+    bool valid;
+} g_line_reservation;
+/* Only the new SC entry points require a line token. Older generated loads
+ * have no token; keep their existing ABI/behavior until regenerated. */
+static PPU_THREAD_LOCAL ppu_context* g_line_sc_ctx;
+
+extern "C" uint32_t ppu_load_reserve32(ppu_context* ctx, uint64_t ea)
+{
+    uint32_t addr = (uint32_t)ea;
+    spu_lockline_lock();
+    uint64_t epoch = spu_coh_line_epoch(addr);
+    uint32_t value = vm_read32(addr);
+    ctx->reserve_addr = addr; ctx->reserve_value = value; ctx->reserve_valid = 1;
+    g_line_reservation = {ctx, addr, epoch, true};
+    spu_lockline_unlock();
+    return value;
+}
+extern "C" uint64_t ppu_load_reserve64(ppu_context* ctx, uint64_t ea)
+{
+    uint32_t addr = (uint32_t)ea;
+    spu_lockline_lock();
+    uint64_t epoch = spu_coh_line_epoch(addr);
+    uint64_t value = vm_read64(addr);
+    ctx->reserve_addr = addr; ctx->reserve_value = value; ctx->reserve_valid = 1;
+    g_line_reservation = {ctx, addr, epoch, true};
+    spu_lockline_unlock();
+    return value;
+}
+/* Called only while lock-line is held, immediately before the actual CAS. */
+extern "C" int ppu_reservation_line_check(ppu_context* ctx, uint32_t addr)
+{
+    if (!g_line_sc_ctx) return 1; /* legacy SC entry point */
+    if (!g_line_reservation.valid) return 0; /* consumed or missing new token */
+    bool held = g_line_reservation.ctx == ctx && g_line_reservation.addr == addr &&
+                g_line_reservation.epoch == spu_coh_line_epoch(addr);
+    g_line_reservation.valid = false;
+    return held;
+}
 
 /* ---------------------------------------------------------------------------
  * lwarx/stwcx. cross-thread reservation invalidation.
@@ -929,7 +977,7 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
     if (resv_off())
         return __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    ppu_context* self = g_active_ctx;
+    ppu_context* self = g_line_sc_ctx ? g_line_sc_ctx : g_active_ctx;
     if (resv_diag() && self) resv_check_reg(self);
     volatile LONG* L = resv_slot(ea);
     resv_lock(L);
@@ -950,6 +998,9 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
     if (coh) spu_lockline_lock();
+    if (coh && !ppu_reservation_line_check(self, (uint32_t)ea)) {
+        spu_lockline_unlock(); resv_unlock(L); return 0;
+    }
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
@@ -1014,13 +1065,16 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     if (resv_off())
         return __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw,
                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    ppu_context* self = g_active_ctx;
+    ppu_context* self = g_line_sc_ctx ? g_line_sc_ctx : g_active_ctx;
     if (resv_diag() && self) resv_check_reg(self);
     volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
     if (coh) spu_lockline_lock();
+    if (coh && !ppu_reservation_line_check(self, (uint32_t)ea)) {
+        spu_lockline_unlock(); resv_unlock(L); return 0;
+    }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
@@ -1036,6 +1090,36 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
         ppu_ww_note_atomic((uint32_t)ea + 4, (uint32_t)val, 4,
                            __builtin_return_address(0));
     }
+    return ok;
+}
+
+/* New lifts always enter here, even if the address does not match. Thus every
+ * SC attempt consumes the token, and an old generated LL/SC pair cannot be
+ * mistaken for a consumed new reservation on the same host thread. */
+extern "C" int ppu_store_conditional32(ppu_context* ctx, uint64_t ea, uint32_t val)
+{
+    ppu_context* saved = g_line_sc_ctx;
+    g_line_sc_ctx = ctx;
+    int ok = 0;
+    if (resv_off() || (g_line_reservation.valid && g_line_reservation.ctx == ctx &&
+                       g_line_reservation.addr == (uint32_t)ea))
+        ok = ppu_stwcx32(ea, (uint32_t)ctx->reserve_value, val);
+    g_line_sc_ctx = saved;
+    g_line_reservation.valid = false;
+    ctx->reserve_valid = 0; ctx->reserve_addr = PPU_RESV_INVALID;
+    return ok;
+}
+extern "C" int ppu_store_conditional64(ppu_context* ctx, uint64_t ea, uint64_t val)
+{
+    ppu_context* saved = g_line_sc_ctx;
+    g_line_sc_ctx = ctx;
+    int ok = 0;
+    if (resv_off() || (g_line_reservation.valid && g_line_reservation.ctx == ctx &&
+                       g_line_reservation.addr == (uint32_t)ea))
+        ok = ppu_stdcx64(ea, ctx->reserve_value, val);
+    g_line_sc_ctx = saved;
+    g_line_reservation.valid = false;
+    ctx->reserve_valid = 0; ctx->reserve_addr = PPU_RESV_INVALID;
     return ok;
 }
 

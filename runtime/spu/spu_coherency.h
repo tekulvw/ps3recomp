@@ -51,6 +51,11 @@ void spu_lockline_unlock(void);
  * mark costs one locked PPU store to a line the kernel owns anyway. */
 void spu_coh_reserve(spu_context* ctx, uint32_t ea);
 
+/* PPU load-reserve/store-conditional generation. Caller holds lock-line.
+ * Tracking a line arms coherent writes and records every subsequent store,
+ * including stores to a different word or stores which restore the old bytes. */
+uint64_t spu_coh_line_epoch(uint32_t ea);
+
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);
