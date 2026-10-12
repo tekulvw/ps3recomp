@@ -35,8 +35,8 @@ static SailPlayer s_players[CELL_SAIL_PLAYER_MAX];
 static struct { u32 self_ea, allocator_ea, callback_ea, arg_ea; int in_use; int state; }
     s_sail_players[CELL_SAIL_PLAYER_MAX];
 
-/* The graphics backend has no decoder and therefore owns no frame buffers.
- * Track initialization separately from the opaque guest adapter bytes. These
+/* Track initialization and explicit producer sessions separately from opaque
+ * guest adapter bytes. The producer owns all frame buffers. These
  * ABI errors deliberately do not reuse this file's older, misnumbered aliases.
  */
 #define SAIL_GRAPHICS_INVALID_ARG   ((s32)0x80610701u)
@@ -46,6 +46,14 @@ static struct { u32 self_ea, allocator_ea, callback_ea, arg_ea; int in_use; int 
 #define SAIL_GRAPHICS_MAX 16
 static u32 s_graphics_adapters[SAIL_GRAPHICS_MAX];
 static SailGraphicsConfig s_graphics_configs[SAIL_GRAPHICS_MAX];
+typedef struct {
+    int active, published, has_picture, new_frame, origin_cached;
+    u32 buffer, session, tag;
+    u64 pts, origin;
+    u8 format[32];
+} SailGraphicsFrame;
+static SailGraphicsFrame s_graphics_frames[SAIL_GRAPHICS_MAX];
+static u32 s_graphics_session;
 static atomic_flag s_graphics_lock = ATOMIC_FLAG_INIT;
 extern u32 ppu_vm_size; /* zero denotes the full 4 GiB guest address space */
 
@@ -68,20 +76,20 @@ static int sail_graphics_slot(u32 ea)
         if (s_graphics_adapters[i] == ea) return i;
     return -1;
 }
-static void sail_graphics_detach_player(u32 player)
+/* Refuse teardown while a producer still owns a published guest buffer. */
+static s32 sail_graphics_detach_player(u32 player)
 {
     sail_graphics_lock();
+    for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i)
+        if (s_graphics_configs[i].player_ea == player && s_graphics_frames[i].active) {
+            sail_graphics_unlock();
+            return SAIL_GRAPHICS_INVALID_STATE;
+        }
     for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i)
         if (s_graphics_configs[i].player_ea == player)
             s_graphics_configs[i].player_ea = 0;
     sail_graphics_unlock();
-}
-static void sail_graphics_reset(void)
-{
-    sail_graphics_lock();
-    memset(s_graphics_adapters, 0, sizeof(s_graphics_adapters));
-    memset(s_graphics_configs, 0, sizeof(s_graphics_configs));
-    sail_graphics_unlock();
+    return CELL_OK;
 }
 
 /* A CellSailPlayer is a GUEST POINTER, not a small integer handle.
@@ -121,8 +129,17 @@ s32 cellSailInit(void)
 s32 cellSailTerm(void)
 {
     printf("[cellSail] Term()\n");
+    sail_graphics_lock();
+    for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i)
+        if (s_graphics_frames[i].active) {
+            sail_graphics_unlock();
+            return SAIL_GRAPHICS_INVALID_STATE;
+        }
+    memset(s_graphics_adapters, 0, sizeof(s_graphics_adapters));
+    memset(s_graphics_configs, 0, sizeof(s_graphics_configs));
+    memset(s_graphics_frames, 0, sizeof(s_graphics_frames));
     s_initialized = 0;
-    sail_graphics_reset();
+    sail_graphics_unlock();
     return CELL_OK;
 }
 
@@ -160,7 +177,8 @@ s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    sail_graphics_detach_player((u32)handle);
+    if (sail_graphics_detach_player((u32)handle) != CELL_OK)
+        return SAIL_GRAPHICS_INVALID_STATE;
     s_sail_players[_sp].in_use = 0;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_CLOSED;
     return CELL_OK;
@@ -652,7 +670,12 @@ s32 cellSailGraphicsAdapterFinalize(u32 pSelf)
         return SAIL_GRAPHICS_INVALID_ARG;
     sail_graphics_lock();
     const int slot = sail_graphics_slot(pSelf);
+    if (slot >= 0 && s_graphics_frames[slot].active) {
+        sail_graphics_unlock();
+        return SAIL_GRAPHICS_INVALID_STATE;
+    }
     if (slot >= 0) {
+        memset(&s_graphics_frames[slot], 0, sizeof(s_graphics_frames[slot]));
         s_graphics_adapters[slot] = 0;
         memset(&s_graphics_configs[slot], 0, sizeof(s_graphics_configs[slot]));
     }
@@ -663,7 +686,8 @@ s32 cellSailGraphicsAdapterFinalize(u32 pSelf)
 /* GetFrame returns synchronization flags, not a CELL_OK/frame-ready boolean.
  * CELL_SAIL_SYNC_NO_FRAME is zero; frame-bearing statuses begin at 0x100.
  * The 24-byte guest record is {u32 buffer, session, tag; s32 status; u64 pts}.
- * With no decoder, every valid poll explicitly reports no frame and no buffer.
+ * Without a published producer frame, a valid poll reports no frame/buffer.
+ * Only selection classes are implemented; timing/drop reason flags are not.
  */
 s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
 {
@@ -672,17 +696,25 @@ s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
         return SAIL_GRAPHICS_INVALID_ARG;
     sail_graphics_lock();
     const int slot = sail_graphics_slot(pSelf);
-    if (slot >= 0) sail_zero_guest(pInfo, 24);
-    /* Bounded stderr evidence survives a later strict-HLE halt. No per-frame
-     * log flood and no change to player events, playback state, or callbacks. */
-    static unsigned logged;
-    if (logged < 6) {
-        ++logged;
-        fprintf(stderr, "[cellSail] GraphicsAdapterGetFrame(self=%08X info=%08X) -> %s\n",
-                pSelf, pInfo, slot >= 0 ? "NO_FRAME (decoder unavailable)" : "INVALID_STATE");
+    s32 result = SAIL_GRAPHICS_INVALID_STATE;
+    if (slot >= 0) {
+        sail_zero_guest(pInfo, 24);
+        SailGraphicsFrame* frame = &s_graphics_frames[slot];
+        result = CELL_SAIL_SYNC_NO_FRAME;
+        if (frame->published) {
+            vm_write32(pInfo, frame->buffer);
+            vm_write32(pInfo + 4, frame->session);
+            vm_write32(pInfo + 8, frame->tag);
+            /* Decoder success status is independent of GetFrame sync flags. */
+            vm_write32(pInfo + 12, 0);
+            vm_write64(pInfo + 16, frame->pts);
+            frame->origin_cached = 1;
+            result = frame->new_frame ? 0x200 : 0x100;
+            frame->new_frame = 0;
+        }
     }
     sail_graphics_unlock();
-    return slot >= 0 ? CELL_SAIL_SYNC_NO_FRAME : SAIL_GRAPHICS_INVALID_STATE;
+    return result;
 }
 
 /* No frame has been decoded or presented, so the backend cannot acknowledge
@@ -710,6 +742,10 @@ s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat)
     memcpy(format, vm_base + pFormat, sizeof(format));
     sail_graphics_lock();
     const int slot = sail_graphics_slot(pSelf);
+    if (slot >= 0 && s_graphics_frames[slot].active) {
+        sail_graphics_unlock();
+        return SAIL_GRAPHICS_INVALID_STATE;
+    }
     if (slot >= 0) {
         memcpy(s_graphics_configs[slot].preferred, format, sizeof(format));
         s_graphics_configs[slot].has_preferred = 1;
@@ -727,8 +763,38 @@ s32 cellSailGraphicsAdapterGetFormat(u32 pSelf, u32 pFormat)
         return SAIL_GRAPHICS_INVALID_ARG;
     sail_graphics_lock();
     const int slot = sail_graphics_slot(pSelf);
+    s32 result = SAIL_GRAPHICS_INVALID_STATE;
+    if (slot >= 0) {
+        result = SAIL_GRAPHICS_NOT_AVAILABLE;
+        if (s_graphics_frames[slot].published) {
+            memcpy(vm_base + pFormat, s_graphics_frames[slot].format, 32);
+            result = CELL_OK;
+        }
+    }
     sail_graphics_unlock();
-    return slot >= 0 ? SAIL_GRAPHICS_NOT_AVAILABLE : SAIL_GRAPHICS_INVALID_STATE;
+    return result;
+}
+
+/* Firmware converts wrapped (PTS - PAMF presentation start) * 1000 / 90,
+ * using a signed numerator and truncation toward zero. Avoid signed overflow.
+ * Unknown origin leaves the guest output untouched. */
+s32 cellSailGraphicsAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTime)
+{
+    if (!sail_graphics_range(pSelf, SAIL_ADAPTER_CLEAR) ||
+        !sail_graphics_range(pTime, 8)) return SAIL_GRAPHICS_INVALID_ARG;
+    sail_graphics_lock();
+    const int slot = sail_graphics_slot(pSelf);
+    s32 result = SAIL_GRAPHICS_INVALID_STATE;
+    if (slot >= 0 && s_graphics_frames[slot].published &&
+        s_graphics_frames[slot].origin_cached && s_graphics_frames[slot].origin != UINT64_MAX) {
+        u64 wrapped = (pts - s_graphics_frames[slot].origin) * 1000u;
+        s64 numerator;
+        memcpy(&numerator, &wrapped, sizeof(numerator));
+        vm_write64(pTime, (u64)(numerator / 90));
+        result = CELL_OK;
+    }
+    sail_graphics_unlock();
+    return result;
 }
 
 /* Internal decoder boundary: snapshot retained guest records under the lock,
@@ -767,4 +833,105 @@ s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
         vm_write32(alloc_ea + 4, vm_read32(funcs_ea + 4));   /* pFree  */
     }
     return CELL_OK;
+}
+
+/* The producer retains guest buffer ownership; publication copies metadata
+ * only. Neither polling nor UpdateAvSync frees or mutates the picture. */
+s32 sail_graphics_publish_frame(u32 player, u32 buffer, const u8 format[32],
+                                u64 pts, u64 origin, u32 tag)
+{
+    if (!format || sail_player_slot(player) < 0) return SAIL_GRAPHICS_INVALID_ARG;
+    const u32 width = ((u32)format[4] << 8) | format[5];
+    const u32 height = ((u32)format[6] << 8) | format[7];
+    const u32 pitch = ((u32)format[8] << 24) | ((u32)format[9] << 16) |
+                      ((u32)format[10] << 8) | format[11];
+    const u64 bytes = (u64)pitch * height;
+    if (format[0] != 1 || format[2] != 8 || !width || !height ||
+        width > 4096 || height > 4096 || pitch < width * 4u ||
+        bytes > UINT32_MAX || !sail_graphics_range(buffer, (u32)bytes))
+        return SAIL_GRAPHICS_INVALID_ARG;
+    sail_graphics_lock();
+    s32 result = SAIL_GRAPHICS_NOT_AVAILABLE;
+    for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i) {
+        if (!s_graphics_adapters[i] || s_graphics_configs[i].player_ea != player) continue;
+        SailGraphicsFrame* frame = &s_graphics_frames[i];
+        result = SAIL_GRAPHICS_INVALID_STATE;
+        if (!frame->has_picture) {
+            if (!frame->active) {
+                memset(frame, 0, sizeof(*frame));
+                if (++s_graphics_session == UINT32_MAX) s_graphics_session = 1;
+                frame->session = s_graphics_session;
+                frame->active = 1;
+            }
+            frame->buffer = buffer;
+            frame->pts = pts;
+            frame->origin = origin;
+            frame->tag = tag;
+            memcpy(frame->format, format, 32);
+            frame->has_picture = frame->new_frame = frame->published = 1;
+            result = CELL_OK;
+        }
+        break;
+    }
+    sail_graphics_unlock();
+    return result;
+}
+
+s32 sail_graphics_withdraw_frame(u32 player)
+{
+    if (sail_player_slot(player) < 0) return SAIL_GRAPHICS_INVALID_ARG;
+    sail_graphics_lock();
+    s32 result = SAIL_GRAPHICS_NOT_AVAILABLE;
+    for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i) {
+        if (s_graphics_adapters[i] && s_graphics_configs[i].player_ea == player) {
+            memset(&s_graphics_frames[i], 0, sizeof(s_graphics_frames[i]));
+            result = CELL_OK;
+            break;
+        }
+    }
+    sail_graphics_unlock();
+    return result;
+}
+
+/* Pin configuration before invoking borrowed guest OPDs. End the pin only
+ * after callback ownership is resolved; withdrawal cancels it explicitly. */
+s32 sail_graphics_begin_session(u32 player, SailGraphicsConfig* out, u32* session)
+{
+    if (!out || !session || sail_player_slot(player) < 0) return SAIL_GRAPHICS_INVALID_ARG;
+    sail_graphics_lock();
+    s32 result = SAIL_GRAPHICS_NOT_AVAILABLE;
+    for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i) {
+        if (!s_graphics_adapters[i] || s_graphics_configs[i].player_ea != player) continue;
+        SailGraphicsFrame* frame = &s_graphics_frames[i];
+        result = SAIL_GRAPHICS_INVALID_STATE;
+        if (!frame->active) {
+            memset(frame, 0, sizeof(*frame));
+            if (++s_graphics_session == UINT32_MAX) s_graphics_session = 1;
+            frame->session = s_graphics_session;
+            frame->active = 1;
+            *out = s_graphics_configs[i];
+            *session = frame->session;
+            result = CELL_OK;
+        }
+        break;
+    }
+    sail_graphics_unlock();
+    return result;
+}
+
+s32 sail_graphics_unpublish_frame(u32 player)
+{
+    if (sail_player_slot(player) < 0) return SAIL_GRAPHICS_INVALID_ARG;
+    sail_graphics_lock();
+    s32 result = SAIL_GRAPHICS_NOT_AVAILABLE;
+    for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i) {
+        if (s_graphics_adapters[i] && s_graphics_configs[i].player_ea == player) {
+            s_graphics_frames[i].published = 0;
+            s_graphics_frames[i].origin_cached = 0;
+            result = CELL_OK;
+            break;
+        }
+    }
+    sail_graphics_unlock();
+    return result;
 }
