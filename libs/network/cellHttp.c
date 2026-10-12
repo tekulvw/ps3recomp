@@ -33,6 +33,7 @@ typedef int http_socket_t;
 #define HTTP_INVALID_SOCKET (-1)
 #define http_closesocket close
 #endif
+#include "host_socket_send.h"
 
 /* Guest-EA marshalling: the generic HLE adapter passes PPC r3.. verbatim, so
  * pointer arguments are guest effective addresses, not host pointers. Translate
@@ -153,7 +154,7 @@ static int http_send_all(http_socket_t sock, const char* data, u32 len)
 {
     u32 total = 0;
     while (total < len) {
-        int n = send(sock, data + total, (int)(len - total), 0);
+        int n = send(sock, data + total, (int)(len - total), PS3_NET_HOST_SEND_FLAGS);
         if (n <= 0)
             return -1;
         total += (u32)n;

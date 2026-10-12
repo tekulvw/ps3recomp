@@ -46,6 +46,7 @@
     #define host_poll           poll
 #endif
 
+#include "host_socket_send.h"
 #include "sysNet.h"
 #include "../../runtime/ppu/ppu_context.h"
 #include "../../runtime/ppu/ppu_memory.h"
@@ -131,6 +132,7 @@ static int32_t host_fail(void)
         case EBADF:         return fail(SYS_NET_EBADF);
         case ENOMEM:        return fail(SYS_NET_ENOMEM);
         case EINVAL:        return fail(SYS_NET_EINVAL);
+        case EPIPE:         return fail(SYS_NET_EPIPE);
         case EAGAIN:        return fail(SYS_NET_EWOULDBLOCK);
         case EINPROGRESS:   return fail(SYS_NET_EINPROGRESS);
         case EALREADY:      return fail(SYS_NET_EALREADY);
@@ -365,7 +367,7 @@ static int p2p_send(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t
     a.sin_family = AF_INET;
     memcpy(&a.sin_addr, ip, 4);
     a.sin_port = htons(port);
-    return (int)sendto(s_sockets[s_p2p_dgram].host_fd, (const char*)buf, (int)len, 0,
+    return (int)sendto(s_sockets[s_p2p_dgram].host_fd, (const char*)buf, (int)len, PS3_NET_HOST_SEND_FLAGS,
                        (struct sockaddr*)&a, sizeof(a));
 }
 
@@ -604,7 +606,7 @@ int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flag
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
-    int n = send(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, 0);
+    int n = send(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, PS3_NET_HOST_SEND_FLAGS);
     if (net_trace()) trace("send", s, n, NULL);
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
 }
@@ -621,7 +623,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
                                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
         return (int32_t)len;   /* went through psnr's relay */
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
-    int n = sendto(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, 0,
+    int n = sendto(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, PS3_NET_HOST_SEND_FLAGS,
                    (struct sockaddr*)&a, sizeof(a));
     if (net_trace()) trace("sendto", s, n, &a);
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
