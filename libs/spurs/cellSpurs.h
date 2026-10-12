@@ -94,6 +94,8 @@ typedef struct CellSpurs CellSpurs;
 typedef struct CellSpursAttribute CellSpursAttribute;
 typedef struct CellSpursTaskset CellSpursTaskset;
 typedef struct CellSpursTasksetAttribute CellSpursTasksetAttribute;
+typedef struct CellSpursTaskset2 CellSpursTaskset2;
+typedef struct CellSpursTasksetAttribute2 CellSpursTasksetAttribute2;
 typedef struct CellSpursTask CellSpursTask;
 typedef struct CellSpursTaskAttribute CellSpursTaskAttribute;
 typedef struct CellSpursTaskExitCode CellSpursTaskExitCode;
@@ -143,6 +145,11 @@ struct CellSpursTasksetAttribute {
     u32  tasksetSize; /* host-layout attribute; retained through creation */
     u8   _padding[60];
 };
+
+/* Guest ABI storage only: access fields through the BE offset helpers.
+ * Guest taskset2 requires 128-byte alignment; attribute2 requires 8 bytes. */
+struct CellSpursTaskset2 { u8 _storage[0x2900]; };
+struct CellSpursTasksetAttribute2 { u8 _storage[0x200]; };
 
 /* Task -- represents a unit of SPU work */
 struct CellSpursTask {
@@ -247,6 +254,10 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                         CellSpursTaskset* taskset,
                                         const CellSpursTasksetAttribute* attr);
+s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
+                           const CellSpursTasksetAttribute2* attr);
+s32 _cellSpursTasksetAttribute2Initialize(CellSpursTasksetAttribute2* attr,
+                                         u32 revision);
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset);
 s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset);
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset);

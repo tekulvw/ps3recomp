@@ -60,6 +60,20 @@ enum {
     CSTS_EVENT_FLAG_ID1 = 0x1898, /* be u32 */
     CSTS_EVENT_FLAG_ID2 = 0x189C, /* be u32 */
     CSTS_STRUCT_END     = 0x1900,
+    CSTS2_TASK_EXIT_CODE= 0x1980, /* be v128[128]: generation 2 extension */
+    CSTS2_STRUCT_END    = 0x2900,
+};
+
+/* CellSpursTasksetAttribute2: 512 bytes, 8-byte guest alignment. */
+enum {
+    CSTA2_REVISION = 0x00,
+    CSTA2_NAME = 0x04,             /* be u32 guest string EA */
+    CSTA2_ARGS = 0x08,            /* be u64 */
+    CSTA2_PRIORITY = 0x10,        /* u8[8] */
+    CSTA2_MAX_CONTENTION = 0x18,  /* be u32 */
+    CSTA2_ENABLE_CLEAR_LS = 0x1C, /* be s32 */
+    CSTA2_TASK_NAME_BUFFER = 0x20,/* be u32, 16-byte aligned guest EA */
+    CSTA2_STRUCT_END = 0x200,
 };
 
 /* CellSpursTaskset::TaskInfo (48 bytes), at CSTS_TASKINFO + taskId*48 */
