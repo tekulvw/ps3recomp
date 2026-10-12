@@ -84,7 +84,18 @@ static s32 sail_audio_start(u32 player,SailDescriptor* d,u64 offset,u64 length,u
     /* Packed BE float PCM, sample count and sample rate from actual decoder. */
     const u8 format[24]={1,(u8)pcm.channels,8,0,0,0,0xbb,0x80,0,0,0,(u8)(pcm.channels==6?9:2),0};
     memcpy(a->format,format,24);memset(a->format+12,0xff,12);memcpy(vm_base+h->scratch,a->format,24);
-    sail_sound_lock();a->pcm=pcm;sail_sound_unlock();
+    /* Decode priming PCM but publish only at/after the container presentation
+     * start. Negative preroll is media data, not a public playing-frame clock.
+     * Preserve absolute PTS; never clamp or rewrite the guest's movie clock. */
+    u32 preroll=0;
+    if(pcm.pts<origin){
+        const u64 ticks=origin-pcm.pts;
+        if(ticks>90000 || (ticks*pcm.rate+89999)/90000>=pcm.count){sail_audio_pcm_release(&pcm);return SAIL_DESC_NOT_AVAILABLE;}
+        preroll=(u32)((ticks*pcm.rate+89999)/90000);
+    }
+    sail_sound_lock();a->pcm=pcm;a->cursor=preroll;sail_sound_unlock();
+    fprintf(stderr,"[cellSail] ATRAC presentation start skipped=%u firstPts=%llu origin=%llu\n",preroll,
+        (unsigned long long)(pcm.pts+(u64)preroll*90000/pcm.rate),(unsigned long long)origin);
     rc=sail_held_invoke(h,s_sound_configs[i].callbacks[0],s_sound_configs[i].arg,0,0,0,&result);
     if(rc)return rc;h->made_up=1;if((s32)result<0)return (s32)result;
     rc=sail_held_invoke(h,s_sound_configs[i].callbacks[2],s_sound_configs[i].arg,h->scratch,session,0,&result);
