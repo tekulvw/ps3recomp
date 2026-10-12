@@ -22,6 +22,10 @@ s32 sail_graphics_publish_frame(u32 player, u32 buffer, const u8 format[32], u64
 /* Same pinned format/session; increasing picture id is distinct from poll tags.
  * After unpublish, only withdraw/begin can reopen publication. */
 s32 sail_graphics_replace_frame(u32 player,u32 buffer,const u8 format[32],u64 pts,u64 origin,u32 picture_id);
+/* Original descriptor construction brackets frame selection. End transfers
+ * one owned immutable-picture reference; caller binds or releases it. */
+void sail_graphics_picture_capture_begin(void);
+u64 sail_graphics_picture_capture_end(void);
 s32 sail_graphics_unpublish_frame(u32 player);
 s32 sail_graphics_withdraw_frame(u32 player);
 s32 sail_graphics_config_for_player(u32 player, SailGraphicsConfig* out);
