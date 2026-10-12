@@ -206,8 +206,9 @@ int main(int argc,char**argv) {
   CHECK(call(0xEEC22809,0x1900,0,fake_clock)==0);
   uint32_t firstbits=vm_read32(pcm);float first;std::memcpy(&first,&firstbits,4);CHECK(std::fabs(first-0.502048f)<0.0000001f);
   if(picture_count==1806){uint32_t bits=vm_read32(pcm+4);float center;std::memcpy(&center,&bits,4);CHECK(std::fabs(center-1.002048f)<0.0000001f);}
+  CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0);CHECK(vm_read32(0x4a40)==0);fake_clock+=6000;
   CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);CHECK(vm_read32(0x4a40)==pcm && vm_read64(0x4a50)==89790);
-  fake_clock+=1000000;for(unsigned k=0;k<188;++k)CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);
+  fake_clock+=1100000;for(unsigned k=0;k<188;++k)CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0x214);
   CHECK(call(0x4AE979DF,0x1900,vm_read64(0x4a50),0x4a80)==0);CHECK(int64_t(vm_read64(0x4a80))>950000);
   CHECK(call(STOP,0x1000,0x1122)==0);CHECK(call(0x7EB8D6B5,0x1900,256,0x4a40)==0 && vm_read32(0x4a40)==0);
   CHECK(call(0x85BEFFCC,0x1000,0x3344)==0);CHECK(scratch_frees==2);CHECK(call(0xD1462438,0x1900)==0);
