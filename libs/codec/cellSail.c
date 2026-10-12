@@ -9,6 +9,7 @@
 
 #include "ps3emu/guest_call.h"
 #include "cellSail.h"
+#include "sail_graphics_state.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_read32 / vm_write32 */
 #include <stdio.h>
 #include <string.h>
@@ -44,6 +45,7 @@ static struct { u32 self_ea, allocator_ea, callback_ea, arg_ea; int in_use; int 
 #define SAIL_GRAPHICS_MEMORY        ((s32)0x806107F0u)
 #define SAIL_GRAPHICS_MAX 16
 static u32 s_graphics_adapters[SAIL_GRAPHICS_MAX];
+static SailGraphicsConfig s_graphics_configs[SAIL_GRAPHICS_MAX];
 static atomic_flag s_graphics_lock = ATOMIC_FLAG_INIT;
 extern u32 ppu_vm_size; /* zero denotes the full 4 GiB guest address space */
 
@@ -66,10 +68,19 @@ static int sail_graphics_slot(u32 ea)
         if (s_graphics_adapters[i] == ea) return i;
     return -1;
 }
+static void sail_graphics_detach_player(u32 player)
+{
+    sail_graphics_lock();
+    for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i)
+        if (s_graphics_configs[i].player_ea == player)
+            s_graphics_configs[i].player_ea = 0;
+    sail_graphics_unlock();
+}
 static void sail_graphics_reset(void)
 {
     sail_graphics_lock();
     memset(s_graphics_adapters, 0, sizeof(s_graphics_adapters));
+    memset(s_graphics_configs, 0, sizeof(s_graphics_configs));
     sail_graphics_unlock();
 }
 
@@ -149,6 +160,7 @@ s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_graphics_detach_player((u32)handle);
     s_sail_players[_sp].in_use = 0;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_CLOSED;
     return CELL_OK;
@@ -340,12 +352,24 @@ s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void* 
  * going to exit. Look the player up the way Initialize2 stored it. */
 s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
 {
-    (void)index; (void)adapter;
-    u32 self_ea = (u32)handle;
-    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
-        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
-            return CELL_OK;
-    return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (sail_player_slot((u32)handle) < 0) return SAIL_GRAPHICS_INVALID_ARG;
+    if (index != 0) return SAIL_GRAPHICS_NOT_AVAILABLE;
+    const u32 ea = (u32)(uintptr_t)adapter;
+    if (!ea) return SAIL_GRAPHICS_INVALID_ARG;
+    sail_graphics_lock();
+    const int slot = sail_graphics_slot(ea);
+    s32 result = SAIL_GRAPHICS_INVALID_STATE;
+    if (slot >= 0) {
+        result = CELL_OK;
+        for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i)
+            if ((i != slot && s_graphics_configs[i].player_ea == (u32)handle) ||
+                (i == slot && s_graphics_configs[i].player_ea &&
+                 s_graphics_configs[i].player_ea != (u32)handle))
+                result = SAIL_GRAPHICS_INVALID_STATE;
+        if (result == CELL_OK) s_graphics_configs[slot].player_ea = (u32)handle;
+    }
+    sail_graphics_unlock();
+    return result;
 }
 
 s32 cellSailPlayerCancel(CellSailPlayerHandle handle)
@@ -584,11 +608,27 @@ s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
  * rather than a stale address that faults or is silently followed. */
 s32 cellSailGraphicsAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
 {
-    (void)pArg;
     printf("[cellSail] GraphicsAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
            pSelf, pCallbacks);
     if (!sail_graphics_range(pSelf, SAIL_ADAPTER_CLEAR))
         return SAIL_GRAPHICS_INVALID_ARG;
+    SailGraphicsConfig config = {0};
+    config.self_ea = pSelf;
+    config.arg_ea = pArg;
+    /* Borrowed table bytes may overlap the object we clear. Snapshot first.
+     * OPD records themselves remain guest-owned until Finalize. */
+    if (pCallbacks) {
+        if ((pCallbacks & 3) || !sail_graphics_range(pCallbacks, 20))
+            return SAIL_GRAPHICS_INVALID_ARG;
+        for (int i = 0; i < 5; ++i) {
+            const u32 opd = vm_read32(pCallbacks + 4*i);
+            if ((opd & 3) || !sail_graphics_range(opd, 12) ||
+                ((u64)opd < (u64)pSelf + SAIL_ADAPTER_CLEAR && (u64)opd + 12 > pSelf) ||
+                !vm_read32(opd))
+                return SAIL_GRAPHICS_INVALID_ARG;
+            config.callbacks[i] = opd;
+        }
+    }
     sail_graphics_lock();
     if (sail_graphics_slot(pSelf) >= 0) {
         sail_graphics_unlock();
@@ -601,6 +641,7 @@ s32 cellSailGraphicsAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
     }
     sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
     s_graphics_adapters[slot] = pSelf;
+    s_graphics_configs[slot] = config;
     sail_graphics_unlock();
     return CELL_OK;
 }
@@ -611,7 +652,10 @@ s32 cellSailGraphicsAdapterFinalize(u32 pSelf)
         return SAIL_GRAPHICS_INVALID_ARG;
     sail_graphics_lock();
     const int slot = sail_graphics_slot(pSelf);
-    if (slot >= 0) s_graphics_adapters[slot] = 0;
+    if (slot >= 0) {
+        s_graphics_adapters[slot] = 0;
+        memset(&s_graphics_configs[slot], 0, sizeof(s_graphics_configs[slot]));
+    }
     sail_graphics_unlock();
     return slot >= 0 ? CELL_OK : SAIL_GRAPHICS_INVALID_STATE;
 }
@@ -656,17 +700,54 @@ s32 cellSailGraphicsAdapterUpdateAvSync(u32 pSelf, u32 tag, u64 time)
     return slot >= 0 ? SAIL_GRAPHICS_NOT_AVAILABLE : SAIL_GRAPHICS_INVALID_STATE;
 }
 
-/* cellSailGraphicsAdapterSetPreferredFormat(pSelf, pFormat)
- *
- * Records nothing: we do not decode video, so there is no format to honour.
- * It must still answer CELL_OK for a valid adapter, because a title that reads
- * an error here concludes its graphics adapter is unusable. */
+/* Preferred bytes express a request, never an actual decoded format. */
 s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat)
 {
-    printf("[cellSail] GraphicsAdapterSetPreferredFormat(self=0x%08X fmt=0x%08X)\n",
-           pSelf, pFormat);
-    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    return CELL_OK;
+    if (!sail_graphics_range(pSelf, SAIL_ADAPTER_CLEAR) ||
+        (pFormat & 3) || !sail_graphics_range(pFormat, 32))
+        return SAIL_GRAPHICS_INVALID_ARG;
+    u8 format[32];
+    memcpy(format, vm_base + pFormat, sizeof(format));
+    sail_graphics_lock();
+    const int slot = sail_graphics_slot(pSelf);
+    if (slot >= 0) {
+        memcpy(s_graphics_configs[slot].preferred, format, sizeof(format));
+        s_graphics_configs[slot].has_preferred = 1;
+    }
+    sail_graphics_unlock();
+    return slot >= 0 ? CELL_OK : SAIL_GRAPHICS_INVALID_STATE;
+}
+
+/* No actual session exists until a decoder publishes a concrete format.
+ * Leave output untouched on failure; preferred dimensions are not readiness. */
+s32 cellSailGraphicsAdapterGetFormat(u32 pSelf, u32 sessionId, u32 pFormat)
+{
+    (void)sessionId;
+    if (!sail_graphics_range(pSelf, SAIL_ADAPTER_CLEAR) ||
+        (pFormat & 3) || !sail_graphics_range(pFormat, 32))
+        return SAIL_GRAPHICS_INVALID_ARG;
+    sail_graphics_lock();
+    const int slot = sail_graphics_slot(pSelf);
+    sail_graphics_unlock();
+    return slot >= 0 ? SAIL_GRAPHICS_NOT_AVAILABLE : SAIL_GRAPHICS_INVALID_STATE;
+}
+
+/* Internal decoder boundary: snapshot retained guest records under the lock,
+ * then allow the consumer to invoke guest callbacks outside it. */
+s32 sail_graphics_config_for_player(u32 player, SailGraphicsConfig* out)
+{
+    if (!out || sail_player_slot(player) < 0) return SAIL_GRAPHICS_INVALID_ARG;
+    s32 result = SAIL_GRAPHICS_NOT_AVAILABLE;
+    sail_graphics_lock();
+    for (int i = 0; i < SAIL_GRAPHICS_MAX; ++i) {
+        if (s_graphics_adapters[i] && s_graphics_configs[i].player_ea == player) {
+            *out = s_graphics_configs[i];
+            result = CELL_OK;
+            break;
+        }
+    }
+    sail_graphics_unlock();
+    return result;
 }
 
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
