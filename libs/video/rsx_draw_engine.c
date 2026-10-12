@@ -11,6 +11,7 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#include "rsx_picture_identity.inc"
 
 #include "rsx_fp_decompiler.h"
 #include "rsx_primitives.h"
@@ -115,7 +116,7 @@ typedef struct {
 typedef struct {
     u32 location, offset, format, width, height, pitch, remap, cubemap;
     u32 handle;
-    u64 content_hash;
+    u64 content_hash, picture_identity;
     u32 last_hash_frame;
     u64 dirty_generation;
     u64 last_use_serial;
@@ -174,6 +175,10 @@ static struct {
 } g;
 
 /* The decompilers' HLSL. The VP decompiler builds bodies up to 192 KB. */
+static u64 s_picture_bound[RSX_BE_MAX_TEXTURES];
+static u32 s_picture_offset_ea[RSX_BE_MAX_TEXTURES];
+static int s_picture_offset_pending[RSX_BE_MAX_TEXTURES];
+static u32 s_picture_command_ea;
 static atomic_int s_checked_ready, s_checked_failed;
 static atomic_uint_fast64_t s_dirty_generation;
 static char s_vs_hlsl[256 * 1024];
@@ -868,10 +873,10 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
  * content id (rsx_live_draw.c:2002-2026). */
-static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
+static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span, u64 identity,
                                     int* readable)
 {
-    const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+    const u8* src = span ? (identity ? rsx_picture_data(identity,location,offset,span) : eng_guest_ptr(NULL, location, offset, span)) : NULL;
     if (!src) { *readable = 0; return 0; }
     u64 hash = 1469598103934665603ull;
     u32 i = 0;
@@ -899,7 +904,7 @@ static int eng_staging_reserve(u32 bytes)
 /* Decode a guest texture out of guest memory and hand every face and level to
  * the backend. Returns the backend handle, or 0. */
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                              u32 levels, u32 pitch, int cube, u32 remap)
+                              u32 levels, u32 pitch, int cube, u32 remap,u64 identity)
 {
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
@@ -908,7 +913,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 face_stride = cube
         ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) : 0u;
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
-    const u8* src = eng_guest_ptr(NULL, location, offset, span);
+    const u8* src = identity ? rsx_picture_data(identity,location,offset,span) : eng_guest_ptr(NULL, location, offset, span);
     if (!src) return 0;
 
     const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
@@ -941,8 +946,13 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * nothing: returning white "made the recovered orphanage render as flat
  * green/black geometry" (rsx_live_draw.c:2326-2334). */
 static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                            u32 levels, u32 pitch, int cube, u32 remap)
+                            u32 levels, u32 pitch, int cube, u32 remap,u64 identity)
 {
+    const u32 identity_span=eng_texture_span(fmt,w,h,levels,pitch,cube);
+    if(!rsx_picture_ready())return 0;
+    if(!identity && pic_requires_identity(location,offset,identity_span)){
+        pic_enter();pic_failed=1;pic_leave();atomic_store(&s_checked_failed,1);return 0;
+    }
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
     const u64 generation = atomic_load_explicit(&s_dirty_generation, memory_order_acquire);
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
@@ -950,21 +960,21 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
 
     for (u32 i = 0; i < g.n_textures; i++) {
         eng_texture* e = &g.textures[i];
-        if (e->location != location || e->offset != offset ||
+        if (e->picture_identity != identity || e->location != location || e->offset != offset ||
             e->format != fmt || e->width != w || e->height != h ||
             e->pitch != pitch || e->remap != remap ||
             e->cubemap != (u32)(cube != 0))
             continue;
         if (e->handle && (e->last_hash_frame != g.frames || e->dirty_generation != generation)) {
             int readable = 0;
-            const u64 hash = eng_texture_content_hash(location, offset, span,
+            const u64 hash = eng_texture_content_hash(location, offset, span, identity,
                                                       &readable);
             e->last_hash_frame = g.frames;
             e->dirty_generation = generation;
             if(!readable){atomic_store(&s_checked_failed,1);return 0;}
             if (readable && hash != e->content_hash) {
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
-                                                     levels, pitch, cube, remap);
+                                                     levels, pitch, cube, remap,identity);
                 if (fresh) {
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
@@ -990,16 +1000,16 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
 
     eng_texture e;
     memset(&e, 0, sizeof(e));
-    e.location = location; e.offset = offset; e.format = fmt;
+    e.picture_identity=identity; e.location = location; e.offset = offset; e.format = fmt;
     e.width = w; e.height = h; e.pitch = pitch;
     e.remap = remap; e.cubemap = (u32)(cube != 0);
     e.last_hash_frame = g.frames;
     e.dirty_generation = generation;
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
-      e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
+      e.content_hash = eng_texture_content_hash(location, offset, span, identity, &readable); }
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
-                                  cube, remap);
+                                  cube, remap,identity);
     if (!e.handle) atomic_store(&s_checked_failed,1);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) g.textures[index] = e;
@@ -1690,6 +1700,15 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
  * render-to-texture read back through a texture unit), a unit naming a
  * tracked zeta in DEPTH24_D8 samples its snapshot, and everything else is a
  * guest upload (rsx_live_draw.c:5986-6062). */
+static void eng_picture_resolve(u32 unit)
+{
+    if(!s_picture_offset_pending[unit])return;
+    rsx_dsp_texture t;rsx_dsp_get_texture(&g.rsx,unit,&t);u64 token=0;
+    if(rsx_picture_take_command(s_picture_offset_ea[unit],t.location,t.offset,&token)<0)
+        atomic_store(&s_checked_failed,1);
+    s_picture_bound[unit]=token;s_picture_offset_pending[unit]=0;
+}
+
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot, u32 tex_used,
                               u32 textures[RSX_BE_MAX_TEXTURES],
@@ -1699,12 +1718,21 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
-        /* A unit left enabled by an earlier draw but not sampled by this
+    /* A unit left enabled by an earlier draw but not sampled by this
          * program is skipped: resolving it would cost a cache check, and an
          * aliased surface a store to guest memory, for nothing. */
         if (!t.enabled || !((tex_used >> u) & 1u)) continue;
+        eng_picture_resolve(u);
         mask |= 1u << u;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
+
+        /* Allocation identity takes priority over stale surface/depth metadata
+         * that happens to occupy the same address. Unknown movie aliases fail. */
+        if(s_picture_bound[u] || pic_requires_identity(t.location,t.offset,eng_texture_span(t.format,t.width,t.height,t.mipmaps,t.pitch,(int)t.cubemap))){
+            textures[u]=eng_texture_slot(t.location,t.offset,t.format,t.width,t.height,
+                t.mipmaps,t.pitch,(int)t.cubemap,t.remap & 0xffffu,s_picture_bound[u]);
+            continue;
+        }
 
         int sampled = -1, own = 0, surface_at = -1;
         for (u32 i = 0; i < g.n_surfaces; i++) {
@@ -1775,7 +1803,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         }
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                        t.width, t.height, t.mipmaps, t.pitch,
-                                       (int)t.cubemap, t.remap & 0xFFFFu);
+                                       (int)t.cubemap, t.remap & 0xFFFFu,s_picture_bound[u]);
     }
     return mask;
 }
@@ -1793,7 +1821,7 @@ static u32 sink_bind_vertex_textures(
         /* A vertex unit has no crossbar, so its remap is the identity. */
         textures[u] = eng_texture_slot(vt.location, vt.offset, vt.format,
                                        vt.width, vt.height, vt.mipmaps,
-                                       vt.pitch, 0, 0xAAE4u);
+                                       vt.pitch, 0, 0xAAE4u,0);
         if (textures[u]) bound |= 1u << u;
     }
     return bound;
@@ -2199,6 +2227,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
                                             textures, samplers);
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
+    if(!rsx_picture_ready()){atomic_store(&s_checked_failed,1);return;}
 
     if (indexed) {
         if (!dc_reserve_indices(n_draw)) {atomic_store(&s_checked_failed,1);return;}
@@ -2481,6 +2510,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
 void rsx_draw_engine_shutdown(void)
 {
     atomic_store(&s_checked_ready, 0);
+    for(u32 i=0;i<RSX_BE_MAX_TEXTURES;++i){rsx_picture_release(s_picture_bound[i]);s_picture_bound[i]=0;s_picture_offset_pending[i]=0;}
     if (!g.be) return;
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
@@ -2506,7 +2536,7 @@ void rsx_draw_engine_shutdown(void)
 
 void rsx_draw_engine_method(u32 method, u32 arg)
 {
-    if (!g.ready) return;
+    if (!g.ready || !rsx_picture_ready()) return;
     /* The subchannel is a binding slot, not an engine selector, and a title
      * whose SPU-built command lists bind NV4097 elsewhere would otherwise
      * store its state in the wrong register bank.  Standard NV4097 methods
@@ -2514,7 +2544,25 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    if(m>=0x1A00 && m<0x1C00 && !((m-0x1A00)&31)){
+        const u32 unit=(m-0x1A00)/32;
+        if(g.rsx.in_begin_end && dc.n_packets &&
+           (s_picture_bound[unit] || pic_pending_command(s_picture_command_ea))){
+            pic_enter();pic_failed=1;pic_leave();atomic_store(&s_checked_failed,1);return;
+        }
+        if(s_picture_offset_pending[unit] && pic_pending_command(s_picture_offset_ea[unit])){
+            pic_enter();pic_failed=1;pic_leave();atomic_store(&s_checked_failed,1);return;
+        }
+        rsx_picture_release(s_picture_bound[unit]);s_picture_bound[unit]=0;
+        s_picture_offset_ea[unit]=s_picture_command_ea;s_picture_offset_pending[unit]=1;
+    }
     rsx_dispatch_method(&g.rsx, m, arg);
+    if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
+}
+
+void rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea)
+{
+    s_picture_command_ea=data_ea;rsx_draw_engine_method(method,arg);s_picture_command_ea=0;
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
@@ -2547,7 +2595,7 @@ void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes)
 
 int rsx_draw_engine_checked_ready(void)
 {
-    return atomic_load(&s_checked_ready) && !atomic_load(&s_checked_failed);
+    return atomic_load(&s_checked_ready) && !atomic_load(&s_checked_failed) && rsx_picture_ready();
 }
 
 int rsx_draw_engine_flush_checked(void)

@@ -2022,7 +2022,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * same reason the live engine does, and masks them itself. */
                 { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  if (eng) rsx_draw_engine_method_at((subch << 13) | m, vm_read32(dea),dea); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
