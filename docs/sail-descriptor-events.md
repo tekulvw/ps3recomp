@@ -1,0 +1,13 @@
+# Bounded Sail descriptor events
+
+This branch builds on the local PAMF descriptor-open and player-finalize branches. It supports one already-opened, registered local PAMF descriptor per EA-keyed player. OpenStream uses the descriptor URI; its second argument is a 64-bit completion token, not a path. CloseStream accepts the same token shape.
+
+A successful source open emits OPEN_TRANSITION, STREAM_OPENED with the descriptor in arg0, OPEN_STREAM completion with the token in arg1, then OPENED. A real close closes the host source and deregisters the descriptor, emits CLOSE_TRANSITION, STREAM_CLOSED with the still-live descriptor, CLOSE_STREAM completion, then CLOSED. This compatible synchronous emission order is a local policy; it is not a captured Sony firmware trace.
+
+Guest callback consumers may queue the events. Closed metadata and URI therefore survive until DestroyDescriptor, and Finalize/Term refuse to discard that pending close. Destruction is blocked during the initial close-transition callback, but allowed once STREAM_CLOSED delivery begins. Event callbacks run without the descriptor allocator guard held. In-flight OpenStream, CloseStream, Initialize2, Finalize/Destroy, and Term cannot replace the player or erase its source while events are emitted. The lifecycle busy flag is atomic; this does not make the pre-existing callback registry or all Sail APIs generally thread-safe.
+
+Unsupported or ambiguous source selection fails without reporting an opened stream. No callback bridge means NOT_AVAILABLE rather than successful undeliverable events. Descriptor zero remains a valid internal handle and is not converted into a fake guest pointer.
+
+This change does not decode or supply pictures/audio, retain graphics formats, or implement adapter makeup/cleanup. The pre-existing Start/Stop/Pause stubs and their synthesized playback events remain outside this branch's scope. They must be replaced by a real playback implementation before movie progress can be treated as evidence of decoding. It also does not establish the unverified RemoveDescriptor output contract.
+
+The real generated-NID PPU HLE regression covers source prerequisites, 64-bit event packing/tokens, actual PAMF database/URI access, both queued and immediate close consumers, reentrant callbacks, pending-close lifetime, exact-once guest allocator release, and subsequent source creation. Run `python3 tools/test_sail_descriptor_events.py`; an optional local PAMF argument replaces the synthetic metadata fixture. The standalone test runner uses a POSIX toolchain and skips on Windows; it does not establish Windows runtime support.
