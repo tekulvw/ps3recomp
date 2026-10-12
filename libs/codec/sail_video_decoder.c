@@ -10,6 +10,11 @@ void sail_video_frame_release(SailVideoFrame* frame)
 }
 #ifndef PS3RECOMP_SAIL_FFMPEG
 int sail_video_available(void) { return 0; }
+int sail_video_open(FILE*f,uint64_t o,uint64_t n,unsigned s,SailVideoDecoder**d)
+{ (void)f;(void)o;(void)n;(void)s;if(d)*d=NULL;return SAIL_VIDEO_UNAVAILABLE; }
+int sail_video_next(SailVideoDecoder*d,SailVideoFrame*out)
+{ (void)d;(void)out;return SAIL_VIDEO_UNAVAILABLE; }
+void sail_video_close(SailVideoDecoder*d) {(void)d;}
 int sail_video_decode_picture(FILE* f,uint64_t offset,uint64_t length,
                               unsigned stream,unsigned ordinal,SailVideoFrame* out)
 {
@@ -110,6 +115,7 @@ static int export_picture(AVFrame* frame, AVStream* stream, unsigned ordinal, Sa
     out->rgba = rgba; rgba = NULL;
     out->width = (uint32_t)frame->width; out->height = (uint32_t)frame->height;
     out->pitch = pitch; out->ordinal = ordinal;
+    out->duration = frame->duration;
     out->pts = frame->best_effort_timestamp;
     out->pts_valid = out->pts != AV_NOPTS_VALUE;
     out->time_base_num = stream->time_base.num; out->time_base_den = stream->time_base.den;
@@ -221,4 +227,162 @@ done:
     if (result != SAIL_VIDEO_OK) sail_video_frame_release(out);
     return result;
 }
+/* A single bounded demux/decoder lifetime. All operations belong to one
+ * caller; FILE remains borrowed and all guest callback work stays elsewhere. */
+struct SailVideoDecoder {
+    Payload payload;
+    int64_t saved;
+    AVFormatContext* format;
+    AVIOContext* io;
+    AVCodecContext* codec;
+    AVPacket* packet;
+    AVFrame* frame;
+    unsigned packets, ordinal;
+    int selected, pending, demux_eof, flushing, ended, failed;
+};
+/* FFmpeg's MPEG-PS demuxer deliberately accepts short PES packets. Its EOF
+ * alone cannot establish an intact bounded payload. Check declared packet
+ * spans independently, without decoding or retaining movie contents. This
+ * supports finite PES packets; zero-length video PES is explicitly unsupported.
+ * A stream shortened exactly at a complete packet boundary is not distinguishable
+ * from a shorter valid stream without an external content manifest. */
+static int validate_program_spans(FILE* f, int64_t offset, int64_t length)
+{
+    if(sail_seek(f,offset,SEEK_SET))return SAIL_VIDEO_IO;
+    int64_t pos=0;uint32_t prefix=UINT32_MAX;unsigned packets=0;
+    while(pos<length){
+        int c=fgetc(f);if(c==EOF)return SAIL_VIDEO_IO;
+        ++pos;prefix=(prefix<<8)|(unsigned)c;
+        if((prefix & 0xffffff00u)!=0x00000100u || c<0xb9)continue;
+        if(++packets>SAIL_VIDEO_MAX_PACKETS)return SAIL_VIDEO_LIMIT;
+        int64_t start=pos-4,end=pos;
+        if(c==0xba){
+            if(length-pos<1)return SAIL_VIDEO_DECODE;
+            int first=fgetc(f);if(first==EOF)return SAIL_VIDEO_IO;
+            if((first & 0xc0)==0x40){
+                if(length-start<14)return SAIL_VIDEO_DECODE;
+                if(sail_seek(f,offset+start+13,SEEK_SET))return SAIL_VIDEO_IO;
+                int stuffing=fgetc(f);if(stuffing==EOF)return SAIL_VIDEO_IO;
+                end=start+14+(stuffing & 7);
+            }else if((first & 0xf0)==0x20)end=start+12;
+            else return SAIL_VIDEO_UNAVAILABLE;
+        }else if(c!=0xb9){
+            if(length-pos<2)return SAIL_VIDEO_DECODE;
+            int hi=fgetc(f),lo=fgetc(f);if(hi==EOF || lo==EOF)return SAIL_VIDEO_IO;
+            unsigned bytes=((unsigned)hi<<8)|(unsigned)lo;
+            if(!bytes && c>=0xe0 && c<=0xef)return SAIL_VIDEO_UNAVAILABLE;
+            end=pos+2+bytes;
+        }
+        if(end>length)return SAIL_VIDEO_DECODE;
+        if(sail_seek(f,offset+end,SEEK_SET))return SAIL_VIDEO_IO;
+        pos=end;prefix=UINT32_MAX;
+    }
+    return SAIL_VIDEO_OK;
+}
+void sail_video_close(SailVideoDecoder* d)
+{
+    if(!d)return;
+    av_frame_free(&d->frame);av_packet_free(&d->packet);avcodec_free_context(&d->codec);
+    avformat_close_input(&d->format);
+    if(d->io){av_freep(&d->io->buffer);avio_context_free(&d->io);}
+    if(d->payload.file && d->saved>=0)(void)sail_seek(d->payload.file,d->saved,SEEK_SET);
+    free(d);
+}
+int sail_video_open(FILE* f,uint64_t offset,uint64_t length,unsigned stream_id,SailVideoDecoder** out)
+{
+    if(!out || *out || !f || !length || length>SAIL_VIDEO_MAX_PAYLOAD ||
+        offset>INT64_MAX || length>(uint64_t)INT64_MAX-offset || stream_id<0x1e0 || stream_id>0x1ef)
+        return SAIL_VIDEO_INVALID;
+    if(!sail_video_available())return SAIL_VIDEO_ABI;
+    int64_t saved=sail_tell(f);
+    if(saved<0 || sail_seek(f,0,SEEK_END))return SAIL_VIDEO_IO;
+    int64_t size=sail_tell(f);
+    if(sail_seek(f,saved,SEEK_SET))return SAIL_VIDEO_IO;
+    if(size<0 || offset+length>(uint64_t)size)return SAIL_VIDEO_INVALID;
+    int spans=validate_program_spans(f,(int64_t)offset,(int64_t)length);
+    if(sail_seek(f,saved,SEEK_SET))return SAIL_VIDEO_IO;
+    if(spans!=SAIL_VIDEO_OK)return spans;
+    SailVideoDecoder* d=calloc(1,sizeof(*d));if(!d)return SAIL_VIDEO_LIMIT;
+    d->payload=(Payload){f,(int64_t)offset,(int64_t)length,0};d->saved=saved;d->selected=-1;
+    int result=SAIL_VIDEO_DECODE,rc;
+    d->format=avformat_alloc_context();if(!d->format)goto fail;
+    uint8_t* buffer=av_malloc(32768);if(!buffer)goto fail;
+    d->io=avio_alloc_context(buffer,32768,0,&d->payload,payload_read,NULL,payload_seek);
+    if(!d->io){av_free(buffer);goto fail;}
+    d->format->pb=d->io;d->format->flags|=AVFMT_FLAG_CUSTOM_IO;
+    d->format->probesize=1024*1024;d->format->max_analyze_duration=2*AV_TIME_BASE;
+    if(avformat_open_input(&d->format,NULL,av_find_input_format("mpeg"),NULL)<0)goto fail;
+    d->packet=av_packet_alloc();d->frame=av_frame_alloc();if(!d->packet || !d->frame)goto fail;
+    while((rc=av_read_frame(d->format,d->packet))>=0){
+        if(++d->packets>SAIL_VIDEO_MAX_PACKETS){result=SAIL_VIDEO_LIMIT;goto fail;}
+        if(d->packet->stream_index<0 || (unsigned)d->packet->stream_index>=d->format->nb_streams)goto fail;
+        AVStream* st=d->format->streams[d->packet->stream_index];
+        if(st->id==(int)stream_id && st->codecpar->codec_type==AVMEDIA_TYPE_VIDEO){
+            if(st->codecpar->codec_id!=AV_CODEC_ID_MPEG2VIDEO){result=SAIL_VIDEO_UNAVAILABLE;goto fail;}
+            d->selected=d->packet->stream_index;d->pending=1;break;
+        }
+        av_packet_unref(d->packet);
+    }
+    if(d->selected<0){result=rc==AVERROR_EOF?SAIL_VIDEO_NOT_FOUND:SAIL_VIDEO_DECODE;goto fail;}
+    const AVCodec* decoder=avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
+    if(!decoder){result=SAIL_VIDEO_UNAVAILABLE;goto fail;}
+    d->codec=avcodec_alloc_context3(decoder);
+    AVStream* st=d->format->streams[d->selected];
+    if(!d->codec || avcodec_parameters_to_context(d->codec,st->codecpar)<0)goto fail;
+    d->codec->thread_count=1;d->codec->pkt_timebase=st->time_base;
+    d->codec->max_pixels=(int64_t)SAIL_VIDEO_MAX_DIMENSION*SAIL_VIDEO_MAX_DIMENSION;
+    d->codec->err_recognition=AV_EF_EXPLODE;
+    if(avcodec_open2(d->codec,decoder,NULL)<0)goto fail;
+    *out=d;return SAIL_VIDEO_OK;
+fail:
+    sail_video_close(d);return result;
+}
+int sail_video_next(SailVideoDecoder* d,SailVideoFrame* out)
+{
+    if(!d || !out || out->rgba)return SAIL_VIDEO_INVALID;
+    memset(out,0,sizeof(*out));
+    if(d->failed)return d->failed;
+    if(d->ended)return SAIL_VIDEO_EOF;
+    int result=SAIL_VIDEO_DECODE;
+    for(;;){
+        int rc=avcodec_receive_frame(d->codec,d->frame);
+        if(rc>=0){
+            if(++d->ordinal>2000){result=SAIL_VIDEO_LIMIT;goto fail;}
+            if(d->frame->decode_error_flags || (d->frame->flags & AV_FRAME_FLAG_CORRUPT))goto fail;
+            AVStream* st=d->format->streams[d->selected];
+            result=export_picture(d->frame,st,d->ordinal,out);
+            if(!result && !out->rate_num){out->rate_num=d->codec->framerate.num;out->rate_den=d->codec->framerate.den;}
+            av_frame_unref(d->frame);
+            if(result)goto fail;
+            return SAIL_VIDEO_OK;
+        }
+        if(rc==AVERROR_EOF){
+            if(!d->demux_eof || !d->flushing)goto fail;
+            d->ended=1;return SAIL_VIDEO_EOF;
+        }
+        if(rc!=AVERROR(EAGAIN) || d->flushing)goto fail;
+        if(d->pending){
+            if(d->packet->flags & AV_PKT_FLAG_CORRUPT)goto fail;
+            rc=avcodec_send_packet(d->codec,d->packet);
+            if(rc<0)goto fail; /* receive EAGAIN then send EAGAIN is invalid. */
+            av_packet_unref(d->packet);d->pending=0;continue;
+        }
+        if(d->demux_eof){
+            if(avcodec_send_packet(d->codec,NULL)<0)goto fail;
+            d->flushing=1;continue;
+        }
+        while((rc=av_read_frame(d->format,d->packet))>=0){
+            if(++d->packets>SAIL_VIDEO_MAX_PACKETS){result=SAIL_VIDEO_LIMIT;goto fail;}
+            if(d->packet->stream_index==d->selected){d->pending=1;break;}
+            av_packet_unref(d->packet);
+        }
+        if(!d->pending){
+            if(rc!=AVERROR_EOF || d->io->error<0 || ferror(d->payload.file))goto fail;
+            d->demux_eof=1;
+        }
+    }
+fail:
+    d->failed=result;sail_video_frame_release(out);av_frame_unref(d->frame);return result;
+}
+
 #endif
