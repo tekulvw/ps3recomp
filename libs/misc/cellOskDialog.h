@@ -24,6 +24,10 @@ extern "C" {
 #define CELL_OSK_ERROR_DIALOG_ALREADY_LOADED    0x8002B305
 #define CELL_OSK_ERROR_ABORT                    0x8002B306
 #define CELL_OSK_ERROR_UNKNOWN                  0x8002B3FF
+/* Published OSK parameter error for the key-layout option ABI. */
+#define CELL_OSKDIALOG_ERROR_PARAM               0x8002B504
+#define CELL_OSKDIALOG_10KEY_PANEL               0x00000001
+#define CELL_OSKDIALOG_FULLKEY_PANEL             0x00000002
 
 /* ---------------------------------------------------------------------------
  * Dialog result codes
@@ -113,6 +117,7 @@ s32 cellOskDialogAbort(void);
 
 s32 cellOskDialogSetInitialInputDevice(u32 device);
 s32 cellOskDialogSetInitialKeyLayout(u32 layout);
+s32 cellOskDialogSetKeyLayoutOption(u32 option);
 s32 cellOskDialogSetLayoutMode(u32 mode);
 s32 cellOskDialogSetSeparateWindowOption(u32 option);
 
