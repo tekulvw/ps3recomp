@@ -83,3 +83,6 @@ int main(void)
     cellGcmQueueUserCommand(7); ppu_gcm_pump(); assert(calls == 7);
     puts("Deferred GCM user-command checks passed");
 }
+
+int rsx_draw_engine_checked_ready(void) { return 1; }
+int rsx_draw_engine_flush_checked(void) { return 0; }

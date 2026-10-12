@@ -117,3 +117,6 @@ int main(void) {
     run_report(0xBAD68000,0); check_report(0xFFFF);
     munmap(vm_base,0x100000000ULL); puts("GCM guest report publication checks passed");
 }
+
+int rsx_draw_engine_checked_ready(void) { return 1; }
+int rsx_draw_engine_flush_checked(void) { return 0; }

@@ -146,3 +146,6 @@ int main(void)
     free(vm_base);
     return fails ? 1 : 0;
 }
+
+int rsx_draw_engine_checked_ready(void) { return 1; }
+int rsx_draw_engine_flush_checked(void) { return 0; }
