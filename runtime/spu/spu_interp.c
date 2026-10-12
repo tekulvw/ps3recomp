@@ -246,6 +246,10 @@ static int spu_step(spu_context* ctx) {
     case SPU_fma:  DSTC = spu_fma(A,B,T); break;    /* RRR: dest=rc */
     case SPU_fms:  DSTC = spu_fms(A,B,T); break;
     case SPU_fnms: DSTC = spu_fnms(A,B,T); break;
+    /* Basic double arithmetic shares the lifted-code helpers. */
+    case SPU_dfs: DST = spu_dfs(A,B); break;
+    case SPU_dfa: DST = spu_dfa(A,B); break;
+    case SPU_dfm: DST = spu_dfm(A,B); break;
     /* immediate byte/halfword compares */
     case SPU_ceqbi: DST = spu_ceqbi(A,I); break;
     case SPU_cgtbi: DST = spu_cgtbi(A,I); break;
