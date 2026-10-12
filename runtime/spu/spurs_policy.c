@@ -153,22 +153,13 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     ctx->gpr[0]._u32[0] = SPURS_PM_EXIT_TO_KERNEL_LS;  /* return-to-kernel link */
     ctx->gpr[1]._u32[0] = 0x3FFB0;                     /* stack (PM reloads its own) */
     ctx->gpr[3]._u32[0] = 0x100;                       /* context */
-    /* r4 layout is LO-WORD-IN-PREFERRED, not a big-endian u64: verified
-     * against the authentic wwsjob PM bytes (entry 0x2BF0 `stqa r4,0x14E0`,
-     * attach 0x2720 `brz r4`/`wrch MFC_EAL, r4` -- it treats r4's PREFERRED
-     * WORD as the 32-bit queue EA, and `shlqbyi r4,4`'s next word as the aux
-     * half). Passing {hi,lo} put 0 in the preferred slot, so the queue attach
-     * early-returned on every run: tickets got claimed via the shifted copy
-     * but the job-list header never DMA'd in, and the PM wedged forever in
-     * its staged-job wait (LBP's post-intro loading freeze). */
-    /* ...and the CLAIM path reads the EA from the shlqbyi(r4,4) copy (LS
-     * 0x13F0, via func_3038 -> 2418), i.e. r4's SECOND word. Both word 0
-     * (attach) and word 1 (claim) must carry the 32-bit EA; the hi half
-     * rides in words 2-3. */
-    ctx->gpr[4]._u32[0] = (uint32_t)wkl_data;          /* attach reads word0  */
-    ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;          /* claim reads word1   */
-    ctx->gpr[4]._u32[2] = (uint32_t)(wkl_data >> 32);
-    ctx->gpr[4]._u32[3] = (uint32_t)(wkl_data >> 32);
+    /* A scalar u64 occupies the preferred doubleword: high word first,
+     * then low word. WWS policies use these as independent optional-audit
+     * and job-list pointers; duplicating the low word enables audit writes
+     * into the job list. Refresh the complete register on every dispatch. */
+    ctx->gpr[4]._u64[1] = 0;
+    ctx->gpr[4]._u32[0] = (uint32_t)(wkl_data >> 32);
+    ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;
     ctx->gpr[5]._u32[0] = spurs_flag_status(spurs_ea, wid, 1); /* FLAG poll reason */
 
     g_spurs_pm_polls  = 0;
