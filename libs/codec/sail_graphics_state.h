@@ -13,6 +13,13 @@ typedef struct SailGraphicsConfig {
 } SailGraphicsConfig;
 /* A snapshot is not an ownership pin. Consumers must prevent Finalize/Destroy
  * while dispatching, and revalidate guest-owned OPDs before invocation. */
+s32 sail_graphics_begin_session(u32 player, SailGraphicsConfig* out, u32* session);
+/* Begin pins callbacks against teardown. Unpublish hides pixels but retains
+ * that pin through free callbacks; withdraw ends the resolved ownership pin.
+ * Producer owns and initializes buffer, never overwriting published pixels. */
+s32 sail_graphics_publish_frame(u32 player, u32 buffer, const u8 format[32], u64 pts, u64 origin, u32 tag);
+s32 sail_graphics_unpublish_frame(u32 player);
+s32 sail_graphics_withdraw_frame(u32 player);
 s32 sail_graphics_config_for_player(u32 player, SailGraphicsConfig* out);
 #ifdef __cplusplus
 }
