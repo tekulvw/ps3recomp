@@ -248,6 +248,10 @@ typedef struct rsx_draw_backend {
     /* Optional certificate: 1 only after accepted work completes without error.
      * Appended for source compatibility; the old void callback is not proof. */
     int (*submit_and_wait_checked)(void* user, u32 reason);
+    /* Optional bounded diagnostics: fence preceding work and point-sample
+     * the actual selected 2D texture/view at mip 0 into an RGBA8 byte file.
+     * Called only for explicitly armed capture offsets, before their draw. */
+    int (*capture_texture_rgba8)(void* user, u32 texture, const char* path);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

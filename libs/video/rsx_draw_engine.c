@@ -2096,10 +2096,12 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
 
 /* Bounded opt-in evidence. A trigger file permits arming after a menu opens;
  * only metadata is logged, once per distinct descriptor and binding source. */
+static const char* s_capture_binding_source[RSX_BE_MAX_TEXTURES];
 static void eng_texture_descriptor_log(u32 unit, const rsx_dsp_texture* t,
                                        u32 handle, const char* source,
                                        const eng_surface* surface)
 {
+    s_capture_binding_source[unit] = source;
     enum { MAX_DESCRIPTORS = 512 };
     static int configured, enabled, armed;
     static u32 start_frame, limit = 128, count, checked_frame = UINT32_MAX;
@@ -2170,6 +2172,147 @@ static void eng_texture_descriptor_log(u32 unit, const rsx_dsp_texture* t,
     for (u32 m = 0; m < n; m++)
         fprintf(stderr, "%s%u:%u:%u", m ? "," : "", m, lv[m].offset, lv[m].tl.row_bytes);
     fputc('\n', stderr);
+}
+
+/* Deliberately independent of the descriptor deduplication: capture the draw
+ * actually consuming an explicitly selected offset, once after arming. */
+static int eng_capture_write(const char* prefix, const char* suffix,
+                             const void* bytes, size_t size)
+{
+    char path[2048];
+    if (!bytes || snprintf(path, sizeof path, "%s%s", prefix, suffix) >= (int)sizeof path) return 0;
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    int ok = fwrite(bytes, 1, size, f) == size;
+    if (fclose(f)) ok = 0;
+    return ok;
+}
+
+static void eng_texture_binding_capture(const u32* textures, u32 mask,
+    const rsx_vertex_layout_plan* layout, u32 pipeline, const u32* targets,
+    u32 n_targets, u32 uploaded, u32 n_indices, u32 fp_bytes,
+    const rsx_be_render_state* render_state, const rsx_dsp_surface* sf,
+    const rsx_dsp_viewport* vp)
+{
+    enum { MAX_CAPTURE = 8, MAX_IMAGE_BYTES = 8u << 20,
+           MAX_TOTAL_BYTES = 64u << 20, MAX_GEOMETRY_BYTES = 1u << 20 };
+    static int configured, enabled, armed;
+    static u32 offsets[MAX_CAPTURE], count, done[MAX_CAPTURE], location;
+    static u32 start_frame, start_draw, draw, checked_frame = UINT32_MAX;
+    static size_t total_bytes;
+    static const char* directory;
+    static const char* trigger;
+    ++draw;
+    if (!configured) {
+        configured = 1;
+        directory = getenv("PS3RECOMP_RSX_BINDING_CAPTURE_DIR");
+        const char* list = getenv("PS3RECOMP_RSX_BINDING_CAPTURE_OFFSETS");
+        if (!directory || !*directory || !list || !*list) return;
+        char* end;
+        while (*list && count < MAX_CAPTURE) {
+            unsigned long value = strtoul(list, &end, 16);
+            if (end == list || value > UINT32_MAX || (*end && *end != ',')) return;
+            for (u32 i=0;i<count;++i) if (offsets[i]==(u32)value) return;
+            offsets[count++] = (u32)value;
+            list = *end ? end+1 : end;
+        }
+        /* Reject an oversized list instead of silently dropping requests. */
+        if (*list) return;
+        const char* loc = getenv("PS3RECOMP_RSX_BINDING_CAPTURE_LOCATION");
+        if (loc) { unsigned long value=strtoul(loc,&end,10); if (*end || value>1) return; location=(u32)value; }
+        const char* frame=getenv("PS3RECOMP_RSX_BINDING_CAPTURE_START_FRAME");
+        const char* first=getenv("PS3RECOMP_RSX_BINDING_CAPTURE_START_DRAW");
+        if (frame) { unsigned long value=strtoul(frame,&end,10); if (*end || value>UINT32_MAX) return; start_frame=(u32)value; }
+        if (first) { unsigned long value=strtoul(first,&end,10); if (*end || value>UINT32_MAX) return; start_draw=(u32)value; }
+        trigger=getenv("PS3RECOMP_RSX_BINDING_CAPTURE_TRIGGER");
+        armed=!trigger || !*trigger;
+        enabled=1;
+    }
+    if (!enabled || g.frames<start_frame || draw<start_draw) return;
+    if (!armed && checked_frame!=g.frames) {
+        checked_frame=g.frames;
+        FILE* f=fopen(trigger,"rb"); if (f) { fclose(f); armed=1; }
+    }
+    if (!armed) return;
+    for (u32 unit=0; unit<RSX_BE_MAX_TEXTURES; ++unit) {
+        if (!(mask & (1u<<unit)) || !textures[unit]) continue;
+        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx,unit,&t);
+        u32 selected=0;
+        while (selected<count && (done[selected] || offsets[selected]!=t.offset || location!=t.location)) ++selected;
+        if (selected==count) continue;
+        done[selected]=1; /* Even failed/unsupported captures cannot flood. */
+        char prefix[1800];
+        if (snprintf(prefix,sizeof prefix,"%s/tex-%02u-frame%u-draw%u-unit%u-%08X",
+                     directory,selected,g.frames,draw,unit,t.offset)>=(int)sizeof prefix) continue;
+        rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+        u32 levels=t.width<=ENG_MAX_TEX_DIM && t.height<=ENG_MAX_TEX_DIM ?
+            rsx_texture_mip_chain(t.format,t.width,t.height,t.mipmaps,t.pitch,lv) : 0;
+        u32 span=levels ? eng_texture_span(t.format,t.width,t.height,t.mipmaps,t.pitch,(int)t.cubemap) : 0;
+        u64 full_span=0;
+        for (u32 m=0;m<levels;++m) full_span+=(u64)lv[m].tl.row_bytes*lv[m].tl.rows;
+        if (t.cubemap) full_span=((full_span+127u)&~(u64)127u)*6u;
+        size_t decoded_bytes=levels ? (size_t)lv[0].tl.dst_row_bytes*lv[0].tl.rows : 0;
+        int bytes_ok=0, gpu_ok=0, readable=0, have_cache=0;
+        u64 current_hash=0, live_hash=0, cache_hash=0;
+        for (u32 i=0; i<g.n_textures; ++i) if (g.textures[i].handle==textures[unit]) {
+            have_cache=1; cache_hash=g.textures[i].content_hash; break;
+        }
+        const u8* guest=NULL;
+        if (span && full_span==span && span<=MAX_IMAGE_BYTES && decoded_bytes<=MAX_IMAGE_BYTES &&
+            total_bytes+span+decoded_bytes<=MAX_TOTAL_BYTES)
+            guest=s_picture_bound[unit] ? rsx_picture_data(s_picture_bound[unit],t.location,t.offset,span) :
+                  eng_guest_ptr(NULL,t.location,t.offset,span);
+        u8* source=guest ? malloc(span) : NULL;
+        u8* decoded=source ? malloc(decoded_bytes) : NULL;
+        if (source && decoded) {
+            total_bytes+=span+decoded_bytes;
+            memcpy(source,guest,span);
+            /* Same word-at-a-time hash used by the upload cache. */
+            current_hash=1469598103934665603ull;
+            u32 i=0;
+            for (;i+8<=span;i+=8) { u64 word;memcpy(&word,source+i,8);current_hash^=word;current_hash*=1099511628211ull; }
+            for (;i<span;++i) { current_hash^=source[i];current_hash*=1099511628211ull; }
+            rsx_texture_decode(decoded,lv[0].tl.dst_row_bytes,source,t.width,t.height,&lv[0].tl,rsx_texture_argb_is_rgba());
+            bytes_ok=eng_capture_write(prefix,".source.bin",source,span) &&
+                eng_capture_write(prefix,".decoded-mip0.bin",decoded,decoded_bytes);
+            live_hash=eng_texture_content_hash(t.location,t.offset,span,s_picture_bound[unit],&readable);
+        }
+        free(decoded); free(source);
+        size_t vertex_bytes=(size_t)uploaded*layout->stride;
+        size_t index_bytes=(size_t)n_indices*sizeof(u32);
+        int geometry_ok=vertex_bytes<=MAX_GEOMETRY_BYTES && index_bytes<=MAX_GEOMETRY_BYTES &&
+            eng_capture_write(prefix,".vertices.bin",dc.verts,vertex_bytes) &&
+            (!n_indices || eng_capture_write(prefix,".indices.bin",g.indices,index_bytes)) &&
+            eng_capture_write(prefix,".vp-constants.bin",g.vp_cb,ENG_VP_CB_BYTES) &&
+            eng_capture_write(prefix,".fp-constants.bin",g.fp_cb,fp_bytes) &&
+            eng_capture_write(prefix,".registers.bin",g.rsx.regs,sizeof g.rsx.regs);
+        const u8* vp_code=NULL; const u8* fp_code=NULL;
+        u32 vp_instrs=0,fp_size=0;
+        int guest_programs=eng_guest_programs(&vp_code,&vp_instrs,&fp_code,&fp_size);
+        int programs_ok=guest_programs &&
+            eng_capture_write(prefix,".vp-program.bin",vp_code,(size_t)vp_instrs*16u) &&
+            eng_capture_write(prefix,".fp-program.bin",fp_code,fp_size);
+        if (g.be->capture_texture_rgba8) {
+            char path[2048];
+            if (snprintf(path,sizeof path,"%s.metal.rgba",prefix)<(int)sizeof path)
+                gpu_ok=g.be->capture_texture_rgba8(g.be->user,textures[unit],path);
+        }
+        char path[2048]; snprintf(path,sizeof path,"%s.meta",prefix);
+        FILE* f=fopen(path,"wb"); if (!f) continue;
+        fprintf(f,"frame=%u draw=%u unit=%u source=%s handle=%u loc=%u offset=%08X fmt=%02X size=%ux%u pitch=%u mips=%u cube=%u remap=%08X filter=%08X wrap=%08X control0=%08X\n",
+            g.frames,draw,unit,s_capture_binding_source[unit] ? s_capture_binding_source[unit] : "unknown",textures[unit],t.location,t.offset,t.format,t.width,t.height,t.pitch,t.mipmaps,t.cubemap,t.remap,t.filter,t.wrap,t.control0);
+        fprintf(f,"source_bytes=%u decoded_bytes=%zu decoded_row=%u decoded_rows=%u decoded_format=%u compressed=%d bytes_saved=%d have_cache=%d cache_hash=%016llX current_hash=%016llX live_hash=%016llX cache_matches_current=%d source_stable=%d gpu_saved=%d geometry_saved=%d\n",
+            span,decoded_bytes,levels ? lv[0].tl.dst_row_bytes : 0,levels ? lv[0].tl.rows : 0,levels ? (u32)lv[0].tl.fmt : 0,levels ? lv[0].tl.compressed : 0,bytes_ok,have_cache,(unsigned long long)cache_hash,(unsigned long long)current_hash,(unsigned long long)live_hash,have_cache && bytes_ok && cache_hash==current_hash,bytes_ok && readable && live_hash==current_hash,gpu_ok,geometry_ok);
+        u64 pipeline_key=0; for (u32 i=0;i<g.n_pipelines;++i) if (g.pipelines[i].handle==pipeline) pipeline_key=g.pipelines[i].key;
+        fprintf(f,"pipeline=%u pipeline_key=%016llX guest_programs=%d programs_saved=%d vp_instructions=%u fp_bytes=%u shader_control=%08X primitive=%u vertices=%u stride=%u indices=%u attr_mask=%08X attrs=",pipeline,(unsigned long long)pipeline_key,guest_programs,programs_ok,vp_instrs,fp_size,rsx_dsp_shader_control(&g.rsx),g.rsx.current_primitive,uploaded,layout->stride,n_indices,layout->mask);
+        for (u32 i=0;i<layout->count;++i) fprintf(f,"%s%u",i ? "," : "",layout->attrs[i]);
+        fprintf(f,"\ntargets="); for (u32 i=0;i<n_targets;++i) fprintf(f,"%s%u:%u:%08X:%ux%u:fmt%u",i ? "," : "",g.surfaces[targets[i]].handle,g.surfaces[targets[i]].location,g.surfaces[targets[i]].offset,g.surfaces[targets[i]].w,g.surfaces[targets[i]].h,(u32)g.surfaces[targets[i]].fmt);
+        fprintf(f,"\nclip=%u,%u,%u,%u color_format=%u viewport_scale=%g,%g,%g,%g viewport_translate=%g,%g,%g,%g scissor_raw=%08X,%08X\n",
+            sf->clip_x,sf->clip_y,sf->clip_w,sf->clip_h,sf->color_format,vp->scale[0],vp->scale[1],vp->scale[2],vp->scale[3],vp->translate[0],vp->translate[1],vp->translate[2],vp->translate[3],rsx_dsp_reg(&g.rsx,M_SCISSOR_HORIZONTAL),rsx_dsp_reg(&g.rsx,M_SCISSOR_VERTICAL));
+        fclose(f);
+        eng_capture_write(prefix,".render-state.bin",render_state,sizeof *render_state);
+        fprintf(stderr,"[rsx texture binding capture] frame=%u draw=%u unit=%u offset=%08X handle=%u source=%s bytes_saved=%d gpu_saved=%d prefix=%s\n",g.frames,draw,unit,t.offset,textures[unit],s_capture_binding_source[unit],bytes_ok,gpu_ok,prefix);
+    }
 }
 
 static void eng_picture_resolve(u32 unit)
@@ -2803,6 +2946,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     u32 handles[RSX_BE_MAX_COLOR_TARGETS];
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
+    const u32 uploaded = indexed ? dc.n_verts : n_draw;
+    eng_texture_binding_capture(textures,tex_mask,&layout,pipeline,targets,n_targets,
+        uploaded,indexed ? n_draw : 0,fp_bytes,&rs,&sf,&vp);
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
     g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
@@ -2848,7 +2994,6 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.be->set_depth_bounds(g.be->user, fmin, fmax);
     }
 
-    const u32 uploaded = indexed ? dc.n_verts : n_draw;
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
     /* Counted only when the draw ran the guest's OWN programs, which is what
