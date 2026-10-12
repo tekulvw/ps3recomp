@@ -92,6 +92,11 @@ int main() {
 
  CHECK(sail_graphics_replace_frame(0x5000,0x6800,format,180090,90000,1)==STATE);
  CHECK(sail_graphics_begin_session(0x5000,&pinned,&session)==0);
+ CHECK(sail_graphics_unpublish_frame(0x5000)==0);
+ CHECK(sail_graphics_replace_frame(0x5000,0x6000,format,90000,90000,1)==STATE);
+ CHECK(call(GET,0x1000,0x2000)==0);CHECK(fill_is(0x2000,24,0));
+ CHECK(sail_graphics_withdraw_frame(0x5000)==0);
+ CHECK(sail_graphics_begin_session(0x5000,&pinned,&session)==0);
  CHECK(sail_graphics_replace_frame(0x5000,0x6000,format,90000,90000,1)==0);
  CHECK(call(GET,0x1000,0x2000)==0x200);CHECK(vm_read32(0x2008)==1 && vm_read32(0x2004)==session);
  CHECK(call(GET,0x1000,0x2000)==0x100);CHECK(vm_read32(0x2008)==2);
