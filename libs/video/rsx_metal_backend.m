@@ -3491,6 +3491,51 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
     }
 }
 
+/* A bounded diagnostic callback, invoked before the selected consuming draw.
+ * Drain preceding records, then sample the selected object/view itself. This
+ * includes hardware BC decoding and its real component remap, unlike getBytes
+ * on a compressed texture. It does not re-upload or replace the selected object. */
+static int eng_capture_texture_rgba8(void* user, u32 handle, const char* path)
+{
+    (void)user;
+    id<MTLTexture> src=eng_obj(handle); /* Retain across retirement collection. */
+    if (!src || !path || !*path || [src textureType]!=MTLTextureType2D || !s_dev || !s_queue) return 0;
+    const size_t w=[src width], h=[src height];
+    if (!w || !h || w>16384 || h>16384 || w*h>4u*1024u*1024u) return 0;
+    if (s_eng_rec_count || s_eng_stage_used) {
+        eng_encode_and_commit(nil);
+        if (!s_eng_checked_completed) return 0;
+    }
+    @autoreleasepool {
+        MTLTextureDescriptor* td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
+        td.usage=MTLTextureUsageRenderTarget;
+        td.storageMode=[s_dev hasUnifiedMemory] ? MTLStorageModeShared : MTLStorageModeManaged;
+        id<MTLTexture> dst=[s_dev newTextureWithDescriptor:td];
+        id<MTLCommandBuffer> cb=[s_queue commandBuffer];
+        if (!dst || !cb || !eng_blit_to_display(cb,src,dst)) return 0;
+        if ([dst storageMode]==MTLStorageModeManaged) {
+            id<MTLBlitCommandEncoder> blit=[cb blitCommandEncoder];
+            if (!blit) return 0;
+            [blit synchronizeResource:dst]; [blit endEncoding];
+        }
+        [cb commit]; [cb waitUntilCompleted];
+        if ([cb status]!=MTLCommandBufferStatusCompleted || [cb error]) return 0;
+        u8* pixels=malloc(w*h*4); if (!pixels) return 0;
+        [dst getBytes:pixels bytesPerRow:w*4 fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+        FILE* f=fopen(path,"wb"); int ok=0;
+        if (f) { ok=fwrite(pixels,1,w*h*4,f)==w*h*4; if (fclose(f)) ok=0; }
+        free(pixels);
+        if (ok) {
+            char meta[2048];
+            if (snprintf(meta,sizeof meta,"%s.meta",path)<(int)sizeof meta) {
+                f=fopen(meta,"wb");
+                if (f) { fprintf(f,"handle=%u metal_format=%lu size=%zux%zu row_bytes=%zu rgba_bytes=%zu level=0 point_sample=1 before_consuming_draw=1 gpu_status=%ld\n",handle,(unsigned long)[src pixelFormat],w,h,w*4,w*h*4,(long)[cb status]); fclose(f); }
+            }
+        }
+        return ok;
+    }
+}
+
 /* Opt-in readback of the game surface, useful on a locked Mac or in CI.
  * Headless submits have completed; windowed captures fence the same queue. */
 static void eng_dump_frame(id<MTLTexture> src, int presented)
@@ -3634,6 +3679,7 @@ static const rsx_draw_backend s_engine_backend = {
     .clear_depth_stencil  = eng_clear_depth_stencil,
     .present              = eng_present,
     .readback             = eng_readback,
+    .capture_texture_rgba8 = eng_capture_texture_rgba8,
 };
 
 /* ---- public API ---------------------------------------------------------- */
