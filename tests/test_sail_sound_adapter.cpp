@@ -59,11 +59,13 @@ int main() {
     ppu_hle_register_all();
     constexpr uint32_t INIT=0x3D0D3B72,GET=0x7EB8D6B5,FINAL=0xD1462438;
     constexpr uint32_t INVALID_ARG=0x80610701,INVALID_STATE=0x80610702,NOT_AVAILABLE=0x80610708;
-    CHECK(ps3_hle_has(GET));CHECK(ps3_hle_has(FINAL));
+    CHECK(ps3_hle_has(GET));CHECK(ps3_hle_has(FINAL));CHECK(ps3_hle_has(0xEEC22809));
     std::memset(vm_base+0x1FFC,0xA5,32);
     CHECK(call(GET,0x1000,256,0x2000)==INVALID_STATE);
     CHECK(fill_is(0x1FFC,32,0xA5));
     CHECK(call(INIT,0x1000)==0);
+    CHECK(call(0xEEC22809,0x1000,0,UINT64_MAX)==0);
+    CHECK(call(0xEEC22809,0x1000,1,12345)==NOT_AVAILABLE);
     CHECK(call(INIT,0x1000)==INVALID_STATE);
     CHECK(call(GET,0x1000,256,0x2000)==0); // CELL_SAIL_SYNC_NO_FRAME, not decoded success
     CHECK(fill_is(0x2000,24,0));
