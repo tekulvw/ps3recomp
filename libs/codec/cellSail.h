@@ -149,6 +149,8 @@ s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
 #define CELL_SAIL_SYNC_NO_FRAME 0
 s32 cellSailGraphicsAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
 s32 cellSailGraphicsAdapterFinalize(u32 pSelf);
+s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat);
+s32 cellSailGraphicsAdapterGetFormat(u32 pSelf, u32 sessionId, u32 pFormat);
 s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo);
 s32 cellSailGraphicsAdapterUpdateAvSync(u32 pSelf, u32 tag, u64 time);
 
