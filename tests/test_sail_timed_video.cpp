@@ -75,7 +75,8 @@ static void event_callback(uint32_t,uint64_t,uint64_t ev,uint64_t a,uint64_t b,u
 static std::vector<unsigned> graphics;
 static unsigned frame_frees=0, scratch_frees=0;
 static bool missing_free=false;
-static uint64_t fake_clock=5000000;
+static uint64_t fake_clock=5000000, test_anchor=5000000;
+static unsigned picture_count=179, expected_session=1;
 static std::array<bool,4> owned{};
 static unsigned allocations=0,decoder_closes=0;
 static uint32_t buffer_ea(unsigned n){return 0x400000+n*0x400000;}
@@ -110,7 +111,7 @@ extern "C" int ppu_guest_call_ct_checked(uint32_t code,uint32_t toc,
   if(c==4 && is_mode("partial-three")){owned[3]=false;vm_write32(d+12,0);*out=3;}
   if(is_mode("allocation-failure")){owned.fill(false);for(unsigned i=0;i<c;++i)vm_write32(d+4*i,0);*out=uint64_t(-1);}
  }
- if(code==0x102) {if(c!=1||vm_base[b]!=1||vm_read32(b+8)!=5120)std::abort();}
+ if(code==0x102) {if(c!=expected_session||vm_base[b]!=1||vm_read32(b+8)!=5120)std::abort();}
  if(code==0x104) {
   if(b!=1)std::abort();
   uint32_t ea=vm_read32(c);unsigned n=0;while(n<4 && buffer_ea(n)!=ea)++n;
@@ -140,12 +141,12 @@ extern "C" int sail_video_open(FILE*,uint64_t off,uint64_t length,unsigned sid,S
 }
 extern "C" int sail_video_next(SailVideoDecoder* decoder,SailVideoFrame*out) {
  unsigned ordinal=++decoder->ordinal;
- if(is_mode("truncated") && ordinal==70)return SAIL_VIDEO_EOF;
- if(ordinal==180)return is_mode("drain-failure")?SAIL_VIDEO_DECODE:SAIL_VIDEO_EOF;
- if(ordinal>180)std::abort();
+ if((is_mode("truncated") || is_mode("intro-truncated")) && ordinal==70)return SAIL_VIDEO_EOF;
+ if(ordinal==picture_count+1)return (is_mode("drain-failure") || is_mode("intro-drain-failure"))?SAIL_VIDEO_DECODE:SAIL_VIDEO_EOF;
+ if(ordinal>picture_count+1)std::abort();
  out->rgba=(uint8_t*)std::malloc(3686400);std::memset(out->rgba,ordinal,3686400);
  out->width=1280;out->height=720;out->pitch=5120;out->ordinal=ordinal;
- out->duration=3003;out->pts_valid=ordinal<179;out->pts=ordinal<179?90000+(ordinal-1)*3003:INT64_MIN;
+ out->duration=3003;out->pts_valid=ordinal<picture_count;out->pts=ordinal<picture_count?90000+(ordinal-1)*3003:INT64_MIN;
  if(is_mode("unknown-nonterminal") && ordinal==15){out->pts_valid=0;out->pts=INT64_MIN;}
  out->time_base_num=1;out->time_base_den=90000;out->rate_num=30000;out->rate_den=1001;
  out->colorspace=1;out->color_range=1;return 0;
@@ -166,7 +167,10 @@ int main(int argc,char**argv) {
  g_ps3_guest_caller=event_callback;
  for(unsigned i=0;i<5;++i){vm_write32(0x2200+4*i,0x2300+16*i);vm_write32(0x2300+16*i,0x100+i);vm_write32(0x2304+16*i,0x12345678);}
  CHECK(call(0x1C983864,0x1800,0x2200,0xABCDEF)==0);CHECK(call(0x18BCD21B,0x1000,0,0x1800)==0);
- std::snprintf((char*)memory+0x4000,512,"x-cell-fs:///dev_bdvd/%s",is_mode("unsupported-source")?"mag_intro.pam":argv[1]);
+ for(unsigned pass=0;pass<(is_mode("sequence")?2u:1u);++pass) {
+ picture_count=(pass || !std::strncmp(mode,"intro",5))?1806:179;
+ expected_session=pass+1;test_anchor=fake_clock;
+ std::snprintf((char*)memory+0x4000,512,"x-cell-fs:///dev_bdvd/%s",is_mode("unsupported-source")?"other.pam":picture_count==1806?"mag_intro.pam":argv[1]);
  CHECK(call(CREATE,0x1000,0,0,0x4000,0x4200)==0);active_desc=vm_read32(0x4200);
  CHECK(call(OPEN,active_desc)==0);CHECK(call(0x7C8DFF3B,0x1000,active_desc)==0);
  CHECK(call(0x0ABB318B,active_desc,0x4400,128,0)==0);
@@ -198,6 +202,11 @@ int main(int argc,char**argv) {
   CHECK(call(STOP,0x1000,0x12345678)==0);
   CHECK(frame_frees==4 && decoder_closes==1);return 0;
  }
+ if(is_mode("intro-stop")){
+  fake_clock+=30000000;CHECK(call(0x0247C69E,0x1800,0x4600)==0x200);
+  CHECK(call(STOP,0x1000,0xFEDCBA9876543210ULL)==0);
+  CHECK(decoder_closes==1 && scratch_frees==1 && frame_frees==4);return 0;
+ }
  if(is_mode("stop") || is_mode("uncertain-free") || is_mode("negative-free")){
   try {uint32_t rc=call(STOP,0x1000,0xFEDCBA9876543210ULL);
    if(is_mode("negative-free")){CHECK(rc==0x80610702);CHECK(call(STOP,0x1000,0)==0x80610702);return 0;}
@@ -205,21 +214,21 @@ int main(int argc,char**argv) {
   }catch(const std::runtime_error&){CHECK(is_mode("uncertain-free"));CHECK(call(STOP,0x1000,0)==0x80610702);return 0;}
   CHECK(frame_frees==4 && decoder_closes==1 && scratch_frees==1);return 0;
  }
- for(unsigned ordinal=2;ordinal<=179;++ordinal){
-  fake_clock=5000000+uint64_t(ordinal-1)*1001000/30-1;
+ for(unsigned ordinal=2;ordinal<=picture_count;++ordinal){
+  fake_clock=test_anchor+uint64_t(ordinal-1)*1001000/30-1;
   CHECK(call(0x0247C69E,0x1800,0x4600)==0x100);
   fake_clock+=1;
-  if(is_mode("delayed-final") && ordinal==179)fake_clock+=250000;
+  if(is_mode("delayed-final") && ordinal==picture_count)fake_clock+=250000;
   uint32_t status=call(0x0247C69E,0x1800,0x4600);
-  if((is_mode("truncated") && ordinal==70) || (is_mode("unknown-nonterminal") && ordinal==15) ||
-     (is_mode("drain-failure") && ordinal==179)){
+  if(((is_mode("truncated") || is_mode("intro-truncated")) && ordinal==70) || (is_mode("unknown-nonterminal") && ordinal==15) ||
+     ((is_mode("drain-failure") || is_mode("intro-drain-failure")) && ordinal==picture_count)){
    CHECK(status==0);CHECK(decoder_closes==1 && scratch_frees==1);CHECK(!owned[0]&&!owned[1]&&!owned[2]&&!owned[3]);return 0;
   }
   CHECK(status==0x200);
-  CHECK(memory[vm_read32(0x4600)]==ordinal);
-  CHECK(vm_read64(0x4610)==(ordinal<179?90000+uint64_t(ordinal-1)*3003:uint64_t(INT64_MIN)));
+  CHECK(memory[vm_read32(0x4600)]==uint8_t(ordinal));
+  CHECK(vm_read64(0x4610)==(ordinal<picture_count?90000+uint64_t(ordinal-1)*3003:uint64_t(INT64_MIN)));
   uint32_t repeated=call(0x0247C69E,0x1800,0x4600);
-  if(repeated==0){CHECK((is_mode("unknown-nonterminal") && ordinal==14) || (is_mode("truncated") && ordinal==69) || (is_mode("drain-failure") && ordinal==178));CHECK(decoder_closes==1 && scratch_frees==1);return 0;}
+  if(repeated==0){CHECK((is_mode("unknown-nonterminal") && ordinal==14) || ((is_mode("truncated") || is_mode("intro-truncated")) && ordinal==69) || ((is_mode("drain-failure") || is_mode("intro-drain-failure")) && ordinal==picture_count-1));CHECK(decoder_closes==1 && scratch_frees==1);return 0;}
   CHECK(repeated==0x100);
  }
  CHECK(rsx_picture_capture_command(0x7000,0x6000,0,0)==1);
@@ -227,12 +236,17 @@ int main(int argc,char**argv) {
  CHECK(rsx_picture_data(captured,0,0,3686400)[0]==1);rsx_picture_release(captured);
  CHECK(events.empty());
  if(is_mode("delayed-final")){CHECK(call(0x0247C69E,0x1800,0x4600)==0x100);CHECK(events.empty());}
- fake_clock=5000000+179ULL*1001000/30-1+(is_mode("delayed-final")?250000:0);
+ fake_clock=test_anchor+uint64_t(picture_count)*1001000/30-1+(is_mode("delayed-final")?250000:0);
  CHECK(call(0x0247C69E,0x1800,0x4600)==0x100);CHECK(events.empty());
  fake_clock+=1;CHECK(call(0x0247C69E,0x1800,0x4600)==0);
  CHECK(events.size()==2 && events[0].major==3 && events[0].arg0==7 && events[1].arg0==4);
  CHECK(decoder_closes==1 && scratch_frees==1 && frame_frees==allocations+(is_mode("partial-three")?2:3));
  CHECK(!owned[0]&&!owned[1]&&!owned[2]&&!owned[3]);
  CHECK(rsx_picture_bind_descriptor(0x6000,0)==1);CHECK(rsx_picture_live_count()==0 && rsx_picture_ready());
- std::printf("%u timed playback checks PASS, 179 pictures, true drain and final duration\n",checks);return 0;
+ CHECK(call(0x85BEFFCC,0x1000,0x87654321)==0);
+ CHECK(call(0xFC839BD4,0x1000,active_desc)==0);
+ events.clear();allocations=frame_frees=decoder_closes=scratch_frees=0;
+ fake_clock+=1000000;
+ }
+ std::printf("%u timed playback checks PASS, %u pictures, true drain, final duration and close\n",checks,picture_count);return 0;
 }
