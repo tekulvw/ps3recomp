@@ -82,7 +82,7 @@ static s32 sail_audio_start(u32 player,SailDescriptor* d,u64 offset,u64 length,u
     }
     h->scratch=(u32)result;h->buffer=h->scratch+128;memset(vm_base+h->scratch,0,size);
     /* Packed BE float PCM, sample count and sample rate from actual decoder. */
-    const u8 format[24]={1,(u8)pcm.channels,1,0,0,0,0xbb,0x80,0,0,0,(u8)(pcm.channels==6?9:2),0};
+    const u8 format[24]={1,(u8)pcm.channels,8,0,0,0,0xbb,0x80,0,0,0,(u8)(pcm.channels==6?9:2),0};
     memcpy(a->format,format,24);memset(a->format+12,0xff,12);memcpy(vm_base+h->scratch,a->format,24);
     sail_sound_lock();a->pcm=pcm;sail_sound_unlock();
     rc=sail_held_invoke(h,s_sound_configs[i].callbacks[0],s_sound_configs[i].arg,0,0,0,&result);
