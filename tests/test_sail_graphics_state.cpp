@@ -99,14 +99,14 @@ int main() {
  CHECK(config.has_preferred==1);
  for(unsigned i=0;i<5;++i)CHECK(config.callbacks[i]==0x3000+i*12);
  for(unsigned i=0;i<32;++i)CHECK(config.preferred[i]==i+1);
- CHECK(call(FMT,0x1000,0,0x2000)==NA);
+ CHECK(call(FMT,0x1000,0x2000)==NA);
  CHECK(fill_is(0x2000,32,0xA5)); // preferred bytes never masquerade as actual format
- CHECK(call(FMT,0x1000,0,0xFFF0)==ARG);
+ CHECK(call(FMT,0x1000,0xFFF0)==ARG);
  CHECK(call(0x24F4E900,0x5000)==0); // PlayerDestroy
  CHECK(call(BIND,0x6000,0,0x1000)==0); // destruction releases association
  CHECK(call(FINAL,0x1000)==0);
  CHECK(sail_graphics_config_for_player(0x6000,&config)==NA);
- CHECK(call(FMT,0x1000,0,0x2000)==STATE);
+ CHECK(call(FMT,0x1000,0x2000)==STATE);
  CHECK(call(INIT,0x1000)==0);
  CHECK(call(BIND,0x6000,0,0x1000)==0);
  if(ps3_hle_has(0x18B4629D)) {
@@ -115,6 +115,6 @@ int main() {
    CHECK(call(BIND,0x5000,0,0x1000)==0);
  }
  CHECK(call(0xF220E64F,0)==0);
- CHECK(call(FMT,0x1000,0,0x2000)==STATE);
+ CHECK(call(FMT,0x1000,0x2000)==STATE);
  std::printf("%u graphics callback and format checks PASS\n",checks);return 0;
 }
