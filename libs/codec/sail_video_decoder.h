@@ -6,17 +6,26 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-enum { SAIL_VIDEO_OK=0, SAIL_VIDEO_UNAVAILABLE=-1, SAIL_VIDEO_INVALID=-2,
+enum { SAIL_VIDEO_EOF=1, SAIL_VIDEO_OK=0, SAIL_VIDEO_UNAVAILABLE=-1, SAIL_VIDEO_INVALID=-2,
        SAIL_VIDEO_IO=-3, SAIL_VIDEO_DECODE=-4, SAIL_VIDEO_NOT_FOUND=-5,
        SAIL_VIDEO_LIMIT=-6, SAIL_VIDEO_ABI=-7 };
 typedef struct SailVideoFrame {
     uint8_t* rgba;
     uint32_t width, height, pitch, ordinal;
-    int64_t pts;
+    int64_t pts, duration;
     int pts_valid, time_base_num, time_base_den;
     int rate_num, rate_den, colorspace, color_range, interlaced;
 } SailVideoFrame;
+#define SAIL_VIDEO_HAS_STREAMING 1
+typedef struct SailVideoDecoder SailVideoDecoder;
 int sail_video_available(void);
+/* Borrow validated FILE; close restores original position and never fclose.
+ * next returns one picture (OK), verified demux+decoder drain (EOF), or error.
+ * Caller releases every picture before reusing its zeroed output record. */
+int sail_video_open(FILE* file, uint64_t offset, uint64_t length,
+                    unsigned stream_id, SailVideoDecoder** decoder);
+int sail_video_next(SailVideoDecoder* decoder, SailVideoFrame* out);
+void sail_video_close(SailVideoDecoder* decoder);
 /* Payload bounds refer to an already validated local file. Only MPEG-2 PES
  * stream ids 0x1E0..0x1EF are accepted. Ordinal is one-based, <=2000.
  * Output must be zero-initialized; failure leaves it zero. No network I/O. */
