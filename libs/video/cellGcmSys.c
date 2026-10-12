@@ -1282,6 +1282,154 @@ static void gcm_checked_ref_fail(const char* why, u32 io)
     if (!atomic_exchange(&s_checked_ref_failed, 1))
         fprintf(stderr, "[gcm checked REF] failed reason=%s io=%08X; reclamation frozen\n", why, io);
 }
+/* NV0039 is a distinct FIFO object. In the observed default PS3 binding,
+ * recognize its complete DMA-pair + eight-register copy packet rather than
+ * stealing individual slot-1 methods (0x30c/0x310 are valid NV4097 state).
+ * Explicit SET_OBJECT removes this inference; handles are not class IDs. */
+static struct { u32 in_dma, out_dma, next_io; int active, rebound; } s_nv0039;
+#define NV0039_COPY_MAX (64u * 1024u * 1024u)
+
+static void nv0039_fail(const char* why)
+{
+    static unsigned warned;
+    if (warned++ < 16)
+        fprintf(stderr,"[NV0039] skipped reason=%s io=%08X; destination unchanged\n",why,s_fifo_getoff);
+    if (gcm_checked_ref_mode()) gcm_checked_ref_fail(why,s_fifo_getoff);
+}
+
+/* Return one actually mapped contiguous piece, never table-first local/main
+ * guessing. A main-memory row may cross non-contiguous physical IO pages. */
+static int nv0039_piece(u32 dma, int64_t offset, u32 left, u32* ea, u32* n)
+{
+    if (!VM_READY || offset < 0 || (u64)offset + left > 0x100000000ull) return 0;
+    if (dma == 0xFEED0000u) {
+        if ((u64)offset + left > s_config.localSize ||
+            (u64)s_config.localAddress + offset + left > 0x100000000ull) return 0;
+        *ea = s_config.localAddress + (u32)offset; *n = left;
+    } else if (dma == 0xFEED0001u) {
+        const u32 off = (u32)offset, page = off >> 20;
+        const u16 mapped = s_ea_address_table[page];
+        if (mapped >= GCM_OFFSET_TABLE_PAGES) return 0;
+        *ea = ((u32)mapped << 20) | (off & 0xFFFFFu);
+        *n = 0x100000u - (off & 0xFFFFFu);
+        if (*n > left) *n = left;
+        if ((u64)*ea + *n > 0x100000000ull ||
+            (ppu_vm_size && (u64)*ea + *n > ppu_vm_size)) return 0;
+    } else return 0;
+    return *ea >= 0x10000u;
+}
+
+static int nv0039_rows_valid(u32 dma,u32 offset,s32 pitch,u32 length,u32 rows)
+{
+    for(u32 row=0;row<rows;row++) {
+        int64_t off=(int64_t)offset+(int64_t)pitch*row;
+        u32 left=length;
+        while(left) {
+            u32 ea,n;
+            if(!nv0039_piece(dma,off,left,&ea,&n)) return 0;
+            off+=n;left-=n;
+        }
+    }
+    return 1;
+}
+
+static void nv0039_copy(const u32 v[8])
+{
+    static u64 sequence;
+    const u64 order=++sequence;
+    const u32 length=v[4], rows=v[5];
+    const s32 in_pitch=(s32)v[2], out_pitch=(s32)v[3];
+    if(v[6]!=0x101u || v[7]!=0) { nv0039_fail("nv0039-unsupported-format-notify");return; }
+    if(!length || !rows) return;
+    const u64 total=(u64)length*rows;
+    if(total>NV0039_COPY_MAX) { nv0039_fail("nv0039-copy-budget");return; }
+    if(!nv0039_rows_valid(s_nv0039.in_dma,v[0],in_pitch,length,rows) ||
+       !nv0039_rows_valid(s_nv0039.out_dma,v[1],out_pitch,length,rows)) {
+        nv0039_fail("nv0039-unmapped-range");return;
+    }
+    u8* snapshot=(u8*)malloc((size_t)total);
+    if(!snapshot) { nv0039_fail("nv0039-allocation");return; }
+    /* Order prior draws before the guest resource mutation. This does not
+     * materialize GPU-only render targets in guest memory. */
+    if(rsx_draw_engine_enabled()) rsx_draw_engine_flush();
+    if(rsx_live_draw_enabled()) rsx_live_draw_flush();
+    for(u32 row=0;row<rows;row++) {
+        int64_t off=(int64_t)v[0]+(int64_t)in_pitch*row;
+        u32 left=length, at=0;
+        while(left) {
+            u32 ea,n;nv0039_piece(s_nv0039.in_dma,off,left,&ea,&n);
+            vm_memcpy_from(snapshot+(size_t)row*length+at,ea,n);
+            off+=n;left-=n;at+=n;
+        }
+    }
+    /* Snapshot all rows first: row-by-row memmove alone loses source rows
+     * when a pitched destination overlaps a later source row. */
+    for(u32 row=0;row<rows;row++) {
+        int64_t off=(int64_t)v[1]+(int64_t)out_pitch*row;
+        u32 left=length, at=0;
+        while(left) {
+            u32 ea,n;nv0039_piece(s_nv0039.out_dma,off,left,&ea,&n);
+            vm_memcpy_to(ea,snapshot+(size_t)row*length+at,n);
+            rsx_draw_engine_mark_guest_dirty(ea,n);
+            off+=n;left-=n;at+=n;
+        }
+    }
+    static int trace_limit=-1;static unsigned traced;
+    if(trace_limit<0) {
+        const char* e=getenv("PS3RECOMP_NV0039_TRACE_LIMIT");
+        long n=e?strtol(e,NULL,10):0;trace_limit=n>256?256:n>0?(int)n:0;
+    }
+    if(traced<(unsigned)trace_limit) {
+        u64 hash=1469598103934665603ull;
+        for(size_t i=0;i<(size_t)total;i++) hash=(hash^snapshot[i])*1099511628211ull;
+        printf("[NV0039] copied sequence=%llu io=%08X src=%08X/%08X pitch=%d dst=%08X/%08X pitch=%d length=%u rows=%u hash=%016llX\n",
+               (unsigned long long)order,s_fifo_getoff,s_nv0039.in_dma,v[0],in_pitch,s_nv0039.out_dma,v[1],out_pitch,
+               length,rows,(unsigned long long)hash);traced++;
+    }
+    free(snapshot);
+}
+
+/* 1 means consumed; 2 means producer has not published the complete packet.
+ * Keep get at the initial DMA header while waiting, including split drains. */
+static int nv0039_packet(u32 w,u32 put)
+{
+    const u32 count=(w>>18)&0x7FFu, method=w&0x1FFCu, subch=(w>>13)&7u;
+    if(subch==1 && method==0 && count==1) { s_nv0039.rebound=1;s_nv0039.active=0;return 0; }
+    if(s_nv0039.rebound) return 0;
+    if(s_nv0039.active && s_fifo_getoff!=s_nv0039.next_io) s_nv0039.active=0;
+    const int pair=subch==1 && method==0x184u && count==2 && !(w&0x40000000u);
+    const int continuation=s_nv0039.active && subch==1 && method==0x30Cu && count==8 && !(w&0x40000000u);
+    const int reset=s_nv0039.active && subch==1 && method==0x310u && count==1 && !(w&0x40000000u);
+    if(!pair && !continuation && !reset) { s_nv0039.active=0;return 0; }
+    u32 start=s_fifo_getoff, copy=start;
+    if(pair) {
+        /* Only this exact original producer form establishes copy identity. */
+        if(start<put && (u64)start+16>put) return 2;
+        u32 a=gcm_io2ea(start+4), b=gcm_io2ea(start+8), h=gcm_io2ea(start+12);
+        if(!a||!b||!h) return 0;
+        u32 in=vm_read32(a),out=vm_read32(b),next=vm_read32(h);
+        if(next!=0x0020230Cu) return 0;
+        s_nv0039.in_dma=in;s_nv0039.out_dma=out;copy=start+12;
+    }
+    const u32 words=reset?1u:8u;
+    const u64 end=(u64)copy+4+words*4;
+    if(end>0xFFFFFFFFull) { nv0039_fail("nv0039-packet-range");return 2; }
+    if(start<put && end>put) return 2;
+    u32 v[8]={0};
+    for(u32 i=0;i<words;i++) {
+        u32 ea=gcm_io2ea(copy+4+i*4);
+        if(!ea) { nv0039_fail("nv0039-unmapped-packet");return 2; }
+        v[i]=vm_read32(ea);
+    }
+    if(reset) {
+        s_nv0039.active=0;
+        if(v[0]) return 0; /* Ordinary blend writes remain ordinary writes. */
+    } else { nv0039_copy(v);s_nv0039.active=1; }
+    s_fifo_getoff=(u32)end;
+    s_nv0039.next_io=s_fifo_getoff;
+    return 1;
+}
+
 int cellGcm_checked_reference_ready(void)
 {
     return gcm_checked_ref_mode() && !atomic_load(&s_checked_ref_failed) &&
@@ -1692,6 +1840,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
+    int nv0039_waiting=0;
     while (s_fifo_getoff != put && budget-- > 0) {
         if(gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed))break;
         u32 ea = gcm_io2ea(s_fifo_getoff);
@@ -1726,6 +1875,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
         s_tr_w[s_tr_i % GCM_TRACE_N] = w;
         s_tr_i++;
         u32 type = w >> 29;
+        if ((type != 0 && type != 2) || (w & 3u) == 2u || w == 0x00020000u)
+            s_nv0039.active=0; /* Control flow ends contiguous packet inference. */
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
@@ -1815,6 +1966,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
+            { int transfer=nv0039_packet(w,put);
+              if(transfer==1) continue;
+              if(transfer==2) {
+                  nv0039_waiting=!atomic_load(&s_checked_ref_failed);
+                  why=nv0039_waiting?"nv0039-producer-wait":"nv0039-failed";
+                  break; } }
             if (gcm_checked_ref_mode() && method == 0x50 && (count != 1 || subch != 0 || type != 0)) {
                 gcm_checked_ref_fail("malformed-reference", s_fifo_getoff); break;
             }
@@ -2070,7 +2227,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
       } else burned = 0; }
 
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
+      if(nv0039_waiting) { stuck=0;last=s_fifo_getoff; }
+      else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
@@ -2103,7 +2261,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      *
      * ponytail: append the JUMP at `current` the way the SDK's own callback
      * does, rather than tracking a second copy of the ring's geometry. */
-    if (s_gcm_ctx_out_ea && !gcm_checked_ref_mode()) {
+    if (s_gcm_ctx_out_ea && !gcm_checked_ref_mode() && !nv0039_waiting) {
         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
