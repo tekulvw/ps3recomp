@@ -20,5 +20,5 @@ with tempfile.TemporaryDirectory(prefix="gcm-report-") as tmp:
            "-pthread", "-lm", "-o", str(out)]
     subprocess.run(cmd, check=True, timeout=60)
     
-    for mode in ("held","repeat_wrap","malformed","incomplete","success","failure","rescue","overflow"):
+    for mode in ("park_patch","park_branch","park_wrap","held","repeat_wrap","malformed","incomplete","success","failure","rescue","overflow"):
         subprocess.run([str(out),mode],check=True,timeout=10)
