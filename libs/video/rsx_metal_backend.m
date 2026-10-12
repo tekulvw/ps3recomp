@@ -50,6 +50,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #if !TARGET_OS_IPHONE
 #  import <AppKit/AppKit.h>
+#  import "../input/pad_macos.h"
 #endif
 
 #include <stdatomic.h>
@@ -483,11 +484,13 @@ static int create_window_impl(const char* title)
     s_layer.framebufferOnly = YES;
     s_layer.drawableSize    = CGSizeMake((CGFloat)s_width, (CGFloat)s_height);
 
-    NSView* view = [s_window contentView];
+    NSView* view = [[PS3RecompPadView alloc] initWithFrame:frame];
+    [s_window setContentView:view];
     [view setWantsLayer:YES];
     [view setLayer:s_layer];
 
     [s_window makeKeyAndOrderFront:nil];
+    [s_window makeFirstResponder:view];
     [NSApp activateIgnoringOtherApps:YES];
     return 0;
 }
