@@ -15,7 +15,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="ps3recomp-metal-capture-") as tmp:
         binary = pathlib.Path(tmp) / "test_metal_first_nonblack"
         subprocess.run([
-            "clang", "-fobjc-arc", "-I", "include", "-I", "libs/video",
+            "clang", "-fobjc-arc", "-DPS3RECOMP_DISABLE_NATIVE_OSK", "-I", "include", "-I", "libs/video",
             "libs/video/tests/test_metal_first_nonblack.m",
             "libs/video/rsx_texture_layout.c", "libs/input/pad_macos.m", "-Wl,-dead_strip",
             "-framework", "Metal", "-framework", "Cocoa", "-framework", "QuartzCore",
