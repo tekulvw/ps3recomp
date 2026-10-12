@@ -128,3 +128,6 @@ int main(int argc,char**argv) {
 }
 
 int rsx_draw_engine_checked_ready(void) { return 1; }
+
+/* Backend boundary required by the production guest-memory transfer path. */
+void rsx_draw_engine_mark_guest_dirty(u32 ea,u32 len) { (void)ea; (void)len; }
