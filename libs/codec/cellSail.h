@@ -164,6 +164,7 @@ s32 cellSailGraphicsAdapterFinalize(u32 pSelf);
 s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat);
 s32 cellSailGraphicsAdapterGetFormat(u32 pSelf, u32 pFormat);
 s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo);
+s32 cellSailGraphicsAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTime);
 s32 cellSailGraphicsAdapterUpdateAvSync(u32 pSelf, u32 tag, u64 time);
 
 /* GetFrame writes a 24-byte guest CellSailSoundFrameInfo. No frame is zero;
