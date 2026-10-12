@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-import pathlib,subprocess,tempfile,sys
+import pathlib,subprocess,tempfile,sys,os
+if os.name=='nt':
+ print('SKIP standalone checked engine fixture requires a POSIX compiler');sys.exit(0)
 r=pathlib.Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='rsx-checked-') as tmp:
  out=pathlib.Path(tmp)/'test'
