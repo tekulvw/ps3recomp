@@ -1834,13 +1834,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                * CPU the guest needs. Stop this pass instead; the next one
                * re-reads the word, so a patched jump is still followed. */
               if (tgt == s_fifo_getoff) {
-                  /* Parked. If the title has meanwhile moved `put` somewhere
-                   * else, it has switched to its other segment and left this
-                   * park standing -- it only patches a park when it reuses that
-                   * block. Waiting for a patch that will not come freezes the
-                   * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
-                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                  /* Legacy recovery follows a moved put to avoid abandoned
+                   * parks. A checked stream may be parked while its producer patches
+                   * the next segment, even when put points elsewhere. Preserve
+                   * get and retry next pass; a temporary park is not an error
+                   * and must not permanently disable reference publication. */
+                  if (put != s_fifo_getoff && !gcm_checked_ref_mode()) {
+                      gcm_fifo_dump_around(s_fifo_getoff);
+                      gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
+                  }
                   break;
               }
               s_fifo_getoff = tgt; }
