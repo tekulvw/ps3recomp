@@ -57,6 +57,7 @@ typedef struct {
     u32         maxContention;
     u32         readyCount;
     int         started;       /* its SPU program has been dispatched        */
+    u32         name_ea;       /* taskset workload name, guest string EA */
 } SpursWorkload;
 
 typedef struct {
@@ -813,21 +814,11 @@ s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
  * Taskset
  * =====================================================================*/
 
-s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
-                           u64 args, const u8* priority, u32 maxContention)
+static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
+                                const u8* priority, u32 maxContention,
+                                u32 size, int clear_ls, u32 name_ea)
 {
-    (void)args; (void)priority; (void)maxContention;
-
-    /* Capture the GUEST EAs (raw register values) BEFORE host translation -- the real
-     * BE taskset builder writes to guest memory at these EAs. */
-    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
-    uint32_t spurs_ea   = (uint32_t)(uintptr_t)spurs;
-
-    /* Args arrive as guest effective addresses (ps3_hle_call passes raw guest
-     * register values); translate to host before dereferencing. */
-    taskset = GUEST_PTR(taskset, CellSpursTaskset*);
-
-    if (!spurs || !taskset) {
+    if (!spurs_ea || !taskset_ea) {
         fprintf(stderr, "[cellSpurs] CreateTaskset REJECT null (spurs=0x%08X taskset=0x%08X)\n",
                 spurs_ea, taskset_ea);
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
@@ -846,29 +837,122 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
     for (wid = 0; wid < CELL_SPURS_MAX_WORKLOAD; ++wid)
         if (!s_workloads[wid].in_use) break;
     if (wid == CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_NOMEM;
-    memset(taskset, 0, sizeof(CellSpursTaskset));
+    /* size is the guest ABI size, never sizeof the legacy native host shim.
+     * Clearing that shim left stale TaskInfo slots and a false size field. */
+    memset(vm_base + taskset_ea, 0, size);
 
-    /* Write the REAL big-endian CellSpursTaskset layout (fork Option-B) so the lifted
-     * SPU leaf + spurs_pm_build_context read valid data (the native writes above are
-     * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
+    /* Both generations share the real BE taskset header and TaskInfo prefix. */
     spurs_taskset_init(taskset_ea, spurs_ea, args, wid,
-                       (uint32_t)sizeof(CellSpursTaskset), /*evf1*/0, /*evf2*/0);
+                       size, /*evf1*/0, /*evf2*/0);
+    vm_write8(taskset_ea + CSTS_ENABLE_CLEAR_LS, clear_ls > 0);
+    vm_write8(taskset_ea + CSTS_WKL_FLAG_WAIT, 0x80);
     SpursWorkload* w = &s_workloads[wid];
     memset(w, 0, sizeof(*w));
     w->is_taskset = 1;
+    w->pm = (const void*)(uintptr_t)0x200;
+    w->sizePm = 0x1E40;
     w->data = taskset_ea;
     w->spurs_ea = spurs_ea;
+    w->name_ea = name_ea;
+    w->minContention = 8;
+    w->maxContention = maxContention;
+    if (priority) memcpy(w->priority, priority, sizeof(w->priority));
     w->in_use = 1;
+    vm_write64(spurs_ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ, (uintptr_t)w->pm);
     vm_write64(spurs_ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8, taskset_ea);
     vm_write32(spurs_ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x14, wid << 24);
+    vm_write32(spurs_ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x10, w->sizePm);
+    memcpy(vm_base + spurs_ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18,
+           w->priority, sizeof(w->priority));
+    vm_write8(spurs_ea + SPURS_WKL_MINCONT + wid, 8);
+    vm_write8(spurs_ea + SPURS_WKL_MAXCONT + wid, (u8)maxContention);
     *(vm_base + spurs_ea + SPURS_WKL_STATE1 + wid) = 2;
     vm_write32(spurs_ea + SPURS_WKL_ENABLED,
                vm_read32(spurs_ea + SPURS_WKL_ENABLED) | (0x80000000u >> wid));
     g_ydkj_real_taskset_ea = taskset_ea;
 
     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
-    printf("[cellSpurs] CreateTaskset() ea=0x%08X spurs=0x%08X (real BE layout)\n", taskset_ea, spurs_ea);
+    printf("[cellSpurs] CreateTaskset%s() ea=0x%08X spurs=0x%08X size=0x%X (real BE layout)\n",
+           size == CSTS2_STRUCT_END ? "2" : "", taskset_ea, spurs_ea, size);
     return CELL_OK;
+}
+
+s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+                           u64 args, const u8* priority, u32 maxContention)
+{
+    return spurs_create_taskset((u32)(uintptr_t)spurs, (u32)(uintptr_t)taskset,
+        args, GUEST_PTR(priority, const u8*), maxContention, CSTS_STRUCT_END, 0, 0);
+}
+
+/* Taskset2 uses the task facility 0x804109xx. The older Task API macros in
+ * cellSpurs.h predate the BE implementation and encode another facility. Keep
+ * this ABI accurate without changing unrelated legacy API return values. */
+#define TASKSET2_ERROR(code) ((s32)(0x80410900u | (code)))
+static int spurs_guest_range(uint64_t ea, u32 size)
+{
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : UINT64_C(0x100000000);
+    return vm_base && ea <= UINT32_MAX && ea + size <= limit;
+}
+
+s32 _cellSpursTasksetAttribute2Initialize(CellSpursTasksetAttribute2* attr,
+                                         u32 revision)
+{
+    uint64_t ea = (uintptr_t)attr;
+    if (!ea) return TASKSET2_ERROR(0x11);
+    if (ea & 7) return TASKSET2_ERROR(0x10);
+    if (!spurs_guest_range(ea, CSTA2_STRUCT_END)) return TASKSET2_ERROR(0x0D);
+    memset(vm_base + (u32)ea, 0, CSTA2_STRUCT_END);
+    vm_write32((u32)ea + CSTA2_REVISION, revision);
+    memset(vm_base + (u32)ea + CSTA2_PRIORITY, 1, CELL_SPURS_MAX_SPU);
+    vm_write32((u32)ea + CSTA2_MAX_CONTENTION, 8);
+    return CELL_OK;
+}
+
+/* NID 0x4A6465E3; three guest-pointer arguments. NULL attribute is supported
+ * by the SDK and selects the same defaults as Attribute2Initialize(rev=0).
+ * The shared prefix feeds the existing real task worker/PM context builder. */
+s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
+                           const CellSpursTasksetAttribute2* attr)
+{
+    uint64_t se = (uintptr_t)spurs, te = (uintptr_t)taskset, ae = (uintptr_t)attr;
+    u64 args = 0;
+    u32 max_contention = 8, name_ea = 0;
+    int clear_ls = 0;
+    u8 priority[CELL_SPURS_MAX_SPU]; memset(priority, 1, sizeof(priority));
+    if (!se || !te) return TASKSET2_ERROR(0x11);
+    if (((se | te) & 127) || (ae & 7)) return TASKSET2_ERROR(0x10);
+    if (!spurs_guest_range(se, SPURS_INST_SIZE) ||
+        !spurs_guest_range(te, CSTS2_STRUCT_END) ||
+        (ae && !spurs_guest_range(ae, CSTA2_STRUCT_END))) return TASKSET2_ERROR(0x0D);
+    if (!spurs_inst_find((u32)se)) return CELL_SPURS_CORE_ERROR_STAT;
+    /* Taskset2 can belong to an ordinary SPURS instance. SPURS2's separate
+     * 32-workload namespace is not implemented by this registry. */
+    if (vm_read8((u32)se + 0x74) & 0x40) return TASKSET2_ERROR(0x03);
+    if (ae) {
+        u32 ea = (u32)ae;
+        u32 names = vm_read32(ea + CSTA2_TASK_NAME_BUFFER);
+        if (names & 15) return TASKSET2_ERROR(0x10);
+        /* The name-buffer extension has no implemented consumer. Explicitly
+         * reject it rather than claiming to implement generation-2 task names. */
+        if (names) {
+            fprintf(stderr, "[cellSpurs] CreateTaskset2 task name buffer unsupported\n");
+            return TASKSET2_ERROR(0x03);
+        }
+        args = vm_read64(ea + CSTA2_ARGS);
+        memcpy(priority, vm_base + ea + CSTA2_PRIORITY, sizeof(priority));
+        max_contention = vm_read32(ea + CSTA2_MAX_CONTENTION);
+        clear_ls = (s32)vm_read32(ea + CSTA2_ENABLE_CLEAR_LS);
+        name_ea = vm_read32(ea + CSTA2_NAME);
+    }
+    /* Workload registration clamps contention to the hardware SPU limit. */
+    if (max_contention > CELL_SPURS_MAX_SPU) max_contention = CELL_SPURS_MAX_SPU;
+    for (u32 i = 0; i < CELL_SPURS_MAX_SPU; i++)
+        if (priority[i] >= CELL_SPURS_MAX_PRIORITY) return TASKSET2_ERROR(0x02);
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++)
+        if (s_workloads[i].in_use && s_workloads[i].is_taskset && s_workloads[i].data == te)
+            return TASKSET2_ERROR(0x0A);
+    return spurs_create_taskset((u32)se, (u32)te, args, priority,
+        max_contention, CSTS2_STRUCT_END, clear_ls, name_ea);
 }
 
 s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
@@ -3122,7 +3206,9 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
         *(vm_base + base + 0x08 + b) = w->priority[b];           /* priority[8] */
     vm_write32(base + 0x10, (u32)(uintptr_t)w->pm);              /* policyModule (32-bit EA) */
     vm_write32(base + 0x14, w->sizePm);                          /* sizePolicyModule */
-    /* nameClass/nameInstance (0x18/0x1C): not tracked -> left 0 by the zero above. */
+    /* Taskset Attribute2's name is the workload instance name. Other workload
+     * paths currently leave name_ea zero, preserving their previous output. */
+    vm_write32(base + 0x1C, w->name_ea);
 
     u32 se = (u32)spurs_ea;
     *(vm_base + base + 0x20) = *(vm_base + se + SPURS_WKL_CURCONT + wid);  /* contention   */

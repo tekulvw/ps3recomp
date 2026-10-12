@@ -5,7 +5,12 @@ uint8_t* vm_base;
 int main(void) {
     vm_base=calloc(1,0x100000); assert(vm_base);
     s_inst[0].ea=0x1000; s_inst[1].ea=0x3000;
+    memset(vm_base+0xFFFF,0xA5,0x1902);
     assert(cellSpursCreateTaskset((CellSpurs*)0x1000,(CellSpursTaskset*)0x10000,42,NULL,1)==0);
+    assert(vm_read32(0x10000+CSTS_SIZE_FIELD)==0x1900);
+    assert(vm_read64(0x10000+CSTS_EXC_HANDLER)==0);
+    assert(vm_read64(spurs_taskset_taskinfo_ea(0x10000,127)+TI_ELF)==0);
+    assert(vm_base[0x118FF]==0 && vm_base[0xFFFF]==0xA5 && vm_base[0x11900]==0xA5);
     unsigned a=vm_read32(0x10000+CSTS_WID);
     assert(vm_read32(0x1000+SPURS_WKL_ENABLED)&(0x80000000u>>a));
     assert(vm_read64(0x1000+SPURS_WKL_INFO1+32*a+8)==0x10000);
