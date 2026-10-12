@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "np_psnr.h"
 #include "../system/cellSysutil.h"
@@ -21,6 +23,71 @@
 static int  s_np_initialized = 0;
 static int  s_score_initialized = 0;
 static char s_fake_username[SCE_NP_ONLINEID_MAX_LENGTH + 1] = "PS3Player";
+
+#ifdef _WIN32
+#include <windows.h>
+static SRWLOCK s_ticket_lock = SRWLOCK_INIT;
+#define TICKET_LOCK() AcquireSRWLockExclusive(&s_ticket_lock)
+#define TICKET_UNLOCK() ReleaseSRWLockExclusive(&s_ticket_lock)
+#else
+#include <pthread.h>
+static pthread_mutex_t s_ticket_lock = PTHREAD_MUTEX_INITIALIZER;
+#define TICKET_LOCK() pthread_mutex_lock(&s_ticket_lock)
+#define TICKET_UNLOCK() pthread_mutex_unlock(&s_ticket_lock)
+#endif
+static SceNpManagerCallback s_npmgr_cb;
+static void* s_npmgr_cb_arg;
+static char s_local_ticket[16];
+static u32 s_local_ticket_size;
+static int s_ticket_pending, s_ticket_delivering;
+static int s_status_pending, s_manager_delivering;
+static u64 s_np_generation;
+
+static int np_is_initialized(void)
+{
+    TICKET_LOCK(); int initialized = s_np_initialized; TICKET_UNLOCK();
+    return initialized;
+}
+
+static int np_local_ticket_enabled(void)
+{
+    const char* flag = getenv("PS3RECOMP_NP_LOCAL_TICKET");
+    return flag && strcmp(flag, "1") == 0;
+}
+
+/* Strict ASCII identity; reject rather than silently repairing a wrong name. */
+static u32 np_local_account(const char* name, char out[16])
+{
+    u32 n = 0;
+    while (n < 17 && name[n]) {
+        unsigned char c = (unsigned char)name[n];
+        if (n == 16) return 0;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) return 0;
+        out[n++] = (char)c;
+    }
+    return n >= 3 ? n : 0;
+}
+
+static void np_clear_ticket(void)
+{
+    s_ticket_pending = 0; s_local_ticket_size = 0;
+    memset(s_local_ticket, 0, sizeof(s_local_ticket));
+}
+
+static void np_cancel_manager(void)
+{
+    np_clear_ticket(); s_status_pending = 0;
+    s_ticket_delivering = s_manager_delivering = 0;
+    ++s_np_generation;
+}
+
+static int np_local_ticket_available(void)
+{
+    if (np_local_ticket_enabled()) return 1;
+    TICKET_LOCK(); np_clear_ticket(); TICKET_UNLOCK();
+    return 0;
+}
 
 /* ---------------------------------------------------------------------------
  * Configuration
@@ -61,10 +128,11 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
     printf("[sceNp] Init(poolSize=%u, username=\"%s\")\n",
            poolSize, np_psnr_online_id());
 
-    if (s_np_initialized)
-        return SCE_NP_ERROR_ALREADY_INITIALIZED;
-
+    TICKET_LOCK();
+    if (s_np_initialized) { TICKET_UNLOCK(); return SCE_NP_ERROR_ALREADY_INITIALIZED; }
     s_np_initialized = 1;
+    ++s_np_generation;
+    TICKET_UNLOCK();
     return CELL_OK;
 }
 
@@ -72,10 +140,12 @@ s32 sceNpTerm(void)
 {
     printf("[sceNp] Term()\n");
 
-    if (!s_np_initialized)
-        return SCE_NP_ERROR_NOT_INITIALIZED;
-
+    TICKET_LOCK();
+    if (!s_np_initialized) { TICKET_UNLOCK(); return SCE_NP_ERROR_NOT_INITIALIZED; }
     s_np_initialized = 0;
+    s_npmgr_cb = NULL; s_npmgr_cb_arg = NULL;
+    np_cancel_manager();
+    TICKET_UNLOCK();
     return CELL_OK;
 }
 
@@ -83,7 +153,7 @@ s32 sceNpGetNpId(s32 userId, SceNpId* npId)
 {
     (void)userId;
 
-    if (!s_np_initialized)
+    if (!np_is_initialized())
         return SCE_NP_ERROR_NOT_INITIALIZED;
 
     if (!npId)
@@ -103,7 +173,7 @@ s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId)
     onlineId = GUEST_PTR(onlineId, SceNpOnlineId*);
     (void)userId;
 
-    if (!s_np_initialized)
+    if (!np_is_initialized())
         return SCE_NP_ERROR_NOT_INITIALIZED;
 
     if (!onlineId)
@@ -122,7 +192,7 @@ s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName)
     onlineName = GUEST_PTR(onlineName, SceNpOnlineName*);
     (void)userId;
 
-    if (!s_np_initialized)
+    if (!np_is_initialized())
         return SCE_NP_ERROR_NOT_INITIALIZED;
 
     if (!onlineName)
@@ -142,7 +212,7 @@ s32 sceNpGetUserProfile(s32 userId, SceNpUserInfo* userInfo)
     userInfo = GUEST_PTR(userInfo, SceNpUserInfo*);
     (void)userId;
 
-    if (!s_np_initialized)
+    if (!np_is_initialized())
         return SCE_NP_ERROR_NOT_INITIALIZED;
 
     if (!userInfo)
@@ -163,7 +233,7 @@ s32 sceNpGetAccountRegion(s32 userId, u32* region)
 {
     (void)userId;
 
-    if (!s_np_initialized)
+    if (!np_is_initialized())
         return SCE_NP_ERROR_NOT_INITIALIZED;
 
     if (!region)
@@ -180,7 +250,7 @@ s32 sceNpGetAccountAge(s32 userId, s32* age)
 {
     (void)userId;
 
-    if (!s_np_initialized)
+    if (!np_is_initialized())
         return SCE_NP_ERROR_NOT_INITIALIZED;
 
     if (!age)
@@ -193,7 +263,7 @@ s32 sceNpGetAccountAge(s32 userId, s32* age)
 
 s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
 {
-    if (!s_np_initialized)
+    if (!np_is_initialized())
         return SCE_NP_ERROR_NOT_INITIALIZED;
 
     if (!langs)
@@ -218,12 +288,9 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
  * Imported by most online-capable titles.
  * -----------------------------------------------------------------------*/
 
-static SceNpManagerCallback s_npmgr_cb = NULL;
-static void*                s_npmgr_cb_arg = NULL;
-
 s32 sceNpManagerGetStatus(s32* status)
 {
-    if (!s_np_initialized)
+    if (!np_is_initialized())
         return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!status)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
@@ -232,7 +299,8 @@ s32 sceNpManagerGetStatus(s32* status)
      * writes to whatever host address shares that number. Same trap as
      * cellGcmSys had. Tokyo Jungle calls this during its online init. */
     /* Signed in when there is a psnr server to be signed in to. */
-    s32 st = np_psnr_enabled() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
+    int local = np_local_ticket_available();
+    s32 st = (np_psnr_enabled() || local) ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
     vm_write32((uint32_t)(uintptr_t)status, (uint32_t)st);
     { static s32 last = -2;
       if (st != last) printf("[sceNp] ManagerGetStatus() -> %s\n", st < 0 ? "OFFLINE" : "ONLINE");
@@ -242,25 +310,109 @@ s32 sceNpManagerGetStatus(s32* status)
 
 s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
 {
-    if (!s_np_initialized)
-        return SCE_NP_ERROR_NOT_INITIALIZED;
+    TICKET_LOCK();
+    if (!s_np_initialized) { TICKET_UNLOCK(); return SCE_NP_ERROR_NOT_INITIALIZED; }
+    np_cancel_manager();
     s_npmgr_cb     = callback;
     s_npmgr_cb_arg = arg;
+    s_status_pending = callback && (np_psnr_enabled() || np_local_ticket_enabled());
+    TICKET_UNLOCK();
     printf("[sceNp] ManagerRegisterCallback()\n");
-    /* Online: tell the title it is signed in, as the console does once the
-     * manager reaches ONLINE. Delivered on its next cellSysutilCheckCallback. */
-    if (np_psnr_enabled() && callback) {
-        const u64 args[8] = { (u64)(u32)SCE_NP_MANAGER_STATUS_ONLINE, 0,
-                              (u64)(u32)(uintptr_t)arg, 0, 0, 0, 0, 0 };
-        cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)callback, args);
-    }
+    /* Sign-in and ticket notifications share a cancellable registration. */
     return CELL_OK;
 }
 
 s32 sceNpManagerUnregisterCallback(void)
 {
+    TICKET_LOCK();
     s_npmgr_cb     = NULL;
     s_npmgr_cb_arg = NULL;
+    np_cancel_manager();
+    TICKET_UNLOCK();
+    return CELL_OK;
+}
+
+s32 sceNpManagerRequestTicket2(const SceNpId* npId, const SceNpTicketVersion* version,
+    const char* serviceId, const void* cookie, u32 cookieSize,
+    const char* entitlementId, u32 consumedCount)
+{
+    TICKET_LOCK();
+    if (!s_np_initialized) { TICKET_UNLOCK(); return SCE_NP_ERROR_NOT_INITIALIZED; }
+    u64 generation = s_np_generation;
+    TICKET_UNLOCK();
+    if (!npId || !serviceId || cookieSize > 1024 || (cookieSize && !cookie))
+        return SCE_NP_AUTH_EINVALID_ARGUMENT;
+    if (!np_local_ticket_available()) return SCE_NP_ERROR_OFFLINE;
+    /* No cookie/entitlement authority exists in this local provider. */
+    if (cookieSize || entitlementId || consumedCount) return (s32)CELL_ENOSYS;
+    if (version && (vm_read16((u32)(uintptr_t)version) != 2 ||
+                   vm_read16((u32)(uintptr_t)version + 2) != 1))
+        return SCE_NP_AUTH_EINVALID_ARGUMENT;
+    if (!vm_read8((u32)(uintptr_t)serviceId)) return SCE_NP_AUTH_EINVALID_ARGUMENT;
+    const SceNpId* id = GUEST_PTR(npId, const SceNpId*);
+    char requested[16], configured[16];
+    if (id->handle.term) return SCE_NP_AUTH_EINVALID_ARGUMENT;
+    u32 size = np_local_account(id->handle.data, requested);
+    u32 configured_size = np_local_account(np_psnr_online_id(), configured);
+    if (!size || !configured_size) return SCE_NP_AUTH_EINVALID_ARGUMENT;
+    if (size != configured_size || memcmp(requested, configured, size))
+        return SCE_NP_ERROR_DIFFERENT_USER;
+    TICKET_LOCK();
+    if (!s_np_initialized || generation != s_np_generation) {
+        TICKET_UNLOCK(); return SCE_NP_ERROR_NOT_INITIALIZED;
+    }
+    if (!s_npmgr_cb) { TICKET_UNLOCK(); return SCE_NP_ERROR_INVALID_STATE; }
+    if (s_ticket_pending || s_ticket_delivering) { TICKET_UNLOCK(); return SCE_NP_AUTH_EBUSY; }
+    memcpy(s_local_ticket, requested, size); s_local_ticket_size = size;
+    s_ticket_pending = 1;
+    TICKET_UNLOCK();
+    printf("[sceNp] RequestTicket2: local account payload pending (%u bytes, not PSN)\n", size);
+    return CELL_OK;
+}
+
+/* Delivered only on the game's normal sysutil polling thread. Keep the request
+ * busy during guest execution and retain it if no guest dispatcher exists. */
+void ps3_np_ticket_tick(void)
+{
+    TICKET_LOCK();
+    ps3_guest_caller_fn caller = g_ps3_guest_caller;
+    if (!np_local_ticket_enabled()) {
+        np_clear_ticket();
+        if (!np_psnr_enabled()) s_status_pending = 0;
+    }
+    if (!s_np_initialized || (!s_status_pending && !s_ticket_pending) || s_manager_delivering || !s_npmgr_cb || !caller) {
+        TICKET_UNLOCK(); return;
+    }
+    u32 opd = (u32)(uintptr_t)s_npmgr_cb, arg = (u32)(uintptr_t)s_npmgr_cb_arg;
+    u64 generation = s_np_generation;
+    u32 event = s_status_pending ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_EVENT_GOT_TICKET;
+    u32 result = s_status_pending ? 0 : s_local_ticket_size;
+    if (s_status_pending) s_status_pending = 0;
+    else { s_ticket_pending = 0; s_ticket_delivering = 1; }
+    s_manager_delivering = 1;
+    TICKET_UNLOCK();
+    caller(opd, event, result, arg, 0, 0, 0, 0, 0);
+    TICKET_LOCK();
+    if (generation == s_np_generation) s_ticket_delivering = s_manager_delivering = 0;
+    TICKET_UNLOCK();
+}
+
+s32 sceNpManagerGetTicket(void* buffer, u32* bufferSize)
+{
+    if (!np_is_initialized()) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!bufferSize) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (!np_local_ticket_available()) return SCE_NP_ERROR_OFFLINE;
+    TICKET_LOCK();
+    if (!s_np_initialized) { TICKET_UNLOCK(); return SCE_NP_ERROR_NOT_INITIALIZED; }
+    if (!s_local_ticket_size || s_ticket_pending) { TICKET_UNLOCK(); return SCE_NP_ERROR_INVALID_STATE; }
+    u32 size_ea = (u32)(uintptr_t)bufferSize, size = s_local_ticket_size;
+    if (buffer && vm_read32(size_ea) < size) {
+        vm_write32(size_ea, size); TICKET_UNLOCK(); return SCE_NP_ERROR_INSUFFICIENT_BUFFER;
+    }
+    if (buffer) vm_memcpy_to((u32)(uintptr_t)buffer, s_local_ticket, size);
+    vm_write32(size_ea, size);
+    TICKET_UNLOCK();
+    printf("[sceNp] GetTicket: local account payload (%u bytes, not PSN)\n", size);
     return CELL_OK;
 }
 
@@ -274,7 +426,7 @@ s32 sceNpManagerGetAccountAge(s32* age)              { return sceNpGetAccountAge
  * returned OK without writing, and the title read whatever was in its stack. */
 s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age)
 {
-    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!np_is_initialized()) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (isRestricted) vm_write32((u32)(uintptr_t)isRestricted, 0);
     if (age) vm_write32((u32)(uintptr_t)age, 25);
     return CELL_OK;
@@ -282,7 +434,7 @@ s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age)
 
 s32 sceNpManagerGetChatRestrictionFlag(s32* isRestricted)
 {
-    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!np_is_initialized()) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (isRestricted) vm_write32((u32)(uintptr_t)isRestricted, 0);
     return CELL_OK;
 }
@@ -293,7 +445,7 @@ s32 sceNpScoreInit(void)
 {
     if (s_score_initialized)
         return SCE_NP_COMMUNITY_ERROR_ALREADY_INITIALIZED;
-    if (!s_np_initialized)
+    if (!np_is_initialized())
         return SCE_NP_ERROR_NOT_INITIALIZED;
     s_score_initialized = 1;
     return CELL_OK;
@@ -303,7 +455,7 @@ s32 sceNpScoreTerm(void)
 {
     if (!s_score_initialized)
         return SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
-    if (!s_np_initialized)
+    if (!np_is_initialized())
         return SCE_NP_ERROR_NOT_INITIALIZED;
     s_score_initialized = 0;
     return CELL_OK;

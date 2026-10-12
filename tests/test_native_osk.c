@@ -20,6 +20,7 @@ void spu_lockline_unlock(void){}
 void spu_coh_notify_write(uint32_t a){}
 void cellMsgDialog_tick(void){}
 void np_psnr_pump(void){}
+void ps3_np_ticket_tick(void){}
 static void put16(uint32_t a,uint16_t v){v=__builtin_bswap16(v);memcpy(memory+a,&v,2);}
 static OskNativeRequest request; static unsigned opens,closes,events;static uint32_t statuses[100];
 static int available=1;
