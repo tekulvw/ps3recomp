@@ -113,6 +113,7 @@ static int spu_step(spu_context* ctx) {
                   | ((uint32_t)p[m+2] << 8) | p[m+3];
     spu_ins d; spu_decode1(insn, pc, &d);
     uint32_t next = (pc + 4) & 0x3FFFC;
+    int indirect_taken = 0;
 
     switch (d.op) {
     /* immediates / loads */
@@ -313,38 +314,29 @@ static int spu_step(spu_context* ctx) {
     case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
     case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
     case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) next = d.tgt; break;
-    /* bi/iret carry the interrupt enable/disable bits (E = 0x40000 sets
-     * int_enable, D = 0x80000 clears it), effective when the branch is taken,
-     * exactly as the lifter decodes them. */
-    #define SPU_IED_BITS() do { \
-        if (insn & 0x40000u) ctx->int_enable = 1; \
-        else if (insn & 0x80000u) ctx->int_enable = 0; \
-    } while (0)
-    case SPU_bi:   next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); break;
+    case SPU_bi:   indirect_taken = 1; next = PREF(A) & 0x3FFFC; break;
     case SPU_bisl: { uint32_t tg = PREF(A) & 0x3FFFC;   /* read ra BEFORE the link write: rt may alias ra */
-        DST = spu_link((pc + 4) & 0x3FFFC); next = tg; break; }
+        DST = spu_link((pc + 4) & 0x3FFFC); indirect_taken = 1; next = tg; break; }
     case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;   /* branch when an enabled event is pending */
         DST = spu_link((pc + 4) & 0x3FFFC);
         if ((__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
-            next = tg;
-            SPU_IED_BITS(); }   /* E/D effective when taken, like the lift */
+            indirect_taken = 1; next = tg; }   /* E/D effective when taken, like the lift */
         break; }
-    case SPU_iret: next = ctx->srr0 & 0x3FFFC;
+    case SPU_iret: indirect_taken = 1; next = ctx->srr0 & 0x3FFFC;
         /* The handler preserves every register: on a return to the point the
          * interrupt was taken, restore the register file saved there. The
          * lifted dispatch path does this in spu_irq_regs_maybe_restore; an iret
          * executed here has to as well, or the snapshot stays armed and later
          * lands on an unrelated dispatch. */
-        SPU_IED_BITS();
         if (ctx->irq_saved && next == (ctx->irq_resume_pc & SPU_LS_MASK)) {
             memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
             ctx->irq_saved = 0;
         }
         break;
-    case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) next = PREF(A) & 0x3FFFC; break;
+    case SPU_biz:  if (PREF(DST) == 0) { indirect_taken = 1; next = PREF(A) & 0x3FFFC; } break;
+    case SPU_binz: if (PREF(DST) != 0) { indirect_taken = 1; next = PREF(A) & 0x3FFFC; } break;
+    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) { indirect_taken = 1; next = PREF(A) & 0x3FFFC; } break;
+    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) { indirect_taken = 1; next = PREF(A) & 0x3FFFC; } break;
     case SPU_stop: case SPU_stopd:
         ctx->pc = next; ctx->stop_code = (d.op == SPU_stopd) ? 0x3FFFu : (uint32_t)I;   /* stopd carries no code field: RPCS3 reports 0x3FFF */
         ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
@@ -363,6 +355,14 @@ static int spu_step(spu_context* ctx) {
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
                 d.op < SPU_OP_COUNT ? spu_op_name[d.op] : "?", insn, pc);
         ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1;
+    }
+    /* SPU ISA v1.2 pp178-179,181,186-189,251: E/D applies on a taken
+     * indirect branch, including a target equal to fallthrough. E/D=11 is
+     * reserved; this interpreter makes no guarantee for that encoding. */
+    if (indirect_taken) {
+        unsigned ed = (insn >> 18) & 3u;
+        if (ed == 1) ctx->int_enable = 1;
+        else if (ed == 2) ctx->int_enable = 0;
     }
     ctx->pc = next;
     return 0;
