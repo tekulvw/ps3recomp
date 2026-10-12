@@ -91,7 +91,7 @@ int main(int argc, char** argv) { @autoreleasepool {
     assert(report()==CELL_PAD_CTRL_START);
     key(view,NSEventTypeKeyUp,36,0); assert(report()==0);
     key(view,NSEventTypeKeyDown,7,0); key(view,NSEventTypeKeyDown,6,0);
-    key(view,NSEventTypeKeyUp,7,0); assert(report()==CELL_PAD_CTRL_CROSS);
+    key(view,NSEventTypeKeyUp,7,0); assert(report()==CELL_PAD_CTRL_SQUARE);
     key(view,NSEventTypeKeyUp,6,0); assert(report()==0);
     key(view,NSEventTypeKeyDown,36,0); key(view,NSEventTypeKeyDown,76,0);
     key(view,NSEventTypeKeyUp,36,0); assert(report()==CELL_PAD_CTRL_START);
@@ -103,7 +103,7 @@ int main(int argc, char** argv) { @autoreleasepool {
     key(view,NSEventTypeKeyDown,126,0); assert(report()==CELL_PAD_CTRL_UP);
     key(view,NSEventTypeKeyUp,126,0); assert(report()==0);
     key(view,NSEventTypeKeyDown,123,0); assert(report()==CELL_PAD_CTRL_LEFT);
-    assert(vm_read16(0x1000+4+CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X*2)==0);
+    assert(vm_read16(0x1000+4+CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X*2)==128);
     NSWindow* other=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,100,80) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
     [other makeKeyAndOrderFront:nil]; wait_key(other); assert(report()==0);
     key(view,NSEventTypeKeyDown,7,0); assert(report()==0); /* unfocused */
