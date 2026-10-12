@@ -320,7 +320,7 @@ static void stub_color_write(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
     memcpy(g_written.row, rows, w * 4u < sizeof g_written.row ? w * 4u : sizeof g_written.row);
 }
 
-static const rsx_draw_backend g_stub_backend = {
+static rsx_draw_backend g_stub_backend = {
     .user = NULL,
     .init = stub_init,
     .shutdown = stub_shutdown,

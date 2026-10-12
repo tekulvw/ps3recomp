@@ -2206,10 +2206,6 @@ static void release_surfaces(void)
 #define ENG_STAGE_MAX    (384u << 20)
 
 static int s_eng_active;
-/* Certificate for synchronous submissions used by depth readback. */
-static int s_eng_checked_completed;
-/* Owner-thread encoding failures remain sticky until backend reinitialization. */
-static int s_eng_encoding_failed;
 
 static id<MTLTexture> s_eng_obj[ENG_MAX_OBJECTS];
 static u32 s_eng_obj_count;
@@ -2276,6 +2272,33 @@ typedef struct {
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
 static u32 s_eng_rec_count;
 static u32 s_eng_dropped;
+/* Async completion handlers only touch this atomic latch. Reset on teardown. */
+static atomic_int s_eng_checked_failed;
+static int s_eng_checked_completed;
+static void eng_checked_fail(void) { atomic_store(&s_eng_checked_failed, 1); }
+#define PS3RECOMP_METAL_TRACKED_COMPLETION 1
+static NSMutableArray<id<MTLCommandBuffer>>* s_eng_submitted;
+/* Consumer-owned receipts: GPU status is checked directly, without relying
+ * on asynchronous completion-handler delivery ordering. */
+static void eng_check_submissions(int barrier_complete)
+{
+    for(NSUInteger i=[s_eng_submitted count];i>0;i--) {
+        id<MTLCommandBuffer> cb=s_eng_submitted[i-1];
+        MTLCommandBufferStatus status=[cb status];
+        if(status==MTLCommandBufferStatusError || [cb error])eng_checked_fail();
+        if(status==MTLCommandBufferStatusCompleted || status==MTLCommandBufferStatusError)
+            [s_eng_submitted removeObjectAtIndex:i-1];
+        else if(barrier_complete)eng_checked_fail();
+    }
+}
+static void eng_track_submission(id<MTLCommandBuffer> cb)
+{
+    eng_check_submissions(0);
+    if(!s_eng_submitted)s_eng_submitted=[NSMutableArray new];
+    if(!cb || !s_eng_submitted || [s_eng_submitted count]>=64){eng_checked_fail();return;}
+    [s_eng_submitted addObject:cb];
+}
+
 
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
@@ -2541,18 +2564,20 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst);
 
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
+    if(bytes>ENG_STAGE_MAX){eng_checked_fail();return 0;}
     const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
     if ((u64)start + bytes > ENG_STAGE_MAX) {
         /* Submit and wait rather than drop the rest of the frame; everything
          * already recorded has been encoded, so the arena is free again. */
         eng_encode_and_commit(nil);
+        if(atomic_load(&s_eng_checked_failed))return 0;
         return eng_stage_reserve(bytes, out_off);
     }
     if (start + bytes > s_eng_stage_cap) {
         u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
         while (start + bytes > cap) cap *= 2u;
         u8* n = (u8*)realloc(s_eng_stage, cap);
-        if (!n) return 0;
+        if (!n) {eng_checked_fail();return 0;}
         s_eng_stage = n;
         s_eng_stage_cap = cap;
     }
@@ -2574,7 +2599,6 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
 static int eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
-    s_eng_encoding_failed = 0;
     if (!s_dev) return -1;
     NSError* err = nil;
     s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
@@ -2609,6 +2633,9 @@ static void eng_shutdown(void* user)
     memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
     s_eng_rec_count = 0;
+    atomic_store(&s_eng_checked_failed,0);
+    s_eng_checked_completed=0;
+    s_eng_submitted=nil;
     free(s_eng_stage); s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
     s_eng_helper_lib = nil;
@@ -2619,7 +2646,6 @@ static void eng_shutdown(void* user)
     s_eng_fxaa_pso = nil;
     s_eng_fxaa_tex = nil;
     s_eng_active = 0;
-    s_eng_encoding_failed = 0;
     s_eng_checked_completed = 0;
 }
 
@@ -2629,6 +2655,16 @@ static void eng_submit_and_wait(void* user, u32 reason)
     (void)user;
     s_ft_flush_reason = reason;
     eng_encode_and_commit(nil);
+}
+
+#define PS3RECOMP_METAL_CHECKED_IMPLEMENTATION 1
+static int eng_submit_and_wait_checked(void* user, u32 reason)
+{
+    (void)user; (void)reason;
+    if(atomic_load(&s_eng_checked_failed))return 0;
+    if(!s_dev || !s_queue || s_eng_dropped){eng_checked_fail();return 0;}
+    eng_encode_and_commit(nil);
+    return s_eng_checked_completed && !atomic_load(&s_eng_checked_failed);
 }
 
 /* ---- resources ----------------------------------------------------------- */
@@ -2661,7 +2697,7 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
 {
     (void)user; (void)rows;
     id<MTLTexture> t = eng_obj(handle);
-    if (!t || !src || !row_bytes) return;
+    if (!t || !src || !row_bytes) {eng_checked_fail();return;}
     [t replaceRegion:MTLRegionMake2D(0, 0, w, h)
          mipmapLevel:mip
                slice:face
@@ -2803,7 +2839,7 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
 {
     (void)user;
     if (!eng_obj(depth) || !s_eng_helper_lib) return 0;
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; eng_checked_fail(); return 0; }
     if (!s_eng_depth_pso) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
@@ -3341,7 +3377,7 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
 {
     (void)user;
     if (!vertex_count || !stride) return;
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; eng_checked_fail(); return; }
     u32 vb_off = 0, ib_off = 0;
     if (!eng_stage_copy(vertices, vertex_count * stride, &vb_off)) return;
     if (indices && index_count &&
@@ -3371,7 +3407,7 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
                    ((u32)(rgba[0] * 255.0f + 0.5f) << 16) |
                    ((u32)(rgba[1] * 255.0f + 0.5f) <<  8) |
                     (u32)(rgba[2] * 255.0f + 0.5f);
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; eng_checked_fail(); return; }
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
     r->kind  = ENG_REC_CLEAR_COLOR;
@@ -3384,7 +3420,7 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
                                     float depth_value, u8 stencil)
 {
     (void)user;
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; eng_checked_fail(); return; }
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
     r->kind = ENG_REC_CLEAR_DS;
@@ -3399,9 +3435,9 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
 static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                             id<MTLBuffer> stage)
 {
-    if (!r->pipeline || r->pipeline > s_eng_pipe_count) { s_eng_encoding_failed = 1; return; }
+    if (!stage || !r->pipeline || r->pipeline > s_eng_pipe_count) {eng_checked_fail();return;}
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
-    if (!p->pso) { s_eng_encoding_failed = 1; return; }
+    if (!p->pso || !p->ds) {eng_checked_fail();return;}
     if (s_eng_diag.active) ++s_eng_diag.encoded_draws;
     [enc setRenderPipelineState:p->pso];
     [enc setDepthStencilState:p->ds];
@@ -3417,6 +3453,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     if (r->ps_cb_bytes) [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         id<MTLTexture> t = eng_obj(r->tex[u]);
+        if(r->tex[u] && !t)eng_checked_fail();
         [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
         [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
                                                       : s_default_sampler)
@@ -3424,6 +3461,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     }
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
         id<MTLTexture> t = eng_obj(r->vtex[u]);
+        if(r->vtex[u] && !t)eng_checked_fail();
         [enc setVertexTexture:(t ? t : s_null_tex) atIndex:MTL_VTEX_INDEX(u)];
         [enc setVertexSamplerState:(r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
                                                      : s_default_sampler)
@@ -3522,13 +3560,13 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->depth);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
-            if (!src || !dst || !s_eng_depth_pso) { s_eng_encoding_failed = 1; continue; }
+            if (!src || !dst || !s_eng_depth_pso) {eng_checked_fail();continue;}
             MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture     = dst;
             rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
-            if (!e) { s_eng_encoding_failed = 1; continue; }
+            if (!e) { eng_checked_fail(); continue; }
             s_ft_resolves++;
             [e setRenderPipelineState:s_eng_depth_pso];
             [e setFragmentTexture:src atIndex:0];
@@ -3624,7 +3662,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             tex[attach++] = t;
         }
         id<MTLTexture> zbuf = eng_obj(depth);
-        if (!attach && !zbuf) { s_eng_encoding_failed = 1; if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
+        if (!attach && !zbuf) { eng_checked_fail(); if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
         /* A pipeline always declares the depth attachment, so a draw pass
          * always has to have one; the display's shared buffer is the fallback
          * for a guest that never declared a zeta. */
@@ -3670,7 +3708,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          * named, so a pass that could not bind them all takes its clears and
          * skips those draws rather than encoding a mismatch. */
         if (!enc || attach != nrt) {
-            s_eng_encoding_failed = 1;
+            eng_checked_fail();
             if (enc) [enc endEncoding];
             while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                    eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
@@ -3795,7 +3833,9 @@ static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
  * encoding work. */
 static int eng_encode_and_commit(id<MTLTexture> present_dst)
 {
-    s_eng_checked_completed = 0;
+    s_eng_checked_completed=0;
+    if(!s_dev || !s_queue){eng_checked_fail();return 0;}
+    if(s_eng_dropped)eng_checked_fail();
     @autoreleasepool {
         id<CAMetalDrawable> drawable = nil;
         id<MTLTexture> dst = nil;
@@ -3823,9 +3863,9 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
             stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
                                       options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
-        if (!cb || (s_eng_stage_used && !stage)) {
-            s_eng_encoding_failed = 1;
-            if (windowed_present) dispatch_semaphore_signal(s_inflight);
+        if(!cb || (s_eng_stage_used && !stage)) {
+            eng_checked_fail();
+            if(windowed_present)dispatch_semaphore_signal(s_inflight);
             return 0;
         }
         const uint64_t ft_e0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -3840,9 +3880,10 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
         if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
         if (windowed_present) {
+            eng_track_submission(cb);
             dispatch_semaphore_t sem = s_inflight;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
-                (void)_unused;
+                if([_unused status]!=MTLCommandBufferStatusCompleted || [_unused error])eng_checked_fail();
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];
@@ -3860,8 +3901,9 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
                                 present_dst ? 1u : 0u, w1 - (uint64_t)(gpu_s * 1e9), w1);
             }
             s_eng_checked_completed = [cb status] == MTLCommandBufferStatusCompleted &&
-                                      ![cb error] && !s_eng_dropped && !s_eng_encoding_failed;
-            if (!s_eng_checked_completed) s_eng_encoding_failed = 1;
+                                      ![cb error] && !s_eng_dropped && !atomic_load(&s_eng_checked_failed);
+            if (!s_eng_checked_completed) { eng_checked_fail(); }
+            eng_check_submissions(1);
             /* A faulted command buffer (GPU hang, a bad resource) completes
              * with an error and nothing says so; the next frame then renders
              * on a device that may have been lost. Name it, with its code. */
@@ -4034,7 +4076,7 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                                                         (u32)[src height]);
         if (!snap) return -1;
         eng_encode_and_commit(nil);
-        if (!s_eng_checked_completed) { eng_obj_release(user, snap); return -1; }
+        if (!s_eng_checked_completed || atomic_load(&s_eng_checked_failed)) { eng_obj_release(user, snap); return -1; }
         id<MTLTexture> resolved = eng_obj(snap);
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
@@ -4064,6 +4106,7 @@ static const rsx_draw_backend s_engine_backend = {
     .init                 = eng_init,
     .shutdown             = eng_shutdown,
     .submit_and_wait      = eng_submit_and_wait,
+    .submit_and_wait_checked = eng_submit_and_wait_checked,
     .texture_create       = eng_texture_create,
     .texture_upload       = eng_texture_upload,
     .texture_release      = eng_obj_release,
@@ -4372,7 +4415,7 @@ void rsx_metal_backend_present(void)
         } else {
             dispatch_semaphore_t sem = s_inflight;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
-                (void)_unused;
+                if([_unused status]!=MTLCommandBufferStatusCompleted || [_unused error])eng_checked_fail();
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];        /* no wait: the CPU goes on to the next frame */
