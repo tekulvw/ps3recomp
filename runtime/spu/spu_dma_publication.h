@@ -1,4 +1,4 @@
-/* Opt-in bounded source snapshots for validated outgoing DMA. */
+/* Opt-in bounded snapshots for validated DMA (incoming opt-in). */
 #ifndef SPU_DMA_PUBLICATION_H
 #define SPU_DMA_PUBLICATION_H
 #include "spu_context.h"

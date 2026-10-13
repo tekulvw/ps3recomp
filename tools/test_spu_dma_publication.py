@@ -24,6 +24,24 @@ with tempfile.TemporaryDirectory(prefix='dma-publication-') as tmp:
     lines=run(match)
     assert len(lines)==2 and all('kind=match' in x and 'match_ea=00012020' in x and 'match_offset=32' in x and 'sample_offset=0' in x and '12345678' in x for x in lines),lines
     assert len(run(dict(raw,**match,SPU_DMA_PUBLICATION_LIMIT='3'),'threads'))==3
+    assert run(match,'incoming')==[], 'incoming is disabled by default'
+    assert run(match,'incoming-disabled')==[]
+    incoming=dict(match,SPU_DMA_PUBLICATION_INCOMING='1',SPU_DMA_PUBLICATION_HEADER_WORDS='8')
+    fetched=run(incoming,'incoming')
+    assert len(fetched)==2 and all('direction=get' in x and 'match_ea=00012020' in x and 'header_words=8' in x and 'header=AA000000,AA000001,AA000002,AA000003,AA000004,AA000005,AA000006,AA000007' in x for x in fetched),fetched
+    assert all('12345678' in x for x in fetched), 'snapshot must read copied incoming bytes'
+    assert run(dict(incoming,SPU_DMA_PUBLICATION_INCOMING='0'),'incoming')==[]
+    for bad in ('true','-1','2',''):
+        assert run(dict(incoming,SPU_DMA_PUBLICATION_INCOMING=bad),'incoming')==[]
+    for bad in ('9','-1','garbage','4294967296'):
+        assert run(dict(incoming,SPU_DMA_PUBLICATION_HEADER_WORDS=bad),'incoming')==[]
+    assert all('header_words=0' in x for x in run(dict(match,SPU_DMA_PUBLICATION_HEADER_WORDS='0')))
+    assert len(run(dict(incoming,SPU_DMA_PUBLICATION_LIMIT='1'),'incoming'))==1
+    assert all('header_words=0' in x for x in run(dict(match,SPU_DMA_PUBLICATION_INCOMING='1'),'incoming'))
+    small=run(incoming,'incoming-small')
+    assert len(small)==1 and 'header_words=1 header=12345678 payload=12345678' in small[0],small
+    ending=run({'SPU_DMA_PUBLICATION':'12000-12010','SPU_DMA_PUBLICATION_INCOMING':'1'},'incoming-end')
+    assert len(ending)==1 and 'lsa=3FFF0' in ending[0] and 'words=4' in ending[0],ending
     for bad in ('','garbage','12080-12000','12000-12080junk','100000000-100000004','-1-20','\n12000-12080'):
         assert run({'SPU_DMA_PUBLICATION':bad})==[]
     for option in ('SPU_DMA_PUBLICATION_WORDS','SPU_DMA_PUBLICATION_LIMIT'):
@@ -49,4 +67,4 @@ with tempfile.TemporaryDirectory(prefix='dma-publication-') as tmp:
     assert run(dict(raw,SPU_DMA_PUBLICATION_LIMIT='32769'))==[]
     assert run({'SPU_DMA_PUBLICATION':'12011-12013'})==[]
     assert run({'SPU_DMA_PUBLICATION':'1207C-12080'})[0].endswith('payload=AA00001F')
-print('PASS: actual direct/list PUT bytes unchanged, raw intersection, descriptor match, strict opt-in bounds and concurrent global cap')
+print('PASS: actual direct/list PUT/GET bytes unchanged, raw intersection, descriptor match/header bounds, incoming opt-in, strict configuration and concurrent global cap')
