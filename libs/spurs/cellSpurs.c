@@ -739,6 +739,19 @@ s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
     return CELL_OK;
 }
 
+/* Validate guest backing before forming a host pointer. A zero VM size is
+ * the existing full-address-space convention; mapped native-VA ports can
+ * use a null base with a nonzero VM size. */
+static int spurs_guest_range_valid(u32 ea, u32 bytes)
+{
+    extern u32 ppu_vm_size;
+    u64 end = (u64)ea + bytes;
+    uintptr_t base = (uintptr_t)vm_base;
+    return bytes && (vm_base || ppu_vm_size) && end <= 0x100000000ull &&
+           (!ppu_vm_size || end <= ppu_vm_size) && base <= UINTPTR_MAX - ea &&
+           base + ea <= UINTPTR_MAX - (bytes - 1u);
+}
+
 /* =========================================================================
  * Taskset
  * =====================================================================*/
@@ -770,12 +783,7 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
         return CELL_SPURS_CORE_ERROR_STAT;
     }
 
-    extern u32 ppu_vm_size;
-    u64 end = (u64)taskset_ea + taskset_size;
-    uintptr_t base = (uintptr_t)vm_base;
-    if ((!vm_base && !ppu_vm_size) || end > 0x100000000ull ||
-        (ppu_vm_size && end > ppu_vm_size) || base > UINTPTR_MAX - taskset_ea ||
-        base + taskset_ea > UINTPTR_MAX - (taskset_size - 1u))
+    if (!spurs_guest_range_valid(taskset_ea, taskset_size))
         return (s32)0x8041090Du; /* host backing safety, before writes */
     memset(taskset, 0, taskset_size);
 
@@ -802,7 +810,10 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                         CellSpursTaskset* taskset,
                                         const CellSpursTasksetAttribute* attr)
 {
-    if (!attr) return (s32)0x80410911u;
+    u32 attr_ea = (u32)(uintptr_t)attr;
+    if (!attr_ea) return (s32)0x80410911u;
+    if (attr_ea & 7u) return (s32)0x80410910u;
+    if (!spurs_guest_range_valid(attr_ea, sizeof(*attr))) return (s32)0x8041090Du;
     const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
     u32 size = attr_h->tasksetSize;
     if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
@@ -3257,6 +3268,7 @@ s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32
     if (!ea) return (s32)0x80410911u;
     if (ea & 7u) return (s32)0x80410910u;
     if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
+    if (!spurs_guest_range_valid(ea, sizeof(*attr))) return (s32)0x8041090Du;
     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
     attr->tasksetSize = size;
     return CELL_OK;

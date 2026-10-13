@@ -50,6 +50,10 @@ int main(void) {
     expect((uint32_t)cellSpursTasksetAttributeSetTasksetSize(PTR(CellSpursTasksetAttribute,0x2001),0)==0x80410910u,"alignment precedence");
     expect((uint32_t)cellSpursTasksetAttributeSetTasksetSize(attr,0x2000)==0x80410902u,"unsupported size");
     expect(cellSpursCreateTasksetWithAttribute(spurs,ts,attr)==0 && vm_read32(0x4000+CSTS_SIZE_FIELD)==0x2900,"failed setter preserves size");
+    expect((uint32_t)cellSpursTasksetAttributeSetTasksetSize(PTR(CellSpursTasksetAttribute,0x10000),0x2000)==0x80410902u,"invalid size precedes backing");
+    expect((uint32_t)cellSpursTasksetAttributeSetTasksetSize(PTR(CellSpursTasksetAttribute,0x10000),0x2900)==0x8041090Du,"unbacked attribute setter rejected");
+    expect((uint32_t)cellSpursCreateTasksetWithAttribute(spurs,ts,PTR(CellSpursTasksetAttribute,0xFFF8))==0x8041090Du,"partial attribute read rejected");
+    expect((uint32_t)cellSpursCreateTasksetWithAttribute(spurs,ts,PTR(CellSpursTasksetAttribute,0x2001))==0x80410910u,"creation attribute alignment");
     ppu_vm_size=0x6800;
     memset(memory+0x4000,0xA5,0x2900);
     expect((uint32_t)cellSpursCreateTasksetWithAttribute(spurs,ts,attr)==0x8041090Du,"partial taskset backing rejected");
