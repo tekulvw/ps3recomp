@@ -9,6 +9,8 @@ extern "C" {
 uint32_t spurs_policy_service_identity(const spu_context* context);
 spu_context* spurs_policy_service_acquire(uint32_t id);
 void spurs_policy_service_release(spu_context* context);
+void spurs_policy_service_expect_reply(spu_context* context, int pending);
+int spurs_policy_service_reply_pending(const spu_context* context);
 static inline int spurs_policy_service_is_id(uint32_t id) { return id >= 0x80000000u; }
 #ifdef __cplusplus
 }
