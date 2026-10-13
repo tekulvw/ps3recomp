@@ -46,7 +46,7 @@ SPU_THREAD_LOCAL volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0
  * Each ID owns an actual context; reset/retirement invalidates its generation.
  * References protect PPU operations without acquiring an admission/slot lock. */
 struct PolicyService { uint32_t id; spu_context* ctx; unsigned refs;
-    int retiring; struct PolicyService* next; };
+    int retiring, reply_pending; struct PolicyService* next; };
 static struct PolicyService* s_policy_services;
 static uint32_t s_policy_service_next = 0x80000000u;
 static SRWLOCK s_policy_service_lock = SRWLOCK_INIT;
@@ -79,6 +79,26 @@ void spurs_policy_service_release(spu_context* ctx)
         if (s->ctx == ctx) { if (s->refs) s->refs--;break; }
     WakeAllConditionVariable(&s_policy_service_wake);
     ReleaseSRWLockExclusive(&s_policy_service_lock);
+}
+
+/* Only an actual published service exchange arms the synchronous reply wait.
+ * The channel lock orders arming and the kernel ACK ahead of a PPU reply. */
+void spurs_policy_service_expect_reply(spu_context* ctx, int pending)
+{
+    AcquireSRWLockExclusive(&s_policy_service_lock);
+    for(struct PolicyService* s=s_policy_services;s;s=s->next)
+        if(s->ctx==ctx && !s->retiring){s->reply_pending=pending;break;}
+    ReleaseSRWLockExclusive(&s_policy_service_lock);
+}
+
+int spurs_policy_service_reply_pending(const spu_context* ctx)
+{
+    int pending=0;
+    AcquireSRWLockShared(&s_policy_service_lock);
+    for(struct PolicyService* s=s_policy_services;s;s=s->next)
+        if(s->ctx==ctx && !s->retiring){pending=s->reply_pending;break;}
+    ReleaseSRWLockShared(&s_policy_service_lock);
+    return pending;
 }
 
 static int policy_service_bind(spu_context* ctx)

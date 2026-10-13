@@ -18,6 +18,7 @@
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include "spurs_workload_flag.h"
+#include "spurs_policy_service.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include <stdint.h>
 #include <stdio.h>
@@ -955,7 +956,8 @@ void spu_ch_wake(spu_context* ctx)
 /* Block the calling SPU host thread until `channel` is readable. */
 static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 {
-    if (!yz_ch_block() || spu_ch_ready(ctx, channel)) return;
+    int service_wait = channel == SPU_RdInMbox && spurs_policy_service_reply_pending(ctx);
+    if ((!yz_ch_block() && !service_wait) || spu_ch_ready(ctx, channel)) return;
 
     { static unsigned long bn = 0; unsigned long n = ++bn;
       if (n <= 50 || (n % 512) == 0)

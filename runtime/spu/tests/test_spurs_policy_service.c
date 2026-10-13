@@ -22,6 +22,18 @@ extern u128 spu_rdch(spu_context*,uint32_t);
 extern int (*g_spu_user_event_hook)(spu_context*,uint32_t);
 static uint32_t ids[16];
 static unsigned calls;
+static int delayed_mode, delayed_started, delayed_returned, delayed_early;
+struct Formatter { uint32_t id; };
+static void* formatter(void* arg) {
+    struct Formatter* f=arg;
+    while(!__atomic_load_n(&delayed_started,__ATOMIC_ACQUIRE)) { struct timespec t={0,1000000};nanosleep(&t,NULL); }
+    struct timespec delay={0,30000000};nanosleep(&delay,NULL);
+    delayed_early=__atomic_load_n(&delayed_returned,__ATOMIC_ACQUIRE);
+    ppu_context p={0};p.gpr[3]=f->id;p.gpr[4]=0x200;p.gpr[5]=0x800;p.gpr[6]=4;
+    assert(!sys_spu_thread_read_ls_handler(&p));
+    p.gpr[3]=f->id;p.gpr[4]=0x76543210;assert(!sys_spu_thread_write_spu_mb_handler(&p));
+    return NULL;
+}
 static pthread_mutex_t gate_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gate_cv=PTHREAD_COND_INITIALIZER;
 static int gate_enabled,gate_arrived,gate_release;
@@ -34,6 +46,13 @@ static void policy(spu_context* c) {
     spu_wrch(c,SPU_WrOutIntrMbox,spu_make_preferred_u32(0x01000000));
     assert(captured_queue==77 && captured_event[0]==0xFFFFFFFF53505501ull);
     assert(captured_event[1]==spurs_policy_service_identity(c) && captured_event[3]==off);
+    if(push_result) {
+        assert(!spurs_policy_service_reply_pending(c));
+        assert(spu_rdch(c,SPU_RdInMbox)._u32[0]==CELL_EBUSY);
+        /* No pending service: preserve the existing latched empty-read path. */
+        assert(spu_rdch(c,SPU_RdInMbox)._u32[0]==CELL_EBUSY);
+        g_spurs_pm_exited=1;return;
+    }
     /* Each physical lane has a different result destination for concurrent runs. */
     uint32_t output=0x400+be32(c->ls+0x1c8)*16;
     ppu_context p={0};p.gpr[3]=captured_event[1];p.gpr[4]=off;p.gpr[5]=output;p.gpr[6]=4;
@@ -42,10 +61,23 @@ static void policy(spu_context* c) {
     assert(__atomic_load_n(&vm_result_writes,__ATOMIC_RELAXED)>0);
     assert(guest[output+4]==0x12 && guest[output+5]==0x34 && guest[output+6]==0x56 && guest[output+7]==0x78);
     assert(spu_rdch(c,SPU_RdInMbox)._u32[0]==CELL_OK); /* Kernel enqueue ack is distinct. */
-    p.gpr[3]=captured_event[1];p.gpr[4]=0x76543210;
-    assert(sys_spu_thread_write_spu_mb_handler(&p)==0);
-    assert(spu_channel_has_data(&c->ch_in_mbox));
-    assert(spu_rdch(c,SPU_RdInMbox)._u32[0]==0x76543210);
+    if(delayed_mode) {
+        struct Formatter f={(uint32_t)captured_event[1]};pthread_t worker;
+        assert(!pthread_create(&worker,NULL,formatter,&f));
+        __atomic_store_n(&delayed_started,1,__ATOMIC_RELEASE);
+        uint32_t reply=spu_rdch(c,SPU_RdInMbox)._u32[0];
+        __atomic_store_n(&delayed_returned,1,__ATOMIC_RELEASE);
+        assert(!pthread_join(worker,NULL));
+        if(delayed_early || reply!=0x76543210) {
+            fprintf(stderr,"FAIL: delayed PPU reply bypassed (early=%d reply=%08X)\n",delayed_early,reply);exit(1);
+        }
+    } else {
+        p.gpr[3]=captured_event[1];p.gpr[4]=0x76543210;
+        assert(sys_spu_thread_write_spu_mb_handler(&p)==0);
+        assert(spu_channel_has_data(&c->ch_in_mbox));
+        assert(spu_rdch(c,SPU_RdInMbox)._u32[0]==0x76543210);
+    }
+    assert(!spurs_policy_service_reply_pending(c));
     ids[__atomic_fetch_add(&calls,1,__ATOMIC_RELAXED)]=spurs_policy_service_identity(c);
     assert(c->spu_id==0); /* No change to the existing physical/context ABI. */
     assert(spurs_policy_release_workload(be32(c->ls+0x1c4),be32(c->ls+0x1dc))==-1);
@@ -121,6 +153,12 @@ int main(void) {
     assert(!pthread_join(ta,NULL));
     spurs_policy_release_instance(0x1000);
     assert(!spurs_policy_service_acquire(ids[6]));
+    delayed_mode=1;
+    assert(spu_run_policy_module(policy,77,pm,sizeof pm,0x9000,4,0x3000,0)==0);
+    delayed_mode=0;push_result=1;
+    assert(spu_run_policy_module(policy,77,pm,sizeof pm,0x9000,5,0x3000,0)==0);
+    spurs_policy_release_instance(0x3000);
+    puts("PASS: delayed PPU formatter blocks the actual second RdInMbox until real reply");
     puts("PASS: real PM service / actual LS / separate replies / concurrent identity / referenced retirement and reset");
 }
 

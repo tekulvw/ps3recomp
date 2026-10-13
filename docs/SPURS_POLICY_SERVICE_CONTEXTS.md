@@ -20,6 +20,15 @@ The kernel enqueue acknowledgement and the PPU service reply remain separate
 FIFO words. For service events the mailbox lock covers event publication and
 enqueue acknowledgement, keeping a concurrently arriving PPU reply behind it.
 
+A successfully published service event arms a reply wait in its endpoint. After
+consuming the kernel acknowledgement, an empty `RdInMbox` blocks until the PPU
+actually appends its reply. A failed enqueue disarms it; a full reply mailbox
+returns BUSY and keeps it armed. This scoped wait preserves legacy empty-read
+behavior for contexts with no pending service exchange. It avoids repeating the
+latched acknowledgement as a fabricated formatter result. The delayed-formatter
+fixture uses a separate PPU host thread and verifies the actual second channel
+read cannot finish before that thread queues its real reply.
+
 An unchanged resident identity persists between policy dispatches. A policy/data
 reset retires its old identity, blocks new references, and waits for existing PPU
 operations before clearing local store. Workload removal checks all lane service
