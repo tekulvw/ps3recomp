@@ -15,37 +15,17 @@ unchanged. The existing helper already uses `spu_splat_u16`; the independent
 also replicates 16-bit lanes, while its IL uses signed 32-bit replication and
 its ILHU shifts into the upper half of each word.
 
-## Native evidence motivating the regression
+## Motivation and scope
 
-A retained MAG engine local-store dump from
-`retail-visible-spu-handoff-20261011` identifies a BRB audio job on workload 11,
-SPURS instance `0x01D39500`, queue data `0x02001C00`. It is separate from the
-renderer workload 6 whose completion marker was also being investigated.
+The defect was observed while investigating an interpreted comparison of a
+replicated halfword cookie. A valid cookie can be rejected when ILH places the
+immediate in only the low half of each word. The instruction semantics and the
+synthetic regression below establish that defect independently of any title's
+memory layout.
 
-- Retail engine ELF SHA-256:
-  `0089f0d6d17e48533ce7ff8d943dddd03487b925e7b04a1a055bfb907568694c`.
-- Local-store dump SHA-256:
-  `0bb74cdbdd3b52d18f23ff195071eb384672e3891b7181ddc08873f5203b6fe1`.
-- The entire initialized module at LS `[0x4000,0x26A00)` is byte-identical to
-  the engine ELF slice at file offset `0x019EB200`, guest EA `0x019FB200`.
-  Its `0x22A00` bytes hash to
-  `7593f9d82d2d8e6d7d488d8d8a711fddfb84b99da88e20de41b10d374de85c3f`.
-- LS `0x1EEE0`, original word `0x41DF77D0`, is `ilh $80,0xBEEF`.
-- Actual speaker bytes at LS `0x3CC08` contain `BEEFBEEF`; the captured
-  comparison operand r65 also contains `BEEFBEEF`. Captured r80 instead
-  contains `0000BEEF` in all four words.
-- `ceq` at LS `0x1EEF8` therefore falsely rejects the valid cookie.
-  The guest assertion at `brb_pluginpack_main_ps3_wwsjm-spu.cpp:233` reports
-  `pspk->cookie == brbSpeakers::ChocolateCookie` and bad speakers data.
-- The assertion executes original `stopd` word `0x28000000` at LS `0x1EBA8`.
-  The inherited zero-stop-code adapter path then reports an unresolved branch
-  at the next PC `0x1EBAC`. That diagnostic does not mean the guest branched to
-  a missing function there.
-
-The source defect and captured comparison establish the false audio assertion.
-They do not establish that correcting ILH resolves the renderer's wait or
-produces a rendered frame. No native title execution is part of this branch's
-validation, and no game bytes or captured memory are included in the branch.
+The fixture does not establish native title progression, completed jobs, audio
+output, or rendering. No original title bytes or captured memory are included
+in this branch.
 
 ## Regression and validation
 
