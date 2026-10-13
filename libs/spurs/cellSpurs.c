@@ -814,11 +814,24 @@ s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
  * Taskset
  * =====================================================================*/
 
+/* Validate guest backing before forming a host pointer. A zero VM size is
+ * the existing full-address-space convention; mapped native-VA ports can
+ * use a null base with a nonzero VM size. */
+static int spurs_guest_range_valid(u32 ea, u32 bytes)
+{
+    extern u32 ppu_vm_size;
+    u64 end = (u64)ea + bytes;
+    uintptr_t base = (uintptr_t)vm_base;
+    return bytes && (vm_base || ppu_vm_size) && end <= 0x100000000ull &&
+           (!ppu_vm_size || end <= ppu_vm_size) && base <= UINTPTR_MAX - ea &&
+           base + ea <= UINTPTR_MAX - (bytes - 1u);
+}
+
 static SRWLOCK s_taskset2_management_lock = SRWLOCK_INIT;
 
 static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
                                 const u8* priority, u32 maxContention,
-                                u32 size, int clear_ls, u32 name_ea)
+                                u32 size, int clear_ls, u32 name_ea, int taskset2)
 {
     if (!spurs_ea || !taskset_ea) {
         fprintf(stderr, "[cellSpurs] CreateTaskset REJECT null (spurs=0x%08X taskset=0x%08X)\n",
@@ -832,6 +845,8 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
         return CELL_SPURS_CORE_ERROR_STAT;
     }
 
+    if (!spurs_guest_range_valid(taskset_ea, size)) return (s32)0x8041090Du;
+
     /* Tasksets occupy the same workload namespace as AddWorkload. Queue
      * notifications carry (wid << 8) | taskId and firmware resolves wid via
      * the guest workload info's data field. A hardcoded wid=0 is insufficient. */
@@ -842,7 +857,7 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
     /* No fallible guest operation remains after the valid creation gate. Do
      * not reuse bytes while an earlier generation still has a worker/reference,
      * including one removed by the legacy Taskset destructor. */
-    if (!spu_taskset_lifecycle_create(taskset_ea, size == CSTS2_STRUCT_END))
+    if (!spu_taskset_lifecycle_create(taskset_ea, taskset2))
         return (s32)0x8041090Au;
     /* size is the guest ABI size, never sizeof the legacy native host shim.
      * Clearing that shim left stale TaskInfo slots and a false size field. */
@@ -880,7 +895,7 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
 
     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
     printf("[cellSpurs] CreateTaskset%s() ea=0x%08X spurs=0x%08X size=0x%X (real BE layout)\n",
-           size == CSTS2_STRUCT_END ? "2" : "", taskset_ea, spurs_ea, size);
+           taskset2 ? "2" : "", taskset_ea, spurs_ea, size);
     return CELL_OK;
 }
 
@@ -888,7 +903,7 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
                            u64 args, const u8* priority, u32 maxContention)
 {
     return spurs_create_taskset((u32)(uintptr_t)spurs, (u32)(uintptr_t)taskset,
-        args, GUEST_PTR(priority, const u8*), maxContention, CSTS_STRUCT_END, 0, 0);
+        args, GUEST_PTR(priority, const u8*), maxContention, CSTS_STRUCT_END, 0, 0, 0);
 }
 
 /* Taskset2 uses the task facility 0x804109xx. The older Task API macros in
@@ -959,7 +974,7 @@ static s32 spurs_create_taskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
         if (s_workloads[i].in_use && s_workloads[i].is_taskset && s_workloads[i].data == te)
             return TASKSET2_ERROR(0x0A);
     return spurs_create_taskset((u32)se, (u32)te, args, priority,
-        max_contention, CSTS2_STRUCT_END, clear_ls, name_ea);
+        max_contention, CSTS2_STRUCT_END, clear_ls, name_ea, 1);
 }
 
 s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
@@ -1023,8 +1038,18 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                         CellSpursTaskset* taskset,
                                         const CellSpursTasksetAttribute* attr)
 {
-    (void)attr;
-    return cellSpursCreateTaskset(spurs, taskset, 0, NULL, 0);
+    u32 attr_ea = (u32)(uintptr_t)attr;
+    if (!attr_ea) return (s32)0x80410911u;
+    if (attr_ea & 7u) return (s32)0x80410910u;
+    if (!spurs_guest_range_valid(attr_ea, sizeof(*attr))) return (s32)0x8041090Du;
+    const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
+    u32 size = attr_h->tasksetSize;
+    if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
+    AcquireSRWLockExclusive(&s_taskset2_management_lock);
+    s32 rc = spurs_create_taskset((u32)(uintptr_t)spurs, (u32)(uintptr_t)taskset,
+                                  0, NULL, 0, size, 0, 0, 0);
+    ReleaseSRWLockExclusive(&s_taskset2_management_lock);
+    return rc;
 }
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
@@ -1072,6 +1097,7 @@ s32 cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr)
     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
     memset(attr, 0, sizeof(CellSpursTasksetAttribute));
     attr->revision = 1;
+    attr->tasksetSize = CSTS_STRUCT_END;
     return CELL_OK;
 }
 
@@ -1404,6 +1430,7 @@ s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
     memset(attr, 0, sizeof(CellSpursTasksetAttribute));
     attr->revision = revision ? revision : 1;
+    attr->tasksetSize = CSTS_STRUCT_END;
     printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u)\n", revision);
     return CELL_OK;
 }
@@ -3528,9 +3555,13 @@ s32 cellSpursGetTasksetInfo(u64 taskset_ea, u64 info_ea)
  * itself), so record the request and accept it. */
 s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size)
 {
-    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-    static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] TasksetAttributeSetTasksetSize(size=%u)\n", size);
+    u32 ea = (u32)(uintptr_t)attr;
+    if (!ea) return (s32)0x80410911u;
+    if (ea & 7u) return (s32)0x80410910u;
+    if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
+    if (!spurs_guest_range_valid(ea, sizeof(*attr))) return (s32)0x8041090Du;
+    attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
+    attr->tasksetSize = size;
     return CELL_OK;
 }
 
