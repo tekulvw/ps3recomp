@@ -1,6 +1,7 @@
 /* Synthetic data only. Exercise the real DMA path; platform/coherence dependencies
  * are inert because the fabricated pages are committed and unreserved. */
 #include "spu_dma.h"
+#include "spu_dma_publication_impl.h"
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
