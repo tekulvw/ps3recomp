@@ -41,3 +41,7 @@ The unchanged parent fails 26 checks; the change passes all 126 at both default
 optimization and `-O2`. The existing complete draw-engine suite also passes.
 This is independent of the Metal depth-readback change and requires no GPU or
 original game data.
+
+The isolated native port also passes all 126 checks with undefined-behavior
+sanitization enabled (`-O1 -fsanitize=undefined -fno-sanitize-recover=all`).
+Its identical fixture fails 26 checks against the unchanged native parent.
