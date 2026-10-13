@@ -137,6 +137,7 @@ static int control_case(int enabled){
 }
 
 int main(int argc,char** argv){
+ assert(!osk_native_has_ui_result(0));
  if(argc==2 && !strcmp(argv[1],"control"))return control_case(1);
  if(argc==2 && !strcmp(argv[1],"control-off"))return control_case(0);
  if(argc==2)return initial_text_case(argv[1]);
@@ -150,26 +151,26 @@ int main(int argc,char** argv){
  assert(load()==(int32_t)0x8002B105);
  g_ps3_guest_caller=cb;assert(!cellSysutilRegisterCallback(1,(void*)0x3000,(void*)0xDEAD));
  cellSysutilCheckCallback();assert(events==0); // no fabricated loaded or completion
- osk_native_did_open(request.token);assert(events==0);
+ osk_native_did_open(request.token);assert(events==0);assert(!osk_native_has_ui_result(request.token));
  cellSysutilCheckCallback();assert(events==1 && statuses[0]==0x502);
  for(int i=0;i<10;i++)cellSysutilCheckCallback();assert(events==1);
  uint16_t text[]={'P',0x03A9,0xD83D,0xDE80,0};
  pthread_t worker;assert(!pthread_create(&worker,NULL,background_finish,text));assert(!pthread_join(worker,NULL));assert(events==1);
- cellSysutilCheckCallback();assert(events==2 && statuses[1]==0x503);
+ cellSysutilCheckCallback();assert(events==2 && statuses[1]==0x503);assert(osk_native_has_ui_result(request.token));
  result_at(2);assert(!cellOskDialogUnloadAsync((void*)0x1200));
  assert(read32(0x1200)==0 && read32(0x1204)==2);
  assert(read16(0x2200)=='P' && read16(0x2202)==0x03A9 && read16(0x2204)==0 && memory[0x2206]==0xA5);
  assert(events==2);cellSysutilCheckCallback();assert(events==3 && statuses[2]==0x504);
- assert(!load());uint64_t token=request.token;
+ assert(!load());uint64_t token=request.token;assert(!osk_native_has_ui_result(token-1) && !osk_native_has_ui_result(token));
  osk_native_did_open(token-1);cellSysutilCheckCallback();assert(events==3);
  osk_native_did_open(token);cellSysutilCheckCallback();assert(statuses[events-1]==0x502);
  assert(cellOskDialogUnloadAsync((void*)0x1200)==(int32_t)0x8002B105);
- osk_native_did_finish(token,1,NULL,0);cellSysutilCheckCallback();
+ osk_native_did_finish(token,1,NULL,0);cellSysutilCheckCallback();assert(osk_native_has_ui_result(token));
  result_at(32);memory[0x2200]=0xA5;assert(!cellOskDialogUnloadAsync((void*)0x1200));
  assert(read32(0x1200)==1 && memory[0x2200]==0xA5);cellSysutilCheckCallback();
  assert(!load());token=request.token;assert(!cellOskDialogAbort());
  osk_native_did_open(token);osk_native_did_finish(token,0,text,4);
- cellSysutilCheckCallback();assert(statuses[events-1]==0x503);
+ cellSysutilCheckCallback();assert(statuses[events-1]==0x503);assert(!osk_native_has_ui_result(token));
  result_at(32);assert(!cellOskDialogUnloadAsync((void*)0x1200));assert(read32(0x1200)==2);
  cellSysutilCheckCallback();
  available=0;assert(load()==(int32_t)0x8002B503);available=1;

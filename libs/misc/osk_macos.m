@@ -38,12 +38,35 @@ void osk_native_open(const OskNativeRequest* request){
   s_field.frame=NSMakeRect(0,0,360,24);s_field.stringValue=string16(copy.initial);
   s_alert.accessoryView=s_field;
   NSAlert* alert=s_alert;NSTextField* field=s_field;NSWindow* parent=s_parent;
+  /* A user who selects another app/window while this sheet is open owns that
+   * focus choice, even if its key window disappears before completion.
+   * Delayed notifications for a window that is no longer key are ignored. */
+  __block BOOL yielded_focus=NO;
+  NSNotificationCenter* nc=[NSNotificationCenter defaultCenter];
+  id app_focus=[nc addObserverForName:NSApplicationDidResignActiveNotification object:NSApp queue:nil usingBlock:^(NSNotification* n){
+   (void)n;yielded_focus=YES;
+  }];
+  id window_focus=[nc addObserverForName:NSWindowDidBecomeKeyNotification object:nil queue:nil usingBlock:^(NSNotification* n){
+   if(n.object==NSApp.keyWindow && n.object!=parent && n.object!=alert.window)yielded_focus=YES;
+  }];
   [alert beginSheetModalForWindow:parent completionHandler:^(NSModalResponse response){
    NSString* text=field.stringValue;NSUInteger n=MIN(text.length,(NSUInteger)512);
    uint16_t units[513]={0};[text getCharacters:units range:NSMakeRange(0,n)];
    osk_native_did_finish(copy.token,response==NSAlertFirstButtonReturn?0:1,units,(uint32_t)n);
-   if(s_ui_token==copy.token){s_alert=nil;s_field=nil;s_ui_token=0;}
-   if(!parent.attachedSheet)[parent makeFirstResponder:parent.contentView];
+   if(s_ui_token==copy.token){
+    s_alert=nil;s_field=nil;s_ui_token=0;
+    /* AppKit still attaches the finishing sheet during its completion block;
+     * makeKeyWindow is ineffective until that sheet has detached. */
+    dispatch_async(dispatch_get_main_queue(),^{
+     [nc removeObserver:app_focus];[nc removeObserver:window_focus];
+     NSWindow* key=NSApp.keyWindow;
+     if(!yielded_focus && NSApp.isActive && parent==s_parent && atomic_load(&s_available)
+        && parent.isVisible && !parent.attachedSheet && s_ui_token==0
+        && (!key || key==parent || key==alert.window) && osk_native_has_ui_result(copy.token)){
+      [parent makeKeyWindow];[parent makeFirstResponder:parent.contentView];
+     }
+    });
+   }else{[nc removeObserver:app_focus];[nc removeObserver:window_focus];}
   }];
   [alert.window makeFirstResponder:field];
   osk_native_did_open(copy.token);
