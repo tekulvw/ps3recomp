@@ -76,8 +76,8 @@ static uint32_t user_address(uint32_t size, uint32_t alignment)
         if (candidate + size > SYS_MEM_ALLOC_END) return 0;
         uint64_t next = candidate;
         uint64_t injected = VM_HLE_INJECT_BASE;
-        if (candidate < injected + 0x8000u && injected < candidate + size)
-            next = injected + 0x8000u;
+        if (candidate < injected + VM_HLE_INJECT_SIZE && injected < candidate + size)
+            next = injected + VM_HLE_INJECT_SIZE;
         if (candidate < (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE &&
             VM_PPU_TLS_BASE < candidate + size && (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE > next)
             next = (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE;
@@ -307,9 +307,22 @@ static uint32_t mapper_address(uint64_t requested, uint64_t alignment)
         alignment > UINT32_MAX || (alignment & (alignment - 1u))) return 0;
     uint64_t addr = ((uint64_t)s_mapper_bump_ptr + alignment - 1u) & ~(alignment - 1u);
     uint64_t size = (requested + alignment - 1u) & ~(alignment - 1u);
-    uint64_t injected = VM_HLE_INJECT_BASE;
-    if (addr < injected + 0x8000u && injected < addr + size)
-        addr = (injected + 0x8000u + alignment - 1u) & ~(alignment - 1u);
+    /* A reservation owns its entire aligned span. Recheck after every skip:
+     * an alignment adjustment can move it into another runtime-owned window. */
+    const uint64_t reserved[][2] = {
+        { VM_HLE_HEAP_BASE, (uint64_t)VM_HLE_HEAP_BASE + VM_HLE_HEAP_SIZE },
+        { VM_AUDIO_BASE, (uint64_t)VM_AUDIO_BASE + VM_AUDIO_SIZE },
+        { VM_SYS_VM_BASE, (uint64_t)VM_SYS_VM_BASE + VM_SYS_VM_SIZE },
+        { VM_HLE_INJECT_BASE, (uint64_t)VM_HLE_INJECT_BASE + VM_HLE_INJECT_SIZE }
+    };
+    for (;;) {
+        uint64_t next = addr;
+        for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i)
+            if (addr < reserved[i][1] && reserved[i][0] < addr + size &&
+                reserved[i][1] > next) next = reserved[i][1];
+        if (next == addr) break;
+        addr = (next + alignment - 1u) & ~(alignment - 1u);
+    }
     if (!size || addr + size > SYS_MAPPER_END || vm_commit((uint32_t)addr, (uint32_t)size) != CELL_OK)
         return 0;
     s_mapper_bump_ptr = (uint32_t)(addr + size);
