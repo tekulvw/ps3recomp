@@ -16,6 +16,7 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#include "../output_provenance.h"
 #include "spu_coherency.h"
 #include <stdint.h>
 #include <string.h>
@@ -665,6 +666,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 }
             }
         }
+        /* A copy receipt after the real PUT, not a submitted-command trace. */
+        if (ps3_output_trace_claim(2, (uint32_t)ea, size))
+            fprintf(stderr, "[output-provenance] spu copied pc=0x%05X img=%d spu=%u r0=0x%08X lsa=0x%05X ea=0x%08X size=%u r82=%08X r88=%08X r89=%08X\n",
+                (uint32_t)spu->pc & SPU_LS_MASK, spu->image_id, spu->spu_id,
+                spu->gpr[0]._u32[0], lsa, (uint32_t)ea, size,
+                spu->gpr[82]._u32[0], spu->gpr[88]._u32[0], spu->gpr[89]._u32[0]);
         /* Tell whoever is listening where this PUT landed.
          *
          * A title whose SPUs build the RSX command stream never tells libgcm
