@@ -863,13 +863,26 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
      * about to land. If the handler was supposed to fill in the claimed job's
      * EA and did not, the elements read back empty and the transfer is a no-op
      * -- which looks identical to "the pipeline never ran" from the PPU side. */
-    { uint32_t _e = spu->list_stall_elem_lsa[t] & SPU_LS_MASK;
-      fprintf(stderr, "[mfc-list] RESUME-ELEMS dest=0x%05X elems\n0x%05X:",
-              spu->list_stall_dest_lsa[t], _e);
-      for (uint32_t _o = 0; _o < 16 && (_e + _o) + 3 < SPU_LS_SIZE; _o += 4)
-          fprintf(stderr, " %02X%02X%02X%02X", spu->ls[_e+_o], spu->ls[_e+_o+1],
-                  spu->ls[_e+_o+2], spu->ls[_e+_o+3]);
-      fprintf(stderr, "\n"); }
+    { /* First 16 dumps per header call site, shared safely by its workers.
+       * Saturate instead of wrapping the counter back into logging. */
+      static volatile LONG _n = 0;
+      LONG _seen = InterlockedCompareExchange(&_n, 0, 0);
+      int _emit = 0;
+      while (_seen < 16) {
+          LONG _previous = InterlockedCompareExchange(&_n, _seen + 1, _seen);
+          if (_previous == _seen) { _emit = 1; break; }
+          _seen = _previous;
+      }
+      if (_emit) {
+        uint32_t _e = spu->list_stall_elem_lsa[t] & SPU_LS_MASK;
+        fprintf(stderr, "[mfc-list] RESUME-ELEMS dest=0x%05X elems\n0x%05X:",
+                spu->list_stall_dest_lsa[t], _e);
+        for (uint32_t _o = 0; _o < 16 && (_e + _o) + 3 < SPU_LS_SIZE; _o += 4)
+            fprintf(stderr, " %02X%02X%02X%02X", spu->ls[_e+_o], spu->ls[_e+_o+1],
+                    spu->ls[_e+_o+2], spu->ls[_e+_o+3]);
+        fprintf(stderr, "\n");
+      }
+    }
     int rc = mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
                           spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
                           spu->list_stall_cmd[t], t);
