@@ -1464,6 +1464,8 @@ int cellGcm_take_flip_pending_synced(void)
 static u32 s_ref_q[GCM_REF_QLEN];
 static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consumer: the ticker */
 
+#include "gcm_fifo_observer.h"
+
 /* A JUMP/CALL whose target has no IO mapping must not be taken. Taking one
  * teleports the walker into unmapped space, where it can never reach `put`
  * again: the FIFO silently stops being processed, no fences are published, and
@@ -2129,6 +2131,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             break;
         }
         u32 w = vm_read32(ea);
+        gcm_observer_packet(s_fifo_getoff,w,put);
         /* Only remember offsets BELOW put -- those are positions in the
          * ring the title is writing. A park in another region is where the
          * walker gave up, not how far it got through the ring. */
@@ -2227,7 +2230,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_observer_branch(s_fifo_getoff,"unmapped-jump",tgt); gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
                * catches up, and overwrites it when the next segment is
@@ -2236,6 +2239,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                * CPU the guest needs. Stop this pass instead; the next one
                * re-reads the word, so a patched jump is still followed. */
               if (tgt == s_fifo_getoff) {
+                  gcm_observer_branch(s_fifo_getoff,"park",tgt);
                   /* Parked. If the title has meanwhile moved `put` somewhere
                    * else, it has switched to its other segment and left this
                    * park standing -- it only patches a park when it reuses that
@@ -2275,6 +2279,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   }
                   break;
               }
+              gcm_observer_branch(s_fifo_getoff,"jump",tgt);
               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
               s_fifo_getoff = tgt;
               /* get is the RSX's fetch pointer: a title polling it sees the
@@ -2287,12 +2292,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_observer_branch(s_fifo_getoff,"unmapped-call",tgt); gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+              gcm_observer_branch(s_fifo_getoff,"call",tgt);
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
+            gcm_observer_branch(s_fifo_getoff,"return",s_fifo_calloff);
             s_fifo_getoff = s_fifo_calloff;
             s_fifo_calloff = 0;
             continue;
@@ -2581,7 +2588,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         u32 dma = vm_read32(dea);
                         s_report_dma = dma == 0xFEED0000u ? GCM_REPORT_DMA_LOCAL : dma;
                     }
-                    if (m == 0x1800u) gcm_get_report(vm_read32(dea));
+                    if (m == 0x1800u) {
+                        u32 argument=vm_read32(dea);
+                        gcm_observer_event(s_fifo_getoff,"report",argument);
+                        gcm_get_report(argument);
+                    }
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
