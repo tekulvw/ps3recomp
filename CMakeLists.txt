@@ -409,6 +409,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_pc_observer
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_pc_observer.py")
+        add_test(NAME spu_pc_observer_groups
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_pc_observer_groups.py")
         add_test(NAME spu_dma_source_identity
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_source_identity.py")
