@@ -1364,6 +1364,14 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 cube_mask = eng_cube_mask();
     const u32 vtex_mask = eng_vtex_mask();
+    u8 texture_bx2_masks[RSX_DSP_NUM_TEXTURES] = {0};
+    const u32 bx2_units = fixed ? 0 : rsx_fp_texture_expand_units(fp_uc, fp_size);
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        if (!(bx2_units & (1u << u))) continue;
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (t.enabled) texture_bx2_masks[u] = rsx_texture_bx2_mask(t.format, t.remap, t.filter);
+    }
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
     const u32 unnorm_mask = eng_unnorm_units(unnorm_dim);
 
@@ -1387,6 +1395,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         const u32 fp_ctrl_key = fp_ctrl & 0x40u;
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
+        if (bx2_units) key = eng_fnv1a(texture_bx2_masks, sizeof texture_bx2_masks, key);
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
@@ -1417,8 +1426,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
-        fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
-                                          s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        fi = rsx_fp_decompile_buffered_texture_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
+                                          texture_bx2_masks, s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)

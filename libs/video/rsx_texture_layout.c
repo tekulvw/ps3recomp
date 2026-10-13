@@ -332,3 +332,27 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
                            : src2res[s];
     }
 }
+
+u8 rsx_texture_bx2_mask(u32 rsx_fmt, u32 control1, u32 filter)
+{
+    /* Normalized color formats supported by the current decode path.
+     * In particular, floating-point and depth resources are not BX2 color
+     * data. Unsupported formats retain their existing sampling behavior. */
+    switch (rsx_fmt & 0x9Fu) {
+    case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
+    case 0x86: case 0x87: case 0x88: case 0x8B: case 0x8D: case 0x8E: case 0x8F:
+    case 0x97: case 0x9D: case 0x9E: break;
+    default: return 0;
+    }
+    if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;
+    u8 remap[4];
+    rsx_texture_component_remap(control1, rsx_fmt, remap);
+    static const u8 rgba_lane[4] = {3, 0, 1, 2}; /* crossbar fields A,R,G,B */
+    u8 mask = 0;
+    for (u32 i = 0; i < 4; i++) {
+        const u32 src_argb = (control1 >> (2u * i)) & 3u;
+        if (remap[i] < RSX_REMAP_ZERO && !((filter >> (28u + src_argb)) & 1u))
+            mask |= (u8)(1u << rgba_lane[i]);
+    }
+    return mask;
+}
