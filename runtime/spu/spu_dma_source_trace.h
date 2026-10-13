@@ -24,9 +24,10 @@ typedef struct mfc_source_trace_config {
     int enabled;
     volatile LONG ready;
     volatile LONG64 next_ms;
+    volatile LONG64 sequence;
     INIT_ONCE once;
 } mfc_source_trace_config;
-static mfc_source_trace_config mfc_source_trace = {0,0,0,0,0,INIT_ONCE_STATIC_INIT};
+static mfc_source_trace_config mfc_source_trace = {0,0,0,0,0,0,INIT_ONCE_STATIC_INIT};
 
 static BOOL WINAPI mfc_source_trace_init(PINIT_ONCE once, PVOID arg, PVOID* out)
 {
@@ -75,6 +76,14 @@ static inline void mfc_trace_source_f32be(spu_context* spu, uint32_t lsa,
      * per translation unit. Disabled/outside-range PUTs never read the clock. */
     if (now < (unsigned long long)prior || now > 0x7FFFFFFFFFFFFFFFull - 5000) return;
     if (InterlockedCompareExchange64(&mfc_source_trace.next_ms, (LONG64)(now+5000), prior) != prior) return;
+    /* Sequence counts admitted samples across contexts in this translation
+     * unit; no allocation, retained context keys or SPU context ABI changes. */
+    unsigned long long sequence = (unsigned long long)
+        InterlockedIncrement64(&mfc_source_trace.sequence);
+    /* Runtime register words are native scalar values. The interpreter's PREF
+     * and indirect branches use the same lane 0; no LS byte-order conversion. */
+    uint32_t r0 = spu_preferred_u32(&spu->gpr[0]);
+    uint32_t r1 = spu_preferred_u32(&spu->gpr[1]);
     uint32_t finite = 0, nonzero = 0, nonfinite = 0;
     float peak = 0;
     for (uint32_t i = first; i < last; ++i) {
@@ -88,8 +97,9 @@ static inline void mfc_trace_source_f32be(spu_context* spu, uint32_t lsa,
         memcpy(&value, &magnitude, sizeof value);
         if (value > peak) peak = value;
     }
-    fprintf(stderr, "[dma-source-f32be] img=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u offset=%u words=%u finite=%u nonzero=%u nonfinite=%u peak=%.9g\n",
+    fprintf(stderr, "[dma-source-f32be] img=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u offset=%u words=%u finite=%u nonzero=%u nonfinite=%u peak=%.9g ctx=%p r0=0x%08X r1=0x%08X seq=%llu\n",
         spu->image_id, spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
-        first*4, last-first, finite, nonzero, nonfinite, (double)peak);
+        first*4, last-first, finite, nonzero, nonfinite, (double)peak,
+        (void*)spu, r0, r1, sequence);
 }
 #endif
