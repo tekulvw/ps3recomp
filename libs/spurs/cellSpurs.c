@@ -891,6 +891,7 @@ static s32 spurs_create_task(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     u32 bound_taskset_ea = (u32)(uintptr_t)taskset;
     if (exit_container_ea) {
         if (!bound_taskset_ea) return (s32)0x80410911u;
+        if (exit_container_ea & 127u) return (s32)0x80410910u;
         if (!spurs_guest_range_valid(bound_taskset_ea, CSTS_SIZE_FIELD + 4u))
             return (s32)0x8041090Du;
         if (vm_read32(bound_taskset_ea + CSTS_SIZE_FIELD) < 0x2900u)

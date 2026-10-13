@@ -114,6 +114,11 @@ int main(void) {
     expect(cellSpursCreateTaskWithAttribute(ts,PTR(CellSpursTaskId,0x2200),attr)==0,"submission CAS survives concurrent publisher");
     expect(!inject_terminal && vm_read32(0x3020)==15 && vm_read32(0x3028)==37 && vm_read32(0x3024)==0x44445555,"publication preserves terminal flags/result/semaphore");
     expect(dispatched==3,"third task dispatched after intact publication");
+    vm_write64(0x2040,0x3001);
+    ((CellSpursTaskAttribute*)(memory+0x2000))->eaElf=0;
+    expect((uint32_t)cellSpursCreateTaskWithAttribute(ts,PTR(CellSpursTaskId,0x2200),attr)==0x80410910u,"consumer rechecks mutated container alignment");
+    vm_write64(0x2040,0x3000);
+    ((CellSpursTaskAttribute*)(memory+0x2000))->eaElf=0x9000;
     /* Base storage cannot hold exit records; reject before task/container writes. */
     expect(cellSpursCreateTaskset(spurs,ts,0,NULL,0)==0,"base taskset");
     uint8_t before_ts[0x1900], before_container[128];
