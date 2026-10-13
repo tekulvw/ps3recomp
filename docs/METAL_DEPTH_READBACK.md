@@ -47,3 +47,19 @@ Shared-buffer access waits for scheduled GPU writes, as required by
 [Apple's shared-storage documentation](https://developer.apple.com/documentation/metal/mtlresourceoptions/storagemodeshared).
 The texture-to-buffer operation uses
 [Metal's blit encoder](https://developer.apple.com/documentation/metal/mtlblitcommandencoder).
+
+## Encoding failure regression
+
+`test_metal_depth_readback_errors.m` runs the nominal 37 checks, then injects
+nil resolve and pending-clear render encoders and verifies that a completed
+command buffer does not certify skipped rendering. It also tests a clear that
+fails during the engine's preceding `submit_and_wait`, followed by a fresh
+readback submission, plus invalid pipelines and missing attachments.
+All 97 checks verify error returns, the whole output including row padding,
+and temporary snapshot cleanup. Build using the command above, substituting
+this test filename.
+
+Encoding failures remain sticky until backend reinitialization or shutdown.
+The generic certificate marks existing skipped-work paths without replacing
+passes or changing their skip behavior. The native callback checks its existing
+atomic failure certificate in addition to command-buffer completion.

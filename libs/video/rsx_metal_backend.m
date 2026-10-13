@@ -3678,7 +3678,9 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                                                         (u32)[src height]);
         if (!snap) return -1;
         eng_encode_and_commit(nil);
-        if (!s_eng_checked_completed) { eng_obj_release(user, snap); return -1; }
+        if (!s_eng_checked_completed || atomic_load(&s_eng_checked_failed)) {
+            eng_obj_release(user, snap); return -1;
+        }
         id<MTLTexture> resolved = eng_obj(snap);
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
