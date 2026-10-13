@@ -11,6 +11,7 @@
 #include "../rsx_fp_decompiler.h"
 #include "../rsx_shader_msl.h"
 #include "../rsx_test_programs.h"
+#include "rsx_source_saturate_fixture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,8 +31,19 @@ static id<MTLFunction> shader_function(id<MTLDevice> dev, const char* hlsl, int 
         return nil;
     }
     NSError* error = nil;
+    MTLCompileOptions* options = [MTLCompileOptions new];
+#if defined(MAC_OS_VERSION_15_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_15_0
+    if (@available(macOS 15.0, *)) options.mathMode = MTLMathModeSafe;
+    else
+#endif
+    {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+    } /* retain NaN behavior of the production guest shaders */
     id<MTLLibrary> library = [dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
-                                             options:nil error:&error];
+                                             options:options error:&error];
     if (!library) {
         fprintf(stderr, "FAIL Metal compile: %s\n", error.localizedDescription.UTF8String);
         failures++;
@@ -216,6 +228,43 @@ int main(void)
             rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ_IDENT);
             snprintf(name, sizeof name, "%s COL0 preserved", compact ? "compact" : "full");
             draw_case(dev, queue, vs, fp, 16, vertices, constants, texture, slots * 16, name, expected_color);
+        }
+        /* A minimal full-screen program carries the finite test input in TC0. */
+        u8 sat_vp[32];
+        rsx_test_vp_mov_out(sat_vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
+        rsx_test_vp_mov_out(sat_vp + 16, 8, RSX_TEST_VP_SWZ_IDENT, 7, 1);
+        char sat_hlsl[65536];
+        if (rsx_vp_decompile(sat_vp, sizeof sat_vp, sat_hlsl, sizeof sat_hlsl) != 2) return 1;
+        id<MTLFunction> sat_vs = shader_function(dev, sat_hlsl, RSX_SHADER_STAGE_VERTEX);
+        if (!sat_vs) return 1;
+        const struct {
+            const char* name;
+            u32 operand, modifier;
+            int absolute, negate, destination_sat;
+            float input, offset;
+            u8 gray;
+        } cases[] = {
+            {"SAT src0 lower/log", 0,4,0,0,0,-.5f,.125f,32},
+            {"SAT src1 lower/log", 1,4,0,0,0,-.5f,.125f,32},
+            {"SAT src2 lower/log", 2,4,0,0,0,-.5f,.5f,64},
+            {"SAT src0 upper", 0,4,0,0,0,1.5f,-.5f,128},
+            {"SAT before abs/neg src0", 0,4,1,1,0,-.5f,.125f,32},
+            {"SAT before abs/neg src1", 1,4,1,1,0,-.5f,.125f,32},
+            {"unmodified source preserved", 0,0,0,0,0,-.5f,.75f,64},
+            {"unknown modifier preserved", 0,5,0,0,0,-.5f,.75f,64},
+            {"destination SAT preserved", 0,0,0,0,1,1.5f,.125f,255}
+        };
+        for (u32 c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+            for (u32 i = 0; i < 3; i++)
+                for (u32 lane = 0; lane < 4; lane++) verts[i][8][lane] = cases[c].input;
+            id<MTLBuffer> vertices = [dev newBufferWithBytes:verts length:sizeof verts
+                                                   options:MTLResourceStorageModeShared];
+            u8 fp[64];
+            source_saturate_fp(fp, cases[c].operand, cases[c].modifier,
+                cases[c].absolute, cases[c].negate, cases[c].destination_sat, cases[c].offset);
+            const u8 gray[4] = {cases[c].gray,cases[c].gray,cases[c].gray,cases[c].gray};
+            draw_case(dev, queue, sat_vs, fp, sizeof fp, vertices, constants, texture,
+                sizeof verts[0], cases[c].name, gray);
         }
     }
     return failures ? 1 : 0;

@@ -30,6 +30,7 @@
 #include "../rsx_fp_decompiler.h"
 #include "../rsx_shader_msl.h"
 #include "../rsx_test_programs.h"
+#include "rsx_source_saturate_fixture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -300,6 +301,28 @@ int main(int argc, char** argv)
             check("MRT FP MSL", g_msl, "[[color(0)]]");
             check("MRT FP MSL", g_msl, "[[color(1)]]");
         }
+    }
+
+    /* Source SAT (modifier 4) applies before abs/neg; destination SAT is
+     * separate. Modifier 5 remains unchanged rather than guessed at. */
+    for (u32 operand = 0; operand < 3; operand++) {
+        u8 fp[64];
+        source_saturate_fp(fp, operand, 4, 0, 0, 0, .125f);
+        check_count("source SAT FP", rsx_fp_decompile(fp, sizeof fp, 0x40,
+                    g_hlsl, sizeof g_hlsl), 3);
+        check("source SAT HLSL", g_hlsl, "saturate((input.tc0).xxxx)");
+        translate("source SAT FP", RSX_SHADER_STAGE_FRAGMENT);
+    }
+    {
+        u8 fp[64];
+        source_saturate_fp(fp, 0, 4, 1, 1, 0, .125f);
+        rsx_fp_decompile(fp, sizeof fp, 0x40, g_hlsl, sizeof g_hlsl);
+        check("SAT before abs/neg", g_hlsl, "-(abs(saturate((input.tc0).xxxx)))");
+        translate("SAT before abs/neg", RSX_SHADER_STAGE_FRAGMENT);
+        source_saturate_fp(fp, 0, 0, 0, 0, 1, .125f);
+        rsx_fp_decompile(fp, sizeof fp, 0x40, g_hlsl, sizeof g_hlsl);
+        check("destination SAT preserved", g_hlsl, "_v = saturate(_v);");
+        translate("destination SAT", RSX_SHADER_STAGE_FRAGMENT);
     }
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
