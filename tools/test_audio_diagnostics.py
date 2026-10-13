@@ -41,10 +41,12 @@ def main():
             assert len(lines)==4, lines
             assert 'channels=8' in lines[0] and 'blocks=1 nonzero=1' in lines[0], lines
             assert 'peaks=[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]' in lines[0], lines
+            assert 'ring_ridx=0 ring_mask=FFFFFFFF ring_peak=0.9 ring_nonfinite=1' in lines[0], lines
             assert 'mix=[0.5721,0.7279]' in lines[1], lines
             assert 'submit=2 errors=1' in lines[1] and 'queue_frames=256' in lines[1], lines
             assert 'controlled queue failure' in lines[1], lines
             assert 'blocks=1 nonzero=0' in lines[2] and 'peaks=[0,0,0,0,0,0,0,0]' in lines[2], lines
+            assert 'ring_ridx=1 ring_mask=00000000 ring_peak=0 ring_nonfinite=0' in lines[2], lines
             assert 'mix=[0,0]' in lines[3], lines
-        print('PASS: BE channels, downmix, ring clearing, SDL errors, cadence/reset, explicit opt-in')
+        print('PASS: all eight channels/all 32 ring slots, BE peaks, nonfinite accounting, unchanged downmix/consumption, SDL errors, cadence/reset, explicit opt-in')
 if __name__ == '__main__': main()

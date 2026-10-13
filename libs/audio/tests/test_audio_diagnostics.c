@@ -32,20 +32,30 @@ static void put_be_float(float* p,float value) {
 int main(void) {
     mutex_init(&s_audio_mutex);audio_diagnostics_init();s_sdl_audio_dev=7;
     AudioPortSlot* p=&s_ports[0];p->in_use=p->running=1;
-    p->param.nChannel=8;p->param.nBlock=2;p->param.level=1;
-    p->port_addr=0x58000000;p->buffer=calloc(2*256*8,sizeof(float));assert(p->buffer);
+    p->param.nChannel=8;p->param.nBlock=32;p->param.level=1;
+    p->port_addr=0x58000000;p->buffer=calloc(32*256*8,sizeof(float));assert(p->buffer);
     const float samples[8]={0.1f,-0.2f,0.3f,-0.4f,0.5f,-0.6f,0.7f,-0.8f};
     for(unsigned c=0;c<8;c++)put_be_float(p->buffer+c,samples[c]);
+    /* Every unconsumed slot has exactly one populated channel. Rotate through
+     * all eight channels, including slot31/channel7 to exercise the mask's
+     * high bit. None of these samples belongs in this block's stereo mix. */
+    for(unsigned b=1;b<32;b++)put_be_float(p->buffer+b*256*8+(b%8),0.01f*b);
+    put_be_float(p->buffer+31*256*8+7,0.9f);
+    put_be_float(p->buffer+30*256*8+5,NAN);
+    float* future=malloc(31*256*8*sizeof(float));assert(future);
+    memcpy(future,p->buffer+256*8,31*256*8*sizeof(float));
     audio_diagnostics_report(1000000);
     audio_mix_one_block();
     assert(fabsf(s_mix_buffer[0]-(0.1f+0.3f*.707f-0.4f*.5f+0.5f*.5f+0.7f*.3f))<1e-6f);
     assert(fabsf(s_mix_buffer[1]-(-0.2f+0.3f*.707f-0.4f*.5f-0.6f*.5f-0.8f*.3f))<1e-6f);
     for(unsigned i=0;i<256*8;i++)assert(p->buffer[i]==0);
+    assert(!memcmp(future,p->buffer+256*8,31*256*8*sizeof(float)));
     audio_backend_submit(s_mix_buffer,256);assert(calls==1 && queued==2048);
     fail=1;audio_backend_submit(s_mix_buffer,256);assert(calls==2 && queued==2048);
     audio_diagnostics_report(1999999); /* Must not emit early. */
     audio_diagnostics_report(2000000);
+    memset(p->buffer+256*8,0,31*256*8*sizeof(float));
     audio_mix_one_block(); /* An empty block resets the next window to silence. */
     audio_diagnostics_report(3000000);
-    free(p->buffer);mutex_destroy(&s_audio_mutex);puts("PASS real mixer and submission unchanged");return 0;
+    free(future);free(p->buffer);mutex_destroy(&s_audio_mutex);puts("PASS real mixer and submission unchanged");return 0;
 }
