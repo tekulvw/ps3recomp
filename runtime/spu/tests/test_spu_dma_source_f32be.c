@@ -71,6 +71,8 @@ int main(int argc, char** argv)
     }
     memcpy(before, local_store+0x100, sizeof before);
     memset(memory+0x12000, 0x5A, sizeof before);
+    /* A two-byte watched PUT has no complete f32 word and cannot claim the window. */
+    assert(mfc_do_transfer(&s, 0x106, 0x12006, 2, 0x20) == 0);
     assert(mfc_do_transfer(&s, SPU_LS_SIZE + 0x100, 0x12000, 32, 0x20) == 0);
     assert(memcmp(local_store+0x100, before, sizeof before) == 0);
     assert(memcmp(memory+0x12000, before, sizeof before) == 0);
@@ -91,6 +93,7 @@ int main(int argc, char** argv)
     clock_ms = 11000;
     assert(mfc_do_transfer(&s, 0x100, 0x12000, 32, 0x40) == 0);
     assert(mfc_do_transfer(&s, 0x100, 0x13000, 32, 0x20) == 0);
+    assert(mfc_do_transfer(&s, 0x100, 0x12000, 32, 0x20) == 0);
     assert(memcmp(local_store+0x100, before, sizeof before) == 0);
     return 0;
 }
