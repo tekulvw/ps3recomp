@@ -1025,7 +1025,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                 ctx->spu_id, ctx->pc & SPU_LS_MASK, op, channel,
                 ctx->event_status, ctx->event_mask); }
 
-    ctx->status = SPU_STATUS_WAITING_CHANNEL;
+    InterlockedExchange((LONG*)&ctx->status, SPU_STATUS_WAITING_CHANNEL);
     yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
     {
         unsigned long long start = GetTickCount64(), next_hb = 2000;
@@ -1048,7 +1048,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     }
     yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
     if (ft_t0) spu_ft_wait_span(ctx, channel, ft_t0);
-    ctx->status = SPU_STATUS_RUNNING;
+    InterlockedExchange((LONG*)&ctx->status, SPU_STATUS_RUNNING);
 }
 
 /* ===========================================================================
