@@ -14,6 +14,8 @@ static struct {
     uint64_t lo, hi, match_lo, match_hi;
     uint32_t word, words, limit;
     int span, match;
+    int incoming;
+    uint32_t header_words;
 } s_dma_publication = {INIT_ONCE_STATIC_INIT,0,0,0,0,0,0,0,16,128,0,0};
 static int dma_pub_number(const char* s, int base, uint64_t max, uint64_t* out) {
     char* end;
@@ -36,10 +38,17 @@ static BOOL WINAPI dma_pub_init(PINIT_ONCE once,PVOID arg,PVOID* out) {
     const char* word=getenv("SPU_DMA_PUBLICATION_MATCH_WORD");
     const char* words=getenv("SPU_DMA_PUBLICATION_WORDS");
     const char* limit=getenv("SPU_DMA_PUBLICATION_LIMIT");
+    const char* incoming=getenv("SPU_DMA_PUBLICATION_INCOMING");
+    const char* header=getenv("SPU_DMA_PUBLICATION_HEADER_WORDS");
     uint64_t n;
     int valid=1;
     if (words) { valid=dma_pub_number(words,10,16,&n) && n; if(valid) s_dma_publication.words=(uint32_t)n; }
     if (limit) { int ok=dma_pub_number(limit,10,32768,&n) && n; valid=valid&&ok; if(ok) s_dma_publication.limit=(uint32_t)n; }
+    if(incoming) {
+        int ok=!strcmp(incoming,"0") || !strcmp(incoming,"1");
+        valid=valid&&ok; s_dma_publication.incoming=ok && !strcmp(incoming,"1");
+    }
+    if(header) { int ok=dma_pub_number(header,10,8,&n); valid=valid&&ok; if(ok) s_dma_publication.header_words=(uint32_t)n; }
     if(raw) { int ok=dma_pub_range(raw,&s_dma_publication.lo,&s_dma_publication.hi); valid=valid&&ok; s_dma_publication.span=ok; }
     if(range || word) {
         int ok=dma_pub_range(range,&s_dma_publication.match_lo,&s_dma_publication.match_hi) &&
@@ -72,19 +81,27 @@ static void dma_pub_log(const spu_context* s,uint32_t lsa,uint64_t ea,
         uint32_t v=dma_pub_read(s->ls+lsa+(uint32_t)(sample-ea)+i*4);
         used+=(size_t)snprintf(payload+used,sizeof payload-used,"%s%08X",i?",":"",v);
     }
-    fprintf(stderr,"[dma-publication] kind=%s img=%d spu=%u pc=%05X cmd=%02X lsa=%05X ea=%08X size=%u sample_ea=%08X words=%u truncated=%d match_ea=%08X sample_offset=%u match_offset=%u payload=%s\n",
-        kind,s->image_id,s->spu_id,s->pc&SPU_LS_MASK,cmd,lsa,(uint32_t)ea,size,
-        (uint32_t)sample,count,sample+count*4<end,(uint32_t)match,(uint32_t)(sample-ea),match?(uint32_t)(match-ea):0,payload);
+    uint32_t header_words=kind[0]=='m'?s_dma_publication.header_words:0;
+    if(header_words>size/4) header_words=size/4;
+    char header[8*9+1]; size_t header_used=0; header[0]=0;
+    for(uint32_t i=0;i<header_words;i++) {
+        uint32_t v=dma_pub_read(s->ls+lsa+i*4);
+        header_used+=(size_t)snprintf(header+header_used,sizeof header-header_used,"%s%08X",i?",":"",v);
+    }
+    fprintf(stderr,"[dma-publication] kind=%s direction=%s img=%d spu=%u pc=%05X cmd=%02X lsa=%05X ea=%08X size=%u sample_ea=%08X words=%u truncated=%d match_ea=%08X sample_offset=%u match_offset=%u header_words=%u header=%s payload=%s\n",
+        kind,(cmd&0x40)?"get":"put",s->image_id,s->spu_id,s->pc&SPU_LS_MASK,cmd,lsa,(uint32_t)ea,size,
+        (uint32_t)sample,count,sample+count*4<end,(uint32_t)match,(uint32_t)(sample-ea),match?(uint32_t)(match-ea):0,header_words,header,payload);
 }
-/* Only outgoing bytes after core transfer validation. No VM reads, writes,
- * callbacks, locks or transfer changes. Snapshot precedes the original copy. */
+/* Validated PUT: pre-copy source. Opt-in GET: post-copy LS snapshot. No VM
+ * reads, writes, callbacks, locks or transfer changes. */
 void spu_dma_publication_observe(const spu_context* s,uint32_t lsa,uint64_t ea,
     uint32_t size,uint32_t cmd) {
     if(!InterlockedCompareExchange(&s_dma_publication.ready,0,0))
         InitOnceExecuteOnce(&s_dma_publication.once,dma_pub_init,NULL,NULL);
     if(!s_dma_publication.span && !s_dma_publication.match) return;
+    if((cmd&0x40) ? !s_dma_publication.incoming : !(cmd&0x20)) return;
     if(!s || !s->ls || !size || size>16384 || (uint64_t)lsa+size>SPU_LS_SIZE ||
-        ea>0xFFFFFFFFull || ea+size>0x100000000ull || !(cmd&0x20) || (cmd&0x40)) return;
+        ea>0xFFFFFFFFull || ea+size>0x100000000ull) return;
     if((uint32_t)InterlockedCompareExchange(&s_dma_publication.emitted,0,0)>=s_dma_publication.limit) return;
     uint64_t transfer_end=ea+size;
     if(s_dma_publication.span) {

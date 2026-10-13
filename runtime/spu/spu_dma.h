@@ -566,6 +566,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        spu_dma_publication_observe(spu, lsa, ea, size, cmd);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
