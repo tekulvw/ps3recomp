@@ -814,6 +814,8 @@ s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
  * Taskset
  * =====================================================================*/
 
+static SRWLOCK s_taskset2_management_lock = SRWLOCK_INIT;
+
 static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
                                 const u8* priority, u32 maxContention,
                                 u32 size, int clear_ls, u32 name_ea)
@@ -837,6 +839,11 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
     for (wid = 0; wid < CELL_SPURS_MAX_WORKLOAD; ++wid)
         if (!s_workloads[wid].in_use) break;
     if (wid == CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_NOMEM;
+    /* No fallible guest operation remains after the valid creation gate. Do
+     * not reuse bytes while an earlier generation still has a worker/reference,
+     * including one removed by the legacy Taskset destructor. */
+    if (!spu_taskset_lifecycle_create(taskset_ea, size == CSTS2_STRUCT_END))
+        return (s32)0x8041090Au;
     /* size is the guest ABI size, never sizeof the legacy native host shim.
      * Clearing that shim left stale TaskInfo slots and a false size field. */
     memset(vm_base + taskset_ea, 0, size);
@@ -911,7 +918,7 @@ s32 _cellSpursTasksetAttribute2Initialize(CellSpursTasksetAttribute2* attr,
 /* NID 0x4A6465E3; three guest-pointer arguments. NULL attribute is supported
  * by the SDK and selects the same defaults as Attribute2Initialize(rev=0).
  * The shared prefix feeds the existing real task worker/PM context builder. */
-s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
+static s32 spurs_create_taskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
                            const CellSpursTasksetAttribute2* attr)
 {
     uint64_t se = (uintptr_t)spurs, te = (uintptr_t)taskset, ae = (uintptr_t)attr;
@@ -953,6 +960,63 @@ s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
             return TASKSET2_ERROR(0x0A);
     return spurs_create_taskset((u32)se, (u32)te, args, priority,
         max_contention, CSTS2_STRUCT_END, clear_ls, name_ea);
+}
+
+s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
+                           const CellSpursTasksetAttribute2* attr)
+{
+    AcquireSRWLockExclusive(&s_taskset2_management_lock);
+    s32 rc=spurs_create_taskset2(spurs,taskset,attr);
+    ReleaseSRWLockExclusive(&s_taskset2_management_lock);
+    return rc;
+}
+
+/* NID 1EBCF459: one guest Taskset2 pointer. The HLE can safely remove a
+ * never-submitted empty set without firmware event semaphores. Submitted sets
+ * require cooperative Shutdown/Join, which this runtime does not implement;
+ * return TASK_BUSY rather than deleting a detached worker's backing memory. */
+static s32 spurs_destroy_taskset2(CellSpursTaskset2* taskset)
+{
+    uint64_t address=(uintptr_t)taskset;
+    if (!address) return TASKSET2_ERROR(0x11);
+    if (address & 127) return TASKSET2_ERROR(0x10);
+    if (!spurs_guest_range(address,CSTS2_STRUCT_END)) return TASKSET2_ERROR(0x0D);
+    u32 ea=(u32)address, wid=vm_read32(ea+CSTS_WID);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return TASKSET2_ERROR(0x02);
+    if (vm_read32(ea+CSTS_SIZE_FIELD)!=CSTS2_STRUCT_END) return TASKSET2_ERROR(0x0F);
+    /* HLE Create2 owns no LV2 event semaphores. Foreign firmware objects
+     * require the unimplemented shutdown/wait/destroy sequence. */
+    if (vm_read32(ea+CSTS_EVENT_FLAG_ID1) || vm_read32(ea+CSTS_EVENT_FLAG_ID2))
+        return TASKSET2_ERROR(0x03);
+    uint64_t owner=vm_read64(ea+CSTS_SPURS);
+    if (!spurs_guest_range(owner,SPURS_INST_SIZE) || !spurs_inst_find((u32)owner))
+        return TASKSET2_ERROR(0x0F);
+    SpursWorkload* w=&s_workloads[wid];
+    if (!w->in_use || !w->is_taskset || w->data!=ea || w->spurs_ea!=owner)
+        return TASKSET2_ERROR(0x05);
+    /* All six task bitsets must be empty. The host gate is authoritative for
+     * pre-spawn admission and worker tails after task-exit clears these bits. */
+    if (w->started || !spu_taskset_lifecycle_retire_unused(ea)) return TASKSET2_ERROR(0x0A);
+    /* Prepare all owned metadata while the slot is still unavailable. Keep
+     * in_use/owner for RemoveWorkload validation and is_taskset so the kernel
+     * cannot mistake this retiring slot for a runnable policy module. Never
+     * write this slot or its workload info after Remove publishes it free. */
+    vm_write64((u32)owner+SPURS_WKL_INFO1+wid*SPURS_WKL_INFO_SZ+8,0);
+    w->pm=NULL; w->sizePm=0; w->data=0;
+    memset(w->priority,0,sizeof(w->priority));
+    w->minContention=0; w->maxContention=0; w->readyCount=0;
+    w->started=0; w->name_ea=0;
+    s32 rc=cellSpursRemoveWorkload((CellSpurs*)(uintptr_t)owner,wid);
+    if (rc) return TASKSET2_ERROR((u32)rc & 0xFF);
+    vm_write32(ea+CSTS_WID,32); /* firmware invalidates the workload id */
+    return CELL_OK;
+}
+s32 cellSpursDestroyTaskset2(CellSpursTaskset2* taskset)
+{
+    AcquireSRWLockExclusive(&s_taskset2_management_lock);
+    s32 rc=spurs_destroy_taskset2(taskset);
+    ReleaseSRWLockExclusive(&s_taskset2_management_lock);
+    return rc;
 }
 
 s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
@@ -1034,7 +1098,22 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
  * from an EA computed out of r3 = that argument (spu_0003 task main @0x17e70:
  * `wrch $ch18, f(r3.word3)`), so a zero argument makes it GET from EA 0 and
  * stall. lsPattern/argument arrive as guest EAs (generic adapter forwards r3..r10). */
+static s32 spurs_create_task(CellSpursTaskset*, CellSpursTaskId*, void*, void*, u32, u32, u32);
 s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                        void* elf, void* context, u32 sizeContext,
+                        u32 lsPattern_ea, u32 argument_ea)
+{
+    uint64_t address=(uintptr_t)taskset;
+    /* A wide invalid EA must not alias a tracked 32-bit generation. */
+    if (address>UINT32_MAX) return TASKSET2_ERROR(0x0D);
+    int admission=spu_taskset_lifecycle_enter((u32)address);
+    if (admission<0) return TASKSET2_ERROR(0x0F);
+    s32 rc=spurs_create_task(taskset,taskId,elf,context,sizeContext,lsPattern_ea,argument_ea);
+    if (admission>0) spu_taskset_lifecycle_leave((u32)address);
+    return rc;
+}
+
+static s32 spurs_create_task(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         void* elf, void* context, u32 sizeContext,
                         u32 lsPattern_ea, u32 argument_ea)
 {
@@ -2006,12 +2085,17 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
      * are common -- the guest calls it whenever it adds work) does not spawn
      * another copy. */
     const uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
+    AcquireSRWLockExclusive(&s_taskset2_management_lock);
     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
         SpursWorkload* w = &s_workloads[i];
         if (!w->in_use || w->started || w->spurs_ea != spurs_ea) continue;
         if (!w->pm || !w->sizePm) continue;
         const uint8_t* host = GUEST_PTR(w->pm, const uint8_t*);
         if (!host) continue;
+        /* A policy attempt is submission even if no lifted image is found.
+         * Use this workload's actual owner, not the last task's global EA. */
+        int admission=w->is_taskset ? spu_taskset_lifecycle_enter((u32)w->data) : 0;
+        if (admission<0) continue;
         w->started = 1;
         fprintf(stderr, "[cellSpurs] WakeUp: starting workload %u pm=0x%08X size=%u\n",
                 i, (uint32_t)(uintptr_t)w->pm, w->sizePm);
@@ -2020,8 +2104,12 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
          * and running 2 or 4 changes nothing for the title this was written
          * against -- measured, not assumed -- so the conservative reading
          * stands until a title needs otherwise. */
-        spu_workload_dispatch_async(host, w->sizePm, (uint32_t)w->data);
+        if (w->is_taskset)
+            spu_workload_dispatch_async_owned(host,w->sizePm,(uint32_t)w->data,(uint32_t)w->data,0);
+        else spu_workload_dispatch_async(host,w->sizePm,(uint32_t)w->data);
+        if (admission>0) spu_taskset_lifecycle_leave((u32)w->data);
     }
+    ReleaseSRWLockExclusive(&s_taskset2_management_lock);
     return CELL_OK;
 }
 
