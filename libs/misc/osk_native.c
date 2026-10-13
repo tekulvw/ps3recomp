@@ -109,7 +109,7 @@ void osk_native_did_finish(uint64_t token,int32_t result,const uint16_t* text,ui
  unlock();
 }
 int osk_native_has_ui_result(uint64_t token){
- lock();int yes=token==s.token && (s.result==0 || s.result==1)
+ lock();int yes=token && token==s.token && (s.result==0 || s.result==1)
   && (s.state==FINISHED || s.state==UNLOADING || s.state==FREE);unlock();return yes;
 }
 static int32_t result_text(uint32_t ea,int unloading,uint64_t* closing_token){

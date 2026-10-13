@@ -91,6 +91,7 @@ static int initial_text_case(const char* mode){
  printf("Native OSK initial text case %s passed\n",mode);return 0;
 }
 int main(int argc,char** argv){
+ assert(!osk_native_has_ui_result(0));
  if(argc==2)return initial_text_case(argv[1]);
  memset(memory,0xA5,sizeof(memory));
  vm_write32(0x1000,0x2000);vm_write32(0x1004,0x2100);vm_write32(0x1008,32);
