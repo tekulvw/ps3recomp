@@ -25,6 +25,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-observer-') as tmp:
     assert len(boundary)==2 and all('kind=zeros' in x and 'zero_words=4' in x for x in boundary),boundary
     assert 'io=00000000' in boundary[0] and 'end=000000010' in boundary[0] and 'last_put=00000010' in boundary[0],boundary
     assert 'io=00000010' in boundary[1] and 'end=000000020' in boundary[1] and 'first_put=00000020' in boundary[1],boundary
+    assert len(run({"GCM_FIFO_OBSERVE":"0x0-0x40","GCM_FIFO_OBSERVE_LIMIT":"32768"},"zeros"))==3
+    assert run({"GCM_FIFO_OBSERVE":"0x0-0x40","GCM_FIFO_OBSERVE_LIMIT":"32769"},"zeros")==[]
     zeros=run({"GCM_FIFO_OBSERVE":"0x0-0x40"},"zeros")
     assert len(zeros)==3 and 'kind=zeros' in zeros[0] and 'io=00000000' in zeros[0] and 'end=000000020' in zeros[0] and 'zero_words=8' in zeros[0],zeros
     assert run({},"zeros")==[]

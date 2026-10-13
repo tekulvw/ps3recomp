@@ -37,7 +37,7 @@ static void gcm_observer_init(void)
     const char* range=getenv("GCM_FIFO_OBSERVE"); uint64_t lo,hi; char *end,*tail;
     if (!gcm_observer_number(range,&lo,&end) || *end!='-' ||
         !gcm_observer_number(end+1,&hi,&tail) || *tail || lo>=hi || hi>UINT32_MAX ||
-        !gcm_observer_option("GCM_FIFO_OBSERVE_LIMIT",128,4096,&s->limit) ||
+        !gcm_observer_option("GCM_FIFO_OBSERVE_LIMIT",128,32768,&s->limit) ||
         !gcm_observer_option("GCM_FIFO_OBSERVE_WORDS",16,32,&s->words)) return;
     s->lo=(uint32_t)lo; s->hi=(uint32_t)hi; s->enabled=1;
 }
