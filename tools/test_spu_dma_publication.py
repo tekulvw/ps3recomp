@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix='dma-publication-') as tmp:
     assert all('kind=span' in x and 'sample_ea=00012010' in x and 'words=2' in x and 'AA000004,AA000005' in x and 'truncated=1' in x for x in lines),lines
     match={'SPU_DMA_PUBLICATION_MATCH_RANGE':'12000-12080','SPU_DMA_PUBLICATION_MATCH_WORD':'12345678'}
     lines=run(match)
-    assert len(lines)==2 and all('kind=match' in x and 'match_ea=00012020' in x and '12345678' in x for x in lines),lines
+    assert len(lines)==2 and all('kind=match' in x and 'match_ea=00012020' in x and 'match_offset=32' in x and 'sample_offset=0' in x and '12345678' in x for x in lines),lines
     assert len(run(dict(raw,**match,SPU_DMA_PUBLICATION_LIMIT='3'),'threads'))==3
     for bad in ('','garbage','12080-12000','12000-12080junk','100000000-100000004','-1-20','\n12000-12080'):
         assert run({'SPU_DMA_PUBLICATION':bad})==[]

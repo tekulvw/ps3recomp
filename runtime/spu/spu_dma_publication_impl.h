@@ -72,9 +72,9 @@ static void dma_pub_log(const spu_context* s,uint32_t lsa,uint64_t ea,
         uint32_t v=dma_pub_read(s->ls+lsa+(uint32_t)(sample-ea)+i*4);
         used+=(size_t)snprintf(payload+used,sizeof payload-used,"%s%08X",i?",":"",v);
     }
-    fprintf(stderr,"[dma-publication] kind=%s img=%d spu=%u pc=%05X cmd=%02X lsa=%05X ea=%08X size=%u sample_ea=%08X words=%u truncated=%d match_ea=%08X payload=%s\n",
+    fprintf(stderr,"[dma-publication] kind=%s img=%d spu=%u pc=%05X cmd=%02X lsa=%05X ea=%08X size=%u sample_ea=%08X words=%u truncated=%d match_ea=%08X sample_offset=%u match_offset=%u payload=%s\n",
         kind,s->image_id,s->spu_id,s->pc&SPU_LS_MASK,cmd,lsa,(uint32_t)ea,size,
-        (uint32_t)sample,count,sample+count*4<end,(uint32_t)match,payload);
+        (uint32_t)sample,count,sample+count*4<end,(uint32_t)match,(uint32_t)(sample-ea),match?(uint32_t)(match-ea):0,payload);
 }
 /* Only outgoing bytes after core transfer validation. No VM reads, writes,
  * callbacks, locks or transfer changes. Snapshot precedes the original copy. */
@@ -104,6 +104,7 @@ void spu_dma_publication_observe(const spu_context* s,uint32_t lsa,uint64_t ea,
                 uint32_t before=s_dma_publication.words/2;
                 uint64_t sample=at-lo>before*4?at-before*4:lo;
                 dma_pub_log(s,lsa,ea,size,cmd,"match",sample,hi,at);
+                break; /* First matching word identifies this transfer; preserve budget. */
             }
         }
     }
