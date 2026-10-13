@@ -16,7 +16,8 @@ static struct {
     int span, match;
     int incoming;
     uint32_t header_words;
-} s_dma_publication = {INIT_ONCE_STATIC_INIT,0,0,0,0,0,0,0,16,128,0,0};
+    int atomic;
+} s_dma_publication = {INIT_ONCE_STATIC_INIT,0,0,0,0,0,0,0,16,128,0,0,0,0,0};
 static int dma_pub_number(const char* s, int base, uint64_t max, uint64_t* out) {
     char* end;
     if (!s || !*s || !(base==16 ? isxdigit((unsigned char)*s) : isdigit((unsigned char)*s))) return 0;
@@ -40,6 +41,7 @@ static BOOL WINAPI dma_pub_init(PINIT_ONCE once,PVOID arg,PVOID* out) {
     const char* limit=getenv("SPU_DMA_PUBLICATION_LIMIT");
     const char* incoming=getenv("SPU_DMA_PUBLICATION_INCOMING");
     const char* header=getenv("SPU_DMA_PUBLICATION_HEADER_WORDS");
+    const char* atomic=getenv("SPU_DMA_PUBLICATION_ATOMIC");
     uint64_t n;
     int valid=1;
     if (words) { valid=dma_pub_number(words,10,16,&n) && n; if(valid) s_dma_publication.words=(uint32_t)n; }
@@ -47,6 +49,10 @@ static BOOL WINAPI dma_pub_init(PINIT_ONCE once,PVOID arg,PVOID* out) {
     if(incoming) {
         int ok=!strcmp(incoming,"0") || !strcmp(incoming,"1");
         valid=valid&&ok; s_dma_publication.incoming=ok && !strcmp(incoming,"1");
+    }
+    if(atomic) {
+        int ok=!strcmp(atomic,"0") || !strcmp(atomic,"1");
+        valid=valid&&ok; s_dma_publication.atomic=ok && !strcmp(atomic,"1");
     }
     if(header) { int ok=dma_pub_number(header,10,8,&n); valid=valid&&ok; if(ok) s_dma_publication.header_words=(uint32_t)n; }
     if(raw) { int ok=dma_pub_range(raw,&s_dma_publication.lo,&s_dma_publication.hi); valid=valid&&ok; s_dma_publication.span=ok; }
@@ -72,7 +78,7 @@ static uint32_t dma_pub_read(const uint8_t* p) {
 }
 static void dma_pub_log(const spu_context* s,uint32_t lsa,uint64_t ea,
     uint32_t size,uint32_t cmd,const char* kind,uint64_t sample,
-    uint64_t end,uint64_t match) {
+    uint64_t end,uint64_t match,unsigned outcome) {
     if(!dma_pub_claim()) return;
     uint32_t count=(uint32_t)((end-sample)/4);
     if(count>s_dma_publication.words) count=s_dma_publication.words;
@@ -88,18 +94,22 @@ static void dma_pub_log(const spu_context* s,uint32_t lsa,uint64_t ea,
         uint32_t v=dma_pub_read(s->ls+lsa+i*4);
         header_used+=(size_t)snprintf(header+header_used,sizeof header-header_used,"%s%08X",i?",":"",v);
     }
-    fprintf(stderr,"[dma-publication] kind=%s direction=%s img=%d spu=%u pc=%05X cmd=%02X lsa=%05X ea=%08X size=%u sample_ea=%08X words=%u truncated=%d match_ea=%08X sample_offset=%u match_offset=%u header_words=%u header=%s payload=%s\n",
+    fprintf(stderr,"[dma-publication] kind=%s direction=%s img=%d spu=%u pc=%05X cmd=%02X lsa=%05X ea=%08X size=%u sample_ea=%08X words=%u truncated=%d match_ea=%08X sample_offset=%u match_offset=%u atomic=%u outcome=%s header_words=%u header=%s payload=%s\n",
         kind,(cmd&0x40)?"get":"put",s->image_id,s->spu_id,s->pc&SPU_LS_MASK,cmd,lsa,(uint32_t)ea,size,
-        (uint32_t)sample,count,sample+count*4<end,(uint32_t)match,(uint32_t)(sample-ea),match?(uint32_t)(match-ea):0,header_words,header,payload);
+        (uint32_t)sample,count,sample+count*4<end,(uint32_t)match,(uint32_t)(sample-ea),match?(uint32_t)(match-ea):0,outcome!=0,
+        outcome==1?"getllar-complete":outcome==2?"putllc-success":outcome==3?"putllc-failure":"none",header_words,header,payload);
 }
 /* Validated PUT: pre-copy source. Opt-in GET: post-copy LS snapshot. No VM
  * reads, writes, callbacks, locks or transfer changes. */
-void spu_dma_publication_observe(const spu_context* s,uint32_t lsa,uint64_t ea,
-    uint32_t size,uint32_t cmd) {
+static void dma_pub_observe(const spu_context* s,uint32_t lsa,uint64_t ea,
+    uint32_t size,uint32_t cmd,unsigned outcome) {
     if(!InterlockedCompareExchange(&s_dma_publication.ready,0,0))
         InitOnceExecuteOnce(&s_dma_publication.once,dma_pub_init,NULL,NULL);
     if(!s_dma_publication.span && !s_dma_publication.match) return;
-    if((cmd&0x40) ? !s_dma_publication.incoming : !(cmd&0x20)) return;
+    if(outcome) {
+        if(!s_dma_publication.atomic) return;
+        if(!((cmd==0xD0 && outcome==1) || (cmd==0xB4 && (outcome==2 || outcome==3)))) return;
+    } else if((cmd&0x40) ? !s_dma_publication.incoming : !(cmd&0x20)) return;
     if(!s || !s->ls || !size || size>16384 || (uint64_t)lsa+size>SPU_LS_SIZE ||
         ea>0xFFFFFFFFull || ea+size>0x100000000ull) return;
     if((uint32_t)InterlockedCompareExchange(&s_dma_publication.emitted,0,0)>=s_dma_publication.limit) return;
@@ -108,7 +118,7 @@ void spu_dma_publication_observe(const spu_context* s,uint32_t lsa,uint64_t ea,
         uint64_t lo=ea>s_dma_publication.lo?ea:s_dma_publication.lo;
         uint64_t hi=transfer_end<s_dma_publication.hi?transfer_end:s_dma_publication.hi;
         lo=(lo+3)&~3ull; hi&=~3ull;
-        if(lo<hi) dma_pub_log(s,lsa,ea,size,cmd,"span",lo,hi,0);
+        if(lo<hi) dma_pub_log(s,lsa,ea,size,cmd,"span",lo,hi,0,outcome);
     }
     if(s_dma_publication.match) {
         uint64_t lo=ea>s_dma_publication.match_lo?ea:s_dma_publication.match_lo;
@@ -120,10 +130,19 @@ void spu_dma_publication_observe(const spu_context* s,uint32_t lsa,uint64_t ea,
             if(dma_pub_read(s->ls+lsa+(uint32_t)(at-ea))==s_dma_publication.word) {
                 uint32_t before=s_dma_publication.words/2;
                 uint64_t sample=at-lo>before*4?at-before*4:lo;
-                dma_pub_log(s,lsa,ea,size,cmd,"match",sample,hi,at);
+                dma_pub_log(s,lsa,ea,size,cmd,"match",sample,hi,at,outcome);
                 break; /* First matching word identifies this transfer; preserve budget. */
             }
         }
     }
+}
+void spu_dma_publication_observe(const spu_context* s,uint32_t lsa,uint64_t ea,
+    uint32_t size,uint32_t cmd) {
+    dma_pub_observe(s,lsa,ea,size,cmd,0);
+}
+void spu_dma_publication_observe_atomic(const spu_context* s,uint32_t lsa,uint64_t ea,
+    uint32_t cmd,enum spu_dma_publication_atomic_outcome outcome) {
+    if(outcome<SPU_DMA_ATOMIC_GETLLAR_COMPLETE || outcome>SPU_DMA_ATOMIC_PUTLLC_FAILURE) return;
+    dma_pub_observe(s,lsa,ea,128,cmd,(unsigned)outcome);
 }
 #endif
