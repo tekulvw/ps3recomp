@@ -663,7 +663,7 @@ static void test_remap_g8b8_lanes(void)
     for (int i = 0; i < 4; i++) CHECK_EQ(n[i], m[i]);
 }
 
-8 has one channel, presented as {1,B,B,B}. A crossbar taking every output
+/* B8 has one channel, presented as {1,B,B,B}. A crossbar taking every output
  * from B (0xAAFF, a distance-field font atlas) must read that channel, not
  * component 2 of a one-channel resource. */
 static void test_remap_b8_lanes(void)
