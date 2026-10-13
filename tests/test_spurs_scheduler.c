@@ -81,6 +81,10 @@ static atomic_uint fast_visits,late_seen;
 static void fast_policy(spu_context* c)
 {
     atomic_fetch_add(&fast_visits,1);
+    /* This manufactured workload remains runnable by explicitly requesting its
+     * next visit, rather than depending on unsolicited coordinator probes. */
+    u32 ea=spu_ls_read32(c,0x1C4),wid=spu_ls_read32(c,0x1DC);
+    spu_lockline_lock();vm_base[ea+SPURS_WKL_READY1+wid]=1;ef_line_end(ea);
     c->pc=SPURS_PM_EXIT_TO_KERNEL_LS;spu_indirect_branch(c);
 }
 static void late_policy(spu_context* c) { atomic_store(&late_seen,1);finish(c); }
@@ -148,14 +152,65 @@ static void* allocate_slot(void* arg)
     else allocation_rc[which]=cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8040,(void*)0x9700,16,0,(u8*)0x8020,1,1);
     return NULL;
 }
+
+/* Request eligibility follows SPURS1 selection: nonzero ready count, the
+ * workload's signal, or its pending receiver flag. Min contention and runnable
+ * registration are constraints, not independent execution requests. */
+static atomic_uint request_entered,request_gate,request_done;
+static void requested_policy(spu_context* c)
+{
+    atomic_fetch_add(&request_entered,1);
+    while(!atomic_load(&request_gate)) Sleep(1);
+    atomic_fetch_add(&request_done,1);
+    /* Stay registered/runnable after returning: idle state must still remain
+     * contention-free until another actual request arrives. */
+    c->pc=SPURS_PM_EXIT_TO_KERNEL_LS;spu_indirect_branch(c);
+}
+static void request_driven_case(unsigned request)
+{
+    atomic_store(&request_entered,0);atomic_store(&request_gate,0);atomic_store(&request_done,0);
+    assert(cellSpursInitialize((CellSpurs*)0x2000,1,0,0,0)==0);
+    assert(cellSpursAddWorkload((CellSpurs*)0x2000,(u32*)0x8000,(void*)0x9A00,16,0,NULL,1,1)==0);
+    unsigned wid=vm_read32(0x8000);assert(wid==0);
+    assert(cellSpursWakeUp((CellSpurs*)0x2000)==0);
+    Sleep(30);
+    assert(!atomic_load(&request_entered));
+    assert(cellSpursGetWorkloadInfo(0x2000,wid,0x8100)==0);
+    assert(vm_read8(0x8120)==0 && vm_read8(0x8123)==0);
+    if(request==0)assert(cellSpursReadyCountStore((CellSpurs*)0x2000,wid,1)==0);
+    else if(request==1) {
+        spu_lockline_lock();ef_w16(0x2000+SPURS_WKL_SIGNAL1,0x8000u>>wid);ef_line_end(0x2000);
+    } else {
+        assert(_cellSpursWorkloadFlagReceiver((CellSpurs*)0x2000,wid,1)==0);
+        spu_lockline_lock();memset(vm_base+0x2000+SPURS_WKL_FLAG_VALUE,0,4);ef_line_end(0x2000);
+    }
+    wait_for(&request_entered,1,"explicit workload request admission");
+    assert(cellSpursGetWorkloadInfo(0x2000,wid,0x8100)==0);
+    assert(vm_read8(0x8120)==1);
+    atomic_store(&request_gate,1);wait_for(&request_done,1,"requested policy return");
+    for(unsigned i=0;vm_read8(0x2000+SPURS_WKL_CURCONT+wid);i++){assert(i<3000);Sleep(1);}
+    assert(cellSpursGetWorkloadInfo(0x2000,wid,0x8100)==0);
+    assert(vm_read8(0x8120)==0);
+    Sleep(30);assert(atomic_load(&request_entered)==1);
+    assert(vm_read8(0x2000+SPURS_WKL_STATE1+wid)==2);
+    assert(cellSpursGetWorkloadInfo(0x2000,wid,0x8100)==0);
+    assert(vm_read8(0x8120)==0 && vm_read8(0x8123)==0);
+    finalize(0x2000);
+}
+
 int main(void)
 {
+    setvbuf(stdout,NULL,_IONBF,0);
     vm_base=calloc(1,ppu_vm_size);assert(vm_base);
+    register_pm(0x9A00,0xAA,requested_policy,85);
+    for(unsigned r=0;r<3;r++)request_driven_case(r);
+    puts("SPURS no unsolicited admission / ready, signal, flag requests / returned contention PASS");
     register_pm(0x9000,0x11,consumer,77);register_pm(0x9100,0x22,producer,78);
     assert((u32)cellSpursInitialize((CellSpurs*)0x1000,7,0,0,0)==CELL_SPURS_CORE_ERROR_INVAL);
     assert(cellSpursInitialize((CellSpurs*)0x1000,2,0,0,0)==0);
     assert(cellSpursAttachLv2EventQueue((CellSpurs*)0x1000,3,(u8*)0x8010,1)==0);
     assert(cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8000,(void*)0x9000,16,0,NULL,1,1)==0);
+        assert(cellSpursReadyCountStore((CellSpurs*)0x1000,vm_read32(0x8000),1)==0);
     wait_for(&entered,1,"consumer admission");
     for(unsigned i=0;i<8;i++) assert(cellSpursWakeUp((CellSpurs*)0x1000)==0);
     assert(!atomic_load(&unbounded_dispatches));
@@ -163,6 +218,7 @@ int main(void)
     assert((u32)cellSpursFinalize((CellSpurs*)0x1000)==CELL_SPURS_CORE_ERROR_BUSY);
     assert(!atomic_load(&canceled_queues) && !memcmp(before,vm_base+0x1000,sizeof(before)));
     assert(cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8000,(void*)0x9100,16,0,NULL,1,1)==0);
+        assert(cellSpursReadyCountStore((CellSpurs*)0x1000,vm_read32(0x8000),1)==0);
     wait_for(&finished,1,"cross-workload dependency");
     assert(atomic_load(&consumer_lane)<2 && atomic_load(&producer_lane)<2);
     assert(atomic_load(&consumer_lane)!=atomic_load(&producer_lane));
@@ -176,6 +232,7 @@ int main(void)
     assert(cellSpursInitialize((CellSpurs*)0x1000,3,0,0,0)==0);
     for(unsigned i=0;i<4;i++) {
         assert(cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8000,(void*)0x9200,16,0,NULL,1,1)==0);
+        assert(cellSpursReadyCountStore((CellSpurs*)0x1000,vm_read32(0x8000),1)==0);
         assert(vm_read32(0x8000)==i);
     }
     for(unsigned i=0;i<3;i++)wait_for(&held[i],1,"configured capacity");
@@ -193,6 +250,7 @@ int main(void)
     atomic_store(&peak_count,0);atomic_store(&lane_mask,0);
     assert(cellSpursInitialize((CellSpurs*)0x1000,3,0,0,0)==0);
     assert(cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8000,(void*)0x9200,16,0,NULL,1,2)==0);
+        assert(cellSpursReadyCountStore((CellSpurs*)0x1000,vm_read32(0x8000),2)==0);
     wait_for(&held[0],2,"maxContention two");Sleep(20);
     assert(atomic_load(&held[0])==2 && atomic_load(&peak_count)==2);
     assert(vm_read8(0x1000+SPURS_WKL_CURCONT)==2);
@@ -205,6 +263,7 @@ int main(void)
     assert(cellSpursInitialize((CellSpurs*)0x1000,1,0,0,0)==0);
     for(unsigned incarnation=0;incarnation<2;incarnation++) {
         assert(cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8000,(void*)0x9600,16,0,NULL,1,1)==0);
+        assert(cellSpursReadyCountStore((CellSpurs*)0x1000,vm_read32(0x8000),1)==0);
         wait_for(&incarnation_runs,incarnation+1,"same policy/data workload incarnation");
         for(unsigned i=0;;i++) {
             s32 rc=cellSpursRemoveWorkload((CellSpurs*)0x1000,0);
@@ -232,6 +291,8 @@ int main(void)
 
     vm_base[0x8021]=1;
     assert(cellSpursSetPriorities((CellSpurs*)0x1000,0,(u8*)0x8020)==0);
+    Sleep(20);assert(!atomic_load(&eligible_lane));
+    assert(cellSpursReadyCountStore((CellSpurs*)0x1000,0,1)==0);
     wait_for(&eligible_lane,1,"zero-priority physical lane exclusion");
     assert(atomic_load(&eligible_lane)==2);finalize(0x1000);
     puts("SPURS explicit zero priority excludes physical lane / SetPriorities guest publication PASS");
@@ -239,8 +300,10 @@ int main(void)
     register_pm(0x9300,0x44,fast_policy,80);register_pm(0x9400,0x55,late_policy,81);
     assert(cellSpursInitialize((CellSpurs*)0x1000,1,0,0,0)==0);
     assert(cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8000,(void*)0x9300,16,0,NULL,1,1)==0);
+        assert(cellSpursReadyCountStore((CellSpurs*)0x1000,vm_read32(0x8000),1)==0);
     wait_for(&fast_visits,2,"continuously runnable workload");
     assert(cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8000,(void*)0x9400,16,0,NULL,1,1)==0);
+        assert(cellSpursReadyCountStore((CellSpurs*)0x1000,vm_read32(0x8000),1)==0);
     wait_for(&late_seen,1,"round-robin admission");
     vm_write8(0x1080,3);finalize(0x1000);puts("SPURS continuously runnable workload does not starve later producer PASS");
 
@@ -249,11 +312,13 @@ int main(void)
     atomic_store(&gate,0);atomic_store(&held[0],0);atomic_store(&done[0],0);
     assert(cellSpursInitialize((CellSpurs*)0x1000,1,0,0,0)==0);
     assert(cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8000,(void*)0x9200,16,0,NULL,1,1)==0);
+        assert(cellSpursReadyCountStore((CellSpurs*)0x1000,vm_read32(0x8000),1)==0);
     wait_for(&held[0],1,"first instance active");
     atomic_store(&late_seen,0);register_pm(0x9500,0x66,stopped_policy,82);
     assert(cellSpursInitialize((CellSpurs*)0x3000,1,0,0,0)==0);
     assert(cellSpursAttachLv2EventQueue((CellSpurs*)0x3000,4,(u8*)0x8010,1)==0);
     assert(cellSpursAddWorkload((CellSpurs*)0x3000,(u32*)0x8000,(void*)0x9500,16,0,NULL,1,1)==0);
+        assert(cellSpursReadyCountStore((CellSpurs*)0x3000,vm_read32(0x8000),1)==0);
     assert(vm_read32(0x8000)==1);wait_for(&late_seen,1,"independent instance stop/error execution");
     finalize(0x3000);
     assert(s_workloads[0].in_use && s_workloads[0].spurs_ea==0x1000);

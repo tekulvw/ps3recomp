@@ -2116,12 +2116,21 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
                 int kicked = ready || (signal & (0x8000u >> wid)) ||
                              spurs_flag_status(ea, wid, 0);
-                if (kicked) si->idle[wid] = 0;
-                if (!kicked && (si->pass_no & ((1u << si->idle[wid]) - 1)))
-                    continue;
+                /* Registration/minimum contention do not request execution.
+                 * Unsolicited policy probes make an idle workload appear busy
+                 * to GetWorkloadInfo and can send callers into obsolete waits. */
+                if (!kicked) continue;
                 spu_lockline_lock();
                 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
                 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+                /* Recheck all request sources in the consumption transaction;
+                 * a PPU/SPU may have withdrawn a request since the first probe. */
+                if (!ready && !(signal & (0x8000u >> wid)) &&
+                    !spurs_flag_status_locked(ea, wid)) {
+                    spu_lockline_unlock();
+                    continue;
+                }
+                si->idle[wid] = 0;
                 if (ready) vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
                 if (signal & (0x8000u >> wid))
                     ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~(0x8000u >> wid)));
