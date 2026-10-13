@@ -12,7 +12,7 @@ change guest registers, memory, DMA, scheduling, or context layout. Each line
 contains context address, image label, actual PC/opcode, raw r0/r1, configured
 identity registers, source/destination pointer and size registers, raw sizes,
 divisors, byte spans, and F32BE finite/nonzero/nonfinite counts and peak magnitude.
-An image label is not an overlay identity. All configured guard words and the
+An image label is not an overlay identity. All global guard words, the selected site group's guards (if configured), and the
 site opcode must match live LS before any dynamic buffer is read.
 
 The fixed configuration, event count, and sequence are shared across contexts,
@@ -84,3 +84,50 @@ reads, and runtime loops drop their local enabled flag on the next instruction.
 Records are observations, not a proof that events from different contexts,
 register identities or blocks form a producer/consumer chain. Numeric statistics
 on arbitrary LS bytes do not establish that a span contains PCM.
+
+An optional grouped mode can qualify different code overlays in one capture:
+
+```
+limit 8
+group 1 4
+group 2 4
+groupguard 1 30010 35002780
+groupguard 2 30010 40200000
+groupsite 1 30000 34000194 3 4 1 5 6 2
+groupsite 2 30000 34000194 3 4 1 5 6 2
+end
+```
+
+`group <id> <quota>` reserves that many events for the group. IDs are decimal
+1 through 8, unique, and must be declared before `groupguard`/`groupsite`
+references. `groupguard <id> <address> <word>` adds a guard for that group;
+`groupsite <id> <eight site values>` assigns a site to it. Every declared group
+must have at least one site and guard. Its quota must be positive, and all
+quotas must sum exactly to `limit` (at most 256). This prevents one overlay from
+spending another overlay's budget. At most 8 sites total and 32 guards per group
+are accepted; the existing 4096-byte file bound still applies. Global `guard`
+lines remain optional in grouped mode and, when present, are required in
+addition to the selected group's guards. Grouped and legacy `site` lines cannot
+be mixed. Existing ungrouped configurations and their output format are
+unchanged.
+
+Site PCs may repeat across different groups. Each matching candidate checks
+its own guards; a wrong overlay cannot spend that group's quota. Duplicate PCs
+within one group are rejected. An exhausted group is skipped before context/LS
+reads; an aliased PC belonging to another live group can still require LS reads
+to qualify that other candidate. The total cap still disables the cached hook.
+Quota admission is atomic across contexts/threads and shares the existing
+trigger lifecycle. Rejected guards, invalid spans, or absent triggers spend
+neither group nor total budget. No new clock reads, file lookups, allocations,
+guest writes, or guest context fields are introduced.
+
+Grouped lines append `group` and `group_seq`. `seq` identifies the process-wide
+admission reservation; `group_seq` identifies that group's reservation. Host
+threads can print in a different order from either reservation and can be
+preempted between admission and reading a buffer. Neither sequence is a frame
+number or a producer/consumer identity. Use the actual context, call/stack
+registers, configured identity registers, dynamic buffer spans and transfer
+addresses to qualify a chain; repeated pointers can refer to reused storage.
+These fields do not establish that a source block was copied to a later block.
+Disabled cached instruction hooks retain their original flag branch, and the
+observer's enable/trigger fast paths are unchanged.

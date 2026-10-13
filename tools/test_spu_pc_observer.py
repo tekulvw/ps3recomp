@@ -44,6 +44,7 @@ with tempfile.TemporaryDirectory(prefix='spu-pc-observer-') as tmp:
         assert len(records)==8, result.stderr
         contexts=dict(re.findall(r"context(\d+)=(\S+)",result.stdout))
         for i,r in enumerate(records):
+            assert 'group' not in r and 'group_seq' not in r
             k=i//4
             assert r['ctx']==contexts[str(k)] and int(r['r0'],16)==0xABC000+k and int(r['r1'],16)==0xDEF000+k
             assert int(r['pc'],16)==0x30000+4*(i%4) and int(r['seq'])==i+1
@@ -68,6 +69,23 @@ with tempfile.TemporaryDirectory(prefix='spu-pc-observer-') as tmp:
         for r in records:
             k=int(r['r0'],16)-0xABC000
             assert r['ctx']==contexts[str(k)] and int(r['r1'],16)==0xDEF000+k
+    # Same actual recognized/fallback instructions, now grouped. The C fixture
+    # checks every guest LS byte/register against the original expected result.
+    grouped="limit 8\nidentity 3 6\ngroup 1 4\ngroup 2 4\ngroupguard 1 30010 35002780\ngroupguard 2 30010 35002780\n" + "".join(
+        f"groupsite {1 if i%2==0 else 2} {pc:X} {word:X} 3 4 1 5 6 2\n"
+        for i,(pc,word) in enumerate([(0x30000,0x34000194),(0x30004,0xB2850A16),(0x30008,0x24000194),(0x3000C,0x40200000)])) + "end\n"
+    result,records=run(binary,text=grouped)
+    assert len(records)==8 and [int(r['seq']) for r in records]==list(range(1,9)),result.stderr
+    for g in (1,2):
+        subset=[r for r in records if int(r['group'])==g]
+        assert [int(r['group_seq']) for r in subset]==list(range(1,5))
+    delayed_grouped=grouped.replace('limit 8','limit 12').replace('group 1 4','group 1 6').replace('group 2 4','group 2 6').replace('end\n',f'trigger {trigger}\nend\n')
+    for mode in ('trigger','trigger_threads'):
+        result,records=run(binary,mode,delayed_grouped,[str(trigger)])
+        assert len(records)==12 and sorted(int(r['seq']) for r in records)==list(range(1,13)),result.stderr
+        for g in (1,2):
+            assert sorted(int(r['group_seq']) for r in records if int(r['group'])==g)==list(range(1,7))
+        if trigger.exists(): trigger.unlink()
     safety=Path(tmp)/'safety'
     compat=Path(tmp)/'compat.o'
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1',
@@ -112,6 +130,17 @@ with tempfile.TemporaryDirectory(prefix='spu-pc-observer-') as tmp:
             text=base.replace('limit 8','limit 3').replace('end\n',f'trigger {trigger}\nend\n')
             result,records=run(trigger_safety,mode,text,[str(trigger),str(config)])
             assert len(records)==(3 if mode=='lifecycle' else 1),result.stderr
+        trigger.unlink()
+    for compiler,standard in [(os.environ.get('CC','cc'),'gnu17'),(os.environ.get('CXX','c++'),'c++17')]:
+        subprocess.run([compiler,'-x','c++' if standard=='c++17' else 'c','-std='+standard,'-O2','-UNDEBUG',
+                        *os.environ.get('SPU_OBSERVER_TEST_CFLAGS','').split(),*include,
+                        str(spu/'tests/test_spu_pc_observer_trigger.c'),'-x','none',str(compat),'-pthread','-o',str(trigger_safety)],check=True)
+        for mode in ('lifecycle','reject'):
+            if trigger.exists(): trigger.unlink()
+            text=f"limit 3\ngroup 1 3\ngroupguard 1 30010 35002780\ngroupsite 1 30000 34000194 3 4 1 5 6 2\ntrigger {trigger}\nend\n"
+            result,records=run(trigger_safety,mode,text,[str(trigger),str(config)])
+            assert len(records)==(3 if mode=='lifecycle' else 1),result.stderr
+            assert [int(r['group_seq']) for r in records]==list(range(1,len(records)+1))
         trigger.unlink()
     _,records=run(safety,'nonmatch',base.replace('end\n','trigger /'+'x'*127+'\nend\n'));assert not records
     # Invalid trigger declarations disable all observation, including poison contexts.
