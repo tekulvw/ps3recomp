@@ -2,6 +2,7 @@
 #include "../libs/spurs/cellSpurs.c"
 #include <assert.h>
 uint8_t* vm_base;
+uint32_t ppu_vm_size=0x100000;
 int main(void) {
     vm_base=calloc(1,0x100000); assert(vm_base);
     s_inst[0].ea=0x1000; s_inst[1].ea=0x3000;
