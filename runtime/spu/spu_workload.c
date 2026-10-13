@@ -25,6 +25,68 @@
  * YDKJ_CRI_RESUME poll-loop watches this to know real work arrived. */
 int g_cri_video_dma = 0;
 
+/* Tombstones prevent a late submission from reopening a destroyed generation.
+ * A valid CreateTaskset resets an entry only after its last admitted reference
+ * has finished. The bounded directory deliberately fails creation when full. */
+typedef struct { uint32_t ea; unsigned active; int tracked, closed, submitted; } taskset_lifetime;
+static taskset_lifetime s_lifetime[256];
+static SRWLOCK s_lifetime_lock = SRWLOCK_INIT;
+static taskset_lifetime* lifetime_find(uint32_t ea) {
+    for (unsigned i=0;i<256;i++) if (s_lifetime[i].ea==ea) return &s_lifetime[i];
+    return NULL;
+}
+int spu_taskset_lifecycle_create(uint32_t ea, int taskset2) {
+    int ok=0;
+    AcquireSRWLockExclusive(&s_lifetime_lock);
+    taskset_lifetime* t=lifetime_find(ea);
+    if (!t && taskset2) for(unsigned i=0;i<256;i++)
+        if (!s_lifetime[i].ea) { t=&s_lifetime[i]; break; }
+    if (!t) ok=!taskset2;
+    else if (!t->active) { *t=(taskset_lifetime){.ea=ea,.tracked=taskset2}; ok=1; }
+    ReleaseSRWLockExclusive(&s_lifetime_lock);
+    return ok;
+}
+int spu_taskset_lifecycle_enter(uint32_t ea) {
+    int result=0;
+    if (!ea) return 0;
+    AcquireSRWLockExclusive(&s_lifetime_lock);
+    taskset_lifetime* t=lifetime_find(ea);
+    if (t && t->tracked) {
+        if (t->closed) result=-1;
+        else { t->submitted=1; t->active++; result=1; }
+    }
+    ReleaseSRWLockExclusive(&s_lifetime_lock);
+    return result;
+}
+void spu_taskset_lifecycle_leave(uint32_t ea) {
+    AcquireSRWLockExclusive(&s_lifetime_lock);
+    taskset_lifetime* t=lifetime_find(ea);
+    if (t && t->active) t->active--;
+    ReleaseSRWLockExclusive(&s_lifetime_lock);
+}
+int spu_taskset_lifecycle_retire_unused(uint32_t ea) {
+    int ok=0;
+    AcquireSRWLockExclusive(&s_lifetime_lock);
+    taskset_lifetime* t=lifetime_find(ea);
+    if (t && t->tracked && !t->closed && !t->submitted && !t->active) {
+        /* Admission and the empty-state read form one transaction: a submitted
+         * task cannot mutate these bytes until it has acquired this gate. */
+        extern uint8_t* vm_base;
+        ok=1;
+        for(unsigned off=0;off<0x60;off++) if(vm_base[ea+off]) { ok=0; break; }
+        if(ok) t->closed=1;
+    }
+    ReleaseSRWLockExclusive(&s_lifetime_lock);
+    return ok;
+}
+unsigned spu_taskset_lifecycle_active(uint32_t ea) {
+    unsigned n=0;
+    AcquireSRWLockExclusive(&s_lifetime_lock);
+    taskset_lifetime* t=lifetime_find(ea); if(t) n=t->active;
+    ReleaseSRWLockExclusive(&s_lifetime_lock);
+    return n;
+}
+
 /* ---- fingerprint ------------------------------------------------------- */
 
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
@@ -252,6 +314,7 @@ typedef struct {
     int                 have_r3;
     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
     uint32_t            taskid;
+    int                 lifetime_counted;
 } spu_async_job;
 
 /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
@@ -782,7 +845,10 @@ static void spu_async_run(spu_async_job* j)
         pthread_mutex_unlock(&ts_slot->lock);
 #endif
     }
+    uint32_t finished_ea = j->taskset_ea;
+    int counted = j->lifetime_counted;
     free(j);
+    if (counted) spu_taskset_lifecycle_leave(finished_ea);
 }
 
 #ifdef _WIN32
@@ -1205,8 +1271,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     return 0;
 }
 
-int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
-                                uint32_t args_ea)
+int spu_workload_dispatch_async_owned(const uint8_t* image, uint32_t image_size,
+                                uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid)
 {
     if (!image || image_size == 0) return 0;
 
@@ -1250,8 +1316,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * set the globals for THIS task). Reading them later in the async thread races
      * the next CreateTask overwriting the single-slot globals -- with two audio
      * tasks that made both run task 1's descriptor. */
-    { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
+    j->taskset_ea = taskset_ea; j->taskid = taskid;
+    int admission = spu_taskset_lifecycle_enter(taskset_ea);
+    if (admission < 0) { free(j); return 0; }
+    j->lifetime_counted = admission > 0;
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is
@@ -1302,7 +1370,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * process death) the moment the real decode path first executed. */
     HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (!th) { free(j); return 0; }
+    if (!th) { if(j->lifetime_counted) spu_taskset_lifecycle_leave(j->taskset_ea); free(j); return 0; }
     CloseHandle(th);   /* detached */
 #else
     /* Same 256 MB reservation, for the same reason: pthread stacks are
@@ -1321,8 +1389,17 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * beats never dispatching at all. */
     if (prc != 0)
         prc = pthread_create(&th, NULL, spu_async_thread, j);
-    if (prc != 0) { free(j); return 0; }
+    if (prc != 0) { if(j->lifetime_counted) spu_taskset_lifecycle_leave(j->taskset_ea); free(j); return 0; }
     pthread_detach(th);
 #endif
     return 1;
+}
+
+/* Existing callers supply the selected task through the synchronous bridge. */
+int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+                                uint32_t args_ea)
+{
+    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+    return spu_workload_dispatch_async_owned(image,image_size,args_ea,
+                        g_ydkj_real_taskset_ea,g_ydkj_real_taskid);
 }

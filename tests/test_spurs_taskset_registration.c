@@ -37,3 +37,8 @@ int spu_coh_is_reserved(uint32_t ea) {(void)ea;return 0;}
 void spu_lockline_lock(void) {} void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w) {(void)a;(void)v;(void)w;}
+/* This Taskset1-only registration fixture does not dispatch runtime workers.
+ * Generation2 lifetime behavior is covered by test_spurs_destroy_taskset2. */
+int spu_taskset_lifecycle_create(uint32_t ea, int taskset2) {
+    (void)ea; assert(!taskset2); return 1;
+}

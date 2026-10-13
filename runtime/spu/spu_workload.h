@@ -125,6 +125,20 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea);
 
+/* Explicit owner for policy-module dispatch; avoids the selected-task globals. */
+int spu_workload_dispatch_async_owned(const uint8_t* image, uint32_t image_size,
+                                      uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
+
+/* Host lifetime gate for the bounded Taskset2 destructor. Unknown/Taskset1
+ * addresses preserve legacy admission. A tracked generation records every
+ * submission before guest mutation or host spawn, and keeps the count until
+ * the worker's final use. Closed generations reject admission. */
+int spu_taskset_lifecycle_create(uint32_t ea, int taskset2);
+int spu_taskset_lifecycle_enter(uint32_t ea); /* -1 closed, 0 legacy, 1 counted */
+void spu_taskset_lifecycle_leave(uint32_t ea);
+int spu_taskset_lifecycle_retire_unused(uint32_t ea);
+unsigned spu_taskset_lifecycle_active(uint32_t ea);
+
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 
