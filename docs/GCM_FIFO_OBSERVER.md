@@ -7,7 +7,7 @@ intervals disable observation. Decimal numbers or numbers prefixed with
 `0x` are accepted.
 
 `GCM_FIFO_OBSERVE_LIMIT` caps all emitted records (default 128, maximum
-4096). `GCM_FIFO_OBSERVE_WORDS` caps the payload sample per packet (default
+32768). `GCM_FIFO_OBSERVE_WORDS` caps the payload sample per packet (default
 16 words, maximum 32). Both must be positive integers within their bounds;
 invalid values disable observation. Configuration is read on first drain.
 
