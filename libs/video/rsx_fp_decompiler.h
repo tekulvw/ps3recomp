@@ -142,6 +142,20 @@ int rsx_fp_decompile_buffered_shadow_ex(
     const rsx_fp_shadow_desc shadow[16],
     char* out, u32 out_size, u32* out_constant_count);
 
+/* TEX/TXP/TXB/TXL with OPDEST.exp_tex (bit 21) expand sampled normalized
+ * lanes as 2*x-1, before result scale and destination SAT. Without texture
+ * state, the legacy entry points assume normalized identity RGBA textures.
+ * The engine supplies a per-unit RGBA lane mask so forced constants and
+ * unsupported formats remain unchanged. NULL retains the legacy assumption. */
+#define RSX_FP_TEXTURE_BX2_MASKS 1
+int rsx_fp_decompile_buffered_texture_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const u8 texture_bx2_masks[16], char* out, u32 out_size,
+    u32* out_constant_count);
+/* Units accessed by a supported fetch carrying exp_tex; used to limit the
+ * texture-state contribution to pipeline identity. */
+u32 rsx_fp_texture_expand_units(const u8* ucode, u32 max_bytes);
+
 /* Extract the exact runtime inline-CONST payload. Returns the slot count on
  * success or -1 for an unterminated/truncated/oversized program. */
 int rsx_fp_collect_constants(
@@ -196,6 +210,13 @@ int rsx_fp_decompile_buffered_color_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count);
 /* Both: depth comparison per unit and post-filter gamma per unit. */
+/* Combined metadata entry point for the shared engine; older APIs retain ABI. */
+int rsx_fp_decompile_buffered_shadow_color_texture_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
+    const u8 texture_bx2_masks[16], char* out, u32 out_size,
+    u32* out_constant_count);
+
 int rsx_fp_decompile_buffered_shadow_color_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
@@ -220,3 +241,4 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
 int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out);
 u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes);
 #endif /* PS3RECOMP_RSX_FP_DECOMPILER_H */
+
