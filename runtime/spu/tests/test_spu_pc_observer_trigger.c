@@ -28,6 +28,8 @@ int main(int argc,char** argv) {
     const char* trigger=argv[2];
     c.ls=(uint8_t*)mmap(NULL,SPU_LS_SIZE,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
     assert(c.ls!=MAP_FAILED);
+    size_t page=(size_t)sysconf(_SC_PAGESIZE);
+    uint8_t* source_page=c.ls+(0x1000/page)*page;
     c.gpr[3]._u32[0]=c.gpr[5]._u32[0]=0x1000;
     c.gpr[4]._u32[0]=16; c.gpr[6]._u32[0]=32;
     spu_ls_write32(&c,0x30000,0x34000194);
@@ -45,7 +47,7 @@ int main(int argc,char** argv) {
         observe(); assert(ReadAcquire(&polls)==1 && ReadAcquire(&g_spu_pc_observer.events)==1);
     } else {
         memcpy(expected,c.ls,sizeof expected); memcpy(&before,&c,sizeof c);
-        assert(!mprotect(c.ls,(size_t)sysconf(_SC_PAGESIZE),PROT_NONE));
+        assert(!mprotect(source_page,page,PROT_NONE));
         SetLastError(1234); errno=ERANGE;
         ULONGLONG start=GetTickCount64();
         for(unsigned i=0;i<10000;i++) observe();
@@ -62,7 +64,7 @@ int main(int argc,char** argv) {
         f=fopen(trigger,"wb"); assert(f); assert(!fclose(f));
         /* Restore the source before presence may arm it; a host scheduling
          * pause must not make this real-clock fixture dereference PROT_NONE. */
-        assert(!mprotect(c.ls,(size_t)sysconf(_SC_PAGESIZE),PROT_READ|PROT_WRITE));
+        assert(!mprotect(source_page,page,PROT_READ|PROT_WRITE));
         usleep(300000);
         observe(); assert(ReadAcquire(&g_spu_pc_observer.events)==1);
         LONG armed_polls=ReadAcquire(&polls);
