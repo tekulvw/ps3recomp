@@ -196,7 +196,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         }
         /* Serialize zeroing with reservation compare-and-commit. Notify each
          * touched line even for a zero-to-zero write: byte comparisons alone
-         * cannot detect that a peer's reservation was lost. Issuer exclusion
+         * cannot detect that a peer's reservation was lost. The same notifier
+         * advances tracked PPU epochs, including ABA stores. Issuer exclusion
          * follows the existing plain-MFC-write model; issuer reservation
          * behavior for storage controls is not separately modeled here. */
         spu_lockline_lock();
