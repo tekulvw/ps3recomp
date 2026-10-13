@@ -115,6 +115,44 @@ int main(int argc, char** argv)
         }
     }
 
+    /* ---- high texture coordinates: TEX8=o15 and TEX9=o6 -----------------
+     * Keep their locations after TEX0..7, including the projected w lane.
+     * o6 shares the RSX point-size/clip register but still exports TEX9. */
+    {
+        u8 vp[48];
+        rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
+        rsx_test_vp_mov_out(vp + 16, 8, RSX_TEST_VP_SWZ_IDENT, 15, 0);
+        rsx_test_vp_mov_out(vp + 32, 9, RSX_TEST_VP_SWZ_IDENT, 6, 1);
+        check_count("high TC VP", rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl), 3);
+        check("TC8 VP map", g_hlsl, "Out.t8=o[15];");
+        check("TC9 VP map", g_hlsl, "Out.t9=o[6];");
+        if (translate("high TC VP", RSX_SHADER_STAGE_VERTEX) == 0) {
+            check("TC8 VP location", g_msl, "[[user(locn11)]]");
+            check("TC9 VP location", g_msl, "[[user(locn12)]]");
+        }
+        for (u32 tc = 8; tc <= 9; tc++) {
+            u8 fp[32];
+            char name[64], input[32], location[32];
+            snprintf(name, sizeof name, "projected TC%u FP", tc);
+            snprintf(input, sizeof input, "(input.tc%u).wwww", tc);
+            snprintf(location, sizeof location, "[[user(locn%u)]]", tc + 3);
+            /* DIV r1, TCn, TCn.wwww; TEX r0, r1 on unit 0. */
+            rsx_test_fp_instr(fp, RSX_TEST_FP_OPC(0x3A) | RSX_TEST_FP_MASK_XYZW |
+                RSX_TEST_FP_OUTREG(1) | RSX_TEST_FP_INSRC(4 + tc),
+                RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+            rsx_test_fp_put_word(fp + 8, RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ(3,3,3,3));
+            rsx_test_fp_instr(fp + 16, RSX_TEST_FP_OPC(RSX_TEST_FP_OP_TEX) |
+                RSX_TEST_FP_MASK_XYZW | RSX_TEST_FP_END, (1u << 2) | RSX_TEST_FP_SWZ_IDENT);
+            check_count(name, rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                        g_hlsl, sizeof g_hlsl, NULL), 2);
+            check(name, g_hlsl, input);
+            if (translate(name, RSX_SHADER_STAGE_FRAGMENT) == 0) {
+                check(name, g_msl, location);
+                check(name, g_msl, "[[texture(0)]]");
+            }
+        }
+    }
+
     /* ---- fragment program: MOV r0, COL0 ---------------------------------- */
     {
         u8 fp[16];

@@ -238,6 +238,8 @@ jobs:
         run: |
           test -x build/test_shader_msl
           ./build/test_shader_msl
+          # Exercise every varying through an actual Metal pipeline and pixel readback.
+          ./build/test_metal_high_texcoords
 
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
