@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <mutex>
+#include "spurs_workload_info_trace.h"
 #include <string.h>
 #include <stdlib.h>       /* getenv, atoi (boot trace) */
 
@@ -165,6 +166,7 @@ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    SpursWorkloadInfoTrace _spurs_info_trace(nid, ctx);
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --
