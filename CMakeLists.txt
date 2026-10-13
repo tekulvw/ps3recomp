@@ -400,6 +400,9 @@ if(PS3RECOMP_BUILD_TESTS)
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME spu_dma_poll
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_poll.py")
         add_test(NAME spu_sdcrz
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")

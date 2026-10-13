@@ -1222,28 +1222,11 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
-    /* A job re-issuing the SAME transfer forever is wedged, not slow: nothing
-     * about its state can change if the DMA is all it is doing. This used to
-     * count only REJECTED transfers, so once the EA check started committing
-     * pages on demand the counter never advanced and a spinning job simply hung
-     * the chain walker instead. Count repeats whether or not the transfer
-     * succeeds, and halt at a known pc rather than hanging silently. */
-    { static uint32_t s_last_ea, s_last_lsa, s_rep;
-      static uint32_t s_limit = 0;
-      if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
-                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
-      if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
-          if (++s_rep >= s_limit) {
-              s_rep = 0;   /* re-arm: the chain may run this job again */
-              extern void spu_halt(spu_context*);
-              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
-                      "transfers to ea=0x%08X -- halting the SPU\n",
-                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
-                      (uint32_t)ea);
-              fflush(stderr);
-              spu_halt(spu);
-          }
-      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
+    /* Repeated transfers are legal: an SPU can poll an asynchronous PPU,
+     * RSX or peer-SPU producer by fetching the same address into the same LS
+     * buffer. A transfer count cannot establish a guest halt, and aborting
+     * here would discard the lifted call stack before completing this DMA.
+     * Host execution bounds belong to the caller, outside MFC semantics. */
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
