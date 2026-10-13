@@ -11,7 +11,15 @@ intervals disable observation. Decimal numbers or numbers prefixed with
 16 words, maximum 32). Both must be positive integers within their bounds;
 invalid values disable observation. Configuration is read on first drain.
 
-Records begin with `[fifo-observe]`. Packet records show the original loaded
+Records begin with `[fifo-observe]`. Consecutive zero headers actually loaded
+by the decoder are combined into `kind=zeros` records with the first IO,
+exclusive end, number of zero headers, and first/last PUT. Zero packet payload
+words are never included in these runs. Runs flush on a nonzero command,
+noncontiguous IO, interval exit, or drain boundary, so a partial run is retained
+when GET catches PUT. Combining these no-op headers leaves room in the record
+cap for meaningful packets across a broader interval.
+
+Packet records show the original loaded
 header used by the decoder, IO position, PUT, decoded type/count/method,
 exclusive computed packet end, and a bounded sample of mapped payload words.
 Selection uses packet-span overlap, so a header before the interval can be

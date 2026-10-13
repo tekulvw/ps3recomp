@@ -21,6 +21,14 @@ with tempfile.TemporaryDirectory(prefix='gcm-observer-') as tmp:
     def run(settings,mode=None):
         result=subprocess.run([str(out)]+([mode] if mode else []),env=dict(clean,**settings),capture_output=True,text=True,check=True,timeout=10)
         return [x for x in result.stderr.splitlines() if x.startswith('[fifo-observe]')]
+    boundary=run({"GCM_FIFO_OBSERVE":"0x0-0x40"},"zero-boundary")
+    assert len(boundary)==2 and all('kind=zeros' in x and 'zero_words=4' in x for x in boundary),boundary
+    assert 'io=00000000' in boundary[0] and 'end=000000010' in boundary[0] and 'last_put=00000010' in boundary[0],boundary
+    assert 'io=00000010' in boundary[1] and 'end=000000020' in boundary[1] and 'first_put=00000020' in boundary[1],boundary
+    zeros=run({"GCM_FIFO_OBSERVE":"0x0-0x40"},"zeros")
+    assert len(zeros)==3 and 'kind=zeros' in zeros[0] and 'io=00000000' in zeros[0] and 'end=000000020' in zeros[0] and 'zero_words=8' in zeros[0],zeros
+    assert run({},"zeros")==[]
+    assert len(run({"GCM_FIFO_OBSERVE":"0x0-0x40","GCM_FIFO_OBSERVE_LIMIT":"2"},"zeros"))==2
     classified=run({"GCM_FIFO_OBSERVE":"0x18-0x40"},"classification")
     assert len(classified)==1 and "kind=flip" in classified[0],classified
     assert run({})==[]

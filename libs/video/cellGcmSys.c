@@ -2250,6 +2250,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         if(gcm_checked_ref_mode()){gcm_checked_ref_fail("unknown-word",s_fifo_getoff);break;}
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
+    gcm_observer_flush_zeros();
 
     /* Walker watchdog. Everything above recovers from a *recognised* stall --
      * a branch we cannot take, a park the title abandoned. A walker that stops
