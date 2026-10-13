@@ -403,6 +403,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME loader_memory_domain
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loader_memory_domain.py")
+        add_test(NAME mmapper_hle_heap
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mmapper_hle_heap.py")
         add_test(NAME user_memory_domain
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")

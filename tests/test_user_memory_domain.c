@@ -48,10 +48,10 @@ int main(void) {
  uint32_t before=out(); CHECK(allocate(0x10000,0x200)!=(int64_t)CELL_OK); CHECK(out()==before);
  reset();
  ppu_hle_inject_base=0x10000000u;
- CHECK(allocate(0x10000,0x200)==CELL_OK);CHECK(out()>=0x10010000u);
+ CHECK(allocate(0x10000,0x200)==CELL_OK);CHECK(out()>=0x11000000u);
  ppu_hle_inject_base=0x20000000u;
  reset();
- CHECK(reserve(0x80000000ull,0x10000000)==CELL_OK); CHECK(out()==0x40000000u);
+ CHECK(reserve(0x50000000ull,0x10000000)==CELL_OK); CHECK(out()==0x70000000u);
  CHECK(reserve(0x10000000ull,0x10000000)!=(int64_t)CELL_OK);
  CHECK(reserve(UINT64_MAX,0x10000000)!=(int64_t)CELL_OK);
  reset(); CHECK(reserve(0x100000,3)!=(int64_t)CELL_OK);
