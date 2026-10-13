@@ -31,6 +31,7 @@
 #  include "../platform/win32_compat.h"   /* _Interlocked*, YieldProcessor, Sleep */
 #endif
 
+#include "../output_provenance.h"
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
@@ -2460,9 +2461,25 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     }
 }
 
+/* The selected indirect entry uses r6=output EA,r8=output length.
+ * Record all argument registers so an investigator can verify that ABI. */
+static void ppu_output_provenance(ppu_context* ctx)
+{
+    if (!ps3_output_trace_enabled() || !ps3_output_trace.target ||
+        (uint32_t)ctx->ctr != ps3_output_trace.target ||
+        !ps3_output_trace_claim(1, (uint32_t)ctx->gpr[6], ctx->gpr[8])) return;
+    fprintf(stderr, "[output-provenance] ppu target=0x%08X out=0x%08X size=%llu lr=0x%08X tid=%llu r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X r31=%08X\n",
+        (uint32_t)ctx->ctr, (uint32_t)ctx->gpr[6], (unsigned long long)ctx->gpr[8],
+        (uint32_t)ctx->lr, (unsigned long long)ctx->thread_id,
+        (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
+        (uint32_t)ctx->gpr[6], (uint32_t)ctx->gpr[7], (uint32_t)ctx->gpr[8],
+        (uint32_t)ctx->gpr[9], (uint32_t)ctx->gpr[10], (uint32_t)ctx->gpr[31]);
+}
+
 static void ps3_indirect_call_impl(ppu_context* ctx)
 {
     g_active_ctx = ctx;
+    ppu_output_provenance(ctx);
     /* BCTRL_RING=1: keep the last N indirect-call targets per thread, and let
      * anything that can name a moment dump them. A render path built out of
      * function pointers and vtables -- a scene graph -- cannot be mapped from
@@ -3122,8 +3139,11 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         if (align < 0x100000u) align = 0x100000u;   /* 1 MB min */
         s_next_va = (s_next_va + align - 1) & ~(align - 1);
         uint32_t va = s_next_va;
-        s_next_va += (size + 0xFFFFFu) & ~0xFFFFFu;
+        uint32_t span = (size + 0xFFFFFu) & ~0xFFFFFu;
+        s_next_va += span;
         if (out) vm_write32(out, va);
+        ps3_output_trace_mapper(330, 0, va, span, ctx->gpr[3], ctx->gpr[4], (uint32_t)ctx->gpr[5], out,
+                                (uint32_t)ctx->lr, ctx->thread_id);
         ctx->gpr[3] = 0;
         return;
     }
@@ -3152,6 +3172,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
          * job's results are silently dropped. */
         vm_commit(va, size);
         if (outp) vm_write32(outp, va);
+        ps3_output_trace_mapper(337, start, va, size, 0, ctx->gpr[5], mem_id, outp,
+                                (uint32_t)ctx->lr, ctx->thread_id);
         ctx->gpr[3] = 0;
         return;
     }
