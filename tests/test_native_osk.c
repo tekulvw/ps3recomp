@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <unistd.h>
 #include "../libs/misc/cellOskDialog.h"
 #include "../libs/system/cellSysutil.h"
 #include "ps3emu/guest_call.h"
@@ -24,6 +25,8 @@ void ps3_np_ticket_tick(void){}
 static void put16(uint32_t a,uint16_t v){v=__builtin_bswap16(v);memcpy(memory+a,&v,2);}
 static OskNativeRequest request; static unsigned opens,closes,events;static uint32_t statuses[100];
 static int available=1;
+static unsigned confirms;static uint64_t confirmed_token;
+void osk_native_confirm(uint64_t token){confirms++;confirmed_token=token;}
 int osk_native_available(void){return available;}
 void osk_native_open(const OskNativeRequest* r){request=*r;opens++;}
 void osk_native_close(uint64_t token){assert(token==request.token);closes++;}
@@ -90,7 +93,52 @@ static int initial_text_case(const char* mode){
  for(unsigned i=0;i<5;i++)assert(read16(0x2200+i*2)==edited[i]);cellSysutilCheckCallback();
  printf("Native OSK initial text case %s passed\n",mode);return 0;
 }
+
+/* Rejecting pre-open, stale, oversized, and repeated commands is observable at
+ * the actual host boundary; the adapter itself never completes guest input. */
+static void command(const char* text){
+ const char* path=getenv("TEST_CONTROL_FILE");assert(path);
+ FILE* f=fopen(path,"w");assert(f);assert(fputs(text,f)>=0);assert(!fclose(f));
+}
+static void confirm_command(uint64_t token){char line[64];snprintf(line,sizeof(line),"confirm %llu\n",(unsigned long long)token);command(line);}
+static int control_case(int enabled){
+ const char* path=getenv("TEST_CONTROL_FILE");assert(path);
+ memset(memory,0,sizeof(memory));vm_write32(0x1000,0x2000);vm_write32(0x1004,0x2100);vm_write32(0x1008,32);
+ put16(0x2000,'N');guest_name();assert(!load());uint64_t token=request.token;
+ confirm_command(token);cellOskDialog_tick();assert(!confirms);
+ if(!enabled){
+  assert(!access(path,F_OK));assert(!setenv("OSK_NATIVE_CONTROL_FILE",path,1));
+  osk_native_did_open(token);cellOskDialog_tick();assert(!confirms && !access(path,F_OK)); // opt-in is cached at startup
+  assert(!cellOskDialogAbort());cellOskDialog_tick();result_at(32);assert(!cellOskDialogUnloadAsync((void*)0x1200));cellOskDialog_tick();
+  puts("Unconfigured native OSK control leaves file and lifecycle untouched");return 0;
+ }
+ assert(access(path,F_OK)); // consumed during LOADING; must not later submit
+ osk_native_did_open(token);cellOskDialog_tick();assert(!confirms);
+ const char* invalid[]={"", "confirm", "confirm 0\n", "confirm -1\n", "confirm +1\n", "confirm 1 junk\n", "confirm 18446744073709551616\n", "confirm 1\nconfirm 1\n", "bogus 1\n"};
+ for(unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++){
+  command(invalid[i]);cellOskDialog_tick();assert(!confirms && access(path,F_OK));
+ }
+ FILE* binary=fopen(path,"w");assert(binary);const char embedded[]="confirm 1\0hidden";
+ assert(fwrite(embedded,1,sizeof(embedded)-1,binary)==sizeof(embedded)-1);assert(!fclose(binary));
+ cellOskDialog_tick();assert(!confirms && access(path,F_OK));
+ char oversized[200];memset(oversized,'x',sizeof(oversized)-1);oversized[sizeof(oversized)-1]=0;
+ command(oversized);cellOskDialog_tick();assert(!confirms && access(path,F_OK));
+ confirm_command(token+1);cellOskDialog_tick();assert(!confirms && access(path,F_OK));
+ confirm_command(token);cellOskDialog_tick();assert(confirms==1 && confirmed_token==token && access(path,F_OK));
+ result_at(32);assert(!cellOskDialogGetInputText((void*)0x1200));assert(read32(0x1200)==3);
+ assert(cellOskDialogUnloadAsync((void*)0x1200)==(int32_t)0x8002B105);
+ confirm_command(token);cellOskDialog_tick();assert(confirms==1 && access(path,F_OK));
+ assert(!cellOskDialogAbort());confirm_command(token);cellOskDialog_tick();assert(confirms==1 && access(path,F_OK));
+ result_at(32);assert(!cellOskDialogUnloadAsync((void*)0x1200));assert(read32(0x1200)==2);cellOskDialog_tick();
+ assert(!load());osk_native_did_open(request.token);confirm_command(token);cellOskDialog_tick();assert(confirms==1);
+ confirm_command(request.token);cellOskDialog_tick();assert(confirms==2 && confirmed_token==request.token);
+ assert(!cellOskDialogAbort());cellOskDialog_tick();result_at(32);assert(!cellOskDialogUnloadAsync((void*)0x1200));cellOskDialog_tick();
+ puts("Native OSK control consumption / token / open race / cancellation / one-shot checks passed");return 0;
+}
+
 int main(int argc,char** argv){
+ if(argc==2 && !strcmp(argv[1],"control"))return control_case(1);
+ if(argc==2 && !strcmp(argv[1],"control-off"))return control_case(0);
  if(argc==2)return initial_text_case(argv[1]);
  memset(memory,0xA5,sizeof(memory));
  vm_write32(0x1000,0x2000);vm_write32(0x1004,0x2100);vm_write32(0x1008,32);
