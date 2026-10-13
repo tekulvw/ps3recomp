@@ -16,6 +16,9 @@ int osk_native_available(void);
 void osk_native_macos_set_window(void* window);
 void osk_native_open(const OskNativeRequest* request);
 void osk_native_close(uint64_t token);
+/* Optional host test control always routes through the real native OK button. */
+void osk_native_confirm(uint64_t token);
+int osk_native_is_open(uint64_t token);
 /* UI thread publishes only host-owned data. Events are emitted by the guest pump. */
 int osk_native_is_pending(uint64_t token);
 void osk_native_did_open(uint64_t token);
