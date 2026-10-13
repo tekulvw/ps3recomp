@@ -10,6 +10,15 @@
 #include <string.h>
 #include <errno.h>
 
+/* This clock is provided by the C runtime, including for C++ DMA callers. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern unsigned long long ps3_ms_now(void);
+#ifdef __cplusplus
+}
+#endif
+
 typedef struct mfc_source_trace_config {
     uint64_t lo, hi;
     int enabled;
@@ -60,7 +69,6 @@ static inline void mfc_trace_source_f32be(spu_context* spu, uint32_t lsa,
         (uint32_t)((mfc_source_trace.lo - start + 3) / 4) : 0;
     uint32_t last = (uint32_t)(((end < mfc_source_trace.hi ? end : mfc_source_trace.hi) - start) / 4);
     if (last <= first) return;
-    extern unsigned long long ps3_ms_now(void);
     unsigned long long now = ps3_ms_now();
     LONG64 prior = InterlockedCompareExchange64(&mfc_source_trace.next_ms, 0, 0);
     /* The atomic claim bounds all emitting threads to one scan per five seconds

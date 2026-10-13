@@ -40,10 +40,15 @@ Run the synthetic direct/list DMA fixture with:
 
 ```sh
 python3 tools/test_spu_dma_source_f32be.py
+python3 tools/test_spu_dma_source_f32be_linkage.py
 ```
 
 It checks explicit opt-in, invalid/missing ranges, negative zero, finite peaks,
 NaN/infinity accounting, partial watch boundaries, five-second rate limiting,
 a concurrent eight-thread window claim, masked local-store addresses, maximum-size last-word coverage and rejected
 local-store/EA overruns. Accepted DMA byte copies and source preservation are
-asserted through the real direct/list transfer paths.
+asserted through the real direct/list transfer paths. Watched PUTs after a GET,
+an unrelated PUT and a partial-word-only PUT verify that those operations leave
+the logging window available. The linkage fixture compiles both the full DMA
+header and the standalone observer as C++, links them to a C-defined runtime
+clock, and rejects an intentional clock-linkage mismatch.
