@@ -417,6 +417,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spinlock_word_width
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
+        add_test(NAME spurs_task_exit_container
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_task_exit_container.py")
         add_test(NAME spurs_task_exit_code_initialize
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_task_exit_code_initialize.py")
