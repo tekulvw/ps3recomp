@@ -8,6 +8,7 @@
 #include <time.h>
 #include "spu_interp.h"
 #include "spu_helpers.h"
+#include "spu_pc_observer.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -391,6 +392,7 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
 }
 
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    int observe = spu_pc_observer_enabled();
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
@@ -500,6 +502,17 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                 LB(0x2700),LB(0x2710),LB(0x2720),LB(0x2730),LB(0x2740),LB(0x2750),LB(0x2790),LB(0x2794),LB(0x27D8),LB(0x2FB0));
             #undef LB
             fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
+        }
+        if (observe) {
+            /* Observe only instructions this invocation will execute, after
+             * lifted/stop rejoin checks. The disabled flag is cached above. */
+            if ((uint32_t)ReadAcquire(&g_spu_pc_observer.events)>=g_spu_pc_observer.limit) {
+                observe = 0;
+            } else {
+                uint32_t pc = ctx->pc, m = pc & SPU_LS_MASK;
+                uint32_t opcode = spu_pc_observer_word(ctx->ls + m);
+                spu_pc_observe_enabled(ctx, pc, opcode);
+            }
         }
         if (spu_step(ctx)) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
