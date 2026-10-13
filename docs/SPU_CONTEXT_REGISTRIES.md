@@ -3,8 +3,9 @@
 The SPURS HLE retains a context for each workload/lane across scheduling quanta.
 That count can exceed the physical SPU count even when only one policy executes
 at a time. The previous global eight-entry MFC table assigned all later contexts
-one shared engine; the coherence table omitted later reservation holders. Real
-MAG v1.0 initialized workloads 8–10 after both limits were exhausted.
+one shared engine; the coherence table omitted later reservation holders.
+Retained contexts beyond that limit could therefore share DMA completion state
+or miss reservation events when later workloads ran.
 
 Both registries now grow with live context ownership instead of a numeric cap.
 MFC nodes keep stable engine addresses and private queue/tag state. An existing
@@ -29,11 +30,8 @@ ownership over introducing per-context caches or a new synchronization scheme.
 It does not prove full scheduler conformance. Inherited global workload/lane
 caching, workload removal/finalization, raw-SPU restart, and stopping threads
 before group destruction still need separate lifecycle review. The existing
-unlocked coherence bitmap fast-path reads are unchanged. This branch does not
-claim that exceeding eight contexts caused MAG workload 4's missing-receiver
-halt: that workload was resolved before the overflow warnings. Missing
-registration does provably lose same-value and ABA invalidations that snapshot
-polling cannot reconstruct.
+unlocked coherence bitmap fast-path reads are unchanged. Missing registration
+loses same-value and ABA invalidations that snapshot polling cannot reconstruct.
 
 `python3 tools/test_spu_context_registries.py` runs POSIX C fixtures. They cover
 12 concurrent MFC owners, private queue/tag state, actual stalled-list DMA and
