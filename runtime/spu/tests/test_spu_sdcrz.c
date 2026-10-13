@@ -50,6 +50,9 @@ int main(void) {
     spu_wrch(&writer,MFC_TagID,spu_splat_u32(11));
     spu_wrch(&writer,MFC_Cmd,spu_splat_u32(0x89));
     cleared(ea,2048);
+    prepare(ea,2048);
+    /* Upper halfword is replacement/transfer class; lower16 is opcode. */
+    spu_wrch(&writer,MFC_Cmd,spu_splat_u32(0x01020089u));cleared(ea,2048);
     /* Independently encode synthetic wrch instructions with preloaded registers. */
     prepare(ea,16384);
     const unsigned channels[]={MFC_EAL,MFC_Size,MFC_TagID,MFC_Cmd};
@@ -89,6 +92,8 @@ int main(void) {
         writer.mfc_eal=(uint32_t)invalid[i].ea;writer.mfc_size=invalid[i].size;
         assert(mfc_submit(mfc_for(&writer),&writer,0x89)==-1);
         for(unsigned j=0;j<2048;j++)assert(guest[ea+j]==0x77);
+        assert(!(mfc_for(&writer)->tag_completed&(1u<<11)));
+        assert(mfc_submit(mfc_for(&writer),&writer,0x01020089u)==-1);
         assert(!(mfc_for(&writer)->tag_completed&(1u<<11)));
     }
     prepare(ea,2048);uint8_t* real_vm=vm_base;vm_base=NULL;

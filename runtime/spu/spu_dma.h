@@ -172,7 +172,8 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
-    if (cmd == MFC_SDCRZ_CMD) {
+    /* Upper16 command-channel bits carry replacement/transfer class IDs. */
+    if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
         /* CBEA 1.02 section 7.7.3: SDCRZ writes zeros in EA space, without an
          * LSA operand. Storage-control alignment is implementation-specific
          * (table 7-6); currently support whole 128-byte blocks, up to 16 KiB.
@@ -1506,7 +1507,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * element: its tag group stays incomplete until MFC_WrListStallAck resumes
      * it to the end (mfc_list_stall_ack marks completion then). */
     if (!(spu->list_stall_mask & (1u << (tag & 0x1F))) &&
-        (cmd != MFC_SDCRZ_CMD || rc == 0))
+        ((cmd & 0xFFFFu) != MFC_SDCRZ_CMD || rc == 0))
         mfc->tag_completed |= (1u << tag);
 
     return rc;
