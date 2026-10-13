@@ -40,6 +40,7 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 #include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
 #include "../spu/spu_lifted_thread.h" /* run a thread's own image, lifted */
 #include "../spu/spu_context.h"       /* the architectural context that runs it */
+#include "../spu/spurs_policy_service.h"
 #include "../spu/spu_workload.h"   /* the content-fingerprint registry */
 #include "sys_event.h"
 
@@ -1457,6 +1458,28 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
     uint32_t tid = (uint32_t)ctx->gpr[3];
     uint32_t val = (uint32_t)ctx->gpr[4];
 
+    spu_context* service = spurs_policy_service_acquire(tid);
+    if (service) {
+        /* Keep kernel enqueue acknowledgement and PPU reply as separate FIFO
+         * words. Check and append under the channel lock; never report success
+         * for a dropped reply, nor wait under the policy admission lock. */
+        spu_channel* ch = &service->ch_in_mbox;
+        SPU_CH_LOCK(ch);
+        uint32_t result = ch->count >= SPU_IN_MBOX_HW_DEPTH ? CELL_EBUSY : CELL_OK;
+        if (!result) {
+            ch->q[(ch->head + ch->count) % SPU_CHANNEL_CAP] = val;
+            ch->value = ch->q[ch->head];ch->count++;
+        }
+        SPU_CH_UNLOCK(ch);
+        spu_ch_wake(service);
+        spurs_policy_service_release(service);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
+        return (int64_t)(int32_t)result;
+    }
+    if (spurs_policy_service_is_id(tid)) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
     spu_thread_t* t = spu_find_thread(tid);
     if (!t) {
         /* Not the guest's error -- ours. Our SPU threads are not resident:
@@ -1675,6 +1698,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
     }
     if (code >= 128) return 0;
     uint32_t result = CELL_EINVAL;
+    int service_acked = 0;
     if (spu->ch_out_mbox.count) {
         uint32_t data = spu_channel_read(&spu->ch_out_mbox);
         unsigned port = code & 63;
@@ -1700,12 +1724,36 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
         }
         result = CELL_ENOTCONN;
         if (queue) {
+            uint32_t identity = spurs_policy_service_identity(spu);
+            if (!identity) identity = spu->spu_id;
+            /* A PPU reply may arrive as soon as the event is visible. Keep
+             * the kernel enqueue acknowledgement ahead of that separate word. */
+            int service_ack = spurs_policy_service_is_id(identity) && code < 64;
+            if (service_ack) {
+                SPU_CH_LOCK(&spu->ch_in_mbox);
+                if (spu->ch_in_mbox.count >= SPU_IN_MBOX_HW_DEPTH) {
+                    /* send_event requires an empty inbox. A malformed raw
+                     * request with no ACK capacity must not publish an event
+                     * or pretend an acknowledgement was queued. */
+                    SPU_CH_UNLOCK(&spu->ch_in_mbox);
+                    return 1;
+                }
+            }
             int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
-                spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
+                identity, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
             result = rc == 0 ? CELL_OK : CELL_EBUSY;
+            if (service_ack) {
+                spu_channel* ch = &spu->ch_in_mbox;
+                if (ch->count < SPU_IN_MBOX_HW_DEPTH) {
+                    ch->q[(ch->head + ch->count) % SPU_CHANNEL_CAP] = result;
+                    ch->value = ch->q[ch->head];ch->count++;
+                    service_acked = 1;
+                }
+                SPU_CH_UNLOCK(ch);
+            }
         }
     }
-    if (code < 64) spu_channel_write(&spu->ch_in_mbox, result);
+    if (code < 64 && !service_acked) spu_channel_write(&spu->ch_in_mbox, result);
     return 1;
 }
 
@@ -1824,6 +1872,17 @@ static int64_t sys_spu_thread_write_ls_handler(ppu_context* ctx)
     uint32_t ls_offset = (uint32_t)ctx->gpr[4];
     uint64_t value     = (uint64_t)ctx->gpr[5];
     uint32_t type      = (uint32_t)ctx->gpr[6];
+    spu_context* service = spurs_policy_service_acquire(tid);
+    if (service) {
+        uint32_t result = CELL_OK;
+        if ((type != 1 && type != 2 && type != 4 && type != 8) ||
+            ls_offset > SPU_LS_SIZE || type > SPU_LS_SIZE - ls_offset) result = CELL_EFAULT;
+        else for (uint32_t i = 0; i < type; ++i)
+            service->ls[ls_offset+i] = (uint8_t)(value >> ((type-1-i)*8));
+        spurs_policy_service_release(service);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
+        return (int64_t)(int32_t)result;
+    }
     spu_thread_t* t = spu_find_thread(tid);
     if (!t) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
@@ -1872,6 +1931,23 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
             char who[64]; ppu_guest_caller(who, sizeof who);
             fprintf(stderr, "[spu-readls] tid=0x%08X off=0x%05X size=%u from %s\n",
                     tid, ls_offset, type, who); } }
+    spu_context* service = spurs_policy_service_acquire(tid);
+    if (service) {
+        uint32_t result = CELL_OK;
+        if (!vm_base || !value_ea || value_ea > UINT32_MAX - 7u ||
+            (ppu_vm_size && (value_ea > ppu_vm_size || 8u > ppu_vm_size - value_ea))) result = CELL_EFAULT;
+        else if ((type != 1 && type != 2 && type != 4 && type != 8) ||
+                 ls_offset > SPU_LS_SIZE || type > SPU_LS_SIZE - ls_offset) result = CELL_EFAULT;
+        else {
+            uint64_t value = 0;
+            for (uint32_t i = 0; i < type; ++i) value = (value << 8) | service->ls[ls_offset+i];
+            extern void vm_write64(uint64_t, uint64_t);
+            vm_write64(value_ea, value);
+        }
+        spurs_policy_service_release(service);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
+        return (int64_t)(int32_t)result;
+    }
     /* A SPURS job chain is polled by its CHAIN HANDLE, not an lv2 thread id.
      * This is the SPU PRINTF service: it reads a pointer from local store and
      * then walks a format string byte by byte (func_00250A8C). Without this
