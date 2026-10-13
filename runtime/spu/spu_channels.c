@@ -2073,13 +2073,13 @@ void spu_indirect_branch(spu_context* ctx)
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
-        extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
+        extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
              * Print gated: fires once per policy run = thousands/sec. */
             g_spurs_pm_exited = 1;
-            { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
-              if (s_t) { static unsigned long _n = 0; unsigned long n = ++_n;
+            { static SPU_THREAD_LOCAL int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
+              if (s_t) { static SPU_THREAD_LOCAL unsigned long _n = 0; unsigned long n = ++_n;
                 if (n <= 64 || (n & 0xFFF) == 0)
                     fprintf(stderr, "[spurs-pm] exit-to-kernel#%lu (r3=0x%08X polls=%u)\n",
                             n, ctx->gpr[3]._u32[0], g_spurs_pm_polls); } }
@@ -2089,7 +2089,7 @@ void spu_indirect_branch(spu_context* ctx)
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
             /* cellSpursModulePoll: report "no contention — keep running".
-             * (One virtual SPU per workload here, so nothing ever preempts.) */
+             * (The host scheduler admits bounded workers; this service does not preempt.) */
             unsigned n = ++g_spurs_pm_polls;
             if (n <= 4 || (n % 4096) == 0)
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
