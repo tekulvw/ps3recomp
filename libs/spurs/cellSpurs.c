@@ -1456,6 +1456,32 @@ s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr)
     return CELL_OK;
 }
 
+/* NID: 0x34552FA6. Initialization only; task attachment and completion are
+ * separate APIs. Use the firmware's task-domain errors here rather than the
+ * legacy module-wide error aliases in cellSpurs.h. */
+s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode)
+{
+    u32 ea = (u32)(uintptr_t)exitCode;
+    if (!ea) return (s32)0x80410911u;
+    if (ea & 0x7Fu) return (s32)0x80410910u;
+
+    /* A zero size denotes the existing fully backed 32-bit VM convention.
+     * Native-VA ports may have a null base with a nonzero mapped size. Check
+     * before forming a host address, so malformed EAs cannot wrap or write
+     * outside a bounded arena. FAULT is a host-backing safety failure. */
+    extern u32 ppu_vm_size;
+    u64 end = (u64)ea + 0x80u;
+    uintptr_t base = (uintptr_t)vm_base;
+    if ((!vm_base && !ppu_vm_size) ||
+        end > 0x100000000ull ||
+        (ppu_vm_size && end > ppu_vm_size) ||
+        base > UINTPTR_MAX - ea || base + ea > UINTPTR_MAX - 0x7Fu)
+        return (s32)0x8041090Du;
+
+    memset((void*)(base + ea), 0, 0x80u);
+    return CELL_OK;
+}
+
 /* =========================================================================
  * Workload
  * =====================================================================*/
