@@ -27,8 +27,16 @@ struct Formatter { uint32_t id; };
 static void* formatter(void* arg) {
     struct Formatter* f=arg;
     while(!__atomic_load_n(&delayed_started,__ATOMIC_ACQUIRE)) { struct timespec t={0,1000000};nanosleep(&t,NULL); }
-    struct timespec delay={0,30000000};nanosleep(&delay,NULL);
-    delayed_early=__atomic_load_n(&delayed_returned,__ATOMIC_ACQUIRE);
+    spu_context* actual=spurs_policy_service_acquire(f->id);assert(actual);
+    int observed=0;
+    for(unsigned i=0;i<2000;i++) {
+        delayed_early=__atomic_load_n(&delayed_returned,__ATOMIC_ACQUIRE);
+        uint32_t status=(uint32_t)InterlockedCompareExchange((LONG*)&actual->status,0,0);
+        if(delayed_early || status==SPU_STATUS_WAITING_CHANNEL){observed=1;break;}
+        struct timespec tick={0,1000000};nanosleep(&tick,NULL);
+    }
+    assert(observed); /* Never publish merely because a timer expired. */
+    spurs_policy_service_release(actual);
     ppu_context p={0};p.gpr[3]=f->id;p.gpr[4]=0x200;p.gpr[5]=0x800;p.gpr[6]=4;
     assert(!sys_spu_thread_read_ls_handler(&p));
     p.gpr[3]=f->id;p.gpr[4]=0x76543210;assert(!sys_spu_thread_write_spu_mb_handler(&p));
