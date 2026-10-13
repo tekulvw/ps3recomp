@@ -21,6 +21,8 @@ int osk_native_is_pending(uint64_t token);
 void osk_native_did_open(uint64_t token);
 void osk_native_host_closed(uint64_t token);
 void osk_native_did_finish(uint64_t token,int32_t result,const uint16_t* text,uint32_t length);
+/* True only for the current generation with a native OK/Cancel result. */
+int osk_native_has_ui_result(uint64_t token);
 int32_t osk_native_load(uint32_t param,uint32_t input);
 int32_t osk_native_unload(uint32_t result);
 int32_t osk_native_get_text(uint32_t result);

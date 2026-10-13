@@ -9,3 +9,31 @@ Abort completes with the abort result and invalidates an unshown/open request. L
 `tools/test_native_osk.py` exercises real guest memory and real sysutil dispatch with a simulated host boundary, including a background-thread completion, duplicate load, no completion before user action, stale tokens, Unicode truncation, cancel, abort, invalid parameters, and guest-buffer canaries. On macOS it also runs the real AppKit sheet: Unicode OK, secure-field Cancel, and pre-open Abort, checking the deferred guest callbacks.
 
 Reference semantics: [RPCS3 cellOskDialog.cpp](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellOskDialog.cpp). Original MAG retail callback OPD 0x01ADEC60 points to 0x00122E28, which recognizes the same three lifecycle statuses; its FINISHED path requests UnloadAsync, and UNLOADED invokes the game's supplied callback.
+
+## Keyboard focus after completion
+
+The runtime pumps AppKit events itself. When a native text-input sheet finishes,
+its completion handler runs while the finishing sheet is still attached to the
+parent. Calling `makeFirstResponder` alone does not make the game window key,
+and `makeKeyWindow` is ineffective until the sheet detaches. Keyboard input can
+therefore remain unavailable until the user clicks the game window.
+
+Native OK and Cancel now schedule the keyboard handoff on the next main-queue
+turn. The handoff makes the game window key and restores its content view as the
+first responder only when the app remains active, the original parent is still
+registered and visible, the current generation has a real native OK/Cancel
+result, no other sheet is attached, and no newer OSK owns the UI. It also checks
+that another window has not become key. Per-dialog observers remember a user's
+switch to another application or window until this handoff completes. Abort,
+parent closure, replacement, and later generations invalidate restoration.
+The handoff never activates the app or brings another application forward.
+
+The macOS fixture launches as its own app so activation and keyboard ownership
+are real. After acquiring focus, it uses the runtime-style manual event pump;
+NSApplication's automatic main loop would otherwise hide the missing handoff.
+It checks native key-event dispatch into the game pad view after real OK/Cancel,
+unchanged Unicode result bytes and deferred guest callbacks, another selected
+window, a follow-up sheet, parent re-registration, an actual cooperative switch
+to a second isolated test app, and abort/closure. It does not fake key-window or
+application-active getters. Run `python3 tools/test_native_osk.py` in a macOS
+graphical session; `--mailbox-only` retains the portable lifecycle checks.
