@@ -18,6 +18,7 @@
 #include "spu_context.h"
 #include "../output_provenance.h"
 #include "spu_coherency.h"
+#include "spu_dma_source_trace.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -610,6 +611,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               }
           } }
     } else if (mfc_is_put(cmd)) {
+        mfc_trace_source_f32be(spu, lsa, ea, size, cmd);
         /* PUT: local store -> main memory.
          *
          * A plain PUT is a store by another processor as far as every SPU
