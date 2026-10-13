@@ -13,6 +13,7 @@
 extern "C" {
 uint8_t* vm_base;
 uint32_t ppu_vm_size=0x10000;
+uint32_t ppu_hle_inject_base=0x20000000;
 uint32_t g_ww_lo=0,g_ww_hi=0;
 int g_resv_store_active=0;
 ps3_guest_caller_fn g_ps3_guest_caller=nullptr;
