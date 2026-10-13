@@ -769,9 +769,7 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 
     /* Args arrive as guest effective addresses (ps3_hle_call passes raw guest
      * register values); translate to host before dereferencing. */
-    taskset = GUEST_PTR(taskset, CellSpursTaskset*);
-
-    if (!spurs || !taskset) {
+    if (!spurs_ea || !taskset_ea) {
         fprintf(stderr, "[cellSpurs] CreateTaskset REJECT null (spurs=0x%08X taskset=0x%08X)\n",
                 spurs_ea, taskset_ea);
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
@@ -785,6 +783,7 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 
     if (!spurs_guest_range_valid(taskset_ea, taskset_size))
         return (s32)0x8041090Du; /* host backing safety, before writes */
+    taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     memset(taskset, 0, taskset_size);
 
     /* Write the REAL big-endian CellSpursTaskset layout (fork Option-B) so the lifted
