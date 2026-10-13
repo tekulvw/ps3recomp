@@ -577,6 +577,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
         spu_lockline_unlock();
+        spu_dma_publication_observe_atomic(ctx, lsa, ea, cmd, SPU_DMA_ATOMIC_GETLLAR_COMPLETE);
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -730,6 +731,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
+        spu_dma_publication_observe_atomic(ctx, lsa, ea, cmd,
+            ctx->atomic_stat ? SPU_DMA_ATOMIC_PUTLLC_FAILURE : SPU_DMA_ATOMIC_PUTLLC_SUCCESS);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
