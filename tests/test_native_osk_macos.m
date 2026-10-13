@@ -110,10 +110,8 @@ static void focus_races(NSWindow* window){
 static void run_fixture(void){@autoreleasepool {
  int controlled=getenv("OSK_NATIVE_CONTROL_FILE") && *getenv("OSK_NATIVE_CONTROL_FILE");
  vm_base=calloc(1,65536);assert(vm_base);
- [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];[NSApp finishLaunching];
- s_dev=MTLCreateSystemDefaultDevice();assert(s_dev);
- assert(!create_window_impl("OSK fixture"));NSWindow* window=s_window;window.releasedWhenClosed=NO;assert(osk_native_available());
- if(@available(macOS 14.0,*))[NSApp activate];else [NSApp activateIgnoringOtherApps:YES];[window makeKeyAndOrderFront:nil];for(int i=0;i<15 && (!NSApp.isActive || !window.isKeyWindow);i++)run_ui();fprintf(stderr,"FOCUS initial active=%d key=%d\n",NSApp.isActive,window.isKeyWindow);game_keys(window);
+ NSWindow* window=s_window;assert(osk_native_available());
+ fprintf(stderr,"FOCUS initial active=%d key=%d\n",NSApp.isActive,window.isKeyWindow);game_keys(window);
  vm_write32(0x1000,0x2000);vm_write32(0x1004,0x2100);vm_write32(0x1008,32);put16(0x2000,'N');put16(0x2002,0);
  const uint16_t original[]={'P','l','a','y','e','r',0};
  for(unsigned i=0;i<7;i++)put16(0x2100+i*2,original[i]);
@@ -167,6 +165,22 @@ int main(int argc,char** argv){@autoreleasepool {
   [NSApp run];return 0;
  }
  [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
- [NSTimer scheduledTimerWithTimeInterval:.05 repeats:NO block:^(NSTimer* timer){(void)timer;[NSApp stop:nil];run_fixture();[NSApp terminate:nil];}];
+ // Acquire genuine startup activation in AppKit's normal loop, then stop
+ // before any OSK is opened. The production-style pump must own every sheet.
+ [NSTimer scheduledTimerWithTimeInterval:.05 repeats:NO block:^(NSTimer* timer){
+  (void)timer;s_dev=MTLCreateSystemDefaultDevice();assert(s_dev);
+  assert(!create_window_impl("OSK fixture"));s_window.releasedWhenClosed=NO;
+  if(@available(macOS 14.0,*))[NSApp activate];else [NSApp activateIgnoringOtherApps:YES];
+  [s_window makeKeyAndOrderFront:nil];
+  __block unsigned startup_ticks=0;
+  [NSTimer scheduledTimerWithTimeInterval:.05 repeats:YES block:^(NSTimer* startup){
+   if(NSApp.isActive && s_window.isKeyWindow && NSApp.keyWindow==s_window){
+    [startup invalidate];[NSApp stop:nil];run_fixture();[NSApp terminate:nil];
+   }else if(++startup_ticks==100){
+    fprintf(stderr,"FOCUS startup timeout active=%d key=%d\n",NSApp.isActive,s_window.isKeyWindow);
+    assert(!"test app did not acquire real startup focus");
+   }
+  }];
+ }];
  [NSApp run];
 }return 0;}
