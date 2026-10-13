@@ -9,6 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../spu_dma.h"
+/* Native diagnostic SDKs provide the real publication hook in this header. */
+#if defined(__has_include)
+#if __has_include("../spu_dma_publication_impl.h")
+#include "../spu_dma_publication_impl.h"
+#endif
+#endif
 
 static uint8_t memory[0x40000];
 uint8_t* vm_base = memory;
