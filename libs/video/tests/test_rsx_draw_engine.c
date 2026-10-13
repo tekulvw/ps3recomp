@@ -13,6 +13,8 @@
  * Builds and runs on Linux as well as macOS; nothing in it is Apple-specific.
  */
 #include "rsx_draw_engine.h"
+#include "rsx_test_programs.h"
+#include "rsx_fp_decompiler.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
 
 #include <stdio.h>
@@ -72,6 +74,7 @@ typedef struct {
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
+    char last_ps[8192];
     int n_draw, n_clear_color, n_clear_ds, n_present;
     u32 cleared[STUB_MAX_CLEARED];
 
@@ -164,6 +167,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
 {
     (void)u; (void)rs; (void)layout; (void)stride; (void)rt;
     if (!vs || !ps || !*vs || !*ps) return 0;
+    snprintf(stub.last_ps, sizeof stub.last_ps, "%s", ps);
     stub.n_pipeline_create++;
     stub.pipeline_rt_count = rt_count;
     return stub_handle();
@@ -681,6 +685,60 @@ static void test_pipeline_key(void)
     engine_down();
 }
 
+/* BX2 makes eligible texture lanes part of shader identity. Changing the
+ * remap/format must rebuild that shader; changing an unrelated unit or a
+ * texture used by an ordinary fetch must not multiply pipelines. */
+static void test_bx2_pipeline_state(void)
+{
+    printf("-- BX2 pipeline state\n");
+    engine_up();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    u8 vp[16];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
+    m(0x1E9C, 0);
+    for (u32 i = 0; i < 4; i++) {
+        u32 word;
+        memcpy(&word, vp + i * 4, 4);
+        m(0x0B80 + i * 4, word);
+    }
+    const u32 fp_offset = TEX_OFFSET + 0x1000;
+    u8* fp = vm_base + fp_offset;
+    rsx_test_fp_tex_r0_tc0(fp, 0);
+    const u32 plain = rsx_fp_read_word(fp);
+    rsx_test_fp_put_word(fp, plain | (1u << 21));
+    m(0x08E4, fp_offset | 2u);
+    m(0x1D60, 0x40);
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 1 && strstr(stub.last_ps, "float4(2,2,2,2)"),
+          "BX2 compiles expansion for the bound normalized texture");
+    m(M_TEX_UNIT + 0x10, 0x92E4);
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 2 && strstr(stub.last_ps, "float4(1,1,2,2)"),
+          "remap ZERO/ONE updates shader expansion and pipeline identity");
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 2, "unchanged BX2 state reuses its pipeline");
+    m(M_TEX_UNIT + 0x20 + 0x0C, 0x80000000);
+    m(M_TEX_UNIT + 0x20 + 0x10, 0x92E4);
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 2, "an unused unit does not affect BX2 identity");
+    m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | (0xBBu << 8) | (1u << 16));
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 3 && !strstr(stub.last_ps, " - float4("),
+          "switching to float texture compiles ordinary sampling");
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 3, "restored BX2 state reuses its first pipeline");
+    rsx_test_fp_put_word(fp, plain);
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 4, "plain fetch has its own shader identity");
+    m(M_TEX_UNIT + 0x10, 0x92E4);
+    m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | (0xBBu << 8) | (1u << 16));
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 4,
+          "ordinary fetch ignores changes to BX2 eligibility");
+    engine_down();
+}
+
 /* ---- 5. restart cuts and topology expansion ------------------------------ */
 
 static void test_restart_expansion(void)
@@ -1165,6 +1223,7 @@ int main(void)
     test_mrt_set();
     test_texture_cache();
     test_pipeline_key();
+    test_bx2_pipeline_state();
     test_restart_expansion();
     test_indexed_draws();
     test_scissor();

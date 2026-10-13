@@ -238,6 +238,8 @@ jobs:
         run: |
           test -x build/test_shader_msl
           ./build/test_shader_msl
+          test -x build/test_metal_texture_expand
+          ./build/test_metal_texture_expand
 
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded

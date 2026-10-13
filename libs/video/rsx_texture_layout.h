@@ -206,6 +206,11 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
  * not, which is precisely that regression. */
 void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4]);
 
+/* RGBA lanes eligible for a TEX_BX2 instruction. Opcode expansion applies
+ * to normalized color data, preserves ZERO/ONE remap outputs, and does not
+ * override signed input channels. Float/depth formats are not expanded. */
+u8 rsx_texture_bx2_mask(u32 rsx_fmt, u32 control1, u32 filter);
+
 /* TEX_RGBA: treat A8R8G8B8 source bytes as already R,G,B,A and copy them
  * straight through.
  *

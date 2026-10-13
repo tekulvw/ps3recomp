@@ -432,6 +432,17 @@ if(UNIX)
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
         )
         target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
+        if(APPLE)
+            add_executable(test_metal_texture_expand
+                libs/video/tests/test_metal_texture_expand.m
+                libs/video/rsx_shader_msl.cpp
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c)
+            target_include_directories(test_metal_texture_expand PRIVATE include libs/video)
+            target_compile_options(test_metal_texture_expand PRIVATE "$<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>")
+            target_link_libraries(test_metal_texture_expand PRIVATE ps3recomp_msl_translation "-framework Metal" "-framework Foundation")
+        endif()
     endif()
 endif()
 

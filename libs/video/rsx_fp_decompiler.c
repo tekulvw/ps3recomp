@@ -25,6 +25,7 @@
 #define FP_INPUT_SRC_MASK   (15u << 13)
 #define FP_TEX_UNIT_SHIFT   17
 #define FP_TEX_UNIT_MASK    (15u << 17)
+#define FP_EXP_TEX          (1u << 21) /* OPDEST: sampled texel BX2 */
 #define FP_OPCODE_SHIFT     24
 #define FP_OPCODE_MASK      (0x3Fu << 24)
 #define FP_OUT_NONE         (1u << 30)
@@ -417,7 +418,8 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
 
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
-    int buffered, char* out, u32 out_size, u32* out_constant_count)
+    int buffered, const u8* texture_bx2_masks,
+    char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
 
@@ -738,6 +740,24 @@ static int rsx_fp_decompile_internal(
             break;
         }
 
+        /* BX2 belongs to this fetch, not to every use of its texture. Apply
+         * it to the sampled value before result scaling and destination SAT.
+         * The masks describe lanes sourced from an eligible normalized
+         * texture; remap constants and signed lanes are left untouched. */
+        if ((w0 & FP_EXP_TEX) && (opcode == OP_TEX || opcode == OP_TXP ||
+                                  opcode == OP_TXB || opcode == OP_TXL)) {
+            const u32 mask = texture_bx2_masks ? texture_bx2_masks[tex_unit] & 15u : 15u;
+            if (mask) {
+                char sample[sizeof rhs];
+                snprintf(sample, sizeof sample, "%s", rhs);
+                snprintf(rhs, sizeof rhs,
+                    "((%s) * float4(%u,%u,%u,%u) - float4(%u,%u,%u,%u))",
+                    sample, 1u+(mask&1u), 1u+((mask>>1)&1u),
+                    1u+((mask>>2)&1u), 1u+((mask>>3)&1u),
+                    mask&1u, (mask>>1)&1u, (mask>>2)&1u, (mask>>3)&1u);
+            }
+        }
+
         int has_dest = !(w0 & FP_OUT_NONE);
         if (handled && (has_dest || set_cond)) {
             u32 dst_idx = (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT;
@@ -940,7 +960,7 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, out, out_size, NULL);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, NULL, out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
@@ -948,8 +968,38 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 1, out, out_size,
+        ucode, max_bytes, ctrl, tex_cube_mask, 1, NULL, out, out_size,
         out_constant_count);
+}
+
+int rsx_fp_decompile_buffered_texture_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const u8 texture_bx2_masks[16], char* out, u32 out_size,
+    u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+        1, texture_bx2_masks, out, out_size, out_constant_count);
+}
+
+u32 rsx_fp_texture_expand_units(const u8* ucode, u32 max_bytes)
+{
+    u32 units = 0;
+    if (!ucode) return 0;
+    for (u32 off = 0; off + 16 <= max_bytes;) {
+        const u32 w0 = rsx_fp_read_word(ucode + off);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        const u32 op = (w0 >> 24) & 63u;
+        if (!(w2 & FP_BRANCH) && (w0 & FP_EXP_TEX) &&
+            (op == OP_TEX || op == OP_TXP || op == OP_TXB || op == OP_TXL))
+            units |= 1u << ((w0 >> FP_TEX_UNIT_SHIFT) & 15u);
+        off += 16;
+        if (!(w2 & FP_BRANCH) &&
+            ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2)) off += 16;
+        if (w0 & FP_END) break;
+    }
+    return units;
 }
 
 static float fp_half_to_float(u16 h)

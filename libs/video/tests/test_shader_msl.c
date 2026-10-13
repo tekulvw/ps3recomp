@@ -264,6 +264,22 @@ int main(int argc, char** argv)
         }
     }
 
+    /* Each supported fetch expands its result independently. A masked
+     * buffered compile preserves remap constants; no flag preserves sampling. */
+    for (u32 op = 0; op < 4; op++) {
+        const u32 ops[4] = {0x17, 0x18, 0x2F, 0x31}; /* TEX, TXP, TXL, TXB */
+        u8 fp[16], masks[16] = {0};
+        masks[2] = 12;
+        rsx_test_fp_instr(fp, RSX_TEST_FP_OPC(ops[op]) | RSX_TEST_FP_MASK_XYZW |
+            RSX_TEST_FP_INSRC_TC0 | RSX_TEST_FP_TEXU(2) | (1u << 21) | RSX_TEST_FP_END,
+            RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        check_count("BX2 unit scan", rsx_fp_texture_expand_units(fp, sizeof fp), 4);
+        check_count("BX2 FP", rsx_fp_decompile_buffered_texture_ex(fp, sizeof fp,
+            0x40, 0, masks, g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("BX2 masked HLSL", g_hlsl, "float4(1,1,2,2) - float4(0,0,1,1)");
+        translate("BX2 FP", RSX_SHADER_STAGE_FRAGMENT);
+    }
+
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

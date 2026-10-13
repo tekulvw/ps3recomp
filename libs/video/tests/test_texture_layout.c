@@ -695,8 +695,27 @@ static void test_remap_rejects_null(void)
     rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, NULL);   /* must not crash */
 }
 
+static void test_texture_bx2_eligibility(void)
+{
+    CHECK(rsx_texture_bx2_mask(0x88, 0xAAE4, 0) == 15);
+    CHECK(rsx_texture_bx2_mask(0xA5, 0xAAE4, 0) == 15); /* linear modifier */
+    CHECK(rsx_texture_bx2_mask(0x85, 0x92E4, 0) == 12); /* R=ZERO, G=ONE */
+    CHECK(rsx_texture_bx2_mask(0x85, 0xAAE4, 1u << 29) == 14); /* signed R */
+    CHECK(rsx_texture_bx2_mask(0x85, 0xAAE1, 1u << 28) == 14); /* A->R */
+    CHECK(rsx_texture_bx2_mask(0x81, 0xAAE4, 0) == 7); /* B8 alpha=ONE */
+    CHECK(rsx_texture_bx2_mask(0x9A, 0xAAE4, 0) == 0);
+    CHECK(rsx_texture_bx2_mask(0x9B, 0xAAE4, 0) == 0);
+    CHECK(rsx_texture_bx2_mask(0x9C, 0xAAE4, 0) == 0);
+    CHECK(rsx_texture_bx2_mask(0x9F, 0xAAE4, 0) == 0);
+    CHECK(rsx_texture_bx2_mask(0x90, 0xAAE4, 0) == 0);
+    CHECK(rsx_texture_bx2_mask(0x91, 0xAAE4, 0) == 0);
+    CHECK(rsx_texture_bx2_mask(0x92, 0xAAE4, 0) == 0);
+    CHECK(rsx_texture_bx2_mask(0x93, 0xAAE4, 0) == 0);
+}
+
 int main(void)
 {
+    test_texture_bx2_eligibility();
     test_argb();
     test_g8b8();
     test_compressed();
