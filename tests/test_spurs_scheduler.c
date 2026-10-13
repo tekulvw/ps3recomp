@@ -12,7 +12,7 @@
 void spu_indirect_branch(spu_context*);
 void spu_halt(spu_context*);
 uint8_t* vm_base;
-uint32_t ppu_vm_size=0x20000;
+uint32_t ppu_vm_size=0x60000;
 int g_resv_store_active;
 uint32_t g_ww_lo,g_ww_hi,g_barrier_sync_watch;
 uint32_t g_spu_image_src_ea,g_spu_image_ls_start,g_spu_image_span;
@@ -94,7 +94,9 @@ static atomic_uintptr_t direct_ctx[2];
 static int direct_rc[2];
 static void resident_policy(spu_context* c)
 {
-    unsigned id=c->gpr[4]._u32[1]-1;   /* low half of the u64 argument (#309) */
+    unsigned instance=spu_ls_read32(c,0x1C4);
+    assert(instance==0x11000 || instance==0x12000);
+    unsigned id=(instance-0x11000)/0x1000;
     assert(id<2);atomic_store(&direct_ctx[id],(uintptr_t)c);
     spu_ls_write32(c,0x4000,0x12340000u+id);
     atomic_fetch_add(&direct_enter,1);
@@ -135,6 +137,16 @@ static void register_pm(unsigned ea,unsigned byte,spu_lifted_entry_fn fn,int ima
 {
     memset(vm_base+ea,byte,16);
     spu_workload_register_img(spu_workload_fingerprint(vm_base+ea,16),fn,image,"manufactured scheduler fixture");
+}
+static atomic_uint allocation_gate;
+static s32 allocation_rc[2];
+static void* allocate_slot(void* arg)
+{
+    unsigned which=(unsigned)(uintptr_t)arg;
+    while(!atomic_load(&allocation_gate)) Sleep(1);
+    if(which) allocation_rc[which]=cellSpursCreateTaskset((CellSpurs*)0x1000,(CellSpursTaskset*)0x30000,0,NULL,1);
+    else allocation_rc[which]=cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8040,(void*)0x9700,16,0,(u8*)0x8020,1,1);
+    return NULL;
 }
 int main(void)
 {
@@ -259,5 +271,25 @@ int main(void)
     pthread_join(a,NULL);pthread_join(b,NULL);assert(direct_rc[0]==-2 && direct_rc[1]==0);
     spurs_policy_release_instance(0x11000);spurs_policy_release_instance(0x12000);
     puts("SPURS same workload/lane across instances retains separate LS and TLS exit classification PASS");
+    /* Taskset/generic registrations retain the same global ID convention and
+     * allocate under the same admission boundary. Both guest workloads idle. */
+    memset(vm_base+0x8020,0,8);
+    assert(cellSpursInitialize((CellSpurs*)0x1000,2,0,0,0)==0);
+    pthread_t allocation_threads[2];
+    for(unsigned i=0;i<2;i++)assert(!pthread_create(&allocation_threads[i],NULL,allocate_slot,(void*)(uintptr_t)i));
+    atomic_store(&allocation_gate,1);
+    for(unsigned i=0;i<2;i++)pthread_join(allocation_threads[i],NULL);
+    assert(!allocation_rc[0] && !allocation_rc[1]);
+    unsigned generic_wid=vm_read32(0x8040),task_wid=vm_read32(0x30000+CSTS_WID);
+    assert(generic_wid!=task_wid && s_workloads[task_wid].is_taskset);
+    struct SpursInst* instance=spurs_inst_find(0x1000);
+    AcquireSRWLockExclusive(&instance->lock);instance->starting=1;ReleaseSRWLockExclusive(&instance->lock);
+    assert((u32)cellSpursWakeUp((CellSpurs*)0x1000)==CELL_SPURS_CORE_ERROR_BUSY);
+    assert(!s_workloads[task_wid].started && !atomic_load(&unbounded_dispatches));
+    AcquireSRWLockExclusive(&instance->lock);instance->starting=0;ReleaseSRWLockExclusive(&instance->lock);
+    assert(cellSpursDestroyTaskset((CellSpursTaskset*)0x30000)==0);
+    assert(cellSpursRemoveWorkload((CellSpurs*)0x1000,generic_wid)==0);
+    finalize(0x1000);puts("SPURS taskset/generic allocation is unique and BUSY WakeUp admits no taskset PASS");
+
     free(vm_base);return 0;
 }

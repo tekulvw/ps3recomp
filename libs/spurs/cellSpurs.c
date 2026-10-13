@@ -463,6 +463,7 @@ static struct SpursInst {
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
 static SRWLOCK s_workload_registry_lock = SRWLOCK_INIT;
 
+static s32 spurs_remove_workload_locked(struct SpursInst*, CellSpurs*, u32, int);
 static s32 spurs_scheduler_start(struct SpursInst* si);
 static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea);
 static void spurs_scheduler_retire(u32 ea);
@@ -928,20 +929,31 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
         return CELL_SPURS_CORE_ERROR_STAT;
     }
 
-    if (!spurs_guest_range_valid(taskset_ea, size))
-        return (s32)0x8041090Du; /* host backing safety, before writes */
+    if (!spurs_guest_range_valid(taskset_ea, size)) return (s32)0x8041090Du;
+
+    struct SpursInst* si;
+    s32 admission = spurs_api_lock(spurs_ea, &si);
+    if (admission) return admission;
+    if (taskset2) {
+        for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++)
+            if (s_workloads[i].in_use && s_workloads[i].is_taskset && s_workloads[i].data == taskset_ea) {
+                spurs_api_unlock(si); return (s32)0x8041090Au;
+            }
+    }
+
     /* Tasksets occupy the same workload namespace as AddWorkload. Queue
      * notifications carry (wid << 8) | taskId and firmware resolves wid via
      * the guest workload info's data field. A hardcoded wid=0 is insufficient. */
     u32 wid;
     for (wid = 0; wid < CELL_SPURS_MAX_WORKLOAD; ++wid)
         if (!s_workloads[wid].in_use) break;
-    if (wid == CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_NOMEM;
+    if (wid == CELL_SPURS_MAX_WORKLOAD) { spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_NOMEM; }
     /* No fallible guest operation remains after the valid creation gate. Do
      * not reuse bytes while an earlier generation still has a worker/reference,
      * including one removed by the legacy Taskset destructor. */
-    if (!spu_taskset_lifecycle_create(taskset_ea, taskset2))
-        return (s32)0x8041090Au;
+    if (!spu_taskset_lifecycle_create(taskset_ea, taskset2)) {
+        spurs_api_unlock(si); return (s32)0x8041090Au;
+    }
     /* size is the guest ABI size, never sizeof the legacy native host shim.
      * Clearing that shim left stale TaskInfo slots and a false size field. */
     memset(vm_base + taskset_ea, 0, size);
@@ -979,6 +991,7 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
     printf("[cellSpurs] CreateTaskset%s() ea=0x%08X spurs=0x%08X size=0x%X (real BE layout)\n",
            taskset2 ? "2" : "", taskset_ea, spurs_ea, size);
+    spurs_api_unlock(si);
     return CELL_OK;
 }
 
@@ -1052,9 +1065,6 @@ static s32 spurs_create_taskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
     if (max_contention > CELL_SPURS_MAX_SPU) max_contention = CELL_SPURS_MAX_SPU;
     for (u32 i = 0; i < CELL_SPURS_MAX_SPU; i++)
         if (priority[i] >= CELL_SPURS_MAX_PRIORITY) return TASKSET2_ERROR(0x02);
-    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++)
-        if (s_workloads[i].in_use && s_workloads[i].is_taskset && s_workloads[i].data == te)
-            return TASKSET2_ERROR(0x0A);
     return spurs_create_taskset((u32)se, (u32)te, args, priority,
         max_contention, CSTS2_STRUCT_END, clear_ls, name_ea, 1);
 }
@@ -1088,12 +1098,21 @@ static s32 spurs_destroy_taskset2(CellSpursTaskset2* taskset)
     uint64_t owner=vm_read64(ea+CSTS_SPURS);
     if (!spurs_guest_range(owner,SPURS_INST_SIZE) || !spurs_inst_find((u32)owner))
         return TASKSET2_ERROR(0x0F);
+    struct SpursInst* si;
+    s32 admission=spurs_api_lock((u32)owner,&si);
+    if (admission) return TASKSET2_ERROR((u32)admission & 0xFF);
     SpursWorkload* w=&s_workloads[wid];
-    if (!w->in_use || !w->is_taskset || w->data!=ea || w->spurs_ea!=owner)
-        return TASKSET2_ERROR(0x05);
+    if (!w->in_use || !w->is_taskset || w->data!=ea || w->spurs_ea!=owner) {
+        spurs_api_unlock(si); return TASKSET2_ERROR(0x05);
+    }
     /* All six task bitsets must be empty. The host gate is authoritative for
      * pre-spawn admission and worker tails after task-exit clears these bits. */
-    if (w->started || !spu_taskset_lifecycle_retire_unused(ea)) return TASKSET2_ERROR(0x0A);
+    /* Tasksets do not enter the policy coordinator. Check every fallible
+     * admission/retirement gate before mutating lifetime or guest metadata. */
+    if (w->started || si->active[wid] || spurs_policy_release_workload((u32)owner,wid) ||
+        !spurs_flag_range(owner) || !spu_taskset_lifecycle_retire_unused(ea)) {
+        spurs_api_unlock(si); return TASKSET2_ERROR(0x0A);
+    }
     /* Prepare all owned metadata while the slot is still unavailable. Keep
      * in_use/owner for RemoveWorkload validation and is_taskset so the kernel
      * cannot mistake this retiring slot for a runnable policy module. Never
@@ -1103,9 +1122,10 @@ static s32 spurs_destroy_taskset2(CellSpursTaskset2* taskset)
     memset(w->priority,0,sizeof(w->priority));
     w->minContention=0; w->maxContention=0; w->readyCount=0;
     w->started=0; w->name_ea=0;
-    s32 rc=cellSpursRemoveWorkload((CellSpurs*)(uintptr_t)owner,wid);
-    if (rc) return TASKSET2_ERROR((u32)rc & 0xFF);
+    s32 rc=spurs_remove_workload_locked(si,(CellSpurs*)(uintptr_t)owner,wid,1);
+    if (rc) { spurs_api_unlock(si); return TASKSET2_ERROR((u32)rc & 0xFF); }
     vm_write32(ea+CSTS_WID,32); /* firmware invalidates the workload id */
+    spurs_api_unlock(si);
     return CELL_OK;
 }
 s32 cellSpursDestroyTaskset2(CellSpursTaskset2* taskset)
@@ -1140,15 +1160,20 @@ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
     if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     u32 wid = vm_read32(ea + CSTS_WID);
     u32 spurs_ea = (u32)vm_read64(ea + CSTS_SPURS);
-    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use ||
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_TASK_ERROR_SRCH;
+    struct SpursInst* si;
+    s32 admission=spurs_api_lock(spurs_ea,&si);
+    if (admission) return admission;
+    if (!s_workloads[wid].in_use ||
         !s_workloads[wid].is_taskset || s_workloads[wid].data != ea ||
         s_workloads[wid].spurs_ea != spurs_ea)
-        return CELL_SPURS_TASK_ERROR_SRCH;
+        { spurs_api_unlock(si); return CELL_SPURS_TASK_ERROR_SRCH; }
     vm_write32(spurs_ea + SPURS_WKL_ENABLED,
                vm_read32(spurs_ea + SPURS_WKL_ENABLED) & ~(0x80000000u >> wid));
     *(vm_base + spurs_ea + SPURS_WKL_STATE1 + wid) = 0;
     vm_write64(spurs_ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8, 0);
     memset(&s_workloads[wid], 0, sizeof(s_workloads[wid]));
+    spurs_api_unlock(si);
     return CELL_OK;
 }
 
@@ -1896,24 +1921,15 @@ s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea, u64 nameIns
     return CELL_OK;
 }
 
-s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
+static s32 spurs_remove_workload_locked(struct SpursInst* si, CellSpurs* spurs, u32 wid, int retired)
 {
-    if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
-    struct SpursInst* si;
-    s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
-    if (rc) return rc;
-    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
-    }
-
-    if (si->active[wid] || spurs_policy_release_workload(si->ea, wid)) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_BUSY;
+    if (!retired && (si->active[wid] || spurs_policy_release_workload(si->ea, wid))) {
+        return CELL_SPURS_CORE_ERROR_BUSY;
     }
     uint64_t address = (uintptr_t)spurs;
-    if (!spurs_flag_range(address)) { spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_FAULT; }
+    if (!spurs_flag_range(address)) { return CELL_SPURS_POLICY_MODULE_ERROR_FAULT; }
     u32 ea = (u32)address;
-    if (s_workloads[wid].spurs_ea != ea) { spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH; }
+    if (s_workloads[wid].spurs_ea != ea) { return CELL_SPURS_CORE_ERROR_SRCH; }
     /* Release receiver ownership before making this workload unavailable.
      * Keep a nonowner's pending flag intact. Publish removal in guest state
      * too, otherwise the removed wid could immediately register again. */
@@ -1934,8 +1950,23 @@ s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
     spu_lockline_unlock();
     spurs_scheduler_forget(wid);
     printf("[cellSpurs] RemoveWorkload(wid=%u)\n", wid);
-    spurs_api_unlock(si);
     return CELL_OK;
+}
+
+s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
+{
+    if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    struct SpursInst* si;
+    s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
+    if (rc) return rc;
+    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
+        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
+    }
+
+    rc = spurs_remove_workload_locked(si, spurs, wid, 0);
+    spurs_api_unlock(si);
+    return rc;
 }
 
 s32 cellSpursWorkloadAttributeInitialize(CellSpursWorkloadAttribute* attr,
@@ -2242,6 +2273,9 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     const uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
     AcquireSRWLockExclusive(&s_taskset2_management_lock);
+    struct SpursInst* si;
+    s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
+    if (rc) { ReleaseSRWLockExclusive(&s_taskset2_management_lock); return rc; }
     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
         SpursWorkload* w = &s_workloads[i];
         if (!w->in_use || !w->is_taskset || w->started || w->spurs_ea != spurs_ea) continue;
@@ -2265,13 +2299,10 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
         else spu_workload_dispatch_async(host,w->sizePm,(uint32_t)w->data);
         if (admission>0) spu_taskset_lifecycle_leave((u32)w->data);
     }
-    ReleaseSRWLockExclusive(&s_taskset2_management_lock);
-    struct SpursInst* si;
-    s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
-    if (rc) return rc;
     /* Work is admitted only by the coordinator, including explicit wakes. */
     memset(si->idle, 0, sizeof(si->idle));
     spurs_api_unlock(si);
+    ReleaseSRWLockExclusive(&s_taskset2_management_lock);
     return CELL_OK;
 }
 

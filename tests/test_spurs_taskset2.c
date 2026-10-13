@@ -64,7 +64,7 @@ static void rejected(u32 expected, CellSpurs* s, CellSpursTaskset2* t,
 int main(void) {
     vm_base=malloc(ppu_vm_size); assert(vm_base);
     memset(vm_base,0xA5,ppu_vm_size);
-    memset(vm_base+0x1000,0,0x1000); s_inst[0].ea=0x1000;
+    memset(vm_base+0x1000,0,0x1000); s_inst[0].ea=0x1000; s_inst[0].kernel_live=1;
     rejected(0x80410911,NULL,TS,NULL);
     rejected(0x80410911,S,NULL,NULL);
     rejected(0x80410910,(CellSpurs*)0x1001,TS,NULL);
@@ -146,7 +146,7 @@ int main(void) {
     rejected(0x80410902,S,TS,A);
     vm_base[0x8010]=1;
     /* A different taskset and instance gets a different live workload id. */
-    memset(vm_base+0x3000,0,0x1000); s_inst[1].ea=0x3000;
+    memset(vm_base+0x3000,0,0x1000); s_inst[1].ea=0x3000; s_inst[1].kernel_live=1;
     assert(CALL(S,TS,NULL)==0); wid=vm_read32(0x10000+CSTS_WID);
     assert(CALL((CellSpurs*)0x3000,(CellSpursTaskset2*)0x30000,NULL)==0);
     u32 other=vm_read32(0x30000+CSTS_WID); assert(other!=wid);

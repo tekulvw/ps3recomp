@@ -73,7 +73,7 @@ int spu_workload_dispatch_async(const uint8_t* image,uint32_t size,uint32_t cont
 }
 int main(void) {
     register_container_fixture(); expect(setter!=NULL,"generated setter NID registered");
-    vm_base=memory; ppu_vm_size=sizeof(memory); s_inst[0].ea=0x1000;
+    vm_base=memory; ppu_vm_size=sizeof(memory); s_inst[0].ea=0x1000; s_inst[0].kernel_live=1;
     CellSpursTaskAttribute* attr=PTR(CellSpursTaskAttribute,0x2000);
     CellSpursTasksetAttribute* tsa=PTR(CellSpursTasksetAttribute,0x2100);
     CellSpursTaskset* ts=PTR(CellSpursTaskset,0x4000);
