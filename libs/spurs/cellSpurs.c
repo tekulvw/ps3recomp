@@ -743,8 +743,9 @@ s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
  * Taskset
  * =====================================================================*/
 
-s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
-                           u64 args, const u8* priority, u32 maxContention)
+static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+                                u64 args, const u8* priority, u32 maxContention,
+                                u32 taskset_size)
 {
     (void)args; (void)priority; (void)maxContention;
 
@@ -769,15 +770,20 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
         return CELL_SPURS_CORE_ERROR_STAT;
     }
 
-    memset(taskset, 0, sizeof(CellSpursTaskset));
-    taskset->initialized = 1;
-    taskset->spurs = spurs;
+    extern u32 ppu_vm_size;
+    u64 end = (u64)taskset_ea + taskset_size;
+    uintptr_t base = (uintptr_t)vm_base;
+    if ((!vm_base && !ppu_vm_size) || end > 0x100000000ull ||
+        (ppu_vm_size && end > ppu_vm_size) || base > UINTPTR_MAX - taskset_ea ||
+        base + taskset_ea > UINTPTR_MAX - (taskset_size - 1u))
+        return (s32)0x8041090Du; /* host backing safety, before writes */
+    memset(taskset, 0, taskset_size);
 
     /* Write the REAL big-endian CellSpursTaskset layout (fork Option-B) so the lifted
      * SPU leaf + spurs_pm_build_context read valid data (the native writes above are
      * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
     spurs_taskset_init(taskset_ea, spurs_ea, args, /*wid*/0,
-                       (uint32_t)sizeof(CellSpursTaskset), /*evf1*/0, /*evf2*/0);
+                       taskset_size, /*evf1*/0, /*evf2*/0);
     g_ydkj_real_taskset_ea = taskset_ea;
 
     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
@@ -785,12 +791,22 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
     return CELL_OK;
 }
 
+s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+                           u64 args, const u8* priority, u32 maxContention)
+{
+    return spurs_create_taskset(spurs, taskset, args, priority, maxContention,
+                                CSTS_STRUCT_END);
+}
+
 s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                         CellSpursTaskset* taskset,
                                         const CellSpursTasksetAttribute* attr)
 {
-    (void)attr;
-    return cellSpursCreateTaskset(spurs, taskset, 0, NULL, 0);
+    if (!attr) return (s32)0x80410911u;
+    const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
+    u32 size = attr_h->tasksetSize;
+    if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
+    return spurs_create_taskset(spurs, taskset, 0, NULL, 0, size);
 }
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
@@ -830,6 +846,7 @@ s32 cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr)
     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
     memset(attr, 0, sizeof(CellSpursTasksetAttribute));
     attr->revision = 1;
+    attr->tasksetSize = CSTS_STRUCT_END;
     return CELL_OK;
 }
 
@@ -1147,6 +1164,7 @@ s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
     memset(attr, 0, sizeof(CellSpursTasksetAttribute));
     attr->revision = revision ? revision : 1;
+    attr->tasksetSize = CSTS_STRUCT_END;
     printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u)\n", revision);
     return CELL_OK;
 }
@@ -3231,14 +3249,16 @@ s32 cellSpursGetTasksetInfo(u64 taskset_ea, u64 info_ea)
     return CELL_OK;
 }
 
-/* cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute*, u32 size)
- * CreateTaskset ignores the attribute entirely (it builds the real BE layout
- * itself), so record the request and accept it. */
+/* NID 0x8F122EF8: the SDK supports the base and extended taskset sizes.
+ * Attributes retain the existing host layout; creation writes guest BE fields. */
 s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size)
 {
-    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-    static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] TasksetAttributeSetTasksetSize(size=%u)\n", size);
+    u32 ea = (u32)(uintptr_t)attr;
+    if (!ea) return (s32)0x80410911u;
+    if (ea & 7u) return (s32)0x80410910u;
+    if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
+    attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
+    attr->tasksetSize = size;
     return CELL_OK;
 }
 

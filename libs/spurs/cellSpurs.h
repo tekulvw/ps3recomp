@@ -128,7 +128,8 @@ struct CellSpursTasksetAttribute {
     u32  flags;
     u64  args;
     u8   priority[CELL_SPURS_MAX_SPU];
-    u8   _padding[64];
+    u32  tasksetSize; /* host-layout attribute; retained through creation */
+    u8   _padding[60];
 };
 
 /* Task -- represents a unit of SPU work */
