@@ -41,7 +41,7 @@ static void clean(uint32_t size) {
            "taskset creation preserves both canaries");
 }
 int main(void) {
-    vm_base=memory; ppu_vm_size=sizeof(memory); s_inst[0].ea=0x1000;
+    vm_base=memory; ppu_vm_size=sizeof(memory); s_inst[0].ea=0x1000; s_inst[0].kernel_live=1;
     CellSpursTasksetAttribute* attr=PTR(CellSpursTasksetAttribute,0x2000);
     CellSpursTaskset* ts=PTR(CellSpursTaskset,0x4000);
     CellSpurs* spurs=PTR(CellSpurs,0x1000);
