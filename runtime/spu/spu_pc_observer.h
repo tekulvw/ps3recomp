@@ -16,6 +16,7 @@
 #define SPU_PC_OBSERVER_GUARDS_MAX 32
 #define SPU_PC_OBSERVER_EVENTS_MAX 256
 #define SPU_PC_OBSERVER_BUFFER_MAX 16384
+#define SPU_PC_OBSERVER_TRIGGER_PATH_MAX 128
 
 typedef struct spu_pc_observer_site {
     uint32_t pc, opcode, sp, sn, sd, dp, dn, dd;
@@ -26,13 +27,16 @@ typedef struct spu_pc_observer_state {
     uint32_t limit, sites, guards, identities;
     spu_pc_observer_site site[SPU_PC_OBSERVER_SITES_MAX];
     uint32_t guard[SPU_PC_OBSERVER_GUARDS_MAX][2], identity[8];
+    volatile LONG trigger_armed;
+    volatile LONG64 trigger_next_poll_ms;
+    char trigger_path[SPU_PC_OBSERVER_TRIGGER_PATH_MAX+1];
 } spu_pc_observer_state;
 #ifdef __cplusplus
 extern "C" {
 #endif
 /* One merged object across translation units, including C++ callers. */
 SPU_GATE spu_pc_observer_state g_spu_pc_observer = {
-    -1,0,0,0,0,0,{{0,0,0,0,0,0,0,0}},{{0,0}},{0}
+    -1,0,0,0,0,0,{{0,0,0,0,0,0,0,0}},{{0,0}},{0},0,0,{0}
 };
 #ifdef __cplusplus
 }
@@ -67,7 +71,7 @@ static inline int spu_pc_observer_load(spu_pc_observer_state* c)
     fclose(f);
     if (bad || !count || buf[count-1]!='\n' || memchr(buf,0,count)) return 0;
     buf[count]=0;
-    int ended=0, have_limit=0, have_identity=0;
+    int ended=0, have_limit=0, have_identity=0, have_trigger=0;
     char* line=buf;
     while (*line) {
         char* next=strchr(line,'\n');
@@ -91,6 +95,15 @@ static inline int spu_pc_observer_load(spu_pc_observer_state* c)
             } else if (!strcmp(token[0],"limit")) {
                 if (nt!=2 || have_limit++ || !spu_pc_observer_number(token[1],10,&c->limit) ||
                     !c->limit || c->limit>SPU_PC_OBSERVER_EVENTS_MAX) return 0;
+            } else if (!strcmp(token[0],"trigger")) {
+                if(nt!=2 || have_trigger++ || strlen(token[1])>SPU_PC_OBSERVER_TRIGGER_PATH_MAX) return 0;
+                const char* path=token[1];
+                /* Absolute POSIX, drive-rooted Windows, or UNC path. No spaces
+                 * or escaping in this bounded whole-token configuration. */
+                int drive=((path[0]>='A' && path[0]<='Z') || (path[0]>='a' && path[0]<='z')) &&
+                    path[1]==':' && (path[2]=='/' || path[2]=='\\');
+                if(path[0]!='/' && !drive && !(path[0]=='\\' && path[1]=='\\')) return 0;
+                memcpy(c->trigger_path,path,strlen(path)+1);
             } else if (!strcmp(token[0],"guard")) {
                 uint32_t a,w;
                 if (nt!=3 || c->guards==SPU_PC_OBSERVER_GUARDS_MAX ||
@@ -140,6 +153,7 @@ static int spu_pc_observer_initialize(LONG gate)
             memcpy(g_spu_pc_observer.site,config.site,sizeof config.site);
             memcpy(g_spu_pc_observer.guard,config.guard,sizeof config.guard);
             memcpy(g_spu_pc_observer.identity,config.identity,sizeof config.identity);
+            memcpy(g_spu_pc_observer.trigger_path,config.trigger_path,sizeof config.trigger_path);
         }
         WriteRelease(&g_spu_pc_observer.gate,enabled);
         return enabled;
@@ -181,6 +195,29 @@ static inline spu_pc_observer_stats spu_pc_observer_scan(const uint8_t* p, uint3
     return s;
 }
 
+/* Opt-in arming is latched for this linked runtime. File metadata lookup does
+ * not allocate or read contents. The shared atomic deadline permits at most
+ * one lookup per 250ms, and only after a matched guarded, in-bounds site. */
+#if defined(_MSC_VER)
+static __declspec(noinline) int spu_pc_observer_trigger_ready(void)
+#else
+static __attribute__((noinline,cold)) int spu_pc_observer_trigger_ready(void)
+#endif
+{
+    if(ReadAcquire(&g_spu_pc_observer.trigger_armed)) return 1;
+    ULONGLONG now=GetTickCount64();
+    LONG64 prior=InterlockedCompareExchange64(&g_spu_pc_observer.trigger_next_poll_ms,0,0);
+    if(now<(ULONGLONG)prior || now>0x7FFFFFFFFFFFFFFFull-250) return 0;
+    if(InterlockedCompareExchange64(&g_spu_pc_observer.trigger_next_poll_ms,(LONG64)(now+250),prior)!=prior)
+        return ReadAcquire(&g_spu_pc_observer.trigger_armed)!=0;
+    DWORD saved_error=GetLastError(); int saved_errno=errno;
+    DWORD attributes=GetFileAttributesA(g_spu_pc_observer.trigger_path);
+    SetLastError(saved_error); errno=saved_errno;
+    if(attributes==INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) return 0;
+    InterlockedExchange(&g_spu_pc_observer.trigger_armed,1);
+    return 1;
+}
+
 /* Call only immediately before executing this actual live instruction. Raw
  * register scalars use native lane 0, matching PREF and microstep addresses. */
 static void spu_pc_observe_enabled(spu_context* ctx, uint32_t pc, uint32_t opcode)
@@ -201,6 +238,7 @@ static void spu_pc_observe_enabled(spu_context* ctx, uint32_t pc, uint32_t opcod
     uint32_t sn=sr/s->sd, dn=dr/s->dd;
     if(sn>SPU_PC_OBSERVER_BUFFER_MAX || dn>SPU_PC_OBSERVER_BUFFER_MAX ||
         src>SPU_LS_SIZE || dst>SPU_LS_SIZE || sn>SPU_LS_SIZE-src || dn>SPU_LS_SIZE-dst) return;
+    if(c->trigger_path[0] && !spu_pc_observer_trigger_ready()) return;
     LONG prior=ReadAcquire(&g_spu_pc_observer.events);
     do {
         if((uint32_t)prior>=c->limit) return;
