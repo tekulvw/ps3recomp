@@ -2097,7 +2097,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
-    int nv0039_waiting=0;
+    /* Recognized producer waits must not become stuck-GET recovery faults. */
+    int producer_waiting=0;
     while (s_fifo_getoff != put && budget-- > 0) {
         if(gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed))break;
         u32 ea = gcm_io2ea(s_fifo_getoff);
@@ -2268,6 +2269,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   }
                   why = "parked";
                   s_park_pass = 1;
+                  if (gcm_checked_ref_mode()) {
+                      producer_waiting=1;
+                      why="checked-jump-producer-wait";
+                  }
                   break;
               }
               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
@@ -2299,8 +2304,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
             { int transfer=nv0039_packet(w,put);
               if(transfer==1) continue;
               if(transfer==2) {
-                  nv0039_waiting=!atomic_load(&s_checked_ref_failed);
-                  why=nv0039_waiting?"nv0039-producer-wait":"nv0039-failed";
+                  producer_waiting=!atomic_load(&s_checked_ref_failed);
+                  why=producer_waiting?"nv0039-producer-wait":"nv0039-failed";
                   break; } }
             if (gcm_checked_ref_mode() && method == 0x50 && (count != 1 || subch != 0 || type != 0)) {
                 gcm_checked_ref_fail("malformed-reference", s_fifo_getoff); break;
@@ -2653,7 +2658,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * for good that way in about one New Marais run in five ("stuck-get" at a
      * self-jump with no "jump-park" before it). */
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_sema_blocked_pass || s_park_pass || nv0039_waiting) {
+      if (s_sema_blocked_pass || s_park_pass || producer_waiting) {
           stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
       else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
@@ -2688,7 +2693,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      *
      * ponytail: append the JUMP at `current` the way the SDK's own callback
      * does, rather than tracking a second copy of the ring's geometry. */
-    if (s_gcm_ctx_out_ea && !gcm_checked_ref_mode() && !nv0039_waiting) {
+    if (s_gcm_ctx_out_ea && !gcm_checked_ref_mode() && !producer_waiting) {
         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
