@@ -914,7 +914,7 @@ static SRWLOCK s_taskset2_management_lock = SRWLOCK_INIT;
 
 static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
                                 const u8* priority, u32 maxContention,
-                                u32 size, int clear_ls, u32 name_ea)
+                                u32 size, int clear_ls, u32 name_ea, int taskset2)
 {
     if (!spurs_ea || !taskset_ea) {
         fprintf(stderr, "[cellSpurs] CreateTaskset REJECT null (spurs=0x%08X taskset=0x%08X)\n",
@@ -940,7 +940,7 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
     /* No fallible guest operation remains after the valid creation gate. Do
      * not reuse bytes while an earlier generation still has a worker/reference,
      * including one removed by the legacy Taskset destructor. */
-    if (!spu_taskset_lifecycle_create(taskset_ea, size == CSTS2_STRUCT_END))
+    if (!spu_taskset_lifecycle_create(taskset_ea, taskset2))
         return (s32)0x8041090Au;
     /* size is the guest ABI size, never sizeof the legacy native host shim.
      * Clearing that shim left stale TaskInfo slots and a false size field. */
@@ -978,7 +978,7 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
 
     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
     printf("[cellSpurs] CreateTaskset%s() ea=0x%08X spurs=0x%08X size=0x%X (real BE layout)\n",
-           size == CSTS2_STRUCT_END ? "2" : "", taskset_ea, spurs_ea, size);
+           taskset2 ? "2" : "", taskset_ea, spurs_ea, size);
     return CELL_OK;
 }
 
@@ -986,7 +986,7 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
                            u64 args, const u8* priority, u32 maxContention)
 {
     return spurs_create_taskset((u32)(uintptr_t)spurs, (u32)(uintptr_t)taskset,
-        args, GUEST_PTR(priority, const u8*), maxContention, CSTS_STRUCT_END, 0, 0);
+        args, GUEST_PTR(priority, const u8*), maxContention, CSTS_STRUCT_END, 0, 0, 0);
 }
 
 /* Taskset2 uses the task facility 0x804109xx. The older Task API macros in
@@ -1056,7 +1056,7 @@ static s32 spurs_create_taskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
         if (s_workloads[i].in_use && s_workloads[i].is_taskset && s_workloads[i].data == te)
             return TASKSET2_ERROR(0x0A);
     return spurs_create_taskset((u32)se, (u32)te, args, priority,
-        max_contention, CSTS2_STRUCT_END, clear_ls, name_ea);
+        max_contention, CSTS2_STRUCT_END, clear_ls, name_ea, 1);
 }
 
 s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
@@ -1127,8 +1127,11 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
     const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
     u32 size = attr_h->tasksetSize;
     if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
-    return spurs_create_taskset((u32)(uintptr_t)spurs, (u32)(uintptr_t)taskset,
-        0, NULL, 0, size, 0, 0);
+    AcquireSRWLockExclusive(&s_taskset2_management_lock);
+    s32 rc = spurs_create_taskset((u32)(uintptr_t)spurs, (u32)(uintptr_t)taskset,
+                                  0, NULL, 0, size, 0, 0, 0);
+    ReleaseSRWLockExclusive(&s_taskset2_management_lock);
+    return rc;
 }
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)

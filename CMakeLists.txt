@@ -534,7 +534,7 @@ endif()
 # The HLE NID table is generated exactly as a port generates it, so the smoke
 # title's firmware imports resolve through the same bridge a game's do.
 if(UNIX)
-    find_package(Python3 COMPONENTS Interpreter QUIET)
+    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(NOT Python3_Interpreter_FOUND)
         message(STATUS "  Boot smoke:   no python3; ps3recomp_boot_smoke not built")
     else()
