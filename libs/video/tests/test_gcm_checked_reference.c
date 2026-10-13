@@ -16,6 +16,7 @@ static unsigned locked, notified, broken, flushed, live_flushed;
 static u32 watched = 0x2000430;
 static unsigned watch_writes;
 static int expect_publication = 1;
+static unsigned draw_words;static int expect_draw;
 void ppu_resv_break_store(uint64_t ea) { if (ea >= watched && ea < (u64)watched + 16) { assert(locked); broken++; } }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) {
     assert(locked && flushed && live_flushed && w==4);
@@ -30,7 +31,7 @@ void spu_lockline_lock(void) { assert(!locked); locked=1; }
 void spu_lockline_unlock(void) { assert(locked); locked=0; }
 int rsx_draw_engine_enabled(void) { return 1; }
 int rsx_live_draw_enabled(void) { return 1; }
-void rsx_draw_engine_method(u32 m, u32 v) { (void)m; (void)v; }
+void rsx_draw_engine_method(u32 m, u32 v) { if(m==0x1814u) { assert(v==0x02000000u);draw_words++; } }
 void rsx_draw_engine_method_at(u32 m,u32 v,u32 ea){(void)ea;rsx_draw_engine_method(m,v);}
 void rsx_live_draw_method(u32 m, u32 v) { (void)m; (void)v; }
 void rsx_draw_engine_flush(void) { assert(!locked); assert(vm_read32(watched+12)==0x00010000); flushed++; }
@@ -50,6 +51,7 @@ static pthread_cond_t hold_cond=PTHREAD_COND_INITIALIZER;
 static int held,pending,released;
 int rsx_draw_engine_flush_checked(void) {
     checked_calls++;
+    if(expect_draw) assert(draw_words==1);
     if(held){pthread_mutex_lock(&hold_mutex);pending=1;pthread_cond_broadcast(&hold_cond);while(!released)pthread_cond_wait(&hold_cond,&hold_mutex);pthread_mutex_unlock(&hold_mutex);}
     assert(peek_ref()==0xA5A5A5A5u);
     return complete;
@@ -69,33 +71,50 @@ int main(int argc,char**argv) {
         assert(peek_ref()==0xA5A5A5A5u);assert(s_ref_qhead==s_ref_qtail);
         released=1;pthread_cond_broadcast(&hold_cond);pthread_mutex_unlock(&hold_mutex);
         assert(!pthread_join(t,NULL));assert(peek_ref()==0xCAFEBABE);
-    } else if(!strcmp(argv[1],"park_patch") || !strcmp(argv[1],"park_branch") || !strcmp(argv[1],"park_wrap")) {
+    } else if(!strcmp(argv[1],"park_patch") || !strcmp(argv[1],"park_branch") || !strcmp(argv[1],"park_wrap") || !strcmp(argv[1],"park_invalid")) {
         /* A producer parks the GPU while its next segment is incomplete.
          * put can be ahead, or behind the park after a ring wrap. */
         int wrap=!strcmp(argv[1],"park_wrap");
-        u32 park=wrap?0x100:0, put=wrap?8:16;
+        u32 park=wrap?0x100:0, put=wrap?16:24;
+        expect_draw=1;
         raw32(0x100000+park,0x20000000u|park);
-        raw32(0x100008,0x00040050);raw32(0x10000C,0xCAFEBABE);
+        raw32(0x100008,0x00041814);raw32(0x10000C,0x02000000);
+        raw32(0x100010,0x00040050);raw32(0x100014,0xCAFEBABE);
         cellGcm_syscall_set_fifo(put,park);
-        for(unsigned i=0;i<3;i++) {
+        for(unsigned i=0;i<12;i++) {
             cellGcm_rsx_process_fifo();
-            assert(s_fifo_getoff==park && !checked_calls);
+            assert(s_fifo_getoff==park && !checked_calls && !draw_words);
             assert(peek_ref()==0xA5A5A5A5u);
             assert(s_ref_qhead==s_ref_qtail);
             assert(!atomic_load(&s_checked_ref_failed));
             assert(cellGcm_checked_reference_ready());
         }
-        if(!strcmp(argv[1],"park_patch")) {
-            raw32(0x100000,0x00040050);raw32(0x100004,0xCAFEBABE);
-            cellGcm_syscall_set_fifo(8,park);
-        } else if(wrap) {
-            raw32(0x100000,0x00040050);raw32(0x100004,0xCAFEBABE);
-            raw32(0x100000+park,0x20000000u);
-        } else raw32(0x100000,0x20000008u);
-        cellGcm_rsx_process_fifo();
-        assert(s_fifo_getoff==(wrap||!strcmp(argv[1],"park_patch")?8:16));
-        assert(checked_calls==1 && peek_ref()==0xCAFEBABE);
-        assert(s_checked_ref_receipt==1 && !atomic_load(&s_checked_ref_failed));
+        if(!strcmp(argv[1],"park_invalid")) {
+            raw32(0x100000,0x20200000u);cellGcm_rsx_process_fifo();
+            assert(atomic_load(&s_checked_ref_failed)&&!checked_calls&&!draw_words);
+            assert(peek_ref()==0xA5A5A5A5u && !cellGcm_checked_reference_ready());
+        } else {
+            if(!strcmp(argv[1],"park_patch")) {
+                raw32(0x100000,0x00041814);raw32(0x100004,0x02000000);
+                raw32(0x100008,0x00040050);raw32(0x10000C,0xCAFEBABE);
+                cellGcm_syscall_set_fifo(16,park);
+            } else if(wrap) {
+                raw32(0x100000,0x00041814);raw32(0x100004,0x02000000);
+                raw32(0x100008,0x00040050);raw32(0x10000C,0xCAFEBABE);
+                raw32(0x100000+park,0x20000000u);
+            } else raw32(0x100000,0x20000008u);
+            cellGcm_rsx_process_fifo();
+            assert(s_fifo_getoff==(wrap||!strcmp(argv[1],"park_patch")?16:24));
+            assert(checked_calls==1 && draw_words==1 && peek_ref()==0xCAFEBABE);
+            assert(s_checked_ref_receipt==1 && !atomic_load(&s_checked_ref_failed));
+        }
+    } else if(!strcmp(argv[1],"circling") || !strcmp(argv[1],"invalid_jump")) {
+        int invalid=!strcmp(argv[1],"invalid_jump");
+        raw32(0x100000,invalid?0x20200000u:0x20000008u);
+        raw32(0x100008,0x20000000u);cellGcm_syscall_set_fifo(16,0);
+        for(unsigned i=0;i<12;i++)cellGcm_rsx_process_fifo();
+        assert(atomic_load(&s_checked_ref_failed)&&!cellGcm_checked_reference_ready());assert(!checked_calls&&!draw_words);
+        assert(peek_ref()==0xA5A5A5A5u && s_ref_qhead==s_ref_qtail);
     } else if(!strcmp(argv[1],"repeat_wrap")) {
         u32 values[]={0xFFFFFFFFu,0xFFFFFFFFu,0,1};
         for(unsigned i=0;i<4;i++){raw32(0x100000+8*i,0x00040050);raw32(0x100004+8*i,values[i]);}
