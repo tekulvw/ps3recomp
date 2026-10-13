@@ -106,7 +106,7 @@ static void admission_races(void) {
 int main(void) {
     vm_base=malloc(ppu_vm_size); assert(vm_base);
     memset(vm_base,0xA5,ppu_vm_size);
-    memset(vm_base+0x1000,0,0x1000); s_inst[0].ea=0x1000;
+    memset(vm_base+0x1000,0,0x1000); s_inst[0].ea=0x1000; s_inst[0].kernel_live=1;
     unchanged(0x80410911,NULL);
     unchanged(0x80410910,(CellSpursTaskset2*)0x10001);
     unchanged(0x8041090D,(CellSpursTaskset2*)0xFF000);

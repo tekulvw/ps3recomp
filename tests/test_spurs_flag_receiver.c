@@ -1,7 +1,11 @@
 /* Real guest initializer, receiver API, coherence, policy entry and poll path.
  * Only background thread creation is suppressed so each schedule is explicit. */
 #include "../runtime/platform/win32_compat.h"
-#define CreateThread(sa, stack, fn, arg, flags, id) ((HANDLE)0)
+/* Layout/poll fixture: acknowledge thread creation without starting host
+ * workers. The separate scheduler fixture verifies actual creation and joins. */
+#define CreateThread(sa, stack, fn, arg, flags, id) ((HANDLE)1)
+#define WaitForSingleObject(h, ms) (WAIT_OBJECT_0)
+#define CloseHandle(h) (TRUE)
 #include "../libs/spurs/cellSpurs.c"
 #include "../runtime/spu/spu_coherency.h"
 #include <assert.h>
