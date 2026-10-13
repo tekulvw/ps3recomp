@@ -1110,7 +1110,9 @@ static int eng_zdepth_to_guest(u32 slot)
                 const u32 v = (u32)(d * 65535.0f + 0.5f);
                 dst[0] = (u8)(v >> 8); dst[1] = (u8)v;
             } else {
-                const u32 v = (u32)(d * 16777215.0f + 0.5f);
+                /* Float32 rounding at this magnitude can turn depth 1 into
+                 * 0x1000000. Quantize in double before storing the 24-bit value. */
+                const u32 v = (u32)((double)d * 16777215.0 + 0.5);
                 dst[0] = (u8)(v >> 16); dst[1] = (u8)(v >> 8); dst[2] = (u8)v; dst[3] = 0;
             }
             dst += bpp;
