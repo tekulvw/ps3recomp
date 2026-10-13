@@ -54,3 +54,12 @@ void osk_native_close(uint64_t token){
   if(s_alert && s_ui_token==token)[NSApp endSheet:s_alert.window returnCode:NSModalResponseCancel];
  });
 }
+
+void osk_native_confirm(uint64_t token){
+ dispatch_async(dispatch_get_main_queue(),^{
+  /* Abort/parent close may race with the guest poll's queued action. */
+  if(s_alert && s_ui_token==token && s_alert.window.sheetParent==s_parent
+     && s_parent && atomic_load(&s_available) && osk_native_is_open(token))
+   [s_alert.buttons[0] performClick:nil];
+ });
+}
