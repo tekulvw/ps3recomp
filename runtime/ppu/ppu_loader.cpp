@@ -1279,7 +1279,7 @@ extern "C" uint32_t ppu_vm_size = 0;
  * the free window just below the mmapper region (0x11000000) and above any
  * game's high data segments, so it doesn't collide with the static image. */
 static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
-#define PPU_TLS_IMG   0x10F00000u
+#define PPU_TLS_IMG   VM_PPU_TLS_BASE
 #define PPU_TLS_TP    (PPU_TLS_IMG + 0x7000u)
 
 #ifdef _WIN32
@@ -3097,6 +3097,8 @@ extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
 
 /* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */
 extern "C" int lv2_try_syscall(ppu_context* ctx);
+extern "C" int64_t sys_mmapper_allocate_address(ppu_context* ctx);
+extern "C" int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* out);
 
 /* lv2 syscall dispatch: r11 = syscall number, args in r3.. (PPC ABI).
  * A few syscalls the CRT needs at boot are handled inline (boot-tuned); the
@@ -3174,19 +3176,12 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     }
     case 330: {   /* sys_mmapper_allocate_address(u64 size, u64 flags,
                    * u64 alignment, u32* alloc_addr) -> reserve guest VA range */
-        static uint32_t s_next_va = 0x11000000u;   /* just past the loaded image */
-        uint32_t size  = (uint32_t)ctx->gpr[3];
-        uint32_t align = (uint32_t)ctx->gpr[5];
-        uint32_t out   = (uint32_t)ctx->gpr[6];
-        if (align < 0x100000u) align = 0x100000u;   /* 1 MB min */
-        s_next_va = (s_next_va + align - 1) & ~(align - 1);
-        uint32_t va = s_next_va;
-        uint32_t span = (size + 0xFFFFFu) & ~0xFFFFFu;
-        s_next_va += span;
-        if (out) vm_write32(out, va);
-        ps3_output_trace_mapper(330, 0, va, span, ctx->gpr[3], ctx->gpr[4], (uint32_t)ctx->gpr[5], out,
+        uint32_t out = (uint32_t)ctx->gpr[6];
+        int64_t rc = sys_mmapper_allocate_address(ctx);
+        uint32_t va = (rc == CELL_OK && out) ? vm_read32(out) : 0;
+        ps3_output_trace_mapper(330, 0, va, (uint32_t)ctx->gpr[3], ctx->gpr[3], ctx->gpr[4], (uint32_t)ctx->gpr[5], out,
                                 (uint32_t)ctx->lr, ctx->thread_id);
-        ctx->gpr[3] = 0;
+        ctx->gpr[3] = (uint64_t)rc;
         return;
     }
     case 337: {   /* sys_mmapper_search_and_map(u32 start_addr, u32 mem_id,
@@ -3199,20 +3194,14 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         uint32_t start  = (uint32_t)ctx->gpr[3];
         uint32_t mem_id = (uint32_t)ctx->gpr[4];
         uint32_t outp   = (uint32_t)ctx->gpr[6];
-        static uint32_t s_map_next = 0;
-        if (!s_map_next) s_map_next = start ? start : 0x11000000u;
         uint32_t size = ps3_mmapper_block_size(mem_id);
         if (!size) size = 0x100000u;
-        uint32_t va = s_map_next;
-        s_map_next = (s_map_next + size + 0xFFFFFu) & ~0xFFFFFu;
-        /* MAP the block, don't just name it. This handed back an address into
-         * MEM_RESERVE, so the page only ever came into existence if the PPU
-         * happened to touch it first (the boot harness commits on fault; a
-         * port with its own main() does not even do that). An SPU-written
-         * output buffer is the case that breaks: the SPU is the FIRST writer,
-         * its DMA guard sees an uncommitted EA and skips the transfer, and the
-         * job's results are silently dropped. */
-        vm_commit(va, size);
+        uint32_t va = 0;
+        int64_t rc = sys_mmapper_search_map_address(start, size, &va);
+        if (rc != CELL_OK) {
+            ctx->gpr[3] = (uint64_t)rc;
+            return;
+        }
         if (outp) vm_write32(outp, va);
         ps3_output_trace_mapper(337, start, va, size, 0, ctx->gpr[5], mem_id, outp,
                                 (uint32_t)ctx->lr, ctx->thread_id);
