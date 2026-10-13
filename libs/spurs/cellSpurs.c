@@ -1123,26 +1123,49 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
  * from an EA computed out of r3 = that argument (spu_0003 task main @0x17e70:
  * `wrch $ch18, f(r3.word3)`), so a zero argument makes it GET from EA 0 and
  * stall. lsPattern/argument arrive as guest EAs (generic adapter forwards r3..r10). */
-static s32 spurs_create_task(CellSpursTaskset*, CellSpursTaskId*, void*, void*, u32, u32, u32);
-s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
-                        void* elf, void* context, u32 sizeContext,
-                        u32 lsPattern_ea, u32 argument_ea)
+static s32 spurs_create_task(CellSpursTaskset*, CellSpursTaskId*, void*, void*, u32, u32, u32, u32);
+static s32 spurs_create_task_admitted(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                                       void* elf, void* context, u32 sizeContext,
+                                       u32 lsPattern_ea, u32 argument_ea,
+                                       u32 exit_container_ea)
 {
     uint64_t address=(uintptr_t)taskset;
     /* A wide invalid EA must not alias a tracked 32-bit generation. */
     if (address>UINT32_MAX) return TASKSET2_ERROR(0x0D);
     int admission=spu_taskset_lifecycle_enter((u32)address);
     if (admission<0) return TASKSET2_ERROR(0x0F);
-    s32 rc=spurs_create_task(taskset,taskId,elf,context,sizeContext,lsPattern_ea,argument_ea);
+    s32 rc=spurs_create_task(taskset,taskId,elf,context,sizeContext,lsPattern_ea,argument_ea,exit_container_ea);
     if (admission>0) spu_taskset_lifecycle_leave((u32)address);
     return rc;
 }
 
-static s32 spurs_create_task(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         void* elf, void* context, u32 sizeContext,
                         u32 lsPattern_ea, u32 argument_ea)
 {
+    return spurs_create_task_admitted(taskset,taskId,elf,context,sizeContext,
+                                      lsPattern_ea,argument_ea,0);
+}
+
+static s32 spurs_create_task(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                              void* elf, void* context, u32 sizeContext,
+                              u32 lsPattern_ea, u32 argument_ea,
+                              u32 exit_container_ea)
+{
     (void)context; (void)sizeContext;
+    u32 bound_taskset_ea = (u32)(uintptr_t)taskset;
+    if (exit_container_ea) {
+        if (!bound_taskset_ea) return (s32)0x80410911u;
+        if (exit_container_ea & 127u) return (s32)0x80410910u;
+        if (!spurs_guest_range_valid(bound_taskset_ea, CSTS_SIZE_FIELD + 4u))
+            return (s32)0x8041090Du;
+        if (vm_read32(bound_taskset_ea + CSTS_SIZE_FIELD) < 0x2900u)
+            return (s32)0x80410909u; /* extended taskset required */
+        if (!spurs_guest_range_valid(bound_taskset_ea, 0x2900u) ||
+            !spurs_guest_range_valid(exit_container_ea, 128u))
+            return (s32)0x8041090Du;
+    }
+
 
     /* Read the 16-byte CellSpursTaskArgument + optional LS pattern from guest mem. */
     uint32_t task_arg[4] = {0,0,0,0};
@@ -1212,8 +1235,32 @@ static s32 spurs_create_task(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             /* Register the task in the REAL BE taskset: writes task_info[slot]
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
-            spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
+            /* Bind before publishing ready/enabled or dispatching a worker.
+             * Preserve an authentic helper descriptor when one is installed.
+             * A zero descriptor deliberately leaves terminal publication
+             * unsupported; adapter rc==0 cannot supply a guest exit result. */
+            if (exit_container_ea) {
+                u32 record_ea = taskset_ea + 0x1980u + i * 16u;
+                vm_write64(record_ea, vm_read64(taskset_ea + 0x1900u));
+                vm_write64(record_ea + 8u, (u64)exit_container_ea);
+                vm_write32(exit_container_ea + 0x20u, 1u);
+                vm_write64(exit_container_ea + 0x50u, (u64)taskset_ea);
+                vm_write8(exit_container_ea + 0x39u, (u8)i);
+            }
+            spurs_taskset_add_task(taskset_ea, i, (uint64_t)(elf_ea | (exit_container_ea ? 1u : 0u)),
                                    (uint64_t)context_ea, task_arg, task_lsp);
+            if (exit_container_ea) {
+                /* Successful task publication makes the container available
+                 * for retrieval (bit 2). This is submission, not completion.
+                 * CAS the flags+semaphore word just as a guest publisher does,
+                 * preserving concurrent terminal/result flags and waiter data. */
+                ppu_context reserve = {0};
+                u64 flags_and_semaphore;
+                do {
+                    flags_and_semaphore = ppu_ldarx(&reserve, exit_container_ea + 0x20u);
+                } while (!ppu_stdcx(&reserve, exit_container_ea + 0x20u,
+                                     flags_and_semaphore | (2ull << 32)));
+            }
             /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
@@ -1396,7 +1443,10 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
                                      CellSpursTaskId* taskId,
                                      CellSpursTaskAttribute* attr)
 {
-    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    u32 attr_ea = (u32)(uintptr_t)attr;
+    if (!attr_ea) return (s32)0x80410911u;
+    if (attr_ea & 7u) return (s32)0x80410910u;
+    if (!spurs_guest_range_valid(attr_ea, sizeof(*attr))) return (s32)0x8041090Du;
     CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
     /* Dump the raw attribute: our struct doesn't model lsPattern/argument, and
      * a wait-capable task NEEDS its context size + ls pattern carried through
@@ -1412,15 +1462,15 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
      * dropping them left the TaskInfo with a zero argument + zero lsPattern and
      * the SPU task library then refuses every blocking wait with 0x8041090F --
      * LBP's binkspu movie-IO task spun forever on that). */
-    return cellSpursCreateTask(taskset, taskId,
+    return spurs_create_task_admitted(taskset, taskId,
                                (void*)(uintptr_t)(u32)attr_h->eaElf,
                                (void*)(uintptr_t)(u32)attr_h->eaContext,
                                attr_h->sizeContext,
-                               attr_h->lsPattern_ea, attr_h->argument_ea);
+                               attr_h->lsPattern_ea, attr_h->argument_ea,
+                               (u32)vm_read64(attr_ea + 0x40u));
 }
 
-/* The SDK's versioned taskset-attribute initializer. We forward taskset creation
- * through CreateTaskset (which ignores the attribute), so just zero the struct. */
+/* Versioned host-layout attribute initialization restores the base guest size. */
 s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
                                          u32 revision, u32 sdkVersion, u64 argTaskset,
                                          u64 priority, u32 maxContention)
@@ -1482,6 +1532,22 @@ s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr)
     attr->revision = 1;
     return CELL_OK;
 }
+
+s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* attr,
+                                               CellSpursTaskExitCode* exitCode)
+{
+    u32 attr_ea = (u32)(uintptr_t)attr;
+    u32 container_ea = (u32)(uintptr_t)exitCode;
+    if (!attr_ea || !container_ea) return (s32)0x80410911u;
+    if ((attr_ea & 7u) || (container_ea & 127u)) return (s32)0x80410910u;
+    if (!spurs_guest_range_valid(attr_ea, sizeof(*attr))) return (s32)0x8041090Du;
+    const CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, const CellSpursTaskAttribute*);
+    if (attr_h->revision != 1u) return (s32)0x80410902u;
+    if (!spurs_guest_range_valid(container_ea, 128u)) return (s32)0x8041090Du;
+    vm_write64(attr_ea + 0x40u, (u64)container_ea);
+    return CELL_OK;
+}
+
 
 /* NID: 0x34552FA6. Initialization only; task attachment and completion are
  * separate APIs. Use the firmware's task-domain errors here rather than the
@@ -3494,7 +3560,7 @@ s32 cellSpursTaskGetContextSaveAreaSize(u64 size_out_ea, u64 pattern_ea)
     return CELL_OK;
 }
 
-/* cellSpursBarrierInitialize(CellSpursTaskset* taskset, CellSpursBarrier* barrier,
+ellSpursBarrierInitialize(CellSpursTaskset* taskset, CellSpursBarrier* barrier,
  *                            u32 total)
  *
  * A barrier is 128 bytes, 128-aligned, opaque in the SDK: the PPU only
@@ -3550,9 +3616,7 @@ s32 cellSpursGetTasksetInfo(u64 taskset_ea, u64 info_ea)
     return CELL_OK;
 }
 
-/* cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute*, u32 size)
- * CreateTaskset ignores the attribute entirely (it builds the real BE layout
- * itself), so record the request and accept it. */
+/* Retain the supported base/extended size in the private host attribute. */
 s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size)
 {
     u32 ea = (u32)(uintptr_t)attr;
