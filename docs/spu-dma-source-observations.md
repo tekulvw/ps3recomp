@@ -12,6 +12,14 @@ list elements through the same transfer path. It reports the issuing context's
 image ID and local-store PC, command, masked local-store address, destination,
 transfer size, source byte offset, inspected word count, finite/nonzero/nonfinite
 counts and maximum finite absolute value. It emits no sample values or dumps.
+The same record includes `ctx` (the issuing `spu_context` pointer), `r0` and `r1`
+(raw preferred scalar words), and `seq` (an atomic admitted-sample trace
+sequence shared by all contexts in the emitting translation unit, starting at
+one and lasting for the process lifetime). Registers use `spu_preferred_u32`,
+which extracts `_u32[0]`; the interpreter's preferred-word macro and indirect branches use
+that same lane. Register values are printed without address masking or byte
+swapping. This can distinguish callers of a shared DMA helper and correlate
+their stack state with the exact source observation.
 The image ID identifies the runtime context; dynamically loaded overlays may
 contain a different ELF's executable code.
 
@@ -30,6 +38,14 @@ in that window was zero. Transfers outside the watch, GETs, invalid transfers
 and partial words do not consume the window. The observer's clock/scan/output
 work is skipped when disabled or outside the watch.
 
+Sequence bookkeeping uses one fixed atomic counter outside the SPU context and
+preserves its ABI. It allocates no memory and retains no context registry.
+Suppressed, invalid, unrelated and disabled transfers do not increment the
+counter. The context pointer is a process-local identity, so pointer reuse does
+not identify a new allocation generation. Sequence values track atomic counter
+assignment order. If an observation is delayed beyond the next five-second
+window, records may finish out of sequence order.
+
 Use the source observation alongside the destination's own bounded observations:
 nonzero source with zero destination narrows investigation to copying/ownership;
 zero source narrows it to producer state or processing. A paused local-store
@@ -41,6 +57,7 @@ Run the synthetic direct/list DMA fixture with:
 ```sh
 python3 tools/test_spu_dma_source_f32be.py
 python3 tools/test_spu_dma_source_f32be_linkage.py
+python3 tools/test_spu_dma_source_identity.py
 ```
 
 It checks explicit opt-in, invalid/missing ranges, negative zero, finite peaks,
@@ -52,3 +69,9 @@ an unrelated PUT and a partial-word-only PUT verify that those operations leave
 the logging window available. The linkage fixture compiles both the full DMA
 header and the standalone observer as C++, links them to a C-defined runtime
 clock, and rejects an intentional clock-linkage mismatch.
+The independent identity fixture issues real direct/list PUTs from two contexts
+with the same image and PC, distinct preferred r0/r1 values, different values in
+the other register lanes and distinct source data. It checks each record's
+context, caller, source statistics and shared trace sequence together, unchanged
+source/destination bytes, disabled poison-pointer safety, and three globally
+rate-limited windows contested by eight threads across both contexts.

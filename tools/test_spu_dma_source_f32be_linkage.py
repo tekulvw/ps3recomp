@@ -25,6 +25,8 @@ int main() {{
     static spu_context ctx;
     static uint8_t ls[SPU_LS_SIZE];
     ctx.ls = ls; ctx.image_id = 7; ctx.pc = 0x2340;
+    ctx.gpr[0]._u32[0] = 0xA1234567; ctx.gpr[0]._u32[3] = 0x11111111;
+    ctx.gpr[1]._u32[0] = 0xC7654321; ctx.gpr[1]._u32[3] = 0x22222222;
     spu_ls_write32(&ctx, 0x100, 0x3F000000);
     mfc_trace_source_f32be(&ctx, 0x100, 0x12000, 4, 0x20);
     return spu_ls_read32(&ctx, 0x100) == 0x3F000000 ? 0 : 1;
@@ -35,6 +37,7 @@ int main() {{
                         '-I'+str(root/'runtime/spu'), str(source), str(clock_obj), '-o', str(binary)], check=True)
         result = subprocess.run([str(binary)], env=env, capture_output=True, text=True, check=True, timeout=5)
         assert 'words=1 finite=1 nonzero=1 nonfinite=0 peak=0.5' in result.stderr, result.stderr
+        assert 'ctx=0x' in result.stderr and 'r0=0xA1234567 r1=0xC7654321 seq=1' in result.stderr, result.stderr
     # Negative control: the same C object cannot satisfy a C++-linked clock.
     bad_source = tmp/'bad.cpp'
     bad_source.write_text('unsigned long long ps3_ms_now();\nint main() { return ps3_ms_now() == 6000 ? 0 : 1; }\n')
