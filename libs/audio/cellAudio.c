@@ -163,6 +163,9 @@ typedef struct {
     u64 blocks, nonzero, read_index, nonfinite;
     u32 channels, address;
     float peaks[8];
+    u32 ring_mask, ring_ridx;
+    u64 ring_nonfinite;
+    float ring_peak;
 } AudioDiagnosticPort;
 static int s_audio_diag_on;
 static AudioDiagnosticPort s_audio_diag_ports[CELL_AUDIO_PORT_MAX];
@@ -189,6 +192,23 @@ static void audio_diagnostics_port(int p, const AudioPortSlot* port, const float
     d->channels = (u32)port->param.nChannel;
     d->address = (u32)port->port_addr;
     d->read_index = port->read_index;
+    /* One complete ring snapshot per reporting window. Sampling only the
+     * consumed slot cannot distinguish silence from PCM in a different slot;
+     * a stride through the raw ring can also miss entire surround channels.
+     * Observe before this block is consumed, without changing any sample. */
+    if (!d->blocks) {
+        d->ring_ridx = (u32)(port->read_index % port->param.nBlock);
+        for (u32 b = 0; b < port->param.nBlock && b < 32; ++b) {
+            const float* block = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * d->channels;
+            for (u32 n = 0; n < CELL_AUDIO_BLOCK_SAMPLES * d->channels; ++n) {
+                const float sample = ld_be_f32(block + n);
+                if (!isfinite(sample)) { d->ring_nonfinite++; continue; }
+                const float a = fabsf(sample);
+                if (a != 0.0f) d->ring_mask |= (u32)1 << b;
+                if (a > d->ring_peak) d->ring_peak = a;
+            }
+        }
+    }
     d->blocks++;
     int nonzero = 0;
     for (u32 n = 0; n < CELL_AUDIO_BLOCK_SAMPLES; ++n) {
@@ -218,7 +238,8 @@ static void audio_diagnostics_report(u64 now)
                 (unsigned long long)d->nonzero, (unsigned long long)d->nonfinite);
         for (u32 c = 0; c < d->channels && c < 8; ++c)
             fprintf(stderr, "%s%.4g", c ? "," : "", d->peaks[c]);
-        fprintf(stderr, "]\n");
+        fprintf(stderr, "] ring_ridx=%u ring_mask=%08X ring_peak=%.4g ring_nonfinite=%llu\n",
+                d->ring_ridx, d->ring_mask, d->ring_peak, (unsigned long long)d->ring_nonfinite);
     }
     fprintf(stderr, "[audio-diag] time_us=%llu duration_us=%llu blocks=%llu mix=[%.4g,%.4g] "
             "nonfinite=%llu backend=%s submit=%llu errors=%llu queue_frames=%u error=\"%s\"\n",
