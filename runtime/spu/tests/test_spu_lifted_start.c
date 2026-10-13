@@ -986,3 +986,9 @@ void sys_rsx_init(lv2_syscall_table* t) { (void)t; }
 void spu_raw_note_image(uint32_t ea, uint32_t src) { (void)ea; (void)src; }
 int32_t spu_registry_fallback(uint32_t tid, uint32_t args, uint32_t size, void* user)
 { (void)tid; (void)args; (void)size; (void)user; return -1; }
+
+/* Shared service reader uses the VM writer for coherent guest results. */
+void vm_write64(uint64_t ea, uint64_t value)
+{
+    for(unsigned i=0;i<8;i++)vm_base[ea+i]=(uint8_t)(value>>((7-i)*8));
+}

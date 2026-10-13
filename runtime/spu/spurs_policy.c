@@ -26,6 +26,7 @@
 #include "spu_coherency.h"
 #include "../platform/win32_compat.h"
 #include "spu_workload.h"
+#include "spurs_policy_service.h"
 #include "spurs_workload_flag.h"
 #include "spu_coherency.h"
 #include <stdio.h>
@@ -39,6 +40,96 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
 SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
 SPU_THREAD_LOCAL volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
+
+/* LV2 service endpoints for resident policy contexts. IDs have a disjoint
+ * runtime namespace from ordinary LV2 SPU threads (allocated from 0x2000).
+ * Each ID owns an actual context; reset/retirement invalidates its generation.
+ * References protect PPU operations without acquiring an admission/slot lock. */
+struct PolicyService { uint32_t id; spu_context* ctx; unsigned refs;
+    int retiring; struct PolicyService* next; };
+static struct PolicyService* s_policy_services;
+static uint32_t s_policy_service_next = 0x80000000u;
+static SRWLOCK s_policy_service_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_policy_service_wake;
+
+uint32_t spurs_policy_service_identity(const spu_context* ctx)
+{
+    uint32_t id=0;
+    AcquireSRWLockShared(&s_policy_service_lock);
+    for (struct PolicyService* s=s_policy_services;s;s=s->next)
+        if(s->ctx==ctx && !s->retiring){id=s->id;break;}
+    ReleaseSRWLockShared(&s_policy_service_lock);
+    return id;
+}
+
+spu_context* spurs_policy_service_acquire(uint32_t id)
+{
+    spu_context* ctx = NULL;
+    AcquireSRWLockExclusive(&s_policy_service_lock);
+    for (struct PolicyService* s = s_policy_services; s; s = s->next)
+        if (s->id == id && !s->retiring) { s->refs++;ctx=s->ctx;break; }
+    ReleaseSRWLockExclusive(&s_policy_service_lock);
+    return ctx;
+}
+
+void spurs_policy_service_release(spu_context* ctx)
+{
+    AcquireSRWLockExclusive(&s_policy_service_lock);
+    for (struct PolicyService* s = s_policy_services; s; s = s->next)
+        if (s->ctx == ctx) { if (s->refs) s->refs--;break; }
+    WakeAllConditionVariable(&s_policy_service_wake);
+    ReleaseSRWLockExclusive(&s_policy_service_lock);
+}
+
+static int policy_service_bind(spu_context* ctx)
+{
+    struct PolicyService* s = (struct PolicyService*)calloc(1,sizeof(*s));
+    if (!s) return -1;
+    AcquireSRWLockExclusive(&s_policy_service_lock);
+    /* Exhaustion must fail rather than reuse an identity retained by a guest. */
+    if (s_policy_service_next == 0xFFFFFFFFu) {
+        ReleaseSRWLockExclusive(&s_policy_service_lock);free(s);return -1;
+    }
+    s->id=s_policy_service_next++;s->ctx=ctx;
+    s->next=s_policy_services;s_policy_services=s;
+    ReleaseSRWLockExclusive(&s_policy_service_lock);
+    return 0;
+}
+
+static void policy_service_retire(spu_context* ctx)
+{
+    AcquireSRWLockExclusive(&s_policy_service_lock);
+    struct PolicyService* s;
+    for (s=s_policy_services;s;s=s->next) if(s->ctx==ctx) break;
+    if (s) {
+        s->retiring=1;
+        while (s->refs)
+            SleepConditionVariableSRW(&s_policy_service_wake,&s_policy_service_lock,INFINITE,0);
+        for(struct PolicyService** link=&s_policy_services;*link;link=&(*link)->next)
+            if(*link==s){*link=s->next;break;}
+        free(s);
+    }
+    ReleaseSRWLockExclusive(&s_policy_service_lock);
+}
+
+/* Workload removal is transactional and nonblocking under admission locks.
+ * Check every endpoint reference before retiring any lane. */
+static int policy_service_retire_unused(spu_context* const* contexts, unsigned count)
+{
+    AcquireSRWLockExclusive(&s_policy_service_lock);
+    for (struct PolicyService* s=s_policy_services;s;s=s->next)
+        for(unsigned i=0;i<count;i++) if(s->ctx==contexts[i] && s->refs) {
+            ReleaseSRWLockExclusive(&s_policy_service_lock);return -1;
+        }
+    for(struct PolicyService** link=&s_policy_services;*link;) {
+        struct PolicyService* s=*link;int match=0;
+        for(unsigned i=0;i<count;i++) if(s->ctx==contexts[i]) match=1;
+        if(match){*link=s->next;free(s);}
+        else link=&s->next;
+    }
+    ReleaseSRWLockExclusive(&s_policy_service_lock);
+    return 0;
+}
 
 /* Contexts are resident per (instance, workload, physical SPU). Workload IDs
  * from different instances must never share local store or pipeline state.
@@ -106,6 +197,11 @@ int spurs_policy_release_workload(uint32_t ea, uint32_t wid)
         if (pi->retiring || pi->workload_users[wid]) {
             ReleaseSRWLockExclusive(&s_pm_directory_lock); return -1;
         }
+        spu_context* contexts[6];
+        for(unsigned n=0;n<6;n++) contexts[n]=pi->slots[wid][n].ctx;
+        if(policy_service_retire_unused(contexts,6)) {
+            ReleaseSRWLockExclusive(&s_pm_directory_lock);return -1;
+        }
         for (unsigned n = 0; n < 6; n++) {
             struct PmSlot* slot = &pi->slots[wid][n];
             if (slot->ctx) {
@@ -134,10 +230,14 @@ void spurs_policy_release_instance(uint32_t ea)
         pi->retiring = 1;
         while (pi->users)
             SleepConditionVariableSRW(&s_pm_directory_wake, &s_pm_directory_lock, INFINITE, 0);
+        /* The retiring marker prevents new callers; endpoint callbacks do not
+         * need this directory lock. Let other instances run while refs drain. */
+        ReleaseSRWLockExclusive(&s_pm_directory_lock);
         for (unsigned w = 0; w < 16; w++) for (unsigned n = 0; n < 6; n++) {
             struct PmSlot* slot = &pi->slots[w][n];
             AcquireSRWLockExclusive(&slot->lock);
             if (slot->ctx) {
+                policy_service_retire(slot->ctx);
                 spu_coh_unregister(slot->ctx);
                 spu_mfc_release(slot->ctx);
                 free(slot->ctx);
@@ -146,6 +246,7 @@ void spurs_policy_release_instance(uint32_t ea)
             slot->data = 0; slot->pm = NULL; slot->size = 0; slot->entry = NULL; slot->image_id = 0;
             ReleaseSRWLockExclusive(&slot->lock);
         }
+        AcquireSRWLockExclusive(&s_pm_directory_lock);
         pi->used = 0; pi->retiring = 0; pi->ea = 0;
         break;
     }
@@ -225,10 +326,14 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                         (unsigned long long)wkl_data);
         }
         first = 1;
+        policy_service_retire(ctx);
         spu_coh_unregister(ctx);
         spu_mfc_release(ctx);
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
+    }
+    if (!spurs_policy_service_identity(ctx) && policy_service_bind(ctx)) {
+        policy_slot_release(resident); return -1;
     }
     resident->data = wkl_data;
     resident->pm = pm_host; resident->size = pm_size;
