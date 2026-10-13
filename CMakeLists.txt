@@ -391,8 +391,11 @@ if(PS3RECOMP_BUILD_TESTS)
     # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
     add_subdirectory(libs/codec/tests)
 
-    find_package(Python3 COMPONENTS Interpreter QUIET)
+    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME spurs_task_exit_container
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_task_exit_container.py")
         add_test(NAME spurs_taskset_size
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_taskset_size.py")
