@@ -25,6 +25,8 @@
 #include <string.h>
 #include <time.h>
 #include "ps3emu/log_first.h"
+#include <errno.h>
+#include <sys/stat.h>
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -2796,15 +2798,130 @@ static void pd_present(u32 presented)
     }
 }
 
-static void sink_end(void* user, const rsx_dispatch* r)
+/* Default-off draw-request observer. The engine and this state are owned by
+ * its renderer thread, like the existing pass/binding captures. One fwrite
+ * emits each complete JSONL record; no guest memory or backend is consulted.
+ * RSX_ENGINE_DRAW_OBSERVER names the output file. Optional _TRIGGER waits
+ * for a file to exist; _TARGET filters color-A offsets. _MAX defaults to 256
+ * and is capped at 4096. Pre-arm and unmatched groups consume no records. */
+static struct {
+    int configured, disabled, active, filter_target;
+    const char* path;
+    const char* trigger;
+    u32 target, maximum, count;
+    FILE* file;
+    const char* outcome;
+} s_draw_observer;
+
+static void draw_observer_reset(void)
+{
+    const int saved = errno;
+    if (s_draw_observer.file) fclose(s_draw_observer.file);
+    memset(&s_draw_observer, 0, sizeof s_draw_observer);
+    errno = saved;
+}
+
+static void draw_observer_begin(void)
+{
+    const int saved = errno;
+    s_draw_observer.active = 0;
+    if (!s_draw_observer.configured) {
+        s_draw_observer.configured = 1;
+        s_draw_observer.path = getenv("RSX_ENGINE_DRAW_OBSERVER");
+        s_draw_observer.disabled = !s_draw_observer.path || !*s_draw_observer.path;
+        if (!s_draw_observer.disabled) {
+            s_draw_observer.trigger = getenv("RSX_ENGINE_DRAW_OBSERVER_TRIGGER");
+            const char* target = getenv("RSX_ENGINE_DRAW_OBSERVER_TARGET");
+            const char* maximum = getenv("RSX_ENGINE_DRAW_OBSERVER_MAX");
+            s_draw_observer.filter_target = target && *target;
+            s_draw_observer.target = target ? (u32)strtoul(target, NULL, 0) : 0;
+            unsigned long cap = maximum ? strtoul(maximum, NULL, 0) : 256;
+            s_draw_observer.maximum = (u32)(cap > 4096 ? 4096 : cap);
+        }
+    }
+    if (s_draw_observer.disabled || s_draw_observer.count >= s_draw_observer.maximum)
+        goto done;
+    if (s_draw_observer.filter_target &&
+        rsx_dsp_reg(&g.rsx, 0x0210) != s_draw_observer.target) goto done;
+    if (s_draw_observer.trigger && *s_draw_observer.trigger) {
+        struct stat st;
+        if (stat(s_draw_observer.trigger, &st) != 0) goto done;
+    }
+    if (!s_draw_observer.file) {
+        s_draw_observer.file = fopen(s_draw_observer.path, "w");
+        if (!s_draw_observer.file) { s_draw_observer.disabled = 1; goto done; }
+    }
+    s_draw_observer.count++;
+    s_draw_observer.active = 1;
+    s_draw_observer.outcome = "entry";
+done:
+    errno = saved;
+}
+
+#define DRAW_OBSERVER_STAGE(stage) do { if (s_draw_observer.active) \
+    s_draw_observer.outcome = (stage); } while (0)
+
+static void draw_observer_finish(void)
+{
+    if (!s_draw_observer.active) return;
+    const int saved = errno;
+    char line[4096];
+    rsx_dsp_surface sf;
+    rsx_dsp_index_array ia;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    rsx_dsp_get_index_array(&g.rsx, &ia);
+    u64 array_vertices = 0, requested_indices = 0;
+    for (u32 b = 0; b < dc.n_arr; b++) array_vertices += dc.arr[b].count;
+    for (u32 b = 0; b < dc.n_idx; b++) requested_indices += dc.idx[b].count;
+    int n = snprintf(line, sizeof line,
+        "{\"record\":%u,\"frame\":%u,\"outcome\":\"%s\","
+        "\"primitive\":%u,\"packets\":%u,\"array_batches\":%u,\"index_batches\":%u,"
+        "\"array_vertices\":%llu,\"requested_indices\":%llu,"
+        "\"index_offset\":%u,\"index_location\":%u,\"index_u32\":%d,"
+        "\"inline_bytes\":%u,\"immediate_vertices\":%u,\"fetch_ok\":%d,"
+        "\"source_refs\":%u,\"vertices\":%u,\"cuts\":%u,"
+        "\"vp_start\":%u,\"fp_program\":\"%08X\",\"shader_control\":\"%08X\","
+        "\"target_select\":%u,\"color_offsets\":[%u,%u,%u,%u],"
+        "\"color_locations\":[%u,%u,%u,%u],\"clip\":[%u,%u],\"attributes\":[",
+        s_draw_observer.count, g.frames, s_draw_observer.outcome,
+        g.rsx.current_primitive, dc.n_packets, dc.n_arr, dc.n_idx,
+        (unsigned long long)array_vertices, (unsigned long long)requested_indices,
+        ia.offset, ia.location, ia.is_u32,
+        dc.inl_bytes, dc.n_immediate, dc.fetch_ok, dc.n_source_refs, dc.n_verts, dc.n_cuts,
+        rsx_dsp_vp_start(&g.rsx), rsx_dsp_reg(&g.rsx, 0x08E4), rsx_dsp_shader_control(&g.rsx),
+        sf.color_target, sf.color_offset[0], sf.color_offset[1], sf.color_offset[2], sf.color_offset[3],
+        sf.color_location[0], sf.color_location[1], sf.color_location[2], sf.color_location[3],
+        sf.clip_w, sf.clip_h);
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR && n > 0 && (size_t)n < sizeof line; a++)
+        n += snprintf(line + n, sizeof line - (size_t)n,
+            "%s[\"%08X\",\"%08X\"]", a ? "," : "",
+            rsx_dsp_reg(&g.rsx, 0x1740 + 4 * a), rsx_dsp_reg(&g.rsx, 0x1680 + 4 * a));
+    if (n > 0 && (size_t)n + 4 <= sizeof line) {
+        memcpy(line + n, "]}\n", 3);
+        const size_t bytes = (size_t)n + 3;
+        if (fwrite(line, 1, bytes, s_draw_observer.file) != bytes ||
+            fflush(s_draw_observer.file) != 0) s_draw_observer.disabled = 1;
+    } else s_draw_observer.disabled = 1;
+    s_draw_observer.active = 0;
+    if (s_draw_observer.disabled || s_draw_observer.count >= s_draw_observer.maximum) {
+        fclose(s_draw_observer.file);
+        s_draw_observer.file = NULL;
+    }
+    errno = saved;
+}
+
+static void sink_end_core(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
+    DRAW_OBSERVER_STAGE(!g.ready ? "not_ready" : !dc.n_packets ? "empty_packets" : !dc.fetch_ok ? "prefetch" : "entry");
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
     /* Mixed geometry sources have no defined concatenation here. Reject the
      * whole group instead of drawing partial/misordered geometry. */
+    DRAW_OBSERVER_STAGE("mixed_sources");
     if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||
                           r->inline_dropped != dc.inline_dropped_at_begin)) return;
 
+    DRAW_OBSERVER_STAGE("topology");
     const u32 prim = g.rsx.current_primitive;
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
      * strips and polygons -- is REBUILT into one triangle list through an
@@ -2825,9 +2942,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
+    DRAW_OBSERVER_STAGE("fetch");
     dc_fetch(&layout, rebuild);
     if (!dc.n_verts || !dc.fetch_ok) {atomic_store(&s_checked_failed,1);return;}
 
+    DRAW_OBSERVER_STAGE("index_topology");
     int indexed = 0;
     u32 n_draw = dc.n_source_refs;
     if (rebuild) {
@@ -2837,12 +2956,14 @@ static void sink_end(void* user, const rsx_dispatch* r)
                                                    dc.cuts, dc.n_cuts)
             : dc.n_source_refs - dc.n_source_refs % 3u;
     }
+    DRAW_OBSERVER_STAGE("zero_geometry");
     if (!n_draw) return;
 
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
+    DRAW_OBSERVER_STAGE("targets");
     const u32 n_targets = eng_current_target_set(targets);
     if (!n_targets) {atomic_store(&s_checked_failed,1);return;}
     const u32 target = targets[0];
@@ -2861,6 +2982,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
     u64 fp_hash = 0;
+    DRAW_OBSERVER_STAGE("pipeline");
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
@@ -2883,8 +3005,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (tex_mask == ENG_INVALID) return;
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
+    DRAW_OBSERVER_STAGE("picture_readiness");
     if(!rsx_picture_ready()){atomic_store(&s_checked_failed,1);return;}
 
+    DRAW_OBSERVER_STAGE("index_allocation");
     if (indexed) {
         if (!dc_reserve_indices(n_draw)) {atomic_store(&s_checked_failed,1);return;}
         rsx_draw_engine_write_topology_indices(
@@ -2918,6 +3042,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
     const u32 nslots = g.fp_constants.count ? g.fp_constants.count : 1u;
     const u32 fp_bytes = (nslots + 1u) * 16u;
+    DRAW_OBSERVER_STAGE("constant_allocation");
     if (g.fp_cb_cap < fp_bytes) {
         u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
         if (!n) {atomic_store(&s_checked_failed,1);return;}
@@ -3000,12 +3125,20 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
     if (!pipeline_is_fixed) g.guest_draws++;
+    DRAW_OBSERVER_STAGE("emitted");
 
     if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
         g.zdepths[zslot].had_write = 1;
         eng_zdepth_wrote(zslot, &sf);
     }
+}
+
+static void sink_end(void* user, const rsx_dispatch* r)
+{
+    draw_observer_begin();
+    sink_end_core(user, r);
+    draw_observer_finish();
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
@@ -3151,6 +3284,7 @@ int rsx_draw_engine_enabled(void)
 int rsx_draw_engine_init(u32 width, u32 height)
 {
     if (!g.be) return -1;
+    draw_observer_reset();
     g.width  = width  ? width  : 1280;
     g.height = height ? height : 720;
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
@@ -3184,6 +3318,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
 
 void rsx_draw_engine_shutdown(void)
 {
+    draw_observer_reset();
     atomic_store(&s_checked_ready, 0);
     for(u32 i=0;i<RSX_BE_MAX_TEXTURES;++i){rsx_picture_release(s_picture_bound[i]);s_picture_bound[i]=0;s_picture_offset_pending[i]=0;}
     if (!g.be) return;
