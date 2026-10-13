@@ -20,4 +20,5 @@ with tempfile.TemporaryDirectory(prefix='spurs-policy-service-') as tmp:
         str(r/'runtime/syscalls/sdk_version_weak.c'),
         *[str(r/'runtime/spu'/f'{u}.c') for u in units],
         str(r/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out)],check=True)
-    subprocess.run([str(out)],check=True,timeout=15)
+    env=os.environ.copy();env.pop('SPU_CH_BLOCK',None)
+    subprocess.run([str(out)],check=True,timeout=15,env=env)

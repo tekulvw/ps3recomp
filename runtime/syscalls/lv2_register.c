@@ -1443,6 +1443,7 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
         if (!result) {
             ch->q[(ch->head + ch->count) % SPU_CHANNEL_CAP] = val;
             ch->value = ch->q[ch->head];ch->count++;
+            spurs_policy_service_expect_reply(service,0);
         }
         SPU_CH_UNLOCK(ch);
         spu_ch_wake(service);
@@ -1685,10 +1686,12 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
                     return 1;
                 }
             }
+            if (service_ack) spurs_policy_service_expect_reply(spu,1);
             int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
                 identity, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
             result = rc == 0 ? CELL_OK : CELL_EBUSY;
             if (service_ack) {
+                if (rc) spurs_policy_service_expect_reply(spu,0);
                 spu_channel* ch = &spu->ch_in_mbox;
                 if (ch->count < SPU_IN_MBOX_HW_DEPTH) {
                     ch->q[(ch->head + ch->count) % SPU_CHANNEL_CAP] = result;
