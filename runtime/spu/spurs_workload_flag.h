@@ -31,9 +31,17 @@ static inline void spurs_flag_notify(uint32_t ea, int receiver_changed)
     ppu_resv_break_store(ea + 0x6C);
     if (receiver_changed) ppu_resv_break_store(ea + 0x74);
 }
-/* Observe a real pending zero without consuming it (idle-backoff decision),
- * or deliver it to the selected receiver and reset the scalar atomically.
- * Only SPURS1 runnable workloads are served by the native policy scheduler. */
+/* Read the receiver eligibility while the caller holds the shared lock line. */
+static inline uint32_t spurs_flag_status_locked(uint32_t ea, uint32_t wid)
+{
+    if (wid >= 16 || !spurs_flag_range(ea)) return 0;
+    return !(vm_base[ea + 0x74] & 0x40) &&
+        (spurs_flag_be32(ea + 0xB0) & (0x80000000u >> wid)) &&
+        vm_base[ea + 0x80 + wid] == 2 && !spurs_flag_be32(ea + 0xD6C) &&
+        vm_base[ea + 0x77] == wid && !spurs_flag_be32(ea + 0x6C) ? 4u : 0u;
+}
+/* Observe a pending receiver flag for admission, or deliver it and reset the
+ * scalar atomically. Only SPURS1 runnable workloads are served here. */
 static inline uint32_t spurs_flag_status(uint32_t ea, uint32_t wid, int consume)
 {
     if (wid >= 16 || !spurs_flag_range(ea)) return 0;
