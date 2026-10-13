@@ -111,3 +111,8 @@ int main(int argc,char**argv){
  }else assert(0);
  puts("memory-to-memory scenario passed");munmap(vm_base,0x100000000ULL);return 0;
 }
+
+/* Upstream renderer hooks are outside this focused FIFO fixture. */
+void rsx_draw_engine_guest_read(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b;(void)c;(void)d;(void)e;}
+void rsx_draw_engine_guest_wrote(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b;(void)c;(void)d;(void)e;}
+void rsx_draw_engine_note_flip(u32 a) {(void)a;}

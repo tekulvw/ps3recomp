@@ -2334,7 +2334,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
-    /* A unit left enabled by an earlier draw but not sampled by this
+        /* A unit left enabled by an earlier draw but not sampled by this
          * program is skipped: resolving it would cost a cache check, and an
          * aliased surface a store to guest memory, for nothing. */
         if (!t.enabled || !((tex_used >> u) & 1u)) continue;
@@ -2388,7 +2388,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
                                                (int)t.cubemap, t.remap & 0xFFFFu,
-                                       (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+                                       (t.dimension == 3 && !t.cubemap) ? t.depth : 1u, 0);
                 continue;
             }
         }
@@ -2425,7 +2425,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                            t.width, t.height, t.mipmaps, t.pitch,
                                            (int)t.cubemap, t.remap & 0xFFFFu,
-                                       (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+                                       (t.dimension == 3 && !t.cubemap) ? t.depth : 1u, 0);
             continue;
         }
         if (sampled >= 0) {

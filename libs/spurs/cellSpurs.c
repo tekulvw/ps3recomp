@@ -3668,7 +3668,7 @@ s32 cellSpursTaskGetContextSaveAreaSize(u64 size_out_ea, u64 pattern_ea)
     return CELL_OK;
 }
 
-ellSpursBarrierInitialize(CellSpursTaskset* taskset, CellSpursBarrier* barrier,
+/* cellSpursBarrierInitialize(CellSpursTaskset* taskset, CellSpursBarrier* barrier,
  *                            u32 total)
  *
  * A barrier is 128 bytes, 128-aligned, opaque in the SDK: the PPU only
