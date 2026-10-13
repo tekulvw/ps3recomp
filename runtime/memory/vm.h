@@ -50,6 +50,10 @@ extern "C" {
 
 #define VM_PPU_STACK_SIZE   0x00100000u      /* 1 MB default PPU stack */
 
+/* Loader-owned main/worker TLS images. User allocations must skip this window. */
+#define VM_PPU_TLS_BASE     0x10F00000u
+#define VM_PPU_TLS_SIZE     0x00100000u
+
 /* Home for guest-visible structures the RUNTIME injects -- the GCM label window,
  * the control register (put/get/ref) and the IO<->EA offset tables. These must
  * NOT sit inside main memory, because that is where the title's own allocator
