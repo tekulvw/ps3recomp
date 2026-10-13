@@ -1,7 +1,11 @@
 /* Use the real initializer and guest-memory accessors. Only thread creation is
  * suppressed: the layout/getter checks must not race a kernel poll thread. */
 #include "../runtime/platform/win32_compat.h"
-#define CreateThread(sa, stack, fn, arg, flags, id) ((HANDLE)0)
+/* Layout/poll fixture: acknowledge thread creation without starting host
+ * workers. The separate scheduler fixture verifies actual creation and joins. */
+#define CreateThread(sa, stack, fn, arg, flags, id) ((HANDLE)1)
+#define WaitForSingleObject(h, ms) (WAIT_OBJECT_0)
+#define CloseHandle(h) (TRUE)
 #include "../libs/spurs/cellSpurs.c"
 #include <assert.h>
 

@@ -6,6 +6,8 @@ uint32_t ppu_vm_size=0x100000;
 int main(void) {
     vm_base=calloc(1,0x100000); assert(vm_base);
     s_inst[0].ea=0x1000; s_inst[1].ea=0x3000;
+    /* This registration-only fixture seeds a live admission boundary. */
+    s_inst[0].kernel_live=s_inst[1].kernel_live=1;
     memset(vm_base+0xFFFF,0xA5,0x1902);
     assert(cellSpursCreateTaskset((CellSpurs*)0x1000,(CellSpursTaskset*)0x10000,42,NULL,1)==0);
     assert(vm_read32(0x10000+CSTS_SIZE_FIELD)==0x1900);

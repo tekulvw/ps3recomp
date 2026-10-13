@@ -1684,6 +1684,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
 
     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
         if (!s_workloads[i].in_use) {
+            s_workloads[i].is_taskset = 0;
             spurs_scheduler_forget(i);
             si->idle[i] = 0;
             spu_lockline_lock();
@@ -1692,7 +1693,6 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             ef_w16(spurs_ea + SPURS_WKL_SIGNAL1,
                    (u16)(vm_read16(spurs_ea + SPURS_WKL_SIGNAL1) & ~(0x8000u >> i)));
             ef_line_end(spurs_ea);
-            s_workloads[i].is_taskset = 0;
             s_workloads[i].in_use = 1;
             s_workloads[i].pm = pm;
             s_workloads[i].sizePm = sizePm;
@@ -2240,6 +2240,32 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
 s32 cellSpursWakeUp(CellSpurs* spurs)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    const uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
+    AcquireSRWLockExclusive(&s_taskset2_management_lock);
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
+        SpursWorkload* w = &s_workloads[i];
+        if (!w->in_use || !w->is_taskset || w->started || w->spurs_ea != spurs_ea) continue;
+        if (!w->pm || !w->sizePm) continue;
+        const uint8_t* host = GUEST_PTR(w->pm, const uint8_t*);
+        if (!host) continue;
+        /* A policy attempt is submission even if no lifted image is found.
+         * Use this workload's actual owner, not the last task's global EA. */
+        int admission=w->is_taskset ? spu_taskset_lifecycle_enter((u32)w->data) : 0;
+        if (admission<0) continue;
+        w->started = 1;
+        fprintf(stderr, "[cellSpurs] WakeUp: starting workload %u pm=0x%08X size=%u\n",
+                i, (uint32_t)(uintptr_t)w->pm, w->sizePm);
+        fflush(stderr);
+        /* One instance. readyCount is how many SPUs the workload MAY run on,
+         * and running 2 or 4 changes nothing for the title this was written
+         * against -- measured, not assumed -- so the conservative reading
+         * stands until a title needs otherwise. */
+        if (w->is_taskset)
+            spu_workload_dispatch_async_owned(host,w->sizePm,(uint32_t)w->data,(uint32_t)w->data,0);
+        else spu_workload_dispatch_async(host,w->sizePm,(uint32_t)w->data);
+        if (admission>0) spu_taskset_lifecycle_leave((u32)w->data);
+    }
+    ReleaseSRWLockExclusive(&s_taskset2_management_lock);
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
     if (rc) return rc;
