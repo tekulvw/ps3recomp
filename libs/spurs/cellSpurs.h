@@ -259,6 +259,7 @@ s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
 s32 _cellSpursTasksetAttribute2Initialize(CellSpursTasksetAttribute2* attr,
                                          u32 revision);
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset);
+s32 cellSpursDestroyTaskset2(CellSpursTaskset2* taskset);
 s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset);
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset);
 
