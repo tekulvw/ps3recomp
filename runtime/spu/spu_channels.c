@@ -1059,7 +1059,9 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     }
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
     case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status; break;
-    case SPU_RdMachStat:    v = (ctx->status == SPU_STATUS_RUNNING) ? 1 : 0; break;
+    /* CBEA 9.8: numeric bit 0 is interrupt-enable, independent of run status.
+     * This runtime models nonisolated SPUs, so the isolation bit stays clear. */
+    case SPU_RdMachStat:    v = ctx->int_enable & 1u; break;
     case SPU_RdSRR0:        v = ctx->srr0;                              break;
     default:
         v = 0;
