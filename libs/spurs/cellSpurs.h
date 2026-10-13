@@ -254,6 +254,8 @@ s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
 
 s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr);
 s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode);
+s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* attr,
+                                               CellSpursTaskExitCode* exitCode);
 
 /* ---------------------------------------------------------------------------
  * Workload functions
