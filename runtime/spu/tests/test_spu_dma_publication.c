@@ -14,6 +14,7 @@ int main(int argc, char** argv) {
     pub_ctx.ls=pub_ls; pub_ctx.image_id=17; pub_ctx.pc=0x1234; pub_ctx.spu_id=2;
     for(unsigned i=0;i<32;i++) spu_ls_write32(&pub_ctx,0x100+4*i,0xAA000000+i);
     spu_ls_write32(&pub_ctx,0x120,0x12345678);
+    spu_ls_write32(&pub_ctx,0x130,0x12345678); /* One report per matching transfer. */
     if(argc>1 && !strcmp(argv[1],"full")) {
         uint32_t at=SPU_LS_SIZE-16384;
         spu_ls_write32(&pub_ctx,SPU_LS_SIZE-4,0x12345678);
