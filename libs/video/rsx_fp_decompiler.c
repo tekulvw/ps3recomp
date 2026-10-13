@@ -43,6 +43,13 @@
 #define FP_SRC_NEGATE       (1u << 17)
 #define FP_SRC0_ABS         (1u << 29) /* in DWORD1 */
 #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
+/* Source precision selectors all live in DWORD2, including SRC0/SRC2.
+ * Modifier 4 saturates each lane before the source abs/neg modifiers. */
+#define FP_SRC0_PRECISION_SHIFT 19
+#define FP_SRC1_PRECISION_SHIFT 22
+#define FP_SRC2_PRECISION_SHIFT 25
+#define FP_SRC_PRECISION_MASK   7u
+#define FP_SRC_PRECISION_SAT    4u
 #define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
 
 /* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
@@ -310,10 +317,11 @@ typedef struct {
     int half;
     int negate;
     int abs;
+    int saturate;
     char swz[5];    /* e.g. "xyzw" */
 } Src;
 
-static void decode_src(u32 w, int abs_bit, Src* s)
+static void decode_src(u32 w, int abs_bit, u32 precision, Src* s)
 {
     static const char comp[4] = {'x','y','z','w'};
     s->type   = (w & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT;
@@ -321,6 +329,7 @@ static void decode_src(u32 w, int abs_bit, Src* s)
     s->half   = (w & FP_SRC_HALF) ? 1 : 0;
     s->negate = (w & FP_SRC_NEGATE) ? 1 : 0;
     s->abs    = abs_bit ? 1 : 0;
+    s->saturate = precision == FP_SRC_PRECISION_SAT;
     for (int i = 0; i < 4; i++)
         s->swz[i] = comp[(w >> (FP_SRC_SWZ_SHIFT + 2 * i)) & 3];
     s->swz[4] = '\0';
@@ -367,7 +376,10 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
     }
 
     char swz[160];
-    snprintf(swz, sizeof(swz), "(%s).%s", base, s->swz);
+    if (s->saturate)
+        snprintf(swz, sizeof(swz), "saturate((%s).%s)", base, s->swz);
+    else
+        snprintf(swz, sizeof(swz), "(%s).%s", base, s->swz);
 
     const char* pre = "";
     const char* post = "";
@@ -519,9 +531,12 @@ static int rsx_fp_decompile_internal(
         else                         cmp_op = "==";  /* exec_eq only */
 
         Src s0, s1, s2;
-        decode_src(w1, w1 & FP_SRC0_ABS, &s0);
-        decode_src(w2, w2 & FP_SRC1_ABS, &s1);
-        decode_src(w3, 0,                &s2);
+        decode_src(w1, w1 & FP_SRC0_ABS,
+            (w2 >> FP_SRC0_PRECISION_SHIFT) & FP_SRC_PRECISION_MASK, &s0);
+        decode_src(w2, w2 & FP_SRC1_ABS,
+            (w2 >> FP_SRC1_PRECISION_SHIFT) & FP_SRC_PRECISION_MASK, &s1);
+        decode_src(w3, 0,
+            (w2 >> FP_SRC2_PRECISION_SHIFT) & FP_SRC_PRECISION_MASK, &s2);
 
         /* Inline constant: any CONST source pulls the next 16 bytes as a
          * float4 literal and advances past it. */
