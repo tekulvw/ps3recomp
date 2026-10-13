@@ -10,6 +10,8 @@
 typedef struct {
     int initialized, enabled, selected, last_park;
     uint32_t lo, hi, limit, words, emitted, last_io, last_header, last_put;
+    uint32_t zero_io, zero_words, zero_first_put, zero_last_put;
+    uint64_t zero_end;
 } gcm_fifo_observer_state;
 static gcm_fifo_observer_state s_fifo_observer;
 
@@ -39,11 +41,34 @@ static void gcm_observer_init(void)
         !gcm_observer_option("GCM_FIFO_OBSERVE_WORDS",16,32,&s->words)) return;
     s->lo=(uint32_t)lo; s->hi=(uint32_t)hi; s->enabled=1;
 }
+/* Only headers actually loaded as zero by the decoder enter these runs.
+ * Packet payload zeroes are not included. Flush at each drain boundary. */
+static void gcm_observer_flush_zeros(void)
+{
+    gcm_fifo_observer_state* s=&s_fifo_observer;
+    if (!s->zero_words) return;
+    if (s->emitted<s->limit) {
+        ++s->emitted;
+        fprintf(stderr,"[fifo-observe] io=%08X header=00000000 kind=zeros end=%09" PRIX64 " zero_words=%u first_put=%08X last_put=%08X\n",
+            s->zero_io,s->zero_end,s->zero_words,s->zero_first_put,s->zero_last_put);
+    }
+    s->zero_words=0;
+}
 static void gcm_observer_packet(uint32_t io, uint32_t header, uint32_t put)
 {
     gcm_observer_init();
     gcm_fifo_observer_state* s=&s_fifo_observer; s->selected=0;
     if (!s->enabled || s->emitted>=s->limit) return;
+    if (!header && io>=s->lo && io<s->hi) {
+        s->last_park=0;
+        if (s->zero_words && s->zero_end!=io) gcm_observer_flush_zeros();
+        if (s->emitted>=s->limit) return;
+        if (!s->zero_words) { s->zero_io=io;s->zero_first_put=put; }
+        ++s->zero_words;s->zero_end=(uint64_t)io+4;s->zero_last_put=put;
+        return;
+    }
+    gcm_observer_flush_zeros();
+    if (s->emitted>=s->limit) return;
     uint32_t type=header>>29, count=(header>>18)&0x7ffu;
     const char* kind="unknown"; uint64_t end=(uint64_t)io+4;
     uint32_t target=0;

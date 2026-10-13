@@ -12,6 +12,20 @@ int main(int argc,char** argv) {
     assert(vm_base!=MAP_FAILED);ppu_vm_size=0x4000000;ppu_hle_inject_base=0x3000000;
     memset(s_ea_address_table,0xFF,sizeof(s_ea_address_table));s_ea_address_table[0]=1;
     s_gcm_syscall_mode=1;
+    if(argc==2 && !strcmp(argv[1],"zero-boundary")) {
+        cellGcm_syscall_set_fifo(0x10,0);
+        cellGcm_rsx_process_fifo();assert(s_fifo_getoff==0x10);
+        cellGcm_syscall_set_fifo(0x20,0x10);
+        cellGcm_rsx_process_fifo();assert(s_fifo_getoff==0x20);
+        return 0;
+    }
+    if(argc==2 && !strcmp(argv[1],"zeros")) {
+        raw32(0x100020,0x20000020);
+        cellGcm_syscall_set_fifo(0x24,0);
+        for(unsigned i=0;i<8;i++)cellGcm_rsx_process_fifo();
+        assert(s_fifo_getoff==0x20);
+        return 0;
+    }
     /* Header precedes the observed interval; its payload consumes it. */
     raw32(0x100000,0x40240300); /* NI, nine words. */
     for(unsigned i=0;i<9;i++)raw32(0x100004+i*4,0xAA000000+i);
