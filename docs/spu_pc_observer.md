@@ -49,6 +49,29 @@ trailing partial four-byte words are excluded. Both signed zeros count as zero;
 finite subnormal values count as nonzero; infinities and NaNs count as nonfinite.
 Source and destination may refer to the same buffer.
 
+An optional `trigger /absolute/path/to/arm` line defers event admission until
+that caller-owned, non-directory file exists. The path is cached with the rest
+of the configuration, is at most 128 bytes, and must be an absolute POSIX,
+drive-rooted Windows or UNC path without spaces/escaping. Duplicate, missing,
+relative or oversized trigger declarations disable the entire configuration.
+
+Only matching sites with valid opcode, overlay guards and in-bounds spans can
+poll the trigger. A shared atomic window permits at most one metadata lookup
+per 250 milliseconds across contexts/threads. The lookup reads no file contents
+and makes no observer allocations; host error state is preserved. Unarmed calls
+scan no buffers and spend no event budget. Once file presence arms the observer,
+arming remains latched for that linked runtime: removal or environment/config
+changes do not disarm it, restart a capture or reset the cap. Concurrent contexts
+may skip an event while another context is completing the first lookup, so a
+capture can start partway through an invocation.
+
+The owner should remove any stale trigger before launch, then create it only at
+the desired application state. The runtime never creates, deletes or rewrites
+that file. Omit `trigger` for the original immediate-admission behavior. When
+the observer is disabled, the cached instruction path is unchanged and performs
+no trigger work; when configured without a trigger, no file polling or clock
+reads are added.
+
 Limits are 4096 file bytes, 160 bytes per line, 8 unique sites, 32 unique guard
 words, 8 optional identity registers, divisors 1 through 16, and 256 events.
 One `limit`, at least one guard and site, and a final `end` line followed by a

@@ -1,6 +1,8 @@
 /* Synthetic actual dispatcher/interpreter observer fixture; no title assets. */
 #include "../spu_helpers.h"
 #include "../spu_interp.h"
+#include "../spu_pc_observer.h"
+#include <unistd.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,7 +63,27 @@ static void* run_context(void* arg) {
 int main(int argc, char** argv) {
     zero=argc>1 && !strcmp(argv[1],"zero");
     spu_begin_image(77); spu_register_function(0x400,finish);
-    if(argc>1 && !strcmp(argv[1],"threads")) {
+    if(argc>1 && (!strcmp(argv[1],"trigger") || !strcmp(argv[1],"trigger_threads"))) {
+        assert(argc==3);
+        run_context((void*)0); run_context((void*)1);
+        assert(spu_pc_observer_enabled());
+        assert(ReadAcquire(&g_spu_pc_observer.events)==0);
+        FILE* file=fopen(argv[2],"wb"); assert(file); assert(!fclose(file));
+        usleep(300000); /* Real bounded polling interval, no clock mock. */
+        if(!strcmp(argv[1],"trigger_threads")) {
+            pthread_t threads[8];
+            for(unsigned i=0;i<8;i++) assert(!pthread_create(&threads[i],NULL,run_context,(void*)(uintptr_t)i));
+            for(unsigned i=0;i<8;i++) assert(!pthread_join(threads[i],NULL));
+            assert(ReadAcquire(&g_spu_pc_observer.events)>0);
+            while((uint32_t)ReadAcquire(&g_spu_pc_observer.events)<g_spu_pc_observer.limit) run_context((void*)1);
+        } else {
+            run_context((void*)0); run_context((void*)1);
+            assert(ReadAcquire(&g_spu_pc_observer.events)==8);
+            assert(!unlink(argv[2])); /* Arming must remain latched. */
+            run_context((void*)1);
+            assert(ReadAcquire(&g_spu_pc_observer.events)==12);
+        }
+    } else if(argc>1 && !strcmp(argv[1],"threads")) {
         pthread_t threads[8];
         for(unsigned i=0;i<8;i++) assert(!pthread_create(&threads[i],NULL,run_context,(void*)(uintptr_t)i));
         for(unsigned i=0;i<8;i++) assert(!pthread_join(threads[i],NULL));

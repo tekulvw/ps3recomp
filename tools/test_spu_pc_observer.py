@@ -30,10 +30,10 @@ with tempfile.TemporaryDirectory(prefix='spu-pc-observer-') as tmp:
         f"site {pc:X} {word:X} 3 4 1 5 6 2\n" for pc, word in [
             (0x30000,0x34000194),(0x30004,0xB2850A16),
             (0x30008,0x24000194),(0x3000C,0x40200000)]) + "end\n"
-    def run(exe, mode='', text=base):
+    def run(exe, mode='', text=base, args=()):
         if text is not None: config.write_text(text)
         current=dict(env,SPU_PC_OBSERVE=str(config)) if text is not None else env
-        result=subprocess.run([str(exe)]+([mode] if mode else []), check=False,
+        result=subprocess.run([str(exe)]+([mode] if mode else [])+list(args), check=False,
                               capture_output=True,text=True,timeout=10,cwd=tmp,env=current)
         assert result.returncode==0, result.stdout+result.stderr
         records=[dict(re.findall(r"(\w+)=([^ ]+)",line)) for line in result.stderr.splitlines()
@@ -52,6 +52,14 @@ with tempfile.TemporaryDirectory(prefix='spu-pc-observer-') as tmp:
             assert r['src_nonzero']==r['dst_nonzero']==('0' if mode else '4')
             assert r['id_r3']=='0x00001000' and r['id_r6']=='0x00000020'
     _,records=run(binary,text=None);assert not records
+    trigger=Path(tmp)/'arm'
+    delayed=base.replace('limit 8','limit 12').replace('end\n',f'trigger {trigger}\nend\n')
+    result,records=run(binary,'trigger',delayed,[str(trigger)])
+    assert len(records)==12 and sorted(int(r['seq']) for r in records)==list(range(1,13)),result.stderr
+    concurrent=delayed.replace('limit 12','limit 5')
+    result,records=run(binary,'trigger_threads',concurrent,[str(trigger)])
+    assert len(records)==5 and sorted(int(r['seq']) for r in records)==list(range(1,6)),result.stderr
+    trigger.unlink()
     # Shared cap includes actual microstep and fallback paths, also under contention.
     for mode in ('','threads'):
         result,records=run(binary,mode,base.replace('limit 8','limit 5'))
@@ -61,11 +69,15 @@ with tempfile.TemporaryDirectory(prefix='spu-pc-observer-') as tmp:
             k=int(r['r0'],16)-0xABC000
             assert r['ctx']==contexts[str(k)] and int(r['r1'],16)==0xDEF000+k
     safety=Path(tmp)/'safety'
+    compat=Path(tmp)/'compat.o'
+    subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1',
+                    *os.environ.get('SPU_OBSERVER_TEST_CFLAGS','').split(),
+                    '-c',str(root/'runtime/platform/win32_compat.c'),'-o',str(compat)],check=True)
     include=['-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform')]
     for compiler, standard in [(os.environ.get('CC','cc'),'gnu17'),(os.environ.get('CXX','c++'),'c++17')]:
         subprocess.run([compiler,'-x','c++' if standard=='c++17' else 'c','-std='+standard,
                         '-O2','-UNDEBUG',*os.environ.get('SPU_OBSERVER_TEST_CFLAGS','').split(),*include,str(spu/'tests/test_spu_pc_observer_safety.c'),
-                        '-pthread','-o',str(safety)],check=True)
+                        '-x','none',str(compat),'-pthread','-o',str(safety)],check=True)
         for mode in ('guard','bounds','nonmatch'):
             _,records=run(safety,mode); assert not records
         _,records=run(safety,'cap');assert len(records)==8
@@ -90,6 +102,23 @@ with tempfile.TemporaryDirectory(prefix='spu-pc-observer-') as tmp:
             _,records=run(safety,'poison',text); assert not records
         result,records=run(safety,'poison',None); assert not records
         print(standard+': '+result.stdout.strip())
+    trigger_safety=Path(tmp)/'trigger-safety'
+    for compiler, standard in [(os.environ.get('CC','cc'),'gnu17'),(os.environ.get('CXX','c++'),'c++17')]:
+        subprocess.run([compiler,'-x','c++' if standard=='c++17' else 'c','-std='+standard,'-O2','-UNDEBUG',
+                        *os.environ.get('SPU_OBSERVER_TEST_CFLAGS','').split(),*include,
+                        str(spu/'tests/test_spu_pc_observer_trigger.c'),'-x','none',str(compat),'-pthread','-o',str(trigger_safety)],check=True)
+        for mode in ('lifecycle','reject'):
+            if trigger.exists(): trigger.unlink()
+            text=base.replace('limit 8','limit 3').replace('end\n',f'trigger {trigger}\nend\n')
+            result,records=run(trigger_safety,mode,text,[str(trigger),str(config)])
+            assert len(records)==(3 if mode=='lifecycle' else 1),result.stderr
+        trigger.unlink()
+    _,records=run(safety,'nonmatch',base.replace('end\n','trigger /'+'x'*127+'\nend\n'));assert not records
+    # Invalid trigger declarations disable all observation, including poison contexts.
+    bad_triggers=['trigger relative','trigger','trigger /one /two','trigger /'+'x'*128,
+                  f'trigger {trigger}\ntrigger {trigger}']
+    for declaration in bad_triggers:
+        _,records=run(safety,'poison',base.replace('end\n',declaration+'\nend\n'));assert not records
     objects=[]
     for compiler,source,standard,extra in [
         (os.environ.get('CC','cc'),'test_spu_pc_observer_safety.c','gnu17',['-DSPU_OBSERVER_LINKAGE']),
@@ -98,7 +127,7 @@ with tempfile.TemporaryDirectory(prefix='spu-pc-observer-') as tmp:
         subprocess.run([compiler,'-std='+standard,'-O2','-UNDEBUG',*extra,*include,
                         *os.environ.get('SPU_OBSERVER_TEST_CFLAGS','').split(),
                         '-c',str(spu/'tests'/source),'-o',str(obj)],check=True)
-    subprocess.run([os.environ.get('CXX','c++'),*objects,'-pthread',
+    subprocess.run([os.environ.get('CXX','c++'),*objects,str(compat),'-pthread',
                     *os.environ.get('SPU_OBSERVER_TEST_CFLAGS','').split(),'-o',str(safety)],check=True)
     _,records=run(safety,'stats');assert len(records)==3
-    print('observer: real paths, handoff, shared cap, identity, zero/nonzero, guards, bounds, trailing words, C/C++, disabled poison and initialization contention passed')
+    print('observer: real paths, handoff, shared cap, identity, zero/nonzero, guards, bounds, trailing words, C/C++, disabled poison/init, trigger absent-to-armed/cached lifecycle/concurrency/throttle/error-state passed')
