@@ -32,6 +32,7 @@
 #endif
 
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
+#define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
@@ -1602,6 +1603,20 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     fflush(stderr);
 }
 
+/* ppu_recomp.h's inline loads (vm_read*_inl) skip the out-of-line accessors'
+ * probes, so they run only while no read diagnostic is armed. */
+extern "C" int vm_inline_ok = 0;
+static struct VmInlineInit {
+    VmInlineInit() {
+        static const char* const vars[] = {
+            "PPU_RWATCH", "PPU_FORCE_READ_ADDR", "YDKJ_RWATCH", "PPU_RVAL", "PPU_RVAL64",
+            "PPU_HOTMAP", "PPU_HOTREAD", "PPU_SPINBT", 0 };
+        int d = 0;
+        for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
+        vm_inline_ok = !d;
+    }
+} s_vm_inline_init;
+
 uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
 #ifdef VM_SAMPLE_READS
@@ -2433,6 +2448,18 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
     ReleaseSRWLockExclusive(&lk);
 }
 
+/* ps3_indirect_call_to: dispatch to an explicit guest target with CTR left as
+ * the guest had it (b<cond>lrl branches through LR; CTR must not change). */
+static PPU_THREAD_LOCAL uint32_t g_icall_target;
+static PPU_THREAD_LOCAL int      g_icall_target_set;
+extern "C" void ps3_indirect_call(ppu_context* ctx);
+extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
+{
+    g_icall_target = target;
+    g_icall_target_set = 1;
+    ps3_indirect_call(ctx);
+}
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     static int on = -1;
@@ -2487,6 +2514,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         fprintf(stderr,"%s\n",ln); } } }
 #endif
     uint32_t addr = (uint32_t)ctx->ctr;
+    if (g_icall_target_set) { addr = g_icall_target; g_icall_target_set = 0; }
     /* PS3_CALLTRACE=N: log the first N indirect calls (target + r3/r4) --
      * generic visibility into vtable/callback dispatch (e.g. which job body a
      * JobManager worker runs). */
