@@ -10,6 +10,7 @@
  */
 
 #include "cellSpurs.h"
+#include "../../runtime/diagnostics/audio_chronology.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
@@ -3508,10 +3509,14 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] GetWorkloadInfo(wid=%u info=0x%08X)\n", wid, (u32)info_ea);
 
-    if (!spurs_ea || !info_ea)
+    if (!spurs_ea || !info_ea) {
+        audio_chronology_workload(spurs_ea,wid,info_ea,CELL_SPURS_CORE_ERROR_NULL_POINTER,0,0,0);
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use)
+    }
+    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use) {
+        audio_chronology_workload(spurs_ea,wid,info_ea,CELL_SPURS_CORE_ERROR_INVAL,0,0,0);
         return CELL_SPURS_CORE_ERROR_INVAL;
+    }
 
     /* CellSpursWorkloadInfo is a GUEST out-buffer (cell/spurs/workload_types.h),
      * big-endian, 32-bit pointers. This used to return CELL_OK writing NOTHING,
@@ -3533,13 +3538,17 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
     vm_write32(base + 0x1C, w->name_ea);
 
     u32 se = (u32)spurs_ea;
-    *(vm_base + base + 0x20) = *(vm_base + se + SPURS_WKL_CURCONT + wid);  /* contention   */
+    u8 ac_contention = *(vm_base + se + SPURS_WKL_CURCONT + wid);
+    *(vm_base + base + 0x20) = ac_contention;  /* contention   */
     *(vm_base + base + 0x21) = (u8)w->minContention;                       /* minContention */
     *(vm_base + base + 0x22) = (u8)w->maxContention;                       /* maxContention */
-    *(vm_base + base + 0x23) = *(vm_base + se + SPURS_WKL_READY1 + wid);   /* readyCount   */
-    *(vm_base + base + 0x24) = *(vm_base + se + SPURS_WKL_IDLE2  + wid);   /* idleSpuRequest */
+    u8 ac_ready = *(vm_base + se + SPURS_WKL_READY1 + wid);
+    *(vm_base + base + 0x23) = ac_ready;   /* readyCount   */
+    u8 ac_idle = *(vm_base + se + SPURS_WKL_IDLE2 + wid);
+    *(vm_base + base + 0x24) = ac_idle;   /* idleSpuRequest */
     u32 sig = vm_read32(se + SPURS_WKL_SIGNAL1) >> 16;
     *(vm_base + base + 0x25) = (sig & (0x8000u >> wid)) ? 1 : 0;           /* hasSignal    */
+    audio_chronology_workload(spurs_ea,wid,info_ea,CELL_OK,ac_contention,ac_ready,ac_idle);
     return CELL_OK;
 }
 

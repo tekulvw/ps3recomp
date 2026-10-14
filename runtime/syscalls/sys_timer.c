@@ -6,6 +6,8 @@
 #define _DEFAULT_SOURCE /* tm_gmtoff on glibc */
 #endif
 #include "sys_timer.h"
+#include "../diagnostics/audio_chronology.h"
+#include <errno.h>
 #include <time.h>
 #include "sys_event.h"
 #include "../memory/vm.h"
@@ -217,6 +219,12 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         extern void ppu_log_host_chain(const char*);
         ppu_log_host_chain("usleep1ms"); } }
 
+    audio_chronology_wait_token ac_wait;
+    audio_chronology_wait_begin(&ac_wait, usec);
+    int ac_host_rc = 0; /* Guest result remains CELL_OK, including host EINTR. */
+#ifdef _WIN32
+    ac_host_rc = INT32_MIN; /* Existing Windows path has no single sleep result. */
+#endif
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
     if (usec >= 1000) {
@@ -254,9 +262,10 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
         ts.tv_nsec = (long)((usec % 1000000) * 1000);
-        nanosleep(&ts, NULL);
+        ac_host_rc = nanosleep(&ts, NULL);
     }
 #endif
+    audio_chronology_wait_end(&ac_wait, ac_host_rc, ac_host_rc == -1 ? errno : 0);
 
     return CELL_OK;
 }
