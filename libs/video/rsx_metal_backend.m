@@ -837,6 +837,23 @@ static u32 vtex_mask_for(const rsx_state* st);
  * and sampled with a direction rather than a 2D coordinate, so it changes the
  * compiled program and belongs in the key -- the D3D12 backend's PSO key
  * carries cube_mask for the same reason. */
+static u32 fp_shadow_state(const rsx_state* st, const u8* uc,
+                           rsx_fp_shadow_desc shadow[RSX_MAX_TEXTURES])
+{
+    memset(shadow, 0, sizeof(rsx_fp_shadow_desc) * RSX_MAX_TEXTURES);
+    u32 shadow_mask = 0;
+    const u32 sampled_units = rsx_fp_texture_units(uc, MTL_FP_MAX_BYTES);
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        if (!(sampled_units & (1u << u))) continue;
+        const rsx_texture_state* t = &st->textures[u];
+        rsx_fp_shadow_desc_from_texture(&shadow[u], (t->format >> 8) & 255u,
+            (t->format >> 4) & 15u, (t->format >> 2) & 1u,
+            (t->format >> 16) & 0xFFFFu, t->filter, t->address, t->control0);
+        if (shadow[u].enabled) shadow_mask |= 1u << u;
+    }
+    return shadow_mask;
+}
+
 static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
 {
     if (!vm_base || st->shader_program == 0) return -1;
@@ -847,6 +864,8 @@ static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
 
     u64 key = rsx_fp_structural_hash(*uc, MTL_FP_MAX_BYTES, 1469598103934665603ull);
     if (!key) return -1;                    /* malformed or unterminated */
+    rsx_fp_shadow_desc shadow[RSX_MAX_TEXTURES];
+    const u32 shadow_mask = fp_shadow_state(st, *uc, shadow);
     const u32 ctrl      = st->shader_control;
     const u32 ctrl_key  = ctrl & (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS | 0xEu);
     const u32 alpha_en  = (st->alpha_test_enable && st->alpha_func != 0x0207u) ? 1u : 0u;
@@ -856,15 +875,20 @@ static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
     key = fnv1a64(&alpha_fn, sizeof alpha_fn, key);
     key = fnv1a64(&cube_mask, sizeof cube_mask, key);
 
+    if (shadow_mask) {
+        key = fnv1a64(&shadow_mask, sizeof shadow_mask, key);
+        key = fnv1a64(shadow, sizeof shadow, key);
+    }
     for (u32 i = 0; i < s_fp_count; i++)
-        if (s_fp_cache[i].key == key) return s_fp_cache[i].fn ? (int)i : -1;
-    if (s_fp_count >= MTL_FP_CACHE) { s_caches_full = 1; return -1; }
+        if (s_fp_cache[i].key == key)
+            return s_fp_cache[i].fn ? (int)i : (shadow_mask ? -2 : -1);
+    if (s_fp_count >= MTL_FP_CACHE) { s_caches_full = 1; return shadow_mask ? -2 : -1; }
 
     char name[64];
     id<MTLFunction> fn = nil;
     u32 nconst = 0;
-    int ni = rsx_fp_decompile_buffered_ex(*uc, MTL_FP_MAX_BYTES, ctrl, cube_mask,
-                                          s_hlsl, sizeof s_hlsl, &nconst);
+    int ni = rsx_fp_decompile_buffered_shadow_ex(*uc, MTL_FP_MAX_BYTES, ctrl, cube_mask,
+        NULL, shadow_mask ? shadow : NULL, s_hlsl, sizeof s_hlsl, &nconst);
     if (ni > 0 && alpha_en &&
         rsx_fp_apply_alpha_test_buffered(s_hlsl, sizeof s_hlsl, st->alpha_func) < 0)
         ni = -1;
@@ -888,13 +912,14 @@ static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
     { static int n = 0; if (n++ < 32)
         fprintf(stderr, "[RSX metal] fragment program %016llX: %d instrs, %u constants -> %s\n",
                 (unsigned long long)key, ni, nconst,
-                fn ? "ok" : "FAILED (built-in shader instead)"); }
+                fn ? "ok" : (shadow_mask ? "FAILED (depth comparison draw rejected)" :
+                                             "FAILED (built-in shader instead)")); }
 
     const int slot = (int)s_fp_count++;
     s_fp_cache[slot].key    = key;
     s_fp_cache[slot].fn     = fn;
     s_fp_cache[slot].nconst = nconst;
-    return fn ? slot : -1;
+    return fn ? slot : (shadow_mask ? -2 : -1);
 }
 
 /* Reserve `bytes` of constant staging at a 256-byte boundary. */
@@ -919,28 +944,32 @@ static int cb_alloc(u32 bytes, u32* off)
 /* Resolve both guest programs for a draw and snapshot their constant blocks.
  * Returns 1 with the record's shader fields filled in, 0 when the draw must
  * use the built-in shader (no vertex program loaded, a translation failure,
- * or a full cache). Both programs or neither: a guest vertex program's
+ * or a full cache). Active depth comparison failures return -1, rejecting
+ * the record before vertex/texture reads. Both programs or neither: a guest vertex program's
  * outputs do not link with the built-in fragment shader's inputs. */
 static int guest_programs_for(const rsx_state* st, MtlDraw* d)
 {
-    const int vs = vp_slot_for(st, vtex_mask_for(st));
-    if (vs < 0) return 0;
     const u8* fp_uc = NULL;
     const int fs = fp_slot_for(st, &fp_uc, cube_mask_for(st));
+    if (fs == -2) return -1; /* Active comparison must never use a raw fallback. */
     if (fs < 0) return 0;
+    rsx_fp_shadow_desc shadow[RSX_MAX_TEXTURES];
+    const int fallback = fp_shadow_state(st, fp_uc, shadow) ? -1 : 0;
+    const int vs = vp_slot_for(st, vtex_mask_for(st));
+    if (vs < 0) return fallback;
 
     /* PSConstants: the program's inline constants as host-order bit patterns,
      * one float4 per slot, then fp_alpha. The count must match what the
      * shader was compiled against. */
     if (rsx_fp_collect_constants(fp_uc, MTL_FP_MAX_BYTES, &s_fp_consts) < 0 ||
         s_fp_consts.count != s_fp_cache[fs].nconst)
-        return 0;
+        return fallback;
     const u32 nslots = s_fp_consts.count ? s_fp_consts.count : 1u;
     const u32 fp_len = (nslots + 1u) * 16u;
 
     u32 vp_off, fp_off;
-    if (!cb_alloc(MTL_VP_CB_BYTES, &vp_off)) return 0;
-    if (!cb_alloc(fp_len, &fp_off)) return 0;
+    if (!cb_alloc(MTL_VP_CB_BYTES, &vp_off)) return fallback;
+    if (!cb_alloc(fp_len, &fp_off)) return fallback;
 
     /* VPConst: the 512 transform constants, then the viewport epilogue
      * (see the D3D12 backend's vp_record_cb): x/y identity, and the z lane
@@ -1676,7 +1705,8 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
      * drops to the built-in shader must still fetch its vertices the same
      * way. Constant staging reserved here for a draw that then fails on
      * vertices is simply left unused until the frame resets it. */
-    const int guest = s_guest_shaders && guest_programs_for(st, d);
+    const int guest = s_guest_shaders ? guest_programs_for(st, d) : 0;
+    if (guest < 0) { s_dropped_records++; return; }
     if (guest) textures_for(st, d);
 
     u32 first_vert = s_vert_count;

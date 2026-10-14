@@ -1376,6 +1376,17 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         rsx_dsp_get_texture(&g.rsx, u, &t);
         if (t.enabled) texture_bx2_masks[u] = rsx_texture_bx2_mask(t.format, t.remap, t.filter);
     }
+    rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
+    u32 shadow_mask = 0;
+    const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        if (!(sampled_units & (1u << u))) continue;
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        rsx_fp_shadow_desc_from_texture(&shadow[u], t.format, t.dimension,
+            t.cubemap, t.mipmaps, t.filter, t.wrap, t.control0);
+        if (shadow[u].enabled) shadow_mask |= 1u << u;
+    }
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
     const u32 unnorm_mask = eng_unnorm_units(unnorm_dim);
 
@@ -1400,6 +1411,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         if (bx2_units) key = eng_fnv1a(texture_bx2_masks, sizeof texture_bx2_masks, key);
+        if (shadow_mask) {
+            key = eng_fnv1a(&shadow_mask, sizeof shadow_mask, key);
+            key = eng_fnv1a(shadow, sizeof shadow, key);
+        }
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
@@ -1430,10 +1445,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
-        fi = rsx_fp_decompile_buffered_texture_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
-                                          texture_bx2_masks, s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        fi = rsx_fp_decompile_buffered_shadow_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
+                texture_bx2_masks, shadow_mask ? shadow : NULL,
+                s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
-        if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
+        if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask & ~shadow_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
             fi = -1;
         if (fi > 0 && rs->alpha_test_enable &&

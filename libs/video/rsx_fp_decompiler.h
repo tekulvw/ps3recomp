@@ -131,6 +131,26 @@ int rsx_fp_decompile_buffered_texture_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     const u8 texture_bx2_masks[16], char* out, u32 out_size,
     u32* out_constant_count);
+/* Native depth texture comparison metadata. Disabled descriptors preserve the
+ * original shader byte-for-byte. enabled=2 marks an active unsupported layout.
+ * RSX ADDRESS zfunc0/7 and texture alpha-kill bypass comparison; modes1..6
+ * compare the source reference against stored depth. R32 color snapshots are
+ * sampled explicitly, so no native depth texture/SampleCmp binding is needed.
+ * Supported: decoded D24_D8/D16, 2D TEX/TXP, one level, matching nearest or
+ * linear min/mag filters. Float-depth formats, cubes/3D, multiple levels and
+ * other texture opcodes reject translation when comparison is active.
+ * The shared engine and legacy Metal supply this state; other legacy backend
+ * paths retain their existing behavior until they adopt the metadata API. */
+typedef struct rsx_fp_shadow_desc {
+    u8 enabled, func, linear, unnormalized;
+} rsx_fp_shadow_desc;
+void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
+    u32 dimension, u32 cube, u32 mips, u32 filter, u32 address, u32 control0);
+u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes);
+int rsx_fp_decompile_buffered_shadow_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const u8 texture_bx2_masks[16], const rsx_fp_shadow_desc shadow[16],
+    char* out, u32 out_size, u32* out_constant_count);
 /* Units accessed by a supported fetch carrying exp_tex; used to limit the
  * texture-state contribution to pipeline identity. */
 u32 rsx_fp_texture_expand_units(const u8* ucode, u32 max_bytes);
