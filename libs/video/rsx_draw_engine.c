@@ -2193,6 +2193,116 @@ static int eng_capture_write(const char* prefix, const char* suffix,
     return ok;
 }
 
+/* CPU-only producer sidecars, including programs with no sampled textures.
+ * Reuses the binding diagnostic's writer and program selector; never calls a
+ * backend readback, flush or capture callback. One full frame, bounded count. */
+static void eng_producer_capture(u32 draw, const rsx_vertex_layout_plan* layout,
+    u32 pipeline, const u32* targets, u32 n_targets, u32 uploaded,
+    u32 n_indices, u32 fp_bytes, const rsx_be_render_state* rs,
+    const rsx_dsp_surface* sf, const rsx_dsp_viewport* vp)
+{
+    enum { MAX_COUNT=32, MAX_ARRAY=1u<<20, MAX_TOTAL=64u<<20 };
+    static int configured, enabled, armed, started, closed;
+    static u32 location, offset, limit=MAX_COUNT, attempts, arm_frame, frame;
+    static size_t total;
+    static const char* directory;
+    static const char* trigger;
+    static rsx_binding_capture_filter selectors[RSX_BINDING_CAPTURE_MAX];
+    const int saved_errno=errno;
+    if (!configured) {
+        configured=1;
+        directory=getenv("RSX_ENGINE_PRODUCER_CAPTURE_DIR");
+        if (!directory || !*directory) goto done;
+        const char* target=getenv("RSX_ENGINE_PRODUCER_CAPTURE_TARGET");
+        const char* selector=getenv("RSX_ENGINE_PRODUCER_CAPTURE_SELECTOR");
+        u64 loc,off;
+        if (strlen(directory)>1600 || !target ||
+            !rsx_binding_capture_hex(&target,1,&loc) || loc>1 || *target++!=':' ||
+            !rsx_binding_capture_hex(&target,8,&off) || *target ||
+            rsx_binding_capture_parse(selector,1,selectors)!=1) goto invalid;
+        location=(u32)loc;offset=(u32)off;
+        const char* cap=getenv("RSX_ENGINE_PRODUCER_CAPTURE_LIMIT");
+        if (cap && *cap) {
+            char* end;errno=0;unsigned long n=strtoul(cap,&end,10);
+            if (errno || end==cap || *end || !n || n>MAX_COUNT) goto invalid;
+            limit=(u32)n;
+        }
+        trigger=getenv("RSX_ENGINE_PRODUCER_CAPTURE_TRIGGER");
+        enabled=1;
+    }
+    if (!enabled || closed || attempts>=limit) goto done;
+    u32 match=0;
+    for (;match<n_targets;match++) if (g.surfaces[targets[match]].location==location &&
+        g.surfaces[targets[match]].offset==offset) break;
+    if (match==n_targets) goto done;
+    if (!armed) {
+        if (trigger && *trigger) {FILE* f=fopen(trigger,"rb");if (!f) goto done;fclose(f);}
+        armed=1;arm_frame=g.frames;
+        fprintf(stderr,"[rsx producer capture] armed frame=%u; capture waits for next full frame\n",arm_frame);
+    }
+    if (g.frames==arm_frame) goto done;
+    if (!started) {started=1;frame=g.frames;}
+    if (g.frames!=frame) {closed=1;goto done;}
+    const u8* vc=NULL;const u8* fc=NULL;u32 vi=0,fb=0;
+    if (!eng_guest_programs(&vc,&vi,&fc,&fb)) goto done;
+    const u64 hash=rsx_fp_structural_hash(fc,fb,1469598103934665603ull);
+    if (!rsx_binding_capture_matches(&selectors[0],hash!=0,hash,
+                                    rsx_dsp_shader_control(&g.rsx))) goto done;
+    const u32 slot=attempts++; /* Failures spend attempts too, never retry. */
+    char prefix[1800];
+    if (snprintf(prefix,sizeof prefix,"%s/producer-%02u-frame%u-draw%u",directory,
+                 slot,g.frames,draw)>=(int)sizeof prefix) goto done;
+    const u64 vb=(u64)uploaded*layout->stride,ib=(u64)n_indices*sizeof(u32);
+    const u64 bytes=vb+ib+ENG_VP_CB_BYTES+fp_bytes+sizeof g.rsx.regs+
+        sizeof *rs+sizeof *sf+sizeof *vp+(u64)vi*16u+fb+8192u;
+    const char* status="complete";int ok=0;
+    if (vb>MAX_ARRAY || ib>MAX_ARRAY) status="geometry_limit";
+    else if (bytes>MAX_TOTAL || total>MAX_TOTAL-bytes) status="total_byte_limit";
+    else {
+        total+=(size_t)bytes;
+        ok=eng_capture_write(prefix,".vertices.bin",dc.verts,(size_t)vb) &&
+           eng_capture_write(prefix,".indices.bin",n_indices ? (const void*)g.indices : (const void*)"",(size_t)ib) &&
+           eng_capture_write(prefix,".vp-program.bin",vc,(size_t)vi*16u) &&
+           eng_capture_write(prefix,".fp-program.bin",fc,fb) &&
+           eng_capture_write(prefix,".vp-constants.bin",g.vp_cb,ENG_VP_CB_BYTES) &&
+           eng_capture_write(prefix,".fp-constants.bin",g.fp_cb,fp_bytes) &&
+           eng_capture_write(prefix,".registers.bin",g.rsx.regs,sizeof g.rsx.regs) &&
+           eng_capture_write(prefix,".render-state.bin",rs,sizeof *rs) &&
+           eng_capture_write(prefix,".surface.bin",sf,sizeof *sf) &&
+           eng_capture_write(prefix,".viewport.bin",vp,sizeof *vp);
+        if (!ok) status="write_failed";
+    }
+    char path[2048];snprintf(path,sizeof path,"%s.meta",prefix);
+    FILE* out=fopen(path,"wb");
+    if (out) {
+        fprintf(out,"frame=%u draw=%u arm_frame=%u slot=%u limit=%u status=%s payload_saved=%d cpu_only=1 before_draw=1\n",
+            g.frames,draw,arm_frame,slot,limit,status,ok);
+        fprintf(out,"fp_structural_hash=%016llX shader_control=%08X fp_bytes=%u vp_instructions=%u pipeline=%u\n",
+            (unsigned long long)hash,rsx_dsp_shader_control(&g.rsx),fb,vi,pipeline);
+        fprintf(out,"primitive=%u vertices=%u stride=%u indices=%u attr_mask=%08X attrs=",
+            g.rsx.current_primitive,uploaded,layout->stride,n_indices,layout->mask);
+        for (u32 i=0;i<layout->count;i++) fprintf(out,"%s%u",i?",":"",layout->attrs[i]);
+        fprintf(out,"\narray_batches=%u index_batches=%u inline_bytes=%u immediate_vertices=%u source_refs=%u\n",
+            dc.n_arr,dc.n_idx,dc.inl_bytes,dc.n_immediate,dc.n_source_refs);
+        fprintf(out,"raw_target_select=%u resolved_target_count=%u matching_attachment=%u targets=",
+            sf->color_target,n_targets,match);
+        for (u32 i=0;i<n_targets;i++) {const eng_surface* s=&g.surfaces[targets[i]];
+            fprintf(out,"%s%u:%u:%08X:%ux%u:p%u:fmt%u",i?",":"",s->handle,s->location,s->offset,s->w,s->h,s->pitch,(u32)s->fmt);}
+        fprintf(out,"\nclip=%u,%u,%u,%u aa=%u aa_scale=%u,%u depth=%u:%08X:p%u cull=%u/%04X/%04X depth_state=%u/%u/%04X stencil=%u color_mask=%08X total_reserved_bytes=%zu\n",
+            sf->clip_x,sf->clip_y,sf->clip_w,sf->clip_h,sf->antialias,sf->aa_sx,sf->aa_sy,
+            sf->zeta_location,sf->zeta_offset,sf->zeta_pitch,rs->cull_enable,rs->cull_face,rs->front_face,
+            rs->depth_test,rs->depth_write,rs->depth_func,rs->stencil_enable,rs->color_mask,total);
+        fclose(out);
+    }
+    fprintf(stderr,"[rsx producer capture] frame=%u draw=%u slot=%u status=%s vertices=%u indices=%u targets=%u prefix=%s\n",
+        g.frames,draw,slot,status,uploaded,n_indices,n_targets,prefix);
+    goto done;
+invalid:
+    fprintf(stderr,"[rsx producer capture] invalid configuration; diagnostic disabled\n");
+done:
+    errno=saved_errno;
+}
+
 static void eng_texture_binding_capture(const u32* textures, u32 mask,
     const rsx_vertex_layout_plan* layout, u32 pipeline, const u32* targets,
     u32 n_targets, u32 uploaded, u32 n_indices, u32 fp_bytes,
@@ -2209,6 +2319,8 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
     static const char* directory;
     static const char* trigger;
     ++draw;
+    eng_producer_capture(draw,layout,pipeline,targets,n_targets,uploaded,n_indices,
+                         fp_bytes,render_state,sf,vp);
     if (!configured) {
         configured = 1;
         directory = getenv("PS3RECOMP_RSX_BINDING_CAPTURE_DIR");
