@@ -40,7 +40,9 @@ void rsx_metal_backend_present(void);
  * to the native window title and stderr once per second. Call this exactly once
  * per guest FLIP submission, excluding boot redraws. It never drives rendering.
  * Without calls the separate guest submission rate stays zero. Headless mode
- * does not claim any display presentations and leaves the tracker disabled. */
+ * does not claim any display presentations and leaves the tracker disabled.
+ * PS3RECOMP_METAL_FPS_DIAGNOSTICS=1 additionally reports GPU frame completions
+ * and raw callback/drop signals; GPU completion never counts as display FPS. */
 void rsx_metal_backend_note_guest_frame(void);
 
 /* --- test hooks ---------------------------------------------------------- */
