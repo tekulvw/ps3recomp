@@ -767,19 +767,47 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+    /* Queue-before-consume pacing is adapted from Noah Peterson's
+     * 93aa8dfe536d5f5a5d0630b83e93f3bf47573e28 (upstream PR #213).
+     * Prime at most four blocks with a device, then advance at 48 kHz even
+     * when the backend is absent or rejects submissions. Waiting must not
+     * consume a guest slot or send its period notification. */
+    struct timespec clock;
+    clock_gettime(CLOCK_MONOTONIC, &clock);
+    u64 epoch_ns = (u64)clock.tv_sec * 1000000000ULL + (u64)clock.tv_nsec;
+    u64 blocks = 0;
+    unsigned lead = s_sdl_audio_dev ? 3 : 0;
+    int had_device = s_sdl_audio_dev != 0;
+    const u64 block_ns = (u64)CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL /
+                         CELL_AUDIO_SAMPLE_RATE;
     while (s_mix_thread_running) {
+        clock_gettime(CLOCK_MONOTONIC, &clock);
+        const u64 now_ns = (u64)clock.tv_sec * 1000000000ULL + (u64)clock.tv_nsec;
+        const int have_device = s_sdl_audio_dev != 0;
+        u64 due_ns = epoch_ns + (blocks > lead ? blocks - lead : 0) *
+            CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL / CELL_AUDIO_SAMPLE_RATE;
+        /* Discard elapsed backlog after a suspension, a frozen device queue,
+         * or device availability change. Recovery admits one block, without
+         * spending the pause in a burst of guest cursor advances. Convert
+         * absolute times first, so crossing a second never casts a negative
+         * nanosecond component to an unsigned elapsed duration. */
+        if (have_device != had_device || now_ns < epoch_ns ||
+            (now_ns > due_ns && now_ns - due_ns > 4 * block_ns)) {
+            epoch_ns = due_ns = now_ns;
+            blocks = lead = 0;
+            had_device = have_device;
+        }
+        if (audio_backend_queued_samples() >= CELL_AUDIO_BLOCK_SAMPLES * 4 ||
+            now_ns < due_ns) {
+            usleep(1000);
+            continue;
+        }
+        blocks++;
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
         if (s_audio_diag_on) audio_diagnostics_report(audio_diagnostics_now());
         audio_chronology_poll();
-
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
-        }
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
