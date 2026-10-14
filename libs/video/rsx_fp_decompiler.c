@@ -512,12 +512,55 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     out_puts(p, "    return (float4)lerp(lerp(c0, c1, fraction.x), lerp(c2, c3, fraction.x), fraction.y);\n}\n");
 }
 
+
+/* EXP_TEX overrides gamma on compatible normalized color formats. Metadata
+ * has already excluded formats without gamma support. */
+u32 rsx_fp_texture_gamma_units(const u8* ucode, u32 max_bytes,
+                                const u8 gamma_masks[16])
+{
+    if (!ucode || !gamma_masks) return 0;
+    u32 units = 0;
+    for (u32 off = 0; off + 16 <= max_bytes;) {
+        const u32 w0 = rsx_fp_read_word(ucode + off);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        const u32 op = (w0 >> 24) & 63u, unit = (w0 >> FP_TEX_UNIT_SHIFT) & 15u;
+        if (!(w2 & FP_BRANCH) && !(w0 & (1u << 21)) && gamma_masks[unit] &&
+            (op == OP_TEX || op == OP_TXP || op == OP_TXB || op == OP_TXL ||
+             op == OP_TXD || op == OP_TEXBEM || op == OP_TXPBEM))
+            units |= 1u << unit;
+        off += 16;
+        if (!(w2 & FP_BRANCH) && ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2)) off += 16;
+        if (w0 & FP_END) return units;
+    }
+    return 0;
+}
+
+static void fp_gamma_helper(Out* out)
+{
+    out_puts(out,
+        "float4 _rsx_gamma_input(float4 v, uint mask) {\n"
+        "    float4 lo = v / 12.92;\n"
+        "    float4 hi = pow(max((v + 0.055) / 1.055, (float4)0), (float4)2.4);\n"
+        "    float4 decoded = float4(v.r > 0.04045 ? hi.r : lo.r,\n"
+        "                            v.g > 0.04045 ? hi.g : lo.g,\n"
+        "                            v.b > 0.04045 ? hi.b : lo.b,\n"
+        "                            v.a > 0.04045 ? hi.a : lo.a);\n"
+        "    return float4((mask & 1u) ? decoded.r : v.r,\n"
+        "                  (mask & 2u) ? decoded.g : v.g,\n"
+        "                  (mask & 4u) ? decoded.b : v.b,\n"
+        "                  (mask & 8u) ? decoded.a : v.a);\n}\n");
+}
+
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     int buffered, const u8* texture_bx2_masks,
-    const rsx_fp_shadow_desc* shadow, char* out, u32 out_size, u32* out_constant_count)
+    const rsx_fp_shadow_desc* shadow, const u8 gamma_masks[16],
+    char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
+    const u32 gamma_units = rsx_fp_texture_gamma_units(ucode, max_bytes, gamma_masks);
 
     const u32 sampled_units = rsx_fp_texture_units(ucode, max_bytes);
     if (shadow) for (u32 u = 0; u < 16; u++)
@@ -729,6 +772,14 @@ static int rsx_fp_decompile_internal(
             continue;
         }
 
+        if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
+            (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+            static u32 reported;
+            if (reported++ < 32)
+                fprintf(stderr, "[RSX fp] gamma fetch opcode %u unsupported on unit %u\n", opcode, tex_unit);
+            return -1;
+        }
+
         /* Build the RHS expression for this opcode. */
         char rhs[640];
         int handled = 1;
@@ -882,6 +933,14 @@ static int rsx_fp_decompile_internal(
                     1u+((mask>>2)&1u), 1u+((mask>>3)&1u),
                     mask&1u, (mask>>1)&1u, (mask>>2)&1u, (mask>>3)&1u);
             }
+        }
+
+        if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            char sample[sizeof rhs]; memcpy(sample, rhs, sizeof sample);
+            const int length = snprintf(rhs, sizeof rhs, "_rsx_gamma_input(%s, %uu)",
+                                        sample, gamma_masks[tex_unit] & 15u);
+            if (length < 0 || (size_t)length >= sizeof rhs) return -1;
         }
 
         int has_dest = !(w0 & FP_OUT_NONE);
@@ -1076,6 +1135,7 @@ static int rsx_fp_decompile_internal(
     if (shadow) for (u32 u = 0; u < 16; u++)
         if ((sampled_units & (1u << u)) && shadow[u].enabled)
             fp_shadow_helper(&p, u, tex_cube_mask, &shadow[u]);
+    if (gamma_units) fp_gamma_helper(&p);
     if (targets == 1 && !depth_export) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
@@ -1103,7 +1163,7 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, NULL, NULL, out, out_size, NULL);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, NULL, NULL, NULL, out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
@@ -1111,7 +1171,7 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 1, NULL, NULL, out, out_size,
+        ucode, max_bytes, ctrl, tex_cube_mask, 1, NULL, NULL, NULL, out, out_size,
         out_constant_count);
 }
 
@@ -1121,7 +1181,7 @@ int rsx_fp_decompile_buffered_texture_ex(
     u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
-        1, texture_bx2_masks, NULL, out, out_size, out_constant_count);
+        1, texture_bx2_masks, NULL, NULL, out, out_size, out_constant_count);
 }
 
 int rsx_fp_decompile_buffered_shadow_ex(
@@ -1130,7 +1190,7 @@ int rsx_fp_decompile_buffered_shadow_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
-        1, texture_bx2_masks, shadow, out, out_size, out_constant_count);
+        1, texture_bx2_masks, shadow, NULL, out, out_size, out_constant_count);
 }
 
 u32 rsx_fp_texture_expand_units(const u8* ucode, u32 max_bytes)
@@ -1465,6 +1525,23 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
             memcpy(q, "rsx_tex", 7);
     }
     return patched;
+}
+
+int rsx_fp_decompile_buffered_color_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+        1, NULL, NULL, gamma_masks, out, out_size, out_constant_count);
+}
+
+int rsx_fp_decompile_buffered_shadow_color_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const u8 texture_bx2_masks[16], const rsx_fp_shadow_desc shadow[16],
+    const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+        1, texture_bx2_masks, shadow, gamma_masks, out, out_size, out_constant_count);
 }
 
 /* NV4097_SET_SHADER_PACKER accepts any nonzero value. Floating surfaces and

@@ -200,6 +200,20 @@ int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format);
  * Apply before alpha-test wrapping; disabled draws should skip this helper. */
 int rsx_fp_apply_srgb_output(char* hlsl, u32 capacity);
 
+/* Gamma metadata is a post-filter/post-remap RGBA lane mask, with formats
+ * validated by rsx_texture_gamma_mask. EXP_TEX overrides gamma per fetch.
+ * Old entry points pass NULL and preserve their source byte for byte. */
+u32 rsx_fp_texture_gamma_units(const u8* ucode, u32 max_bytes,
+                                const u8 gamma_masks[16]);
+int rsx_fp_decompile_buffered_color_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count);
+
+int rsx_fp_decompile_buffered_shadow_color_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const u8 texture_bx2_masks[16], const rsx_fp_shadow_desc shadow[16],
+    const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count);
+
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */
 const char* rsx_fp_opcode_name(u32 opcode);

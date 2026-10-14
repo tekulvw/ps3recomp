@@ -356,3 +356,26 @@ u8 rsx_texture_bx2_mask(u32 rsx_fmt, u32 control1, u32 filter)
     }
     return mask;
 }
+
+/* ADDRESS gamma flags name final RGBA lanes, after remapping. Signed input
+ * interpretation wins; its FILTER ARGB flags follow the source crossbar. */
+u8 rsx_texture_gamma_mask(u32 format, u32 control1, u32 filter, u32 address)
+{
+    switch (format & 0x9Fu) {
+    case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
+    case 0x86: case 0x87: case 0x88: case 0x8B: case 0x8D: case 0x8E: case 0x8F:
+    case 0x97: case 0x9D: case 0x9E: break;
+    default: return 0;
+    }
+    u8 gamma = (u8)((address >> 20) & 15u);
+    if (!gamma) return 0;
+    if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;
+    u8 remap[4]; rsx_texture_component_remap(control1, format, remap);
+    static const u8 rgba_lane[4] = {3, 0, 1, 2};
+    for (u32 i = 0; i < 4; ++i) {
+        const u32 source = (control1 >> (2u * i)) & 3u;
+        if (remap[i] < RSX_REMAP_ZERO && ((filter >> (28u + source)) & 1u))
+            gamma &= (u8)~(1u << rgba_lane[i]);
+    }
+    return gamma;
+}
