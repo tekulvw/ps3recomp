@@ -38,10 +38,23 @@ program pointers. Existing trigger, raw color-A filter, 4,096-row cap and output
 error behavior remain unchanged. Existing strict readers of the old JSON schema
 will require an explicit schema update before accepting these extended rows.
 
-Build `libs/video/tests/test_draw_observer_program_identity.c` with the same
-source list as `test_producer_geometry.c`; define `DRAW_OBSERVER_ID_TEST` for the
-inactive poison-pointer check. Pass the executable to
-`python3 libs/video/tests/test_draw_observer_program_identity.py`.
+From the SDK root, compile the actual engine fixture with its neutral backend:
+
+```sh
+clang -std=c11 -O2 -DDRAW_OBSERVER_ID_TEST -Iinclude -Ilibs/video \
+  libs/video/tests/test_draw_observer_program_identity.c \
+  libs/video/rsx_dispatch.c libs/video/rsx_vertex_fetch.c \
+  libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c \
+  libs/video/rsx_fp_decompiler.c libs/video/rsx_vp_decompiler.c \
+  -lm -o /private/tmp/draw-observer-program-identity-test
+python3 libs/video/tests/test_draw_observer_program_identity.py \
+  /private/tmp/draw-observer-program-identity-test
+```
+
+The fixture includes `test_rsx_draw_engine.c` for the neutral backend and
+`rsx_draw_engine.c` for direct access to the inactive poison-pointer check.
+For undefined-behavior checking, add `-fsanitize=undefined
+-fno-sanitize-recover=all` and choose a separate executable name.
 The fixtures use neutral synthetic programs and an inert backend. They exercise
 same-address changed FP/VP bytes, unchanged FP structural identity after inline
 constant changes, missing programs, early rejection/reset, maximum lengths, and
