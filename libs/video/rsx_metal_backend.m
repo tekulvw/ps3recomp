@@ -2848,14 +2848,14 @@ static u32 eng_color_snapshot(void* user, u32 surface)
     (void)user;
     id<MTLTexture> src = eng_obj(surface);
     if (!src || [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
-        s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
+        s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; eng_checked_fail(); return 0; }
     MTLTextureDescriptor* td =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[src pixelFormat]
                          width:[src width] height:[src height] mipmapped:NO];
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     const u32 copy = eng_obj_add([s_dev newTextureWithDescriptor:td]);
-    if (!copy) { s_eng_dropped++; return 0; }
+    if (!copy) { s_eng_dropped++; eng_checked_fail(); return 0; }
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
     r->kind = ENG_REC_COLOR_SNAPSHOT;
@@ -3591,10 +3591,10 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
             if (!src || !dst || [src width] != [dst width] ||
                 [src height] != [dst height] || [src pixelFormat] != [dst pixelFormat]) {
-                s_eng_dropped++; continue;
+                s_eng_dropped++; eng_checked_fail(); continue;
             }
             id<MTLBlitCommandEncoder> copy = [cb blitCommandEncoder];
-            if (!copy) { s_eng_dropped++; continue; }
+            if (!copy) { s_eng_dropped++; eng_checked_fail(); continue; }
             s_ft_copies++;
             [copy copyFromTexture:src sourceSlice:0 sourceLevel:0
                    sourceOrigin:MTLOriginMake(0, 0, 0)
@@ -4263,7 +4263,6 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_target_create  = eng_depth_target_create,
     .depth_target_release = eng_obj_release,
     .depth_snapshot       = eng_depth_snapshot,
-    .color_snapshot       = eng_color_snapshot,
     .depth_readback       = eng_depth_readback,
     .color_snapshot       = eng_color_snapshot,
     .pipeline_create      = eng_pipeline_create,
