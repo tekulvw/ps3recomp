@@ -298,6 +298,17 @@ static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    AcquireSRWLockShared(&s_mfc_claim_lock);
+    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        if (slot->ctx == ctx) {
+            ReleaseSRWLockShared(&s_mfc_claim_lock);
+            return &slot->mfc;
+        }
+    }
+    ReleaseSRWLockShared(&s_mfc_claim_lock);
+
+    /* A concurrent miss may publish while the read lock is released. Recheck
+     * under the writer lock before creating this context's private engine. */
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
