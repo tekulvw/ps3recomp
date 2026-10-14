@@ -48,6 +48,10 @@ def main():
         assert enabled.stdout==disabled.stdout
         assert 'audio-chronology'not in disabled.stderr
         cases.append('actual-cellAudio-enabled-disabled-functional-equivalence')
+        env['AUDIO_CHRONOLOGY_TRIGGER']=str(out/'quiet-gate')
+        quiet=run([str(audio),'quiet'],env)
+        assert quiet.stdout.count('locks=0 clocks=0 SDLqueries=0')==3
+        cases.append('actual-cellAudio-pretrigger-expired-postflush-quietness')
         linkage=out/'linkage'
         cxxflags=[x if x!='-std=c11' else '-std=c++17' for x in flags]
         run([args.cxx,*cxxflags,str(ROOT/'runtime/spu/tests/test_audio_chronology_linkage.cpp'),'-o',str(linkage)])

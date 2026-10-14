@@ -14,7 +14,11 @@ AUDIO_CHRONOLOGY_LIMIT=32768
 
 Set these before process launch, remove the old trigger before launch, and
 create a regular trigger file when the desired capture phase begins. The
-recorder checks for it at most every 250 ms. The default window is ten seconds;
+audio poll path checks for it at most every 250 ms. Hot hooks and extra SDL
+queue queries use only atomic active-window admission; they do not take the
+metadata lock, read the clock or sample PCM before trigger admission or after
+flush. Cold port open/close still maintains the allocation registry before
+arming. After flush, even the poll path stops clock/lock work. The default window is ten seconds;
 valid overrides are 1–30,000 ms and 1–32,768 metadata records. Invalid config
 fails closed. Port allocation metadata is tracked before arming, but PCM is not
 sampled and records/budget are not consumed before the trigger is admitted.
@@ -24,7 +28,7 @@ serializes only diagnostic metadata; it does not protect guest audio bytes or
 alter their ownership. No log is printed on each transfer. The audio thread
 polls the deadline after submission and notification. Once the window expires,
 or cellAudio quits, the bounded buffer and summary are printed to stderr once.
-The summary includes dropped events, pending writer-slot brackets, queue-depth
+The summary includes dropped events, pending recorded writer-slot brackets, queue-depth
 minimum/zero counts and maximum submission interval. Printing the final buffer
 can delay execution after the capture; exclude that interval from performance
 comparisons. The observer also adds bounded sampling/metadata overhead during
@@ -65,7 +69,13 @@ the transfer. `words` gives the complete aligned BE32 words actually sampled;
 `nz` counts integer magnitude bits, so it treats both signs of zero as zero and
 does not depend on floating-point denormal handling. Partial-word transfers
 can have zero sampled words even though bytes were copied. Nonzero counts are
-not proof of finite, audible PCM. Overlapping reads/writes are explicitly
+not proof of finite, audible PCM. Flags cover copy/consume overlaps only;
+flags zero is not an unambiguous producer certificate. An assessor must also
+reject intersecting same-EA/epoch DMA request-through-outcome brackets for
+both producers, including equal timestamps at clock resolution. Pending
+brackets can describe copies completed after window admission closed; they
+are not proof that the physical transfer is still running at flush.
+Overlapping reads/writes are explicitly
 ambiguous; sampling does not add PCM locks or resolve the underlying race.
 
 The queue depth is measured before and after each SDL submission; the minimum

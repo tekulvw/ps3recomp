@@ -1,7 +1,15 @@
 /* Actual cellAudio implementation against inert synthetic SDL/VM services. */
 #include <stdint.h>
+#include "../../platform/win32_compat.h"
+static unsigned test_clock_calls, test_lock_calls, test_queue_queries;
+static volatile LONG* test_watched_lock;
+static LONG test_compare(volatile LONG* target,LONG a,LONG b) {
+    if(target==test_watched_lock)test_lock_calls++;
+    return InterlockedCompareExchange(target,a,b);
+}
+#define InterlockedCompareExchange test_compare
 static uint64_t test_clock=1000000;
-static uint64_t test_now(void) { return test_clock; }
+static uint64_t test_now(void) { test_clock_calls++;return test_clock; }
 #define AUDIO_CHRONOLOGY_TEST_CLOCK test_now
 #include "../../diagnostics/audio_chronology_impl.h"
 #ifndef AUDIO_CHRONOLOGY_AUDIO_SOURCE
@@ -26,19 +34,46 @@ SDL_AudioDeviceID SDL_OpenAudioDevice(const char* name,int capture,const SDL_Aud
 void SDL_PauseAudioDevice(SDL_AudioDeviceID id,int pause) { (void)id;(void)pause; }
 void SDL_CloseAudioDevice(SDL_AudioDeviceID id) { (void)id; }
 int SDL_QueueAudio(SDL_AudioDeviceID id,const void* data,Uint32 length) { (void)id;(void)data;fake_queue+=length;return 0; }
-Uint32 SDL_GetQueuedAudioSize(SDL_AudioDeviceID id) { (void)id;errno=ERANGE;return fake_queue; }
+Uint32 SDL_GetQueuedAudioSize(SDL_AudioDeviceID id) { (void)id;test_queue_queries++;errno=ERANGE;return fake_queue; }
 const char* SDL_GetError(void) { return "synthetic-no-error"; }
 void SDL_Delay(Uint32 ms) { (void)ms; }
 int sys_event_queue_push_by_id(uint32_t q,uint64_t source,uint64_t a,uint64_t b,uint64_t c) { (void)q;(void)source;(void)a;(void)b;(void)c;notify_calls++;return -1; }
 uint32_t sys_event_find_queue_by_key(uint64_t key) { return key==42?3:0; }
 uint32_t sys_event_queue_create_direct(uint64_t key,int32_t n) { (void)key;(void)n;return 3; }
 static void put_sample(unsigned n,uint32_t bits) { test_memory[0x12000+n*4]=(uint8_t)(bits>>24);test_memory[0x12001+n*4]=(uint8_t)(bits>>16);test_memory[0x12002+n*4]=(uint8_t)(bits>>8);test_memory[0x12003+n*4]=(uint8_t)bits; }
+static void quiet_hot_hooks(const char* phase) {
+    test_clock_calls=test_lock_calls=test_queue_queries=0;errno=EDOM;
+    audio_backend_submit(s_mix_buffer,256);
+    for(unsigned stage=0;stage<4;stage++)audio_chronology_consume(0,stage,0,(const uint8_t*)1,2048,0);
+    audio_chronology_dma_token token;audio_chronology_dma_begin(&token,0x12000,32,0x20);assert(token.port==-1);
+    audio_chronology_dma_after(&token,(const uint8_t*)1);
+    audio_chronology_dma_end(&token,(const void*)1,0,0,0,0,0,1);
+    audio_chronology_notify(3,42,-1);audio_chronology_api(0,0,1,0,1,0);
+    printf("quiet %s locks=%u clocks=%u SDLqueries=%u\n",phase,test_lock_calls,test_clock_calls,test_queue_queries);
+    assert(!test_lock_calls && !test_clock_calls && !test_queue_queries && errno==EDOM);
+}
+static void test_quiet_window(void) {
+    test_watched_lock=&s_ac.lock;s_sdl_audio_dev=1;
+    audio_chronology_port(0,0x12000,2,8,1);quiet_hot_hooks("pretrigger");
+    const char* gate=getenv("AUDIO_CHRONOLOGY_TRIGGER");assert(gate);
+    FILE* f=fopen(gate,"w");assert(f);fclose(f);test_clock+=250001;audio_chronology_poll();assert(s_ac.armed);
+    audio_chronology_dma_token pending;audio_chronology_dma_begin(&pending,0x12000,32,0x20);assert(pending.port==0);
+    // Hard admission expiry even when the audio poll path has stopped.
+    test_clock+=10000001;
+    audio_chronology_consume(0,0,0,(const uint8_t*)1,2048,0);
+    assert(!audio_chronology_enabled() && !s_ac.flushed);
+    audio_chronology_dma_after(&pending,(const uint8_t*)1);
+    audio_chronology_dma_end(&pending,(const void*)1,0,0,0,0,0,1);
+    quiet_hot_hooks("expired-before-flush");
+    audio_chronology_poll();assert(s_ac.flushed);quiet_hot_hooks("postflush");
+}
 int main(int argc,char** argv) {
-    (void)argv;assert(argc==1);s_audio_initialized=1;mutex_init(&s_audio_mutex);s_audio_start_us=1234567;
+    if(argc==2 && !strcmp(argv[1],"quiet")) { test_quiet_window();return 0; }
+    assert(argc==1);s_audio_initialized=1;mutex_init(&s_audio_mutex);s_audio_start_us=1234567;
     AudioPortSlot* p=&s_ports[0];p->in_use=p->running=1;p->param.nChannel=2;p->param.nBlock=8;p->param.level=1;
     p->buffer=(float*)(test_memory+0x12000);p->port_addr=0x12000;p->buf_size=16384;p->read_idx_addr=0x3000;p->read_index=35;
     audio_chronology_port(0,0x12000,2,8,1);
-    const char* trigger=getenv("AUDIO_CHRONOLOGY_TRIGGER");if(trigger) { FILE* f=fopen(trigger,"w");assert(f);fclose(f);test_clock+=250001; }
+    const char* trigger=getenv("AUDIO_CHRONOLOGY_TRIGGER");if(trigger) { FILE* f=fopen(trigger,"w");assert(f);fclose(f);test_clock+=250001;audio_chronology_poll(); }
     // Observe the unchanged current API semantics, not a reference fix.
     assert(cellAudioGetPortBlockTag(0,1,(u64*)(uintptr_t)0x2000)==0);assert(vm_read64(0x2000)==41);
     assert(cellAudioGetPortBlockTag(0,4,(u64*)(uintptr_t)0x2000)==0);assert(vm_read64(0x2000)==36);

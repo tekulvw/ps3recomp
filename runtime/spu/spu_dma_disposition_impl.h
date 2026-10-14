@@ -113,7 +113,7 @@ void spu_dma_disposition_after(spu_dma_disposition_token* t,const uint8_t* dst) 
     for(uint32_t i=0;i<t->count;i++)t->after[i]=dma_disp_read(dst+t->offset+i*4);
 }
 int spu_dma_disposition_finish(const spu_dma_disposition_token* t,const spu_context* s,uint32_t lsa,uint64_t ea,uint32_t size,uint32_t cmd,int rc,unsigned outcome) {
-    if(t->chronology.port>=0)audio_chronology_dma_end(&t->chronology,s,s->spu_id,s->pc&SPU_LS_MASK,lsa,cmd,rc,outcome==SPU_DMA_DISPOSITION_PUT);
+    if(t->chronology.port>=0 && audio_chronology_enabled())audio_chronology_dma_end(&t->chronology,s,s->spu_id,s->pc&SPU_LS_MASK,lsa,cmd,rc,outcome==SPU_DMA_DISPOSITION_PUT);
     if(!t->seq)return rc;
     int saved=errno;
 #ifdef _WIN32
