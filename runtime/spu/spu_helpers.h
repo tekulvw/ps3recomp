@@ -16,6 +16,9 @@
 #include "spu_context.h"
 #include <string.h>
 #include <math.h>
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+#include <arm_neon.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -200,6 +203,26 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
     u128 out; memcpy(&out, &r, 16); return out;
 }
+#elif defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+/* ARM64 SHUFB adapted from Noah Peterson's upstream PR #213, commit
+ * 5cecc43306d94b55cafa33edf5ffa8fb3d82573d. SPU byte P lives at
+ * host byte SPU_W(P): reverse each word, select from {a,b}, reverse back. */
+static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+    uint8x16x2_t t;
+    t.val[0] = vrev32q_u8(vld1q_u8(a._u8));
+    t.val[1] = vrev32q_u8(vld1q_u8(b._u8));
+    const uint8x16_t C = vrev32q_u8(vld1q_u8(c._u8));
+    uint8x16_t r = vqtbl2q_u8(t, vandq_u8(C, vdupq_n_u8(0x1F)));
+    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
+    const uint8x16_t m80 = vtstq_u8(C, vdupq_n_u8(0x80));
+    const uint8x16_t mC0 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0xC0)), vdupq_n_u8(0xC0));
+    const uint8x16_t mE0 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0xE0)), vdupq_n_u8(0xE0));
+    const uint8x16_t special = vbslq_u8(mE0, vdupq_n_u8(0x80), mC0);
+    r = vrev32q_u8(vbslq_u8(m80, special, r));
+    u128 out; vst1q_u8(out._u8, r); return out;
+}
+#endif
+#if defined(__SSE4_1__) || (defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS))
 /* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
 static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
     /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
