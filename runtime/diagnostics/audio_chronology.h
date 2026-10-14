@@ -16,11 +16,19 @@ typedef struct audio_chronology_dma_token {
 #define AUDIO_CHRONOLOGY_CALL_SPAN_VERSION 1
 /* Separate metadata-only stream, sharing the audio capture clock/window. */
 typedef struct audio_chronology_call_token {
-    uint64_t serial, run, ctx, thread, args[9];
+    uint64_t serial, run, ctx, thread, args[9], previous_note_scope[4];
     uint32_t target, depth;
 } audio_chronology_call_token;
 void audio_chronology_call_begin(audio_chronology_call_token*, const void*, uint32_t, uint32_t);
 void audio_chronology_call_end(audio_chronology_call_token*, unsigned);
+#define AUDIO_CHRONOLOGY_WAIT_NOTES_VERSION 1
+/* Same selected-call/window scope; no register or guest-memory accesses. */
+typedef struct audio_chronology_wait_token {
+    uint64_t serial, run, span, ctx, thread, requested;
+} audio_chronology_wait_token;
+void audio_chronology_wait_begin(audio_chronology_wait_token*, uint64_t);
+void audio_chronology_wait_end(const audio_chronology_wait_token*, int, int);
+void audio_chronology_workload(uint64_t, uint32_t, uint64_t, int32_t, uint32_t, uint32_t, uint32_t);
 int audio_chronology_enabled(void);
 void audio_chronology_port(unsigned, uint32_t, uint32_t, uint32_t, int);
 void audio_chronology_consume(unsigned, unsigned, uint64_t, const uint8_t*, uint32_t, uint64_t);

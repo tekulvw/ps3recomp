@@ -44,6 +44,28 @@ static struct {
     uint64_t serial;
     ac_call_record records[AC_MAX];
 } s_ac_calls;
+/* Scalar TLS cannot dangle after a non-C++ longjmp. Such pending spans are
+ * incomplete: consumers must reject notes without a matched normal span end. */
+#if defined(__cplusplus)
+#define AC_TLS thread_local
+#elif defined(_MSC_VER)
+#define AC_TLS __declspec(thread)
+#else
+#define AC_TLS _Thread_local
+#endif
+static AC_TLS uint64_t ac_note_scope[4]; /* run, span, ctx, guest thread */
+typedef struct ac_note_record {
+    uint64_t us, run, span, token, ctx, thread, arg0, arg1, arg2, arg3;
+    uint32_t kind, phase;
+    int32_t rc;
+} ac_note_record;
+static struct {
+    int enabled;
+    uint32_t count, dropped, pending;
+    uint64_t serial;
+    ac_note_record records[AC_MAX];
+} s_ac_notes;
+static void ac_notes_dump_locked(void);
 static void ac_calls_dump_locked(void);
 /* Preserve host error state for every public hook, including disabled paths. */
 #ifdef _WIN32
@@ -92,6 +114,8 @@ static BOOL WINAPI ac_init(PINIT_ONCE once,PVOID arg,PVOID* out) {
     }
     /* The paired call-span option is capped at ten seconds on the SAME window. */
     if(s_ac_calls.target && s_ac.duration_us>10000000ull)s_ac.duration_us=10000000ull;
+    const char* notes=getenv("AUDIO_CHRONOLOGY_PPU_WAIT_NOTES");
+    s_ac_notes.enabled=s_ac_calls.target && notes && !strcmp(notes,"1");
     InterlockedExchange(&s_ac.ready,1); return TRUE;
 }
 static int ac_enabled(void) {
@@ -263,6 +287,7 @@ static void ac_calls_dump_locked(void) {
             i+1,(unsigned long long)r->run,(unsigned long long)r->token,r->phase,(unsigned long long)r->us,(unsigned long long)r->ctx,(unsigned long long)r->thread,r->target,r->depth,r->flags,
             (unsigned long long)r->args[0],(unsigned long long)r->args[1],(unsigned long long)r->args[2],(unsigned long long)r->args[3],(unsigned long long)r->args[4],(unsigned long long)r->args[5],(unsigned long long)r->args[6],(unsigned long long)r->args[7],(unsigned long long)r->args[8]);
     }
+    ac_notes_dump_locked();
 }
 static void ac_call_drop(void) { if(s_ac_calls.dropped!=~0u)s_ac_calls.dropped++; }
 void audio_chronology_call_begin(audio_chronology_call_token* t,const void* context,uint32_t target,uint32_t depth) {
@@ -277,6 +302,10 @@ void audio_chronology_call_begin(audio_chronology_call_token* t,const void* cont
                 for(unsigned i=0;i<8;i++)t->args[i]=ctx->gpr[i+3];t->args[8]=ctx->gpr[31];
                 ac_call_record r={0};r.us=now;r.run=t->run;r.token=t->serial;r.ctx=t->ctx;r.thread=t->thread;r.target=target;r.depth=depth;memcpy(r.args,t->args,sizeof r.args);
                 s_ac_calls.records[s_ac_calls.count++]=r;s_ac_calls.pending++;
+                if(s_ac_notes.enabled) {
+                    memcpy(t->previous_note_scope,ac_note_scope,sizeof ac_note_scope);
+                    ac_note_scope[0]=t->run;ac_note_scope[1]=t->serial;ac_note_scope[2]=t->ctx;ac_note_scope[3]=t->thread;
+                }
             }
         }
         ac_unlock();
@@ -285,6 +314,7 @@ void audio_chronology_call_begin(audio_chronology_call_token* t,const void* cont
 }
 void audio_chronology_call_end(audio_chronology_call_token* t,unsigned abnormal) {
     AC_SAVE;uint64_t token=t->serial;t->serial=0;
+    if(token && s_ac_notes.enabled)memcpy(ac_note_scope,t->previous_note_scope,sizeof ac_note_scope);
     if(token && ac_active()) {
         ac_lock();uint64_t now=ac_now();
         if(ac_window_locked(now) && t->run==s_ac.start_us) {
@@ -297,6 +327,68 @@ void audio_chronology_call_end(audio_chronology_call_token* t,unsigned abnormal)
         ac_unlock();
     }
     AC_RESTORE;
+}
+/* Admission touches no context or guest memory. The first expired hook can
+ * close admission, but cannot flush; subsequent hooks do no clocks or locks. */
+static int ac_note_admitted(void) {
+    return ac_active() && s_ac_notes.enabled && ac_note_scope[1] && ac_note_scope[0]==s_ac.start_us;
+}
+static int ac_note_room(void) {
+    if(s_ac_notes.count<s_ac.limit)return 1;
+    if(s_ac_notes.dropped!=~0u)s_ac_notes.dropped++;return 0;
+}
+static void ac_note_identity(ac_note_record* r,uint64_t now) {
+    r->us=now;r->run=ac_note_scope[0];r->span=ac_note_scope[1];r->ctx=ac_note_scope[2];r->thread=ac_note_scope[3];
+}
+void audio_chronology_wait_begin(audio_chronology_wait_token* t,uint64_t requested) {
+    AC_SAVE;t->serial=0;
+    if(ac_note_admitted()) {
+        ac_lock();uint64_t now=ac_now();
+        if(ac_window_locked(now) && ac_note_room()) {
+            ac_note_record r={0};ac_note_identity(&r,now);r.kind=1;r.arg0=requested;r.token=++s_ac_notes.serial;
+            t->serial=r.token;t->run=r.run;t->span=r.span;t->ctx=r.ctx;t->thread=r.thread;t->requested=requested;
+            s_ac_notes.records[s_ac_notes.count++]=r;s_ac_notes.pending++;
+        }
+        ac_unlock();
+    }
+    AC_RESTORE;
+}
+void audio_chronology_wait_end(const audio_chronology_wait_token* t,int host_rc,int host_errno) {
+    AC_SAVE;
+    if(t->serial && ac_active() && s_ac_notes.enabled) {
+        ac_lock();uint64_t now=ac_now();
+        if(ac_window_locked(now) && t->run==s_ac.start_us && ac_note_room()) {
+            ac_note_record r={0};r.us=now;r.run=t->run;r.span=t->span;r.token=t->serial;r.ctx=t->ctx;r.thread=t->thread;
+            r.kind=1;r.phase=1;r.arg0=t->requested;r.rc=host_rc;r.arg1=(uint32_t)host_errno;
+            s_ac_notes.records[s_ac_notes.count++]=r;if(s_ac_notes.pending)s_ac_notes.pending--;
+        }
+        ac_unlock();
+    }
+    AC_RESTORE;
+}
+void audio_chronology_workload(uint64_t spurs,uint32_t wid,uint64_t info,int32_t rc,uint32_t contention,uint32_t ready,uint32_t idle) {
+    AC_SAVE;
+    if(ac_note_admitted()) {
+        ac_lock();uint64_t now=ac_now();
+        if(ac_window_locked(now) && ac_note_room()) {
+            ac_note_record r={0};ac_note_identity(&r,now);r.kind=2;r.phase=2;r.rc=rc;r.arg0=spurs;r.arg1=wid;r.arg2=info;
+            r.arg3=rc?AC_UNKNOWN:(uint64_t)contention|((uint64_t)ready<<8)|((uint64_t)idle<<16);
+            s_ac_notes.records[s_ac_notes.count++]=r;
+        }
+        ac_unlock();
+    }
+    AC_RESTORE;
+}
+static void ac_notes_dump_locked(void) {
+    if(!s_ac_notes.enabled)return;
+    fprintf(stderr,"[ppu-call-note-summary] run_id=%llu start_us=%llu duration_us=%llu count=%u dropped=%u limit=%u pending_recorded_sleeps=%u coverage=existing-sleep-and-workload-info-only\n",
+        (unsigned long long)s_ac.start_us,(unsigned long long)s_ac.start_us,(unsigned long long)s_ac.duration_us,s_ac_notes.count,s_ac_notes.dropped,s_ac.limit,s_ac_notes.pending);
+    for(uint32_t i=0;i<s_ac_notes.count;i++) {
+        const ac_note_record* r=&s_ac_notes.records[i];
+        fprintf(stderr,"[ppu-call-note] seq=%u run_id=%llu span=%llu token=%llu us=%llu ctx=%llX thread=%llu kind=%u phase=%u rc=%d arg0=%llu arg1=%llu arg2=%llu arg3=%llu\n",
+            i+1,(unsigned long long)r->run,(unsigned long long)r->span,(unsigned long long)r->token,(unsigned long long)r->us,(unsigned long long)r->ctx,(unsigned long long)r->thread,r->kind,r->phase,r->rc,
+            (unsigned long long)r->arg0,(unsigned long long)r->arg1,(unsigned long long)r->arg2,(unsigned long long)r->arg3);
+    }
 }
 void audio_chronology_poll(void) {
     AC_SAVE;
