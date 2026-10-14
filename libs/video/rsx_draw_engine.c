@@ -1388,7 +1388,13 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (shadow[u].enabled) shadow_mask |= 1u << u;
     }
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
-    const u32 unnorm_mask = eng_unnorm_units(unnorm_dim);
+    /* Shadow helpers normalize against the bound resource themselves. Only
+     * sampled ordinary UN units need baked dimensions or cache identity. */
+    const u32 unnorm_mask = eng_unnorm_units(unnorm_dim) &
+        (fixed ? 0xFFFFu : sampled_units) & ~shadow_mask;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++)
+        if (!(unnorm_mask & (1u << u)))
+            unnorm_dim[u][0] = unnorm_dim[u][1] = 0;
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
@@ -1449,7 +1455,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 texture_bx2_masks, shadow_mask ? shadow : NULL,
                 s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
-        if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask & ~shadow_mask,
+        if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
             fi = -1;
         if (fi > 0 && rs->alpha_test_enable &&
