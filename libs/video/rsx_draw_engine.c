@@ -54,6 +54,7 @@ extern u32 ppu_vm_size;
 /* Guest textures larger than this are a misdecoded register, not an image;
  * rsx_live_draw.c rejects the same 4096 bound (2033). */
 #define ENG_MAX_TEX_DIM    4096u
+
 /* A surface declaration beyond this is a guest pointer read as clip
  * dimensions. rsx_live_draw.c's surface-guard (2625) preserves the existing
  * target rather than destroying a live one. */
@@ -2627,6 +2628,94 @@ static void draw_observer_finish(void)
     errno = saved;
 }
 
+/* Private opt-in diagnostic, not a raster correctness workaround. The target
+ * selector contains no title data. Apply before pipeline lookup so a changed
+ * state gets its own ordinary cache identity and switchback reuses the old one. */
+static struct {
+    int configured, mode, armed, have_logged, expired;
+    u32 location, offset, selected, changed, frames, first_frame, last_log_frame;
+    const char* trigger;
+} s_raster_probe;
+
+static void eng_raster_probe(rsx_be_render_state* rs,
+                             const rsx_dsp_surface* sf, u32 n_targets)
+{
+    const int saved_errno = errno;
+    if (!s_raster_probe.configured) {
+        s_raster_probe.configured = 1;
+        const char* mode = getenv("RSX_ENGINE_RASTER_PROBE");
+        if (!mode || !*mode) goto done;
+        const char* target = getenv("RSX_ENGINE_RASTER_PROBE_TARGET");
+        s_raster_probe.mode = !strcmp(mode,"observe") ? 1 :
+                             !strcmp(mode,"cull-off") ? 2 : 0;
+        if (!s_raster_probe.mode || !target || strlen(target)!=10 ||
+            (target[0]!='0' && target[0]!='1') || target[1]!=':') goto invalid;
+        u32 offset = 0;
+        for (unsigned i=2;i<10;i++) {
+            unsigned char c=(unsigned char)target[i];
+            unsigned v=c>='0'&&c<='9' ? c-'0' : c>='a'&&c<='f' ? c-'a'+10 :
+                       c>='A'&&c<='F' ? c-'A'+10 : 16;
+            if (v>15) goto invalid;
+            offset=(offset<<4)|v;
+        }
+        s_raster_probe.location=(u32)(target[0]-'0');
+        s_raster_probe.offset=offset;
+        s_raster_probe.frames=16;
+        const char* cap=getenv("RSX_ENGINE_RASTER_PROBE_FRAMES");
+        if (cap && *cap) {
+            char* end; errno=0; unsigned long n=strtoul(cap,&end,10);
+            if (errno || end==cap || *end || !n || n>64) goto invalid;
+            s_raster_probe.frames=(u32)n;
+        }
+        s_raster_probe.trigger=getenv("RSX_ENGINE_RASTER_PROBE_TRIGGER");
+    }
+    if (!s_raster_probe.mode ||
+        n_targets!=1 || sf->color_location[0]!=s_raster_probe.location ||
+        sf->color_offset[0]!=s_raster_probe.offset ||
+        !rs->depth_test || !rs->depth_write || !rs->color_mask) goto done;
+    if (!s_raster_probe.armed) {
+        if (s_raster_probe.trigger && *s_raster_probe.trigger) {
+            struct stat st;
+            if (stat(s_raster_probe.trigger,&st)!=0) goto done;
+        }
+        s_raster_probe.armed=1;
+        s_raster_probe.first_frame=g.frames;
+    }
+    if ((u32)(g.frames-s_raster_probe.first_frame)>=s_raster_probe.frames) {
+        if (!s_raster_probe.expired) {
+            fprintf(stderr,"[rsx raster probe] expired frame=%u first_frame=%u frames=%u selected=%u changed=%u\n",
+                g.frames,s_raster_probe.first_frame,s_raster_probe.frames,
+                s_raster_probe.selected,s_raster_probe.changed);
+            s_raster_probe.expired=1;
+        }
+        goto done;
+    }
+    const u32 raw_cull=rs->cull_enable;
+    s_raster_probe.selected++;
+    if (s_raster_probe.mode==2 && raw_cull) {
+        rs->cull_enable=0;
+        s_raster_probe.changed++;
+    }
+    if (!s_raster_probe.have_logged || s_raster_probe.last_log_frame!=g.frames) {
+        fprintf(stderr,"[rsx raster probe] frame=%u first_frame=%u frames=%u mode=%s target=%u:%08X selected=%u changed=%u raw_cull=%u face=%04X front=%04X depth=%u/%u/%04X stencil=%u color_mask=%08X clip=%ux%u aa=%u primitive=%u fp=%08X ctrl=%08X\n",
+            g.frames,s_raster_probe.first_frame,s_raster_probe.frames,
+            s_raster_probe.mode==2?"cull-off":"observe",
+            s_raster_probe.location,s_raster_probe.offset,s_raster_probe.selected,
+            s_raster_probe.changed,raw_cull,rs->cull_face,
+            rs->front_face,rs->depth_test,rs->depth_write,rs->depth_func,
+            rs->stencil_enable,rs->color_mask,sf->clip_w,sf->clip_h,sf->antialias,
+            g.rsx.current_primitive,rsx_dsp_reg(&g.rsx,0x08E4),rsx_dsp_shader_control(&g.rsx));
+        s_raster_probe.have_logged=1;
+        s_raster_probe.last_log_frame=g.frames;
+    }
+    goto done;
+invalid:
+    s_raster_probe.mode=0;
+    fprintf(stderr,"[rsx raster probe] invalid configuration; diagnostic disabled\n");
+done:
+    errno=saved_errno;
+}
+
 static void sink_end_core(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -2688,6 +2777,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
     rsx_dsp_viewport vp;
     rsx_dsp_get_surface(&g.rsx, &sf);
     rsx_dsp_get_viewport(&g.rsx, &vp);
+    eng_raster_probe(&rs, &sf, n_targets);
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      sf.clip_w, sf.clip_h);
 
