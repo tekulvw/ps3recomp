@@ -2,6 +2,7 @@
 #ifndef SPU_DMA_PUBLICATION_IMPL_H
 #define SPU_DMA_PUBLICATION_IMPL_H
 #include "spu_dma_publication.h"
+#include "spu_dma_disposition_impl.h"
 #include "../platform/win32_compat.h"
 #include <errno.h>
 #include <ctype.h>
