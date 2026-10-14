@@ -1396,7 +1396,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
         if (!key) return 0;
-        const u32 fp_ctrl_key = fp_ctrl & 0x40u;
+        const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         if (bx2_units) key = eng_fnv1a(texture_bx2_masks, sizeof texture_bx2_masks, key);

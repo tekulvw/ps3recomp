@@ -848,7 +848,7 @@ static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
     u64 key = rsx_fp_structural_hash(*uc, MTL_FP_MAX_BYTES, 1469598103934665603ull);
     if (!key) return -1;                    /* malformed or unterminated */
     const u32 ctrl      = st->shader_control;
-    const u32 ctrl_key  = ctrl & CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS;
+    const u32 ctrl_key  = ctrl & (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS | 0xEu);
     const u32 alpha_en  = (st->alpha_test_enable && st->alpha_func != 0x0207u) ? 1u : 0u;
     const u32 alpha_fn  = alpha_en ? st->alpha_func : 0u;
     key = fnv1a64(&ctrl_key, sizeof ctrl_key, key);
