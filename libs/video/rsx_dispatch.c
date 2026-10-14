@@ -466,6 +466,14 @@ void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out)
     out->clip_w = h >> 16;
     out->clip_y = v & 0xFFFF;
     out->clip_h = v >> 16;
+    /* Antialiased surfaces at their sample resolution (rsx_dispatch.h). A
+     * texture that reads an AA surface's memory sees the sample grid: a
+     * 320x180 SQUARE_ROTATED_4 target is a 640x360 image. */
+    out->antialias = (fmt >> 12) & 0xF;
+    out->aa_sx = (out->antialias >= 3 && out->antialias <= 5) ? 2u : 1u;
+    out->aa_sy = (out->antialias == 4 || out->antialias == 5) ? 2u : 1u;
+    out->clip_x *= out->aa_sx; out->clip_w *= out->aa_sx;
+    out->clip_y *= out->aa_sy; out->clip_h *= out->aa_sy;
 
     out->color_offset[0] = rsx_dsp_reg(rsx, M_COLOR0_OFFSET);
     out->color_offset[1] = rsx_dsp_reg(rsx, M_COLOR1_OFFSET);

@@ -7196,13 +7196,17 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 
     const float W = sf.clip_w ? (float)sf.clip_w : (float)g.width;
     const float H = sf.clip_h ? (float)sf.clip_h : (float)g.height;
+    /* The guest viewport is in pixels; an antialiased surface's clip is in
+     * samples (aa_sx x aa_sy per pixel), so map NDC over the pixel extent. */
+    const float Wv = W / (float)sf.aa_sx;
+    const float Hv = H / (float)sf.aa_sy;
     float xf[8] = {1, 1, 1, 0, 0, 0, 0, 0};
     if (vp.scale[0] != 0.0f || vp.translate[0] != 0.0f) {
-        xf[0] = vp.scale[0] / (W * 0.5f);
-        xf[1] = -(vp.scale[1] / (H * 0.5f));
+        xf[0] = vp.scale[0] / (Wv * 0.5f);
+        xf[1] = -(vp.scale[1] / (Hv * 0.5f));
         xf[2] = vp.scale[2];
-        xf[4] = (vp.translate[0] - W * 0.5f) / (W * 0.5f);
-        xf[5] = -((vp.translate[1] - H * 0.5f) / (H * 0.5f));
+        xf[4] = (vp.translate[0] - Wv * 0.5f) / (Wv * 0.5f);
+        xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
     u8* cbdst = g.cb_mapped + g.cb_used;
@@ -7241,8 +7245,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     {
         const u32 sh = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
         const u32 sv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
-        const LONG sx = (LONG)(sh & 0xFFFFu), sw = (LONG)(sh >> 16);
-        const LONG sy = (LONG)(sv & 0xFFFFu), svh = (LONG)(sv >> 16);
+        /* The scissor is in pixels too: scale it to the sample grid. */
+        const LONG ax = (LONG)sf.aa_sx, ay = (LONG)sf.aa_sy;
+        const LONG sx = (LONG)(sh & 0xFFFFu) * ax, sw = (LONG)(sh >> 16) * ax;
+        const LONG sy = (LONG)(sv & 0xFFFFu) * ay, svh = (LONG)(sv >> 16) * ay;
         const int written = g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] != 0 ||
                             g.rsx.seen[M_SCISSOR_VERTICAL >> 2] != 0;
         if (written) {

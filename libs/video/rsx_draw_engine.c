@@ -2607,13 +2607,17 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
      * host's clip space (rsx_live_draw.c:6143-6156). */
     const float W = sf.clip_w ? (float)sf.clip_w : (float)g.width;
     const float H = sf.clip_h ? (float)sf.clip_h : (float)g.height;
+    /* The guest viewport is in pixels; an antialiased surface's clip is in
+     * samples (aa_sx x aa_sy per pixel), so map NDC over the pixel extent. */
+    const float Wv = W / (float)sf.aa_sx;
+    const float Hv = H / (float)sf.aa_sy;
     float xf[8] = { 1, 1, 1, 0, 0, 0, 0, 0 };
     if (vp.scale[0] != 0.0f || vp.translate[0] != 0.0f) {
-        xf[0] = vp.scale[0] / (W * 0.5f);
-        xf[1] = -(vp.scale[1] / (H * 0.5f));
+        xf[0] = vp.scale[0] / (Wv * 0.5f);
+        xf[1] = -(vp.scale[1] / (Hv * 0.5f));
         xf[2] = vp.scale[2];
-        xf[4] = (vp.translate[0] - W * 0.5f) / (W * 0.5f);
-        xf[5] = -((vp.translate[1] - H * 0.5f) / (H * 0.5f));
+        xf[4] = (vp.translate[0] - Wv * 0.5f) / (Wv * 0.5f);
+        xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
     memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
@@ -2672,8 +2676,9 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
         u32 sw = g.surfaces[target].w, sh = g.surfaces[target].h;
         const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
         const u32 v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
-        const u32 gx = h & 0xFFFFu, gw = h >> 16;
-        const u32 gy = v & 0xFFFFu, gh = v >> 16;
+        /* The scissor is in pixels: scale it to the sample grid. */
+        const u32 gx = (h & 0xFFFFu) * sf.aa_sx, gw = (h >> 16) * sf.aa_sx;
+        const u32 gy = (v & 0xFFFFu) * sf.aa_sy, gh = (v >> 16) * sf.aa_sy;
         if (gw > 0 && gh > 0) {
             u32 right = sx + sw, bottom = sy + sh;
             if (gx > sx) sx = gx;
