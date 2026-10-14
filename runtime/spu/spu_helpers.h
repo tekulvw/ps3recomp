@@ -313,7 +313,21 @@ static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-
 static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
 static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
 static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
+static inline u128 spu_fnms(u128 a, u128 b, u128 c) {
+    u128 r;
+    for(int i=0;i<4;i++) {
+        uint32_t aa=a._u32[i]&0x7FFFFFFFu, bb=b._u32[i]&0x7FFFFFFFu;
+        /* SPU exponent FF is finite extended range, not IEEE NaN/Inf.
+         * An exact zero product preserves c; SPU exponent-zero results
+         * (signed zero or denormal) become positive zero. */
+        if((aa==0 && (bb&0x7F800000u)==0x7F800000u) ||
+           (bb==0 && (aa&0x7F800000u)==0x7F800000u))
+            r._u32[i]=(c._u32[i]&0x7F800000u)?c._u32[i]:0;
+        else
+            r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]);
+    }
+    return r;
+}
 static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
 static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
 

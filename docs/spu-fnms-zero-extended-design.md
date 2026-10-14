@@ -8,7 +8,7 @@ The proposed change is limited to `spu_fnms`, per lane:
 2. Return the addend bits unchanged when its exponent is nonzero. Return positive zero when its exponent is zero, including signed zero and denormal encodings.
 3. Keep the existing host `fmaf` expression for every other input lane.
 
-No production change is included yet. General nonzero extended multiplication, rounding, exception flags, denormal multiplicands, and other float helpers remain outside this proposal. The tests include ordinary finite controls but do not claim complete SPU floating-point conformance.
+The implementation follows this guard. General nonzero extended multiplication, rounding, exception flags, denormal multiplicands, and other float helpers remain outside this change. The tests include ordinary finite controls but do not claim complete SPU floating-point conformance.
 
 ## References
 
@@ -22,4 +22,4 @@ Run `python3 tests/test_spu_fnms_zero_extended.py`. It generates synthetic FNMS 
 
 448 mixed-lane cases cover both operand orders, both zero signs, eight extended-range encodings across both signs, and fourteen positive/negative normal/extended/zero/denormal addends. Every case exercises the helper, interpreter and compiled lift; interpreter/lift use a separate destination and each of the three input aliases. One ordinary finite control verifies exact arithmetic in the unchanged path.
 
-The oracle follows only exact zero-product arithmetic plus documented exponent-zero normalization. The test is intentionally RED on base `5133e393c91d9e7b6641f1c4bafe6cf91ef707e5`. Native observations and integration remain separately coordinated; a generic semantic discrepancy alone does not establish an application-level cause.
+The oracle follows only exact zero-product arithmetic plus documented exponent-zero normalization. The test is RED on base `5133e393c91d9e7b6641f1c4bafe6cf91ef707e5` and GREEN with the guard. Native observations and integration remain separately coordinated; this test does not establish an application-level outcome.
