@@ -107,6 +107,7 @@ typedef struct rsx_be_render_state {
 /* ---- the backend interface ---------------------------------------------- */
 
 #define RSX_BE_HAS_CHECKED_COMPLETION 1
+#define RSX_BE_HAS_COLOR_SNAPSHOT 1
 typedef struct rsx_draw_backend {
     void* user;
 
@@ -227,6 +228,12 @@ typedef struct rsx_draw_backend {
      * the actual selected 2D texture/view at mip 0 into an RGBA8 byte file.
      * Called only for explicitly armed capture offsets, before their draw. */
     int (*capture_texture_rgba8)(void* user, u32 texture, const char* path);
+    /* Optional same-target colour feedback. Return a fresh, immutable texture
+     * of the target's full physical extent and storage format. Its GPU copy
+     * must execute after all preceding writes and before the next draw. The
+     * engine owns the returned handle and releases it with texture_release.
+     * 0 is a checked failure; NULL retains the legacy guest-upload route. */
+    u32 (*color_snapshot)(void* user, u32 surface);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

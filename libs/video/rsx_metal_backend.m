@@ -2252,7 +2252,8 @@ static EngView s_eng_view[ENG_MAX_VIEWS];
 static u32 s_eng_view_count;
 
 typedef enum {
-    ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE
+    ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE,
+    ENG_REC_COLOR_SNAPSHOT
 } EngRecKind;
 
 typedef struct {
@@ -2279,7 +2280,7 @@ typedef struct {
     u32   clear_flags;
     float clear_depth;
     u8    clear_stencil;
-    u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
+    u32   resolve_dst;          /* snapshot/resolve destination texture */
 } EngRecord;
 
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
@@ -2603,6 +2604,29 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
     s_eng_view[s_eng_view_count].view    = handle;
     s_eng_view_count++;
     return handle;
+}
+
+/* Allocate now, copy in command order. The returned object is unique to
+ * this draw; later snapshots never overwrite a queued draw's sampled image. */
+static u32 eng_color_snapshot(void* user, u32 surface)
+{
+    (void)user;
+    id<MTLTexture> src = eng_obj(surface);
+    if (!src || [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
+        s_eng_rec_count >= ENG_MAX_RECORDS) { eng_checked_fail(); return 0; }
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[src pixelFormat]
+                         width:[src width] height:[src height] mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate;
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    const u32 copy = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    if (!copy) { eng_checked_fail(); return 0; }
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_COLOR_SNAPSHOT;
+    r->rt[0] = surface;
+    r->resolve_dst = copy;
+    return copy;
 }
 
 static u32 eng_depth_target_create(void* user, u32 w, u32 h)
@@ -3275,6 +3299,24 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 {
     u32 i = 0;
     while (i < s_eng_rec_count) {
+        if (s_eng_rec[i].kind == ENG_REC_COLOR_SNAPSHOT) {
+            const EngRecord* r = &s_eng_rec[i++];
+            id<MTLTexture> src = eng_obj(r->rt[0]);
+            id<MTLTexture> dst = eng_obj(r->resolve_dst);
+            if (!src || !dst || [src width] != [dst width] ||
+                [src height] != [dst height] || [src pixelFormat] != [dst pixelFormat]) {
+                eng_checked_fail(); continue;
+            }
+            id<MTLBlitCommandEncoder> copy = [cb blitCommandEncoder];
+            if (!copy) { eng_checked_fail(); continue; }
+            [copy copyFromTexture:src sourceSlice:0 sourceLevel:0
+                   sourceOrigin:MTLOriginMake(0, 0, 0)
+                     sourceSize:MTLSizeMake([src width], [src height], 1)
+                      toTexture:dst destinationSlice:0 destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [copy endEncoding];
+            continue;
+        }
         if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->depth);
@@ -3307,7 +3349,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         float cdepth = 1.0f;
         u8 cstencil = 0;
         while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
-               s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE) {
+               s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE &&
+               s_eng_rec[i].kind != ENG_REC_COLOR_SNAPSHOT) {
             const EngRecord* r = &s_eng_rec[i];
             if (r->kind == ENG_REC_CLEAR_COLOR) {
                 u32 k = 0;
@@ -3842,6 +3885,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_target_create  = eng_depth_target_create,
     .depth_target_release = eng_obj_release,
     .depth_snapshot       = eng_depth_snapshot,
+    .color_snapshot       = eng_color_snapshot,
     .depth_readback       = eng_depth_readback,
     .pipeline_create      = eng_pipeline_create,
     .pipeline_release     = eng_pipeline_release,

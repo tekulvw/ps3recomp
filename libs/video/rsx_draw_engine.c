@@ -98,6 +98,7 @@ typedef struct {
     u32 pitch;              /* guest bytes per row, from SET_SURFACE_PITCH */
     rsx_be_format fmt;
     u32 handle;
+    u32 feedback;          /* last immutable own-target copy, engine-owned */
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
 } eng_surface;
@@ -586,6 +587,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;}
 
     eng_surface* s = &g.surfaces[slot];
+    if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
@@ -2008,12 +2010,51 @@ static void eng_picture_resolve(u32 unit)
     s_picture_bound[unit]=token;s_picture_offset_pending[unit]=0;
 }
 
+/* A direct copy is valid only for the entire matching physical sample
+ * layout. Reinterpreted, swizzled, mipmapped and subrectangle aliases need a
+ * different conversion and must not silently sample stale guest bytes. */
+static int eng_color_feedback_compatible(const eng_surface* s,
+                                          const rsx_dsp_texture* t)
+{
+    const u32 base = t->format & 0x9fu;
+    u32 bpp = 0;
+    switch (s->fmt) {
+    case RSX_BE_FMT_R8G8B8A8:        if (base == 0x85u) bpp = 4; break;
+    case RSX_BE_FMT_R16G16B16A16F:   if (base == 0x9au) bpp = 8; break;
+    case RSX_BE_FMT_R32G32B32A32F:   if (base == 0x9bu) bpp = 16; break;
+    case RSX_BE_FMT_R32F:            if (base == 0x9cu) bpp = 4; break;
+    default: break;
+    }
+    if (!bpp || !(t->format & 0x20u) || t->dimension != 2 ||
+        t->cubemap || t->mipmaps > 1 || t->depth > 1 ||
+        t->width != s->w || t->height != s->h) return 0;
+    const u64 row = (u64)s->w * bpp;
+    const u64 sp = s->pitch ? s->pitch : row;
+    const u64 tp = t->pitch ? t->pitch : row;
+    return row && sp >= row && tp == sp;
+}
+
+static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
+                                       const rsx_dsp_texture* t)
+{
+    static u32 logs;
+    atomic_store(&s_checked_failed, 1);
+    if (logs++ < 8)
+        fprintf(stderr, "[rsx engine] rejected colour feedback unit %u: "
+                "target %ux%u fmt%u pitch%u, texture %ux%u fmt%02X pitch%u "
+                "dim%u levels%u cube%u\n", unit, s->w, s->h, (u32)s->fmt,
+                s->pitch, t->width, t->height, t->format, t->pitch,
+                t->dimension, t->mipmaps, t->cubemap);
+    return ENG_INVALID;
+}
+
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot, u32 tex_used,
                               u32 textures[RSX_BE_MAX_TEXTURES],
                               rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
 {
     u32 mask = 0;
+    u32 feedback[RSX_BE_MAX_COLOR_TARGETS] = {0};
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
@@ -2040,9 +2081,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 g.surfaces[i].offset != t.offset)
                 continue;
             surface_at = (int)i;
-            /* Not one this draw writes: reading a target a pass is writing
-             * is undefined on every API, and an MRT set writes more than
-             * one of them. */
+            /* A current attachment requires an ordered immutable copy; it
+             * cannot be sampled directly while the host pass writes it. */
             for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
             if (own) break;
             sampled = (int)i;
@@ -2073,6 +2113,31 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                                (int)t.cubemap, t.remap & 0xFFFFu, 0);
                 continue;
             }
+        }
+        if (own && zsrc < 0 && g.be->color_snapshot) {
+            eng_surface* s = &g.surfaces[surface_at];
+            if (!eng_color_feedback_compatible(s, &t))
+                return eng_color_feedback_failure(u, s, &t);
+            u32 k = 0;
+            while (k < n_targets && target_slots[k] != (u32)surface_at) k++;
+            if (k == n_targets) return eng_color_feedback_failure(u, s, &t);
+            if (!feedback[k]) {
+                const u32 copy = g.be->color_snapshot(g.be->user, s->handle);
+                if (!copy) return eng_color_feedback_failure(u, s, &t);
+                if (s->feedback) g.be->texture_release(g.be->user, s->feedback);
+                s->feedback = feedback[k] = copy;
+            }
+            if (g.be->surface_view) {
+                textures[u] = g.be->surface_view(g.be->user, feedback[k],
+                                               t.remap & 0xffffu, t.format);
+                if (!textures[u]) return eng_color_feedback_failure(u, s, &t);
+            } else if ((t.remap & 0xffffu) == 0xaae4u) {
+                textures[u] = feedback[k];
+            } else {
+                return eng_color_feedback_failure(u, s, &t);
+            }
+            eng_texture_descriptor_log(u, &t, textures[u], "feedback", s);
+            continue;
         }
         if (sampled >= 0 && zsrc < 0 &&
             g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
@@ -2650,6 +2715,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
     memset(vsamplers, 0, sizeof vsamplers);
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
+    if (tex_mask == ENG_INVALID) return;
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
     DRAW_OBSERVER_STAGE("picture_readiness");
@@ -2963,8 +3029,10 @@ void rsx_draw_engine_shutdown(void)
         if (g.textures[i].handle) g.be->texture_release(g.be->user, g.textures[i].handle);
     for (u32 i = 0; i < g.n_pipelines; i++)
         if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
-    for (u32 i = 0; i < g.n_surfaces; i++)
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
+    }
     for (u32 i = 0; i < g.n_zdepths; i++)
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
