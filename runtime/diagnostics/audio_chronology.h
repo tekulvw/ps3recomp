@@ -13,6 +13,14 @@ typedef struct audio_chronology_dma_token {
     uint32_t size, slot_mask, offset, bytes, nonzero, words, overlap;
     int port;
 } audio_chronology_dma_token;
+#define AUDIO_CHRONOLOGY_CALL_SPAN_VERSION 1
+/* Separate metadata-only stream, sharing the audio capture clock/window. */
+typedef struct audio_chronology_call_token {
+    uint64_t serial, run, ctx, thread, args[9];
+    uint32_t target, depth;
+} audio_chronology_call_token;
+void audio_chronology_call_begin(audio_chronology_call_token*, const void*, uint32_t, uint32_t);
+void audio_chronology_call_end(audio_chronology_call_token*, unsigned);
 int audio_chronology_enabled(void);
 void audio_chronology_port(unsigned, uint32_t, uint32_t, uint32_t, int);
 void audio_chronology_consume(unsigned, unsigned, uint64_t, const uint8_t*, uint32_t, uint64_t);

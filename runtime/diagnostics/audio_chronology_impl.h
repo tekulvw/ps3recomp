@@ -2,6 +2,7 @@
 #ifndef PS3RECOMP_AUDIO_CHRONOLOGY_IMPL_H
 #define PS3RECOMP_AUDIO_CHRONOLOGY_IMPL_H
 #include "audio_chronology.h"
+#include "../ppu/ppu_context.h"
 #include "../platform/win32_compat.h"
 #include <errno.h>
 #include <stdio.h>
@@ -34,6 +35,16 @@ static struct {
     ac_port ports[AC_PORTS];
     ac_record records[AC_MAX];
 } s_ac = { INIT_ONCE_STATIC_INIT };
+typedef struct ac_call_record {
+    uint64_t us, run, token, ctx, thread, args[9];
+    uint32_t target, depth, phase, flags;
+} ac_call_record;
+static struct {
+    uint32_t target, count, dropped, pending;
+    uint64_t serial;
+    ac_call_record records[AC_MAX];
+} s_ac_calls;
+static void ac_calls_dump_locked(void);
 /* Preserve host error state for every public hook, including disabled paths. */
 #ifdef _WIN32
 #define AC_SAVE int ac_errno=errno; DWORD ac_last=GetLastError()
@@ -74,6 +85,13 @@ static BOOL WINAPI ac_init(PINIT_ONCE once,PVOID arg,PVOID* out) {
     if(valid)memcpy(s_ac.trigger,trigger,strlen(trigger)+1);
     s_ac.duration_us=(uint64_t)ms*1000;
     s_ac.enabled=valid;
+    const char* selected=getenv("AUDIO_CHRONOLOGY_PPU_TARGET");
+    if(valid && selected && *selected>='0' && *selected<='9') {
+        char* end;errno=0;unsigned long long target=strtoull(selected,&end,0);
+        if(!errno && !*end && target && target<=0xFFFFFFFCull && !(target&3))s_ac_calls.target=(uint32_t)target;
+    }
+    /* The paired call-span option is capped at ten seconds on the SAME window. */
+    if(s_ac_calls.target && s_ac.duration_us>10000000ull)s_ac.duration_us=10000000ull;
     InterlockedExchange(&s_ac.ready,1); return TRUE;
 }
 static int ac_enabled(void) {
@@ -94,6 +112,7 @@ static void ac_dump_locked(const char* reason) {
     uint64_t inflight=0;for(unsigned p=0;p<AC_PORTS;p++)for(unsigned b=0;b<32;b++)inflight+=s_ac.ports[p].writers[b];
     fprintf(stderr,"[audio-chronology-summary] reason=%s count=%u dropped=%u limit=%u start_us=%llu duration_us=%llu queue_min=%u queue_zero=%u max_submit_interval_us=%llu inflight_at_flush=%llu coverage=SPU-DMA-only overlap_is_ambiguous=1\n",
         reason,s_ac.count,s_ac.dropped,s_ac.limit,(unsigned long long)s_ac.start_us,(unsigned long long)s_ac.duration_us,s_ac.min_queue,s_ac.zero_queue,(unsigned long long)s_ac.max_interval,(unsigned long long)inflight);
+    ac_calls_dump_locked();
     for(uint32_t i=0;i<s_ac.count;i++) {
         const ac_record* r=&s_ac.records[i];
         fprintf(stderr,"[audio-chronology] seq=%u kind=%u us=%llu begin_us=%llu copy_us=%llu port=%u epoch=%llu index=%llu ea=%08X size=%u lsa=%05X cmd=%X ctx=%llX spu=%u pc=%05X mask=%08X nz=%u words=%u flags=%u rc=%d arg0=%llu arg1=%llu value=%llu\n",
@@ -231,6 +250,53 @@ void audio_chronology_api(unsigned kind,unsigned port,uint64_t requested,uint64_
         if(port<AC_PORTS) { ac_port* p=&s_ac.ports[port];r.epoch=p->epoch;r.ea=p->ea;r.size=p->block_bytes;if(p->blocks && counter!=AC_UNKNOWN)r.index=counter%p->blocks; }
         ac_record_locked(&r);
     }ac_unlock(); }AC_RESTORE;
+}
+/* A separate prefix retains the existing audio record schema unchanged. Raw
+ * register arguments never authorize guest-memory or PCM dereferences. */
+static void ac_calls_dump_locked(void) {
+    if(!s_ac_calls.target)return;
+    fprintf(stderr,"[ppu-call-span-summary] run_id=%llu target=%08X start_us=%llu duration_us=%llu count=%u dropped=%u limit=%u pending_recorded_brackets=%u completion=PPU-fn-and-trampoline-only\n",
+        (unsigned long long)s_ac.start_us,s_ac_calls.target,(unsigned long long)s_ac.start_us,(unsigned long long)s_ac.duration_us,s_ac_calls.count,s_ac_calls.dropped,s_ac.limit,s_ac_calls.pending);
+    for(uint32_t i=0;i<s_ac_calls.count;i++) {
+        const ac_call_record* r=&s_ac_calls.records[i];
+        fprintf(stderr,"[ppu-call-span] seq=%u run_id=%llu token=%llu phase=%u us=%llu ctx=%llX thread=%llu target=%08X depth=%u flags=%u r3=%llu r4=%llu r5=%llu r6=%llu r7=%llu r8=%llu r9=%llu r10=%llu r31=%llu\n",
+            i+1,(unsigned long long)r->run,(unsigned long long)r->token,r->phase,(unsigned long long)r->us,(unsigned long long)r->ctx,(unsigned long long)r->thread,r->target,r->depth,r->flags,
+            (unsigned long long)r->args[0],(unsigned long long)r->args[1],(unsigned long long)r->args[2],(unsigned long long)r->args[3],(unsigned long long)r->args[4],(unsigned long long)r->args[5],(unsigned long long)r->args[6],(unsigned long long)r->args[7],(unsigned long long)r->args[8]);
+    }
+}
+static void ac_call_drop(void) { if(s_ac_calls.dropped!=~0u)s_ac_calls.dropped++; }
+void audio_chronology_call_begin(audio_chronology_call_token* t,const void* context,uint32_t target,uint32_t depth) {
+    AC_SAVE;t->serial=0;
+    if(ac_active() && s_ac_calls.target && target==s_ac_calls.target) {
+        ac_lock();uint64_t now=ac_now();
+        if(ac_window_locked(now)) {
+            if(s_ac_calls.count>=s_ac.limit || s_ac_calls.serial==~(uint64_t)0)ac_call_drop();
+            else {
+                const ppu_context* ctx=(const ppu_context*)context;
+                memset(t,0,sizeof *t);t->serial=++s_ac_calls.serial;t->run=s_ac.start_us;t->ctx=(uint64_t)(uintptr_t)context;t->thread=ctx->thread_id;t->target=target;t->depth=depth;
+                for(unsigned i=0;i<8;i++)t->args[i]=ctx->gpr[i+3];t->args[8]=ctx->gpr[31];
+                ac_call_record r={0};r.us=now;r.run=t->run;r.token=t->serial;r.ctx=t->ctx;r.thread=t->thread;r.target=target;r.depth=depth;memcpy(r.args,t->args,sizeof r.args);
+                s_ac_calls.records[s_ac_calls.count++]=r;s_ac_calls.pending++;
+            }
+        }
+        ac_unlock();
+    }
+    AC_RESTORE;
+}
+void audio_chronology_call_end(audio_chronology_call_token* t,unsigned abnormal) {
+    AC_SAVE;uint64_t token=t->serial;t->serial=0;
+    if(token && ac_active()) {
+        ac_lock();uint64_t now=ac_now();
+        if(ac_window_locked(now) && t->run==s_ac.start_us) {
+            if(s_ac_calls.count>=s_ac.limit)ac_call_drop();
+            else {
+                ac_call_record r={0};r.us=now;r.run=t->run;r.token=token;r.ctx=t->ctx;r.thread=t->thread;r.target=t->target;r.depth=t->depth;r.phase=1;r.flags=abnormal?1u:0u;memcpy(r.args,t->args,sizeof r.args);
+                s_ac_calls.records[s_ac_calls.count++]=r;if(s_ac_calls.pending)s_ac_calls.pending--;
+            }
+        }
+        ac_unlock();
+    }
+    AC_RESTORE;
 }
 void audio_chronology_poll(void) {
     AC_SAVE;
