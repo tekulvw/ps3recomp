@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "spu_dma_disposition_impl.h"
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
