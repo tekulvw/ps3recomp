@@ -2201,9 +2201,9 @@ static void eng_producer_capture(u32 draw, const rsx_vertex_layout_plan* layout,
     u32 n_indices, u32 fp_bytes, const rsx_be_render_state* rs,
     const rsx_dsp_surface* sf, const rsx_dsp_viewport* vp)
 {
-    enum { MAX_COUNT=32, MAX_ARRAY=1u<<20, MAX_TOTAL=64u<<20 };
+    enum { MAX_COUNT=256, DEFAULT_COUNT=32, MAX_ARRAY=1u<<20, MAX_TOTAL=64u<<20 };
     static int configured, enabled, armed, started, closed;
-    static u32 location, offset, limit=MAX_COUNT, attempts, arm_frame, frame;
+    static u32 location, offset, limit=DEFAULT_COUNT, attempts, arm_frame, frame;
     static size_t total;
     static const char* directory;
     static const char* trigger;
