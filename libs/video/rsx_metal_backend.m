@@ -3940,6 +3940,54 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
     }
 }
 
+/* Optional lossless storage bytes for a 1x1 floating-point source. A blit
+ * reads physical channels; sampling/view swizzles are recorded, not applied.
+ * Failure is diagnostic-only and never changes the existing RGBA8 result. */
+static void eng_capture_raw_1x1(id<MTLTexture> src, const char* path)
+{
+    const char* opt=getenv("PS3RECOMP_RSX_BINDING_CAPTURE_RAW_1X1");
+    if (!opt || strcmp(opt,"1") || [src width]!=1 || [src height]!=1) return;
+    size_t bytes=0;
+    switch ([src pixelFormat]) {
+    case MTLPixelFormatRGBA32Float: bytes=16; break;
+    case MTLPixelFormatRGBA16Float: bytes=8; break;
+    case MTLPixelFormatR32Float: bytes=4; break;
+    case MTLPixelFormatR16Float: bytes=2; break;
+    default: break;
+    }
+    char raw[2048],meta[2048];
+    if (snprintf(raw,sizeof raw,"%s.raw",path)>=(int)sizeof raw ||
+        snprintf(meta,sizeof meta,"%s.raw.meta",path)>=(int)sizeof meta) return;
+    const char* status="unsupported_format"; int saved=0; long gpu_status=0;
+    if (bytes) {
+        status="allocation_or_encoder_failed";
+        id<MTLBuffer> buffer=[s_dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb=[s_queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit=buffer && cb ? [cb blitCommandEncoder] : nil;
+        if (blit) {
+            [blit copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                sourceSize:MTLSizeMake(1,1,1) toBuffer:buffer destinationOffset:0
+                destinationBytesPerRow:256 destinationBytesPerImage:256];
+            [blit endEncoding]; [cb commit]; [cb waitUntilCompleted]; gpu_status=(long)[cb status];
+            status="gpu_failed";
+            if ([cb status]==MTLCommandBufferStatusCompleted && ![cb error]) {
+                FILE* f=fopen(raw,"wb"); status="file_failed";
+                if (f) { saved=fwrite([buffer contents],1,bytes,f)==bytes; if(fclose(f))saved=0; }
+                if (saved) status="saved";
+            }
+        }
+    }
+    MTLTextureSwizzleChannels swizzle=[src swizzle];
+    const u16 endian_probe=1;
+    FILE* f=fopen(meta,"wb");
+    if (f) {
+        fprintf(f,"metal_format=%lu size=1x1 level=0 raw_bytes=%zu bytes_saved=%d status=%s swizzle=%u,%u,%u,%u swizzle_applied=0 native_endian=%s before_consuming_draw=1 gpu_status=%ld\n",
+            (unsigned long)[src pixelFormat],bytes,saved,status,(unsigned)swizzle.red,(unsigned)swizzle.green,
+            (unsigned)swizzle.blue,(unsigned)swizzle.alpha,*(const u8*)&endian_probe ? "little" : "big",gpu_status);
+        fclose(f);
+    }
+}
+
 /* A bounded diagnostic callback, invoked before the selected consuming draw.
  * Drain preceding records, then sample the selected object/view itself. This
  * includes hardware BC decoding and its real component remap, unlike getBytes
@@ -3956,6 +4004,7 @@ static int eng_capture_texture_rgba8(void* user, u32 handle, const char* path)
         if (!s_eng_checked_completed) return 0;
     }
     @autoreleasepool {
+        eng_capture_raw_1x1(src,path);
         MTLTextureDescriptor* td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
         td.usage=MTLTextureUsageRenderTarget;
         td.storageMode=[s_dev hasUnifiedMemory] ? MTLStorageModeShared : MTLStorageModeManaged;

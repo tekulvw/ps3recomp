@@ -11,6 +11,7 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#include "rsx_binding_capture_filter.h"
 #include "rsx_picture_identity.inc"
 
 #include "rsx_fp_decompiler.h"
@@ -2199,6 +2200,7 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
     enum { MAX_CAPTURE = 8, MAX_IMAGE_BYTES = 8u << 20,
            MAX_TOTAL_BYTES = 64u << 20, MAX_GEOMETRY_BYTES = 1u << 20 };
     static int configured, enabled, armed;
+    static rsx_binding_capture_filter consumers[RSX_BINDING_CAPTURE_MAX];
     static u32 offsets[MAX_CAPTURE], count, done[MAX_CAPTURE], location;
     static u32 start_frame, start_draw, draw, checked_frame = UINT32_MAX;
     static size_t total_bytes;
@@ -2220,6 +2222,12 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
         }
         /* Reject an oversized list instead of silently dropping requests. */
         if (*list) return;
+        int consumer_filters=rsx_binding_capture_parse(
+            getenv("PS3RECOMP_RSX_BINDING_CAPTURE_CONSUMERS"),count,consumers);
+        if (consumer_filters<0) {
+            fprintf(stderr,"[rsx texture binding capture] invalid consumer selectors; capture disabled\n");
+            return;
+        }
         const char* loc = getenv("PS3RECOMP_RSX_BINDING_CAPTURE_LOCATION");
         if (loc) { unsigned long value=strtoul(loc,&end,10); if (*end || value>1) return; location=(u32)value; }
         const char* frame=getenv("PS3RECOMP_RSX_BINDING_CAPTURE_START_FRAME");
@@ -2236,12 +2244,24 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
         FILE* f=fopen(trigger,"rb"); if (f) { fclose(f); armed=1; }
     }
     if (!armed) return;
+    int consumer_checked=0, consumer_valid=0; u64 consumer_hash=0;
     for (u32 unit=0; unit<RSX_BE_MAX_TEXTURES; ++unit) {
         if (!(mask & (1u<<unit)) || !textures[unit]) continue;
         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx,unit,&t);
         u32 selected=0;
         while (selected<count && (done[selected] || offsets[selected]!=t.offset || location!=t.location)) ++selected;
         if (selected==count) continue;
+        /* A nonmatching early consumer must not spend an attempt or capture
+         * budget. Resolve the resident program only when a selected unit needs it. */
+        if (consumers[selected].active && !consumer_checked) {
+            const u8* vcode=NULL; const u8* fcode=NULL; u32 vi=0,bytes=0;
+            consumer_checked=1;
+            consumer_valid=eng_guest_programs(&vcode,&vi,&fcode,&bytes);
+            if (consumer_valid) consumer_hash=rsx_fp_structural_hash(fcode,bytes,1469598103934665603ull);
+            consumer_valid=consumer_valid && consumer_hash!=0;
+        }
+        if (!rsx_binding_capture_matches(&consumers[selected],consumer_valid,
+                consumer_hash,rsx_dsp_shader_control(&g.rsx))) continue;
         done[selected]=1; /* Even failed/unsupported captures cannot flood. */
         char prefix[1800];
         if (snprintf(prefix,sizeof prefix,"%s/tex-%02u-frame%u-draw%u-unit%u-%08X",
@@ -2308,6 +2328,9 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
         u64 pipeline_key=0; for (u32 i=0;i<g.n_pipelines;++i) if (g.pipelines[i].handle==pipeline) pipeline_key=g.pipelines[i].key;
         fprintf(f,"pipeline=%u pipeline_key=%016llX guest_programs=%d programs_saved=%d vp_instructions=%u fp_bytes=%u shader_control=%08X primitive=%u vertices=%u stride=%u indices=%u attr_mask=%08X attrs=",pipeline,(unsigned long long)pipeline_key,guest_programs,programs_ok,vp_instrs,fp_size,rsx_dsp_shader_control(&g.rsx),g.rsx.current_primitive,uploaded,layout->stride,n_indices,layout->mask);
         for (u32 i=0;i<layout->count;++i) fprintf(f,"%s%u",i ? "," : "",layout->attrs[i]);
+        if (consumers[selected].active)
+            fprintf(f,"\nconsumer_fp_structural_hash=%016llX consumer_shader_control=%08X consumer_matched=1",
+                (unsigned long long)consumer_hash,rsx_dsp_shader_control(&g.rsx));
         fprintf(f,"\ntargets="); for (u32 i=0;i<n_targets;++i) fprintf(f,"%s%u:%u:%08X:%ux%u:fmt%u",i ? "," : "",g.surfaces[targets[i]].handle,g.surfaces[targets[i]].location,g.surfaces[targets[i]].offset,g.surfaces[targets[i]].w,g.surfaces[targets[i]].h,(u32)g.surfaces[targets[i]].fmt);
         fprintf(f,"\nclip=%u,%u,%u,%u color_format=%u viewport_scale=%g,%g,%g,%g viewport_translate=%g,%g,%g,%g scissor_raw=%08X,%08X\n",
             sf->clip_x,sf->clip_y,sf->clip_w,sf->clip_h,sf->color_format,vp->scale[0],vp->scale[1],vp->scale[2],vp->scale[3],vp->translate[0],vp->translate[1],vp->translate[2],vp->translate[3],rsx_dsp_reg(&g.rsx,M_SCISSOR_HORIZONTAL),rsx_dsp_reg(&g.rsx,M_SCISSOR_VERTICAL));
