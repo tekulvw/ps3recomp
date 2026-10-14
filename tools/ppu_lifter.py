@@ -1746,10 +1746,9 @@ class PPULifter:
 
         if mn == "mtctr":
             rs_i = _reg_idx(ops[0])
-            # Mask CTR to 32 bits — PS3 games use 32-bit loop counts.
-            # Without masking, sign-extended 64-bit values from addi/rldicr
-            # produce CTR values like 0x9FFFFFFFE0000000 causing infinite loops.
-            return f"ctx->ctr = (uint32_t)ctx->gpr[{rs_i}];"
+            # CTR is architectural 64-bit state and can hold data between
+            # mtctr/mfctr, not only loop counts or guest branch addresses.
+            return f"ctx->ctr = ctx->gpr[{rs_i}];"
 
         if mn == "mfcr":
             rd_i = _reg_idx(ops[0])
@@ -1786,7 +1785,7 @@ class PPULifter:
             if mn == "mfspr":
                 return f"ctx->gpr[{g}] = ctx->{spr_field};"
             if spr_field == "ctr":
-                return f"ctx->ctr = (uint32_t)ctx->gpr[{g}];"
+                return f"ctx->ctr = ctx->gpr[{g}];"
             return f"ctx->{spr_field} = ctx->gpr[{g}];"
 
         if mn == "mtcr":
@@ -3218,8 +3217,8 @@ class PPULifter:
             "le": f"(!((ctx->cr >> {shift}) & 4))",
             "so": f"((ctx->cr >> {shift}) & 1)",
             "ns": f"(!((ctx->cr >> {shift}) & 1))",
-            "dnz": "((ctx->ctr = (uint32_t)(ctx->ctr - 1)) != 0)",
-            "dz": "((ctx->ctr = (uint32_t)(ctx->ctr - 1)) == 0)",
+            "dnz": "((--ctx->ctr) != 0)",
+            "dz": "((--ctx->ctr) == 0)",
         }
 
         return cond_map.get(mn, f"/* cond: {mnemonic} */ 1")
