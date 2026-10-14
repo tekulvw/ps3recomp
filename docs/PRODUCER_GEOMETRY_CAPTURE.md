@@ -16,7 +16,7 @@ Set these before the engine's first draw:
 - `RSX_ENGINE_PRODUCER_CAPTURE_SELECTOR`: one required structural FP hash and
   raw shader control, in the existing `hash:control` hexadecimal syntax.
   Wildcards are rejected so an accidental unfiltered dump cannot occur.
-- `RSX_ENGINE_PRODUCER_CAPTURE_LIMIT`: 1 through 32, default 32 attempts.
+- `RSX_ENGINE_PRODUCER_CAPTURE_LIMIT`: 1 through 256, default 32 attempts.
   Failed writes and unsupported geometry spend attempts; nonmatching shaders
   do not. The vertex and index arrays are each limited to 1 MiB. Successful
   capture reservations, including 8 KiB per-record metadata allowance, are

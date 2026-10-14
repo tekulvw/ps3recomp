@@ -19,7 +19,8 @@ int main(int argc,char**argv){if(argc!=3)return 2;const char*kind=argv[1];vm_bas
  render();rsx_draw_engine_present();
  if(!strcmp(kind,"miss-then-match")){m(0x1D60,0x41);render();m(0x1D60,0x40);}
  if(!strcmp(kind,"indexed")){const u8 ix[6]={0,0,0,1,0,2};memcpy(vm_base+0x30000,ix,6);m(0x181C,0x30000);m(0x1820,0x11);unsigned before=calls;m(M_BEGIN_END,RSX_PRIMITIVE_TRIANGLES);m(0x1824,2u<<24);m(M_BEGIN_END,0);draw_extra+=calls-before;}else render();
- render();render();rsx_draw_engine_present();render();
+ if(!strcmp(kind,"census")){for(unsigned i=1;i<300;i++)render();}else{render();render();}
+ rsx_draw_engine_present();render();
  printf("draws=%d texture_mask=%u GPU_sync_or_read=%u\n",stub.n_draw,stub.bound_mask,draw_extra);
  const char*dir=getenv("RSX_ENGINE_PRODUCER_CAPTURE_DIR");if(dir&&*dir){char path[2048];
  #define EXPECTED(suffix,ptr,bytes) do{snprintf(path,sizeof path,"%s/expected%s",dir,suffix);f=fopen(path,"wb");if(f){fwrite(ptr,1,bytes,f);fclose(f);}}while(0)
