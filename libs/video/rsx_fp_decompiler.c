@@ -1466,3 +1466,73 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
     }
     return patched;
 }
+
+/* NV4097_SET_SHADER_PACKER accepts any nonzero value. Floating surfaces and
+ * 32-bit exports bypass the integer framebuffer's RGB transfer function. */
+int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format)
+{
+    return packer != 0 && !(ctrl & FP_CTRL_32BIT_EXPORTS) &&
+           color_format != 0x0Bu && color_format != 0x0Cu && color_format != 0x0Du;
+}
+
+int rsx_fp_apply_srgb_output(char* hlsl, u32 capacity)
+{
+    static const char helper[] =
+        "float4 _rsx_srgb_output(float4 v) {\n"
+        "    float3 lo = v.rgb * 12.92;\n"
+        "    float3 hi = 1.055 * pow(max(v.rgb, (float3)0), (float3)(1.0 / 2.4)) - 0.055;\n"
+        "    float3 rgb = float3(v.r < 0.0031308 ? lo.r : hi.r,\n"
+        "                         v.g < 0.0031308 ? lo.g : hi.g,\n"
+        "                         v.b < 0.0031308 ? lo.b : hi.b);\n"
+        "    return float4(saturate(rgb), v.a);\n}\n";
+    if (!hlsl || !capacity) return -1;
+    size_t len = 0;
+    while (len < capacity && hlsl[len]) ++len;
+    if (len == capacity || strstr(hlsl, "_rsx_srgb_output")) return -1;
+    char* marker = NULL;
+    for (char* p = strstr(hlsl, "    return "); p;
+         p = strstr(p + 1, "    return ")) marker = p;
+    if (!marker) return -1;
+    const char* expression = marker + strlen("    return ");
+    const char* end = strstr(expression, ";\n}\n");
+    if (!end || end == expression || (size_t)(end - expression) >= 96 || end[4])
+        return -1;
+    char output[96];
+    memcpy(output, expression, (size_t)(end - expression));
+    output[end - expression] = 0;
+    const int mrt = strstr(hlsl, "struct PSOutput") != NULL;
+    char suffix[1024];
+    int n = snprintf(suffix, sizeof suffix, "    %s _rsx_color_out = %s;\n",
+                     mrt ? "PSOutput" : "float4", output);
+    if (n < 0 || (size_t)n >= sizeof suffix) return -1;
+    if (mrt) {
+        unsigned targets = 0;
+        for (unsigned t = 0; t < 4; ++t) {
+            char field[64];
+            snprintf(field, sizeof field, "    float4 t%u : SV_TARGET%u;", t, t);
+            if (!strstr(hlsl, field)) continue;
+            const int added = snprintf(suffix + n, sizeof suffix - (size_t)n,
+                "    _rsx_color_out.t%u = _rsx_srgb_output(_rsx_color_out.t%u);\n", t, t);
+            if (added < 0 || (size_t)added >= sizeof suffix - (size_t)n) return -1;
+            n += added; ++targets;
+        }
+        if (!targets) return -1;
+    } else {
+        const int added = snprintf(suffix + n, sizeof suffix - (size_t)n,
+            "    _rsx_color_out = _rsx_srgb_output(_rsx_color_out);\n");
+        if (added < 0 || (size_t)added >= sizeof suffix - (size_t)n) return -1;
+        n += added;
+    }
+    const int added = snprintf(suffix + n, sizeof suffix - (size_t)n,
+                              "    return _rsx_color_out;\n}\n");
+    if (added < 0 || (size_t)added >= sizeof suffix - (size_t)n) return -1;
+    n += added;
+    const size_t prefix = (size_t)(marker - hlsl);
+    const size_t helper_len = sizeof helper - 1;
+    if (helper_len + prefix + (size_t)n + 1 > capacity) return -1;
+    /* All parsing/capacity checks precede the first mutation. */
+    memcpy(marker, suffix, (size_t)n + 1);
+    memmove(hlsl + helper_len, hlsl, prefix + (size_t)n + 1);
+    memcpy(hlsl, helper, helper_len);
+    return 1;
+}

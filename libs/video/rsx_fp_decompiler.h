@@ -189,6 +189,17 @@ int rsx_fp_constant_ring_plan(
 int rsx_vertex_constant_ring_plan(
     u32 used, u32 capacity, u32 block_bytes, u32* out_offset);
 
+/* Integer framebuffer sRGB conversion (NV4097_SET_SHADER_PACKER / 0x1FEC).
+ * Pass the decoded surface color format. Any nonzero packer enables it for
+ * half exports; floating surfaces and 32-bit exports bypass conversion. */
+int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format);
+
+/* Apply RGB-only linear-to-sRGB conversion to all emitted color targets,
+ * before output quantization. Alpha and optional depth exports are preserved.
+ * Returns 1, or -1 without mutation for malformed source/insufficient space.
+ * Apply before alpha-test wrapping; disabled draws should skip this helper. */
+int rsx_fp_apply_srgb_output(char* hlsl, u32 capacity);
+
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */
 const char* rsx_fp_opcode_name(u32 opcode);
