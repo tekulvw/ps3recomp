@@ -16,6 +16,9 @@
 #include "spu_context.h"
 #include <string.h>
 #include <math.h>
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+#include <arm_neon.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -383,7 +386,7 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
     u128 out; memcpy(&out, &r, 16); return out;
 }
-#elif defined(__ARM_NEON)
+#elif defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
 #include <arm_neon.h>
 /* NEON version: tbl over the 32-byte {a,b} concatenation. SPU byte P lives at
  * host byte P^3 (each word's bytes reversed), so rev32 into SPU order,
@@ -403,7 +406,7 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     u128 out; vst1q_u8(out._u8, r); return out;
 }
 #endif
-#if defined(__SSE4_1__) || defined(__ARM_NEON)
+#if defined(__SSE4_1__) || (defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS))
 /* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
 static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
     /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
