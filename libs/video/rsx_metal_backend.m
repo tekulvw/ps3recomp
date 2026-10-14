@@ -96,6 +96,7 @@ static u32                 s_height = 720;
 @public
     pthread_mutex_t lock;
     MetalFrameRate stats;
+    int signals_enabled;
 }
 @end
 @implementation MetalFrameRateSession
@@ -103,6 +104,8 @@ static u32                 s_height = 720;
     if ((self=[super init])) {
         pthread_mutex_init(&lock,NULL);
         metal_frame_rate_reset(&stats,CACurrentMediaTime());
+        const char *signals=getenv("PS3RECOMP_METAL_FPS_DIAGNOSTICS");
+        signals_enabled=signals && !strcmp(signals,"1");
     }
     return self;
 }
@@ -128,6 +131,36 @@ static void fps_track_drawable(id<CAMetalDrawable> drawable)
         metal_frame_rate_presented(&session->stats,shown.presentedTime);
         pthread_mutex_unlock(&session->lock);
     }];
+}
+
+static void fps_track_frame_completion(id<MTLCommandBuffer> cb)
+{
+    MetalFrameRateSession *session=fps_session();
+    if (!session || !session->signals_enabled || !cb) return;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+        const int success=finished.status==MTLCommandBufferStatusCompleted && !finished.error;
+        pthread_mutex_lock(&session->lock);
+        metal_frame_rate_completed(&session->stats,success,CACurrentMediaTime());
+        pthread_mutex_unlock(&session->lock);
+    }];
+}
+
+static void fps_note_drawable(int available)
+{
+    MetalFrameRateSession *session=fps_session();
+    if (!session || !session->signals_enabled) return;
+    pthread_mutex_lock(&session->lock);
+    metal_frame_rate_drawable(&session->stats,available);
+    pthread_mutex_unlock(&session->lock);
+}
+
+static void fps_note_skipped_blit(void)
+{
+    MetalFrameRateSession *session=fps_session();
+    if (!session || !session->signals_enabled) return;
+    pthread_mutex_lock(&session->lock);
+    ++session->stats.skipped_blits;
+    pthread_mutex_unlock(&session->lock);
 }
 
 void rsx_metal_backend_note_guest_frame(void)
@@ -170,6 +203,13 @@ static void fps_start(void)
             title,r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds];
         fprintf(stderr,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f\n",
             r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds);
+        if (session->signals_enabled) {
+            window.title=[window.title stringByAppendingFormat:@" | GPU completed %.1f FPS / age %.1f s",r.gpu_fps,r.gpu_age_seconds];
+            fprintf(stderr,"[RSX FPS signals] guest_admitted=%llu gpu_completed=%llu gpu_fps=%.2f gpu_failed=%llu gpu_last_s=%.6f gpu_age_s=%.2f display_last_s=%.6f callbacks=%llu positive=%llu zero=%llu invalid=%llu duplicate=%llu out_of_order=%llu drawable_attempts=%llu nil_drawables=%llu skipped_blits=%llu\n",
+                r.guest_admitted,r.gpu_completed,r.gpu_fps,r.gpu_failed,r.last_gpu_completed,r.gpu_age_seconds,r.last_presented,
+                r.present_callbacks,r.positive_presented_time,r.zero_presented_time,r.invalid_presented_time,
+                r.duplicate_presented_time,r.stale_presented_time,r.drawable_attempts,r.nil_drawables,r.skipped_blits);
+        }
     });
     dispatch_resume(s_fps_timer);
 }
@@ -3857,6 +3897,7 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
                 dst = s_offscreen;
             } else {
                 drawable = [s_layer nextDrawable];
+                fps_note_drawable(drawable!=nil);
                 if (!drawable) {           /* compositor is busy; skip */
                     if (s_eng_diag.active) s_eng_diag.reason = "no_drawable";
                     dispatch_semaphore_signal(s_inflight);
@@ -3883,10 +3924,12 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
         const u32 trace_count=eng_trace_targets(trace_handles, present_dst);
         eng_encode_records(cb, stage);
         int presented = eng_blit_to_display(cb, present_dst, dst);
+        if (drawable && !presented) fps_note_skipped_blit();
         if (s_eng_diag.active && !presented && present_dst) s_eng_diag.reason = "blit_skipped";
         const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
         if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
+        if (drawable && presented) fps_track_frame_completion(cb);
         if (windowed_present) {
             eng_track_submission(cb);
             dispatch_semaphore_t sem = s_inflight;
@@ -4441,6 +4484,7 @@ void rsx_metal_backend_present(void)
             target = s_offscreen;
         } else {
             drawable = [s_layer nextDrawable];
+            fps_note_drawable(drawable!=nil);
             if (!drawable) {            /* compositor is busy; skip this frame */
                 dispatch_semaphore_signal(s_inflight);
                 return;
@@ -4510,6 +4554,8 @@ void rsx_metal_backend_present(void)
         if (enc) [enc endEncoding];
 
         if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
+
+        if (drawable) fps_track_frame_completion(cb);
 
         if (s_headless) {
             /* The readback below must see a completed frame. */

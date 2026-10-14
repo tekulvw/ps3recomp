@@ -23,6 +23,48 @@ that gap visible. No image readback, GPU wait, rendering change, or per-frame
 statistics allocation is introduced. Drawable callbacks retain their own
 session so shutdown/reinitialization cannot contaminate a new run.
 
+Add `PS3RECOMP_METAL_FPS_DIAGNOSTICS=1` to an FPS-enabled windowed run to
+append a separately labeled **GPU completed FPS / age** to the title and emit
+one `[RSX FPS signals]` line per sample. With this option absent, title/log
+format is unchanged and no extra command-buffer completion handler is added.
+The existing display FPS, display intervals and age continue to use only
+accepted compositor `presentedTime` values. GPU completion never supplies a
+replacement display timestamp or display FPS.
+
+The signal line contains per-sample admitted host FLIP submissions
+(`guest_admitted`), successful frame command-buffer completions
+(`gpu_completed` / `gpu_fps`), failed frame command buffers (`gpu_failed`),
+and the last successful GPU completion's monotonic host timestamp and age.
+These count at most one completion per frame command buffer, independently of
+the number of draws or render passes. Report flushes, texture captures,
+offscreen submissions and headless work are excluded. In the engine path,
+the display blit must have encoded successfully before completion is tracked.
+Successful completion establishes GPU work completion, not correct rendering,
+visible scanout, or hardware performance.
+
+`callbacks` counts every received drawable presentation callback. `positive`
+counts all finite positive timestamps, including the separately rejected
+`duplicate` and `out_of_order` timestamps; `zero` is separate from `invalid`
+(negative or nonfinite). `display_last_s` is the last accepted compositor
+timestamp. `drawable_attempts`, `nil_drawables` and `skipped_blits` distinguish
+drawable acquisition failure and skipped engine display blits. All event
+counters reset per sample, while the last timestamps retain continuity.
+Callbacks retain their original session across shutdown/reinitialization.
+
+For example, positive GPU completion rate with zero display rate and no
+callbacks points to absent presentation callback delivery. A nonzero `zero`
+count instead proves callbacks arrived without a positive presentation time.
+Nil drawables or failed command buffers identify earlier failures. If both
+GPU and admitted guest frame rates stop, check the guest/render submission
+path. These signals diagnose telemetry and submission boundaries; they do
+not establish the cause of compositor behavior by themselves.
+
+Run `python3 tools/test_metal_frame_rate_signals.py` for portable math checks
+and macOS protocol fixtures. It opens no window and submits no GPU work. It
+checks success/error completions, callback classifications, nil drawables,
+skipped blits, exclusion of a successful non-frame flush, session lifetime,
+disabled mode, and the existing deterministic frame-rate scenarios.
+
 Run `python3 tools/test_metal_frame_rate.py` on macOS with a display. It checks
 deterministic rates/stalls/duplicate timestamps/bounded p95, worker-thread
 headless shutdown without main-queue pumping, a native title
