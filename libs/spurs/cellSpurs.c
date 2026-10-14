@@ -671,12 +671,17 @@ s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
     return CELL_OK;
 }
 
-/* The SDK's cellSpursAttributeInitialize() macro imports this internal name
- * (NID 0x95180230). Forward to the implementation above. */
-s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
-                                  s32 spuPriority, s32 ppuPriority,
-                                  u8 exitIfNoWork)
+/* The SDK's cellSpursAttributeInitialize() is an inline wrapper over this
+ * internal export (NID 0x95180230), whose arguments are (attr, revision,
+ * sdkVersion, nSpus, spuPriority, ppuPriority, exitIfNoWork). Reading them with
+ * the public five-argument prototype took the revision (2) as nSpus, the SDK
+ * version as spuPriority and the real nSpus as ppuPriority. */
+s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, u32 revision,
+                                  u32 sdkVersion, s32 nSpus, s32 spuPriority,
+                                  s32 ppuPriority, u8 exitIfNoWork)
 {
+    (void)revision;
+    (void)sdkVersion;
     return cellSpursAttributeInitialize(attr, nSpus, spuPriority,
                                         ppuPriority, exitIfNoWork);
 }
