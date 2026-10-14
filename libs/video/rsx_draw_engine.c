@@ -1356,6 +1356,9 @@ static u32 eng_sampled_units(const char* ps)
  * retried on every draw of every frame. `out_tex_used` gets the units the
  * pixel program samples: all of them for the built-in pair, which keeps
  * every enabled unit bound as before. */
+static void draw_observer_programs(const u8* vp, u32 instructions,
+                                    const u8* fp, u32 bytes);
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
@@ -1368,6 +1371,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     u32 vp_instrs = 0, fp_size = 0;
     /* No resident program pair means the built-in one; see kEngFixedVS. */
     const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
+    /* Observe only pointers the normal pipeline path already resolved. */
+    draw_observer_programs(vp_uc, vp_instrs, fp_uc, fp_size);
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
@@ -2641,7 +2646,31 @@ static struct {
     u32 target, maximum, count;
     FILE* file;
     const char* outcome;
+    int programs_observed, vp_valid, fp_valid;
+    u32 vp_instructions, fp_bytes;
+    u64 vp_hash, fp_hash;
 } s_draw_observer;
+
+static void draw_observer_programs(const u8* vp, u32 instructions,
+                                    const u8* fp, u32 bytes)
+{
+    if (!s_draw_observer.active) return;
+    s_draw_observer.programs_observed = 1;
+    if (vp && instructions && instructions <= RSX_DSP_VP_INSTR) {
+        s_draw_observer.vp_instructions = instructions;
+        s_draw_observer.vp_hash = eng_fnv1a(vp, instructions * 16u,
+                                            1469598103934665603ull);
+        s_draw_observer.vp_valid = 1;
+    }
+    if (fp && bytes && bytes <= ENG_FP_MAX_BYTES && !(bytes & 15u)) {
+        const u64 hash = rsx_fp_structural_hash(fp, bytes, 1469598103934665603ull);
+        if (hash) {
+            s_draw_observer.fp_bytes = bytes;
+            s_draw_observer.fp_hash = hash;
+            s_draw_observer.fp_valid = 1;
+        }
+    }
+}
 
 static void draw_observer_reset(void)
 {
@@ -2684,6 +2713,10 @@ static void draw_observer_begin(void)
     s_draw_observer.count++;
     s_draw_observer.active = 1;
     s_draw_observer.outcome = "entry";
+    s_draw_observer.programs_observed = 0;
+    s_draw_observer.vp_valid = s_draw_observer.fp_valid = 0;
+    s_draw_observer.vp_instructions = s_draw_observer.fp_bytes = 0;
+    s_draw_observer.vp_hash = s_draw_observer.fp_hash = 0;
 done:
     errno = saved;
 }
@@ -2711,6 +2744,9 @@ static void draw_observer_finish(void)
         "\"inline_bytes\":%u,\"immediate_vertices\":%u,\"fetch_ok\":%d,"
         "\"source_refs\":%u,\"vertices\":%u,\"cuts\":%u,"
         "\"vp_start\":%u,\"fp_program\":\"%08X\",\"shader_control\":\"%08X\","
+        "\"program_identity_observed\":%d,\"vp_content_valid\":%d,"
+        "\"vp_content_hash\":\"%016llX\",\"vp_instructions\":%u,"
+        "\"fp_structure_valid\":%d,\"fp_structural_hash\":\"%016llX\",\"fp_bytes\":%u,"
         "\"target_select\":%u,\"color_offsets\":[%u,%u,%u,%u],"
         "\"color_locations\":[%u,%u,%u,%u],\"clip\":[%u,%u],\"attributes\":[",
         s_draw_observer.count, g.frames, s_draw_observer.outcome,
@@ -2719,6 +2755,10 @@ static void draw_observer_finish(void)
         ia.offset, ia.location, ia.is_u32,
         dc.inl_bytes, dc.n_immediate, dc.fetch_ok, dc.n_source_refs, dc.n_verts, dc.n_cuts,
         rsx_dsp_vp_start(&g.rsx), rsx_dsp_reg(&g.rsx, 0x08E4), rsx_dsp_shader_control(&g.rsx),
+        s_draw_observer.programs_observed, s_draw_observer.vp_valid,
+        (unsigned long long)s_draw_observer.vp_hash, s_draw_observer.vp_instructions,
+        s_draw_observer.fp_valid, (unsigned long long)s_draw_observer.fp_hash,
+        s_draw_observer.fp_bytes,
         sf.color_target, sf.color_offset[0], sf.color_offset[1], sf.color_offset[2], sf.color_offset[3],
         sf.color_location[0], sf.color_location[1], sf.color_location[2], sf.color_location[3],
         sf.clip_w, sf.clip_h);
