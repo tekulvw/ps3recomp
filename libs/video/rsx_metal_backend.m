@@ -4005,7 +4005,6 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * the path that uses it: the FIFO walker feeds both models, so leaving
          * both live would record every draw twice. */
         s_ready  = 1;
-        s_closed = 0;
         rsx_draw_engine_set_backend(&s_engine_backend);
         /* The engine is this backend's default now that every host mode
          * passes both ways. PS3RECOMP_RSX_ENGINE=vtable is the way back, and

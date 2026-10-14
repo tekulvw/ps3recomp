@@ -13,7 +13,10 @@ helpers=''
 if 'static void window_close_observer_start(' in s:
  helpers=fun('window_close_observer_stop')+'\n'+fun('window_close_observer_start')
 else:helpers='static void window_close_observer_start(NSWindow* w){(void)w;}\nstatic void window_close_observer_stop(void){}'
-pump=fun('pump_messages_impl')+'\n'+fun('rsx_metal_backend_pump_messages');body=r'''#import <AppKit/AppKit.h>
+init=s[s.index('int rsx_metal_backend_init('):s.index('void rsx_metal_backend_shutdown(')]
+tail=init[init.index('        s_ready'):init.index('        rsx_draw_engine_set_backend')]
+assert re.fullmatch(r'\s*s_ready\s*=\s*1;\s*(?:s_closed\s*=\s*0;\s*)?',tail), 'readiness tail changed: review required'
+pump=fun('pump_messages_impl')+'\n'+fun('rsx_metal_backend_pump_messages')+'\nstatic void actual_readiness_tail(void) {\n'+tail+'\n}';body=r'''#import <AppKit/AppKit.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #define TARGET_OS_IPHONE 0
@@ -23,7 +26,7 @@ static atomic_int s_closed;static id s_window_close_observer;
 static int checks,failures;
 #define T(c,m) do{checks++;if(!(c)){failures++;fprintf(stderr,"FAIL %s\n",m);}}while(0)
 static NSWindow* make(void){NSWindow*w=[[NSWindow alloc]initWithContentRect:NSMakeRect(-10000,-10000,64,64) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable backing:NSBackingStoreBuffered defer:NO];[w setReleasedWhenClosed:NO];return w;}
-int main(void){@autoreleasepool{[NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];s_window=make();window_close_observer_start(s_window);
+int main(void){@autoreleasepool{[NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];s_window=make();window_close_observer_start(s_window);s_ready=0;[s_window close];actual_readiness_tail();T(rsx_metal_backend_pump_messages()==-1,"close during initialization survives actual readiness tail");s_window=make();window_close_observer_start(s_window);
 T(pump_messages_impl()==0,"initial ordered-out owned window is not close");
 [s_window orderFront:nil];T(pump_messages_impl()==0,"visible remains active");
 [s_window orderOut:nil];T(pump_messages_impl()==0,"orderOut is not close");
