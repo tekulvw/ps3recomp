@@ -32,6 +32,7 @@
 #endif
 
 #include "../output_provenance.h"
+#include "../diagnostics/ppu_call_span.h"
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
@@ -2815,6 +2816,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         g_vcall_sp++;
         struct vcall_scope { ~vcall_scope() { if (g_vcall_sp > 0) --g_vcall_sp; } };
         { vcall_scope vcall_guard;
+        ppu_call_span_scope call_span(ctx,addr);
         fn(ctx);
         while (g_trampoline_fn) {
             void (*tf)(void*) = g_trampoline_fn;
@@ -2822,6 +2824,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             if (_tf) ctx->gpr[2] = _toc0;
             tf(ctx);
         }
+        call_span.complete();
         }
         /* PPU_RETWATCH=<hex>: catch the first vcall(s) whose RETURN value (r3)
          * equals this, pinning the exact virtual method that produces the poison. */
