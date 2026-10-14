@@ -327,6 +327,31 @@ int main(void)
         check("large_program_return", backend_hlsl, "return (_o == _o) ? _o");
     }
 
+    /* Depth export: SHADER_CONTROL bits 1-3 (0xE) make r1.z the fragment
+     * depth. The program must declare SV_Depth and write r1.z, clamped,
+     * even with a single colour target; without those bits it keeps the
+     * single float4 return. */
+    {
+        u8 prog[32];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | OUTREG(1) | INSRC(4)); /* MOV r1, TC0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);     /* MOV r0, COL0 */
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT | 0xEu, hlsl, sizeof(hlsl));
+        check("depth_export_semantic", hlsl, "    float depth : SV_Depth;\n");
+        check("depth_export_entry",    hlsl, "PSOutput main(PSInput input) {");
+        check("depth_export_colour",   hlsl, "_out.t0 = (_o0 == _o0) ? _o0 : (float4)0;");
+        check("depth_export_value",    hlsl, "    float _d = r[1].z;\n"
+                                             "    _out.depth = (_d == _d) ? saturate(_d) : 0.0;\n");
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("no_depth_export_semantic", hlsl, "SV_Depth");
+        check("no_depth_export_entry", hlsl, "float4 main(PSInput input) : SV_TARGET {");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
