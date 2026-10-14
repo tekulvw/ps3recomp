@@ -417,6 +417,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spinlock_word_width
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
+        add_test(NAME spu_shufb
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_shufb.py")
         add_test(NAME spu_dma_source_f32be
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_source_f32be.py")
