@@ -20,6 +20,7 @@
 #include "spu_coherency.h"
 #include "spu_dma_source_trace.h"
 #include "spu_dma_publication.h"
+#include "spu_dma_disposition.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -172,6 +173,9 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    spu_dma_disposition_token disposition;
+    spu_dma_disposition_begin(&disposition, lsa, ea, size, cmd);
+    unsigned copy_disposition = SPU_DMA_DISPOSITION_NONE;
     /* Upper16 command-channel bits carry replacement/transfer class IDs. */
     if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
         /* CBEA 1.02 section 7.7.3: SDCRZ writes zeros in EA space, without an
@@ -183,7 +187,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             (ea >> 32) || !mfc_ea_range_committed(ea, size)) {
             fprintf(stderr, "[mfc] REJECTED SDCRZ range: ea=0x%016llX size=%u\n",
                     (unsigned long long)ea, size);
-            return -1;
+            return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, -1, SPU_DMA_DISPOSITION_REJECTED);
         }
         /* Storage controls impose a barrier in their tag group. Ordinary
          * transfers finish synchronously, but a stalled list does not. This
@@ -191,7 +195,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         if (spu->list_stall_mask & (1u << (spu->mfc_tag & 31u))) {
             fprintf(stderr, "[mfc] REJECTED SDCRZ behind stalled tag %u\n",
                     spu->mfc_tag & 31u);
-            return -1;
+            return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, -1, SPU_DMA_DISPOSITION_REJECTED);
         }
         /* Serialize zeroing with reservation compare-and-commit. Notify each
          * touched line even for a zero-to-zero write: byte comparisons alone
@@ -204,7 +208,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         for (uint32_t offset = 0; offset < size; offset += 128u)
             spu_coh_notify_write_except((uint32_t)ea + offset, spu);
         spu_lockline_unlock();
-        return 0;
+        return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, 0, SPU_DMA_DISPOSITION_ZERO_EA);
     }
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
@@ -276,7 +280,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                   " cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
                           spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd,
                           lsa, (uint32_t)ea, size);
-              return 0;
+              return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, 0, SPU_DMA_DISPOSITION_MALFORMED);
           } } }
     /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own
      * dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for
@@ -405,7 +409,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
       } }
     /* Validate size */
     if (size == 0 || size > MFC_MAX_DMA_SIZE)
-        return -1;
+        return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, -1, SPU_DMA_DISPOSITION_REJECTED);
 
     /* Mask LSA to local store range */
     lsa &= SPU_LS_MASK;
@@ -414,7 +418,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * SPU MFC requires the LS range to be valid; an out-of-range lsa+size here
      * would corrupt host heap past spu->ls). */
     if ((uint64_t)lsa + (uint64_t)size > (uint64_t)SPU_LS_SIZE)
-        return -1;
+        return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, -1, SPU_DMA_DISPOSITION_REJECTED);
 
     /* Reject transfers whose main-memory range is not committed guest memory,
      * so a garbage EA (e.g. from an incomplete SPURS context) is a failed DMA
@@ -438,7 +442,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             for (uint32_t i = 0; i < 128; i++)
                 fputc((q[i] >= 32 && q[i] < 127) ? q[i] : 46, stderr);
             fputc(10, stderr); fflush(stderr); } }
-        return -1;
+        return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, -1, SPU_DMA_DISPOSITION_REJECTED);
     }
 
     uint8_t* ls_ptr = &spu->ls[lsa];
@@ -566,7 +570,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 fprintf(stderr, "[nulldma] img%u GET ea=0x%08X size=%u -> ZEROED (skipped)\n",
                         spu->image_id, (uint32_t)ea, size);
             memset(ls_ptr, 0, size);
-            return 0;
+            return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, 0, SPU_DMA_DISPOSITION_ZERO_LS);
         }
     }
     if (mfc_is_get(cmd)) {
@@ -599,7 +603,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               }
           } }
         /* GET: main memory -> local store */
+        spu_dma_disposition_before(&disposition, ea_ptr, ea, size);
         memcpy(ls_ptr, ea_ptr, size);
+        spu_dma_disposition_after(&disposition, ls_ptr);
+        copy_disposition = SPU_DMA_DISPOSITION_GET;
         spu_dma_publication_observe(spu, lsa, ea, size, cmd);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
@@ -687,14 +694,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             }
             if (span_reserved) {
                 spu_lockline_lock();
+                spu_dma_disposition_before(&disposition, ls_ptr, ea, size);
                 memcpy(ea_ptr, ls_ptr, size);
+                spu_dma_disposition_after(&disposition, ea_ptr);
+                copy_disposition = SPU_DMA_DISPOSITION_PUT;
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
                 spu_lockline_unlock();
             } else {
+                spu_dma_disposition_before(&disposition, ls_ptr, ea, size);
                 memcpy(ea_ptr, ls_ptr, size);
+                spu_dma_disposition_after(&disposition, ea_ptr);
+                copy_disposition = SPU_DMA_DISPOSITION_PUT;
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
                         spu_lockline_lock();
@@ -756,7 +769,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
     }
 
-    return 0;
+    return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, 0, copy_disposition);
 }
 
 /*
