@@ -2638,7 +2638,8 @@ static struct {
 } s_raster_probe;
 
 static void eng_raster_probe(rsx_be_render_state* rs,
-                             const rsx_dsp_surface* sf, u32 n_targets)
+                             const rsx_dsp_surface* sf, const u32* targets,
+                             u32 n_targets)
 {
     const int saved_errno = errno;
     if (!s_raster_probe.configured) {
@@ -2670,8 +2671,8 @@ static void eng_raster_probe(rsx_be_render_state* rs,
         s_raster_probe.trigger=getenv("RSX_ENGINE_RASTER_PROBE_TRIGGER");
     }
     if (!s_raster_probe.mode ||
-        n_targets!=1 || sf->color_location[0]!=s_raster_probe.location ||
-        sf->color_offset[0]!=s_raster_probe.offset ||
+        n_targets!=1 || g.surfaces[targets[0]].location!=s_raster_probe.location ||
+        g.surfaces[targets[0]].offset!=s_raster_probe.offset ||
         !rs->depth_test || !rs->depth_write || !rs->color_mask) goto done;
     if (!s_raster_probe.armed) {
         if (s_raster_probe.trigger && *s_raster_probe.trigger) {
@@ -2777,7 +2778,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
     rsx_dsp_viewport vp;
     rsx_dsp_get_surface(&g.rsx, &sf);
     rsx_dsp_get_viewport(&g.rsx, &vp);
-    eng_raster_probe(&rs, &sf, n_targets);
+    eng_raster_probe(&rs, &sf, targets, n_targets);
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      sf.clip_w, sf.clip_h);
 
