@@ -347,8 +347,10 @@ static const char* input_expr(u32 input_src)
         "input.tc8", "input.tc9" };
     switch (input_src) {
     case 0x0: return "input.position"; /* WPOS */
-    case 0x1: return "input.col0";     /* COL0 */
-    case 0x2: return "input.col1";     /* COL1 */
+    /* RSX clamps fragment color-input reads before swizzle/abs/negate.
+     * Texture coordinates and the vertex output registers remain unbounded. */
+    case 0x1: return "saturate(input.col0)"; /* COL0 */
+    case 0x2: return "saturate(input.col1)"; /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
     default:
         if (input_src >= 0x4 && input_src <= 0xD) return tc[input_src - 0x4]; /* TC0..9 */
