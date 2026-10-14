@@ -1,0 +1,215 @@
+/* One definition alongside the existing accepted-copy observer. C and C++. */
+#ifndef PS3RECOMP_AUDIO_CHRONOLOGY_IMPL_H
+#define PS3RECOMP_AUDIO_CHRONOLOGY_IMPL_H
+#include "audio_chronology.h"
+#include "../platform/win32_compat.h"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#define AC_PORTS 8
+#define AC_MAX 32768
+#define AC_UNKNOWN (~(uint64_t)0)
+enum { AC_PORT=1, AC_CONSUME=2, AC_CLEAR_BEGIN=3, AC_CLEAR_END=4,
+       AC_CURSOR=5, AC_DMA=6, AC_BACKEND=7, AC_NOTIFY=8, AC_API=9 };
+typedef struct ac_port {
+    uint64_t epoch, serial[32];
+    uint32_t ea, block_bytes, blocks, channels, phase, writers[32];
+    int active;
+} ac_port;
+typedef struct ac_record {
+    uint64_t us, begin_us, copy_us, epoch, index, ctx, arg0, arg1, value;
+    uint32_t kind, port, ea, size, lsa, cmd, spu, pc, mask, nz, words, flags;
+    int rc;
+} ac_record;
+static struct {
+    INIT_ONCE once;
+    volatile LONG ready, lock;
+    int enabled, armed, flushed;
+    uint32_t limit, count, dropped, api_count[2], min_queue, zero_queue;
+    uint64_t duration_us, start_us, next_poll, previous_submit, max_interval;
+    char trigger[129];
+    ac_port ports[AC_PORTS];
+    ac_record records[AC_MAX];
+} s_ac = { INIT_ONCE_STATIC_INIT };
+/* Preserve host error state for every public hook, including disabled paths. */
+#ifdef _WIN32
+#define AC_SAVE int ac_errno=errno; DWORD ac_last=GetLastError()
+#define AC_RESTORE do { errno=ac_errno; SetLastError(ac_last); } while(0)
+#else
+#define AC_SAVE int ac_errno=errno
+#define AC_RESTORE do { errno=ac_errno; } while(0)
+#endif
+static uint64_t ac_now(void) {
+#ifdef AUDIO_CHRONOLOGY_TEST_CLOCK
+    return AUDIO_CHRONOLOGY_TEST_CLOCK();
+#elif defined(_WIN32)
+    LARGE_INTEGER freq, count;
+    if(!QueryPerformanceFrequency(&freq) || !QueryPerformanceCounter(&count) || freq.QuadPart<=0)return 0;
+    return (uint64_t)(count.QuadPart/freq.QuadPart)*1000000ull + (uint64_t)(count.QuadPart%freq.QuadPart)*1000000ull/(uint64_t)freq.QuadPart;
+#else
+    struct timespec t; if(clock_gettime(CLOCK_MONOTONIC,&t))return 0;
+    return (uint64_t)t.tv_sec*1000000ull+(uint64_t)t.tv_nsec/1000ull;
+#endif
+}
+static void ac_lock(void) { while(InterlockedCompareExchange(&s_ac.lock,1,0)) { /* metadata only */ } }
+static void ac_unlock(void) { InterlockedExchange(&s_ac.lock,0); }
+static int ac_number(const char* s,uint32_t max,uint32_t* out) {
+    char* end; if(!s || !*s || *s<'0' || *s>'9')return 0;
+    errno=0; unsigned long n=strtoul(s,&end,10);
+    if(errno || *end || n>max || !n)return 0; *out=(uint32_t)n;return 1;
+}
+static BOOL WINAPI ac_init(PINIT_ONCE once,PVOID arg,PVOID* out) {
+    (void)once;(void)arg;(void)out;
+    const char* enable=getenv("AUDIO_CHRONOLOGY");
+    const char* trigger=getenv("AUDIO_CHRONOLOGY_TRIGGER");
+    const char* limit=getenv("AUDIO_CHRONOLOGY_LIMIT");
+    const char* duration=getenv("AUDIO_CHRONOLOGY_MS");
+    uint32_t ms=10000; s_ac.limit=32768; s_ac.min_queue=~0u;
+    int valid=enable && !strcmp(enable,"1") && trigger && *trigger && strlen(trigger)<=128;
+    if(limit)valid=ac_number(limit,AC_MAX,&s_ac.limit)&&valid;
+    if(duration)valid=ac_number(duration,30000,&ms)&&valid;
+    if(valid)memcpy(s_ac.trigger,trigger,strlen(trigger)+1);
+    s_ac.duration_us=(uint64_t)ms*1000;
+    s_ac.enabled=valid;
+    InterlockedExchange(&s_ac.ready,1); return TRUE;
+}
+static int ac_enabled(void) {
+    if(!InterlockedCompareExchange(&s_ac.ready,0,0))InitOnceExecuteOnce(&s_ac.once,ac_init,NULL,NULL);
+    return s_ac.enabled;
+}
+/* All registry/record accesses are serialized. This lock NEVER protects audio
+ * PCM, transfer execution, notification queues, or native scheduling state. */
+static void ac_record_locked(ac_record* r) {
+    if(s_ac.count<s_ac.limit)s_ac.records[s_ac.count++]=*r;
+    else if(s_ac.dropped!=~0u)s_ac.dropped++;
+}
+static void ac_dump_locked(const char* reason) {
+    if(s_ac.flushed || !s_ac.armed)return;
+    s_ac.flushed=1;
+    uint64_t inflight=0;for(unsigned p=0;p<AC_PORTS;p++)for(unsigned b=0;b<32;b++)inflight+=s_ac.ports[p].writers[b];
+    fprintf(stderr,"[audio-chronology-summary] reason=%s count=%u dropped=%u limit=%u start_us=%llu duration_us=%llu queue_min=%u queue_zero=%u max_submit_interval_us=%llu inflight_at_flush=%llu coverage=SPU-DMA-only overlap_is_ambiguous=1\n",
+        reason,s_ac.count,s_ac.dropped,s_ac.limit,(unsigned long long)s_ac.start_us,(unsigned long long)s_ac.duration_us,s_ac.min_queue,s_ac.zero_queue,(unsigned long long)s_ac.max_interval,(unsigned long long)inflight);
+    for(uint32_t i=0;i<s_ac.count;i++) {
+        const ac_record* r=&s_ac.records[i];
+        fprintf(stderr,"[audio-chronology] seq=%u kind=%u us=%llu begin_us=%llu copy_us=%llu port=%u epoch=%llu index=%llu ea=%08X size=%u lsa=%05X cmd=%X ctx=%llX spu=%u pc=%05X mask=%08X nz=%u words=%u flags=%u rc=%d arg0=%llu arg1=%llu value=%llu\n",
+            i+1,r->kind,(unsigned long long)r->us,(unsigned long long)r->begin_us,(unsigned long long)r->copy_us,r->port,(unsigned long long)r->epoch,(unsigned long long)r->index,r->ea,r->size,r->lsa,r->cmd,(unsigned long long)r->ctx,r->spu,r->pc,r->mask,r->nz,r->words,r->flags,r->rc,(unsigned long long)r->arg0,(unsigned long long)r->arg1,(unsigned long long)r->value);
+    }
+}
+static int ac_gate_locked(uint64_t now) {
+    if(!now || s_ac.flushed)return 0;
+    if(s_ac.armed) {
+        if(now>=s_ac.start_us && now-s_ac.start_us>=s_ac.duration_us) { ac_dump_locked("window");return 0; }
+        return 1;
+    }
+    if(now<s_ac.next_poll)return 0;
+    s_ac.next_poll=now+250000;
+#ifdef _WIN32
+    struct _stat64 st; int found=!_stat64(s_ac.trigger,&st) && (st.st_mode&_S_IFMT)==_S_IFREG;
+#else
+    struct stat st; int found=!stat(s_ac.trigger,&st) && S_ISREG(st.st_mode);
+#endif
+    if(!found)return 0;
+    s_ac.armed=1;s_ac.start_us=now;
+    for(unsigned i=0;i<AC_PORTS;i++)if(s_ac.ports[i].active) {
+        ac_port* p=&s_ac.ports[i]; ac_record r={0};
+        r.kind=AC_PORT;r.us=now;r.port=i;r.epoch=p->epoch;r.ea=p->ea;r.size=p->block_bytes;r.cmd=p->blocks;r.lsa=p->channels;r.flags=1;
+        ac_record_locked(&r);
+    }
+    return 1;
+}
+static uint32_t ac_nonzero(const uint8_t* data,uint32_t bytes) {
+    uint32_t nz=0;
+    for(uint32_t i=0;i+4<=bytes;i+=4) { uint32_t w=((uint32_t)data[i]<<24)|((uint32_t)data[i+1]<<16)|((uint32_t)data[i+2]<<8)|data[i+3];nz+=(w&0x7FFFFFFFu)!=0; }
+    return nz;
+}
+int audio_chronology_enabled(void) { AC_SAVE;int yes=ac_enabled();AC_RESTORE;return yes; }
+void audio_chronology_port(unsigned port,uint32_t ea,uint32_t channels,uint32_t blocks,int active) {
+    AC_SAVE;
+    if(ac_enabled() && port<AC_PORTS) {
+        ac_lock();ac_port* p=&s_ac.ports[port];uint64_t epoch=p->epoch+1;memset(p,0,sizeof *p);p->epoch=epoch;
+        if(active && (channels==2 || channels==8) && (blocks==8 || blocks==16 || blocks==32) && ea && (uint64_t)ea+(uint64_t)channels*256*4*blocks<=0x100000000ull) {
+            p->ea=ea;p->block_bytes=channels*256*4;p->blocks=blocks;p->channels=channels;p->active=1;
+        }
+        uint64_t now=ac_now();if(ac_gate_locked(now)) { ac_record r={0};r.kind=AC_PORT;r.us=now;r.port=port;r.epoch=epoch;r.ea=p->ea;r.size=p->block_bytes;r.cmd=p->blocks;r.lsa=p->channels;r.flags=p->active;ac_record_locked(&r); }
+        ac_unlock();
+    }
+    AC_RESTORE;
+}
+void audio_chronology_consume(unsigned port,unsigned stage,uint64_t index,const uint8_t* data,uint32_t bytes,uint64_t guest_index) {
+    AC_SAVE;
+    if(ac_enabled() && port<AC_PORTS && stage<4) {
+        ac_lock();uint64_t now=ac_now();ac_port* p=&s_ac.ports[port];
+        if(ac_gate_locked(now) && p->active && bytes==p->block_bytes) {
+            uint32_t slot=(uint32_t)(index%p->blocks),mask=1u<<slot;
+            if(stage==0) { p->serial[slot]++;p->phase|=mask; }
+            ac_record r={0};r.kind=AC_CONSUME+stage;r.us=now;r.port=port;r.epoch=p->epoch;r.index=index;r.ea=p->ea+slot*p->block_bytes;r.size=bytes;r.mask=mask;r.arg0=guest_index;
+            r.flags=p->writers[slot]?1:0;if(stage==0 && data) { r.nz=ac_nonzero(data,bytes);r.words=bytes/4; }
+            ac_record_locked(&r);if(stage==3)p->phase&=~mask;
+        }
+        ac_unlock();
+    }
+    AC_RESTORE;
+}
+void audio_chronology_dma_begin(audio_chronology_dma_token* t,uint64_t ea,uint32_t size,uint32_t cmd) {
+    AC_SAVE;t->port=-1;
+    if(ac_enabled() && (cmd&0x20) && !(cmd&0x40) && size && ea<=0xFFFFFFFFull && size<=0x100000000ull-ea) {
+        ac_lock();uint64_t now=ac_now();
+        if(ac_gate_locked(now))for(unsigned i=0;i<AC_PORTS;i++) {
+            ac_port* p=&s_ac.ports[i];uint64_t end=(uint64_t)p->ea+p->block_bytes*p->blocks;
+            if(!p->active || ea>=end || ea+size<=p->ea)continue;
+            memset(t,0,sizeof *t);t->port=(int)i;t->epoch=p->epoch;t->begin_us=now;t->ea=ea;t->size=size;
+            uint64_t lo=ea>p->ea?ea:p->ea,hi=ea+size<end?ea+size:end;
+            t->offset=(uint32_t)(lo-ea);t->bytes=(uint32_t)(hi-lo);
+            unsigned first=(unsigned)((lo-p->ea)/p->block_bytes),last=(unsigned)((hi-1-p->ea)/p->block_bytes);
+            for(unsigned slot=first;slot<=last;slot++) { t->slot_mask|=1u<<slot;t->serial+=p->serial[slot];p->writers[slot]++; }
+            t->overlap=(p->phase&t->slot_mask)!=0;break;
+        }
+        ac_unlock();
+    }
+    AC_RESTORE;
+}
+void audio_chronology_dma_after(audio_chronology_dma_token* t,const uint8_t* destination) {
+    AC_SAVE;
+    if(t->port>=0) {
+        t->copy_us=ac_now();
+        uint32_t align=(uint32_t)(-(t->ea+t->offset))&3u;
+        t->words=t->bytes>=align?(t->bytes-align)/4:0;
+        if(t->words)t->nonzero=ac_nonzero(destination+t->offset+align,t->words*4);
+    }
+    AC_RESTORE;
+}
+void audio_chronology_dma_end(const audio_chronology_dma_token* t,const void* ctx,uint32_t spu,uint32_t pc,uint32_t lsa,uint32_t cmd,int rc,unsigned copied) {
+    AC_SAVE;
+    if(t->port>=0 && t->port<AC_PORTS) {
+        ac_lock();ac_port* p=&s_ac.ports[t->port];uint64_t serial=0;unsigned mismatch=p->epoch!=t->epoch;
+        if(!mismatch)for(unsigned slot=0;slot<p->blocks;slot++)if(t->slot_mask&(1u<<slot)) { serial+=p->serial[slot];if(p->writers[slot])p->writers[slot]--; }
+        unsigned ambiguous=t->overlap || mismatch || serial!=t->serial || (p->phase&t->slot_mask)!=0;
+        uint64_t now=ac_now();if(ac_gate_locked(now)) {
+            ac_record r={0};r.kind=AC_DMA;r.us=now;r.begin_us=t->begin_us;r.copy_us=t->copy_us;r.port=(uint32_t)t->port;r.epoch=t->epoch;r.index=serial;r.ea=(uint32_t)t->ea;r.size=t->size;r.lsa=lsa;r.cmd=cmd;r.ctx=(uint64_t)(uintptr_t)ctx;r.spu=spu;r.pc=pc;r.mask=t->slot_mask;r.nz=t->nonzero;r.words=t->words;r.flags=(ambiguous?1u:0u)|(mismatch?2u:0u)|(copied?4u:0u);r.rc=rc;r.arg0=t->offset;r.arg1=t->bytes;r.value=p->epoch;ac_record_locked(&r);
+        }
+        ac_unlock();
+    }
+    AC_RESTORE;
+}
+void audio_chronology_backend(uint32_t before,uint32_t after,int rc,uint32_t frames) {
+    AC_SAVE;if(ac_enabled()) { ac_lock();uint64_t now=ac_now();if(ac_gate_locked(now)) {
+        ac_record r={0};r.kind=AC_BACKEND;r.us=now;r.port=~0u;r.arg0=before;r.arg1=after;r.size=frames;r.rc=rc;
+        r.value=s_ac.previous_submit?now-s_ac.previous_submit:0;s_ac.previous_submit=now;if(r.value>s_ac.max_interval)s_ac.max_interval=r.value;
+        if(before<s_ac.min_queue)s_ac.min_queue=before;if(!before)s_ac.zero_queue++;ac_record_locked(&r);
+    }ac_unlock(); }AC_RESTORE;
+}
+void audio_chronology_notify(uint32_t queue,uint64_t key,int rc) {
+    AC_SAVE;if(ac_enabled()) { ac_lock();uint64_t now=ac_now();if(ac_gate_locked(now)) { ac_record r={0};r.kind=AC_NOTIFY;r.us=now;r.port=~0u;r.arg0=queue;r.arg1=key;r.rc=rc;ac_record_locked(&r); }ac_unlock(); }AC_RESTORE;
+}
+void audio_chronology_api(unsigned kind,unsigned port,uint64_t requested,uint64_t counter,uint64_t result,int rc) {
+    AC_SAVE;if(ac_enabled() && kind<2) { ac_lock();uint64_t now=ac_now();if(ac_gate_locked(now) && s_ac.api_count[kind]<16) {
+        s_ac.api_count[kind]++;ac_record r={0};r.kind=AC_API;r.us=now;r.port=port;r.cmd=kind;r.arg0=requested;r.arg1=counter;r.value=result;r.rc=rc;
+        if(port<AC_PORTS) { ac_port* p=&s_ac.ports[port];r.epoch=p->epoch;r.ea=p->ea;r.size=p->block_bytes;if(p->blocks && counter!=AC_UNKNOWN)r.index=counter%p->blocks; }
+        ac_record_locked(&r);
+    }ac_unlock(); }AC_RESTORE;
+}
+void audio_chronology_poll(void) { AC_SAVE;if(ac_enabled()) { ac_lock();(void)ac_gate_locked(ac_now());ac_unlock(); }AC_RESTORE; }
+void audio_chronology_finish(void) { AC_SAVE;if(ac_enabled()) { ac_lock();ac_dump_locked("shutdown");ac_unlock(); }AC_RESTORE; }
+#endif

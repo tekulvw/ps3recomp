@@ -14,12 +14,14 @@
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
+#include "../../runtime/diagnostics/audio_chronology.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#include <errno.h>
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -310,11 +312,30 @@ static void audio_backend_shutdown(void)
     }
 }
 
+/* Read-only diagnostic query must not replace the host API error state. */
+static u32 audio_backend_chronology_queue(void)
+{
+    int saved_errno = errno;
+#ifdef _WIN32
+    DWORD saved_error = GetLastError();
+#endif
+    u32 frames = SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
+    errno = saved_errno;
+#ifdef _WIN32
+    SetLastError(saved_error);
+#endif
+    return frames;
+}
+
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
     if (s_sdl_audio_dev) {
+        const int chronology = audio_chronology_enabled();
+        const u32 chronology_before = chronology ? audio_backend_chronology_queue() : 0;
         const int rc = SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
                        num_samples * 2 * sizeof(float));
+        if (chronology) audio_chronology_backend(chronology_before,
+            audio_backend_chronology_queue(), rc, num_samples);
         if (s_audio_diag_on) {
             s_audio_diag_submit++;
             if (rc < 0) {
@@ -566,6 +587,8 @@ static void audio_mix_one_block(void)
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+        audio_chronology_consume((unsigned)p, 0, port->read_index, (const uint8_t*)src,
+            CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float), port->read_index % nblock);
         if (s_audio_diag_on) audio_diagnostics_port(p, port, src);
 
         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
@@ -616,7 +639,11 @@ static void audio_mix_one_block(void)
         /* Firmware clears a ring-buffer block after consuming it. Besides
          * preventing stale PCM from replaying when a producer stalls, the
          * cleared block is an observable consumption signal for producers. */
+        audio_chronology_consume((unsigned)p, 1, port->read_index, NULL,
+            CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float), port->read_index % nblock);
         memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
+        audio_chronology_consume((unsigned)p, 2, port->read_index, NULL,
+            CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float), port->read_index % nblock);
 
         /* Keep the monotonic counter for tags/timestamps, but publish the
          * ring slot to the guest. SurMixer multiplies this value by the block
@@ -624,6 +651,8 @@ static void audio_mix_one_block(void)
         port->read_index++;
         if (port->read_idx_addr)
             vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
+        audio_chronology_consume((unsigned)p, 3, port->read_index - 1, NULL,
+            CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float), port->read_index % nblock);
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -654,9 +683,11 @@ static void audio_notify_event_queues(void)
     for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
         if (!s_notify_queues[i].in_use) continue;
         uint32_t qid = sys_event_find_queue_by_key(s_notify_queues[i].key);
+        int chronology_rc = -2; /* Unresolved queue, observation only. */
         if (qid)
-            sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
+            chronology_rc = sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
                                        0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0);
+        audio_chronology_notify(qid, s_notify_queues[i].key, chronology_rc);
     }
 }
 
@@ -724,6 +755,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         /* Notify event queues */
         audio_notify_event_queues();
         if (s_audio_diag_on) audio_diagnostics_report(audio_diagnostics_now());
+        audio_chronology_poll();
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
@@ -740,6 +772,7 @@ static void* audio_mix_thread_func(void* arg)
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
         if (s_audio_diag_on) audio_diagnostics_report(audio_diagnostics_now());
+        audio_chronology_poll();
 
         u32 queued = audio_backend_queued_samples();
         if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
@@ -854,11 +887,13 @@ s32 cellAudioQuit(void)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
     audio_stop_mix_thread();
+    audio_chronology_finish();
     audio_backend_shutdown();
 
     /* Port buffers live in the guest vm_base arena (bump-allocated, not host
      * malloc) -- just drop the references; never free() them. */
     for (int i = 0; i < CELL_AUDIO_PORT_MAX; i++) {
+        audio_chronology_port((unsigned)i, 0, 0, 0, 0);
         s_ports[i].buffer = NULL;
         s_ports[i].in_use = 0;
         s_ports[i].running = 0;
@@ -942,6 +977,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 
     port->port_addr     = guest_buf;
     port->read_idx_addr = guest_ridx;
+    audio_chronology_port((unsigned)found, guest_buf, (u32)nch, (u32)nblk, 1);
 
     vm_write32(portNum_ea, (u32)found);   /* guest out-param */
 
@@ -969,6 +1005,7 @@ s32 cellAudioPortClose(u32 portNum)
     /* buffer points INTO the guest vm_base arena (reserved per port in PortOpen),
      * not a host malloc -- do NOT free() it (that corrupts the host heap).
      * The guest window is reclaimed wholesale when vm_base is released. */
+    audio_chronology_port(portNum, 0, 0, 0, 0);
     s_ports[portNum].buffer = NULL;
 
     s_ports[portNum].in_use  = 0;
@@ -1021,50 +1058,73 @@ s32 cellAudioPortStop(u32 portNum)
 s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
 {
     uint32_t tag_ea = (uint32_t)(uintptr_t)tag;
-    if (!s_audio_initialized)
+    if (!s_audio_initialized) {
+        audio_chronology_api(0, portNum, blockNo, UINT64_MAX, UINT64_MAX, CELL_AUDIO_ERROR_NOT_INIT);
         return CELL_AUDIO_ERROR_NOT_INIT;
-    if (portNum >= CELL_AUDIO_PORT_MAX)
+    }
+    if (portNum >= CELL_AUDIO_PORT_MAX) {
+        audio_chronology_api(0, portNum, blockNo, UINT64_MAX, UINT64_MAX, CELL_AUDIO_ERROR_PARAM);
         return CELL_AUDIO_ERROR_PARAM;
-    if (!s_ports[portNum].in_use)
+    }
+    if (!s_ports[portNum].in_use) {
+        audio_chronology_api(0, portNum, blockNo, UINT64_MAX, UINT64_MAX, CELL_AUDIO_ERROR_PORT_NOT_OPEN);
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
-    if (!tag_ea)
+    }
+    if (!tag_ea) {
+        audio_chronology_api(0, portNum, blockNo, UINT64_MAX, UINT64_MAX, CELL_AUDIO_ERROR_PARAM);
         return CELL_AUDIO_ERROR_PARAM;
+    }
 
     mutex_lock(&s_audio_mutex);
     AudioPortSlot* port = &s_ports[portNum];
     u64 nblk = port->param.nBlock ? port->param.nBlock : 1;
     if (blockNo >= nblk) {
+        u64 chronology_counter_error = port->read_index;
         mutex_unlock(&s_audio_mutex);
+        audio_chronology_api(0, portNum, blockNo, chronology_counter_error, UINT64_MAX, CELL_AUDIO_ERROR_PARAM);
         return CELL_AUDIO_ERROR_PARAM;
     }
+    u64 chronology_counter = port->read_index;
     u64 t = port->read_index + blockNo - (port->read_index % nblk);
     if (blockNo < port->read_index % nblk) t += nblk;
     mutex_unlock(&s_audio_mutex);
 
     vm_write64(tag_ea, t);
+    audio_chronology_api(0, portNum, blockNo, chronology_counter, t, CELL_OK);
     return CELL_OK;
 }
 
 s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
 {
     uint32_t stamp_ea = (uint32_t)(uintptr_t)stamp;
-    if (!s_audio_initialized)
+    if (!s_audio_initialized) {
+        audio_chronology_api(1, portNum, tag, UINT64_MAX, UINT64_MAX, CELL_AUDIO_ERROR_NOT_INIT);
         return CELL_AUDIO_ERROR_NOT_INIT;
-    if (portNum >= CELL_AUDIO_PORT_MAX)
+    }
+    if (portNum >= CELL_AUDIO_PORT_MAX) {
+        audio_chronology_api(1, portNum, tag, UINT64_MAX, UINT64_MAX, CELL_AUDIO_ERROR_PARAM);
         return CELL_AUDIO_ERROR_PARAM;
-    if (!s_ports[portNum].in_use)
+    }
+    if (!s_ports[portNum].in_use) {
+        audio_chronology_api(1, portNum, tag, UINT64_MAX, UINT64_MAX, CELL_AUDIO_ERROR_PORT_NOT_OPEN);
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
-    if (!stamp_ea)
+    }
+    if (!stamp_ea) {
+        audio_chronology_api(1, portNum, tag, UINT64_MAX, UINT64_MAX, CELL_AUDIO_ERROR_PARAM);
         return CELL_AUDIO_ERROR_PARAM;
+    }
 
     mutex_lock(&s_audio_mutex);
     u64 global_counter = s_ports[portNum].read_index;
     mutex_unlock(&s_audio_mutex);
-    if (tag > global_counter)
+    if (tag > global_counter) {
+        audio_chronology_api(1, portNum, tag, global_counter, UINT64_MAX, CELL_AUDIO_ERROR_TAG_NOT_FOUND);
         return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
+    }
 
     u64 t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
     vm_write64(stamp_ea, t);
+    audio_chronology_api(1, portNum, tag, global_counter, t, CELL_OK);
     return CELL_OK;
 }
 

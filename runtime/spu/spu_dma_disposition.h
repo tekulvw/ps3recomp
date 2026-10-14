@@ -3,6 +3,7 @@
 #ifndef SPU_DMA_DISPOSITION_H
 #define SPU_DMA_DISPOSITION_H
 #include "spu_context.h"
+#include "../diagnostics/audio_chronology.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -14,6 +15,7 @@ extern "C" {
 #define SPU_DMA_DISPOSITION_REJECTED 5
 #define SPU_DMA_DISPOSITION_MALFORMED 6
 typedef struct spu_dma_disposition_token {
+    audio_chronology_dma_token chronology;
     uint32_t seq, request_lsa, request_size, request_cmd;
     uint64_t request_ea;
     uint32_t offset, count, before[16], after[16];

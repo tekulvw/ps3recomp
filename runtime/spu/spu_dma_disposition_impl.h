@@ -2,6 +2,7 @@
 #ifndef SPU_DMA_DISPOSITION_IMPL_H
 #define SPU_DMA_DISPOSITION_IMPL_H
 #include "spu_dma_disposition.h"
+#include "../diagnostics/audio_chronology_impl.h"
 #include "../platform/win32_compat.h"
 #include <errno.h>
 #include <ctype.h>
@@ -75,6 +76,7 @@ void spu_dma_disposition_begin(spu_dma_disposition_token* t,uint32_t lsa,uint64_
 #ifdef _WIN32
     DWORD last=GetLastError();
 #endif
+    audio_chronology_dma_begin(&t->chronology,ea,size,cmd);
     t->seq=0;
     if(!InterlockedCompareExchange(&s_dma_disposition.ready,0,0))InitOnceExecuteOnce(&s_dma_disposition.once,dma_disp_init,NULL,NULL);
     if(s_dma_disposition.enabled && ea<=0xFFFFFFFFull && (uint64_t)size<=0x100000000ull-ea &&
@@ -106,10 +108,12 @@ void spu_dma_disposition_before(spu_dma_disposition_token* t,const uint8_t* src,
     for(uint32_t i=0;i<t->count;i++)t->before[i]=dma_disp_read(src+t->offset+i*4);
 }
 void spu_dma_disposition_after(spu_dma_disposition_token* t,const uint8_t* dst) {
+    audio_chronology_dma_after(&t->chronology,dst);
     if(!t->seq)return;
     for(uint32_t i=0;i<t->count;i++)t->after[i]=dma_disp_read(dst+t->offset+i*4);
 }
 int spu_dma_disposition_finish(const spu_dma_disposition_token* t,const spu_context* s,uint32_t lsa,uint64_t ea,uint32_t size,uint32_t cmd,int rc,unsigned outcome) {
+    if(t->chronology.port>=0)audio_chronology_dma_end(&t->chronology,s,s->spu_id,s->pc&SPU_LS_MASK,lsa,cmd,rc,outcome==SPU_DMA_DISPOSITION_PUT);
     if(!t->seq)return rc;
     int saved=errno;
 #ifdef _WIN32
