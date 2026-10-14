@@ -234,7 +234,7 @@ typedef struct rsx_draw_backend {
      * of the target's full physical extent and storage format. Its GPU copy
      * must execute after all preceding writes and before the next draw. The
      * engine owns the returned handle and releases it with texture_release.
-     * 0 rejects the consuming draw; NULL retains the legacy guest-upload route. */
+     * 0 is a checked failure; NULL retains the legacy guest-upload route. */
     u32 (*color_snapshot)(void* user, u32 surface);
 
     /* Optional. 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth):

@@ -4263,6 +4263,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_target_create  = eng_depth_target_create,
     .depth_target_release = eng_obj_release,
     .depth_snapshot       = eng_depth_snapshot,
+    .color_snapshot       = eng_color_snapshot,
     .depth_readback       = eng_depth_readback,
     .color_snapshot       = eng_color_snapshot,
     .pipeline_create      = eng_pipeline_create,
