@@ -7,7 +7,12 @@ updated that backing. The old path therefore sampled stale pixels.
 
 The optional backend `color_snapshot` callback now supplies a unique immutable
 copy for each referenced owned colour attachment, shared by texture units in
+<<<<<<< HEAD
 that draw. Newer depth content retains priority. The copy receives the sampling unit's existing component-remap view; gamma/filter
+=======
+that draw. Allocation identity and newer depth content retain priority. The
+copy receives the sampling unit's existing component-remap view; gamma/filter
+>>>>>>> eb45dd85 (Snapshot owned color targets in GPU command order)
 state stays on the ordinary shader/sampler paths. No CPU readback is required.
 Backends leaving the appended callback NULL retain their existing behaviour.
 
@@ -18,11 +23,16 @@ explicit intervening clear requests otherwise. Each copy has independent
 storage, so subsequent copies cannot overwrite an earlier queued reader.
 Retired numeric resource/view handles remain available until their records
 have acquired retained Metal objects; resize and shutdown release the last
+<<<<<<< HEAD
 copy. Record/allocation failures are explicit failures, not successful fallback
+=======
+copy. Record/allocation failures are checked failures, not successful fallback
+>>>>>>> eb45dd85 (Snapshot owned color targets in GPU command order)
 textures.
 
 The implemented aliases have the same location, offset, entire physical width
 and height, compatible native storage format, and effective source/texture row
+<<<<<<< HEAD
 pitch. The original surface must declare pitch-linear raster and the matching
 RSX colour format (8, 11, 12 or 13); the host RGBA8 fallback for packed
 formats is not enough to prove storage compatibility. Eligible formats are A8R8G8B8, W16_Z16_Y16_X16_FLOAT,
@@ -38,11 +48,27 @@ No hardware MSAA coverage is claimed.
 For a backend providing the callback, incompatible owned aliases or failed
 copy/view creation reject the consuming draw with a bounded diagnostic.
 Subrectangles, swizzled reinterpretation, other formats,
+=======
+pitch. Eligible formats are A8R8G8B8, W16_Z16_Y16_X16_FLOAT,
+W32_Z32_Y32_X32_FLOAT and X32_FLOAT. Only linear 2D, non-cube, one-level layouts
+are copied. A zero pitch denotes packed rows; explicit matching padded pitches
+are accepted. AA-expanded storage remains at physical sample dimensions: an
+AA3 64x64 pixel surface is copied as 128x64, AA4/5 as 128x128. This preserves
+the existing sample-resolution approximation, not hardware MSAA coverage.
+
+For a backend providing the callback, incompatible owned aliases or failed
+copy/view creation reject the consuming draw with a bounded diagnostic and
+checked failure. Subrectangles, swizzled reinterpretation, other formats,
+>>>>>>> eb45dd85 (Snapshot owned color targets in GPU command order)
 mips, cubes and differing pitches require separate conversion contracts.
 Non-owned colour/depth/guest binding paths are unchanged.
 
 Synthetic validation drives the production engine and Metal translator with
+<<<<<<< HEAD
 queued producer and consumer draws, asymmetric component
+=======
+queued producer and consumer draws, all four AA layouts, asymmetric component
+>>>>>>> eb45dd85 (Snapshot owned color targets in GPU command order)
 remapping, alpha, EQUAL depth/stencil and a long queued retirement chain.
 CPU controls exercise descriptor rejection, MRT, repeated units, allocation
 location, depth priority, callback/view failures, resize and legacy NULL
@@ -55,6 +81,7 @@ The existing repository's `rsx_live_draw.c` own-target snapshot path documents
 the compatibility behaviour (same-target GPU content, not stale guest VRAM).
 This implementation is independently written. PR213 also describes snapshots
 in a broad renderer change; this focused delta intentionally does not copy it.
+<<<<<<< HEAD
 
 Master has no checked-completion certificate API. Copy failures use the existing
 Metal dropped-record diagnostic and reject the consuming draw when detected
@@ -70,3 +97,5 @@ existing HLSL-to-MSL translator plus the ordinary decompiler, dispatch, vertex
 compact and texture-layout objects. It needs no window or title runtime.
 Its additional native-format copy cases sample float values above one into
 RGBA32Float, so integer saturation cannot hide a conversion error.
+=======
+>>>>>>> eb45dd85 (Snapshot owned color targets in GPU command order)

@@ -1,5 +1,9 @@
+<<<<<<< HEAD
 /* Synthetic real-engine same-target sampling. No title data.
  * Explicit AA0 full extent: sample-resolution AA is a separate feature. */
+=======
+/* Synthetic real-engine same-target sampling. No title data. */
+>>>>>>> eb45dd85 (Snapshot owned color targets in GPU command order)
 #include "rsx_metal_backend.m"
 #define eng_texture_upload test_engine_texture_upload
 #define eng_present test_engine_present
@@ -44,20 +48,33 @@ static void run(u32 aa,u32 sx,u32 sy){
   T(s_eng_obj_retired[old_view-1]&&eng_obj(old_view)!=nil,"released queued view retains texture until encoding");
  }
 #endif
+<<<<<<< HEAD
  s_engine_backend.submit_and_wait(NULL,0);T(s_eng_rec_count==0,"headless GPU submission finished encoding");
  u8 pixels[128*128*4];float z[128*128];s_engine_backend.readback(NULL,g.surfaces[0].handle,0,0,64*sx,64*sy,pixels,64*sx*4);
  const u32 ds=eng_depth_snapshot(NULL,g.zdepths[0].handle,64*sx,64*sy);T(ds!=0,"existing depth snapshot");s_engine_backend.submit_and_wait(NULL,0);[eng_obj(ds) getBytes:z bytesPerRow:64*sx*4 fromRegion:MTLRegionMake2D(0,0,64*sx,64*sy) mipmapLevel:0];eng_obj_release(NULL,ds);
  for(u32 i=0;i<64*sx*64*sy;i++){T(pixels[4*i]==191&&pixels[4*i+1]==128&&pixels[4*i+2]==64&&pixels[4*i+3]==32,"ordered self sampling preserves producer and prior consumer RGBA");T(fabsf(z[i]-.2f)<1e-6f,"encoder restart preserves depth");}
  T(s_eng_dropped==0,"no dropped records");
+=======
+ T(s_engine_backend.submit_and_wait_checked(NULL,0),"GPU completion");
+ u8 pixels[128*128*4];float z[128*128];s_engine_backend.readback(NULL,g.surfaces[0].handle,0,0,64*sx,64*sy,pixels,64*sx*4);
+ T(!s_engine_backend.depth_readback(NULL,g.zdepths[0].handle,0,0,64*sx,64*sy,z,64*sx*4),"depth readback");
+ for(u32 i=0;i<64*sx*64*sy;i++){T(pixels[4*i]==191&&pixels[4*i+1]==128&&pixels[4*i+2]==64&&pixels[4*i+3]==32,"ordered self sampling preserves producer and prior consumer RGBA");T(fabsf(z[i]-.2f)<1e-6f,"encoder restart preserves depth");}
+ T(!atomic_load(&s_eng_checked_failed),"no checked backend errors");
+>>>>>>> eb45dd85 (Snapshot owned color targets in GPU command order)
 #ifdef RSX_BE_HAS_COLOR_SNAPSHOT
  if(aa==0){const u32 old_count=s_eng_obj_count;s_eng_rec_count=ENG_MAX_RECORDS;
   T(!eng_color_snapshot(NULL,g.surfaces[0].handle),"full record queue rejects snapshot");
   T(s_eng_obj_count==old_count,"queue rejection allocates no texture");
+<<<<<<< HEAD
   T(s_eng_dropped>0,"queue rejection records explicit backend failure");
+=======
+  T(atomic_load(&s_eng_checked_failed),"queue rejection records checked failure");
+>>>>>>> eb45dd85 (Snapshot owned color targets in GPU command order)
   s_eng_rec_count=0;}
 #endif
  rsx_draw_engine_shutdown();
 }
+<<<<<<< HEAD
 
 #ifdef RSX_BE_HAS_COLOR_SNAPSHOT
 static void formats(void){
@@ -85,3 +102,6 @@ int main(void){@autoreleasepool{s_dev=MTLCreateSystemDefaultDevice();if(!s_dev)r
 formats();
 #endif
 rsx_draw_engine_set_backend(NULL);free(vm_base);printf("GPU feedback checks=%u failures=%u\n",checks,failures);return failures?1:0;}}
+=======
+int main(void){@autoreleasepool{s_dev=MTLCreateSystemDefaultDevice();if(!s_dev)return 2;s_queue=[s_dev newCommandQueue];s_headless=1;s_guest_shaders=1;vm_base=calloc(1,1u<<20);ppu_vm_size=1u<<20;rsx_draw_engine_set_backend(&s_engine_backend);run(0,1,1);run(3,2,1);run(4,2,2);run(5,2,2);rsx_draw_engine_set_backend(NULL);free(vm_base);printf("GPU feedback checks=%u failures=%u\n",checks,failures);return failures?1:0;}}
+>>>>>>> eb45dd85 (Snapshot owned color targets in GPU command order)

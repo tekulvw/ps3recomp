@@ -1796,6 +1796,7 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
                                        const rsx_dsp_texture* t)
 {
     static u32 logs;
+    atomic_store(&s_checked_failed, 1);
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
     if (logs++ < 8)
@@ -2149,6 +2150,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             } else {
                 return eng_color_feedback_failure(u, s, &t);
             }
+            eng_texture_descriptor_log(u, &t, textures[u], "feedback", s);
             continue;
         }
         if (sampled >= 0 && zsrc < 0 &&
