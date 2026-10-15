@@ -1,0 +1,11 @@
+# Bounded unchecked empty Metal flush
+
+Keep this experiment default off with PS3RECOMP_METAL_EMPTY_FLUSH=1 selecting the shortcut. The upcoming SPURS trial keeps it disabled; optional PS3RECOMP_METAL_EMPTY_FLUSH_DIAGNOSTICS=1 measures common unchecked-flush wall cost in both arms.
+
+Proof: MAG records, drains and presents on one renderer consumer. All active-engine asynchronous command buffers are tracked before commit; all other active-engine commits wait synchronously. The inactive vtable path is excluded. Skip the unchecked barrier only with active engine, valid device/queue, no records/staging/drops/failure, directly retired terminal receipts, no pending receipt and no newly latched failure. Retain retired-resource cleanup. Checked completion and outer shutdown/inflight draining are unchanged.
+
+Verification: thirty mode/scenario controls pass O2 and O2+UBSan after integration with frame telemetry. Deliberately ignoring pending work, ignoring post-retirement failure or skipping cleanup each fails the corresponding regression. A real Metal shared-event command blocks the following empty flush until release; color-clear bytes are preserved. The existing twelve checked-completion clear/failure scenarios pass with real Metal. Sandbox GPU creation returns nil; real-GPU checks pass outside that sandbox. No game/native performance benefit is established.
+
+Diagnostics count initial empty predicates separately from successful shortcuts. Cumulative total_s/max_s are wall time inside unchecked flush callbacks, including preemption and GPU waiting, and exclude later logging/counter overhead. They are not CPU/GPU time. Use matching cumulative deltas over gameplay windows, with identical diagnostics in both arms. A cumulative maximum is not an interval maximum. New-process arms avoid mixing lifecycle totals. Preserve completed-status authority independent of delayed semaphore callback delivery.
+
+Remaining coverage limits: full shutdown/delayed-callback lifecycle is source-reviewed with original outer drain unchanged; allocation-failure tracking is covered by existing latch behavior and nil fixture, not a new allocator-injection test. Synthetic output is not native scene validation. Review measured critical-path wall cost before prioritizing a full optimization trial.

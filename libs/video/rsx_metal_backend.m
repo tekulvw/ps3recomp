@@ -2809,12 +2809,52 @@ static void eng_shutdown(void* user)
     s_eng_checked_completed = 0;
 }
 
+/* An empty flush may omit its queue barrier only with an empty active
+ * engine and no outstanding tracked work. A terminal receipt can set the
+ * sticky failure latch while being retired, so recheck after retirement.
+ * The renderer consumer owns all state below; callbacks only set the latch.
+ * Keep checked completion certificates and shutdown's inflight drain intact. */
+#define PS3RECOMP_METAL_EMPTY_FLUSH_IMPLEMENTATION 1
+static int eng_empty_flush_option(const char* name, atomic_int* setting)
+{
+    int value=atomic_load_explicit(setting,memory_order_relaxed);
+    if(!value) {
+        const char* e=getenv(name);value=e && !strcmp(e,"1") ? 2 : 1;
+        atomic_store_explicit(setting,value,memory_order_relaxed);
+    }
+    return value==2;
+}
 static u32 s_ft_flush_reason;   /* PS3_FTRACE: why the commit in progress was asked for */
 static void eng_submit_and_wait(void* user, u32 reason)
 {
     (void)user;
     s_ft_flush_reason = reason;
-    eng_encode_and_commit(nil);
+    static atomic_int setting, diagnostic;
+    static unsigned long long calls, empty_calls, fast_calls;
+    static double total_seconds, first_time, last_log, max_seconds;
+    int observe=eng_empty_flush_option("PS3RECOMP_METAL_EMPTY_FLUSH_DIAGNOSTICS",&diagnostic);
+    double start=observe ? CACurrentMediaTime() : 0;
+    int empty=s_eng_active && s_dev && s_queue && !s_eng_dropped &&
+        !atomic_load(&s_eng_checked_failed) && !s_eng_rec_count && !s_eng_stage_used;
+    int fast=0;
+    if(eng_empty_flush_option("PS3RECOMP_METAL_EMPTY_FLUSH",&setting) && empty) {
+        eng_check_submissions(0);
+        if(![s_eng_submitted count] && !atomic_load(&s_eng_checked_failed)) {
+            eng_collect_retired_objects();
+            fast=1;
+        }
+    }
+    if(!fast)eng_encode_and_commit(nil);
+    if(observe) {
+        double end=CACurrentMediaTime(),elapsed=end-start;
+        if(!calls)first_time=start;
+        ++calls;empty_calls+=empty;fast_calls+=fast;total_seconds+=elapsed;
+        if(elapsed>max_seconds)max_seconds=elapsed;
+        if(end-last_log>=1) {
+            fprintf(stderr,"[RSX flush cost] now_s=%.9f first_s=%.9f calls=%llu empty=%llu fast=%llu total_s=%.9f max_s=%.9f\n",end,first_time,calls,empty_calls,fast_calls,total_seconds,max_seconds);
+            last_log=end;
+        }
+    }
 }
 
 #define PS3RECOMP_METAL_CHECKED_IMPLEMENTATION 1
