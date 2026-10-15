@@ -513,6 +513,66 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
 }
 
 
+/* WPOS is in logical window pixels; the shared engine can rasterize its
+ * AA sample grid into a larger single-sample host surface. */
+int rsx_fp_uses_wpos(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 0;
+    int found = 0;
+    for (u32 off = 0; max_bytes - off >= 16;) {
+        const u32 w0 = rsx_fp_read_word(ucode + off);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        if (!(w2 & FP_BRANCH) && !(w0 & FP_INPUT_SRC_MASK) &&
+            ((w1 & 3u) == FP_REG_TYPE_INPUT ||
+             (w2 & 3u) == FP_REG_TYPE_INPUT ||
+             (w3 & 3u) == FP_REG_TYPE_INPUT)) found = 1;
+        off += 16;
+        if (!(w2 & FP_BRANCH) && ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2)) {
+            if (max_bytes - off < 16) return 0;
+            off += 16;
+        }
+        if (w0 & FP_END) return found;
+    }
+    return 0;
+}
+
+int rsx_fp_apply_wpos_scale(char* hlsl, u32 capacity, u32 sx, u32 sy)
+{
+    if (!hlsl || !capacity || (sx != 1 && sx != 2) || (sy != 1 && sy != 2)) return -1;
+    const char* end = (const char*)memchr(hlsl, 0, capacity);
+    if (!end) return -1;
+    if (sx == 1 && sy == 1) return 1;
+    static const char needle[] = "input.position";
+    char replacement[128];
+    snprintf(replacement, sizeof replacement,
+        "float4(input.position.xy * float2(%s, %s), input.position.zw)",
+        sx == 2 ? "0.5" : "1.0", sy == 2 ? "0.5" : "1.0");
+    size_t count = 0;
+    for (const char* p = hlsl; (p = strstr(p, needle)); p += sizeof needle - 1) ++count;
+    if (!count) return 1;
+    const size_t extra = strlen(replacement) - (sizeof needle - 1);
+    const size_t length = (size_t)(end - hlsl);
+    if (count > (capacity - length - 1) / extra) return -1;
+    char* result = (char*)malloc(length + count * extra + 1);
+    if (!result) return -1;
+    char* out = result;
+    const char* in = hlsl;
+    const char* match;
+    while ((match = strstr(in, needle))) {
+        const size_t prefix = (size_t)(match - in);
+        memcpy(out, in, prefix); out += prefix;
+        const size_t n = strlen(replacement);
+        memcpy(out, replacement, n); out += n;
+        in = match + sizeof needle - 1;
+    }
+    strcpy(out, in);
+    strcpy(hlsl, result);
+    free(result);
+    return 1;
+}
+
 /* EXP_TEX overrides gamma on compatible normalized color formats. Metadata
  * has already excluded formats without gamma support. */
 u32 rsx_fp_texture_gamma_units(const u8* ucode, u32 max_bytes,

@@ -1374,6 +1374,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     /* Observe only pointers the normal pipeline path already resolved. */
     draw_observer_programs(vp_uc, vp_instrs, fp_uc, fp_size);
 
+    rsx_dsp_surface surface;
+    rsx_dsp_get_surface(&g.rsx, &surface);
+    const u32 wpos_grid = !fixed && (surface.aa_sx != 1 || surface.aa_sy != 1) &&
+        rsx_fp_uses_wpos(fp_uc, fp_size) ? surface.aa_sx | (surface.aa_sy << 8) : 0;
+
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
         rsx_dsp_reg(&g.rsx, 0x1FECu), fp_ctrl,
@@ -1436,6 +1441,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (!key) return 0;
         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
+        if (wpos_grid) key = eng_fnv1a(&wpos_grid, sizeof wpos_grid, key);
         if (srgb_output) key = eng_fnv1a(&srgb_output, sizeof srgb_output, key);
         if (gamma_units) key = eng_fnv1a(gamma_masks, sizeof gamma_masks, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
@@ -1478,6 +1484,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 texture_bx2_masks, shadow_mask ? shadow : NULL, gamma_masks,
                 s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
+        if (fi > 0 && wpos_grid && rsx_fp_apply_wpos_scale(s_ps_hlsl,
+                sizeof s_ps_hlsl, surface.aa_sx, surface.aa_sy) < 0) fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
             fi = -1;
