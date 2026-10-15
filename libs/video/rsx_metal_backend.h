@@ -44,6 +44,11 @@ void rsx_metal_backend_present(void);
  * PS3RECOMP_METAL_FPS_DIAGNOSTICS=1 additionally reports GPU frame completions
  * and raw callback/drop signals; GPU completion never counts as display FPS. */
 void rsx_metal_backend_note_guest_frame(void);
+/* A coherent guest FLIP receipt tags one existing present call. ID zero is
+ * unknown. PS3RECOMP_METAL_FPS_WINDOW_CONTROL enables opt-in frame ledgers;
+ * write a strictly increasing request ID and duration (seconds) to that file.
+ * Results use the exact host wall interval and a two-second callback grace. */
+void rsx_metal_backend_present_guest_frame(uint64_t guest_flip_id, uint32_t buffer_id);
 
 /* --- test hooks ---------------------------------------------------------- */
 

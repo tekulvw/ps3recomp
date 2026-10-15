@@ -58,6 +58,7 @@
 #include <pthread.h>
 #include "metal_frame_rate.h"
 #include <stdatomic.h>
+#include "metal_frame_measurement.h"
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 #include "rsx_vertex_fetch.h"
@@ -97,6 +98,9 @@ static u32                 s_height = 720;
     pthread_mutex_t lock;
     MetalFrameRate stats;
     int signals_enabled;
+    NSString *window_control;
+    uint64_t next_submission_id, last_guest_id, last_request_id;
+    MetalFrameMeasurement *measurement;
 }
 @end
 @implementation MetalFrameRateSession
@@ -106,10 +110,12 @@ static u32                 s_height = 720;
         metal_frame_rate_reset(&stats,CACurrentMediaTime());
         const char *signals=getenv("PS3RECOMP_METAL_FPS_DIAGNOSTICS");
         signals_enabled=signals && !strcmp(signals,"1");
+        const char *control=getenv("PS3RECOMP_METAL_FPS_WINDOW_CONTROL");
+        if(control && *control)window_control=[NSString stringWithUTF8String:control];
     }
     return self;
 }
-- (void)dealloc { pthread_mutex_destroy(&lock); }
+- (void)dealloc { free(measurement); pthread_mutex_destroy(&lock); }
 @end
 static MetalFrameRateSession *s_fps_session;
 static dispatch_source_t s_fps_timer;
@@ -122,44 +128,101 @@ static MetalFrameRateSession *fps_session(void)
     return session;
 }
 
-static void fps_track_drawable(id<CAMetalDrawable> drawable)
+/* Captured once per actual drawable submission. The callback keeps its original
+ * session alive; a later backend initialization cannot receive these events. */
+@interface MetalFrameTicket : NSObject {
+@public
+    MetalFrameRateSession *session;
+    uint64_t submission_id, guest_flip_id, window_request_id;
+    uint32_t buffer_id;
+}
+@end
+@implementation MetalFrameTicket
+@end
+static _Thread_local uint64_t s_present_guest_id;
+static _Thread_local uint32_t s_present_buffer_id;
+static MetalFrameTicket *fps_frame_ticket(void)
 {
     MetalFrameRateSession *session=fps_session();
+    if(!session || !session->window_control)return nil;
+    MetalFrameTicket *ticket=[MetalFrameTicket new];ticket->session=session;
+    pthread_mutex_lock(&session->lock);
+    ticket->submission_id=++session->next_submission_id;
+    if(session->measurement && session->measurement->active && !session->measurement->finalized)
+        ticket->window_request_id=session->measurement->request_id;
+    pthread_mutex_unlock(&session->lock);
+    ticket->guest_flip_id=s_present_guest_id;ticket->buffer_id=s_present_buffer_id;
+    return ticket;
+}
+/* Called under the original session lock. A late callback cannot enter a
+ * different measurement window, including a new window in the same session. */
+static MetalFrameMeasurement *fps_ticket_measurement(MetalFrameTicket *ticket)
+{
+    MetalFrameMeasurement *m=ticket->session->measurement;
+    return m && ticket->window_request_id && m->request_id==ticket->window_request_id?m:NULL;
+}
+static void fps_track_drawable_tagged(id<CAMetalDrawable> drawable,MetalFrameTicket *ticket)
+{
+    MetalFrameRateSession *session=ticket?ticket->session:fps_session();
     if (!session || !drawable) return;
     [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+        const double arrival=CACurrentMediaTime();
         pthread_mutex_lock(&session->lock);
         metal_frame_rate_presented(&session->stats,shown.presentedTime);
+        if(ticket)metal_measurement_present(fps_ticket_measurement(ticket),ticket->submission_id,
+            ticket->guest_flip_id,shown.presentedTime,arrival);
         pthread_mutex_unlock(&session->lock);
     }];
 }
-
-static void fps_track_frame_completion(id<MTLCommandBuffer> cb)
+static void fps_track_drawable(id<CAMetalDrawable> drawable)
 {
-    MetalFrameRateSession *session=fps_session();
-    if (!session || !session->signals_enabled || !cb) return;
+    fps_track_drawable_tagged(drawable,nil);
+}
+static void fps_track_frame_completion_tagged(id<MTLCommandBuffer> cb,MetalFrameTicket *ticket,int count_gpu)
+{
+    MetalFrameRateSession *session=ticket?ticket->session:fps_session();
+    if (!session || (!session->signals_enabled && !ticket) || !cb) return;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
         const int success=finished.status==MTLCommandBufferStatusCompleted && !finished.error;
+        const double arrival=CACurrentMediaTime();
         pthread_mutex_lock(&session->lock);
-        metal_frame_rate_completed(&session->stats,success,CACurrentMediaTime());
+        if(count_gpu && session->signals_enabled)metal_frame_rate_completed(&session->stats,success,arrival);
+        if(ticket)metal_measurement_complete(fps_ticket_measurement(ticket),ticket->submission_id,
+            ticket->guest_flip_id,success,arrival);
         pthread_mutex_unlock(&session->lock);
     }];
+}
+static void fps_track_frame_completion(id<MTLCommandBuffer> cb)
+{
+    fps_track_frame_completion_tagged(cb,nil,1);
+}
+static void fps_frame_committed(MetalFrameTicket *ticket)
+{
+    if(!ticket)return;
+    MetalFrameRateSession *session=ticket->session;
+    const double now=CACurrentMediaTime();
+    pthread_mutex_lock(&session->lock);
+    metal_measurement_commit(fps_ticket_measurement(ticket),ticket->submission_id,ticket->guest_flip_id,now);
+    pthread_mutex_unlock(&session->lock);
 }
 
 static void fps_note_drawable(int available)
 {
     MetalFrameRateSession *session=fps_session();
-    if (!session || !session->signals_enabled) return;
+    if (!session || (!session->signals_enabled && !session->window_control)) return;
     pthread_mutex_lock(&session->lock);
     metal_frame_rate_drawable(&session->stats,available);
+    if(!available)metal_measurement_drop(session->measurement,METAL_MEASUREMENT_DROP_DRAWABLE,CACurrentMediaTime());
     pthread_mutex_unlock(&session->lock);
 }
 
 static void fps_note_skipped_blit(void)
 {
     MetalFrameRateSession *session=fps_session();
-    if (!session || !session->signals_enabled) return;
+    if (!session || (!session->signals_enabled && !session->window_control)) return;
     pthread_mutex_lock(&session->lock);
     ++session->stats.skipped_blits;
+    metal_measurement_drop(session->measurement,METAL_MEASUREMENT_DROP_BLIT,CACurrentMediaTime());
     pthread_mutex_unlock(&session->lock);
 }
 
@@ -169,6 +232,54 @@ void rsx_metal_backend_note_guest_frame(void)
     if (!session) return;
     pthread_mutex_lock(&session->lock);
     metal_frame_rate_guest(&session->stats);
+    metal_measurement_admit(session->measurement,CACurrentMediaTime());
+    if(s_present_guest_id>session->last_guest_id)session->last_guest_id=s_present_guest_id;
+    pthread_mutex_unlock(&session->lock);
+}
+
+static int fps_backend_failed(void);
+static void fps_note_submission_failure(void)
+{
+    MetalFrameRateSession *session=fps_session();if(!session)return;
+    pthread_mutex_lock(&session->lock);
+    metal_measurement_drop(session->measurement,METAL_MEASUREMENT_DROP_SUBMISSION,CACurrentMediaTime());
+    pthread_mutex_unlock(&session->lock);
+}
+static void fps_window_poll(MetalFrameRateSession *session,double now)
+{
+    if(!session->window_control)return;
+    pthread_mutex_lock(&session->lock);
+    MetalFrameMeasurementResult result;
+    if(metal_measurement_finish(session->measurement,now,&result)) {
+        int backend_failed=fps_backend_failed();if(backend_failed)result.qualified=0;
+        fprintf(stderr,"[RSX FPS window] {\"phase\":\"complete\",\"request_id\":%llu,\"t0\":%.9f,\"t1\":%.9f,\"seconds\":%.9f,\"qualified\":%s,\"meets_30_displayed_guest_fps\":%s,\"verified_guest_fps\":%.6f,\"admitted\":%llu,\"committed\":%llu,\"gpu_completed\":%llu,\"gpu_failed\":%llu,\"displayed\":%llu,\"positive_presentations\":%llu,\"duplicate_presented_time\":%llu,\"ambiguous_presented_time\":%llu,\"unique_guest_displayed\":%llu,\"repeated_guest_displayed\":%llu,\"uncorrelated\":%llu,\"unresolved\":%llu,\"uncommitted_events\":%llu,\"missing_presentations\":%llu,\"zero_presented_time\":%llu,\"invalid_presented_time\":%llu,\"duplicate_callbacks\":%llu,\"out_of_order\":%llu,\"overflow\":%llu,\"identity_errors\":%llu,\"nil_drawables\":%llu,\"skipped_blits\":%llu,\"submission_failures\":%llu,\"guest_id_floor\":%llu,\"preexisting_guest_submissions\":%llu,\"backend_failed\":%s}\n",
+            result.request_id,result.t0,result.t1,result.seconds,result.qualified?"true":"false",result.qualified && result.verified_guest_fps>=30.0?"true":"false",result.verified_guest_fps,
+            result.admitted,result.committed,result.gpu_completed,result.gpu_failed,result.displayed,
+            result.positive_presentations,result.duplicate_presented_time,result.ambiguous_presented_time,
+            result.unique_guest_displayed,result.repeated_guest_displayed,result.uncorrelated,result.unresolved,result.uncommitted_events,
+            result.missing_presentations,result.zero_presented_time,result.invalid_presented_time,
+            result.duplicate_callbacks,result.out_of_order,result.overflow,result.identity_errors,
+            result.nil_drawables,result.skipped_blits,result.submission_failures,result.guest_id_floor,
+            result.preexisting_guest_submissions,backend_failed?"true":"false");
+    }
+    pthread_mutex_unlock(&session->lock);
+    FILE *file=fopen([session->window_control fileSystemRepresentation],"r");
+    if(!file)return;
+    char line[256];char *read=fgets(line,sizeof(line),file);int more=fgetc(file);fclose(file);
+    unsigned long long request=0;double seconds=0;char extra=0;
+    if(!read || line[0]<'0' || line[0]>'9' || more!=EOF || sscanf(line,"%llu %lf %c",&request,&seconds,&extra)!=2 || !request ||
+       !isfinite(seconds) || seconds<=0 || seconds>300)return;
+    pthread_mutex_lock(&session->lock);
+    if(request>session->last_request_id) {
+        session->last_request_id=request;
+        if(!session->measurement)session->measurement=calloc(1,sizeof(*session->measurement));
+        if(metal_measurement_begin(session->measurement,request,now,seconds,2.0)) {
+            session->measurement->guest_id_floor=session->last_guest_id;
+            fprintf(stderr,"[RSX FPS window] {\"phase\":\"started\",\"request_id\":%llu,\"t0\":%.9f,\"t1\":%.9f,\"grace_seconds\":2.0}\n",request,now,now+seconds);
+        } else {
+            fprintf(stderr,"[RSX FPS window] {\"phase\":\"rejected\",\"request_id\":%llu,\"reason\":\"busy_or_allocation_failed\"}\n",request);
+        }
+    }
     pthread_mutex_unlock(&session->lock);
 }
 
@@ -196,6 +307,7 @@ static void fps_start(void)
     dispatch_source_set_timer(s_fps_timer,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),NSEC_PER_SEC,50*NSEC_PER_MSEC);
     dispatch_source_set_event_handler(s_fps_timer,^{
         if (fps_session()!=session) return;
+        fps_window_poll(session,CACurrentMediaTime());
         pthread_mutex_lock(&session->lock);
         MetalFrameRateSample r=metal_frame_rate_sample(&session->stats,CACurrentMediaTime());
         pthread_mutex_unlock(&session->lock);
@@ -2323,6 +2435,7 @@ static u32 s_eng_dropped;
 static atomic_int s_eng_checked_failed;
 static int s_eng_checked_completed;
 static void eng_checked_fail(void) { atomic_store(&s_eng_checked_failed, 1); }
+static int fps_backend_failed(void) { return atomic_load(&s_eng_checked_failed); }
 #define PS3RECOMP_METAL_TRACKED_COMPLETION 1
 static NSMutableArray<id<MTLCommandBuffer>>* s_eng_submitted;
 /* Consumer-owned receipts: GPU status is checked directly, without relying
@@ -3913,7 +4026,7 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
                                       options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         if(!cb || (s_eng_stage_used && !stage)) {
-            eng_checked_fail();
+            eng_checked_fail();fps_note_submission_failure();
             if(windowed_present)dispatch_semaphore_signal(s_inflight);
             return 0;
         }
@@ -3927,9 +4040,10 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
         if (drawable && !presented) fps_note_skipped_blit();
         if (s_eng_diag.active && !presented && present_dst) s_eng_diag.reason = "blit_skipped";
         const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
-        if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
+        MetalFrameTicket *ticket=drawable?fps_frame_ticket():nil;
+        if (drawable) { fps_track_drawable_tagged(drawable,ticket); [cb presentDrawable:drawable]; }
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
-        if (drawable && presented) fps_track_frame_completion(cb);
+        if (drawable && (presented || ticket)) fps_track_frame_completion_tagged(cb,ticket,presented);
         if (windowed_present) {
             eng_track_submission(cb);
             dispatch_semaphore_t sem = s_inflight;
@@ -3938,6 +4052,7 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];
+            fps_frame_committed(ticket);
         } else {
             const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
             [cb commit];
@@ -4533,7 +4648,9 @@ void rsx_metal_backend_present(void)
         }
 
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        if(!cb)fps_note_submission_failure();
         id<MTLRenderCommandEncoder> enc = begin_pass(cb, target, &first.rt, &first, &ps);
+        if(!enc)fps_note_submission_failure();
         for (; enc && r < s_rec_count; r++) {
             const MtlRecord* rec = &s_records[r];
             if (rec->kind == MTL_REC_CLEAR) {
@@ -4547,15 +4664,16 @@ void rsx_metal_backend_present(void)
             if (!target_same(&rec->u.draw.rt, &ps.rt)) {
                 [enc endEncoding];
                 enc = begin_pass(cb, target, &rec->u.draw.rt, &load_all, &ps);
-                if (!enc) break;
+                if (!enc) { fps_note_submission_failure(); break; }
             }
             encode_draw(enc, &rec->u.draw, &ps);
         }
         if (enc) [enc endEncoding];
 
-        if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
+        MetalFrameTicket *ticket=(drawable && cb)?fps_frame_ticket():nil;
+        if (drawable) { fps_track_drawable_tagged(drawable,ticket); [cb presentDrawable:drawable]; }
 
-        if (drawable) fps_track_frame_completion(cb);
+        if (drawable) fps_track_frame_completion_tagged(cb,ticket,1);
 
         if (s_headless) {
             /* The readback below must see a completed frame. */
@@ -4568,9 +4686,11 @@ void rsx_metal_backend_present(void)
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];        /* no wait: the CPU goes on to the next frame */
+            if(cb)fps_frame_committed(ticket);
         }
 
         if (s_dropped_records) {
+            fps_note_submission_failure();
             fprintf(stderr, "[RSX metal] dropped %u record(s) this frame (cap %d records / %u verts)\n",
                     s_dropped_records, MTL_MAX_RECORDS, MTL_MAX_VERTS);
             s_dropped_records = 0;
@@ -4611,4 +4731,17 @@ u32 rsx_metal_backend_readback_center(void)
 u32 rsx_metal_backend_guest_draws(void)
 {
     return s_eng_active ? rsx_draw_engine_guest_draws() : s_last_guest_draws;
+}
+
+/* Tag the existing presentation call only. Buffer selection, guest callbacks,
+ * command encoding, fences, and presentation scheduling retain their behavior.
+ * Untagged boot redraws and engine-internal sink flips keep guest ID zero. */
+void rsx_metal_backend_present_guest_frame(uint64_t guest_flip_id,uint32_t buffer_id)
+{
+    const uint64_t previous_id=s_present_guest_id;
+    const uint32_t previous_buffer=s_present_buffer_id;
+    s_present_guest_id=guest_flip_id;s_present_buffer_id=buffer_id;
+    rsx_metal_backend_note_guest_frame();
+    rsx_metal_backend_present();
+    s_present_guest_id=previous_id;s_present_buffer_id=previous_buffer;
 }

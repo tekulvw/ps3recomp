@@ -97,11 +97,14 @@ static volatile int s_flip_lock;
  * a fixed 16ms clock, and a drain that catches the guest mid-frame -- e.g.
  * while it's blocked in the FIFO-wrap recycle callback -- would show a
  * clear+few-draws frame as a visible flicker). */
-static volatile u32 s_flip_request_count = 0;
+#include "gcm_flip_receipt_state.h"
+static GcmFlipReceiptState s_flip_receipts=GCM_FLIP_RECEIPT_STATE_INIT;
 
 u32 cellGcm_flip_request_count(void)
 {
-    return s_flip_request_count;
+    CellGcmFlipReceipt receipt;
+    gcm_flip_receipt_latest(&s_flip_receipts,&receipt);
+    return receipt.flip_count;
 }
 static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
 
@@ -113,7 +116,7 @@ static u32 s_current_display_buffer_id = 0;
  * the ticker, which presents the accumulated batch BEFORE draining further --
  * presenting on a raw flip-count change raced the drain and showed empty or
  * mixed batches (wave: black flashes, layout flicker). */
-static volatile int s_flip_pending = 0;
+/* Pending status and identity are consumed together under the receipt lock. */
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
 /* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
@@ -146,11 +149,19 @@ static int gcm_flip_executed_take(void)
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
 
+int cellGcm_take_flip_receipt(CellGcmFlipReceipt *out)
+{
+    return gcm_flip_receipt_take(&s_flip_receipts,out);
+}
+
+int cellGcm_latest_flip_receipt(CellGcmFlipReceipt *out)
+{
+    return gcm_flip_receipt_latest(&s_flip_receipts,out);
+}
+
 int cellGcm_take_flip_pending(void)
 {
-    int v = s_flip_pending;
-    s_flip_pending = 0;
-    return v;
+    return gcm_flip_receipt_take(&s_flip_receipts,NULL);
 }
 
 /* The flip now names this buffer. The shared draw engine presents on the
@@ -1440,12 +1451,11 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
  * and halved the frame rate). Call AFTER draining. */
 int cellGcm_take_flip_pending_synced(void)
 {
-    if (!s_flip_pending) return 0;
+    if(!gcm_flip_receipt_is_pending(&s_flip_receipts))return 0;
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
     u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
     if (get != put) return 0;   /* frame not fully drained yet */
-    s_flip_pending = 0;
-    return 1;
+    return gcm_flip_receipt_take(&s_flip_receipts,NULL);
 }
 
 /* ---- fence (SET_REFERENCE) observability ---------------------------------
@@ -2198,8 +2208,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
                 gcm_set_current_display_buffer(w & 7u);
-                s_flip_pending = 1;
-                s_flip_request_count++;
+                gcm_flip_receipt_publish(&s_flip_receipts,w & 7u,1);
                 /* Not past `queued`: a resync may already have written off
                  * this flip. */
                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
@@ -3006,8 +3015,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
      * the drain does this half when it reaches it (see the 0xFEAD case). */
     if (!in_fifo) {
         gcm_set_current_display_buffer(bufferId);
-        s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
-        s_flip_request_count++;
+        gcm_flip_receipt_publish(&s_flip_receipts,bufferId,1); /* present before next drain */
         s_flip_direct_pending = 1;
     }
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
@@ -3128,7 +3136,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    s_flip_request_count++;
+    gcm_flip_receipt_publish(&s_flip_receipts,bufferId,0);
     s_last_flip_time = get_timestamp_ns();
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
