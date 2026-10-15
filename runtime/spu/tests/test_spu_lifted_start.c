@@ -822,6 +822,10 @@ static void test_nonzero_link_return(void)
     free(ctx);
 }
 
+#ifdef SPU_VERIFIED_OVERLAY_TEST
+#include "test_spu_verified_overlay_fixture.h"
+#endif
+
 int main(void)
 {
     printf("SPU lifted thread-group start\n");
@@ -832,6 +836,9 @@ int main(void)
     test_smc_xori();
     test_resident_code_regions();
     test_resident_interpreter_rejoin();
+#ifdef SPU_VERIFIED_OVERLAY_TEST
+    test_verified_overlay();
+#endif
     test_lle_taskset_syscall();
     test_taskset_resume_identity();
     test_guest_stack_reset();
