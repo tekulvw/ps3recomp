@@ -14,6 +14,7 @@ void spu_wrch(spu_context* c,uint32_t x,u128 v){(void)c;(void)x;(void)v;abort();
 uint32_t spu_rchcnt(spu_context* c,uint32_t x){(void)c;(void)x;abort();}
 int g_spu_ls_watch_n,g_spu_ls_probe,g_wws_read_probe,g_wws_code_probe,g_spu_smc_watch;
 spu_lifted_fn spu_lifted_lookup(const spu_context* c,uint32_t x){(void)c;(void)x;return 0;}
+int spu_lifted_entry_maybe(uint32_t a) { (void)a; return 1; }
 void spu_spurs_taskset_syscall(spu_context* c){(void)c;abort();}
 void spu_ls_watch_slow(uint32_t a,int b,const uint8_t* c,uint32_t d,uint32_t e){(void)a;(void)b;(void)c;(void)d;(void)e;abort();}
 static int cache_on;

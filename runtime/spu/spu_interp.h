@@ -26,6 +26,10 @@ typedef void (*spu_lifted_fn)(spu_context*);
  * authoritative misses), then task, overlay, and primary image. This is the
  * same resolver used by indirect dispatch. NULL ctx retains wildcard lookup. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
+/* Negative-only prefilter over all registered images. A true result still
+ * requires the full owner/code-aware resolver above. Registration must finish
+ * before concurrent interpretation, as required by the function registry. */
+int spu_lifted_entry_maybe(uint32_t lsa);
 
 /* Interpret from `start_lsa` until the SPU stops (`stop`/`stopd`/halt) or a
  * host-fatal decode. Handles all control flow internally. Returns the stop
