@@ -65,3 +65,24 @@ caller. Removing only the generated gates is a failing negative control. Actual
 GET and GET LIST partial loads, foreign GET replacement, immutable descriptor
 copies, bounds, holes, wrong binding, wildcard rejection, ambiguity, and registry
 capacity are also checked. The existing thread-start/rejoin suite is retained.
+
+## Optional function-span guards
+
+Add `--verified-code-spans` together with a positive `--verified-code-image` to
+compare the complete `[start,end)` instruction interval of each generated body
+at direct entries. Every direct call, queued tail transfer and fallthrough
+receives a gate. An interval must fit one immutable registered executable
+segment and start at an exact registered function. Failure defers to the normal
+interpreter dispatcher. There is no cached trust: changes between entries are
+checked even when they arrive through an uninstrumented local-store writer.
+
+Indirect lookup and the original `spu_verified_code_enter` API continue comparing
+the full image and rejecting ambiguous matches. The span gate proves equivalence
+of the executing body, rather than unchanged bytes throughout the module. Its
+trusted caller must supply the entire generated interval. Changes to any active
+body, including a suspended caller while a nested callee runs, remain outside the
+readonly-text contract. Original default generation remains byte-identical.
+
+Run `SPU_VERIFIED_SPANS=1 UBSAN=1 MUTANT=1 python3 tools/test_spu_verified_overlay.py`
+for complete-span byte accounting, invalid ranges, direct callee and queued tail
+mutation fallback, unchanged full-image admission, and gate-removal controls.

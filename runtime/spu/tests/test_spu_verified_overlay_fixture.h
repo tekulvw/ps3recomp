@@ -2,9 +2,14 @@
 #include "spu_verified_overlay.h"
 #include "../spu_dma.h"
 extern unsigned test_verified_compares;
+extern unsigned long long test_verified_bytes;
 #include "spu_recomp.h"
 #include "outside_recomp.h"
 #include "verified_program.h"
+#ifdef SPU_VERIFIED_SPANS_TEST
+#include "tail_recomp.h"
+#include "tail_program.h"
+#endif
 static void verified_stale(spu_context* c) { c->gpr[7]._u32[0] = 555; }
 static void test_verified_overlay(void)
 {
@@ -125,6 +130,46 @@ static void test_verified_overlay(void)
     check(mfc_do_transfer(c,0x10020,0x30020,8,0x40)==0 &&
           spu_lifted_lookup(c,0x10000)==verified_test_spu_func_00010000,
           "restored GET is freshly validated");
+#ifdef SPU_VERIFIED_SPANS_TEST
+    check(spu_verified_code_enter_span(c,701,0x10000,0x10010), "span gate accepts complete caller body");
+    unsigned long long byte_count = test_verified_bytes;
+    for (unsigned n=0;n<1000;++n)
+        check(spu_verified_code_enter_span(c,701,0x10000,0x10010), "repeated span entry");
+    check(test_verified_bytes-byte_count==16000, "span guards compare only the complete executing instruction body");
+    check(!spu_verified_code_enter_span(c,701,0x10000,0x10000), "empty span rejected");
+    check(!spu_verified_code_enter_span(c,701,0x10000,0x1000f), "unaligned span end rejected");
+    check(!spu_verified_code_enter_span(c,701,0x10000,0x10024), "span across executable gap rejected");
+    check(!spu_verified_code_enter_span(c,701,0x10020,0x40004), "span outside local store rejected");
+    check(!spu_verified_code_enter_span(NULL,701,0x10000,0x10010), "null span context rejected");
+    check(!spu_verified_code_enter_span(c,702,0x10000,0x10010), "unregistered image span rejected");
+    check(!spu_verified_code_enter_span(c,701,0x10004,0x10010), "non-entry span rejected");
+    c->ls[0x1000c]^=1;
+    check(!spu_verified_code_enter_span(c,701,0x10000,0x10010), "changed final instruction rejects span body");
+    c->ls[0x1000c]^=1;
+    c->ls[0x10024]^=1;
+    check(spu_verified_code_enter_span(c,701,0x10000,0x10010), "unexecuted callee change does not rescan caller module");
+    check(!spu_verified_code_enter_span(c,701,0x10020,0x10028), "changed callee cannot execute its compiled body");
+    check(!spu_lifted_lookup(c,0x10000), "indirect admission retains full image verification");
+    c->ls[0x10024]^=1;
+    c->policy_mode=0;
+    check(!spu_verified_code_enter_span(c,701,0x10000,0x10010), "span requires policy context");
+    c->policy_mode=1;
+#endif
+#ifdef SPU_VERIFIED_SPANS_TEST
+    spu_verified_code_segment tail_segs[]={{0x22000,8,tail_program},{0x22020,8,tail_program+32}};
+    spu_begin_image(705);tail_test_spu_recomp_register();spu_begin_image(0);
+    check(spu_verified_overlay_register(501,705,tail_segs,2), "register queued transfer program");
+    memcpy(c->ls+0x22000,tail_program,8);memcpy(c->ls+0x22020,tail_program+32,8);
+    check(spu_lifted_lookup(c,0x22000)==tail_test_spu_func_00022000, "queued caller has full admission");
+    c->gpr[10]._u32[0]=0x40800000u|(99u<<7)|7;
+    c->gpr[10]._u32[1]=0x35000000u;
+    c->gpr[10]._u32[2]=c->gpr[10]._u32[3]=0;
+    c->gpr[11]._u32[0]=0x22020;c->gpr[0]=spu_link(0x900);
+    c->pc=0x22000;c->status=SPU_STATUS_RUNNING;
+    tail_test_spu_func_00022000(c);spu_drain_call(c,0x900);
+    check(c->gpr[7]._u32[0]==99 && c->pc==0x900 && c->host_depth==1,
+          "queued generated destination interprets changed instructions and returns");
+#endif
     /* Exact bytes with only compatibility wildcard registration must fail. */
     unsigned char wildcard_bytes[] = {0,0,0,0};
     spu_verified_code_segment ws={0x18000,4,wildcard_bytes};
@@ -140,7 +185,13 @@ static void test_verified_overlay(void)
      * startup registry and reject the first excess entry. */
     unsigned slots=0;
     while (spu_verified_overlay_register(601,800+(int)slots,&ws,1)) ++slots;
-    check(slots==13, "registry has exact fixed image capacity without partial invalid registrations");
+    check(slots==
+#ifdef SPU_VERIFIED_SPANS_TEST
+        12,
+#else
+        13,
+#endif
+        "registry has exact fixed image capacity without partial invalid registrations");
     check(!spu_verified_overlay_register(601,999,&ws,1), "registry overflow fails closed");
     free(vm_base);vm_base=saved_vm;
     g_spu_trampoline_fn=0;free(c);
