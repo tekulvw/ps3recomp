@@ -3,6 +3,7 @@
 #include "../spu_dma.h"
 extern unsigned test_verified_compares;
 #include "spu_recomp.h"
+#include "outside_recomp.h"
 #include "verified_program.h"
 static void verified_stale(spu_context* c) { c->gpr[7]._u32[0] = 555; }
 static void test_verified_overlay(void)
@@ -30,8 +31,9 @@ static void test_verified_overlay(void)
     check(!spu_verified_overlay_register(501,701,&bad,1), "reject unaligned segment");
     spu_verified_code_segment overlap[] = {segs[0],{0x10004,8,expected_callee}};
     check(!spu_verified_overlay_register(501,701,overlap,2), "reject overlapping segments");
-    spu_begin_image(701); verified_test_spu_recomp_register();
+    spu_begin_image(701); verified_test_spu_recomp_register(); outside_test_spu_recomp_register();
     spu_begin_image(501); spu_register_function(0x10000,verified_stale);
+    spu_register_function(0x20000,verified_stale);
     spu_register_function(0x10010,verified_stale); /* hole within authoritative region */
     spu_begin_image(0);
     check(spu_verified_overlay_register(501,701,segs,2), "register exact executable segments");
@@ -74,6 +76,20 @@ static void test_verified_overlay(void)
     check(!spu_lifted_lookup(c,0x10000), "wrong primary binding cannot recursively serve guarded function");
     c->image_id=0;
     check(!spu_lifted_lookup(c,0x10020), "wildcard primary cannot repeatedly select a rejected guarded body");
+    c->image_id=501;
+    c->resident_code[0].lsa=0x20000; c->resident_code[0].size=0x100;
+    c->resident_code[0].image_id=701;
+    check(!spu_verified_code_enter(c,701,0x20000), "out-of-range generated function entry rejects its body");
+    check(!spu_lifted_lookup(c,0x20000), "out-of-range authoritative resident cannot serve rejected guarded body");
+    c->resident_code[0].image_id=94; /* registered image, no function here */
+    c->resident_task=501; c->resident_ovl=501;
+    check(!spu_lifted_lookup(c,0x20000), "ordinary resident owner miss still cannot fall through");
+    c->resident_code[0].image_id=0; c->resident_task=0; c->resident_ovl=701;
+    check(!spu_lifted_lookup(c,0x20000), "out-of-range overlay cannot serve rejected guarded body");
+    c->resident_ovl=0; c->resident_task=701;
+    check(!spu_lifted_lookup(c,0x20000), "out-of-range task cannot serve rejected guarded body");
+    c->resident_task=0; c->image_id=701;
+    check(!spu_lifted_lookup(c,0x20000), "out-of-range primary cannot serve rejected guarded body");
     c->image_id=501;
     c->policy_mode=0;
     check(!spu_lifted_lookup(c,0x10000), "opted non-policy context cannot bypass guarded entry");
