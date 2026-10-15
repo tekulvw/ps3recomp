@@ -29,6 +29,11 @@ typedef struct audio_chronology_wait_token {
 void audio_chronology_wait_begin(audio_chronology_wait_token*, uint64_t);
 void audio_chronology_wait_end(const audio_chronology_wait_token*, int, int);
 void audio_chronology_workload(uint64_t, uint32_t, uint64_t, int32_t, uint32_t, uint32_t, uint32_t);
+#define AUDIO_CHRONOLOGY_SCALAR_NOTES_VERSION 1
+/* Optional caller-supplied raw scalars in the existing selected-call stream.
+ * Scope/token numbers are diagnostic identities, never guest/job ownership. */
+uint64_t audio_chronology_scalar_scope(void);
+uint64_t audio_chronology_scalar(uint64_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
 int audio_chronology_enabled(void);
 void audio_chronology_port(unsigned, uint32_t, uint32_t, uint32_t, int);
 void audio_chronology_consume(unsigned, unsigned, uint64_t, const uint8_t*, uint32_t, uint64_t);
