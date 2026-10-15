@@ -225,6 +225,17 @@ int rsx_fp_decompile_buffered_shadow_color_ex(
     const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
     char* out, u32 out_size, u32* out_constant_count);
 
+/* Detect WPOS input in a bounded, terminated program (inline constants and
+ * branch encodings are skipped). Unused source fields may conservatively
+ * qualify a program; this never omits a WPOS read. */
+int rsx_fp_uses_wpos(const u8* ucode, u32 max_bytes);
+
+/* Correct generated HLSL WPOS reads for a 1x/2x host sample grid in each
+ * dimension. Z/W are unchanged. 1x1 and programs without WPOS retain their
+ * exact source. Call once before other source wrappers. Returns 1 on success,
+ * -1 without mutation on invalid factors/source bounds or insufficient space. */
+int rsx_fp_apply_wpos_scale(char* hlsl, u32 capacity, u32 sx, u32 sy);
+
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */
 const char* rsx_fp_opcode_name(u32 opcode);

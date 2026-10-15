@@ -7,7 +7,7 @@
 static char captured[65536];
 static u32 capture_pipeline(void* u,const char* vs,const char* ps,const rsx_be_render_state* rs,const rsx_vertex_layout_plan* l,u32 stride,rsx_be_format f,u32 n)
 { snprintf(captured,sizeof captured,"%s",ps);return stub_pipeline_create(u,vs,ps,rs,l,stride,f,n); }
-int main(void)
+int main(int argc, char** argv)
 {
  vm_base=calloc(1,GUEST_BYTES);ppu_vm_size=GUEST_BYTES;engine_up();
  rsx_draw_backend be=g_stub_backend;be.pipeline_create=capture_pipeline;rsx_draw_engine_set_backend(&be);
@@ -27,5 +27,24 @@ int main(void)
  rsx_test_fp_instr(vm_base+0x60000,RSX_TEST_FP_OPC(1)|RSX_TEST_FP_MASK_XYZW|RSX_TEST_FP_INSRC_TC0|RSX_TEST_FP_END,RSX_TEST_FP_SRC_INPUT|RSX_TEST_FP_SWZ_IDENT);
  draw_triangle();const u32 tc=stub.bound_pipeline;const int tc_count=stub.n_pipeline_create;
  m(M_SURFACE_FORMAT,8|(3u<<12));draw_triangle();CHECK(stub.bound_pipeline==tc&&stub.n_pipeline_create==tc_count,"non-WPOS programs keep AA-independent pipeline identity");
+ char source[65536],copy[65536];u8 fp[48]={0};u32 constants=0;
+ rsx_test_fp_instr(fp,RSX_TEST_FP_OPC(1)|RSX_TEST_FP_MASK_XYZW|RSX_TEST_FP_END,RSX_TEST_FP_SRC_INPUT|RSX_TEST_FP_SWZ_IDENT);
+ CHECK(rsx_fp_uses_wpos(fp,16)==1,"WPOS detector sees actual input");
+ CHECK(!rsx_fp_uses_wpos(fp,15)&&!rsx_fp_uses_wpos(NULL,16),"truncated/null programs do not qualify");
+ for(u32 sx=1;sx<=2;sx++)for(u32 sy=1;sy<=2;sy++){
+ CHECK(rsx_fp_decompile_buffered_ex(fp,16,0x40,0,source,sizeof source,&constants)>0,"synthetic WPOS decompiles");strcpy(copy,source);
+ CHECK(rsx_fp_apply_wpos_scale(source,sizeof source,sx,sy)==1,"all four sample grids transform");
+ if(sx==1&&sy==1)CHECK(!strcmp(copy,source),"1x1 source byte identity");
+ else CHECK(strstr(source,", input.position.zw)")!=NULL,"Z/W preserved directly");
+ if(argc==2){char path[1024];snprintf(path,sizeof path,"%s/wpos-%u-%u.hlsl",argv[1],sx,sy);FILE* f=fopen(path,"wb");if(!f)return 2;fputs(source,f);fclose(f);}
+ }
+ strcpy(source,copy);CHECK(rsx_fp_apply_wpos_scale(source,(u32)strlen(source)+1,2,1)<0&&!strcmp(source,copy),"insufficient capacity leaves source unchanged");
+ CHECK(rsx_fp_apply_wpos_scale(source,sizeof source,0,1)<0&&!strcmp(source,copy),"invalid scale leaves source unchanged");
+ char unterminated[4]={'a','b','c','d'};CHECK(rsx_fp_apply_wpos_scale(unterminated,4,2,1)<0,"unterminated source rejected");
+ strcpy(source,"float4 main() { return 0; }");strcpy(copy,source);CHECK(rsx_fp_apply_wpos_scale(source,sizeof source,2,2)==1&&!strcmp(source,copy),"non-WPOS source byte identity");
+ /* An inline constant payload containing input-like bits must be skipped. */
+ rsx_test_fp_instr(fp,RSX_TEST_FP_OPC(1)|RSX_TEST_FP_MASK_XYZW|RSX_TEST_FP_END,2u|RSX_TEST_FP_SWZ_IDENT);
+ rsx_test_fp_instr(fp+16,RSX_TEST_FP_OPC(1)|RSX_TEST_FP_END,RSX_TEST_FP_SRC_INPUT);
+ CHECK(!rsx_fp_uses_wpos(fp,32)&&!rsx_fp_uses_wpos(fp,16),"inline payload and truncated constants cannot manufacture WPOS");
  engine_down();free(vm_base);printf("WPOS scale: %d failures\n",g_failures);return g_failures?1:0;
 }

@@ -420,6 +420,11 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_shufb
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_shufb.py")
+        if(NOT WIN32)
+            add_test(NAME rsx_wpos_scale
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_rsx_wpos_scale.py")
+        endif()
         add_test(NAME spu_dma_source_f32be
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_source_f32be.py")
