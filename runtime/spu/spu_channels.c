@@ -22,6 +22,7 @@
 #include "spu_pc_observer.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
+#include "spu_verified_overlay.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1518,6 +1519,114 @@ int spu_have_function(uint32_t addr)
     return spu_image_of_function(addr) >= 0;
 }
 
+/* Exact-image lookup: verification must never adopt a compatibility wildcard. */
+static spu_fn spu_lookup_exact(uint32_t addr, int image_id)
+{
+    for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
+        const spu_reg_entry* e = &s_registry[n - 1];
+        if (e->addr == addr && e->image_id == image_id) return e->fn;
+    }
+    return NULL;
+}
+
+#define SPU_VERIFIED_IMAGES 16u
+#define SPU_VERIFIED_SEGMENTS 8u
+#define SPU_VERIFIED_BYTES (4u * 1024u * 1024u)
+typedef struct {
+    int policy, image;
+    uint32_t lo, hi;
+    unsigned count;
+    spu_verified_code_segment segments[SPU_VERIFIED_SEGMENTS];
+} spu_verified_image;
+static spu_verified_image s_verified_images[SPU_VERIFIED_IMAGES];
+static unsigned s_verified_count;
+static uint32_t s_verified_bytes;
+
+int spu_verified_overlay_register(int policy, int image,
+    const spu_verified_code_segment* segments, unsigned count)
+{
+    if (policy <= 0 || image <= 0 || policy == image || !segments ||
+        !count || count > SPU_VERIFIED_SEGMENTS || s_verified_count >= SPU_VERIFIED_IMAGES)
+        return 0;
+    for (unsigned i = 0; i < s_verified_count; ++i)
+        if (s_verified_images[i].policy == policy && s_verified_images[i].image == image)
+            return 0;
+    uint32_t total = 0, lo = SPU_LS_SIZE, hi = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        const spu_verified_code_segment* s = &segments[i];
+        if (!s->bytes || !s->size || (s->lsa & 3u) || (s->size & 3u) ||
+            s->lsa >= SPU_LS_SIZE || s->size > SPU_LS_SIZE - s->lsa ||
+            s->size > SPU_LS_SIZE - total) return 0;
+        for (unsigned j = 0; j < i; ++j)
+            if (s->lsa < segments[j].lsa + segments[j].size &&
+                segments[j].lsa < s->lsa + s->size) return 0;
+        total += s->size;
+        if (s->lsa < lo) lo = s->lsa;
+        if (s->lsa + s->size > hi) hi = s->lsa + s->size;
+    }
+    if (total > SPU_VERIFIED_BYTES - s_verified_bytes) return 0;
+    uint8_t* copy = (uint8_t*)malloc(total);
+    if (!copy) return 0;
+    spu_verified_image next = {0};
+    next.policy = policy; next.image = image; next.lo = lo; next.hi = hi; next.count = count;
+    uint32_t at = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        next.segments[i] = segments[i];
+        memcpy(copy + at, segments[i].bytes, segments[i].size);
+        next.segments[i].bytes = copy + at;
+        at += segments[i].size;
+    }
+    s_verified_images[s_verified_count++] = next;
+    s_verified_bytes += total;
+    return 1;
+}
+
+/* On an exact function-table miss there is no large byte comparison. A known
+ * registered region still blocks stale primary functions, including holes.
+ * No cached trust survives DMA, SPU stores, or PPU changes between entries. */
+static spu_fn spu_verified_lookup(const spu_context* ctx, uint32_t lsa,
+    int* covered, int* image)
+{
+    spu_fn result = NULL;
+    *covered = 0; *image = 0;
+    if (!ctx || (lsa & 3u)) return NULL;
+    for (unsigned i = 0; i < s_verified_count; ++i) {
+        const spu_verified_image* v = &s_verified_images[i];
+        if (lsa < v->lo || lsa >= v->hi) continue;
+        /* A guarded image must not recursively re-enter itself through legacy
+         * primary/resident lookup after rejecting an inappropriate context. */
+        if (ctx->image_id == v->policy || ctx->image_id == v->image || ctx->resident_ovl == v->image ||
+            ctx->resident_task == v->image) *covered = 1;
+        for (unsigned k = 0; k < 4; ++k)
+            if (ctx->resident_code[k].image_id == v->image) *covered = 1;
+        if (!ctx->policy_mode || ctx->ls != ctx->ls_store || ctx->image_id != v->policy)
+            continue;
+        *covered = 1;
+        spu_fn fn = spu_lookup_exact(lsa, v->image);
+        if (!fn) continue;
+        int in_text = 0;
+        for (unsigned j = 0; j < v->count; ++j)
+            if (lsa >= v->segments[j].lsa &&
+                lsa - v->segments[j].lsa < v->segments[j].size) in_text = 1;
+        if (!in_text) continue;
+        unsigned j = 0;
+        for (; j < v->count; ++j) {
+            const spu_verified_code_segment* s = &v->segments[j];
+            if (memcmp(ctx->ls + s->lsa, s->bytes, s->size)) break;
+        }
+        if (j != v->count) continue;
+        if (result) { *image = 0; return NULL; } /* ambiguity, never first-match */
+        result = fn; *image = v->image;
+    }
+    return result;
+}
+
+int spu_verified_code_enter(const spu_context* ctx, int image, uint32_t entry)
+{
+    int covered, owner;
+    return spu_verified_lookup(ctx, entry, &covered, &owner) != NULL && owner == image;
+}
+
 /* Shared by indirect dispatch and interpreter rejoin. A bounded resident
  * code owner is authoritative even if it has no lift at this LSA: falling
  * through would execute stale code registered under another image. Task and
@@ -1525,6 +1634,11 @@ int spu_have_function(uint32_t addr)
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
     if (!ctx) return (spu_lifted_fn)spu_lookup(lsa, 0);
+    if (s_verified_count) {
+        int covered, image;
+        spu_fn fn = spu_verified_lookup(ctx, lsa, &covered, &image);
+        if (covered) return (spu_lifted_fn)fn;
+    }
     for (unsigned slot = 0; slot < 4; ++slot)
         if (ctx->resident_code[slot].image_id &&
             lsa >= ctx->resident_code[slot].lsa &&
@@ -1534,6 +1648,11 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     if (ctx->resident_task) fn = spu_lookup(lsa, ctx->resident_task);
     if (!fn && ctx->resident_ovl) fn = spu_lookup(lsa, ctx->resident_ovl);
     if (!fn) fn = spu_lookup(lsa, ctx->image_id);
+    /* A wildcard/unrelated context cannot bypass a guarded image's rejected
+     * policy through the legacy registry and recursively schedule that body. */
+    if (fn && s_verified_count)
+        for (unsigned i = 0; i < s_verified_count; ++i)
+            if (fn == spu_lookup_exact(lsa, s_verified_images[i].image)) return NULL;
     return (spu_lifted_fn)fn;
 }
 

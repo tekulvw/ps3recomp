@@ -499,12 +499,13 @@ def compute_link_returns(insns, bounds) -> set:
 LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
 
 class SPULifter:
-    def __init__(self, trace: bool = False, prefix: str = ""):
+    def __init__(self, trace: bool = False, prefix: str = "", verified_code_image: int = 0):
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
         self.unsupported: dict[str, int] = {}
         self.trace = trace
+        self.verified_code_image = verified_code_image
         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
         # Lets multiple lifted SPU images link into one binary without collisions
         # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
@@ -1067,9 +1068,13 @@ class SPULifter:
 
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
+        if self.verified_code_image:
+            lines.append('#include "spu_verified_overlay.h"')
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         for f in self.functions:
             lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
+            if self.verified_code_image:
+                lines.append(f"    if (!spu_verified_code_enter(ctx, {self.verified_code_image}, 0x{f.start_addr:X}u)) {{ ctx->pc = 0x{f.start_addr:X}u; g_spu_trampoline_fn = spu_indirect_branch; return; }}")
             for b in f.body_lines:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
@@ -1142,6 +1147,8 @@ def main() -> None:
                    help="Prefix for all emitted spu_func_* / spu_recomp_register "
                         "symbols, so multiple lifted SPU images can link into one "
                         "binary without colliding (e.g. flow_spu_00_). Default: none.")
+    p.add_argument("--verified-code-image", type=lambda x: int(x, 0), default=0,
+                   help="Opt-in exact readonly-text image id. Guard every emitted function entry; requires verified overlay runtime registration. Transfer entries only, not mid-function SMC.")
     p.add_argument("--extra-funcs", default="",
                    help="Comma-separated extra function entry addresses (e.g. "
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
@@ -1186,6 +1193,8 @@ def main() -> None:
                         "dispatched blocks later -- classified as a return, which "
                         "silently skipped every job-command handler).")
     args = p.parse_args()
+    if args.verified_code_image < 0 or args.verified_code_image > 0x7fffffff:
+        p.error("--verified-code-image must be zero (disabled) or a positive signed image id")
 
     if args.auto_functions:
         from find_spu_functions import detect_functions, parse_elf, pick_text, text_image
@@ -1298,7 +1307,7 @@ def main() -> None:
 
     insns = disassemble_spu(data, base)
 
-    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
+    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix, verified_code_image=args.verified_code_image)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
