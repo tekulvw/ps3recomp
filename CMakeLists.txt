@@ -424,6 +424,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME user_memory_domain
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")
+        add_test(NAME spu_byte_permute
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_byte_permute.py")
         add_test(NAME spu_shufb
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_shufb.py")
