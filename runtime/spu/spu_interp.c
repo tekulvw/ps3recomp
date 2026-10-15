@@ -11,6 +11,7 @@
 #include "spu_pc_observer.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 /* Channel ABI (runtime/spu/spu_channels.c); the lifter emits these same protos
  * into each generated spu_recomp.h — declared here to stay header-independent. */
@@ -424,6 +425,15 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
 }
 
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    /* Experimental same-binary switch. Cache the immutable environment once;
+     * concurrent first callers may compute the same value without a data race. */
+    static atomic_int prefilter_setting;
+    int prefilter = atomic_load_explicit(&prefilter_setting, memory_order_relaxed);
+    if (!prefilter) {
+        const char* value = getenv("SPU_INTERP_REJOIN_PREFILTER");
+        prefilter = value && atoi(value) ? 2 : 1;
+        atomic_store_explicit(&prefilter_setting, prefilter, memory_order_relaxed);
+    }
     int observe = spu_pc_observer_enabled();
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
@@ -461,7 +471,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || ((prefilter != 2 || spu_lifted_entry_maybe(ctx->pc)) && spu_lifted_lookup(ctx, ctx->pc)))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);

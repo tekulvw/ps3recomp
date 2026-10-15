@@ -1395,6 +1395,20 @@ static uint32_t s_hash_head[SPU_FN_HASH_SIZE];
 static uint32_t s_hash_tail[SPU_FN_HASH_SIZE];
 static uint32_t s_hash_next[SPU_FN_REGISTRY_MAX];
 
+/* Negative-only rejoin prefilter. Registration and the function table are
+ * startup-single-threaded; readers use both after registration completes.
+ * A bit says some image registered this exact canonical LS word, never that
+ * its owner or current bytes are valid. Noncanonical addresses conservatively
+ * retain the full resolver so unusual legacy registrations keep their behavior. */
+static uint8_t s_entry_bits[SPU_LS_SIZE / 32];
+int spu_lifted_entry_maybe(uint32_t addr)
+{
+    if (addr >= SPU_LS_SIZE || (addr & 3u)) return 1;
+    uint32_t word = addr >> 2;
+    return (s_entry_bits[word >> 3] >> (word & 7u)) & 1u;
+}
+
+
 static inline uint32_t spu_fn_hash(uint32_t addr)
 {
     return ((addr >> 2) * 2654435761u) & (SPU_FN_HASH_SIZE - 1);
@@ -1438,6 +1452,10 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     else
         s_hash_next[s_hash_tail[h] - 1] = i + 1;
     s_hash_tail[h] = i + 1;
+    if (addr < SPU_LS_SIZE && !(addr & 3u)) {
+        uint32_t word = addr >> 2;
+        s_entry_bits[word >> 3] |= (uint8_t)(1u << (word & 7u));
+    }
 }
 
 /* Report a CROSS-IMAGE match: the registry served a function some other image
