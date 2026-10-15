@@ -34,13 +34,17 @@ multiple matching candidates stays interpreted. The comparison happens again on
 each eligible transfer. There is no cached trust requiring an incomplete write
 invalidation scheme, and no whole-image comparison at every interpreter PC.
 
-Every opted-in generated function starts with the same verification gate, so a
-direct generated call or queued trampoline cannot bypass verification. A failed
+Every opted-in translated function body starts with the same verification gate,
+so a direct generated call or queued trampoline cannot bypass verification.
+External dispatch stubs contain no translated guest instructions and retain
+their existing behavior of queuing the verified indirect resolver. A failed
 gate publishes its own entry PC, queues the existing indirect dispatcher, and
 returns. The existing caller drain installs its architectural return PC before
 interpreting the live LS instructions. It preserves the guest link register,
 host call depth, and scheduler state. Guarded image IDs are suppressed from
-inappropriate legacy primary/wildcard/resident lookups to avoid reject/retry loops.
+all inappropriate legacy primary/wildcard/resident lookup return paths, even
+outside their verified segment bounds, to avoid reject/retry loops. An ordinary
+authoritative resident owner miss still returns NULL without falling through.
 
 This is **transfer-entry verification**, not complete support for self-modifying
 code. Writes between entries are observed at the next verification. Changes to

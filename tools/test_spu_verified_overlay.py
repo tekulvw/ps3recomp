@@ -27,6 +27,12 @@ with tempfile.TemporaryDirectory(prefix='spu-verified-overlay-') as td:
   r=subprocess.run(command+['--output',str(where),'--verified-code-image',value],cwd=root,env=env,capture_output=True)
   assert r.returncode!=0 and not where.exists()
  h=work/'spu_recomp.h';h.write_text(h.read_text().replace('../../runtime/spu/','').replace('../runtime/spu/',''))
+ # A real generated guarded function deliberately outside its registered text.
+ # Legacy ownership must not repeatedly serve it after its guard rejects.
+ (work/'outside.bin').write_bytes((0x40800000|(66<<7)|7).to_bytes(4,'big')+(0x35000000).to_bytes(4,'big'))
+ (work/'outside-bounds.json').write_text('[{"start":"0x20000","end":"0x20008"}]')
+ subprocess.run([sys.executable,str(root/'tools/spu_lifter.py'),str(work/'outside.bin'),'--base','0x20000','--functions',str(work/'outside-bounds.json'),'--symbol-prefix','outside_test_','--header-name','outside_recomp.h','--source-name','outside_recomp.c','--output',str(work),'--verified-code-image','701'],check=True,cwd=root,env=env,capture_output=True)
+ oh=work/'outside_recomp.h';oh.write_text(oh.read_text().replace('../../runtime/spu/','').replace('../runtime/spu/',''))
  # Store original neutral byte image for independent actual-LS expectations.
  (work/'verified_program.h').write_text('static const unsigned char verified_program[] = {'+','.join(str(b) for b in raw)+'};\n')
  runtime=(spu/'spu_channels.c').read_bytes()
@@ -39,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix='spu-verified-overlay-') as td:
  if os.environ.get('UBSAN')=='1':flags+=['-fsanitize=undefined','-fno-sanitize-recover=all']
  def run(source,label):
   binary=work/label
-  build=subprocess.run([cc,*flags,*[(str(instrumented) if s=='runtime/spu/spu_channels.c' else str(root/s)) for s in sources],str(source),'-lpthread','-o',str(binary)],capture_output=True,text=True)
+  build=subprocess.run([cc,*flags,*[(str(instrumented) if s=='runtime/spu/spu_channels.c' else str(root/s)) for s in sources],str(source),str(work/'outside_recomp.c'),'-lpthread','-o',str(binary)],capture_output=True,text=True)
   if build.returncode:print(build.stdout,build.stderr);raise SystemExit(build.returncode)
   r=subprocess.run([str(binary)],capture_output=True,text=True,timeout=20,env=env)
   summary=[line for line in r.stdout.splitlines() if 'passed' in line or 'FAIL:' in line]
