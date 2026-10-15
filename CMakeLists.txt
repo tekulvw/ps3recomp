@@ -403,6 +403,16 @@ if(PS3RECOMP_BUILD_TESTS)
         add_subdirectory(tests/gcm_reports)
     endif()
 
+    if(NOT WIN32)
+        add_executable(test_spu_lockline_wait
+            runtime/spu/tests/test_spu_lockline_wait.c)
+        target_include_directories(test_spu_lockline_wait PRIVATE include)
+        target_compile_options(test_spu_lockline_wait PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_lockline_wait PRIVATE Threads::Threads)
+        add_test(NAME spu_lockline_wait COMMAND test_spu_lockline_wait)
+        set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
+    endif()
+
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME loader_memory_domain
