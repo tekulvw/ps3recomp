@@ -60,7 +60,7 @@ typedef struct ac_note_record {
     int32_t rc;
 } ac_note_record;
 static struct {
-    int enabled;
+    int enabled, scalar_enabled;
     uint32_t count, dropped, pending;
     uint64_t serial;
     ac_note_record records[AC_MAX];
@@ -116,6 +116,8 @@ static BOOL WINAPI ac_init(PINIT_ONCE once,PVOID arg,PVOID* out) {
     if(s_ac_calls.target && s_ac.duration_us>10000000ull)s_ac.duration_us=10000000ull;
     const char* notes=getenv("AUDIO_CHRONOLOGY_PPU_WAIT_NOTES");
     s_ac_notes.enabled=s_ac_calls.target && notes && !strcmp(notes,"1");
+    const char* scalar=getenv("AUDIO_CHRONOLOGY_PPU_SCALAR_NOTES");
+    s_ac_notes.scalar_enabled=s_ac_notes.enabled && scalar && !strcmp(scalar,"1");
     InterlockedExchange(&s_ac.ready,1); return TRUE;
 }
 static int ac_enabled(void) {
@@ -379,10 +381,31 @@ void audio_chronology_workload(uint64_t spurs,uint32_t wid,uint64_t info,int32_t
     }
     AC_RESTORE;
 }
+/* No guest/context access: callers pass already-observed scalar values. */
+uint64_t audio_chronology_scalar_scope(void) {
+    AC_SAVE;uint64_t span=0;
+    if(ac_note_admitted() && s_ac_notes.scalar_enabled)span=ac_note_scope[1];
+    AC_RESTORE;return span;
+}
+uint64_t audio_chronology_scalar(uint64_t token,uint32_t tag,uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3) {
+    AC_SAVE;uint64_t recorded=0;
+    if(ac_note_admitted() && s_ac_notes.scalar_enabled) {
+        ac_lock();uint64_t now=ac_now();
+        if(ac_window_locked(now) && ac_note_room()) {
+            ac_note_record r={0};ac_note_identity(&r,now);
+            r.kind=3;r.phase=tag;r.token=token?token:++s_ac_notes.serial;
+            r.arg0=a0;r.arg1=a1;r.arg2=a2;r.arg3=a3;
+            s_ac_notes.records[s_ac_notes.count++]=r;recorded=r.token;
+        }
+        ac_unlock();
+    }
+    AC_RESTORE;return recorded;
+}
 static void ac_notes_dump_locked(void) {
     if(!s_ac_notes.enabled)return;
-    fprintf(stderr,"[ppu-call-note-summary] run_id=%llu start_us=%llu duration_us=%llu count=%u dropped=%u limit=%u pending_recorded_sleeps=%u coverage=existing-sleep-and-workload-info-only\n",
-        (unsigned long long)s_ac.start_us,(unsigned long long)s_ac.start_us,(unsigned long long)s_ac.duration_us,s_ac_notes.count,s_ac_notes.dropped,s_ac.limit,s_ac_notes.pending);
+    fprintf(stderr,"[ppu-call-note-summary] run_id=%llu start_us=%llu duration_us=%llu count=%u dropped=%u limit=%u pending_recorded_sleeps=%u coverage=%s\n",
+        (unsigned long long)s_ac.start_us,(unsigned long long)s_ac.start_us,(unsigned long long)s_ac.duration_us,s_ac_notes.count,s_ac_notes.dropped,s_ac.limit,s_ac_notes.pending,
+        s_ac_notes.scalar_enabled?"existing-sleep-workload-and-scalar-only":"existing-sleep-and-workload-info-only");
     for(uint32_t i=0;i<s_ac_notes.count;i++) {
         const ac_note_record* r=&s_ac_notes.records[i];
         fprintf(stderr,"[ppu-call-note] seq=%u run_id=%llu span=%llu token=%llu us=%llu ctx=%llX thread=%llu kind=%u phase=%u rc=%d arg0=%llu arg1=%llu arg2=%llu arg3=%llu\n",
