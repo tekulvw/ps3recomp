@@ -805,6 +805,9 @@ void (*spu_take_interrupt(spu_context* ctx,
 
 /* Drain a translated call up to its explicit architectural return PC. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc);
+/* Connected-region direct boundary. Returns zero to use the original drain
+ * whenever live frames or IRQ/compatibility/diagnostic state need the drain. */
+int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*));
 /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
  *
  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from

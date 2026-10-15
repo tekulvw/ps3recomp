@@ -7,6 +7,7 @@
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
 #include <setjmp.h>
+#include <stdatomic.h>
 
 /* See spu_context.h `irq_frame`. */
 typedef struct spu_irq_frame {
@@ -375,6 +376,35 @@ int spu_tailret_enabled(void)
     static int s_on = -1;
     if (s_on < 0) { const char* e = getenv("SPU_TAILRET"); s_on = (e && e[0] == 0x31) ? 1 : 0; }
     return s_on;
+}
+
+/* Internal edges retain the original transfer checkpoint. Enabled interrupts
+ * always deopt before any hook, so the existing drain owns IRQ setjmp frames,
+ * D/E delivery and restoration. Neither lockstep nor task-launch enables IRQs;
+ * stack-reset may longjmp, exactly as it does from the ordinary drain.
+ *
+ * PCHIST requires original drain accounting and therefore also deopts. Recent
+ * PC history includes local transfers; it is diagnostic, not architectural.
+ * A direct native callee can run before its caller materializes the explicit
+ * drain return PC. Keep framed transfers in the original drain, which sets
+ * that PC before invoking the destination; interpreter fallback consumes it.
+ * This helper does not admit code: generated destination gates still compare
+ * every byte of the complete original logical body before running it. */
+int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*))
+{
+    if (ctx->int_enable || ctx->host_depth || ctx->drain_ret_pc ||
+        spu_tailret_enabled()) return 0;
+    static atomic_int diagnostic_mode;
+    int diagnostic = atomic_load_explicit(&diagnostic_mode, memory_order_relaxed);
+    if (!diagnostic) {
+        diagnostic = getenv("SPU_PCHIST") ? 2 : 1;
+        atomic_store_explicit(&diagnostic_mode, diagnostic, memory_order_relaxed);
+    }
+    if (diagnostic == 2) return 0;
+    yz_lockstep_tick(ctx);
+    spu_task_launch_check(ctx, (void*)target);
+    g_spu_pch[g_spu_pch_n++ & 7u] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    return 1;
 }
 
 /* A return may use any register, not only r0. Running that branch target

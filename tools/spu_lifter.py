@@ -204,6 +204,9 @@ class LiftedFunction:
     end_addr: int = 0
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)
+    instruction_lines: list = field(default_factory=list)
+    region_suffix: list[str] = field(default_factory=list)
+    region_eligible: bool = True
 
 
 # Mnemonics whose last operand is a branch target address (0x...).
@@ -500,7 +503,7 @@ LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
 
 class SPULifter:
     def __init__(self, trace: bool = False, prefix: str = "", verified_code_image: int = 0,
-                 verified_code_spans: bool = False):
+                 verified_code_spans: bool = False, connected_regions: bool = False, region_bytes: int = 1024):
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
@@ -508,6 +511,8 @@ class SPULifter:
         self.trace = trace
         self.verified_code_image = verified_code_image
         self.verified_code_spans = verified_code_spans
+        self.connected_regions = connected_regions
+        self.region_bytes = region_bytes
         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
         # Lets multiple lifted SPU images link into one binary without collisions
         # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
@@ -553,6 +558,7 @@ class SPULifter:
                 continue
             if insn.addr in internal:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
+            instruction_start = len(func.body_lines)
             c = self._translate(insn, func)
             if c:
                 if self.trace:
@@ -561,8 +567,12 @@ class SPULifter:
                 if self.trace and insn.mnemonic not in _NO_RT_WRITE:
                     rt_idx = insn.raw & 0x7F
                     func.body_lines.append(f"    spu_trace_rt(ctx, {rt_idx});")
+            func.instruction_lines.append((insn.addr, func.body_lines[instruction_start:]))
+            if c and ("spu_unsupported(" in c or "TODO spu:" in c):
+                func.region_eligible = False
             last_insn = insn
 
+        suffix_start = len(func.body_lines)
         # Fall-through chaining: if the final instruction does NOT unconditionally
         # end the basic block (i.e. it's a normal op, a call brsl/bisl, or a
         # conditional branch whose not-taken path continues), execution proceeds
@@ -578,6 +588,8 @@ class SPULifter:
                 f"    {{ ctx->pc = 0x{end:X}; "
                 f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
 
+        func.region_suffix = func.body_lines[suffix_start:]
+
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
         # nothing but spin. The default lifting renders it as `goto loc_<x>` --
@@ -591,6 +603,7 @@ class SPULifter:
             ltgt = self._branch_target(last)
             if (last.mnemonic in ("br", "bra") and ltgt is not None
                     and start <= ltgt < end):
+                func.region_eligible = False
                 func.body_lines = [
                     "    /* infinite no-op self-loop (SPU halt idiom) -> abort */",
                     "    spu_halt(ctx); return;",
@@ -1069,6 +1082,9 @@ class SPULifter:
         return "\n".join(lines)
 
     def emit_source(self,header_name: str) -> str:
+        if self.connected_regions:
+            from spu_regions import emit_connected
+            return emit_connected(self, header_name, SOURCE_PREAMBLE)
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
         if self.verified_code_image:
             lines.append('#include "spu_verified_overlay.h"')
@@ -1156,6 +1172,8 @@ def main() -> None:
                    help="Opt-in exact readonly-text image id. Guard every emitted function entry; requires verified overlay runtime registration. Transfer entries only, not mid-function SMC.")
     p.add_argument("--verified-code-spans", action="store_true",
                    help="With --verified-code-image, validate the complete executing function span at direct entries; indirect admission still checks the full image.")
+    p.add_argument("--connected-regions", action="store_true", help="Opt-in multi-entry regions with exact body guards and sensitive-edge dispatcher fallback")
+    p.add_argument("--region-bytes", type=lambda s: int(s,0), default=1024, help="Maximum grouped region bytes; a larger logical body remains intact")
     p.add_argument("--extra-funcs", default="",
                    help="Comma-separated extra function entry addresses (e.g. "
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
@@ -1205,6 +1223,8 @@ def main() -> None:
     if args.verified_code_spans and not args.verified_code_image:
         p.error("--verified-code-spans requires --verified-code-image")
 
+    if args.connected_regions and not (args.verified_code_image and args.verified_code_spans):
+        p.error("--connected-regions requires --verified-code-image and --verified-code-spans")
     if args.auto_functions:
         from find_spu_functions import detect_functions, parse_elf, pick_text, text_image
         with open(args.auto_functions, "rb") as f:
@@ -1318,7 +1338,8 @@ def main() -> None:
 
     lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix,
                       verified_code_image=args.verified_code_image,
-                      verified_code_spans=args.verified_code_spans)
+                      verified_code_spans=args.verified_code_spans,
+                      connected_regions=args.connected_regions, region_bytes=args.region_bytes)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
@@ -1366,6 +1387,10 @@ def main() -> None:
                        "unsupported": lifter.unsupported,
                        "call_targets": sorted(lifter.call_targets),
                        "branch_targets": sorted(lifter.branch_targets)}, report, indent=2)
+
+    if args.connected_regions:
+        with open(os.path.join(args.output, "spu_regions.json"), "w") as f:
+            json.dump(lifter.region_manifest, f, indent=2); f.write("\n")
 
     print(f"Wrote {hp}")
     print(f"Wrote {sp}")
