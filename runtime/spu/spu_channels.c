@@ -1571,13 +1571,24 @@ int spu_verified_code_enter(const spu_context* ctx, int image, uint32_t entry)
     return spu_verified_lookup(ctx, entry, &covered, &owner) != NULL && owner == image;
 }
 
+/* Apply to every legacy resolver exit, including authoritative resident
+ * owners. A guarded image outside its verified span must not reject and then
+ * be selected repeatedly through a legacy ownership binding. */
+static spu_lifted_fn spu_verified_filter_legacy(uint32_t lsa, spu_fn fn)
+{
+    if (fn && s_verified_count)
+        for (unsigned i = 0; i < s_verified_count; ++i)
+            if (fn == spu_lookup_exact(lsa, s_verified_images[i].image)) return NULL;
+    return (spu_lifted_fn)fn;
+}
+
 /* Shared by indirect dispatch and interpreter rejoin. A bounded resident
  * code owner is authoritative even if it has no lift at this LSA: falling
  * through would execute stale code registered under another image. Task and
  * unbounded overlay misses retain their existing primary-image fallback. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
-    if (!ctx) return (spu_lifted_fn)spu_lookup(lsa, 0);
+    if (!ctx) return spu_verified_filter_legacy(lsa, spu_lookup(lsa, 0));
     if (s_verified_count) {
         int covered, image;
         spu_fn fn = spu_verified_lookup(ctx, lsa, &covered, &image);
@@ -1587,17 +1598,12 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         if (ctx->resident_code[slot].image_id &&
             lsa >= ctx->resident_code[slot].lsa &&
             lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
-            return (spu_lifted_fn)spu_lookup(lsa, ctx->resident_code[slot].image_id);
+            return spu_verified_filter_legacy(lsa, spu_lookup(lsa, ctx->resident_code[slot].image_id));
     spu_fn fn = NULL;
     if (ctx->resident_task) fn = spu_lookup(lsa, ctx->resident_task);
     if (!fn && ctx->resident_ovl) fn = spu_lookup(lsa, ctx->resident_ovl);
     if (!fn) fn = spu_lookup(lsa, ctx->image_id);
-    /* A wildcard/unrelated context cannot bypass a guarded image's rejected
-     * policy through the legacy registry and recursively schedule that body. */
-    if (fn && s_verified_count)
-        for (unsigned i = 0; i < s_verified_count; ++i)
-            if (fn == spu_lookup_exact(lsa, s_verified_images[i].image)) return NULL;
-    return (spu_lifted_fn)fn;
+    return spu_verified_filter_legacy(lsa, fn);
 }
 
 /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
