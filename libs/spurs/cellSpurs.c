@@ -2083,10 +2083,23 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     return 0;
 }
 
+/* Opt-in SPURS1 ready level: ready is guest-owned demand, not a token.
+ * Keep the legacy default while this bounded coordinator experiment is measured.
+ * Signal/receiver flag requests remain independent admission sources. */
+static int spurs_ready_requests(u32 ea, u32 wid, u32 ready, u32 active, int target_mode)
+{
+    if (!target_mode) return ready != 0;
+    u32 idle = vm_read8(ea + SPURS_WKL_IDLE2 + wid);
+    u32 requested = (ready > 8 ? 8 : ready) + (idle > 8 ? 8 : idle);
+    return ready != 0 && requested > active;
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
     int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
+    const char* target_option = getenv("PS3RECOMP_SPURS_READY_TARGET");
+    const int target_mode = target_option && !strcmp(target_option, "1");
     AcquireSRWLockExclusive(&si->lock);
     while (!si->stopping) {
         SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
@@ -2115,7 +2128,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 if (!pm) continue;
                 u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
                 u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
-                int kicked = ready || (signal & (0x8000u >> wid)) ||
+                int kicked = spurs_ready_requests(ea, wid, ready, si->active[wid], target_mode) ||
+                             (signal & (0x8000u >> wid)) ||
                              spurs_flag_status(ea, wid, 0);
                 /* Registration/minimum contention do not request execution.
                  * Unsolicited policy probes make an idle workload appear busy
@@ -2126,13 +2140,15 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
                 /* Recheck all request sources in the consumption transaction;
                  * a PPU/SPU may have withdrawn a request since the first probe. */
-                if (!ready && !(signal & (0x8000u >> wid)) &&
+                if (!spurs_ready_requests(ea, wid, ready, si->active[wid], target_mode) &&
+                    !(signal & (0x8000u >> wid)) &&
                     !spurs_flag_status_locked(ea, wid)) {
                     spu_lockline_unlock();
                     continue;
                 }
                 si->idle[wid] = 0;
-                if (ready) vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
+                if (ready && !target_mode)
+                    vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
                 if (signal & (0x8000u >> wid))
                     ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~(0x8000u >> wid)));
                 ef_line_end(ea);
