@@ -76,6 +76,23 @@ int main(void){
         h=digest(h,a.gpr,sizeof(a.gpr));h=digest(h,a.ls,SPU_LS_SIZE);
         h=digest(h,&a.pc,sizeof(a.pc));h=digest(h,&a.status,sizeof(a.status));
     }
+    /* Cached decode must equal the unchanged reference on arbitrary words,
+     * including unsupported opcodes (decode only), different PCs and code
+     * replacement. Do not compare padding in the decoder's result struct. */
+    uint32_t random=0xDECAFBADu;
+    for(unsigned k=0;k<8192;k++){
+        random=random*1664525u+1013904223u;
+        uint32_t raw=random,pc=(k*997u)&SPU_LS_MASK;
+        /* Existing decoder shifts a signed negative LQD/STQD displacement;
+         * exclude that inherited UB from this optimization's UBSan oracle. */
+        if((raw>>24)==0x34u||(raw>>24)==0x24u)raw&=~(1u<<23);
+        for(unsigned repeat=0;repeat<2;repeat++){
+            spu_ins got,want;test_decode_path(raw,pc,&got);spu_decode1(raw,pc,&want);
+            CHECK(got.op==want.op);CHECK(got.rt==want.rt);CHECK(got.ra==want.ra);
+            CHECK(got.rb==want.rb);CHECK(got.rc==want.rc);CHECK(got.ch==want.ch);
+            CHECK(got.imm==want.imm);CHECK(got.tgt==want.tgt);
+        }
+    }
     pthread_t ts[4];for(uintptr_t k=0;k<4;k++)CHECK(!pthread_create(&ts[k],NULL,thread_case,(void*)(k+31)));
     for(int k=0;k<4;k++)CHECK(!pthread_join(ts[k],NULL));
     printf("PASS checks=%u architecture=%016llx\n",checks,(unsigned long long)h);
