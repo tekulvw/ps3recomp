@@ -3,7 +3,7 @@
  *
  * See spu_coherency.h for what this is for. The state here is deliberately
  * plain: a bit per 128-byte line, a small table of the SPU contexts that have
- * ever reserved one, and the lock-line spinlock. Everything that WRITES it runs
+ * ever reserved one, and the lock-line lock. Everything that WRITES it runs
  * with the lock-line lock held (the SPU's GETLLAR, the PPU's coherent store),
  * so the read-modify-write on a shared bitmap byte is serialized. Only
  * spu_coh_is_reserved reads without the lock, which is the entire point: it is
@@ -27,9 +27,8 @@ extern "C" {
  * Moved here from spu_channels.c, where it was a file-static and so could
  * serialize SPU against SPU but not SPU against PPU -- which left the PPU free
  * to write a line in the middle of a PUTLLC's compare-and-commit. Same
- * spinlock, same semantics, now shared. _InterlockedExchange is a clang-cl/MSVC
- * intrinsic (no runtime library symbol needed); elsewhere use the C11
- * equivalent, which lowers to the same LL/SC or lock-xchg on every target.
+ * exclusion semantics, now shared. MSVC uses a bounded polite spin loop;
+ * POSIX uses a mutex so a descheduled owner does not make every waiter spin.
  * ===========================================================================*/
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -50,11 +49,22 @@ void spu_lockline_lock(void)
     }
 }
 void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
-#else
+#elif defined(_WIN32)
+/* Retain the existing non-MSVC Windows path without a pthread dependency. */
 #include <stdatomic.h>
 static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
 void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
 void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
+#else
+#include <pthread.h>
+/* The owner may be descheduled or wake a host channel waiter while holding
+ * this global lock. An unbounded exchange loop then consumes whole cores and
+ * competes with the owner and the remaining SPU workers. Let the host park
+ * contended waiters; the mutex preserves the same non-recursive exclusion and
+ * acquire/release publication for every reservation and coherent store. */
+static pthread_mutex_t g_lockline = PTHREAD_MUTEX_INITIALIZER;
+void spu_lockline_lock(void)   { if (pthread_mutex_lock(&g_lockline)) abort(); }
+void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort(); }
 #endif
 
 /* ===========================================================================
