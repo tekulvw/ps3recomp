@@ -95,6 +95,38 @@ static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
     d->op = SPU_word;
 }
 
+/* Adapted from PR213 commit 8a10b544: decode is a function of the live word
+ * and PC, not the context/image. Revalidate the word on every instruction so
+ * DMA overlays and self-modifying stores cannot reuse stale decoded operands.
+ * Fixed TLS owns bounded storage for the host thread's lifetime (no retained
+ * heap allocation when a worker exits). This is not a lifted-function cache.
+ * SPU_INTERP_DECODE_CACHE=0 selects the original decoder for native A/B. */
+#if defined(_MSC_VER)
+#  define SPU_DECODE_TLS __declspec(thread)
+#else
+#  define SPU_DECODE_TLS _Thread_local
+#endif
+static inline void spu_decode_cached(uint32_t insn, uint32_t pc, spu_ins* d)
+{
+    typedef struct { uint32_t insn, pc; spu_ins decoded; unsigned valid; } spu_dent;
+    static SPU_DECODE_TLS spu_dent cache[SPU_LS_SIZE / 4];
+    static SPU_DECODE_TLS int enabled = -1;
+    if (enabled < 0) {
+        const char* e = getenv("SPU_INTERP_DECODE_CACHE");
+        enabled = !(e && e[0] == '0' && e[1] == '\0');
+    }
+    if (!enabled) { spu_decode1(insn, pc, d); return; }
+    spu_dent* entry = &cache[(pc & SPU_LS_MASK) >> 2];
+    if (!entry->valid || entry->insn != insn || entry->pc != pc) {
+        spu_decode1(insn, pc, &entry->decoded);
+        entry->insn = insn;
+        entry->pc = pc;
+        entry->valid = 1;
+    }
+    *d = entry->decoded;
+}
+#undef SPU_DECODE_TLS
+
 /* spu_lifted_lookup() is defined by spu_fn_registry.c (the single owner of the
  * lifted-function table + eviction). Declared in spu_interp.h. */
 
@@ -112,7 +144,7 @@ static int spu_step(spu_context* ctx) {
     const uint8_t* p = ctx->ls;
     uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
                   | ((uint32_t)p[m+2] << 8) | p[m+3];
-    spu_ins d; spu_decode1(insn, pc, &d);
+    spu_ins d; spu_decode_cached(insn, pc, &d);
     uint32_t next = pc + 4;
     int indirect_taken = 0;
 
