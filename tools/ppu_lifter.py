@@ -618,6 +618,9 @@ def _reg_idx(token: str) -> str:
 # Callee-saved register save/restore (r14-r31) to/from the frame, for the
 # robust ABI-preservation pass in lift_function. Group order: SAVE -> (off, reg);
 # RESTORE -> (reg, off), so a save and its restore pair on matching (off, reg).
+# Any write of a GPR in emitted C: `ctx->gpr[N] = ...`, `ctx->gpr[N] += ...` etc.,
+# anywhere in the line (not `==`). Used to find a register's first redefinition.
+_CS_ANY_DEF_RE = re.compile(r'ctx->gpr\[(\d+)\]\s*(?:[-+*/|&^%]|<<|>>)?=(?!=)')
 _CS_SAVE_RE = re.compile(
     r'vm_write64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
 _CS_REST_RE = re.compile(
@@ -1043,10 +1046,15 @@ class PPULifter:
         # stores went through a stale pointer (missing/torn cube polygons).
         # Track each callee-save register's first redefinition and only accept
         # saves that precede it.
+        #
+        # Every assignment counts, not only a line that starts with one. The
+        # carry forms (addic/addc/adde/addze/subfc/subfic) are emitted as
+        # `{ uint64_t _a = ...; ctx->gpr[N] = _r; ... }`, so they were invisible: a
+        # single spill/reload of a register set by one of them passed as a callee-save
+        # and the reload became the register's value at entry.
         _first_def = {}
         for _i, _l in enumerate(func.body_lines):
-            _dm = re.match(r'\s*ctx->gpr\[(\d+)\] = ', _l)
-            if _dm:
+            for _dm in _CS_ANY_DEF_RE.finditer(_l):
                 _r = int(_dm.group(1))
                 if _r not in _first_def:
                     _first_def[_r] = _i
