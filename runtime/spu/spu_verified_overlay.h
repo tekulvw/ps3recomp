@@ -28,6 +28,16 @@ int spu_verified_overlay_register(int policy_image_id, int image_id,
  */
 int spu_verified_code_enter(const spu_context* ctx, int image_id, uint32_t entry);
 
+/* Opt-in generated direct-transfer gate. Verifies every instruction byte in
+ * the complete generated function [entry,end) at each entry, without caching
+ * trust. The interval must fit within one registered executable segment and
+ * begin at an exact registered function. Other functions validate their own
+ * spans when entered. Indirect lookup retains full-image admission/ambiguity
+ * checks. Callers must pass the full interval represented by the lifted body;
+ * this is not a whole-image identity assertion or mid-function SMC support. */
+int spu_verified_code_enter_span(const spu_context* ctx, int image_id,
+    uint32_t entry, uint32_t end);
+
 #ifdef __cplusplus
 }
 #endif

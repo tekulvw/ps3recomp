@@ -1627,6 +1627,27 @@ int spu_verified_code_enter(const spu_context* ctx, int image, uint32_t entry)
     return spu_verified_lookup(ctx, entry, &covered, &owner) != NULL && owner == image;
 }
 
+int spu_verified_code_enter_span(const spu_context* ctx, int image,
+    uint32_t entry, uint32_t end)
+{
+    if (!ctx || !ctx->policy_mode || ctx->ls != ctx->ls_store ||
+        ((entry | end) & 3u) || end <= entry || end > SPU_LS_SIZE)
+        return 0;
+    for (unsigned i = 0; i < s_verified_count; ++i) {
+        const spu_verified_image* v = &s_verified_images[i];
+        if (v->image != image || v->policy != ctx->image_id) continue;
+        for (unsigned j = 0; j < v->count; ++j) {
+            const spu_verified_code_segment* s = &v->segments[j];
+            if (entry < s->lsa || end > s->lsa + s->size) continue;
+            if (!spu_lookup_exact(entry, image)) return 0;
+            uint32_t offset = entry - s->lsa;
+            return memcmp(ctx->ls + entry, s->bytes + offset, end - entry) == 0;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 /* Apply to every legacy resolver exit, including authoritative resident
  * owners. A guarded image outside its verified span must not reject and then
  * be selected repeatedly through a legacy ownership binding. */
