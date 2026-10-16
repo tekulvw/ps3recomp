@@ -105,7 +105,15 @@ int main(void) {
     assert(vm_read32(watched+12)==0x00010000 && !notified && !broken && !watch_writes);
     assert(flushed==1 && live_flushed==1 && s_report_data[0x43].value==0xFFFF);
     reject(0xDEADBEEF,0x430); reject(0xBAD68000,0x431);
-    reject(0xFEED0000,0x430); /* Generic VRAM context is not a report context. */
+    /* Upstream accepts the generic local DMA handle as a local-report alias.
+     * It must never invent a guest report-memory window. */
+    prepare(0x2000430);expect_publication=0;
+    u64 local_before=s_report_data[0x43].timestamp;
+    run_report(0xFEED0000,0x430);
+    assert(s_report_dma==GCM_REPORT_DMA_LOCAL);
+    assert(vm_read32(watched+12)==0x10000&&!notified&&!broken&&!watch_writes);
+    assert(flushed==1&&live_flushed==1&&s_report_data[0x43].value==0xffff);
+    assert(s_report_data[0x43].timestamp>local_before);
     reject(0xBAD68000,0x100000); /* Next IO page is unmapped. */
     s_ea_address_table[0xE1]=0x1000; reject(0xBAD68000,0x100000); /* Invalid EA page. */
     s_ea_address_table[0xE0]=0x40; reject(0xBAD68000,0x430); /* Beyond VM size. */

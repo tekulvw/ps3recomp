@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix='native-osk-') as t:
   app=Path(t)/'OskFixture.app';(app/'Contents/MacOS').mkdir(parents=True)
   (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable':'ui','CFBundleIdentifier':'org.ps3recomp.tests.nativeosk','CFBundleName':'Native OSK fixture','CFBundlePackageType':'APPL','CFBundleVersion':'1'}))
   ui=app/'Contents/MacOS/ui'
-  subprocess.run(['clang','-fobjc-arc','-O1','-UNDEBUG','-I'+str(r/'include'),str(r/'tests/test_native_osk_macos.m'),*objects,str(r/'libs/input/pad_macos.m'),str(r/'libs/video/rsx_texture_layout.c'),'-framework','Metal','-framework','QuartzCore','-framework','AppKit','-pthread','-Wl,-dead_strip','-o',str(ui)],check=True)
+  subprocess.run(['clang','-fobjc-arc','-O1','-UNDEBUG','-I'+str(r/'include'),str(r/'tests/test_native_osk_macos.m'),*objects,str(r/'libs/input/pad_macos.m'),str(r/'libs/video/rsx_texture_layout.c'),str(r/'runtime/diagnostics/critical_trace.c'),'-framework','Metal','-framework','QuartzCore','-framework','AppKit','-pthread','-Wl,-dead_strip','-o',str(ui)],check=True)
   other=Path(t)/'OtherFixture.app';(other/'Contents/MacOS').mkdir(parents=True)
   info=plistlib.loads((app/'Contents/Info.plist').read_bytes());info['CFBundleIdentifier']='org.ps3recomp.tests.nativeoskother';info['CFBundleName']='Other focus fixture'
   (other/'Contents/Info.plist').write_bytes(plistlib.dumps(info));shutil.copy2(ui,other/'Contents/MacOS/ui')

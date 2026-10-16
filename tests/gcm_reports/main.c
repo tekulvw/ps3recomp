@@ -130,9 +130,11 @@ int main(void)
     CHECK(t1 != untouched && t1 < t2 && t2 < t3 && t3 < t4,
           "timestamps strictly rising: %llu < %llu < %llu < %llu",
           (unsigned long long)t1, (unsigned long long)t2, (unsigned long long)t3, (unsigned long long)t4);
-    CHECK(cellGcmGetReportDataAddress(MAIN_OFF1 / 16u) == NULL ||
-          cellGcmGetReportDataAddress(MAIN_OFF1 / 16u)->timestamp == 0,
-          "main report left the host report area alone");
+    /* The integrated native API retains a host mirror for in-range report
+     * indices as well as the authoritative mapped guest completion record. */
+    r = cellGcmGetReportDataAddress(MAIN_OFF1 / 16u);
+    CHECK(r && r->timestamp == t1 && r->value == 0xffffu,
+          "main report API mirror agrees with the actual mapped guest report");
     r = cellGcmGetReportDataAddress(LOCAL_OFF2 / 16u);
     CHECK(r && r->value == 0xFFFFu && r->timestamp > t4 && gr32(IO_ADDR + LOCAL_OFF2) == SENTINEL,
           "back on 0xFEED0000: host slot 0x%X written after the main reports, guest untouched",

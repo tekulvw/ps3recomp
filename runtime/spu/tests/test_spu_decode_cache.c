@@ -53,8 +53,8 @@ int main(void){
     CHECK(step(&a,0x200,0x32000100u)==0);CHECK(a.pc==0x208);
     CHECK(step(&b,0x300,0x32000100u)==0);CHECK(b.pc==0x308);
     CHECK(step(&a,0x200,0x32000100u)==0);CHECK(a.pc==0x208);
-    /* Last valid LS word: preserve inherited next-PC behavior, no new fetch. */
-    CHECK(step(&a,0x3FFFC,il(3,-1))==0);CHECK(a.pc==0x40000);scalar(&a,3,UINT32_MAX);
+    /* Last valid LS word: upstream wraps the fallthrough PC into local store. */
+    CHECK(step(&a,0x3FFFC,il(3,-1))==0);CHECK(a.pc==0);scalar(&a,3,UINT32_MAX);
     /* Zero is a valid first opcode, not an uninitialized-cache hit. */
     CHECK(step(&a,0,0)==1);CHECK(a.status==SPU_STATUS_STOPPED_BY_STOP);CHECK(a.pc==4);
     /* Actual STQD replaces all four code words through the production LS writer. */

@@ -4,6 +4,7 @@ static int test_queue(SDL_AudioDeviceID, const void*, Uint32);
 static Uint32 test_queued(SDL_AudioDeviceID);
 #define SDL_QueueAudio test_queue
 #define SDL_GetQueuedAudioSize test_queued
+#include "../../../runtime/diagnostics/audio_chronology_impl.h"
 #include "../cellAudio.c"
 #include <assert.h>
 

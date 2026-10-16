@@ -209,6 +209,13 @@ static void fail(const char* test, const char* fmt, ...)
 }
 
 static ULONGLONG now_ms(void) { return GetTickCount64(); }
+/* Shared diagnostic ticks use Win32 LONG. Compare modulo 2^32 so signed
+ * bit31 and the 49.7-day tick wrap cannot manufacture a multi-day stall. */
+static ULONGLONG elapsed_since_tick(ULONGLONG now, LONG earlier)
+{
+    return (uint32_t)((uint32_t)now - (uint32_t)earlier);
+}
+
 
 /* =========================================================================
  * TEST 1 -- No lost wakeup
@@ -336,7 +343,7 @@ static unsigned __stdcall t1_watchdog(void* p)
         Sleep(100);
         if (sh->done_producing && sh->produced <= sh->consumed) return 0; /* test finished cleanly */
         if (sh->produced > sh->consumed) {
-            ULONGLONG stalled_for = now_ms() - (ULONGLONG)sh->last_progress_ms;
+            ULONGLONG stalled_for = elapsed_since_tick(now_ms(), InterlockedCompareExchange(&sh->last_progress_ms, 0, 0));
             if (stalled_for > T1_STALL_MS) {
                 fprintf(stderr, "[FAIL] test1_no_lost_wakeup: STUCK: no consumption progress for "
                         ">%dms with produced=%ld consumed=%ld (possible lost wakeup)\n",
@@ -406,7 +413,7 @@ static unsigned __stdcall t1b_watchdog(void* p)
         Sleep(50);
         if (sh->woke) return 0;
         if (sh->parked_at_ms != 0) {
-            ULONGLONG since_park = now_ms() - (ULONGLONG)sh->parked_at_ms;
+            ULONGLONG since_park = elapsed_since_tick(now_ms(), InterlockedCompareExchange(&sh->parked_at_ms, 0, 0));
             if (since_park > (ULONGLONG)(T1B_PARK_DELAY_MS + T1B_STALL_MS)) {
                 fprintf(stderr, "[FAIL] test1b_rendezvous_park: consumer parked >%dms ago and "
                         "never woke (signal delivered to an already-sleeping waiter was lost)\n",
@@ -1441,6 +1448,10 @@ int main(int argc, char** argv)
 
     ULONGLONG t_start = now_ms();
 
+    if (elapsed_since_tick(UINT64_C(0x80000010), (LONG)0x7ffffff0u) != 32 ||
+        elapsed_since_tick(UINT64_C(0x100000010), (LONG)0xfffffff0u) != 32) {
+        fprintf(stderr, "[FAIL] watchdog tick rollover arithmetic\n");return 1;
+    }
     int rc1a = test1b_rendezvous_park();
     int rc1 = test1_no_lost_wakeup();
     int rc2 = test2_timed_wait_semantics();

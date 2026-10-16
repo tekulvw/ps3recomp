@@ -60,5 +60,5 @@ with tempfile.TemporaryDirectory(prefix='ppu-spu-lines-') as tmp:
  common=['-O1','-ffunction-sections','-fdata-sections']
  subprocess.run([os.environ.get('CC','cc'),'-std=gnu17',*common,'-c',str(root/'runtime/spu/spu_coherency.c'),'-o',str(p/'coh.o')],check=True)
  subprocess.run([os.environ.get('CC','cc'),*common,'-c',str(root/'runtime/platform/win32_compat.c'),'-o',str(p/'compat.o')],check=True)
- subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-UNDEBUG',*common,'-I'+str(p),'-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform'),str(root/'runtime/ppu/ppu_loader.cpp'),str(p/'driver.cpp'),str(p/'lifted.cpp'),str(p/'coh.o'),str(p/'compat.o'),'-pthread',('-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'),'-o',str(p/'test')],check=True)
+ subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-UNDEBUG','-I'+str(root/'runtime/ppu'),*common,'-I'+str(p),'-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform'),str(root/'runtime/ppu/ppu_loader.cpp'),str(p/'driver.cpp'),str(p/'lifted.cpp'),str(p/'coh.o'),str(p/'compat.o'),'-pthread',('-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True,timeout=10)

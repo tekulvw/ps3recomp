@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix='spu-xorbi-') as tmp:
         binary = Path(tmp) / name
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                         '-I'+str(root/'include'), '-I'+str(spu),
-                        str(spu/'tests'/f'{name}.c'), str(spu/'spu_interp.c'),
+                        str(spu/'tests'/f'{name}.c'), str(spu/'spu_interp.c'), str(root/'runtime/platform/win32_compat.c'),
                         '-lm', '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)
 
@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix='spu-xorbi-') as tmp:
     binary = Path(tmp) / 'xorbi_lifted'
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-DXORBI_LIFTED',
                     '-I'+str(root/'include'), '-I'+str(spu), '-include', str(generated),
-                    str(spu/'tests/test_spu_interpreter_xorbi.c'), str(spu/'spu_interp.c'),
+                    str(spu/'tests/test_spu_interpreter_xorbi.c'), str(spu/'spu_interp.c'), str(root/'runtime/platform/win32_compat.c'),
                     '-lm', '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)
     regenerated = subprocess.check_output([os.environ.get('PYTHON', 'python3'), str(root/'tools/gen_spu_interp.py')])

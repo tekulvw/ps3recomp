@@ -20,5 +20,5 @@ with tempfile.TemporaryDirectory(prefix='spu-ri10-exec-') as tmp:
     source += ['static void lifted_run(uint32_t word,spu_context* ctx) {switch(word) {',*entries,'default: abort();}}']
     generated=tmp/'lifted.h';generated.write_text('\n'.join(source)+'\n')
     exe=tmp/'test'
-    subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG','-DRI10_LIFTED','-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-include',str(generated),str(root/'runtime/spu/tests/test_spu_interpreter_orbi_xorhi.c'),str(root/'runtime/spu/spu_interp.c'),'-lm','-o',str(exe)],check=True)
+    subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG','-DRI10_LIFTED','-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-include',str(generated),str(root/'runtime/spu/tests/test_spu_interpreter_orbi_xorhi.c'),str(root/'runtime/spu/spu_interp.c'), str(root/'runtime/platform/win32_compat.c'),'-lm','-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True,timeout=5,env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_'))})

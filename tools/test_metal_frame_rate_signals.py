@@ -10,7 +10,7 @@ with tempfile.TemporaryDirectory(prefix='metal-fps-signals-') as tmp:
         print('SKIP: Objective-C callback fixture requires macOS')
     else:
         common = ['clang', '-fobjc-arc', '-DPS3RECOMP_DISABLE_NATIVE_OSK', '-I', 'include', '-I', 'libs/video']
-        link = ['libs/video/rsx_texture_layout.c', 'libs/input/pad_macos.m', '-Wl,-dead_strip', '-framework', 'Metal', '-framework', 'Cocoa', '-framework', 'QuartzCore']
+        link = ['libs/video/rsx_texture_layout.c','runtime/diagnostics/critical_trace.c', 'libs/input/pad_macos.m', '-Wl,-dead_strip', '-framework', 'Metal', '-framework', 'Cocoa', '-framework', 'QuartzCore']
         for name, args in [('test_metal_frame_rate_signals', []), ('test_metal_frame_rate', ['stats'])]:
             binary = pathlib.Path(tmp) / name
             subprocess.run(common + ['libs/video/tests/' + name + '.m'] + link + ['-o', str(binary)], cwd=ROOT, check=True, timeout=60)
