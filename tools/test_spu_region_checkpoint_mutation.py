@@ -23,6 +23,7 @@ COMMON=['spu_lockstep.c','spu_coherency.c','spu_workload.c','spurs_policy.c',
 def run():
     env={k:v for k,v in os.environ.items()
          if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
+    env['SPU_REGION_FRAMED']=os.environ.get('SPU_REGION_FRAMED','0')
     with tempfile.TemporaryDirectory(prefix='spu-checkpoint-mutation-') as td:
         p=pathlib.Path(td)
         words=[0x1c000000|(1<<14)|(20<<7)|20,0x32000080,
