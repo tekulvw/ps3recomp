@@ -4,6 +4,7 @@ import os,pathlib,re,struct,subprocess,sys,tempfile,json
 root=pathlib.Path(__file__).resolve().parents[1];spu=root/'runtime/spu'
 common=['spu_drain.c','spu_lockstep.c','spu_coherency.c','spu_workload.c','spurs_policy.c','spurs_job.c','spu_tsp_weak.c','spu_vm_pagemap.c','spurs_policy_blob_weak.c','spu_interp.c']
 env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
+env['SPU_REGION_FRAMED']=os.environ.get('SPU_REGION_FRAMED','0')
 with tempfile.TemporaryDirectory(prefix='spu-region-exec-') as td:
  p=pathlib.Path(td);words=[0x40800007,0x40800188,0x1c004387,0x1cffc408,0x217fff08,0x35000000]
  blob=struct.pack('>6I',*words);(p/'program.bin').write_bytes(blob)

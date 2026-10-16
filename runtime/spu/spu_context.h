@@ -392,6 +392,8 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+    uint32_t region_dispatch_depth, region_return_pc;
+    int region_dispatch_valid, region_has_return;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -796,6 +798,30 @@ void spu_ch_wake(spu_context* ctx);
  * SPU_HOST_DEPTH_MAX overrides the limit. */
 void spu_depth_guard(spu_context* ctx);
 int  spu_tailret_enabled(void);
+/* Actual native dispatch ownership; nested drains invalidate rather than restore. */
+extern int g_spu_region_scope_mode;
+int spu_region_scope_enabled(void);
+static inline int spu_region_scope_on(void) {
+#if defined(_MSC_VER)
+    return spu_region_scope_enabled();
+#else
+    int mode=__atomic_load_n(&g_spu_region_scope_mode,__ATOMIC_RELAXED);
+    return mode ? mode==2 : spu_region_scope_enabled();
+#endif
+}
+static inline void spu_region_dispatch_invoke(spu_context* ctx,
+    void (*fn)(spu_context*), int has_return, uint32_t return_pc) {
+    ctx->region_dispatch_valid=0;
+    if(spu_region_scope_on()) {
+        ctx->region_dispatch_depth=ctx->host_depth;
+        ctx->region_return_pc=return_pc&SPU_LS_MASK;
+        ctx->region_has_return=has_return;
+        ctx->region_dispatch_valid=1;
+    }
+    fn(ctx);
+    ctx->region_dispatch_valid=0;
+}
+
 /* Take a pending SPU interrupt (spu_drain.c): srr0 <- ctx->pc, int_enable <- 0,
  * decode the guest-planted branch at LS 0 into ctx->pc, and return the
  * dispatcher to run instead of the interrupted transfer. Returns `tf`
@@ -858,6 +884,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */
 #define SPU_DRAIN(ctx) do {                                    \
+        (ctx)->region_dispatch_valid=0;                        \
         spu_depth_guard(ctx);                                  \
         while (g_spu_trampoline_fn) {                           \
             /* SPU_TAILRET=1: a pending transfer whose target equals the   \
@@ -883,7 +910,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             spu_pchist_tick(ctx);                              \
             g_spu_pch[g_spu_pch_n++ & 7u] =                    \
                 (uint32_t)((ctx)->pc & SPU_LS_MASK);           \
-            _tf(ctx);                                          \
+            spu_region_dispatch_invoke((ctx),_tf,0,0);                                          \
         }                                                      \
     } while (0)
 

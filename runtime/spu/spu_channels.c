@@ -122,6 +122,7 @@ static SPU_TLS int     s_spu_halt_armed = 0;
  * any architectural registers, local store, or pending guest work. */
 void spu_restart_dispatch(spu_context* ctx)
 {
+    ctx->region_dispatch_valid=0;
     g_spu_trampoline_fn = 0;
     if (s_spu_halt_armed) longjmp(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
@@ -146,6 +147,7 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 
 void spu_halt(spu_context* ctx)
 {
+    ctx->region_dispatch_valid=0;
     /* Register/context dump at halt-asserts: the WWS job's parameter guard
      * (heqi 0x1650 in job_wws_7BD900) checks (r12 bit0) & (r9 16-aligned) &
      * (r15 != 0) -- job descriptor/ABI values our execute path must supply.
@@ -208,6 +210,7 @@ void spu_stop(spu_context* ctx)
  * (via spu_halt), 0 if it returned normally. */
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
+    ctx->region_dispatch_valid=0;
     int halted = 0;
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
@@ -250,10 +253,12 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     yz_lockstep_register(ctx);
     switch (setjmp(s_spu_halt_env)) {
     case 1:
+        ctx->region_dispatch_valid=0;
         halted = 1;
         g_spu_trampoline_fn = 0;
         break;
     case 2:
+        ctx->region_dispatch_valid=0;
         /* A one-way guest stack reset invalidates every lifted host caller.
          * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;
@@ -277,6 +282,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
               fflush(stderr); } }
         SPU_DRAIN(ctx);
     }
+    ctx->region_dispatch_valid=0;
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
@@ -1810,6 +1816,7 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
+            ctx->region_dispatch_valid=0;
             longjmp(s_spu_halt_env, 2);
         }
 }
@@ -2529,6 +2536,7 @@ void spu_indirect_branch(spu_context* ctx)
              * Resume at depth zero so SPU_RET follows the restored guest link. */
             ctx->resident_task = ti;
             g_spu_trampoline_fn = 0;
+            ctx->region_dispatch_valid=0;
             longjmp(s_spu_halt_env, 2);
         }
         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);

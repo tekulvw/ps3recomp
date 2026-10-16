@@ -26,6 +26,7 @@ def ai(reg):
 def run():
     env={k:v for k,v in os.environ.items()
          if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
+    env['SPU_REGION_FRAMED']=os.environ.get('SPU_REGION_FRAMED','0')
     with tempfile.TemporaryDirectory(prefix='spu-nested-fallback-') as td:
         p=pathlib.Path(td)
         words=[0x40200000]*13  # excluded gap words never become lifted entries

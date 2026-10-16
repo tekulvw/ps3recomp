@@ -260,6 +260,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                       if (s_it && PS3_LOG_FIRST(_n, 200))
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
                                   ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
+                    ctx->region_dispatch_valid=0;
                     longjmp(f->env, 1);
                 }
                 if (!f && ctx->host_depth > 0) {
@@ -378,6 +379,20 @@ int spu_tailret_enabled(void)
     return s_on;
 }
 
+int g_spu_region_scope_mode=0;
+int spu_region_scope_enabled(void)
+{
+    int mode=__atomic_load_n(&g_spu_region_scope_mode,__ATOMIC_RELAXED);
+    if(!mode) {
+        const char* e=getenv("SPU_REGION_FRAMED");
+        int requested=e && !strcmp(e,"1") ? 2 : 1;
+        int expected=0;
+        __atomic_compare_exchange_n(&g_spu_region_scope_mode,&expected,requested,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED);
+        mode=__atomic_load_n(&g_spu_region_scope_mode,__ATOMIC_RELAXED);
+    }
+    return mode==2;
+}
+
 /* Internal edges retain the original transfer checkpoint. Enabled interrupts
  * always deopt before any hook, so the existing drain owns IRQ setjmp frames,
  * D/E delivery and restoration. Neither lockstep nor task-launch enables IRQs;
@@ -388,12 +403,21 @@ int spu_tailret_enabled(void)
  * A direct native callee can run before its caller materializes the explicit
  * drain return PC. Keep framed transfers in the original drain, which sets
  * that PC before invoking the destination; interpreter fallback consumes it.
+ * SPU_REGION_FRAMED=1 permits only the exact actual drain-owned scope;
+ * nested drains/nonlocals invalidate it and caller return PCs still unwind.
  * This helper does not admit code: generated destination gates still compare
  * every byte of the complete original logical body before running it. */
 int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*))
 {
-    if (ctx->int_enable || ctx->host_depth || ctx->drain_ret_pc ||
-        spu_tailret_enabled()) return 0;
+    if (ctx->int_enable || spu_tailret_enabled()) return 0;
+    if(spu_region_scope_on() && ctx->region_dispatch_valid && ctx->region_has_return &&
+        (ctx->pc&SPU_LS_MASK)==ctx->region_return_pc)return 0;
+    int framed=ctx->host_depth || ctx->drain_ret_pc;
+    if(framed && (!spu_region_scope_on() || !ctx->region_dispatch_valid ||
+        !ctx->region_has_return || ctx->region_dispatch_depth!=ctx->host_depth ||
+        ctx->region_return_pc!=ctx->drain_ret_pc ||
+        (ctx->pc&SPU_LS_MASK)==ctx->region_return_pc || ctx->irq_saved ||
+        ctx->irq_frame || ctx->status || g_spu_trampoline_fn))return 0;
     static atomic_int diagnostic_mode;
     int diagnostic = atomic_load_explicit(&diagnostic_mode, memory_order_relaxed);
     if (!diagnostic) {
@@ -403,6 +427,17 @@ int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*))
     if (diagnostic == 2) return 0;
     yz_lockstep_tick(ctx);
     spu_task_launch_check(ctx, (void*)target);
+    if(framed && (!ctx->region_dispatch_valid ||
+        ctx->region_dispatch_depth!=ctx->host_depth ||
+        ctx->region_return_pc!=ctx->drain_ret_pc || ctx->int_enable ||
+        ctx->status || g_spu_trampoline_fn))return 0;
+    if(framed) {
+        static SPU_THREAD_LOCAL int reported;
+        if(!reported && getenv("SPU_REGION_FRAMED_DIAGNOSTICS")) {
+            reported=1;fprintf(stderr,"[spu-region-framed] accepted depth=%u return=%05X target=%05X\n",
+                ctx->host_depth,ctx->region_return_pc,(unsigned)ctx->pc&SPU_LS_MASK);
+        }
+    }
     g_spu_pch[g_spu_pch_n++ & 7u] = (uint32_t)ctx->pc & SPU_LS_MASK;
     return 1;
 }
@@ -428,6 +463,7 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
+    ctx->region_dispatch_valid=0;
     spu_depth_guard(ctx);
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
      * after the handler's first host function returns -- the handler keeps
@@ -435,7 +471,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
-#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
+#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; ctx->region_dispatch_valid=0; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
             if (g_spu_trampoline_fn == spu_indirect_branch &&
@@ -461,8 +497,9 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         ctx->irq_frame = &f;
                     }
                     if (setjmp(f.env) == 0) {
-                        vf(ctx);
+                        spu_region_dispatch_invoke(ctx,vf,1,return_pc);
                     } else {
+                        ctx->region_dispatch_valid=0;
                         /* iret fired deeper: registers restored, pc = srr0 */
                         ctx->host_depth = f.depth;
                         ctx->image_id = f.image_id;
@@ -472,7 +509,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                     continue;
                 }
             }
-            fn(ctx);
+            spu_region_dispatch_invoke(ctx,fn,1,return_pc);
         }
         if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
             SPU_DRAIN_POP_IRQ();
