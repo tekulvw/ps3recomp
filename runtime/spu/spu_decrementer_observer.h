@@ -15,6 +15,10 @@ extern "C" {
  * reported_pc is ctx->pc, NOT a promise of the current guest instruction for
  * compiled/native callers. Verify the instruction/source identity before
  * attributing a poll loop. The value is exactly what this channel read returns.
+ * host_caller is the extracted native return address of the spu_rdch caller,
+ * when supported by the compiler, otherwise zero. It identifies a host call
+ * site only with the exact binary/load address; it is not a guest instruction
+ * address. Inlining/tail calls can affect this witness and must be qualified.
  *
  * The callback may copy bounded scalar metadata. It must not mutate ctx or LS,
  * retain ctx, execute guest code, recursively install a callback, or nonlocally
@@ -23,7 +27,8 @@ extern "C" {
 typedef void (*spu_decrementer_observer_fn)(const spu_context* ctx,
                                          uint32_t reported_pc,
                                          uint32_t decrementer_value,
-                                         uint64_t read_ordinal);
+                                         uint64_t read_ordinal,
+                                         uintptr_t host_caller);
 /* Default NULL. Atomic publication; prefer installation before workers start.
  * Uninstallation does not wait for in-flight callbacks. Callback code/storage
  * must remain alive until workers quiesce. No context pointer is retained. */

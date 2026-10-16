@@ -1282,7 +1282,13 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
             const uint64_t ordinal = ++s_decrementer_read_ordinal;
             if ((ordinal & (SPU_DECREMENTER_OBSERVER_CADENCE - 1u)) == 0) {
                 const int saved_errno = errno;
-                observer(ctx, ctx->pc, v, ordinal);
+                uintptr_t host_caller = 0;
+#if defined(__GNUC__) || defined(__clang__)
+                /* Must be inside spu_rdch itself, not an observer helper. */
+                host_caller = (uintptr_t)__builtin_extract_return_addr(
+                    __builtin_return_address(0));
+#endif
+                observer(ctx, ctx->pc, v, ordinal, host_caller);
                 errno = saved_errno;
             }
         }
