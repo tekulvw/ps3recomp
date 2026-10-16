@@ -9,7 +9,7 @@ struct SpursAttributeTrace {
   static const bool enabled=[](){const char *e=getenv("PS3_SPURS_ATTRIBUTE_TRACE");return e&&!strcmp(e,"1");}();
   static std::atomic<unsigned> admitted{0};
   if(enabled){unsigned n=admitted.fetch_add(1,std::memory_order_relaxed);
-   if(n<12&&SpursWorkloadInfoTrace::range(c->gpr[1]+0x70,8)&&SpursWorkloadInfoTrace::range(c->gpr[3],0x28)){
+   if(n<12&&c->gpr[1]<=UINT32_MAX-0x70u&&SpursWorkloadInfoTrace::range(c->gpr[1]+0x70,8)&&SpursWorkloadInfoTrace::range(c->gpr[3],0x28)){
     ctx=c;attr=c->gpr[3];data=c->gpr[8];sp=c->gpr[1];lr=c->lr;id=n;
     for(unsigned i=0;i<8;i++)arg9=(arg9<<8)|vm_base[sp+0x70+i];
    }

@@ -69,7 +69,7 @@ static atomic_uint held[16],done[16],gate,active_count,peak_count,lane_mask;
 static void held_policy(spu_context* c)
 {
     unsigned w=spu_ls_read32(c,0x1DC),lane=spu_ls_read32(c,0x1C8);
-    assert(lane<3);
+    assert(lane<5);
     atomic_fetch_or(&lane_mask,1u<<lane);
     unsigned n=atomic_fetch_add(&active_count,1)+1,peak=atomic_load(&peak_count);
     while(peak<n && !atomic_compare_exchange_weak(&peak_count,&peak,n)) {}
@@ -258,6 +258,19 @@ int main(void)
     Sleep(20);assert(atomic_load(&held[0])==2);
     atomic_store(&gate,1);wait_for(&done[0],2,"lowered limit preserves admitted work");
     finalize(0x1000);puts("SPURS one workload has two physical lanes and obeys lowered admission limit PASS");
+
+    atomic_store(&gate,0);atomic_store(&held[0],0);atomic_store(&done[0],0);
+    atomic_store(&peak_count,0);atomic_store(&lane_mask,0);
+    assert(cellSpursInitialize((CellSpurs*)0x1000,5,0,0,0)==0);
+    assert(cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8000,(void*)0x9200,16,0,NULL,1,5)==0);
+    assert(cellSpursReadyCountStore((CellSpurs*)0x1000,vm_read32(0x8000),5)==0);
+    wait_for(&held[0],5,"authentic five-lane request");Sleep(20);
+    assert(atomic_load(&held[0])==5&&atomic_load(&peak_count)==5&&atomic_load(&lane_mask)==31);
+    assert(vm_read8(0x1000+SPURS_WKL_CURCONT)==5);
+    assert(cellSpursSetMaxContention((CellSpurs*)0x1000,0,0)==0);
+    atomic_store(&gate,1);wait_for(&done[0],5,"five original completions");
+    finalize(0x1000);assert(atomic_load(&done[0])==5&&atomic_load(&active_count)==0);
+    puts("SPURS five physical lanes preserve exactly five original completions PASS");
 
     register_pm(0x9600,0x66,incarnation_policy,83);
     assert(cellSpursInitialize((CellSpurs*)0x1000,1,0,0,0)==0);
