@@ -132,6 +132,10 @@ int main(void) {
     flushed=live_flushed=1; /* Existing publication assertions remain active. */
     cellGcm_rsx_consumer_begin();gcm_get_report(0x01000430);cellGcm_rsx_consumer_end();
     assert(s_reports.count==1&&s_reports.unissued==1&&!notified);
+    u64 before_issue=fixture_issued;
+    (void)cellGcmGetReport(1,0x43);(void)cellGcmGetTimeStamp(0x43);
+    (void)cellGcmGetReportDataAddress(0x43);
+    assert(fixture_issued==before_issue&&s_reports.unissued==1);
     assert(vm_read32(watched+12)==0x10000);
     assert(!gcm_report_vm_begin(watched+4,4)); /* No mutation lease granted. */
     cellGcm_rsx_process_fifo();

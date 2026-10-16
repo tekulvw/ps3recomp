@@ -29,7 +29,7 @@ static int rsx_reports_issue(rsx_deferred_report_queue *q,const rsx_deferred_rep
 static int rsx_reports_progress(rsx_deferred_report_queue *q,const rsx_deferred_report_ops *o,int wait,int issue){
  if(q->failed)return 0;if(issue&&!rsx_reports_issue(q,o))return 0;
  while(q->count){rsx_deferred_report *r=&q->records[q->head];if(!r->ticket)break;
-  int ready=o->status(o->user,r->ticket,wait);if(!ready)break;
+  int ready=o->status(o->user,r->ticket,wait);if(!ready){if(wait){q->failed=1;return 0;}break;}
   if(ready!=1||r->generation!=q->generation||!o->publish(o->user,r)){q->failed=1;return 0;}
   q->head=(q->head+1)%RSX_DEFERRED_REPORT_CAPACITY;q->count--;q->published++;
  }

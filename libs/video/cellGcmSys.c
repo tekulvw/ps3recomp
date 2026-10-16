@@ -43,7 +43,8 @@ static _Thread_local unsigned s_consumer_depth;
 static int s_deferred_reports;
 static rsx_deferred_report_queue s_reports = {.generation=1};
 static int gcm_reports_dependency(void);
-static int gcm_reports_sync_barrier(void);
+static int gcm_reports_sync_barrier_at(u32 reason);
+#define gcm_reports_sync_barrier() gcm_reports_sync_barrier_at(__LINE__)
 void cellGcm_rsx_consumer_begin(void) {
     if (s_deferred_reports && s_consumer_depth++ == 0)
         AcquireSRWLockExclusive(&s_gcm_fifo_lock);
@@ -981,12 +982,15 @@ static int gcm_reports_dependency(void){
     cellGcm_rsx_consumer_begin();int ok=gcm_reports_progress(1,1);
     cellGcm_rsx_consumer_end();return ok;
 }
-static int gcm_reports_sync_barrier(void){
+static int gcm_reports_sync_barrier_at(u32 reason){
     if(!s_deferred_reports)return 1;
-    if(!gcm_reports_dependency())return 0;
-    if(rsx_live_draw_enabled())rsx_live_draw_flush();
-    if(rsx_draw_engine_async_available()&&rsx_draw_engine_flush_checked()!=1)return 0;
-    return 1;
+    uint64_t capture=ps3_critical_capture_id(),start=ps3_critical_enabled()?ps3_critical_now_ns():0;
+    uint64_t pending=s_reports.count,issued=s_reports.issued,published=s_reports.published;
+    int ok=gcm_reports_dependency();
+    if(ok&&rsx_live_draw_enabled())rsx_live_draw_flush();
+    if(ok&&rsx_draw_engine_async_available())ok=rsx_draw_engine_flush_checked()==1;
+    if(start){uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};ps3_critical_emit_capture(capture,19,reason,0,w,7);}
+    return ok;
 }
 static void gcm_get_report(u32 argument){
     rsx_deferred_report r={0};r.argument=argument;r.context=s_report_dma;r.index=(argument&0xffffffu)/16u;
@@ -1391,7 +1395,6 @@ static void nv3089_blit(void)
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
-    if(method>=0x400u&&method<=0x7fcu&&!gcm_reports_sync_barrier())return;
     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
      * subchannel a title binds each 2D object to is libgcm-version-specific and
      * SET_OBJECT binds are not tracked, so state landing on an unexpected
@@ -1447,6 +1450,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         case 0x030C: return;                /* SIZE_IN */
         }
         if (method >= 0x0400 && method <= 0x07FC) {
+            if(!gcm_reports_sync_barrier())return;
             /* COLOR data word: write into the destination surface. Inline
              * transfers use format Y32 (4 bytes/px, one row per point.y).
              * DMA 0xFEED0000 = local memory, 0xFEED0001 = main memory. */
@@ -2650,7 +2654,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    if((m==0x50u||m==0x1d70u||m==0x1d74u||m==0x1a8u)&&!gcm_reports_sync_barrier())return;
+                    if(m==0x50u && !(gcm_checked_ref_mode()?gcm_reports_dependency():gcm_reports_sync_barrier()))return;
+                    if((m==0x1d70u||m==0x1d74u)&&!gcm_reports_sync_barrier())return;
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
@@ -3319,17 +3324,7 @@ s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
 /* NID: 0xDB769B32 */
 static u32 gcm_io_alloc(u32 size);   /* defined below */
 
-static s32 cellGcmAddressToOffset_consumer_body(u32 address, u32* offset);
 s32 cellGcmAddressToOffset(u32 address, u32* offset)
-{
-    if(!s_deferred_reports)return cellGcmAddressToOffset_consumer_body(address, offset);
-    cellGcm_rsx_consumer_begin();
-    s32 result=CELL_GCM_ERROR_FAILURE;
-    if(gcm_reports_sync_barrier())result=cellGcmAddressToOffset_consumer_body(address, offset);
-    else fprintf(stderr,"[deferred reports] rejected cellGcmAddressToOffset after failure\n");
-    cellGcm_rsx_consumer_end();return result;
-}
-static s32 cellGcmAddressToOffset_consumer_body(u32 address, u32* offset)
 {
     /* `offset` is a GUEST address; write big-endian via vm_write32. */
     uint32_t off_ea = (uint32_t)(uintptr_t)offset;
@@ -3407,12 +3402,14 @@ static s32 cellGcmAddressToOffset_consumer_body(u32 address, u32* offset)
 
     u32 auto_map_limit = s_config.localAddress ? s_config.localAddress : 0x40000000u;
     if (address < auto_map_limit && s_gcm_initialized) {
+        cellGcm_rsx_consumer_begin();
+        if(!gcm_reports_sync_barrier()){cellGcm_rsx_consumer_end();return CELL_GCM_ERROR_FAILURE;}
         u32 ea_page = address & ~0xFFFFFu;
         u32 io      = gcm_io_alloc(0x100000u);
         if (io == 0xFFFFFFFFu) {
             printf("[cellGcmSys] AddressToOffset: no free IO page to auto-map ea 0x%08X\n", address);
             vm_write32(off_ea, 0);
-            return CELL_GCM_ERROR_FAILURE;
+            cellGcm_rsx_consumer_end();return CELL_GCM_ERROR_FAILURE;
         }
         populate_offset_table(ea_page, io, 0x100000u);
         /* Record it in the mapping list too, not just the offset table.
@@ -3436,7 +3433,7 @@ static s32 cellGcmAddressToOffset_consumer_body(u32 address, u32* offset)
         printf("[cellGcmSys] AddressToOffset: auto-mapped ea 0x%08X -> io 0x%08X\n",
                ea_page, io);
         vm_write32(off_ea, io | (address & 0xFFFFFu));
-        return CELL_OK;
+        cellGcm_rsx_consumer_end();return CELL_OK;
     }
 
     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
@@ -3795,17 +3792,7 @@ u32* cellGcmGetLabelAddress(u8 index)
 }
 
 /* NID: 0x8572ADE4 */
-static CellGcmReportData* cellGcmGetReportDataAddress_consumer_body(u32 index);
 CellGcmReportData* cellGcmGetReportDataAddress(u32 index)
-{
-    if(!s_deferred_reports)return cellGcmGetReportDataAddress_consumer_body(index);
-    cellGcm_rsx_consumer_begin();
-    CellGcmReportData* result=NULL;
-    if(gcm_reports_sync_barrier())result=cellGcmGetReportDataAddress_consumer_body(index);
-    else fprintf(stderr,"[deferred reports] rejected cellGcmGetReportDataAddress after failure\n");
-    cellGcm_rsx_consumer_end();return result;
-}
-static CellGcmReportData* cellGcmGetReportDataAddress_consumer_body(u32 index)
 {
     if (index >= CELL_GCM_MAX_REPORT_COUNT) {
         printf("[cellGcmSys] WARNING: GetReportDataAddress index %u out of range\n", index);
@@ -3823,7 +3810,7 @@ u32 cellGcmGetReport(u32 type, u32 index)
     if(!s_deferred_reports)return cellGcmGetReport_consumer_body(type, index);
     cellGcm_rsx_consumer_begin();
     u32 result=0;
-    if(gcm_reports_sync_barrier())result=cellGcmGetReport_consumer_body(type, index);
+    if(gcm_reports_progress(0,0))result=cellGcmGetReport_consumer_body(type, index);
     else fprintf(stderr,"[deferred reports] rejected cellGcmGetReport after failure\n");
     cellGcm_rsx_consumer_end();return result;
 }
@@ -3842,7 +3829,7 @@ u64 cellGcmGetTimeStamp(u32 index)
     if(!s_deferred_reports)return cellGcmGetTimeStamp_consumer_body(index);
     cellGcm_rsx_consumer_begin();
     u64 result=0;
-    if(gcm_reports_sync_barrier())result=cellGcmGetTimeStamp_consumer_body(index);
+    if(gcm_reports_progress(0,0))result=cellGcmGetTimeStamp_consumer_body(index);
     else fprintf(stderr,"[deferred reports] rejected cellGcmGetTimeStamp after failure\n");
     cellGcm_rsx_consumer_end();return result;
 }
@@ -4031,7 +4018,7 @@ u64 cellGcmGetTimeStampLocation(u32 index, u32 location)
     if(!s_deferred_reports)return cellGcmGetTimeStampLocation_consumer_body(index, location);
     cellGcm_rsx_consumer_begin();
     u64 result=0;
-    if(gcm_reports_sync_barrier())result=cellGcmGetTimeStampLocation_consumer_body(index, location);
+    if(gcm_reports_progress(0,0))result=cellGcmGetTimeStampLocation_consumer_body(index, location);
     else fprintf(stderr,"[deferred reports] rejected cellGcmGetTimeStampLocation after failure\n");
     cellGcm_rsx_consumer_end();return result;
 }
@@ -4409,17 +4396,7 @@ void cellGcmSortRemapEaIoAddress(void)
 }
 
 /* Report data with location parameter */
-static CellGcmReportData* cellGcmGetReportDataAddressLocation_consumer_body(u32 index, u32 location);
 CellGcmReportData* cellGcmGetReportDataAddressLocation(u32 index, u32 location)
-{
-    if(!s_deferred_reports)return cellGcmGetReportDataAddressLocation_consumer_body(index, location);
-    cellGcm_rsx_consumer_begin();
-    CellGcmReportData* result=NULL;
-    if(gcm_reports_sync_barrier())result=cellGcmGetReportDataAddressLocation_consumer_body(index, location);
-    else fprintf(stderr,"[deferred reports] rejected cellGcmGetReportDataAddressLocation after failure\n");
-    cellGcm_rsx_consumer_end();return result;
-}
-static CellGcmReportData* cellGcmGetReportDataAddressLocation_consumer_body(u32 index, u32 location)
 {
     (void)location;  /* We only have one report area */
 
@@ -4437,7 +4414,7 @@ u32 cellGcmGetReportDataLocation(u32 index, u32 location)
     if(!s_deferred_reports)return cellGcmGetReportDataLocation_consumer_body(index, location);
     cellGcm_rsx_consumer_begin();
     u32 result=0;
-    if(gcm_reports_sync_barrier())result=cellGcmGetReportDataLocation_consumer_body(index, location);
+    if(gcm_reports_progress(0,0))result=cellGcmGetReportDataLocation_consumer_body(index, location);
     else fprintf(stderr,"[deferred reports] rejected cellGcmGetReportDataLocation after failure\n");
     cellGcm_rsx_consumer_end();return result;
 }
