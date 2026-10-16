@@ -43,7 +43,7 @@ int spu_verified_code_enter_span(const spu_context* ctx, int image_id,
  * calls, services/IRQ control, native return classification or outside-code
  * facts. Every control transfer publishes its architectural PC to the drain.
  * Every byte of [start,end) is checked at lookup AND entry, without cached trust.
- * Framed execution requires the actual innermost drain witness and excludes
+ * Framed execution requires the actual innermost native call/drain witness and excludes
  * any span containing that caller's continuation PC.
  * Legacy translations retain their whole-image admission. Existing readonly-
  * running-body limitations remain; this does not support concurrent/mid-block SMC.
@@ -56,6 +56,11 @@ typedef struct spu_verified_leaf_unit {
 } spu_verified_leaf_unit;
 int spu_verified_leaf_register(int image_id,const spu_verified_leaf_unit*,unsigned count);
 int spu_verified_leaf_enter(const spu_context*,int image_id,uint32_t start,uint32_t end);
+/* Use only inside the generated native guest-call bracket after host_depth++.
+ * The explicit instruction+4 return PC owns the caller's continuation. With
+ * leaf mode off this is exactly the original indirect dispatcher call. The
+ * original service/IRQ/ownership intercepts still run in both modes. */
+void spu_verified_leaf_indirect_call(spu_context*,uint32_t return_pc);
 
 #ifdef __cplusplus
 }

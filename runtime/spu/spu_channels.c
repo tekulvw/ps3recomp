@@ -1810,8 +1810,8 @@ static spu_fn spu_verified_leaf_lookup(const spu_context* c,uint32_t pc,int* cov
     for(uint32_t n=s_verified_leaf_head[pc>>2];n;n=s_verified_leaf[n-1].next) {
         const spu_verified_leaf* u=&s_verified_leaf[n-1];
         if(c->image_id!=u->policy||!spu_verified_leaf_scope(c,u))continue;
-        *covered=1;
         if(memcmp(c->ls+u->start,u->expected,u->end-u->start))continue;
+        *covered=1; /* misses retain the original legacy/module resolver */
         if(result)return NULL; /* ambiguity: never choose the first translation */
         result=u->fn;selected=u;
     }
@@ -1823,6 +1823,20 @@ static spu_fn spu_verified_leaf_lookup(const spu_context* c,uint32_t pc,int* cov
                 selected->image,pc,selected->end-selected->start);
     }
     return result;
+}
+/* Generated indirect C calls already own a real continuation. Publish it
+ * around the ORIGINAL dispatcher, preserving every service/IRQ/owner hook. */
+void spu_verified_leaf_indirect_call(spu_context* c,uint32_t return_pc)
+{
+    if(!spu_verified_leaf_mode()||!spu_region_scope_on()||!c->host_depth||
+        return_pc>=SPU_LS_SIZE||(return_pc&3u)) {
+        spu_indirect_branch(c);return;
+    }
+    uint32_t outer_return=c->drain_ret_pc;
+    c->drain_ret_pc=return_pc;
+    spu_region_dispatch_invoke(c,spu_indirect_branch,1,return_pc);
+    c->region_dispatch_valid=0;
+    c->drain_ret_pc=outer_return;
 }
 int spu_verified_leaf_enter(const spu_context* c,int image,uint32_t start,uint32_t end)
 {

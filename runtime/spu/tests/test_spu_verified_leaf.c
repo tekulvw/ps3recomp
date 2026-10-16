@@ -82,7 +82,19 @@ int main(int argc,char** argv) {
     CHECK(raw_entries==(unsigned)enabled);
     CHECK(c->pc==0x20000 && c->gpr[20]._u32[0]==1 && c->gpr[22]._u32[0]==0);
     CHECK(!g_spu_trampoline_fn);++c->gpr[22]._u32[0];CHECK(c->gpr[22]._u32[0]==1);
+    c->pc=0x10010;spu_verified_leaf_indirect_call(c,0x20000);
+    CHECK(!c->region_dispatch_valid && c->drain_ret_pc==0);
+    spu_drain_call(c,0x20000);
+    CHECK(raw_entries==2u*(unsigned)enabled && c->gpr[20]._u32[0]==2);
     c->host_depth=0;
+    uint8_t other_bytes[32];memcpy(other_bytes,bytes,sizeof(bytes));
+    put(other_bytes+16,0x1c000000u|(2u<<14)|(20u<<7)|20u);
+    spu_verified_code_segment other_segment={0x10000,sizeof(other_bytes),other_bytes};
+    CHECK(spu_verified_overlay_register(501,703,&other_segment,1));
+    spu_begin_image(703);spu_register_function(0x10010,other);spu_begin_image(0);
+    memcpy(c->ls+0x10000,other_bytes,sizeof(other_bytes));
+    CHECK(spu_lifted_lookup(c,0x10010)==other); /* a leaf miss must retain legacy admission */
+    memcpy(c->ls+0x10000,bytes,sizeof(bytes));
     /* Duplicate eligible byte matches must deopt rather than choose an owner. */
     CHECK(spu_verified_overlay_register(501,702,&segment,1));
     spu_begin_image(702);spu_register_function(0x10010,other);spu_begin_image(0);
