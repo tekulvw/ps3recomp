@@ -5,9 +5,16 @@
 #include "leaf_program.h"
 void legacy_test_spu_recomp_register(void);
 int raw_test_spu_leaf_register(void);
-static unsigned admissions;
+static unsigned admissions,inject_irq,irq_entries;
+static uint32_t irq_resume;
+static void handler(spu_context* c) {
+    ++irq_entries;irq_resume=c->srr0;spu_wrch(c,SPU_WrEventAck,spu_pref_u32(1));
+    c->int_enable=1;c->pc=c->srr0;g_spu_trampoline_fn=spu_indirect_branch;
+}
 int observed_leaf_enter(const spu_context* c,int image,uint32_t start,uint32_t end) {
-    int ok=spu_verified_leaf_enter(c,image,start,end);admissions+=(unsigned)ok;return ok;
+    int ok=spu_verified_leaf_enter(c,image,start,end);admissions+=(unsigned)ok;
+    if(ok && inject_irq) {inject_irq=0;((spu_context*)c)->event_status=1;}
+    return ok;
 }
 static uint32_t rng=1;
 static uint32_t next(void) {return rng=rng*1664525u+1013904223u;}
@@ -17,6 +24,7 @@ int main(int argc,char** argv) {
     CHECK(spu_verified_overlay_register(501,701,&seg,1));
     spu_begin_image(701);legacy_test_spu_recomp_register();spu_begin_image(0);
     CHECK(raw_test_spu_leaf_register());
+    spu_begin_image(501);spu_register_function(0x8000,handler);spu_begin_image(0);
     for(unsigned trial=1;trial<=16;++trial) {
         spu_context* oracle=calloc(1,sizeof(*oracle));spu_context* native=calloc(1,sizeof(*native));
         CHECK(oracle!=NULL&&native!=NULL);spu_context_init(oracle,0);spu_context_init(native,0);
@@ -38,6 +46,10 @@ int main(int argc,char** argv) {
         /* This disables compiled rejoin only, not any instruction semantics. */
         oracle->policy_mode=0;native->policy_mode=1;native->status=SPU_STATUS_RUNNING;
         native->int_enable=oracle->int_enable=(trial&1);
+        if(trial==15) {
+            native->event_mask=oracle->event_mask=1;inject_irq=enabled;
+            spu_ls_write32(native,0,0x30100000u);
+        }
         if(enabled && (trial&1))native->ls[0x10020]^=1; /* outside both independent units */
         CHECK(spu_interp_run_until(oracle,0x10000,0x20000)==0x20000);
         ++native->host_depth;native->pc=0x10000;
@@ -51,7 +63,9 @@ int main(int argc,char** argv) {
         spu_mfc_release(oracle);spu_coh_unregister(oracle);free(oracle);
         spu_mfc_release(native);spu_coh_unregister(native);free(native);
     }
-    CHECK(admissions==(enabled?32u:0u));
+    CHECK(admissions==(enabled?152u:0u));
+    CHECK(irq_entries==(unsigned)enabled);
+    CHECK(!enabled || irq_resume==0x10000); /* delivered at the next taken branch */
     printf("LEAF EXEC mode=%d trials=16 passed=%d failed=%d\n",enabled,g_pass,g_fail);
     return g_fail?1:0;
 }

@@ -1784,23 +1784,20 @@ int spu_verified_leaf_register(int image,const spu_verified_leaf_unit* units,uns
     }
     return 1;
 }
+/* Native execution can retain status0; only an active owner may admit it. */
 static int spu_verified_leaf_eligible(const spu_context* c)
 {
     return c && c->policy_mode && c->ls==c->ls_store &&
-        c->status==SPU_STATUS_RUNNING &&
+        (c->status==SPU_STATUS_RUNNING ||
+         (c->status==0 && c->region_dispatch_valid && c->region_dispatch_depth==c->host_depth)) &&
         !(c->int_enable && (c->event_status&c->event_mask)) && !c->irq_saved && !c->irq_frame;
 }
 /* Raw blocks may not execute through an owning native caller continuation. */
 static int spu_verified_leaf_scope(const spu_context* c,const spu_verified_leaf* u)
 {
-    if((c->host_depth||c->drain_ret_pc) &&
-        (!c->region_dispatch_valid||!c->region_has_return||
-         c->region_dispatch_depth!=c->host_depth||c->region_return_pc!=c->drain_ret_pc))return 0;
-    if(c->region_dispatch_valid && c->region_has_return) {
-        if(c->region_dispatch_depth!=c->host_depth||c->region_return_pc!=c->drain_ret_pc)return 0;
-        if(c->region_return_pc>=u->start && c->region_return_pc<u->end)return 0;
-    }
-    return 1;
+    if(!c->region_dispatch_valid||!c->region_has_return||
+       c->region_dispatch_depth!=c->host_depth||c->region_return_pc!=c->drain_ret_pc)return 0;
+    return !(c->region_return_pc>=u->start && c->region_return_pc<u->end);
 }
 static spu_fn spu_verified_leaf_lookup(const spu_context* c,uint32_t pc,int* covered)
 {

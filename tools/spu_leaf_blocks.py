@@ -22,7 +22,6 @@ def emit(raw,base,bounds,image,prefix):
    raise ValueError('invalid, overlapping or unsorted bounds')
   previous=end;ops=[];reason=None;f=LiftedFunction(start_addr=start,end_addr=end)
   def transfer(target):
-   if start<=target<end:return f'goto leaf_pc_{target:08X};'
    return f'ctx->pc = 0x{target:X}u; g_spu_trampoline_fn = spu_indirect_branch; return;'
   for pc in range(start,end,4):
    w=int.from_bytes(raw[pc-base:pc-base+4],'big');d=spu_decode(w,pc);mn=d.mnemonic
@@ -53,7 +52,7 @@ def emit(raw,base,bounds,image,prefix):
   if reason:skipped.append({'start':start,'end':end,'reason':reason});continue
   name=f'{prefix}block_{start:08X}';definitions.append(f'void {name}(spu_context* ctx) {{')
   definitions.append(f'    if (!spu_verified_leaf_enter(ctx,{image},0x{start:X}u,0x{end:X}u)) {{ ctx->pc=0x{start:X}u; g_spu_trampoline_fn=spu_indirect_branch; return; }}')
-  for pc,c in ops:definitions.extend([f'leaf_pc_{pc:08X}:','    '+c])
+  for pc,c in ops:definitions.append('    '+c)
   definitions.extend(['    '+transfer(end),'}'])
   units.append({'start':start,'end':end,'symbol':name,'sha256':hashlib.sha256(raw[start-base:end-base]).hexdigest()})
  header='#pragma once\n#include "spu_context.h"\n#include "spu_verified_overlay.h"\n'+f'int {prefix}spu_leaf_register(void);\n'

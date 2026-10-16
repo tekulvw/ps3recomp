@@ -15,7 +15,7 @@ class Leaf(unittest.TestCase):
    h,c,m=self.build([w]);self.assertFalse(m['units'],hex(w))
  def test_control_is_instruction_local(self):
   h,c,m=self.build([0x1cffc408,0x217fff88])
-  self.assertEqual(len(m['units']),1);self.assertIn('goto leaf_pc_00010000',c)
+  self.assertEqual(len(m['units']),1);self.assertNotIn('goto leaf_pc_',c);self.assertIn('ctx->pc = 0x10000u',c)
   self.assertIn('ctx->pc = 0x10008u',c)
  def test_bad_bounds_fail_closed(self):
   for bounds in [[(0x10001,0x10008)],[(0x10000,0x10010)],[(0x10000,0x10000)]]:
