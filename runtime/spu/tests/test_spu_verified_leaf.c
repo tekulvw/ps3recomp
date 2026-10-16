@@ -38,6 +38,9 @@ int main(int argc,char** argv) {
     put(bytes+20,0x35000000u|(6u<<7));
     spu_context* c=calloc(1,sizeof(*c));CHECK(c!=NULL);spu_context_init(c,0);
     c->policy_mode=1;c->image_id=501;c->status=SPU_STATUS_RUNNING;
+    /* Guard-only queries model an existing owner; execution tests use real dispatch. */
+    c->region_dispatch_valid=1;c->region_dispatch_depth=0;c->region_has_return=1;
+    c->region_return_pc=c->drain_ret_pc=0x20000;
     memcpy(c->ls+0x10000,bytes,sizeof(bytes));
     spu_verified_code_segment segment={0x10000,sizeof(bytes),bytes};
     CHECK(spu_verified_overlay_register(501,701,&segment,1));
@@ -51,6 +54,11 @@ int main(int argc,char** argv) {
         {0x1000c,0x10014,raw_leaf},{0x10010,0x10024,raw_leaf},{0x10010,0x10018,0}};
     for(unsigned k=0;k<sizeof(invalid)/sizeof(invalid[0]);++k)
         CHECK(!spu_verified_leaf_register(701,&invalid[k],1));
+    c->region_dispatch_valid=0;c->region_has_return=0;c->drain_ret_pc=0;
+    CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);
+    CHECK(!spu_verified_leaf_enter(c,701,0x10010,0x10018));
+    c->region_dispatch_valid=1;c->region_has_return=1;
+    c->region_return_pc=c->drain_ret_pc=0x20000;
     compared_bytes=compare_calls=0;
     for(unsigned k=0;k<10000;++k)CHECK(spu_lifted_lookup(c,0x10010)==(enabled?raw_leaf:legacy));
     CHECK(compared_bytes==(enabled?80000:320000) && compare_calls==10000);
@@ -70,7 +78,7 @@ int main(int argc,char** argv) {
     c->event_status=c->event_mask=0;c->int_enable=0;
     c->irq_saved=1;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->irq_saved=0;
     c->irq_frame=c;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->irq_frame=0;
-    c->status=0;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->status=SPU_STATUS_RUNNING;
+    c->region_dispatch_valid=0;c->status=0;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->status=SPU_STATUS_RUNNING;c->region_dispatch_valid=1;
     c->policy_mode=0;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->policy_mode=1;
     c->ls=bytes;CHECK(!spu_verified_leaf_enter(c,701,0x10010,0x10018));c->ls=c->ls_store;
     c->host_depth=1;
@@ -100,7 +108,14 @@ int main(int argc,char** argv) {
     g_spu_trampoline_fn=spu_indirect_branch;spu_drain_call(c,0x20000);
     CHECK(irq_entries==1 && c->gpr[20]._u32[0]==3);
     CHECK(c->int_enable==1 && !c->irq_saved && !c->irq_frame && !c->event_status);
-    c->host_depth=0;
+    const unsigned before_zero=raw_entries;
+    c->status=0;c->pc=0x10010;
+    spu_verified_leaf_indirect_call(c,0x20000);spu_drain_call(c,0x20000);
+    CHECK(c->status==0 && c->gpr[20]._u32[0]==4 && c->gpr[22]._u32[0]==1);
+    CHECK(raw_entries==before_zero+(unsigned)enabled);
+    c->status=SPU_STATUS_RUNNING;c->host_depth=0;
+    c->region_dispatch_valid=1;c->region_dispatch_depth=0;c->region_has_return=1;
+    c->region_return_pc=c->drain_ret_pc=0x20000;
     uint8_t other_bytes[32];memcpy(other_bytes,bytes,sizeof(bytes));
     put(other_bytes+16,0x1c000000u|(2u<<14)|(20u<<7)|20u);
     spu_verified_code_segment other_segment={0x10000,sizeof(other_bytes),other_bytes};
@@ -116,6 +131,6 @@ int main(int argc,char** argv) {
     CHECK(spu_verified_leaf_register(702,&ambiguous,1));
     CHECK(spu_lifted_lookup(c,0x10010)==NULL);
     CHECK(!spu_verified_leaf_enter(c,701,0x10010,0x10018));
-    printf("LEAF mode=%d passed=%d failed=%d\n",enabled,g_pass,g_fail);
+    printf("LEAF mode=%d entries=%u passed=%d failed=%d\n",enabled,raw_entries,g_pass,g_fail);
     spu_mfc_release(c);spu_coh_unregister(c);free(c);return g_fail?1:0;
 }
