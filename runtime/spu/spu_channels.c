@@ -1775,6 +1775,35 @@ static int spu_verified_negative_precheck(const spu_context *ctx,
     return 1;
 }
 
+/* Complete immutable identity for an already qualified exact entry. */
+static int spu_verified_matches(const spu_context* ctx,const spu_verified_image* v,uint32_t entry)
+{
+    int in_text=0;
+    for(unsigned i=0;i<v->count;++i)
+        if(entry>=v->segments[i].lsa && entry-v->segments[i].lsa<v->segments[i].size)in_text=1;
+    if(!in_text)return 0;
+    if(spu_verified_entry_prefilter_mode() && !spu_verified_negative_precheck(ctx,v,entry))return 0;
+    for(unsigned i=0;i<v->count;++i){
+        const spu_verified_code_segment*s=&v->segments[i];
+        if(memcmp(ctx->ls + s->lsa, s->bytes, s->size))return 0;
+    }
+    return 1;
+}
+/* Direct generated calls do not pass through the indirect resolver. Their
+ * existing failure continuation must defer to the exact sparse owner too.
+ * A function-table miss performs no byte scan. Two sparse claims fail closed. */
+static int spu_verified_sparse_preempts(const spu_context*ctx,int image,uint32_t entry)
+{
+    unsigned matches=0;int owner=0;
+    for(unsigned i=0;i<s_verified_count;++i){
+        const spu_verified_image*v=&s_verified_images[i];
+        if(!v->entry_only || v->policy!=ctx->image_id || entry<v->lo || entry>=v->hi ||
+           !spu_lookup_exact(entry,v->image) || !spu_verified_matches(ctx,v,entry))continue;
+        ++matches;owner=v->image;
+    }
+    return matches>1 || (matches==1 && owner!=image);
+}
+
 /* On an exact function-table miss there is no large byte comparison. A known
  * registered region still blocks stale primary functions, including holes.
  * No cached trust survives DMA, SPU stores, or PPU changes between entries. */
@@ -1782,6 +1811,7 @@ static spu_fn spu_verified_lookup(const spu_context* ctx, uint32_t lsa,
     int* covered, int* image)
 {
     spu_fn result = NULL;
+    int rank=-1;unsigned matches=0;
     *covered = 0; *image = 0;
     if (!ctx || (lsa & 3u)) return NULL;
     for (unsigned i = 0; i < s_verified_count; ++i) {
@@ -1800,25 +1830,16 @@ static spu_fn spu_verified_lookup(const spu_context* ctx, uint32_t lsa,
         if (!v->entry_only) *covered = 1;
         spu_fn fn = spu_lookup_exact(lsa, v->image);
         if (!fn) continue;
-        int in_text = 0;
-        for (unsigned j = 0; j < v->count; ++j)
-            if (lsa >= v->segments[j].lsa &&
-                lsa - v->segments[j].lsa < v->segments[j].size) in_text = 1;
-        if (!in_text) continue;
-        if(spu_verified_entry_prefilter_mode() && !spu_verified_negative_precheck(ctx,v,lsa))continue;
-        unsigned j = 0;
-        for (; j < v->count; ++j) {
-            const spu_verified_code_segment* s = &v->segments[j];
-            if (memcmp(ctx->ls + s->lsa, s->bytes, s->size)) break;
-        }
-        if (j != v->count) continue;
-        /* Sparse overrides own only an exact, fully validated entry. A miss
-         * must retain existing primary/resident resolution for other modules. */
-        *covered = 1;
-        if (result) { *image = 0; return NULL; } /* ambiguity, never first-match */
-        result = fn; *image = v->image;
+        if(!spu_verified_matches(ctx,v,lsa))continue;
+        /* A sparse override supersedes the authoritative image at this exact
+         * entry only. Equal-priority ambiguity remains closed; do not stop
+         * before a later higher-priority exact sparse claim is considered. */
+        *covered=1;
+        int priority=v->entry_only?1:0;
+        if(priority>rank){rank=priority;matches=1;result=fn;*image=v->image;}
+        else if(priority==rank){++matches;result=NULL;*image=0;}
     }
-    return result;
+    return matches==1?result:NULL;
 }
 
 int spu_verified_code_enter(const spu_context* ctx, int image, uint32_t entry)
@@ -1833,6 +1854,7 @@ int spu_verified_code_enter_span(const spu_context* ctx, int image,
     if (!ctx || !ctx->policy_mode || ctx->ls != ctx->ls_store ||
         ((entry | end) & 3u) || end <= entry || end > SPU_LS_SIZE)
         return 0;
+    if(spu_verified_sparse_preempts(ctx,image,entry))return 0;
     for (unsigned i = 0; i < s_verified_count; ++i) {
         const spu_verified_image* v = &s_verified_images[i];
         if (v->image != image || v->policy != ctx->image_id) continue;

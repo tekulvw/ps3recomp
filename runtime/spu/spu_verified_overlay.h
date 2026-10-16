@@ -25,8 +25,11 @@ int spu_verified_overlay_register(int policy_image_id, int image_id,
  * expected segments and exact registered function table as overlay admission.
  * Only a matching exact function with all expected bytes owns the transfer;
  * other addresses, contexts and mismatching modules retain their existing
- * primary/resident resolver. Unlike an authoritative overlay, it claims no
- * surrounding holes. Ambiguous admitted entries fail closed. Guarded functions
+ * primary/resident resolver. An exact validated sparse owner supersedes a
+ * matching authoritative overlay at that entry, including direct generated
+ * calls through their existing guard-failure continuation. Unlike an authoritative overlay, it claims no
+ * surrounding holes. Multiple admitted sparse owners (or authoritative owners
+ * without a sparse owner) fail closed. Guarded functions
  * remain excluded from unverified legacy lookup. Same readonly-text lifetime
  * contract and registry budgets as spu_verified_overlay_register apply. */
 int spu_verified_entry_override_register(int policy_image_id, int image_id,
