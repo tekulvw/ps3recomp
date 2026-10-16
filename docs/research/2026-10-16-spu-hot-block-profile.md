@@ -1,0 +1,7 @@
+# Diagnostic SPU instruction-location profile
+
+`SPU_INTERP_HOT_BLOCKS=1` counts actual interpreted instructions after live decoding, grouped into64-byte LS blocks and opcode mnemonics. It emits the eight largest buckets after1048576 instructions for a retained context-address/image/resident-task key. Storage is four bounded slots per host thread; replacing a slot discards its partial interval. Context addresses are labels only and are never dereferenced after the observation. Address reuse, changing overlays within one image, native execution, and replaced partial intervals limit attribution. These counts are instruction frequencies, not CPU time or a complete workload census. This diagnostic mode is unsuitable for performance A/B timing.
+
+`SPU_REGION_REJECT_DIAGNOSTICS=1` emits at most one record per reason per host thread:1 IRQ enabled,2 tail-return compatibility mode,3 caller continuation,4 incompatible frame/witness/IRQ/status/pending state,5 state changed across the runtime checkpoint. A record contains observed host ownership metadata without original code bytes. The normal guard outcomes are unchanged.
+
+The neutral real-interpreter regression executes1200001 instructions and reaches the same stop PC, counter register and status with profiling off/on. Its first complete diagnostic interval must contain1048576 instructions in the correct block, split equally between `ai` and `brnz`. Both O2 and UBSan passed. An initial fixture build needed an explicit declaration of the existing diagnostic step-count global; production code was unaffected.

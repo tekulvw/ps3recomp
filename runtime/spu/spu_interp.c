@@ -132,6 +132,52 @@ static inline void spu_decode_cached(uint32_t insn, uint32_t pc, spu_ins* d)
 /* spu_lifted_lookup() is defined by spu_fn_registry.c (the single owner of the
  * lifted-function table + eviction). Declared in spu_interp.h. */
 
+/* Diagnostic instruction counts, not CPU-time attribution. Fixed TLS storage;
+ * no retained guest pointers are dereferenced, no code bytes are logged. */
+static void spu_interp_hot_block(spu_context* ctx, uint32_t pc, spu_op op)
+{
+    typedef struct {
+        uintptr_t owner;
+        int image, resident;
+        uint32_t total, blocks[SPU_LS_SIZE/64], ops[SPU_OP_COUNT];
+    } hot_slot;
+    static SPU_THREAD_LOCAL hot_slot slots[4];
+    static SPU_THREAD_LOCAL unsigned replace;
+    hot_slot* h=0;
+    for(unsigned k=0;k<4;++k)
+        if(slots[k].owner==(uintptr_t)ctx && slots[k].image==ctx->image_id &&
+           slots[k].resident==ctx->resident_task) { h=&slots[k];break; }
+    if(!h) {
+        h=&slots[replace++&3u];memset(h,0,sizeof(*h));
+        h->owner=(uintptr_t)ctx;h->image=ctx->image_id;h->resident=ctx->resident_task;
+    }
+    ++h->blocks[(pc&SPU_LS_MASK)>>6];
+    if((unsigned)op<SPU_OP_COUNT)++h->ops[op];
+    if(++h->total != 1048576u)return;
+    fprintf(stderr,"[spu-hot-block] ctx=%p image=%d task=%d policy=%d total=%u blocks=",
+        (void*)ctx,h->image,h->resident,ctx->policy_mode,h->total);
+    uint32_t used[8];
+    for(unsigned n=0;n<8;++n) {
+        unsigned best=0;uint32_t count=0;
+        for(unsigned k=0;k<SPU_LS_SIZE/64;++k) {
+            int duplicate=0;for(unsigned j=0;j<n;++j)if(used[j]==k)duplicate=1;
+            if(!duplicate && h->blocks[k]>count){best=k;count=h->blocks[k];}
+        }
+        used[n]=best;fprintf(stderr,"%s%05X:%u",n?",":"",best*64,count);
+    }
+    fprintf(stderr," ops=");
+    for(unsigned n=0;n<8;++n) {
+        unsigned best=0;uint32_t count=0;
+        for(unsigned k=0;k<SPU_OP_COUNT;++k) {
+            int duplicate=0;for(unsigned j=0;j<n;++j)if(used[j]==k)duplicate=1;
+            if(!duplicate && h->ops[k]>count){best=k;count=h->ops[k];}
+        }
+        used[n]=best;fprintf(stderr,"%s%s:%u",n?",":"",spu_op_name[best],count);
+    }
+    fprintf(stderr,"\n");memset(h->blocks,0,sizeof(h->blocks));
+    memset(h->ops,0,sizeof(h->ops));h->total=0;
+}
+
 /* ---- execute one instruction; returns 1 if the SPU stopped ---- */
 #define A   (ctx->gpr[d.ra])
 #define B   (ctx->gpr[d.rb])
@@ -147,6 +193,9 @@ static int spu_step(spu_context* ctx) {
     uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
                   | ((uint32_t)p[m+2] << 8) | p[m+3];
     spu_ins d; spu_decode_cached(insn, pc, &d);
+    static SPU_THREAD_LOCAL int hot_mode=-1;
+    if(hot_mode<0) { const char* e=getenv("SPU_INTERP_HOT_BLOCKS");hot_mode=e && !strcmp(e,"1"); }
+    if(hot_mode)spu_interp_hot_block(ctx,pc,d.op);
     uint32_t next = (pc + 4) & 0x3FFFC;
 
     switch (d.op) {

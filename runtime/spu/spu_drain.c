@@ -393,6 +393,22 @@ int spu_region_scope_enabled(void)
     return mode==2;
 }
 
+/* One report per rejection category and host thread in diagnostic runs. */
+static int spu_region_reject(spu_context* ctx,unsigned reason)
+{
+    static SPU_THREAD_LOCAL int enabled=-1;
+    static SPU_THREAD_LOCAL unsigned seen;
+    if(enabled<0) {const char* e=getenv("SPU_REGION_REJECT_DIAGNOSTICS");enabled=e && !strcmp(e,"1");}
+    if(enabled && !(seen&(1u<<reason))) {
+        seen|=1u<<reason;
+        fprintf(stderr,"[spu-region-reject] reason=%u image=%d depth=%u ret=%05X valid=%d scopeDepth=%u scopeRet=%05X hasRet=%d irqEnabled=%d irqSaved=%d irqFrame=%d status=%u pending=%d\n",
+            reason,ctx->image_id,ctx->host_depth,ctx->drain_ret_pc,ctx->region_dispatch_valid,
+            ctx->region_dispatch_depth,ctx->region_return_pc,ctx->region_has_return,
+            ctx->int_enable,ctx->irq_saved,ctx->irq_frame!=0,ctx->status,g_spu_trampoline_fn!=0);
+    }
+    return 0;
+}
+
 /* Internal edges retain the original transfer checkpoint. Enabled interrupts
  * always deopt before any hook, so the existing drain owns IRQ setjmp frames,
  * D/E delivery and restoration. Neither lockstep nor task-launch enables IRQs;
@@ -409,15 +425,15 @@ int spu_region_scope_enabled(void)
  * every byte of the complete original logical body before running it. */
 int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*))
 {
-    if (ctx->int_enable || spu_tailret_enabled()) return 0;
+    if (ctx->int_enable || spu_tailret_enabled()) return spu_region_reject(ctx,ctx->int_enable?1:2);
     if(spu_region_scope_on() && ctx->region_dispatch_valid && ctx->region_has_return &&
-        (ctx->pc&SPU_LS_MASK)==ctx->region_return_pc)return 0;
+        (ctx->pc&SPU_LS_MASK)==ctx->region_return_pc)return spu_region_reject(ctx,3);
     int framed=ctx->host_depth || ctx->drain_ret_pc;
     if(framed && (!spu_region_scope_on() || !ctx->region_dispatch_valid ||
         !ctx->region_has_return || ctx->region_dispatch_depth!=ctx->host_depth ||
         ctx->region_return_pc!=ctx->drain_ret_pc ||
         (ctx->pc&SPU_LS_MASK)==ctx->region_return_pc || ctx->irq_saved ||
-        ctx->irq_frame || ctx->status || g_spu_trampoline_fn))return 0;
+        ctx->irq_frame || ctx->status || g_spu_trampoline_fn))return spu_region_reject(ctx,4);
     static atomic_int diagnostic_mode;
     int diagnostic = atomic_load_explicit(&diagnostic_mode, memory_order_relaxed);
     if (!diagnostic) {
@@ -430,7 +446,7 @@ int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*))
     if(framed && (!ctx->region_dispatch_valid ||
         ctx->region_dispatch_depth!=ctx->host_depth ||
         ctx->region_return_pc!=ctx->drain_ret_pc || ctx->int_enable ||
-        ctx->status || g_spu_trampoline_fn))return 0;
+        ctx->status || g_spu_trampoline_fn))return spu_region_reject(ctx,5);
     if(framed) {
         static SPU_THREAD_LOCAL int reported;
         if(!reported && getenv("SPU_REGION_FRAMED_DIAGNOSTICS")) {
