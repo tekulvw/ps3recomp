@@ -8,6 +8,7 @@
 #include <time.h>
 #include "spu_interp.h"
 #include "spu_interp_observer.h"
+#include "spu_instruction_observer.h"
 #include "spu_helpers.h"
 #include "spu_pc_observer.h"
 #include "../diagnostics/critical_pc_trace.h"
@@ -19,6 +20,12 @@
 static _Atomic(spu_interp_entry_observer_fn) entry_observer;
 void spu_interp_entry_observer_set(spu_interp_entry_observer_fn observer) {
     atomic_store_explicit(&entry_observer, observer, memory_order_release);
+}
+
+static _Atomic(spu_instruction_observer_fn) instruction_observer;
+static _Thread_local uint64_t instruction_ordinal;
+void spu_instruction_observer_set(spu_instruction_observer_fn observer) {
+    atomic_store_explicit(&instruction_observer, observer, memory_order_release);
 }
 
 /* Channel ABI (runtime/spu/spu_channels.c); the lifter emits these same protos
@@ -502,6 +509,8 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         observer(ctx, start_lsa, stop_lsa);
         errno = saved_errno;
     }
+    spu_instruction_observer_fn instruction_sample =
+        atomic_load_explicit(&instruction_observer, memory_order_acquire);
     uint64_t steps = 0;
     /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
      * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
@@ -621,6 +630,14 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                 uint32_t opcode = spu_pc_observer_word(ctx->ls + m);
                 spu_pc_observe_enabled(ctx, pc, opcode);
             }
+        }
+        if (instruction_sample &&
+            (++instruction_ordinal % SPU_INSTRUCTION_OBSERVER_CADENCE) == 0) {
+            uint32_t pc = ctx->pc, m = pc & SPU_LS_MASK;
+            uint32_t opcode = spu_pc_observer_word(ctx->ls + m);
+            int saved_errno = errno;
+            instruction_sample(ctx, pc, opcode, instruction_ordinal);
+            errno = saved_errno;
         }
         if (spu_step(ctx)) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
