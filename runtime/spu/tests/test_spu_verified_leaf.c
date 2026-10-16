@@ -26,6 +26,11 @@ static void legacy(spu_context* c) {
 }
 static void other(spu_context* c) {(void)c;}
 static void premature(spu_context* c) {++c->gpr[22]._u32[0];}
+static unsigned irq_entries;
+static void handler(spu_context* c) {
+    ++irq_entries;spu_wrch(c,SPU_WrEventAck,spu_pref_u32(1));
+    c->int_enable=1;c->pc=c->srr0;g_spu_trampoline_fn=spu_indirect_branch;
+}
 static void put(uint8_t* b,uint32_t w) {for(unsigned i=0;i<4;++i)b[i]=(uint8_t)(w>>(24-8*i));}
 int main(int argc,char** argv) {
     enabled=argc>1&&atoi(argv[1]);
@@ -59,7 +64,10 @@ int main(int argc,char** argv) {
     c->ls[0x10017]^=1;CHECK(spu_lifted_lookup(c,0x10010)==NULL);
     CHECK(!spu_verified_leaf_enter(c,701,0x10010,0x10018));
     c->ls[0x10017]^=1;c->ls[0x10000]^=1;
-    c->int_enable=1;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->int_enable=0;
+    c->int_enable=1;CHECK(spu_lifted_lookup(c,0x10010)==(enabled?raw_leaf:legacy));
+    c->event_status=c->event_mask=1;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);
+    CHECK(!spu_verified_leaf_enter(c,701,0x10010,0x10018));
+    c->event_status=c->event_mask=0;c->int_enable=0;
     c->irq_saved=1;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->irq_saved=0;
     c->irq_frame=c;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->irq_frame=0;
     c->status=0;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->status=SPU_STATUS_RUNNING;
@@ -86,6 +94,12 @@ int main(int argc,char** argv) {
     CHECK(!c->region_dispatch_valid && c->drain_ret_pc==0);
     spu_drain_call(c,0x20000);
     CHECK(raw_entries==2u*(unsigned)enabled && c->gpr[20]._u32[0]==2);
+    spu_begin_image(501);spu_register_function(0x8000,handler);spu_begin_image(0);
+    spu_ls_write32(c,0,0x30100000u); /* neutral BRA vector */
+    c->int_enable=1;c->event_status=c->event_mask=1;c->pc=0x10010;
+    g_spu_trampoline_fn=spu_indirect_branch;spu_drain_call(c,0x20000);
+    CHECK(irq_entries==1 && c->gpr[20]._u32[0]==3);
+    CHECK(c->int_enable==1 && !c->irq_saved && !c->irq_frame && !c->event_status);
     c->host_depth=0;
     uint8_t other_bytes[32];memcpy(other_bytes,bytes,sizeof(bytes));
     put(other_bytes+16,0x1c000000u|(2u<<14)|(20u<<7)|20u);

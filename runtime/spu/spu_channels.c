@@ -1787,7 +1787,8 @@ int spu_verified_leaf_register(int image,const spu_verified_leaf_unit* units,uns
 static int spu_verified_leaf_eligible(const spu_context* c)
 {
     return c && c->policy_mode && c->ls==c->ls_store &&
-        c->status==SPU_STATUS_RUNNING && !c->int_enable && !c->irq_saved && !c->irq_frame;
+        c->status==SPU_STATUS_RUNNING &&
+        !(c->int_enable && (c->event_status&c->event_mask)) && !c->irq_saved && !c->irq_frame;
 }
 /* Raw blocks may not execute through an owning native caller continuation. */
 static int spu_verified_leaf_scope(const spu_context* c,const spu_verified_leaf* u)
@@ -1828,6 +1829,17 @@ static spu_fn spu_verified_leaf_lookup(const spu_context* c,uint32_t pc,int* cov
  * around the ORIGINAL dispatcher, preserving every service/IRQ/owner hook. */
 void spu_verified_leaf_indirect_call(spu_context* c,uint32_t return_pc)
 {
+    static SPU_THREAD_LOCAL int diagnostic=-1;
+    static SPU_THREAD_LOCAL unsigned reports;
+    if(diagnostic<0)diagnostic=getenv("SPU_VERIFIED_LEAF_DIAGNOSTICS")!=NULL;
+    if(diagnostic && reports<8) {
+        ++reports;
+        uint32_t pc=(uint32_t)c->pc&0x3fffcu;
+        fprintf(stderr,"[spu-leaf-call] pc=%05X unit=%u image=%d state=%u enabled=%d pending=%u saved=%d frame=%d depth=%u return=%05X mode=%d\n",
+            pc,s_verified_leaf_head[pc>>2]!=0,c->image_id,c->status,c->int_enable,
+            c->event_status&c->event_mask,c->irq_saved,c->irq_frame!=0,c->host_depth,
+            return_pc,spu_verified_leaf_mode());
+    }
     if(!spu_verified_leaf_mode()||!spu_region_scope_on()||!c->host_depth||
         return_pc>=SPU_LS_SIZE||(return_pc&3u)) {
         spu_indirect_branch(c);return;
