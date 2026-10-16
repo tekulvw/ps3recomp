@@ -10,4 +10,4 @@ with tempfile.TemporaryDirectory(prefix='spu-leaf-check-')as td:
   if san:cmd[1:1]=['-fsanitize=undefined','-fno-sanitize-recover=all']
   p=subprocess.run(cmd,capture_output=True,text=True,timeout=45);assert not p.returncode,p.stderr
   for mode in ('0','1'):
-   p=subprocess.run([str(exe),mode],env=dict(e,SPU_VERIFIED_LEAF_BLOCKS=mode),capture_output=True,text=True,timeout=10);print(('UBSan'if san else'O2'),mode,p.stdout.strip(),flush=True);assert not p.returncode,p.stdout+p.stderr
+   p=subprocess.run([str(exe),mode],env=dict(e,SPU_VERIFIED_LEAF_BLOCKS=mode,SPU_REGION_FRAMED="1"),capture_output=True,text=True,timeout=10);print(('UBSan'if san else'O2'),mode,p.stdout.strip(),flush=True);assert not p.returncode,p.stdout+p.stderr

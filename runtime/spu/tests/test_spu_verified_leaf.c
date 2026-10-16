@@ -12,11 +12,12 @@ static int counted_compare(const void* a,const void* b,size_t n) {
 #undef memcmp
 #include "../spu_verified_overlay.h"
 static int enabled;
+static unsigned raw_entries;
 static void raw_leaf(spu_context* c) {
     if(!spu_verified_leaf_enter(c,701,0x10010,0x10018)) {
         c->pc=0x10010;g_spu_trampoline_fn=spu_indirect_branch;return;
     }
-    c->gpr[20]=spu_ai(c->gpr[20],1);
+    ++raw_entries;c->gpr[20]=spu_ai(c->gpr[20],1);
     c->pc=c->gpr[6]._u32[0]&0x3fffc;
     g_spu_trampoline_fn=spu_indirect_branch;
 }
@@ -64,12 +65,24 @@ int main(int argc,char** argv) {
     c->status=0;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->status=SPU_STATUS_RUNNING;
     c->policy_mode=0;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);c->policy_mode=1;
     c->ls=bytes;CHECK(!spu_verified_leaf_enter(c,701,0x10010,0x10018));c->ls=c->ls_store;
+    c->host_depth=1;
+    CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf); /* no owning dispatch yet */
+    c->region_dispatch_valid=1;c->region_dispatch_depth=1;c->region_has_return=1;
+    c->region_return_pc=c->drain_ret_pc=0x10014;
+    CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf); /* continuation inside block */
+    c->region_return_pc=c->drain_ret_pc=0x20000;
+    c->region_dispatch_depth=2;CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);
+    c->region_dispatch_depth=1;c->region_has_return=0;
+    CHECK(spu_lifted_lookup(c,0x10010)!=raw_leaf);
+    c->region_dispatch_valid=0;c->drain_ret_pc=0;
     /* Raw return through r6 must unwind the owning C call exactly once. */
     spu_begin_image(501);spu_register_function(0x20000,premature);spu_begin_image(0);
     c->host_depth=1;c->gpr[6]=spu_link(0x20000);c->gpr[0]=spu_link(0x30000);
-    g_spu_trampoline_fn=spu_lifted_lookup(c,0x10010);spu_drain_call(c,0x20000);
+    c->pc=0x10010;g_spu_trampoline_fn=spu_indirect_branch;spu_drain_call(c,0x20000);
+    CHECK(raw_entries==(unsigned)enabled);
     CHECK(c->pc==0x20000 && c->gpr[20]._u32[0]==1 && c->gpr[22]._u32[0]==0);
     CHECK(!g_spu_trampoline_fn);++c->gpr[22]._u32[0];CHECK(c->gpr[22]._u32[0]==1);
+    c->host_depth=0;
     /* Duplicate eligible byte matches must deopt rather than choose an owner. */
     CHECK(spu_verified_overlay_register(501,702,&segment,1));
     spu_begin_image(702);spu_register_function(0x10010,other);spu_begin_image(0);

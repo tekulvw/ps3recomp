@@ -43,6 +43,8 @@ int spu_verified_code_enter_span(const spu_context* ctx, int image_id,
  * calls, services/IRQ control, native return classification or outside-code
  * facts. Every control transfer publishes its architectural PC to the drain.
  * Every byte of [start,end) is checked at lookup AND entry, without cached trust.
+ * Framed execution requires the actual innermost drain witness and excludes
+ * any span containing that caller's continuation PC.
  * Legacy translations retain their whole-image admission. Existing readonly-
  * running-body limitations remain; this does not support concurrent/mid-block SMC.
  * Startup only: the verified image and exact legacy entries must already exist.
