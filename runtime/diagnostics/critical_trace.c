@@ -21,6 +21,8 @@ static _Atomic unsigned enabled,writers,reserved,dropped;
 static _Atomic uint64_t capture;
 static uint64_t started,duration;
 uint64_t ps3_critical_watch_range;
+uint32_t ps3_critical_arrival_pc=0xFFFFFFFFu;
+void (*ps3_critical_arrival_callback)(void*,uint32_t,uint32_t);
 static uint32_t watch_container,watch_array;
 static _Atomic uint64_t write_sequence;
 static _Atomic uint64_t watch_snapshot;

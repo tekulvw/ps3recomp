@@ -9,6 +9,7 @@
 #include "spu_interp.h"
 #include "spu_helpers.h"
 #include "spu_pc_observer.h"
+#include "../diagnostics/critical_pc_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -500,6 +501,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     static int _g1in=0;
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
+        ps3_critical_pc_arrive(ctx,ctx->pc,2);
         /* Match the lifted path: only synthetic HLE tasks may bypass the
          * resident policy. Real tasksets also store 0xA70 in their API table.
          * Preserve the legacy CRI return convention while invoking the HLE. */

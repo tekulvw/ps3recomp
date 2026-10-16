@@ -20,6 +20,7 @@
 #include "spurs_workload_flag.h"
 #include "spurs_policy_service.h"
 #include "spu_pc_observer.h"
+#include "../diagnostics/critical_pc_trace.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include "spu_verified_overlay.h"
@@ -2336,6 +2337,7 @@ static int spu_smc_microstep(spu_context* ctx)
     int observe = spu_pc_observer_enabled();
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
     for (int steps = 0; steps < 4096; steps++) {
+        ps3_critical_pc_arrive(ctx,pc,3);
         uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
                      ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
         uint32_t op11 = w >> 21, op9 = w >> 23, op8 = w >> 24, op7 = w >> 25;
