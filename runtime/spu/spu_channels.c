@@ -20,12 +20,14 @@
 #include "spurs_workload_flag.h"
 #include "spurs_policy_service.h"
 #include "spu_pc_observer.h"
+#include "spu_decrementer_observer.h"
 #include "../diagnostics/critical_pc_trace.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include "spu_verified_overlay.h"
 #include "spu_native_service.h"
 #include <stdint.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,6 +77,14 @@ static uint64_t spu_host_ns(void)
 #else
 #  define SPU_TLS __thread
 #endif
+/* Diagnostic only: no context registry, extra clock read, or guest mutation. */
+static _Atomic(spu_decrementer_observer_fn) s_decrementer_observer;
+static SPU_TLS uint64_t s_decrementer_read_ordinal;
+void spu_decrementer_observer_set(spu_decrementer_observer_fn observer)
+{
+    atomic_store_explicit(&s_decrementer_observer, observer, memory_order_release);
+}
+
 /* Called after an SPU atomic commits a 128-byte line, with the lock-line lock
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
@@ -1266,6 +1276,16 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
         uint32_t ticks   = (uint32_t)(secs * SPU_DECREMENTER_HZ +
                                       (rem * SPU_DECREMENTER_HZ) / 1000000000ull);
         v = ctx->decrementer - ticks;
+        spu_decrementer_observer_fn observer = atomic_load_explicit(
+            &s_decrementer_observer, memory_order_acquire);
+        if (observer) {
+            const uint64_t ordinal = ++s_decrementer_read_ordinal;
+            if ((ordinal & (SPU_DECREMENTER_OBSERVER_CADENCE - 1u)) == 0) {
+                const int saved_errno = errno;
+                observer(ctx, ctx->pc, v, ordinal);
+                errno = saved_errno;
+            }
+        }
         break;
     }
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
