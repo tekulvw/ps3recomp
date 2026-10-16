@@ -1728,6 +1728,104 @@ int spu_verified_code_enter_span(const spu_context* ctx, int image,
     return 0;
 }
 
+/* Independently translated raw-ISA spans. Never use these for legacy
+ * classifier-dependent functions. Startup validation is all-or-nothing. */
+#define SPU_VERIFIED_LEAF_MAX 8192u
+typedef struct {
+    uint32_t start,end,next;
+    int policy,image;
+    const uint8_t* expected;
+    spu_fn fn;
+} spu_verified_leaf;
+static spu_verified_leaf s_verified_leaf[SPU_VERIFIED_LEAF_MAX];
+static uint32_t s_verified_leaf_head[SPU_LS_SIZE/4];
+static unsigned s_verified_leaf_count;
+static int spu_verified_leaf_mode(void)
+{
+    static atomic_int mode;
+    int value=atomic_load_explicit(&mode,memory_order_relaxed);
+    if(!value) {
+        const char* e=getenv("SPU_VERIFIED_LEAF_BLOCKS");value=e&&!strcmp(e,"1")?2:1;
+        atomic_store_explicit(&mode,value,memory_order_relaxed);
+    }
+    return value==2;
+}
+static const uint8_t* spu_verified_leaf_bytes(const spu_verified_image* v,
+    uint32_t start,uint32_t end)
+{
+    if(((start|end)&3u)||end<=start||end>SPU_LS_SIZE)return NULL;
+    for(unsigned j=0;j<v->count;++j) {
+        const spu_verified_code_segment* s=&v->segments[j];
+        if(start>=s->lsa && end<=s->lsa+s->size)return s->bytes+start-s->lsa;
+    }
+    return NULL;
+}
+int spu_verified_leaf_register(int image,const spu_verified_leaf_unit* units,unsigned count)
+{
+    if(!units||!count||count>SPU_VERIFIED_LEAF_MAX-s_verified_leaf_count)return 0;
+    const spu_verified_image* v=NULL;
+    for(unsigned k=0;k<s_verified_count;++k)
+        if(s_verified_images[k].image==image)v=&s_verified_images[k];
+    if(!v)return 0;
+    for(unsigned k=0;k<count;++k) {
+        const spu_verified_leaf_unit* u=&units[k];
+        if(!u->func||!spu_verified_leaf_bytes(v,u->start,u->end)||
+            !spu_lookup_exact(u->start,image))return 0;
+        for(unsigned j=0;j<k;++j)if(units[j].start==u->start)return 0;
+        for(uint32_t n=s_verified_leaf_head[u->start>>2];n;n=s_verified_leaf[n-1].next)
+            if(s_verified_leaf[n-1].image==image)return 0;
+    }
+    for(unsigned k=0;k<count;++k) {
+        const spu_verified_leaf_unit* u=&units[k];unsigned at=s_verified_leaf_count++;
+        s_verified_leaf[at]=(spu_verified_leaf){u->start,u->end,
+            s_verified_leaf_head[u->start>>2],v->policy,image,
+            spu_verified_leaf_bytes(v,u->start,u->end),u->func};
+        s_verified_leaf_head[u->start>>2]=at+1;
+    }
+    return 1;
+}
+static int spu_verified_leaf_eligible(const spu_context* c)
+{
+    return c && c->policy_mode && c->ls==c->ls_store &&
+        c->status==SPU_STATUS_RUNNING && !c->int_enable && !c->irq_saved && !c->irq_frame;
+}
+static spu_fn spu_verified_leaf_lookup(const spu_context* c,uint32_t pc,int* covered)
+{
+    *covered=0;
+    if(pc>=SPU_LS_SIZE||(pc&3u)||!spu_verified_leaf_eligible(c))return NULL;
+    spu_fn result=NULL;
+    const spu_verified_leaf* selected=NULL;
+    for(uint32_t n=s_verified_leaf_head[pc>>2];n;n=s_verified_leaf[n-1].next) {
+        const spu_verified_leaf* u=&s_verified_leaf[n-1];
+        if(c->image_id!=u->policy)continue;
+        *covered=1;
+        if(memcmp(c->ls+u->start,u->expected,u->end-u->start))continue;
+        if(result)return NULL; /* ambiguity: never choose the first translation */
+        result=u->fn;selected=u;
+    }
+    static SPU_THREAD_LOCAL int reported;
+    if(result && !reported) {
+        reported=1;
+        if(getenv("SPU_VERIFIED_LEAF_DIAGNOSTICS"))
+            fprintf(stderr,"[spu-leaf] lookup image=%d pc=%05X bytes=%u\n",
+                selected->image,pc,selected->end-selected->start);
+    }
+    return result;
+}
+int spu_verified_leaf_enter(const spu_context* c,int image,uint32_t start,uint32_t end)
+{
+    if(!spu_verified_leaf_mode()||start>=SPU_LS_SIZE||(start&3u)||
+        !spu_verified_leaf_eligible(c))return 0;
+    for(uint32_t n=s_verified_leaf_head[start>>2];n;n=s_verified_leaf[n-1].next) {
+        const spu_verified_leaf* u=&s_verified_leaf[n-1];
+        if(u->image==image && u->policy==c->image_id && u->end==end) {
+            int covered;
+            return spu_verified_leaf_lookup(c,start,&covered)==u->fn;
+        }
+    }
+    return 0;
+}
+
 /* Apply to every legacy resolver exit, including authoritative resident
  * owners. A guarded image outside its verified span must not reject and then
  * be selected repeatedly through a legacy ownership binding. */
@@ -1746,6 +1844,10 @@ static spu_lifted_fn spu_verified_filter_legacy(uint32_t lsa, spu_fn fn)
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
     if (!ctx) return spu_verified_filter_legacy(lsa, spu_lookup(lsa, 0));
+    if(s_verified_leaf_count && spu_verified_leaf_mode()) {
+        int covered;spu_fn fn=spu_verified_leaf_lookup(ctx,lsa,&covered);
+        if(covered)return (spu_lifted_fn)fn;
+    }
     if (s_verified_count) {
         int covered, image;
         spu_fn fn = spu_verified_lookup(ctx, lsa, &covered, &image);
