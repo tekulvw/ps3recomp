@@ -433,7 +433,7 @@ int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*))
         !ctx->region_has_return || ctx->region_dispatch_depth!=ctx->host_depth ||
         ctx->region_return_pc!=ctx->drain_ret_pc ||
         (ctx->pc&SPU_LS_MASK)==ctx->region_return_pc || ctx->irq_saved ||
-        ctx->irq_frame || ctx->status || g_spu_trampoline_fn))return spu_region_reject(ctx,4);
+        ctx->irq_frame || ctx->status != SPU_STATUS_RUNNING || g_spu_trampoline_fn))return spu_region_reject(ctx,4);
     static atomic_int diagnostic_mode;
     int diagnostic = atomic_load_explicit(&diagnostic_mode, memory_order_relaxed);
     if (!diagnostic) {
@@ -446,7 +446,7 @@ int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*))
     if(framed && (!ctx->region_dispatch_valid ||
         ctx->region_dispatch_depth!=ctx->host_depth ||
         ctx->region_return_pc!=ctx->drain_ret_pc || ctx->int_enable ||
-        ctx->status || g_spu_trampoline_fn))return spu_region_reject(ctx,5);
+        ctx->status != SPU_STATUS_RUNNING || g_spu_trampoline_fn))return spu_region_reject(ctx,5);
     if(framed) {
         static SPU_THREAD_LOCAL int reported;
         if(!reported && getenv("SPU_REGION_FRAMED_DIAGNOSTICS")) {
