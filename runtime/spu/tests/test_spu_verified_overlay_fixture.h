@@ -170,6 +170,30 @@ static void test_verified_overlay(void)
     check(c->gpr[7]._u32[0]==99 && c->pc==0x900 && c->host_depth==1,
           "queued generated destination interprets changed instructions and returns");
 #endif
+    /* Necessary-byte prechecks may only reject: every surviving admission
+     * still compares the complete registered text, including unsampled bytes. */
+    unsigned char long_bytes[256];for(unsigned i=0;i<256;i++)long_bytes[i]=(unsigned char)(i*17+29);
+    spu_verified_code_segment long_segment={0x23000,sizeof long_bytes,long_bytes};
+    spu_begin_image(704);spu_register_function(0x23000,verified_stale);spu_begin_image(0);
+    check(spu_verified_overlay_register(501,704,&long_segment,1),"register bounded long text segment");
+    memcpy(c->ls+0x23000,long_bytes,sizeof long_bytes);
+    compares=test_verified_compares;
+    check(spu_lifted_lookup(c,0x23000)==verified_stale,"exact long image still admitted");
+    check(test_verified_compares==compares+1,"successful candidate retains complete comparison");
+    c->ls[0x23028]^=1;compares=test_verified_compares;
+    check(!spu_lifted_lookup(c,0x23000),"unsampled executable mutation rejects full candidate");
+    check(test_verified_compares==compares+1,"unsampled mutation reaches authoritative complete comparison");
+    c->ls[0x23028]^=1;c->ls[0x23080]^=1;compares=test_verified_compares;
+    check(!spu_lifted_lookup(c,0x23000),"sampled executable mutation rejects candidate");
+    const char* pf=getenv("SPU_VERIFIED_ENTRY_PREFILTER");int prefilter=pf&&!strcmp(pf,"1");
+    check(test_verified_compares==compares+(prefilter?0:1),"negative precheck avoids entire-image scan only when enabled");
+    c->ls[0x23080]^=1;
+    for(unsigned i=0;i<sizeof long_bytes;i++){
+        c->ls[0x23000+i]^=1;
+        check(!spu_lifted_lookup(c,0x23000),"every executable-byte mutation rejects under prefilter");
+        c->ls[0x23000+i]^=1;
+    }
+    check(spu_lifted_lookup(c,0x23000)==verified_stale,"restoration requires fresh complete validation");
     /* Exact bytes with only compatibility wildcard registration must fail. */
     unsigned char wildcard_bytes[] = {0,0,0,0};
     spu_verified_code_segment ws={0x18000,4,wildcard_bytes};
@@ -187,9 +211,9 @@ static void test_verified_overlay(void)
     while (spu_verified_overlay_register(601,800+(int)slots,&ws,1)) ++slots;
     check(slots==
 #ifdef SPU_VERIFIED_SPANS_TEST
-        12,
+        11,
 #else
-        13,
+        12,
 #endif
         "registry has exact fixed image capacity without partial invalid registrations");
     check(!spu_verified_overlay_register(601,999,&ws,1), "registry overflow fails closed");

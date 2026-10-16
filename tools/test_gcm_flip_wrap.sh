@@ -8,5 +8,5 @@ case "$(uname -s)" in
  *) linkflags='-Wl,--gc-sections';;
 esac
 ${CC:-cc} -std=gnu17 -ffunction-sections -fdata-sections -I "$root/include" -I "$root/libs/video" \
- "$root/libs/video/tests/test_gcm_flip_wrap.c" $linkflags -pthread -o "$work/test"
+ "$root/libs/video/tests/test_gcm_flip_wrap.c" "$root/libs/video/tests/gcm_deferred_fixture_stubs.c" $linkflags -pthread -o "$work/test"
 "$work/test"
