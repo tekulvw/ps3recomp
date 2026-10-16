@@ -1,5 +1,9 @@
 #include "../rsx_metal_backend.m"
 #include <assert.h>
+/* This standalone Metal fixture intentionally has no GCM consumer. */
+int cellGcm_native_consumer_enabled(void){return 0;}
+void cellGcm_fifo_kick_notify(void){assert(!"disabled consumer must not be notified");}
+void rsx_ring_progress_metal_committed(uint64_t ticket,uint64_t records){(void)ticket;(void)records;}
 static int checked(void* u,u32 reason) {
 #ifdef PS3RECOMP_METAL_CHECKED_IMPLEMENTATION
  return eng_submit_and_wait_checked(u,reason);
