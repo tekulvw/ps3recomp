@@ -1,3 +1,4 @@
+#include "../../runtime/diagnostics/critical_trace.h"
 /*
  * ps3recomp - cellGcmSys HLE module implementation
  *
@@ -885,6 +886,8 @@ u32 gcm_io_offset_to_ea(u32 io) { return gcm_io2ea(io); }
  * control register/offset tables. Sample values remain approximate. */
 static void gcm_get_report(u32 argument)
 {
+    const uint64_t critical_capture=ps3_critical_capture_id();
+    const uint64_t critical_start=ps3_critical_enabled()?ps3_critical_now_ns():0;
     const u32 offset = argument & 0xFFFFFFu;
     const u32 index = offset / 16u;
     u32 ea = 0;
@@ -922,7 +925,10 @@ static void gcm_get_report(u32 argument)
         s_report_data[index].timestamp = timestamp;
         s_report_data[index].value = value;
     }
-    if (s_report_dma == GCM_REPORT_DMA_LOCAL) return;
+    if (s_report_dma == GCM_REPORT_DMA_LOCAL) {
+        if(critical_start){uint64_t w[5]={critical_start,ea,argument,s_report_dma,1};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_REPORT,ea,index,w,5);}
+        return;
+    }
 
     /* Serialize with GETLLAR/PUTLLC. The completion word is the final store,
      * and one notification after the complete record wakes lock-line waiters.
@@ -939,8 +945,10 @@ static void gcm_get_report(u32 argument)
     }
     spu_coh_notify_write(ea);
     spu_lockline_unlock();
+    if(critical_start){uint64_t w[5]={critical_start,ea,argument,s_report_dma,1};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_REPORT,ea,index,w,5);}
     return;
 invalid:
+    if(critical_start){uint64_t w[5]={critical_start,ea,argument,s_report_dma,0};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_REPORT,ea,index,w,5);}
     { static unsigned warnings;
       if (warnings < 8) {
           ++warnings;

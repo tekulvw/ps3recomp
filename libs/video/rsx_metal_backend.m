@@ -1,3 +1,4 @@
+#include "../../runtime/diagnostics/critical_trace.h"
 #include "../misc/osk_native.h"
 /*
  * ps3recomp - RSX -> Metal backend (macOS / Apple Silicon)
@@ -134,11 +135,14 @@ static MetalFrameRateSession *fps_session(void)
 @public
     MetalFrameRateSession *session;
     uint64_t submission_id, guest_flip_id, window_request_id;
+    uint64_t critical_command_id,critical_capture_id;
     uint32_t buffer_id;
 }
 @end
 @implementation MetalFrameTicket
 @end
+static _Atomic uint64_t s_critical_command_sequence;
+static uint64_t critical_double(double v){uint64_t u;memcpy(&u,&v,sizeof(u));return u;}
 static _Thread_local uint64_t s_present_guest_id;
 static _Thread_local uint32_t s_present_buffer_id;
 static MetalFrameTicket *fps_frame_ticket(void)
@@ -166,7 +170,9 @@ static void fps_track_drawable_tagged(id<CAMetalDrawable> drawable,MetalFrameTic
     MetalFrameRateSession *session=ticket?ticket->session:fps_session();
     if (!session || !drawable) return;
     [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+        const uint64_t bridge_before=ps3_critical_enabled()?ps3_critical_now_ns():0;
         const double arrival=CACurrentMediaTime();
+        if(bridge_before){uint64_t w[5]={critical_double(shown.presentedTime),critical_double(arrival),bridge_before,ps3_critical_now_ns(),ticket?ticket->submission_id:0};ps3_critical_emit_capture(ticket?ticket->critical_capture_id:0,PS3_CRITICAL_PRESENT,ticket?ticket->guest_flip_id:0,ticket?ticket->critical_command_id:0,w,5);}
         pthread_mutex_lock(&session->lock);
         metal_frame_rate_presented(&session->stats,shown.presentedTime);
         if(ticket)metal_measurement_present(fps_ticket_measurement(ticket),ticket->submission_id,
@@ -228,6 +234,7 @@ static void fps_note_skipped_blit(void)
 
 void rsx_metal_backend_note_guest_frame(void)
 {
+    if(ps3_critical_enabled()){uint64_t w[2]={s_present_buffer_id,0};ps3_critical_emit(PS3_CRITICAL_GUEST,s_present_guest_id,0,w,2);}
     MetalFrameRateSession *session=fps_session();
     if (!session) return;
     pthread_mutex_lock(&session->lock);
@@ -4034,6 +4041,11 @@ static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
  * encoding work. */
 static int eng_encode_and_commit(id<MTLTexture> present_dst)
 {
+    const uint64_t critical_id=atomic_fetch_add(&s_critical_command_sequence,1)+1;
+    const uint64_t critical_capture=ps3_critical_capture_id();
+    const uint64_t critical_start=ps3_critical_enabled()?ps3_critical_now_ns():0;
+    const uint64_t critical_size=((uint64_t)s_eng_rec_count<<32)|s_eng_stage_used;
+    uint64_t critical_commit=0,critical_wait=0;
     s_eng_checked_completed=0;
     if(!s_dev || !s_queue){eng_checked_fail();return 0;}
     if(s_eng_dropped)eng_checked_fail();
@@ -4041,15 +4053,22 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
         id<CAMetalDrawable> drawable = nil;
         id<MTLTexture> dst = nil;
         const int windowed_present = (present_dst && !s_headless);
+        uint64_t semaphore_start=0,semaphore_end=0,drawable_start=0,drawable_end=0;
         { const uint64_t w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-          if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+          if (windowed_present) {
+              if(critical_start)semaphore_start=ps3_critical_now_ns();
+              dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+              if(critical_start)semaphore_end=ps3_critical_now_ns();
+          }
           if (w0 && windowed_present) { const uint64_t w1 = ps3_ft_now();
               if (w1 - w0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 2, 0, w0, w1); } }
         if (present_dst) {
             if (s_headless) {
                 dst = s_offscreen;
             } else {
+                if(critical_start)drawable_start=ps3_critical_now_ns();
                 drawable = [s_layer nextDrawable];
+                if(critical_start)drawable_end=ps3_critical_now_ns();
                 fps_note_drawable(drawable!=nil);
                 if (!drawable) {           /* compositor is busy; skip */
                     if (s_eng_diag.active) s_eng_diag.reason = "no_drawable";
@@ -4081,6 +4100,15 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
         if (s_eng_diag.active && !presented && present_dst) s_eng_diag.reason = "blit_skipped";
         const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
         MetalFrameTicket *ticket=drawable?fps_frame_ticket():nil;
+        if(ticket){ticket->critical_command_id=critical_id;ticket->critical_capture_id=critical_start?critical_capture:0;}
+        if(critical_start && windowed_present){uint64_t w[5]={critical_start,semaphore_start,semaphore_end,drawable_start,drawable_end};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_CLOCK,s_present_guest_id,critical_id,w,5);}
+        if(critical_start && windowed_present){
+            const uint64_t guest_id=s_present_guest_id;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> finished){
+                uint64_t w[4]={(uint64_t)(finished.status==MTLCommandBufferStatusCompleted && !finished.error),critical_double(finished.GPUStartTime),critical_double(finished.GPUEndTime),ticket?ticket->submission_id:0};
+                ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_GPU,guest_id,critical_id,w,4);
+            }];
+        }
         if (drawable) { fps_track_drawable_tagged(drawable,ticket); [cb presentDrawable:drawable]; }
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
         if (drawable && (presented || ticket)) fps_track_frame_completion_tagged(cb,ticket,presented);
@@ -4091,11 +4119,14 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
                 if([_unused status]!=MTLCommandBufferStatusCompleted || [_unused error])eng_checked_fail();
                 dispatch_semaphore_signal(sem);
             }];
+            if(critical_start)critical_commit=ps3_critical_now_ns();
             [cb commit];
             fps_frame_committed(ticket);
         } else {
+            if(critical_start)critical_commit=ps3_critical_now_ns();
             const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
             [cb commit];
+            if(critical_start)critical_wait=ps3_critical_now_ns();
             [cb waitUntilCompleted];
             if (ft_w0) {
                 const uint64_t w1 = ps3_ft_now();
@@ -4131,6 +4162,7 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
                     s_eng_dropped, ENG_MAX_RECORDS);
             s_eng_dropped = 0;
         }
+        if(critical_start){uint64_t w[8]={critical_start,critical_size,critical_commit,critical_wait,s_present_guest_id,(uint64_t)([cb status]==MTLCommandBufferStatusCompleted && ![cb error]),critical_double(cb.GPUStartTime),critical_double(cb.GPUEndTime)};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_FLUSH,critical_id,(uint64_t)windowed_present,w,8);}
         s_eng_rec_count  = 0;
         s_eng_stage_used = 0;
         eng_collect_retired_objects();
