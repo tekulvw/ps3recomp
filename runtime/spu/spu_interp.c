@@ -7,12 +7,19 @@
  */
 #include <time.h>
 #include "spu_interp.h"
+#include "spu_interp_observer.h"
 #include "spu_helpers.h"
 #include "spu_pc_observer.h"
 #include "../diagnostics/critical_pc_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <errno.h>
+
+static _Atomic(spu_interp_entry_observer_fn) entry_observer;
+void spu_interp_entry_observer_set(spu_interp_entry_observer_fn observer) {
+    atomic_store_explicit(&entry_observer, observer, memory_order_release);
+}
 
 /* Channel ABI (runtime/spu/spu_channels.c); the lifter emits these same protos
  * into each generated spu_recomp.h — declared here to stay header-independent. */
@@ -487,6 +494,14 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     int observe = spu_pc_observer_enabled();
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
+    /* One cheap null check per invocation; no instruction-loop instrumentation. */
+    spu_interp_entry_observer_fn observer =
+        atomic_load_explicit(&entry_observer, memory_order_acquire);
+    if (observer) {
+        int saved_errno = errno;
+        observer(ctx, start_lsa, stop_lsa);
+        errno = saved_errno;
+    }
     uint64_t steps = 0;
     /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
      * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
