@@ -39,7 +39,9 @@ int main(int argc,char** argv) {
         oracle->policy_mode=0;native->policy_mode=1;native->status=SPU_STATUS_RUNNING;
         if(enabled && (trial&1))native->ls[0x10020]^=1; /* outside both independent units */
         CHECK(spu_interp_run_until(oracle,0x10000,0x20000)==0x20000);
-        ++native->host_depth;native->pc=0x10000;g_spu_trampoline_fn=spu_indirect_branch;
+        ++native->host_depth;native->pc=0x10000;
+        if(trial&1)spu_verified_leaf_indirect_call(native,0x20000);
+        else g_spu_trampoline_fn=spu_indirect_branch;
         spu_drain_call(native,0x20000);--native->host_depth;
         CHECK(native->pc==oracle->pc && native->host_depth==0);
         CHECK(native->status==oracle->status && native->int_enable==oracle->int_enable);
