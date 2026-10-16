@@ -17,6 +17,7 @@ with tempfile.TemporaryDirectory(prefix="gcm-report-") as tmp:
            "-ffunction-sections", "-fdata-sections", "-I", str(ROOT / "include"),
            str(ROOT / "libs/video/tests/test_gcm_checked_reference.c"),
            "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
+           str(ROOT / "libs/video/tests/gcm_deferred_fixture_stubs.c"),
            "-pthread", "-lm", "-o", str(out)]
     subprocess.run(cmd, check=True, timeout=60)
     
