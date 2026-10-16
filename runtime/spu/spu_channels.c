@@ -1789,6 +1789,18 @@ static int spu_verified_leaf_eligible(const spu_context* c)
     return c && c->policy_mode && c->ls==c->ls_store &&
         c->status==SPU_STATUS_RUNNING && !c->int_enable && !c->irq_saved && !c->irq_frame;
 }
+/* Raw blocks may not execute through an owning native caller continuation. */
+static int spu_verified_leaf_scope(const spu_context* c,const spu_verified_leaf* u)
+{
+    if((c->host_depth||c->drain_ret_pc) &&
+        (!c->region_dispatch_valid||!c->region_has_return||
+         c->region_dispatch_depth!=c->host_depth||c->region_return_pc!=c->drain_ret_pc))return 0;
+    if(c->region_dispatch_valid && c->region_has_return) {
+        if(c->region_dispatch_depth!=c->host_depth||c->region_return_pc!=c->drain_ret_pc)return 0;
+        if(c->region_return_pc>=u->start && c->region_return_pc<u->end)return 0;
+    }
+    return 1;
+}
 static spu_fn spu_verified_leaf_lookup(const spu_context* c,uint32_t pc,int* covered)
 {
     *covered=0;
@@ -1797,7 +1809,7 @@ static spu_fn spu_verified_leaf_lookup(const spu_context* c,uint32_t pc,int* cov
     const spu_verified_leaf* selected=NULL;
     for(uint32_t n=s_verified_leaf_head[pc>>2];n;n=s_verified_leaf[n-1].next) {
         const spu_verified_leaf* u=&s_verified_leaf[n-1];
-        if(c->image_id!=u->policy)continue;
+        if(c->image_id!=u->policy||!spu_verified_leaf_scope(c,u))continue;
         *covered=1;
         if(memcmp(c->ls+u->start,u->expected,u->end-u->start))continue;
         if(result)return NULL; /* ambiguity: never choose the first translation */

@@ -5,6 +5,10 @@
 #include "leaf_program.h"
 void legacy_test_spu_recomp_register(void);
 int raw_test_spu_leaf_register(void);
+static unsigned admissions;
+int observed_leaf_enter(const spu_context* c,int image,uint32_t start,uint32_t end) {
+    int ok=spu_verified_leaf_enter(c,image,start,end);admissions+=(unsigned)ok;return ok;
+}
 static uint32_t rng=1;
 static uint32_t next(void) {return rng=rng*1664525u+1013904223u;}
 int main(int argc,char** argv) {
@@ -35,8 +39,8 @@ int main(int argc,char** argv) {
         oracle->policy_mode=0;native->policy_mode=1;native->status=SPU_STATUS_RUNNING;
         if(enabled && (trial&1))native->ls[0x10020]^=1; /* outside both independent units */
         CHECK(spu_interp_run_until(oracle,0x10000,0x20000)==0x20000);
-        ++native->host_depth;g_spu_trampoline_fn=spu_lifted_lookup(native,0x10000);
-        CHECK(g_spu_trampoline_fn!=NULL);spu_drain_call(native,0x20000);--native->host_depth;
+        ++native->host_depth;native->pc=0x10000;g_spu_trampoline_fn=spu_indirect_branch;
+        spu_drain_call(native,0x20000);--native->host_depth;
         CHECK(native->pc==oracle->pc && native->host_depth==0);
         CHECK(native->status==oracle->status && native->int_enable==oracle->int_enable);
         CHECK(!memcmp(native->gpr,oracle->gpr,sizeof(native->gpr)));
@@ -44,6 +48,7 @@ int main(int argc,char** argv) {
         spu_mfc_release(oracle);spu_coh_unregister(oracle);free(oracle);
         spu_mfc_release(native);spu_coh_unregister(native);free(native);
     }
+    CHECK(admissions==(enabled?32u:0u));
     printf("LEAF EXEC mode=%d trials=16 passed=%d failed=%d\n",enabled,g_pass,g_fail);
     return g_fail?1:0;
 }
