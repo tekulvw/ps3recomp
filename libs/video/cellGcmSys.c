@@ -41,6 +41,7 @@ static u32 s_gcm_context_ea = 0;
 static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
 static _Thread_local unsigned s_consumer_depth;
 static int s_deferred_reports;
+static int s_query_observe;
 static rsx_deferred_report_queue s_reports = {.generation=1};
 static u32 s_backend_label_offset;
 static int gcm_reports_dependency(void);
@@ -67,6 +68,7 @@ static int gcm_report_vm_begin(uint64_t ea,uint64_t size) {
 __attribute__((constructor))
 #endif
 static void gcm_deferred_initialize(void) {
+    const char *q=getenv("PS3RECOMP_RSX_QUERY_OBSERVE");s_query_observe=q&&!strcmp(q,"1");
     const char *e=getenv("PS3RECOMP_RSX_DEFERRED_REPORTS");
     s_deferred_reports=e && !strcmp(e,"1");
     if (s_deferred_reports) {
@@ -1012,6 +1014,22 @@ static int gcm_defer_label(u32 ea,u32 value,u32 method){
     int ok=rsx_reports_enqueue(&s_reports,&s_report_ops,r);
     if(!ok&&!failed)fprintf(stderr,"[deferred reports] label enqueue FAILED; publication stopped\n");
     return ok;
+}
+
+/* Separate diagnostic capture only. Counts are FIFO draw-method words, not
+ * certified encoded draws or visibility results. Unknown initial state stays
+ * explicit until an actual enable and clear have been observed. */
+static void gcm_query_observe(u32 method,u32 argument,u32 fifo){
+    if(!s_query_observe||!ps3_critical_enabled()||ps3_critical_capture_id()!=2)return;
+    static u64 capture,generation;static u32 enabled,known,draws,clear_argument;
+    u64 id=ps3_critical_capture_id();
+    if(capture!=id){capture=id;generation=0;enabled=known=draws=clear_argument=0;}
+    if(method==0x1814u||method==0x1824u){++draws;return;}
+    if(method==0x17ccu){enabled=argument;known|=1u;}
+    else if(method==0x17c8u){++generation;draws=0;clear_argument=argument;known|=2u;}
+    else if(method!=0x1800u)return;
+    uint64_t w[7]={method,argument,enabled,known,draws,s_report_dma,clear_argument};
+    ps3_critical_emit_capture(id,22,fifo,generation,w,7);
 }
 
 static void gcm_get_report(u32 argument){
@@ -2539,6 +2557,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
+                if(s_query_observe&&ps3_critical_enabled()&&ps3_critical_capture_id()==2)
+                    gcm_query_observe((subch<<13)|m,vm_read32(dea),s_fifo_getoff+4+i*4);
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It
