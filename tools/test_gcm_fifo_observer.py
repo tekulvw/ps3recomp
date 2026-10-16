@@ -15,6 +15,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-observer-') as tmp:
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',
         '-ffunction-sections','-fdata-sections','-I',str(ROOT/'include'),
         str(ROOT/'libs/video/tests/test_gcm_fifo_observer.c'),
+        str(ROOT/'libs/video/tests/gcm_deferred_fixture_stubs.c'),
         '-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections',
         '-pthread','-lm','-o',str(out)],check=True,timeout=60)
     clean={k:v for k,v in os.environ.items() if not k.startswith('GCM_FIFO_OBSERVE')}

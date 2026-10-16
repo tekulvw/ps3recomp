@@ -1668,6 +1668,35 @@ int spu_verified_overlay_register(int policy, int image,
     return 1;
 }
 
+/* Stateless negative-only precheck. Matching anchors confer no trust: every
+ * survivor still passes the original complete image comparison below. */
+static int spu_verified_entry_prefilter_mode(void)
+{
+    static atomic_int mode;
+    int value=atomic_load_explicit(&mode,memory_order_relaxed);
+    if(!value){const char *e=getenv("SPU_VERIFIED_ENTRY_PREFILTER");
+        value=e&&!strcmp(e,"1")?2:1;atomic_store_explicit(&mode,value,memory_order_relaxed);}
+    return value==2;
+}
+static int spu_verified_negative_precheck(const spu_context *ctx,
+    const spu_verified_image *v,uint32_t entry)
+{
+    for(unsigned j=0;j<v->count;j++){
+        const spu_verified_code_segment *s=&v->segments[j];
+        uint32_t width=s->size<16u?s->size:16u;
+        if(entry>=s->lsa && entry-s->lsa<s->size){
+            uint32_t offset=entry-s->lsa,bytes=s->size-offset;
+            if(bytes>16u)bytes=16u;
+            if(memcmp(ctx->ls+entry,s->bytes+offset,bytes))return 0;
+        }
+        for(unsigned k=0;k<5;k++){
+            uint32_t offset=(((s->size-width)*k)/4u)&~3u;
+            if(memcmp(ctx->ls+s->lsa+offset,s->bytes+offset,width))return 0;
+        }
+    }
+    return 1;
+}
+
 /* On an exact function-table miss there is no large byte comparison. A known
  * registered region still blocks stale primary functions, including holes.
  * No cached trust survives DMA, SPU stores, or PPU changes between entries. */
@@ -1696,6 +1725,7 @@ static spu_fn spu_verified_lookup(const spu_context* ctx, uint32_t lsa,
             if (lsa >= v->segments[j].lsa &&
                 lsa - v->segments[j].lsa < v->segments[j].size) in_text = 1;
         if (!in_text) continue;
+        if(spu_verified_entry_prefilter_mode() && !spu_verified_negative_precheck(ctx,v,lsa))continue;
         unsigned j = 0;
         for (; j < v->count; ++j) {
             const spu_verified_code_segment* s = &v->segments[j];

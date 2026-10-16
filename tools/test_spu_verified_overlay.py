@@ -8,6 +8,7 @@ cc=os.environ.get('CC','cc')
 span_mode=os.environ.get('SPU_VERIFIED_SPANS')=='1'
 span_args=['--verified-code-spans'] if span_mode else []
 env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
+env['SPU_VERIFIED_ENTRY_PREFILTER']=os.environ.get('SPU_VERIFIED_ENTRY_PREFILTER','0')
 # STQD r10,0(r11); BRSL r6,callee; AI r7,r7,1; BI r0.
 # Callee: IL r7,22; BI r6. Gaps are deliberately not executable segments.
 words=[0x24000000|(11<<7)|10,0x33000000|(7<<7)|6,
