@@ -37,6 +37,7 @@ int main(int argc,char** argv) {
         oracle->image_id=native->image_id=501;
         /* This disables compiled rejoin only, not any instruction semantics. */
         oracle->policy_mode=0;native->policy_mode=1;native->status=SPU_STATUS_RUNNING;
+        native->int_enable=oracle->int_enable=(trial&1);
         if(enabled && (trial&1))native->ls[0x10020]^=1; /* outside both independent units */
         CHECK(spu_interp_run_until(oracle,0x10000,0x20000)==0x20000);
         ++native->host_depth;native->pc=0x10000;
