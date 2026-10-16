@@ -247,11 +247,13 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * base (e.g. func_002B03AC's `*(r2-0x4B34)` FMOD list head -> null -> infinite walk
      * -> no draws). Snapshot the caller r2+sp now and restore BOTH the live r2 and the
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
-    struct _TocGuard { ppu_context* c; uint64_t toc, sp;
-        ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
+    const bool attribute_arg9_enabled=nid==0xEFEB2679u&&[](){static const bool on=[](){const char *v=getenv("PS3RECOMP_SPURS_WORKLOAD_STACK_ARG9");return v&&!strcmp(v,"1");}();return on;}();
+    const bool attribute_stack_invalid=attribute_arg9_enabled&&(ctx->gpr[1]>UINT32_MAX-0x70u||!SpursWorkloadInfoTrace::range(ctx->gpr[1]+0x70,8));
+    struct _TocGuard { ppu_context* c; uint64_t toc, sp; bool writeback;
+        ~_TocGuard(){ c->gpr[2] = toc; if(writeback)vm_write64(sp + 0x28, toc);
                       unsigned t = (unsigned)c->thread_id;
                       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
-    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
+    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1],!attribute_stack_invalid };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */
@@ -348,7 +350,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * unnecessary — and in the frameless-cascade it can clobber a caller frame slot
      * (e.g. the deserializer's this-pointer). Skip it to test that theory. */
     { static int _ns=-1; if(_ns<0)_ns=getenv("FLOW_NOSPILL")?1:0;
-      if(!_ns) vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); }
+      if(!_ns&&!attribute_stack_invalid) vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); }
 
     /* Real libsre (loaded PRX) takes priority over the HLE stub -- EXCEPT for NIDs
      * listed in YDKJ_FORCE_HLE (comma-separated hex). Some LLE entry points fail
@@ -753,6 +755,28 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                     e->name, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
                     (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],
                     (uint32_t)ctx->gpr[6],(uint32_t)ctx->gpr[7],(uint32_t)ctx->gpr[8]);
+    }
+    /* This export has nine integer arguments. ELFv1 places the ninth in the
+     * BE64 parameter save slot sp+0x70; its u32 type consumes the low 32 bits.
+     * Both comparison arms call the full prototype (off explicitly supplies1).
+     * Keep this after LLE export and context-handler dispatch precedence. */
+    if(nid==0xEFEB2679u){
+        uint32_t maximum=1;
+        if(attribute_arg9_enabled){
+            const uint64_t sp=ctx->gpr[1];
+            if(attribute_stack_invalid){
+                /* A rejected stack must not reach the initializer or its TOC
+                 * writeback (which also needs a valid guest stack). */
+                _tg.writeback=false;ctx->gpr[3]=0x80410702u;
+                fprintf(stderr,"[spurs-attribute-abi] invalid ninth-argument stack sp=0x%llX\n",(unsigned long long)sp);
+                return;
+            }
+            uint64_t raw=0;for(unsigned b=0;b<8;b++)raw=(raw<<8)|vm_base[sp+0x70+b];
+            maximum=(uint32_t)raw;
+        }
+        using WorkloadAttributeFn=int32_t(*)(uint64_t,uint32_t,uint32_t,uint64_t,uint32_t,uint64_t,uint64_t,uint32_t,uint32_t);
+        ctx->gpr[3]=(uint32_t)((WorkloadAttributeFn)e->handler)(ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],ctx->gpr[6],(uint32_t)ctx->gpr[7],ctx->gpr[8],ctx->gpr[9],(uint32_t)ctx->gpr[10],maximum);
+        return;
     }
     hle_generic fn = (hle_generic)e->handler;
     uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],

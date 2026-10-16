@@ -1885,10 +1885,12 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
 
 /* The SDK-versioned workload-attribute initializer (the import the game links;
  * NID differs from the non-underscore inline wrapper). Args arrive raw in
- * r3..r10; writes the REAL BE layout so AddWorkloadWithAttribute round-trips. */
+ * r3..r10 plus the ninth stack argument decoded by the typed HLE bridge;
+ * writes the REAL BE layout so AddWorkloadWithAttribute round-trips. */
 s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVersion,
                                           u64 pm_ea, u32 size, u64 data,
-                                          u64 prio_ea, u32 minContention)
+                                          u64 prio_ea, u32 minContention,
+                                          u32 maxContention)
 {
     if (!attr_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     vm_write32((u32)attr_ea + WKATTR_REVISION,   revision);
@@ -1900,7 +1902,7 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
         *(vm_base + (u32)attr_ea + WKATTR_PRIORITY + i) =
             prio_ea ? *(vm_base + (u32)prio_ea + i) : 0;
     vm_write32((u32)attr_ea + WKATTR_MIN_CONT, minContention);
-    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, 1);   /* 9th arg is beyond the 8-GPR adapter */
+    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, maxContention);
     vm_write32((u32)attr_ea + WKATTR_NAME_CLASS, 0);
     vm_write32((u32)attr_ea + WKATTR_NAME_INST,  0);
     vm_write32((u32)attr_ea + WKATTR_HOOK,     0);
