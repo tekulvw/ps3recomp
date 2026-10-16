@@ -32,6 +32,23 @@ static u32 s_gcm_context_ea = 0;
 #include "ps3emu/log_first.h"
 #include <stdatomic.h>
 
+/* Explicitly initialized by the application before guest/consumer threads.
+ * Only launch-static diagnostic configuration is frozen. Runtime diagnostic
+ * control files and all FIFO/guest state retain their existing behavior. */
+static atomic_int s_native_consumer;
+static int s_native_checked_ref,s_native_drain_debug;
+/* Startup-only publication, before any PPU worker. Never changed thereafter;
+ * the generated-code store seam compares only this exact control address. */
+uint32_t g_gcm_consumer_put_wake_ea;
+static SRWLOCK s_consumer_config_lock = SRWLOCK_INIT;
+static int s_consumer_config_initialized;
+int cellGcm_native_consumer_enabled(void) {
+    return atomic_load_explicit(&s_native_consumer,memory_order_acquire);
+}
+static int gcm_drain_debug(void) {
+    return cellGcm_native_consumer_enabled() ? s_native_drain_debug : getenv("GCM_DRAINDBG") != NULL;
+}
+
 static _Atomic(rsx_ring_progress_observer_fn) s_ring_observer;
 static _Atomic(uint32_t) s_ring_target,s_ring_issue_ea,s_ring_issue_value;
 static _Atomic(uint64_t) s_ring_snapshot_target;
@@ -1705,6 +1722,7 @@ static u64 s_checked_ref_receipt;
 static u64 s_ref_receipts[GCM_REF_QLEN];
 static int gcm_checked_ref_mode(void)
 {
+    if(cellGcm_native_consumer_enabled())return s_native_checked_ref;
     const char* e = getenv("PS3RECOMP_GCM_CHECKED_REF");
     return e && !strcmp(e, "1");
 }
@@ -2106,11 +2124,44 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * 16 ms tick per fence was ~0.75 s/frame (the 2 FPS intro). The walker (and
  * the D3D12 backend it feeds) stays on the present thread -- running it from
  * the polling game thread killed the process silently. */
-static HANDLE s_gcm_kick_ev = NULL;
+/* Process-lifetime event: never closed while a producer or Metal callback may
+ * signal it. Release publication permits callbacks to load without a lock. */
+static _Atomic(HANDLE) s_gcm_kick_ev;
+static SRWLOCK s_gcm_kick_init_lock = SRWLOCK_INIT;
 void* cellGcm_fifo_kick_event(void)
 {
-    if (!s_gcm_kick_ev) s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
-    return (void*)s_gcm_kick_ev;
+    HANDLE ev=atomic_load_explicit(&s_gcm_kick_ev,memory_order_acquire);
+    if(!ev){
+        AcquireSRWLockExclusive(&s_gcm_kick_init_lock);
+        ev=atomic_load_explicit(&s_gcm_kick_ev,memory_order_relaxed);
+        if(!ev){ev=CreateEventA(NULL,FALSE,FALSE,NULL);atomic_store_explicit(&s_gcm_kick_ev,ev,memory_order_release);}
+        ReleaseSRWLockExclusive(&s_gcm_kick_init_lock);
+    }
+    return (void*)ev;
+}
+void cellGcm_native_consumer_init(void)
+{
+    AcquireSRWLockExclusive(&s_consumer_config_lock);
+    if(!s_consumer_config_initialized){
+        const char* flag=getenv("MAG_NATIVE_CONSUMER");
+        int on=flag&&!strcmp(flag,"1");
+        if(on){
+            const char* checked=getenv("PS3RECOMP_GCM_CHECKED_REF");
+            s_native_checked_ref=checked&&!strcmp(checked,"1");
+            s_native_drain_debug=getenv("GCM_DRAINDBG")!=NULL;
+            if(!cellGcm_fifo_kick_event())on=0;
+        }
+        if(on)g_gcm_consumer_put_wake_ea=GCM_CONTROL_GUEST_ADDR;
+        atomic_store_explicit(&s_native_consumer,on,memory_order_release);
+        s_consumer_config_initialized=1;
+    }
+    ReleaseSRWLockExclusive(&s_consumer_config_lock);
+}
+void cellGcm_fifo_kick_notify(void)
+{
+    if(!cellGcm_native_consumer_enabled())return;
+    HANDLE ev=atomic_load_explicit(&s_gcm_kick_ev,memory_order_acquire);
+    if(ev)SetEvent(ev);
 }
 
 /* The present thread's idle wait. It used to be a flat Sleep(4), which meant
@@ -2152,8 +2203,9 @@ void cellGcm_ref_on_poll(void)
         dry = (s_ref_qhead == s_ref_qtail);
     }
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
-    if (dry && s_gcm_kick_ev)
-        SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
+    HANDLE ev=atomic_load_explicit(&s_gcm_kick_ev,memory_order_acquire);
+    if (dry && ev)
+        SetEvent(ev);       /* dry: ask the present thread to walk */
 }
 
 static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
@@ -2250,7 +2302,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
     static int s_drain_every = -1;
     if (s_drain_every < 0) { const char* e = getenv("GCM_DRAINDBG_EVERY");
                              s_drain_every = (e && atoi(e) > 0) ? atoi(e) : 60; }
-    if (getenv("GCM_DRAINDBG")) {
+    if (gcm_drain_debug()) {
         static int n = 0;
         if (n++ % s_drain_every == 0)
             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
@@ -2907,7 +2959,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
-    if (getenv("GCM_DRAINDBG")) {
+    if (gcm_drain_debug()) {
         static int n2 = 0;
         if (n2++ % s_drain_every == 0)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
@@ -4706,4 +4758,7 @@ static void cellGcm_syscall_set_fifo_consumer_body(u32 put, u32 get)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, get);
     s_fifo_getoff  = get;
     s_fifo_calloff = 0;
+    /* Wake only after this real control-register publication. The consumer
+     * still performs its acquire and ordinary FIFO/dependency validation. */
+    cellGcm_fifo_kick_notify();
 }

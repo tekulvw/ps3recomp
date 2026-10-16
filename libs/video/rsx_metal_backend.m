@@ -2477,12 +2477,27 @@ static void eng_check_submissions(int barrier_complete)
         else if(barrier_complete)eng_checked_fail();
     }
 }
+/* Optional GCM linkage keeps standalone Metal consumers independent. The
+ * callback is only a scheduling hint: guest label/report publication remains
+ * on the consumer after it checks the actual command-buffer status. */
+extern int cellGcm_native_consumer_enabled(void) __attribute__((weak_import));
+extern void cellGcm_fifo_kick_notify(void) __attribute__((weak_import));
+static void eng_wake_consumer_on_completion(id<MTLCommandBuffer> cb)
+{
+    if(!cb || !cellGcm_native_consumer_enabled || !cellGcm_fifo_kick_notify ||
+       !cellGcm_native_consumer_enabled())return;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+        (void)finished;
+        cellGcm_fifo_kick_notify();
+    }];
+}
 static void eng_track_submission(id<MTLCommandBuffer> cb)
 {
     eng_check_submissions(0);
     if(!s_eng_submitted)s_eng_submitted=[NSMutableArray new];
     if(!cb || !s_eng_submitted || [s_eng_submitted count]>=64){eng_checked_fail();return;}
     [s_eng_submitted addObject:cb];
+    eng_wake_consumer_on_completion(cb);
 }
 
 
@@ -4799,6 +4814,7 @@ void rsx_metal_backend_present(void)
                 if([_unused status]!=MTLCommandBufferStatusCompleted || [_unused error])eng_checked_fail();
                 dispatch_semaphore_signal(sem);
             }];
+            eng_wake_consumer_on_completion(cb);
             [cb commit];        /* no wait: the CPU goes on to the next frame */
             if(cb)fps_frame_committed(ticket);
         }
