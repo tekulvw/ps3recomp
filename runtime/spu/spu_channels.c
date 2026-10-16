@@ -1620,7 +1620,7 @@ static spu_fn spu_lookup_exact(uint32_t addr, int image_id)
 #define SPU_VERIFIED_SEGMENTS 8u
 #define SPU_VERIFIED_BYTES (4u * 1024u * 1024u)
 typedef struct {
-    int policy, image;
+    int policy, image, entry_only;
     uint32_t lo, hi;
     unsigned count;
     spu_verified_code_segment segments[SPU_VERIFIED_SEGMENTS];
@@ -1629,8 +1629,8 @@ static spu_verified_image s_verified_images[SPU_VERIFIED_IMAGES];
 static unsigned s_verified_count;
 static uint32_t s_verified_bytes;
 
-int spu_verified_overlay_register(int policy, int image,
-    const spu_verified_code_segment* segments, unsigned count)
+static int spu_verified_register(int policy, int image,
+    const spu_verified_code_segment* segments, unsigned count, int entry_only)
 {
     if (policy <= 0 || image <= 0 || policy == image || !segments ||
         !count || count > SPU_VERIFIED_SEGMENTS || s_verified_count >= SPU_VERIFIED_IMAGES)
@@ -1655,7 +1655,7 @@ int spu_verified_overlay_register(int policy, int image,
     uint8_t* copy = (uint8_t*)malloc(total);
     if (!copy) return 0;
     spu_verified_image next = {0};
-    next.policy = policy; next.image = image; next.lo = lo; next.hi = hi; next.count = count;
+    next.entry_only = entry_only; next.policy = policy; next.image = image; next.lo = lo; next.hi = hi; next.count = count;
     uint32_t at = 0;
     for (unsigned i = 0; i < count; ++i) {
         next.segments[i] = segments[i];
@@ -1666,6 +1666,17 @@ int spu_verified_overlay_register(int policy, int image,
     s_verified_images[s_verified_count++] = next;
     s_verified_bytes += total;
     return 1;
+}
+
+int spu_verified_overlay_register(int policy, int image,
+    const spu_verified_code_segment* segments, unsigned count)
+{
+    return spu_verified_register(policy,image,segments,count,0);
+}
+int spu_verified_entry_override_register(int policy, int image,
+    const spu_verified_code_segment* segments, unsigned count)
+{
+    return spu_verified_register(policy,image,segments,count,1);
 }
 
 /* Stateless negative-only precheck. Matching anchors confer no trust: every
@@ -1711,13 +1722,15 @@ static spu_fn spu_verified_lookup(const spu_context* ctx, uint32_t lsa,
         if (lsa < v->lo || lsa >= v->hi) continue;
         /* A guarded image must not recursively re-enter itself through legacy
          * primary/resident lookup after rejecting an inappropriate context. */
-        if (ctx->image_id == v->policy || ctx->image_id == v->image || ctx->resident_ovl == v->image ||
-            ctx->resident_task == v->image) *covered = 1;
-        for (unsigned k = 0; k < 4; ++k)
-            if (ctx->resident_code[k].image_id == v->image) *covered = 1;
+        if (!v->entry_only) {
+            if (ctx->image_id == v->policy || ctx->image_id == v->image || ctx->resident_ovl == v->image ||
+                ctx->resident_task == v->image) *covered = 1;
+            for (unsigned k = 0; k < 4; ++k)
+                if (ctx->resident_code[k].image_id == v->image) *covered = 1;
+        }
         if (!ctx->policy_mode || ctx->ls != ctx->ls_store || ctx->image_id != v->policy)
             continue;
-        *covered = 1;
+        if (!v->entry_only) *covered = 1;
         spu_fn fn = spu_lookup_exact(lsa, v->image);
         if (!fn) continue;
         int in_text = 0;
@@ -1732,6 +1745,9 @@ static spu_fn spu_verified_lookup(const spu_context* ctx, uint32_t lsa,
             if (memcmp(ctx->ls + s->lsa, s->bytes, s->size)) break;
         }
         if (j != v->count) continue;
+        /* Sparse overrides own only an exact, fully validated entry. A miss
+         * must retain existing primary/resident resolution for other modules. */
+        *covered = 1;
         if (result) { *image = 0; return NULL; } /* ambiguity, never first-match */
         result = fn; *image = v->image;
     }
