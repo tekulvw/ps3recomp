@@ -304,7 +304,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 /* Native workunit service scope; implemented beside the private halt TLS. */
 extern void (*spu_take_interrupt(spu_context*,void (*)(spu_context*)))(spu_context*);
 extern int spu_irq_regs_maybe_restore(spu_context*);
-int spu_native_service_call(spu_context* ctx,uint32_t entry_pc,uint32_t return_pc)
+static int spu_native_service_call_impl(spu_context* ctx,uint32_t entry_pc,uint32_t return_pc,int prepared_link)
 {
     if (!ctx || ctx->ls != ctx->ls_store || ctx->status != SPU_STATUS_RUNNING ||
         ctx->irq_frame || ctx->irq_saved || g_spu_trampoline_fn ||
@@ -341,7 +341,7 @@ int spu_native_service_call(spu_context* ctx,uint32_t entry_pc,uint32_t return_p
                 spu_take_interrupt(ctx, 0) : 0;
         } else {
             if (reason == 0) {
-                ctx->gpr[0] = spu_link(return_pc);
+                if (!prepared_link) ctx->gpr[0] = spu_link(return_pc);
                 ctx->pc = entry_pc;
             }
             g_spu_trampoline_fn = spu_indirect_branch;
@@ -365,6 +365,35 @@ int spu_native_service_call(spu_context* ctx,uint32_t entry_pc,uint32_t return_p
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof outer_env);
     return result;
+}
+
+int spu_native_service_call(spu_context* ctx,uint32_t entry_pc,uint32_t return_pc)
+{ return spu_native_service_call_impl(ctx,entry_pc,return_pc,0); }
+
+int spu_native_service_call_prepared(spu_context* ctx,uint32_t entry_pc,uint32_t return_pc)
+{ return spu_native_service_call_impl(ctx,entry_pc,return_pc,1); }
+
+/* Keep a plain-C native owner's cleanup reachable even when a direct channel
+ * operation halts/restarts. Guest services install their own nested scopes. */
+int spu_native_owner_call(spu_context* ctx, void (*body)(spu_context*))
+{
+    if (!ctx || !body || ctx->status != SPU_STATUS_RUNNING) return -1;
+    const int outer_armed = s_spu_halt_armed;
+    const uint32_t depth = ctx->host_depth, outer_return = ctx->drain_ret_pc;
+    jmp_buf outer_env;
+    if (outer_armed) memcpy(outer_env, s_spu_halt_env, sizeof outer_env);
+    s_spu_halt_armed = 1;
+    int reason = setjmp(s_spu_halt_env);
+    if (!reason) body(ctx);
+    if (reason) {
+        ctx->host_depth = depth;
+        ctx->drain_ret_pc = outer_return;
+        ctx->region_dispatch_valid = 0;
+        g_spu_trampoline_fn = 0;
+    }
+    s_spu_halt_armed = outer_armed;
+    if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof outer_env);
+    return reason;
 }
 
 /* ===========================================================================
