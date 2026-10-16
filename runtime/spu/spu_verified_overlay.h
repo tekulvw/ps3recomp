@@ -38,6 +38,23 @@ int spu_verified_code_enter(const spu_context* ctx, int image_id, uint32_t entry
 int spu_verified_code_enter_span(const spu_context* ctx, int image_id,
     uint32_t entry, uint32_t end);
 
+
+/* Experimental independent raw-ISA blocks. The generator must use no guest
+ * calls, services/IRQ control, native return classification or outside-code
+ * facts. Every control transfer publishes its architectural PC to the drain.
+ * Every byte of [start,end) is checked at lookup AND entry, without cached trust.
+ * Legacy translations retain their whole-image admission. Existing readonly-
+ * running-body limitations remain; this does not support concurrent/mid-block SMC.
+ * Startup only: the verified image and exact legacy entries must already exist.
+ * The immutable verified-image byte storage remains owned by the runtime.
+ */
+typedef struct spu_verified_leaf_unit {
+    uint32_t start, end;
+    void (*func)(spu_context*);
+} spu_verified_leaf_unit;
+int spu_verified_leaf_register(int image_id,const spu_verified_leaf_unit*,unsigned count);
+int spu_verified_leaf_enter(const spu_context*,int image_id,uint32_t start,uint32_t end);
+
 #ifdef __cplusplus
 }
 #endif
