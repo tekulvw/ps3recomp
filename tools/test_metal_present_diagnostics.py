@@ -8,7 +8,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="ps3recomp-metal-diag-") as tmp:
         binary=pathlib.Path(tmp)/"fixture"
         subprocess.run(["clang","-fobjc-arc", "-DPS3RECOMP_DISABLE_NATIVE_OSK","-I","include","-I","libs/video",
-            "libs/video/tests/test_metal_present_diagnostics.m","libs/video/rsx_texture_layout.c", "libs/input/pad_macos.m",
+            "libs/video/tests/test_metal_present_diagnostics.m","libs/video/rsx_texture_layout.c",'runtime/diagnostics/critical_trace.c', "libs/input/pad_macos.m",
             "-Wl,-dead_strip","-framework","Metal","-framework","Cocoa","-framework","QuartzCore",
             "-o",str(binary)],cwd=ROOT,check=True,timeout=120)
         results={}

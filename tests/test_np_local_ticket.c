@@ -10,6 +10,7 @@
 #include "../libs/system/cellSysutil.h"
 #include "../runtime/ppu/ppu_memory.h"
 #include "ps3emu/guest_call.h"
+void edat_add_klicensee(const uint8_t klic[16]) {(void)klic;}
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 65536;
 int g_resv_store_active;

@@ -3,6 +3,7 @@
  * and the runtime symbols it links against. See test_np_basic_after_np_init.c.
  */
 #include "../sceNp.c"
+ps3_guest_caller_fn g_ps3_guest_caller;
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;

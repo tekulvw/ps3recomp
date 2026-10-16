@@ -31,6 +31,15 @@ static thread_local ppu_context* g_active_ctx;
 static uint32_t written;
 static void vm_write32(uint64_t a,uint32_t v){assert(a==0x100);written=v;}
 static void vm_commit(uint32_t,uint32_t){}
+#define CELL_OK 0
+static uint32_t vm_read32(uint64_t a){assert(a==0x100);return written;}
+static int64_t sys_mmapper_allocate_address(ppu_context* c){
+    static unsigned calls;assert(c->gpr[6]==0x100);
+    vm_write32(c->gpr[6],calls++?0x20000000:0x11000000);return CELL_OK;
+}
+static int64_t sys_mmapper_search_map_address(uint32_t start,uint32_t size,uint32_t* out){
+    assert(start==0x20000000&&size==0x100000);*out=start;return CELL_OK;
+}
 extern "C" uint32_t ps3_mmapper_block_size(uint32_t){return 0x100000;}
 static void mapper(ppu_context* ctx){switch(ctx->gpr[11]){// MAPPER
 }}

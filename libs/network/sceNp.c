@@ -44,7 +44,7 @@ static int s_ticket_pending, s_ticket_delivering;
 static int s_status_pending, s_manager_delivering;
 static u64 s_np_generation;
 
-static int np_is_initialized(void)
+int np_is_initialized(void)
 {
     TICKET_LOCK(); int initialized = s_np_initialized; TICKET_UNLOCK();
     return initialized;
@@ -136,9 +136,6 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
     TICKET_UNLOCK();
     return CELL_OK;
 }
-
-/* Whether sceNpInit has run; sceNpBasic follows it (see sceNpBasic.c). */
-int np_is_initialized(void) { return s_np_initialized; }
 
 s32 sceNpTerm(void)
 {

@@ -27,7 +27,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='audio-diagnostics-') as tmp:
         exe = str(Path(tmp) / 'fixture')
         subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-pthread',*includes,
-            str(root/'libs/audio/tests/test_audio_diagnostics.c'),*linker,*sections,'-o',exe],check=True,timeout=30)
+            str(root/'libs/audio/tests/test_audio_diagnostics.c'),str(root/'runtime/platform/win32_compat.c'),*linker,*sections,'-o',exe],check=True,timeout=30)
         env = {k:v for k,v in os.environ.items() if k != 'AUDIO_DIAGNOSTICS'}
         for value in (None,'0','true','1'):
             runenv = dict(env)

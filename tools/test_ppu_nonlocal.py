@@ -44,6 +44,7 @@ PROGRAM = {
 
 DRIVER = r'''
 #include "ppu_recomp.h"
+#include "diagnostics/ppu_call_span.h"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -64,7 +65,10 @@ static jmp_buf host_exit;
 static void pending(void*) { std::abort(); }
 extern "C" { PPU_THREAD_LOCAL ppu_context* g_active_ctx=nullptr; }
 static thread_local uint32_t g_vcall_stk[128];
-static thread_local int g_vcall_sp, observed_depth;
+static thread_local int g_vcall_sp, g_dispatch_depth;
+#define observed_depth g_dispatch_depth
+extern "C" void audio_chronology_call_begin(audio_chronology_call_token* t,const void*,uint32_t,unsigned) { *t={}; }
+extern "C" void audio_chronology_call_end(audio_chronology_call_token*,unsigned) {}
 // ACTUAL_ACTIVE_SCOPE
 void module_func_00003000(ppu_context*);
 static void dispatched(ppu_context* ctx) {
@@ -213,7 +217,7 @@ def main():
         module=make_lifter(prefix='module_');module.header_name='module.h'
         (out/'module.h').write_text(module.emit_header());(out/'module.cpp').write_text(module.emit_source())
         (out/'lifted.cpp').write_text(lifter.emit_source());(out/'driver.cpp').write_text(runtime_driver())
-        command=[compiler,'-std=c++20','-O2','-pthread',str(out/'lifted.cpp'),str(out/'module.cpp'),str(out/'driver.cpp'),'-o',str(out/'test')]
+        command=[compiler,'-DPPU_NO_INLINE_LOADS','-I'+str(ROOT/'runtime/ppu'),'-I'+str(ROOT/'runtime'),'-std=c++20','-O2','-pthread',str(out/'lifted.cpp'),str(out/'module.cpp'),str(out/'driver.cpp'),'-o',str(out/'test')]
         hook=ROOT/'runtime/syscalls/ppu_host_unwind.c'
         if hook.exists():
             obj=out/'hook.o';subprocess.run([shutil.which('clang') or 'cc','-c',str(hook),'-o',str(obj)],check=True)

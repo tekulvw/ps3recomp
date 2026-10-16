@@ -23,7 +23,7 @@ def main():
         subprocess.run(["clang", "-fobjc-arc", "-DPS3RECOMP_DISABLE_NATIVE_OSK",
                         "-Iinclude", "-Ilibs/video",
                         "libs/video/tests/test_metal_b8_remap.m",
-                        "libs/video/rsx_texture_layout.c", "libs/input/pad_macos.m",
+                        "libs/video/rsx_texture_layout.c",'runtime/diagnostics/critical_trace.c', "libs/input/pad_macos.m",
                         "-Wl,-dead_strip", "-framework", "Metal", "-framework", "Cocoa",
                         "-framework", "QuartzCore", "-o", str(binary)],
                        cwd=ROOT, check=True, timeout=120)

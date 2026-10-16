@@ -45,6 +45,8 @@ HARNESS = r'''
 #include "spu_context.h"
 #include "spu_helpers.h"
 #include "spu_interp.h"
+#include "spu_pc_observer.h"
+#include "diagnostics/critical_pc_trace.h"
 
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
 int g_spu_ls_watch_n = 0;   /* LS watch off */
@@ -127,7 +129,7 @@ with tempfile.TemporaryDirectory() as tmp:
     c_path.write_text(HARNESS % func)
     cmd = [cc, '-std=gnu17', '-O1', '-w',
            '-I', str(root / 'runtime/spu'), '-I', str(root / 'runtime'),
-           '-I', str(root / 'include'), str(c_path), '-o', str(exe)]
+           '-I', str(root / 'include'), str(c_path), str(root/'runtime/platform/win32_compat.c'), '-pthread', '-lm', '-o', str(exe)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         print(r.stdout + r.stderr)

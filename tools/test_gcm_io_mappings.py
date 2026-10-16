@@ -41,8 +41,8 @@ def function(signature):
 slots = re.search(r'^#define CELL_GCM_MAX_IO_MAPPINGS\s+(\d+)', hdr, re.M).group(1)
 parts = [function(r'static IoMapping\* find_free_mapping\(void\)'),
          function(r'static u32 gcm_io_alloc\(u32 size\)\n\{'),
-         function(r's32 cellGcmMapMainMemory\(u32 ea, u32 size, u32\* offset\)'),
-         function(r'void cellGcm_syscall_iomap\(u32 ea, u32 io, u32 size\)')]
+         function(r'static s32 cellGcmMapMainMemory_consumer_body\(u32 ea, u32 size, u32\* offset\)\n\{').replace('static s32 cellGcmMapMainMemory_consumer_body','s32 cellGcmMapMainMemory'),
+         function(r'static void cellGcm_syscall_iomap_consumer_body\(u32 ea, u32 io, u32 size\)\n\{').replace('static void cellGcm_syscall_iomap_consumer_body','void cellGcm_syscall_iomap')]
 
 HARNESS = r'''
 #include <stdint.h>

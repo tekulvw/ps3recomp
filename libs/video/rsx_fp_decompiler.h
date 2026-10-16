@@ -252,4 +252,3 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
 int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out);
 u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes);
 #endif /* PS3RECOMP_RSX_FP_DECOMPILER_H */
-

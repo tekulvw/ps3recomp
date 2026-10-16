@@ -23,8 +23,12 @@
 #include <cstdint>
 #include <ucontext.h>
 #include "win32_compat.h"
+#include "../../diagnostics/audio_chronology.h"
 
 extern "C" {
+void SetLastError(DWORD) {}
+void audio_chronology_call_begin(audio_chronology_call_token* t,const void*,uint32_t,uint32_t) { *t={}; }
+void audio_chronology_call_end(audio_chronology_call_token*,unsigned) {}
 uint8_t* vm_base;
 uint32_t ppu_hle_inject_base = 0x20000000;
 int spu_coh_is_reserved(uint32_t) { return 0; }
