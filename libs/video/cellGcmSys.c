@@ -1020,14 +1020,14 @@ static int gcm_defer_label(u32 ea,u32 value,u32 method){
  * certified encoded draws or visibility results. Unknown initial state stays
  * explicit until an actual enable and clear have been observed. */
 static void gcm_query_observe(u32 method,u32 argument,u32 fifo){
-    if(!s_query_observe||!ps3_critical_enabled()||ps3_critical_capture_id()!=2)return;
-    static u64 capture,generation;static u32 enabled,known,draws,clear_argument;
-    u64 id=ps3_critical_capture_id();
-    if(capture!=id){capture=id;generation=0;enabled=known=draws=clear_argument=0;}
+    if(!s_query_observe)return;
+    static u64 generation;static u32 enabled,known,draws,clear_argument;
     if(method==0x1814u||method==0x1824u){++draws;return;}
     if(method==0x17ccu){enabled=argument;known|=1u;}
     else if(method==0x17c8u){++generation;draws=0;clear_argument=argument;known|=2u;}
     else if(method!=0x1800u)return;
+    if(!ps3_critical_enabled()||ps3_critical_capture_id()!=2)return;
+    uint64_t id=ps3_critical_capture_id();
     uint64_t w[7]={method,argument,enabled,known,draws,s_report_dma,clear_argument};
     ps3_critical_emit_capture(id,22,fifo,generation,w,7);
 }
@@ -2557,8 +2557,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
-                if(s_query_observe&&ps3_critical_enabled()&&ps3_critical_capture_id()==2)
-                    gcm_query_observe((subch<<13)|m,vm_read32(dea),s_fifo_getoff+4+i*4);
+                if(s_query_observe && subch==0 && (m==0x17c8u||m==0x17ccu||m==0x1800u||m==0x1814u||m==0x1824u))
+                    gcm_query_observe(m,vm_read32(dea),s_fifo_getoff+4+i*4);
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It

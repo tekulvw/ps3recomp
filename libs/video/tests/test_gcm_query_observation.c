@@ -22,5 +22,7 @@ int main(void){
  assert(events==5&&observed[4].generation==1&&observed[4].words[3]==3&&observed[4].words[4]==2&&observed[4].words[6]==1);
  gcm_query_observe(0x17cc,0,36);assert(events==6&&observed[5].words[2]==0);
  capture=1;gcm_query_observe(0x17c8,0,40);assert(events==6);
+ capture=2;gcm_query_observe(0x1800,0x01000440,44);
+ assert(events==7&&observed[6].generation==2&&observed[6].words[3]==3&&observed[6].words[4]==0);
  assert(vm_base==NULL);puts("PASS query observations: unknown state, enable/clear generations, draw words, capture gate; no guest writes");
 }
