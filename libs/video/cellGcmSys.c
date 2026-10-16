@@ -42,6 +42,7 @@ static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
 static _Thread_local unsigned s_consumer_depth;
 static int s_deferred_reports;
 static rsx_deferred_report_queue s_reports = {.generation=1};
+static u32 s_backend_label_offset;
 static int gcm_reports_dependency(void);
 static int gcm_reports_sync_barrier_at(u32 reason);
 #define gcm_reports_sync_barrier() gcm_reports_sync_barrier_at(__LINE__)
@@ -949,6 +950,13 @@ static int gcm_report_destination(u32 argument,u32 context,u32 *ea) {
 }
 static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     (void)user;u32 ea;
+    if(r->operation){
+        u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
+        if(!vm_base||r->vm!=(uintptr_t)vm_base||(u64)r->ea+4u>limit)return 0;
+        vm_write32(r->ea,r->argument);
+        if(r->start_ns){uint64_t w[5]={r->start_ns,r->ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,20,r->ea,0,w,5);}
+        return 1;
+    }
     if(r->vm!=(uintptr_t)vm_base||!gcm_report_destination(r->argument,r->context,&ea)||ea!=r->ea)return 0;
     u64 timestamp=gcm_report_timestamp();
     u32 value=(r->argument>>24)==1u?0xffffu:0u;
@@ -992,6 +1000,20 @@ static int gcm_reports_sync_barrier_at(u32 reason){
     if(start){uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};ps3_critical_emit_capture(capture,19,reason,0,w,7);}
     return ok;
 }
+/* Label writes retain the existing value/byte-order semantics, but release
+ * guest reuse only after the same genuine ordered GPU completion as reports. */
+static int gcm_defer_label(u32 ea,u32 value,u32 method){
+    rsx_deferred_report r={0};r.operation=1;r.main_memory=1;
+    r.ea=ea;r.argument=value;r.context=method;r.vm=(uintptr_t)vm_base;
+    r.capture=ps3_critical_capture_id();r.start_ns=ps3_critical_enabled()?ps3_critical_now_ns():0;
+    u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
+    if(!vm_base||(u64)ea+4u>limit){s_reports.failed=1;fprintf(stderr,"[deferred reports] invalid label destination %08X; publication stopped\n",ea);return 0;}
+    unsigned failed=s_reports.failed;
+    int ok=rsx_reports_enqueue(&s_reports,&s_report_ops,r);
+    if(!ok&&!failed)fprintf(stderr,"[deferred reports] label enqueue FAILED; publication stopped\n");
+    return ok;
+}
+
 static void gcm_get_report(u32 argument){
     rsx_deferred_report r={0};r.argument=argument;r.context=s_report_dma;r.index=(argument&0xffffffu)/16u;
     r.vm=(uintptr_t)vm_base;r.capture=ps3_critical_capture_id();
@@ -1450,7 +1472,6 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         case 0x030C: return;                /* SIZE_IN */
         }
         if (method >= 0x0400 && method <= 0x07FC) {
-            if(!gcm_reports_sync_barrier())return;
             /* COLOR data word: write into the destination surface. Inline
              * transfers use format Y32 (4 bytes/px, one row per point.y).
              * DMA 0xFEED0000 = local memory, 0xFEED0001 = main memory. */
@@ -2446,14 +2467,21 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
                     { static int sn = 0; if (getenv("GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
-                    if ((m==0x68u||m==0x6cu)&&!gcm_reports_sync_barrier()){sem_blocked=1;break;}
+                    if(m==0x68u&&!gcm_reports_sync_barrier()){sem_blocked=1;break;}
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
                     if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
                         s_ft_sema_t0 = 0;
                     }
                     if (m == 0x64u)      s_sema_offset = v;
+                    else if(m==0x6cu && s_deferred_reports&&!rsx_live_draw_enabled()&&rsx_draw_engine_async_available()){
+                        if(!gcm_defer_label(la,v,m)){sem_blocked=1;break;}
+                        /* The label lands after GPU completion; get leads it. */
+                        if (!gcm_get_eq_put())
+                            vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
+                    }
                     else if (m == 0x6Cu) {
+                        if(!gcm_reports_sync_barrier()){sem_blocked=1;break;}
                         /* The RSX has fetched past a RELEASE before its
                          * semaphore write lands, so a guest that sees the
                          * label must also see `get` past the command. `get`
@@ -2504,6 +2532,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
+            if(count && (subch==4u||subch==5u) && method<=0x7fcu &&
+               (method>=0x400u || (type==0u && (u64)method+(u64)(count-1u)*4u>=0x400u)) &&
+               !gcm_reports_sync_barrier())return;
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
@@ -2655,6 +2686,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     if(m==0x50u && !(gcm_checked_ref_mode()?gcm_reports_dependency():gcm_reports_sync_barrier()))return;
+                    if(m==0x1d6cu)s_backend_label_offset=vm_read32(dea);
+                    if((m==0x1d70u||m==0x1d74u)&&s_deferred_reports&&!rsx_live_draw_enabled()&&rsx_draw_engine_async_available()){
+                        u32 value=vm_read32(dea);
+                        if(m==0x1d70u)value=(value&0xff00ff00u)|((value>>16)&0xffu)|((value&0xffu)<<16);
+                        if(!gcm_defer_label(VM_HLE_INJECT_BASE+(s_backend_label_offset&0xffffffu),value,m))return;
+                        continue;
+                    }
                     if((m==0x1d70u||m==0x1d74u)&&!gcm_reports_sync_barrier())return;
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED

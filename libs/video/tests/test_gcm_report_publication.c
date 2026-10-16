@@ -146,6 +146,23 @@ int main(void) {
     assert(!s_reports.count&&s_reports.published==1&&notified==1);
     assert(vm_read32(watched+8)==0xffff&&vm_read32(watched+12)==0);
     assert(gcm_report_vm_begin(watched,16));cellGcm_rsx_consumer_end();
+    /* Actual FIFO NV4097 release keeps the original byte swap, but leaves
+     * the label untouched until its genuine command-buffer receipt. */
+    u32 label_ea=VM_HLE_INJECT_BASE+0x900;raw32(label_ea,0xa5a5a5a5);
+    raw32(0x100000,(2u<<18)|0x1d6cu);raw32(0x100004,0x900);raw32(0x100008,0x11223344);
+    cellGcm_syscall_set_fifo(12,0);cellGcm_rsx_process_fifo();
+    assert(vm_read32(label_ea)==0xa5a5a5a5&&s_reports.count==1);
+    assert(rsx_reports_overlap(&s_reports,label_ea+3,1)&&!rsx_reports_overlap(&s_reports,label_ea+4,1));
+    fixture_completed=fixture_issued;cellGcm_rsx_process_fifo();
+    assert(vm_read32(label_ea)==0x11443322&&!s_reports.count);
+    /* NV406E release publishes the raw value using the same ordered queue. */
+    label_ea=GCM_LABEL_GUEST_BASE+0x920;raw32(label_ea,0xaaaaaaaa);
+    raw32(0x100000,0x40064);raw32(0x100004,0x920);
+    raw32(0x100008,0x4006c);raw32(0x10000c,0x55667788);
+    cellGcm_syscall_set_fifo(16,0);cellGcm_rsx_process_fifo();
+    assert(vm_read32(label_ea)==0xaaaaaaaa&&s_reports.count==1);
+    fixture_completed=fixture_issued;cellGcm_rsx_process_fifo();
+    assert(vm_read32(label_ea)==0x55667788&&!s_reports.count);
     /* GPU error is sticky and never publishes success or grants a VM lease. */
     raw32(watched+12,0x10000);
     cellGcm_rsx_consumer_begin();gcm_get_report(0x01000430);cellGcm_rsx_consumer_end();
