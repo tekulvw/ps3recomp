@@ -21,6 +21,17 @@ typedef struct spu_verified_code_segment {
 int spu_verified_overlay_register(int policy_image_id, int image_id,
     const spu_verified_code_segment* segments, unsigned count);
 
+/* Startup-only sparse native entry overrides. Uses the same complete immutable
+ * expected segments and exact registered function table as overlay admission.
+ * Only a matching exact function with all expected bytes owns the transfer;
+ * other addresses, contexts and mismatching modules retain their existing
+ * primary/resident resolver. Unlike an authoritative overlay, it claims no
+ * surrounding holes. Ambiguous admitted entries fail closed. Guarded functions
+ * remain excluded from unverified legacy lookup. Same readonly-text lifetime
+ * contract and registry budgets as spu_verified_overlay_register apply. */
+int spu_verified_entry_override_register(int policy_image_id, int image_id,
+    const spu_verified_code_segment* segments, unsigned count);
+
 /* Generated function-entry gate. Does not mutate guest/context state.
  * Rejecting callers must defer to indirect dispatch through the normal drain.
  * Verifies transfer entries only; mid-function self-modification and concurrent
