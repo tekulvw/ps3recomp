@@ -109,6 +109,8 @@ add_library(ps3recomp_runtime STATIC
     ${RUNTIME_SOURCES}
 )
 
+target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_CRITICAL_WRITE_AVAILABLE=1)
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SailFFmpeg.cmake")
 ps3recomp_enable_sail_video(ps3recomp_runtime)
 

@@ -1,3 +1,4 @@
+#include "../diagnostics/critical_write_trace.h"
 /*
  * ps3recomp - PPU runtime loader
  *
@@ -1559,13 +1560,17 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
  * them, until SPU code runs) it is the plain memcpy it replaced. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
+        ps3_critical_write_token _critical_write = {0};                      \
         if (spu_coh_is_reserved((uint32_t)(a))) {                             \
             spu_lockline_lock();                                              \
+            if(ps3_critical_write_watched((a),(n)))ps3_critical_write_begin(&_critical_write,(uint64_t)(uintptr_t)g_active_ctx,(a),(n),vm_base+(uint32_t)(a),(src),10,0,g_active_ctx?g_active_ctx->cia:0,g_active_ctx?g_active_ctx->lr:0,g_active_ctx?(uint32_t)g_active_ctx->thread_id:0,1); \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
+            if(_critical_write.capture)ps3_critical_write_end(&_critical_write,vm_base+(uint32_t)(a)); \
             spu_coh_notify_write((uint32_t)(a));                              \
             spu_lockline_unlock();                                            \
         } else {                                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
+            if(_critical_write.capture)ps3_critical_write_end(&_critical_write,vm_base+(uint32_t)(a)); \
         }                                                                     \
     } while (0)
 

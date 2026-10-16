@@ -506,6 +506,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
+    ps3_critical_write_token critical_write = {0};
+    uint32_t critical_generation = ps3_critical_write_watched(ea,128) ? ps3_critical_context_generation(ctx) : 0;
 
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_n = 0; static uint32_t s_lastea = 0;
@@ -749,7 +751,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
+            if(ps3_critical_write_watched(ea,128))ps3_critical_write_begin(&critical_write,(uint64_t)(uintptr_t)ctx,ea,128,mem,ls,9,cmd|((uint32_t)ctx->image_id<<16),ctx->pc,ctx->gpr[0]._u32[0],critical_generation,1);
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            if(critical_write.capture)ps3_critical_write_end(&critical_write,mem);
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
              * Silent, this is the same lost update the PPU half was added to
@@ -848,7 +852,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_lockline_lock();
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
+        if(ps3_critical_write_watched(ea,128))ps3_critical_write_begin(&critical_write,(uint64_t)(uintptr_t)ctx,ea,128,mem,ls,9,cmd|((uint32_t)ctx->image_id<<16),ctx->pc,ctx->gpr[0]._u32[0],critical_generation,1);
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        if(critical_write.capture)ps3_critical_write_end(&critical_write,mem);
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the
          * bookkeeping below rather than after it. A peer left holding a

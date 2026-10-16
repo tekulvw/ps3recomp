@@ -22,6 +22,7 @@
 #include "spu_dma_source_trace.h"
 #include "spu_dma_publication.h"
 #include "spu_dma_disposition.h"
+#include "../diagnostics/critical_write_trace.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -688,6 +689,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
             uint32_t a0 = (uint32_t)ea & ~127u;
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+            ps3_critical_write_token critical_write = {0};
+            uint32_t critical_generation = ps3_critical_write_watched(ea,size) ? ps3_critical_context_generation(spu) : 0;
             int span_reserved = 0;
             for (uint32_t a = a0; ; a += 128u) {
                 if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
@@ -696,7 +699,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             if (span_reserved) {
                 spu_lockline_lock();
                 spu_dma_disposition_before(&disposition, ls_ptr, ea, size);
+                if(ps3_critical_write_watched(ea,size))ps3_critical_write_begin(&critical_write,(uint64_t)(uintptr_t)spu,ea,size,ea_ptr,ls_ptr,9,cmd|((uint32_t)spu->image_id<<16),spu->pc,spu->gpr[0]._u32[0],critical_generation,1);
                 memcpy(ea_ptr, ls_ptr, size);
+                if(critical_write.capture)ps3_critical_write_end(&critical_write,ea_ptr);
                 spu_dma_disposition_after(&disposition, ea_ptr);
                 copy_disposition = SPU_DMA_DISPOSITION_PUT;
                 for (uint32_t a = a0; ; a += 128u) {
@@ -706,7 +711,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 spu_lockline_unlock();
             } else {
                 spu_dma_disposition_before(&disposition, ls_ptr, ea, size);
+                if(ps3_critical_write_watched(ea,size))ps3_critical_write_begin(&critical_write,(uint64_t)(uintptr_t)spu,ea,size,ea_ptr,ls_ptr,9,cmd|((uint32_t)spu->image_id<<16),spu->pc,spu->gpr[0]._u32[0],critical_generation,0);
                 memcpy(ea_ptr, ls_ptr, size);
+                if(critical_write.capture)ps3_critical_write_end(&critical_write,ea_ptr);
                 spu_dma_disposition_after(&disposition, ea_ptr);
                 copy_disposition = SPU_DMA_DISPOSITION_PUT;
                 for (uint32_t a = a0; ; a += 128u) {
