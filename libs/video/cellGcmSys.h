@@ -457,6 +457,10 @@ CellGcmReportData* cellGcmGetReportDataAddressLocation(u32 index, u32 location);
 u32 cellGcmGetReportDataLocation(u32 index, u32 location);
 
 
+/* Shared experimental FIFO/presentation/lifetime lease; default-off no-op. */
+void cellGcm_rsx_consumer_begin(void);
+void cellGcm_rsx_consumer_end(void);
+
 #ifdef __cplusplus
 }
 #endif

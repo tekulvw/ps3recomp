@@ -252,6 +252,11 @@ typedef struct rsx_draw_backend {
      * the actual selected 2D texture/view at mip 0 into an RGBA8 byte file.
      * Called only for explicitly armed capture offsets, before their draw. */
     int (*capture_texture_rgba8)(void* user, u32 texture, const char* path);
+    /* Optional consumer-owned genuine completion tickets. Async submission
+     * copies staging and retains all encoded resources until terminal status.
+     * status: -1 failure/unknown,0 pending,1 actual successful completion. */
+    u64 (*submit_async)(void* user,u32 reason);
+    int (*completion_status)(void* user,u64 ticket,int wait);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -291,6 +296,11 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 /* The guest's SET_REFERENCE sync point: submit and wait, so a title spinning
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
+int rsx_draw_engine_async_available(void);
+u64 rsx_draw_engine_submit_async(void);
+int rsx_draw_engine_completion_status(u64 ticket,int wait);
+void rsx_draw_engine_set_report_barrier(int (*barrier)(void));
+
 int rsx_draw_engine_flush_checked(void);
 int rsx_draw_engine_checked_ready(void);
 /* Publish a CPU write before exposing its guest allocation. Cache work stays

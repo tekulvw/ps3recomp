@@ -187,6 +187,10 @@ static struct {
 
     rsx_fp_constant_block fp_constants;
 } g;
+static int (*s_report_barrier)(void);
+void rsx_draw_engine_set_report_barrier(int (*barrier)(void)){s_report_barrier=barrier;}
+static int eng_report_barrier(void){return !s_report_barrier||s_report_barrier();}
+
 
 /* The decompilers' HLSL. The VP decompiler builds bodies up to 192 KB. */
 static u64 s_picture_bound[RSX_BE_MAX_TEXTURES];
@@ -792,6 +796,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
     const u32 n = (skip + bytes + bpp - 1u) / bpp;
     u8* rows = eng_coherence_buffer(n * bpp * h);
     if (!rows) return;
+    if(!eng_report_barrier())return;
     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
     g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
     if (eng_coherence_log())
@@ -1273,6 +1278,7 @@ static int eng_surface_to_guest(u32 slot)
     if (!s->guest_dirty) return 1;
     if (s->fmt != RSX_BE_FMT_R8G8B8A8 || s->pitch < s->w * 4u || !g.be->readback)
         return 0;
+    if(!eng_report_barrier())return 0;
     rsx_draw_engine_guest_read(s->location, s->offset, s->pitch, s->w, s->h);
     s->guest_dirty = 0;
     eng_textures_touch(s->location, s->offset, s->pitch * s->h);
@@ -1301,6 +1307,7 @@ static int eng_zdepth_to_guest(u32 slot)
         s_depth_rows = n;
         s_depth_cap = w * h;
     }
+    if(!eng_report_barrier())return 0;
     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
     if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
                              w * (u32)sizeof(float)) != 0)
@@ -3593,6 +3600,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
 
 void rsx_draw_engine_shutdown(void)
 {
+    if(!eng_report_barrier())return;
     draw_observer_reset();
     atomic_store(&s_checked_ready, 0);
     for(u32 i=0;i<RSX_BE_MAX_TEXTURES;++i){rsx_picture_release(s_picture_bound[i]);s_picture_bound[i]=0;s_picture_offset_pending[i]=0;}
@@ -3667,9 +3675,14 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 
 void rsx_draw_engine_flush(void)
 {
+    if(!eng_report_barrier())return;
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
 }
+
+int rsx_draw_engine_async_available(void){return g.ready&&g.be&&g.be->submit_async&&g.be->completion_status;}
+u64 rsx_draw_engine_submit_async(void){if(!rsx_draw_engine_async_available()||g.rsx.in_begin_end||atomic_load(&s_checked_failed))return 0;return g.be->submit_async(g.be->user,RSX_BE_FLUSH_GUEST_REFERENCE);}
+int rsx_draw_engine_completion_status(u64 ticket,int wait){if(!ticket||!rsx_draw_engine_async_available())return -1;int status=g.be->completion_status(g.be->user,ticket,wait);if(status<0)atomic_store(&s_checked_failed,1);return status;}
 
 void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes)
 {
@@ -3687,6 +3700,7 @@ int rsx_draw_engine_checked_ready(void)
 
 int rsx_draw_engine_flush_checked(void)
 {
+    if(!eng_report_barrier())return 0;
     if (!rsx_draw_engine_checked_ready()) return 0;
     if (!g.ready || !g.be || !g.be->submit_and_wait_checked || g.rsx.in_begin_end ||
         g.be->submit_and_wait_checked(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE) != 1) {

@@ -29,7 +29,8 @@ void spu_coh_notify_write(uint32_t a) { if (a / 128 == watched / 128) { assert(l
 void spu_lockline_lock(void) { assert(!locked); locked=1; }
 void spu_lockline_unlock(void) { assert(locked); locked=0; }
 int rsx_draw_engine_enabled(void) { return 1; }
-int rsx_live_draw_enabled(void) { return 1; }
+static int fixture_live=1;
+int rsx_live_draw_enabled(void) { return fixture_live; }
 void rsx_draw_engine_method(u32 m, u32 v) { (void)m; (void)v; }
 void rsx_draw_engine_method_at(u32 m,u32 v,u32 ea){(void)ea;rsx_draw_engine_method(m,v);}
 void rsx_live_draw_method(u32 m, u32 v) { (void)m; (void)v; }
@@ -69,6 +70,12 @@ static void reject(u32 context,u32 offset) {
     assert(memcmp(before,vm_base+watched,16)==0);
     assert(!flushed && !live_flushed && !notified && !broken && !watch_writes);
 }
+static u64 fixture_issued,fixture_completed;
+static int fixture_gpu_error;
+int rsx_draw_engine_async_available(void){return s_deferred_reports;}
+u64 rsx_draw_engine_submit_async(void){return ++fixture_issued;}
+int rsx_draw_engine_completion_status(u64 ticket,int wait){(void)wait;return fixture_gpu_error?-1:ticket<=fixture_completed;}
+void rsx_draw_engine_set_report_barrier(int(*barrier)(void)){(void)barrier;}
 int main(void) {
     /* Sparse 4-GiB mapping also exercises the final valid guest record. */
     vm_base=mmap(NULL,0x100000000ULL,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
@@ -116,6 +123,32 @@ int main(void) {
     /* A valid mapping to guest page zero must not be mistaken for failure. */
     s_ea_address_table[0xE0]=0; prepare(0);
     run_report(0xBAD68000,0); check_report(0xFFFF);
+    /* The actual deferred GCM path leaves completion pending until a genuine
+     * backend receipt, including an otherwise empty FIFO drain. */
+    s_deferred_reports=1;fixture_live=0;g_ww_lo=g_ww_hi=0;
+    s_report_dma=GCM_REPORT_DMA_MAIN;s_ea_address_table[0xe0]=0x20;
+    memset(&s_reports,0,sizeof(s_reports));s_reports.generation=7;
+    watched=0x2000430;prepare(watched);g_ww_lo=g_ww_hi=0;
+    flushed=live_flushed=1; /* Existing publication assertions remain active. */
+    cellGcm_rsx_consumer_begin();gcm_get_report(0x01000430);cellGcm_rsx_consumer_end();
+    assert(s_reports.count==1&&s_reports.unissued==1&&!notified);
+    assert(vm_read32(watched+12)==0x10000);
+    assert(!gcm_report_vm_begin(watched+4,4)); /* No mutation lease granted. */
+    cellGcm_rsx_process_fifo();
+    assert(s_reports.count==1&&!s_reports.unissued&&!notified);
+    assert(vm_read32(watched+12)==0x10000);
+    fixture_completed=fixture_issued;
+    cellGcm_rsx_process_fifo();
+    assert(!s_reports.count&&s_reports.published==1&&notified==1);
+    assert(vm_read32(watched+8)==0xffff&&vm_read32(watched+12)==0);
+    assert(gcm_report_vm_begin(watched,16));cellGcm_rsx_consumer_end();
+    /* GPU error is sticky and never publishes success or grants a VM lease. */
+    raw32(watched+12,0x10000);
+    cellGcm_rsx_consumer_begin();gcm_get_report(0x01000430);cellGcm_rsx_consumer_end();
+    fixture_gpu_error=1;cellGcm_rsx_process_fifo();
+    assert(s_reports.failed&&vm_read32(watched+12)==0x10000&&notified==1);
+    assert(!gcm_report_vm_begin(0,UINT64_C(0x100000000)));
+    s_deferred_reports=0;
     munmap(vm_base,0x100000000ULL); puts("GCM guest report publication checks passed");
 }
 
@@ -124,12 +157,7 @@ void rsx_draw_engine_guest_read(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b;
 void rsx_draw_engine_guest_wrote(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b;(void)c;(void)d;(void)e;}
 void rsx_draw_engine_note_flip(u32 a) {(void)a;}
 int rsx_draw_engine_checked_ready(void) { return 1; }
-int rsx_draw_engine_flush_checked(void) { return 0; }
+int rsx_draw_engine_flush_checked(void) { return fixture_gpu_error?0:1; }
 
 /* Backend boundary required by the production guest-memory transfer path. */
 void rsx_draw_engine_mark_guest_dirty(u32 ea,u32 len) { (void)ea; (void)len; }
-
-/* Upstream renderer hooks are outside this focused FIFO fixture. */
-void rsx_draw_engine_guest_read(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b;(void)c;(void)d;(void)e;}
-void rsx_draw_engine_guest_wrote(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b;(void)c;(void)d;(void)e;}
-void rsx_draw_engine_note_flip(u32 a) {(void)a;}

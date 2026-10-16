@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../include/ps3emu/log_first.h"   /* relative: tools/test_*memory*.py compile this file alone */
+#include "../memory/vm_release_guard.h"
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -145,9 +146,10 @@ int64_t sys_memory_free(ppu_context* ctx)
     bump_lock();
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
+            if(!vm_release_begin(addr,g_sys_mem_allocs[i].size)){bump_unlock();return (int64_t)(int32_t)CELL_EBUSY;}
             s_total_allocated -= g_sys_mem_allocs[i].size;
             g_sys_mem_allocs[i].active = 0;
-            bump_unlock(); return CELL_OK;
+            bump_unlock();vm_release_end(); return CELL_OK;
         }
     }
     bump_unlock();
@@ -517,13 +519,15 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    /* Reject overlapping deferred report destinations before commit/zero. */
+    if(!vm_release_begin(addr,s->size))return (int64_t)(int32_t)CELL_EBUSY;
     /* Commit the memory at the specified address */
     int32_t rc = vm_commit(addr, s->size);
-    if (rc != CELL_OK)
-        return (int64_t)(int32_t)rc;
+    if (rc != CELL_OK){vm_release_end();return (int64_t)(int32_t)rc;}
 
     s->addr = addr;
     memset(vm_to_host(addr), 0, s->size);
+    vm_release_end();
 
     return CELL_OK;
 }
@@ -534,6 +538,7 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
 void sys_memory_init(lv2_syscall_table* tbl)
 {
     bump_lock();
+    if(!vm_release_begin(0,UINT64_C(0x100000000))){bump_unlock();return;}
     memset(g_sys_mem_allocs,     0, sizeof(g_sys_mem_allocs));
     memset(g_sys_mem_containers, 0, sizeof(g_sys_mem_containers));
     memset(g_sys_mmapper_shared, 0, sizeof(g_sys_mmapper_shared));
@@ -541,7 +546,7 @@ void sys_memory_init(lv2_syscall_table* tbl)
     s_total_allocated  = 0;
     s_mapper_bump_ptr = SYS_MAPPER_BASE;
     memset(s_mapper_reservations, 0, sizeof(s_mapper_reservations));
-    bump_unlock();
+    bump_unlock();vm_release_end();
 
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
     lv2_syscall_register(tbl, SYS_MEMORY_FREE,                 sys_memory_free);

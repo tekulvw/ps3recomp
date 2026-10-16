@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <assert.h>
+#include "vm_release_guard.h"
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -277,6 +278,7 @@ static inline int32_t vm_init(void)
 static inline void vm_shutdown(void)
 {
     if (!vm_base) return;
+    if(!vm_release_begin(0,UINT64_C(0x100000000)))return;
 
 #ifdef _WIN32
     VirtualFree(vm_base, 0, MEM_RELEASE);
@@ -285,6 +287,7 @@ static inline void vm_shutdown(void)
 #endif
 
     vm_base = NULL;
+    vm_release_end();
 }
 
 /* ---------------------------------------------------------------------------
@@ -307,7 +310,7 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
     return CELL_OK;
 }
 
-static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int write, int exec)
+static inline int32_t vm_protect_unleased(uint32_t addr, uint32_t size, int read, int write, int exec)
 {
     if (!VM_READY) return CELL_EFAULT;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
@@ -334,6 +337,15 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
 #endif
 
     return CELL_OK;
+}
+
+static inline int32_t vm_protect(uint32_t addr,uint32_t size,int read,int write,int exec){
+ uint64_t first=(uint64_t)addr&~((uint64_t)VM_PAGE_SIZE-1u);
+ uint64_t rounded=((uint64_t)size+VM_PAGE_SIZE-1u)&~((uint64_t)VM_PAGE_SIZE-1u);
+ uint64_t end=((uint64_t)addr+rounded+VM_PAGE_SIZE-1u)&~((uint64_t)VM_PAGE_SIZE-1u);
+ if(end>UINT64_C(0x100000000))return CELL_EFAULT;
+ if(!vm_release_begin(first,end-first))return CELL_EBUSY;
+ int32_t rc=vm_protect_unleased(addr,size,read,write,exec);vm_release_end();return rc;
 }
 
 /* ---------------------------------------------------------------------------

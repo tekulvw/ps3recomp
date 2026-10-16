@@ -2443,6 +2443,22 @@ static atomic_int s_eng_checked_failed;
 static int s_eng_checked_completed;
 static void eng_checked_fail(void) { atomic_store(&s_eng_checked_failed, 1); }
 static int fps_backend_failed(void) { return atomic_load(&s_eng_checked_failed); }
+/* Consumer-owned, ordered receipts. No GPU callback can touch guest VM. */
+static NSMutableArray<id<MTLCommandBuffer>> *s_eng_fence_cbs;
+static uint64_t s_eng_fence_next,s_eng_fence_completed;
+static int eng_completion_status(void *user,u64 ticket,int wait){
+ (void)user;if(!ticket||ticket>s_eng_fence_next||atomic_load(&s_eng_checked_failed))return -1;
+ while([s_eng_fence_cbs count]){
+  id<MTLCommandBuffer> cb=s_eng_fence_cbs[0];
+  if(wait&&s_eng_fence_completed<ticket)[cb waitUntilCompleted];
+  MTLCommandBufferStatus status=cb.status;
+  if(status==MTLCommandBufferStatusError||cb.error){eng_checked_fail();return -1;}
+  if(status!=MTLCommandBufferStatusCompleted)break;
+  [s_eng_fence_cbs removeObjectAtIndex:0];++s_eng_fence_completed;
+ }
+ return ticket<=s_eng_fence_completed?1:0;
+}
+
 #define PS3RECOMP_METAL_TRACKED_COMPLETION 1
 static NSMutableArray<id<MTLCommandBuffer>>* s_eng_submitted;
 /* Consumer-owned receipts: GPU status is checked directly, without relying
@@ -2727,7 +2743,9 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
 
 /* ---- staging ------------------------------------------------------------- */
 
-static int eng_encode_and_commit(id<MTLTexture> present_dst);
+static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submit,u64 *ticket);
+static int eng_encode_and_commit(id<MTLTexture> present_dst){return eng_encode_and_commit_mode(present_dst,0,NULL);}
+
 
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
@@ -2803,6 +2821,7 @@ static void eng_shutdown(void* user)
     atomic_store(&s_eng_checked_failed,0);
     s_eng_checked_completed=0;
     s_eng_submitted=nil;
+    s_eng_fence_cbs=nil;s_eng_fence_next=s_eng_fence_completed=0;
     free(s_eng_stage); s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
     s_eng_helper_lib = nil;
@@ -4039,8 +4058,10 @@ static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
  * in-flight semaphore instead, the same bound the vtable path uses, because
  * waiting on every frame is the one pattern where a driver cannot hide its
  * encoding work. */
-static int eng_encode_and_commit(id<MTLTexture> present_dst)
+static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submit,u64 *out_ticket)
 {
+    if(out_ticket)*out_ticket=0;
+
     const uint64_t critical_id=atomic_fetch_add(&s_critical_command_sequence,1)+1;
     const uint64_t critical_capture=ps3_critical_capture_id();
     const uint64_t critical_start=ps3_critical_enabled()?ps3_critical_now_ns():0;
@@ -4112,13 +4133,20 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
         if (drawable) { fps_track_drawable_tagged(drawable,ticket); [cb presentDrawable:drawable]; }
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
         if (drawable && (presented || ticket)) fps_track_frame_completion_tagged(cb,ticket,presented);
-        if (windowed_present) {
+        if (windowed_present || async_submit) {
             eng_track_submission(cb);
+            if(async_submit){
+                if(!s_eng_fence_cbs)s_eng_fence_cbs=[NSMutableArray new];
+                if(!s_eng_fence_cbs||[s_eng_fence_cbs count]>=64){eng_checked_fail();return 0;}
+                [s_eng_fence_cbs addObject:cb];if(out_ticket)*out_ticket=++s_eng_fence_next;
+            }
+            if(windowed_present){
             dispatch_semaphore_t sem = s_inflight;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
                 if([_unused status]!=MTLCommandBufferStatusCompleted || [_unused error])eng_checked_fail();
                 dispatch_semaphore_signal(sem);
             }];
+            }
             if(critical_start)critical_commit=ps3_critical_now_ns();
             [cb commit];
             fps_frame_committed(ticket);
@@ -4162,12 +4190,19 @@ static int eng_encode_and_commit(id<MTLTexture> present_dst)
                     s_eng_dropped, ENG_MAX_RECORDS);
             s_eng_dropped = 0;
         }
-        if(critical_start){uint64_t w[8]={critical_start,critical_size,critical_commit,critical_wait,s_present_guest_id,(uint64_t)([cb status]==MTLCommandBufferStatusCompleted && ![cb error]),critical_double(cb.GPUStartTime),critical_double(cb.GPUEndTime)};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_FLUSH,critical_id,(uint64_t)windowed_present,w,8);}
+        if(critical_start){uint64_t w[8]={critical_start,critical_size,critical_commit,critical_wait,s_present_guest_id,(uint64_t)([cb status]==MTLCommandBufferStatusCompleted && ![cb error]),critical_double(cb.GPUStartTime),critical_double(cb.GPUEndTime)};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_FLUSH,critical_id,(uint64_t)(windowed_present?1:async_submit?2:0),w,8);}
         s_eng_rec_count  = 0;
         s_eng_stage_used = 0;
         eng_collect_retired_objects();
         return presented;
     }
+}
+
+static u64 eng_submit_async(void *user,u32 reason){
+ (void)user;(void)reason;if(atomic_load(&s_eng_checked_failed))return 0;
+ if([s_eng_fence_cbs count]>=64&&eng_completion_status(NULL,s_eng_fence_completed+1,1)!=1)return 0;
+ u64 ticket=0;eng_encode_and_commit_mode(nil,1,&ticket);
+ return atomic_load(&s_eng_checked_failed)?0:ticket;
 }
 
 /* Optional lossless storage bytes for a 1x1 floating-point source. A blit
@@ -4439,6 +4474,8 @@ static const rsx_draw_backend s_engine_backend = {
     .shutdown             = eng_shutdown,
     .submit_and_wait      = eng_submit_and_wait,
     .submit_and_wait_checked = eng_submit_and_wait_checked,
+    .submit_async = eng_submit_async,
+    .completion_status = eng_completion_status,
     .texture_create       = eng_texture_create,
     .texture_upload       = eng_texture_upload,
     .texture_release      = eng_obj_release,
