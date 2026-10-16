@@ -24,6 +24,7 @@
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include "spu_verified_overlay.h"
+#include "spu_native_service.h"
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -288,6 +289,72 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
     return halted;
+}
+
+/* Native workunit service scope; implemented beside the private halt TLS. */
+extern void (*spu_take_interrupt(spu_context*,void (*)(spu_context*)))(spu_context*);
+extern int spu_irq_regs_maybe_restore(spu_context*);
+int spu_native_service_call(spu_context* ctx,uint32_t entry_pc,uint32_t return_pc)
+{
+    if (!ctx || ctx->ls != ctx->ls_store || ctx->status != SPU_STATUS_RUNNING ||
+        ctx->irq_frame || ctx->irq_saved || g_spu_trampoline_fn ||
+        entry_pc >= SPU_LS_SIZE || return_pc >= SPU_LS_SIZE ||
+        ((entry_pc | return_pc) & 3u) ||
+        (ctx->gpr[1]._u32[0] & 15u) || ctx->host_depth == UINT32_MAX)
+        return -1;
+    const uint32_t stack = ctx->gpr[1]._u32[0];
+    const uint32_t depth = ctx->host_depth;
+    const uint32_t outer_return = ctx->drain_ret_pc;
+    const int image = ctx->image_id;
+    const int outer_armed = s_spu_halt_armed;
+    jmp_buf outer_env;
+    if (outer_armed) memcpy(outer_env, s_spu_halt_env, sizeof outer_env);
+    s_spu_halt_armed = 1;
+    int result;
+    int reason = setjmp(s_spu_halt_env);
+    if (reason == 1) {
+        result = 1;
+    } else {
+        /* A restart discards only this service's inner host frames. The
+         * enclosing native POD owner remains below this landing pad. Its
+         * effects and state are not recreated or replayed. */
+        ctx->host_depth = depth + 1;
+        ctx->irq_frame = 0;
+        ctx->region_dispatch_valid = 0;
+        if (reason == 0 && entry_pc == return_pc) {
+            /* A native-body interrupt checkpoint has no guest callee and
+             * must not overwrite its architectural link. The native owner
+             * remains live below this scope while the genuine handler runs. */
+            ctx->pc = return_pc;
+            g_spu_trampoline_fn = ctx->int_enable &&
+                (ctx->event_status & ctx->event_mask) ?
+                spu_take_interrupt(ctx, 0) : 0;
+        } else {
+            if (reason == 0) {
+                ctx->gpr[0] = spu_link(return_pc);
+                ctx->pc = entry_pc;
+            }
+            g_spu_trampoline_fn = spu_indirect_branch;
+        }
+        spu_drain_call(ctx, return_pc);
+        /* The exact return target can stop a drain before indirect dispatch
+         * sees the IRET. Complete the same architectural register restoration
+         * here; no saved handler state may leak into native continuation. */
+        spu_irq_regs_maybe_restore(ctx);
+        spu_img_restore(ctx, image);
+        result = ctx->pc == return_pc && ctx->gpr[1]._u32[0] == stack &&
+            ctx->image_id == (ctx->module_img_a00 ? ctx->module_img_a00 : image) &&
+            ctx->status == SPU_STATUS_RUNNING && !ctx->irq_frame &&
+            !ctx->irq_saved ? 0 : -1;
+    }
+    g_spu_trampoline_fn = 0;
+    ctx->host_depth = depth;
+    ctx->irq_frame = 0;
+    ctx->drain_ret_pc = outer_return;
+    ctx->region_dispatch_valid = 0;
+    s_spu_halt_armed = outer_armed;
+    if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof outer_env);
+    return result;
 }
 
 /* ===========================================================================
