@@ -12,6 +12,7 @@
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
 #include "rsx_deferred_reports.h"
+#include "rsx_ring_progress_observer.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
@@ -29,6 +30,51 @@ static u32 s_gcm_context_ea = 0;
 #include <stdlib.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include <stdatomic.h>
+
+static _Atomic(rsx_ring_progress_observer_fn) s_ring_observer;
+static _Atomic(uint32_t) s_ring_target,s_ring_issue_ea,s_ring_issue_value;
+static _Atomic(uint64_t) s_ring_snapshot_target;
+static struct { _Atomic(uint64_t) ticket; _Atomic(uint32_t) completed; uint32_t ea,value; } s_ring_tickets[64];
+void rsx_ring_progress_observer_set(uint32_t ea,rsx_ring_progress_observer_fn fn){
+    atomic_store_explicit(&s_ring_observer,NULL,memory_order_release);
+    atomic_store_explicit(&s_ring_target,ea,memory_order_release);
+    atomic_store_explicit(&s_ring_observer,fn,memory_order_release);
+}
+static uint32_t ring_target(void){
+    if(!atomic_load_explicit(&s_ring_observer,memory_order_acquire))return 0;
+    return atomic_load_explicit(&s_ring_target,memory_order_acquire);
+}
+static void ring_note(uint32_t kind,uint32_t ea,uint32_t value,uint64_t ticket,uint64_t aux){
+    rsx_ring_progress_observer_fn fn=atomic_load_explicit(&s_ring_observer,memory_order_acquire);
+    if(fn&&ea&&ea==atomic_load_explicit(&s_ring_target,memory_order_acquire))fn(kind,ea,value,ticket,aux);
+}
+/* Only the serialized consumer inserts tickets. Setter never mutates this
+ * table, so arming from an SPU cannot race its plain ea/value payload. */
+static void ring_track(uint32_t ea,uint32_t value,uint64_t ticket){
+    if(!ticket||ea!=ring_target())return;
+    for(unsigned i=0;i<64;i++){
+        uint64_t old=atomic_load_explicit(&s_ring_tickets[i].ticket,memory_order_acquire);
+        if(old==ticket)return;
+        if(!old){s_ring_tickets[i].ea=ea;s_ring_tickets[i].value=value;
+            atomic_store_explicit(&s_ring_tickets[i].ticket,ticket,memory_order_release);return;}
+    }
+    ring_note(RSX_RING_TRACK_OVERFLOW,ea,value,ticket,64);
+}
+void rsx_ring_progress_metal_committed(uint64_t ticket,uint64_t records){
+    uint32_t ea=atomic_load_explicit(&s_ring_issue_ea,memory_order_acquire);
+    if(!ea||ea!=ring_target())return;
+    uint32_t value=atomic_load_explicit(&s_ring_issue_value,memory_order_relaxed);
+    ring_track(ea,value,ticket);ring_note(RSX_RING_METAL_COMMIT,ea,value,ticket,records);
+}
+void rsx_ring_progress_metal_completed(uint64_t ticket,uint64_t status){
+    uint32_t target=ring_target();if(!target)return;
+    for(unsigned i=0;i<64;i++)if(atomic_load_explicit(&s_ring_tickets[i].ticket,memory_order_acquire)==ticket){
+        if(s_ring_tickets[i].ea==target&&!atomic_exchange_explicit(&s_ring_tickets[i].completed,1,memory_order_acq_rel))
+            ring_note(RSX_RING_METAL_COMPLETE,target,s_ring_tickets[i].value,ticket,status);
+        return;
+    }
+}
 
 #ifdef _WIN32
 #include <windows.h>
@@ -956,6 +1002,7 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
         u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
         if(!vm_base||r->vm!=(uintptr_t)vm_base||(u64)r->ea+4u>limit)return 0;
         vm_write32(r->ea,r->argument);
+        ring_note(RSX_RING_VM_PUBLISH,r->ea,r->argument,r->ticket,r->context);
         if(r->start_ns){uint64_t w[5]={r->start_ns,r->ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,20,r->ea,0,w,5);}
         return 1;
     }
@@ -977,11 +1024,47 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     if(r->start_ns){uint64_t w[5]={r->start_ns,ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,PS3_CRITICAL_REPORT,ea,r->index,w,5);}
     return 1;
 }
-static uint64_t gcm_report_issue(void *user){(void)user;return rsx_draw_engine_submit_async();}
-static int gcm_report_status(void *user,uint64_t ticket,int wait){(void)user;return rsx_draw_engine_completion_status(ticket,wait);}
+static uint64_t gcm_report_issue(void *user){
+    (void)user;uint32_t target=ring_target(),value=0,selected=0;
+    if(!target)return rsx_draw_engine_submit_async();
+    if(target)for(uint32_t i=0;i<s_reports.count;i++){
+        const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_CAPACITY];
+        if(r->operation&&r->ea==target&&!r->ticket){selected=target;value=r->argument;break;}
+    }
+    atomic_store_explicit(&s_ring_issue_value,value,memory_order_relaxed);
+    atomic_store_explicit(&s_ring_issue_ea,selected,memory_order_release);
+    uint64_t ticket=rsx_draw_engine_submit_async();
+    atomic_store_explicit(&s_ring_issue_ea,0,memory_order_release);
+    if(selected&&ticket)for(uint32_t i=0;i<s_reports.count;i++){
+        const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_CAPACITY];
+        if(r->operation&&r->ea==selected&&!r->ticket){
+            ring_track(r->ea,r->argument,ticket);
+            ring_note(RSX_RING_TICKET_BIND,r->ea,r->argument,ticket,s_reports.generation);
+        }
+    }
+    return ticket;
+}
+static int gcm_report_status(void *user,uint64_t ticket,int wait){
+    (void)user;int ready=rsx_draw_engine_completion_status(ticket,wait);
+    /* A left-censored ticket may already have been retired by the backend
+     * before arming. Record its genuine positive API result once as well. */
+    if(ready==1)rsx_ring_progress_metal_completed(ticket,UINT64_C(0x8000000000000001));
+    return ready;
+}
 static const rsx_deferred_report_ops s_report_ops={NULL,gcm_report_issue,gcm_report_status,gcm_report_publish};
 static int gcm_reports_progress(int wait,int issue){
     if(!s_deferred_reports)return 1;
+    uint32_t target=ring_target();
+    if(target&&atomic_load_explicit(&s_ring_snapshot_target,memory_order_acquire)!=target){
+        atomic_store_explicit(&s_ring_snapshot_target,target,memory_order_release);
+        for(uint32_t i=0;i<s_reports.count;i++){
+            const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_CAPACITY];
+            if(r->operation&&r->ea==target){
+                ring_track(r->ea,r->argument,r->ticket);
+                ring_note(RSX_RING_PENDING_SNAPSHOT,r->ea,r->argument,r->ticket,s_reports.generation);
+            }
+        }
+    }
     int was_failed=s_reports.failed;
     int ok=rsx_reports_progress(&s_reports,&s_report_ops,wait,issue);
     if(!ok&&!was_failed)fprintf(stderr,"[deferred reports] FAILED; publication stopped pending=%u issued=%llu published=%llu\n",s_reports.count,(unsigned long long)s_reports.issued,(unsigned long long)s_reports.published);
@@ -1004,7 +1087,8 @@ static int gcm_reports_sync_barrier_at(u32 reason){
 }
 /* Label writes retain the existing value/byte-order semantics, but release
  * guest reuse only after the same genuine ordered GPU completion as reports. */
-static int gcm_defer_label(u32 ea,u32 value,u32 method){
+static int gcm_defer_label(u32 ea,u32 value,u32 method,u32 fifo_ea){
+    ring_note(RSX_RING_DECODE,ea,value,0,((uint64_t)method<<32)|fifo_ea);
     rsx_deferred_report r={0};r.operation=1;r.main_memory=1;
     r.ea=ea;r.argument=value;r.context=method;r.vm=(uintptr_t)vm_base;
     r.capture=ps3_critical_capture_id();r.start_ns=ps3_critical_enabled()?ps3_critical_now_ns():0;
@@ -1012,6 +1096,7 @@ static int gcm_defer_label(u32 ea,u32 value,u32 method){
     if(!vm_base||(u64)ea+4u>limit){s_reports.failed=1;fprintf(stderr,"[deferred reports] invalid label destination %08X; publication stopped\n",ea);return 0;}
     unsigned failed=s_reports.failed;
     int ok=rsx_reports_enqueue(&s_reports,&s_report_ops,r);
+    ring_note(RSX_RING_ENQUEUE,ea,value,0,((uint64_t)(ok!=0)<<63)|s_reports.count);
     if(!ok&&!failed)fprintf(stderr,"[deferred reports] label enqueue FAILED; publication stopped\n");
     return ok;
 }
@@ -2493,7 +2578,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if(m==0x6cu && s_deferred_reports&&!rsx_live_draw_enabled()&&rsx_draw_engine_async_available()){
-                        if(!gcm_defer_label(la,v,m)){sem_blocked=1;break;}
+                        if(!gcm_defer_label(la,v,m,dea)){sem_blocked=1;break;}
                         /* The label lands after GPU completion; get leads it. */
                         if (!gcm_get_eq_put())
                             vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
@@ -2710,7 +2795,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if((m==0x1d70u||m==0x1d74u)&&s_deferred_reports&&!rsx_live_draw_enabled()&&rsx_draw_engine_async_available()){
                         u32 value=vm_read32(dea);
                         if(m==0x1d70u)value=(value&0xff00ff00u)|((value>>16)&0xffu)|((value&0xffu)<<16);
-                        if(!gcm_defer_label(VM_HLE_INJECT_BASE+(s_backend_label_offset&0xffffffu),value,m))return;
+                        if(!gcm_defer_label(VM_HLE_INJECT_BASE+(s_backend_label_offset&0xffffffu),value,m,dea))return;
                         continue;
                     }
                     if((m==0x1d70u||m==0x1d74u)&&!gcm_reports_sync_barrier())return;

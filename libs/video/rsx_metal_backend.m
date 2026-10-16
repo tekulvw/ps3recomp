@@ -2358,6 +2358,8 @@ static void release_surfaces(void)
  * --------------------------------------------------------------------------*/
 
 #include "rsx_draw_engine.h"
+#define RSX_RING_PROGRESS_OPTIONAL 1
+#include "rsx_ring_progress_observer.h"
 
 #define ENG_MAX_OBJECTS  4096
 #define ENG_MAX_PIPES    4096
@@ -2455,6 +2457,7 @@ static int eng_completion_status(void *user,u64 ticket,int wait){
   if(status==MTLCommandBufferStatusError||cb.error){eng_checked_fail();return -1;}
   if(status!=MTLCommandBufferStatusCompleted)break;
   [s_eng_fence_cbs removeObjectAtIndex:0];++s_eng_fence_completed;
+  if(rsx_ring_progress_metal_completed)rsx_ring_progress_metal_completed(s_eng_fence_completed,(uint64_t)status);
  }
  return ticket<=s_eng_fence_completed?1:0;
 }
@@ -4149,6 +4152,8 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
             }
             if(critical_start)critical_commit=ps3_critical_now_ns();
             [cb commit];
+            if(async_submit&&out_ticket&&*out_ticket&&rsx_ring_progress_metal_committed)
+                rsx_ring_progress_metal_committed(*out_ticket,s_eng_rec_count);
             fps_frame_committed(ticket);
         } else {
             if(critical_start)critical_commit=ps3_critical_now_ns();
