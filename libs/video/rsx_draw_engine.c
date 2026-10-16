@@ -3681,7 +3681,27 @@ void rsx_draw_engine_flush(void)
 }
 
 int rsx_draw_engine_async_available(void){return g.ready&&g.be&&g.be->submit_async&&g.be->completion_status;}
-u64 rsx_draw_engine_submit_async(void){if(!rsx_draw_engine_async_available()||g.rsx.in_begin_end||atomic_load(&s_checked_failed))return 0;return g.be->submit_async(g.be->user,RSX_BE_FLUSH_GUEST_REFERENCE);}
+/* Failure-only witness for the opt-in consumer experiment. No submission,
+ * report publication or completion behavior changes, including partial BEGIN. */
+static void eng_async_failure_witness(const char *where,int available)
+{
+    static atomic_int reported;
+    const char *flag=getenv("MAG_NATIVE_CONSUMER");
+    if(!flag||strcmp(flag,"1")||atomic_exchange(&reported,1))return;
+    fprintf(stderr,"[rsx async failure] where=%s available=%d ready=%d in_begin_end=%u checked_failed=%d write_serial=%llu\n",
+        where,available,g.ready,g.rsx.in_begin_end,atomic_load(&s_checked_failed),
+        (unsigned long long)g.write_serial);
+}
+u64 rsx_draw_engine_submit_async(void)
+{
+    int available=rsx_draw_engine_async_available();
+    if(!available||g.rsx.in_begin_end||atomic_load(&s_checked_failed)){
+        eng_async_failure_witness("guard",available);return 0;
+    }
+    u64 ticket=g.be->submit_async(g.be->user,RSX_BE_FLUSH_GUEST_REFERENCE);
+    if(!ticket)eng_async_failure_witness("backend",available);
+    return ticket;
+}
 int rsx_draw_engine_completion_status(u64 ticket,int wait){if(!ticket||!rsx_draw_engine_async_available())return -1;int status=g.be->completion_status(g.be->user,ticket,wait);if(status<0)atomic_store(&s_checked_failed,1);return status;}
 
 void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes)
