@@ -21,6 +21,7 @@
 #include "spu_coherency.h"
 #include "spu_dma_source_trace.h"
 #include "spu_dma_publication.h"
+#include "../diagnostics/job_io_recorder.h"
 #include "spu_dma_disposition.h"
 #include "../diagnostics/critical_write_trace.h"
 #include <stdint.h>
@@ -205,6 +206,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * advances tracked PPU epochs, including ABA stores. Issuer exclusion
          * follows the existing plain-MFC-write model; issuer reservation
          * behavior for storage controls is not separately modeled here. */
+        if(ps3_jobio_is(spu))ps3_jobio_event(spu,PS3_JOBIO_ZERO,cmd,lsa,ea,size,NULL,0);
         spu_lockline_lock();
         memset(vm_base + (uint32_t)ea, 0, size);
         for (uint32_t offset = 0; offset < size; offset += 128u)
@@ -609,6 +611,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         memcpy(ls_ptr, ea_ptr, size);
         spu_dma_disposition_after(&disposition, ls_ptr);
         copy_disposition = SPU_DMA_DISPOSITION_GET;
+        if(ps3_jobio_is(spu))ps3_jobio_event(spu,PS3_JOBIO_GET,cmd,lsa,ea,size,ls_ptr,0);
         spu_dma_publication_observe(spu, lsa, ea, size, cmd);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
@@ -687,6 +690,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             extern void spu_lockline_unlock(void);
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
+            if(ps3_jobio_is(spu))ps3_jobio_event(spu,PS3_JOBIO_PUT,cmd,lsa,ea,size,ls_ptr,0);
             uint32_t a0 = (uint32_t)ea & ~127u;
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
             ps3_critical_write_token critical_write = {0};

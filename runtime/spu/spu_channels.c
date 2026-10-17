@@ -22,6 +22,7 @@
 #include "spu_pc_observer.h"
 #include "spu_decrementer_observer.h"
 #include "../diagnostics/critical_pc_trace.h"
+#include "../diagnostics/job_io_recorder.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include "spu_verified_overlay.h"
@@ -1013,8 +1014,23 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
-        if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
-            return;
+        if (channel == MFC_Cmd) {
+            const int jobio = ps3_jobio_is(ctx) && (v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD);
+            const uint32_t jobio_ea = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1), jobio_lsa = ctx->mfc_lsa & SPU_LS_MASK;
+            /* A conditional store is recorded with its source line before the
+             * operation, and with the outcome afterwards. */
+            uint8_t jobio_line[MFC_ATOMIC_LINE];
+            if (jobio && v != MFC_GETLLAR_CMD) memcpy(jobio_line, &ctx->ls[jobio_lsa], MFC_ATOMIC_LINE);
+            if (spu_mfc_atomic(ctx, v)) {
+                if (jobio) {
+                    if (v == MFC_GETLLAR_CMD)
+                        ps3_jobio_event(ctx, PS3_JOBIO_GETLLAR, v, jobio_lsa, jobio_ea, MFC_ATOMIC_LINE, &ctx->ls[jobio_lsa], 0);
+                    else
+                        ps3_jobio_event(ctx, v == MFC_PUTLLC_CMD ? PS3_JOBIO_PUTLLC : PS3_JOBIO_PUTLLUC, v, jobio_lsa, jobio_ea, MFC_ATOMIC_LINE, jobio_line, (uint32_t)ctx->atomic_stat);
+                }
+                return;
+            }
+        }
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
         /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
          * DMA completes synchronously, so the instant the program arms tag
