@@ -16,6 +16,7 @@
 
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
+#include "../../runtime/syscalls/sys_memory_native.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -456,6 +457,22 @@ void cellGcmSortRemapEaIoAddress(void);
 CellGcmReportData* cellGcmGetReportDataAddressLocation(u32 index, u32 location);
 u32 cellGcmGetReportDataLocation(u32 index, u32 location);
 
+
+/* Host-only native output mapping. Requires initialized deferred-consumer mode.
+ * Allocation ownership stays with the caller on map failure: release/rollback
+ * explicitly with sys_memory_native_release. Never pass these HOST output
+ * pointers to cellGcmMapMainMemory, whose output argument remains a guest EA.
+ * Unmap requires a nonblocking, non-reentrant proof that producer/output/GPU
+ * use is quiescent and no new use can begin. Refusal changes no mapping.
+ * Release owned mappings/allocations before GCM or VM teardown. */
+typedef struct CellGcmNativeOutputMapping {
+    sys_memory_native_allocation allocation;
+    u32 io;
+    u64 generation;
+} CellGcmNativeOutputMapping;
+typedef int (*CellGcmNativeOutputQuiescent)(void*,const CellGcmNativeOutputMapping*);
+s32 cellGcmNativeMapMainMemory(const sys_memory_native_allocation*,CellGcmNativeOutputMapping* host_result);
+s32 cellGcmNativeUnmapMainMemory(CellGcmNativeOutputMapping*,CellGcmNativeOutputQuiescent,void* owner);
 
 /* Shared experimental FIFO/presentation/lifetime lease; default-off no-op. */
 void cellGcm_rsx_consumer_begin(void);
