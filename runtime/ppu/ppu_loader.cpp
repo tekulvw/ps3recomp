@@ -3187,6 +3187,39 @@ extern "C" int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size,
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+#include "../diagnostics/timer_gcm_pump.h"
+#if defined(__APPLE__)
+extern "C" __attribute__((weak_import)) void ppu_gcm_pump(void);
+#else
+extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
+#endif
+static uint32_t timer_gcm_pump_enabled;
+static uint64_t timer_gcm_eligible_141,timer_gcm_eligible_142,timer_gcm_invocations,
+ timer_gcm_missing,timer_gcm_disabled,timer_gcm_transitions;
+extern "C" void ppu_timer_gcm_pump_set_enabled(int enabled){
+ const uint32_t value=enabled!=0;
+ if(__atomic_exchange_n(&timer_gcm_pump_enabled,value,__ATOMIC_ACQ_REL)!=value)
+  __atomic_fetch_add(&timer_gcm_transitions,1,__ATOMIC_RELAXED);
+}
+extern "C" void ppu_timer_gcm_pump_get_snapshot(PpuTimerGcmPumpSnapshot*out){
+ if(!out)return;
+ *out={sizeof(*out),__atomic_load_n(&timer_gcm_pump_enabled,__ATOMIC_ACQUIRE),
+  __atomic_load_n(&timer_gcm_eligible_141,__ATOMIC_RELAXED),__atomic_load_n(&timer_gcm_eligible_142,__ATOMIC_RELAXED),
+  __atomic_load_n(&timer_gcm_invocations,__ATOMIC_RELAXED),__atomic_load_n(&timer_gcm_missing,__ATOMIC_RELAXED),
+  __atomic_load_n(&timer_gcm_disabled,__ATOMIC_RELAXED),__atomic_load_n(&timer_gcm_transitions,__ATOMIC_RELAXED)};
+}
+/* Exact PR353 dispatch location, with a local default-off control for the
+ * experiment. The existing GCM pump owns its callback/reentrancy policy. */
+static void timer_gcm_pump_before_sleep(uint64_t number){
+ if(number!=141&&number!=142)return;
+ __atomic_fetch_add(number==141?&timer_gcm_eligible_141:&timer_gcm_eligible_142,1,__ATOMIC_RELAXED);
+ if(!__atomic_load_n(&timer_gcm_pump_enabled,__ATOMIC_ACQUIRE)){
+  __atomic_fetch_add(&timer_gcm_disabled,1,__ATOMIC_RELAXED);return;
+ }
+ if(ppu_gcm_pump){__atomic_fetch_add(&timer_gcm_invocations,1,__ATOMIC_RELAXED);ppu_gcm_pump();}
+ else __atomic_fetch_add(&timer_gcm_missing,1,__ATOMIC_RELAXED);
+}
+
 /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
@@ -3203,6 +3236,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
           const char* e = getenv("PPU_GUARD_EA");
           if (e && *e) ppu_guard_page((uint32_t)strtoul(e, 0, 16)); } }
     uint64_t num = ctx->gpr[11];
+    timer_gcm_pump_before_sleep(num);
     /* Milestone: which lv2 calls this title makes, in first-occurrence order.
      * Formatting the key each time is noise next to the profiler stamp below,
      * which resolves a host return address to a guest function. */
