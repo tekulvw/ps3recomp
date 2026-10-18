@@ -3209,6 +3209,7 @@ extern "C" int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size,
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+#include "../diagnostics/timer_gcm_pump.h"
 /* cellGcmSys.c, when linked. ppu_hle.cpp already holds a weak reference, and
  * under COFF a second weak declaration emits a second fallback definition, so
  * every port failed to link. On Windows use the linker's own default instead. */
@@ -3221,6 +3222,33 @@ extern "C" void ppu_gcm_pump_absent(void) {}
 extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 #define PPU_GCM_PUMP_LINKED (ppu_gcm_pump != nullptr)
 #endif
+static uint32_t timer_gcm_pump_enabled=1;   /* upstream PR353 default */
+static uint64_t timer_gcm_eligible_141,timer_gcm_eligible_142,timer_gcm_invocations,
+ timer_gcm_missing,timer_gcm_disabled,timer_gcm_transitions;
+extern "C" void ppu_timer_gcm_pump_set_enabled(int enabled){
+ const uint32_t value=enabled!=0;
+ if(__atomic_exchange_n(&timer_gcm_pump_enabled,value,__ATOMIC_ACQ_REL)!=value)
+  __atomic_fetch_add(&timer_gcm_transitions,1,__ATOMIC_RELAXED);
+}
+extern "C" void ppu_timer_gcm_pump_get_snapshot(PpuTimerGcmPumpSnapshot*out){
+ if(!out)return;
+ *out={sizeof(*out),__atomic_load_n(&timer_gcm_pump_enabled,__ATOMIC_ACQUIRE),
+  __atomic_load_n(&timer_gcm_eligible_141,__ATOMIC_RELAXED),__atomic_load_n(&timer_gcm_eligible_142,__ATOMIC_RELAXED),
+  __atomic_load_n(&timer_gcm_invocations,__ATOMIC_RELAXED),__atomic_load_n(&timer_gcm_missing,__ATOMIC_RELAXED),
+  __atomic_load_n(&timer_gcm_disabled,__ATOMIC_RELAXED),__atomic_load_n(&timer_gcm_transitions,__ATOMIC_RELAXED)};
+}
+/* Upstream PR353 dispatch with invocation counters and a diagnostic off
+ * switch. The existing GCM pump owns its callback/reentrancy policy. */
+static void timer_gcm_pump_before_sleep(uint64_t number){
+ if(number!=141&&number!=142)return;
+ __atomic_fetch_add(number==141?&timer_gcm_eligible_141:&timer_gcm_eligible_142,1,__ATOMIC_RELAXED);
+ if(!__atomic_load_n(&timer_gcm_pump_enabled,__ATOMIC_ACQUIRE)){
+  __atomic_fetch_add(&timer_gcm_disabled,1,__ATOMIC_RELAXED);return;
+ }
+ if(PPU_GCM_PUMP_LINKED){__atomic_fetch_add(&timer_gcm_invocations,1,__ATOMIC_RELAXED);ppu_gcm_pump();}
+ else __atomic_fetch_add(&timer_gcm_missing,1,__ATOMIC_RELAXED);
+}
+
 /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
@@ -3245,7 +3273,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * writes it) and then spins in 0x13ACE8 on the ref register with
      * sys_timer_usleep only; it used to be rescued by another thread's HLE
      * call, and hung once that thread had nothing left to poll. */
-    if ((num == 141 || num == 142) && PPU_GCM_PUMP_LINKED) ppu_gcm_pump();
+    timer_gcm_pump_before_sleep(num);
     /* Milestone: which lv2 calls this title makes, in first-occurrence order.
      * Formatting the key each time is noise next to the profiler stamp below,
      * which resolves a host return address to a guest function. */
