@@ -952,6 +952,31 @@ extern "C" void ppu_resv_break_line(uint32_t ea)
             c->reserve_addr = PPU_RESV_INVALID;
     }
 }
+
+/* Bulk equivalent of ppu_resv_break_store for a non-wrapping guest byte range.
+ * Keep exact four-byte coverage, including partial first/last words; this is
+ * not a 128-byte reservation-granule substitution. Scan the registry once so
+ * native coherent copies do not pay O(words * registered PPU contexts).
+ * Like the word helper this only breaks legacy PPU address reservations; the
+ * caller must still serialize its store and publish SPU coherence/line epochs.
+ * Empty or out-of-address-space ranges have no effect. The registry lifetime
+ * and unlocked best-effort concurrency contract are unchanged. */
+extern "C" void ppu_resv_break_store_range(uint32_t ea, uint64_t bytes)
+{
+    if (!bytes || bytes > PPU_RESV_INVALID - uint64_t(ea)) return;
+    uint32_t first = ea & ~3u;
+    uint32_t last = uint32_t(uint64_t(ea) + bytes - 1) & ~3u;
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++) {
+        ppu_context* c = g_resv_ctxs[i];
+        if (!c) continue;
+        uint64_t reserved = c->reserve_addr;
+        if (reserved < PPU_RESV_INVALID) {
+            uint32_t word = uint32_t(reserved) & ~3u;
+            if (word >= first && word <= last) c->reserve_addr = PPU_RESV_INVALID;
+        }
+    }
+}
 static inline volatile LONG* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 4) & (PPU_RESV_LOCKS - 1)]; }
 static inline void resv_lock(volatile LONG* L)   { while (_InterlockedExchange(L, 1)) { while (*L) YieldProcessor(); } }
 static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
