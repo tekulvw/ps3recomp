@@ -11,6 +11,7 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#include "../../runtime/diagnostics/render_ablation.h"
 #include "rsx_binding_capture_filter.h"
 #include "rsx_picture_identity.inc"
 
@@ -3194,6 +3195,12 @@ done:
 static void sink_end_core(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
+    /* Diagnostic B consumes every geometry source at END before layout,
+       fetch, shaders, textures or backend preparation. BEGIN still resets. */
+    if(rsx_render_ablation_skip_prepare()) {
+        DRAW_OBSERVER_STAGE("diagnostic_no_draw_prepare");
+        return;
+    }
     DRAW_OBSERVER_STAGE(!g.ready ? "not_ready" : !dc.n_packets ? "empty_packets" : !dc.fetch_ok ? "prefetch" : "entry");
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
     /* Mixed geometry sources have no defined concatenation here. Reject the
@@ -3565,6 +3572,9 @@ int rsx_draw_engine_enabled(void)
 
 int rsx_draw_engine_init(u32 width, u32 height)
 {
+    /* Configuration is parsed once; active mode stays OFF until explicit arm.
+       Invalid flags are reported and the diagnostic controller must refuse. */
+    (void)rsx_render_ablation_init();
     if (!g.be) return -1;
     draw_observer_reset();
     g.width  = width  ? width  : 1280;

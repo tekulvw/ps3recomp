@@ -1,4 +1,5 @@
 #include "../../runtime/diagnostics/critical_trace.h"
+#include "../../runtime/diagnostics/render_ablation.h"
 #include "../misc/osk_native.h"
 /*
  * ps3recomp - RSX -> Metal backend (macOS / Apple Silicon)
@@ -3715,6 +3716,10 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
      * strip's shared vertices from being fetched and uploaded per triangle.
      * Only a rebuilt triangle list is ever indexed; points and lines arrive as
      * the guest issued them. */
+    /* Diagnostic A suppresses only actual draw issue after all bindings and
+       staging. B also suppresses queued pre-arm draws. Real command buffers,
+       clears, transfers, submissions and completion remain untouched. */
+    if(rsx_render_ablation_skip_draw())return;
     if (r->index_count)
         [enc drawIndexedPrimitives:r->topology
                         indexCount:r->index_count
