@@ -121,6 +121,9 @@ extern "C" {
 #endif
 extern int  g_resv_store_active;
 void        ppu_resv_break_store(uint64_t ea);
+/* Exact word coverage for a bulk native store. No SPU/epoch notification is
+ * performed here. Empty or wrapping byte ranges have no effect. */
+void        ppu_resv_break_store_range(uint32_t ea, uint64_t bytes);
 
 /* PPU <-> SPU lock-line coherence (runtime/spu/spu_coherency.c). A PPU store to
  * a 128-byte line an SPU has reserved with GETLLAR has to serialize through the
