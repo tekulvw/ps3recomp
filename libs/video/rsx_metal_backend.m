@@ -2902,12 +2902,46 @@ static void eng_submit_and_wait(void* user, u32 reason)
     }
 }
 
+/* Checked-only experiment. A successful empty Boolean barrier is justified by
+ * actual completed statuses, not by issuing or advancing a GPU ticket. The
+ * renderer consumer owns these arrays; pending work keeps the original wait. */
+static int eng_checked_empty_flush_try(void)
+{
+    static atomic_int setting, diagnostic;
+    static unsigned long long calls, eligible_calls, fast_calls, pending_calls, failed_calls;
+    const int enabled=eng_empty_flush_option("PS3RECOMP_METAL_CHECKED_EMPTY_FLUSH",&setting);
+    const int observe=eng_empty_flush_option("PS3RECOMP_METAL_CHECKED_EMPTY_FLUSH_DIAGNOSTICS",&diagnostic);
+    const int eligible=s_eng_active && s_dev && s_queue && !s_eng_dropped &&
+        !atomic_load(&s_eng_checked_failed) && !s_eng_rec_count && !s_eng_stage_used;
+    int fast=0,pending=0,failed=0;
+    if(enabled && eligible) {
+        eng_check_submissions(0);
+        pending=[s_eng_submitted count]!=0;
+        failed=atomic_load(&s_eng_checked_failed)!=0;
+        if(!pending && !failed) {
+            eng_collect_retired_objects();
+            fast=1;
+        }
+    }
+    if(observe) {
+        ++calls;eligible_calls+=eligible;fast_calls+=fast;
+        pending_calls+=pending;failed_calls+=failed;
+        /* Aggregate counters only: no per-flush clock, file polling or fake
+         * command-buffer completion record. Both experimental arms use this. */
+        if(calls==1 || !(calls&4095ull))
+            fprintf(stderr,"[RSX checked empty] enabled=%d calls=%llu eligible=%llu fast=%llu pending=%llu failed=%llu\n",
+                enabled,calls,eligible_calls,fast_calls,pending_calls,failed_calls);
+    }
+    return fast;
+}
+
 #define PS3RECOMP_METAL_CHECKED_IMPLEMENTATION 1
 static int eng_submit_and_wait_checked(void* user, u32 reason)
 {
     (void)user; (void)reason;
     if(atomic_load(&s_eng_checked_failed))return 0;
     if(!s_dev || !s_queue || s_eng_dropped){eng_checked_fail();return 0;}
+    if(eng_checked_empty_flush_try())return 1;
     eng_encode_and_commit(nil);
     return s_eng_checked_completed && !atomic_load(&s_eng_checked_failed);
 }
