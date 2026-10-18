@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../include/ps3emu/log_first.h"   /* relative: tools/test_*memory*.py compile this file alone */
+#include <stdatomic.h>
+#include <stdint.h>
 #include "../memory/vm_release_guard.h"
 
 /* ---------------------------------------------------------------------------
@@ -34,6 +36,7 @@ typedef struct mapper_reservation {
     uint32_t start, end, next;
 } mapper_reservation;
 static mapper_reservation s_mapper_reservations[SYS_MEMORY_ALLOC_MAX];
+static int s_native_mapper_owners[SYS_MEMORY_ALLOC_MAX];
 
 
 static uint32_t s_total_allocated = 0;
@@ -43,6 +46,12 @@ void sys_memory_set_image_query(uint64_t (*query)(uint64_t addr, uint64_t end))
 {
     s_image_query = query;
 }
+/* Private native ownership; guest allocation-record ABI remains unchanged. */
+typedef struct native_memory_info {uint64_t owner,generation;uintptr_t vm;uint32_t pins,mappings,mapper_slot;} native_memory_info;
+static native_memory_info s_native_memory[SYS_MEMORY_ALLOC_MAX];
+static _Atomic(uint64_t) s_native_ranges[SYS_MEMORY_ALLOC_MAX];
+static uint64_t s_native_vm_epoch,s_native_generation;
+static _Thread_local int s_native_release_slot=-1;
 
 /* Guest threads are real host threads; serialize the bump allocator. */
 #ifdef _WIN32
@@ -146,6 +155,7 @@ int64_t sys_memory_free(ppu_context* ctx)
     bump_lock();
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
+            if(s_native_memory[i].owner){bump_unlock();return (int64_t)(int32_t)CELL_EBUSY;}
             if(!vm_release_begin(addr,g_sys_mem_allocs[i].size)){bump_unlock();return (int64_t)(int32_t)CELL_EBUSY;}
             s_total_allocated -= g_sys_mem_allocs[i].size;
             g_sys_mem_allocs[i].active = 0;
@@ -312,7 +322,7 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 /* Mapper reservation and legacy direct mapping share their own cursor.
  * Called with the allocator lock held. */
-static uint32_t mapper_address(uint64_t requested, uint64_t alignment)
+static uint32_t mapper_candidate(uint64_t requested, uint64_t alignment)
 {
     if (!requested || requested > UINT32_MAX || !alignment ||
         alignment > UINT32_MAX || (alignment & (alignment - 1u))) return 0;
@@ -334,10 +344,15 @@ static uint32_t mapper_address(uint64_t requested, uint64_t alignment)
         if (next == addr) break;
         addr = (next + alignment - 1u) & ~(alignment - 1u);
     }
-    if (!size || addr + size > SYS_MAPPER_END || vm_commit((uint32_t)addr, (uint32_t)size) != CELL_OK)
-        return 0;
-    s_mapper_bump_ptr = (uint32_t)(addr + size);
+    if (!size || addr + size > SYS_MAPPER_END) return 0;
     return (uint32_t)addr;
+}
+static uint32_t mapper_address(uint64_t requested,uint64_t alignment)
+{
+    uint32_t addr=mapper_candidate(requested,alignment);if(!addr)return 0;
+    uint32_t size=(uint32_t)((requested+alignment-1u)&~(alignment-1u));
+    if(vm_commit(addr,size)!=CELL_OK)return 0;
+    s_mapper_bump_ptr=addr+size;return addr;
 }
 
 int64_t sys_mmapper_allocate_address(ppu_context* ctx)
@@ -373,6 +388,7 @@ int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* 
     mapper_reservation* found = NULL;
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i) {
         mapper_reservation* r = &s_mapper_reservations[i];
+        if(s_native_mapper_owners[i])continue;
         if (r->start && ((!start && !found) || (start >= r->start && start < r->end))) {
             found = r; if (start) break;
         }
@@ -399,8 +415,10 @@ int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* 
  * -----------------------------------------------------------------------*/
 int64_t sys_mmapper_free_address(ppu_context* ctx)
 {
-    /* uint32_t addr = LV2_ARG_U32(ctx, 0); */
-    (void)ctx;
+    uint32_t addr=LV2_ARG_U32(ctx,0);
+    bump_lock();
+    for(int i=0;i<SYS_MEMORY_ALLOC_MAX;++i)if(s_native_mapper_owners[i]&&addr>=s_mapper_reservations[i].start&&addr<s_mapper_reservations[i].end){bump_unlock();return (int64_t)(int32_t)CELL_EBUSY;}
+    bump_unlock();
     /* In our bump allocator we don't actually free, just acknowledge */
     return CELL_OK;
 }
@@ -538,14 +556,21 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
 void sys_memory_init(lv2_syscall_table* tbl)
 {
     bump_lock();
+    for(int i=0;i<SYS_MEMORY_ALLOC_MAX;++i)if(s_native_memory[i].owner){
+        fprintf(stderr,"[sys_memory] reset refused: release native owned arenas before VM reset\n");bump_unlock();return;
+    }
+    if(s_native_vm_epoch==UINT64_MAX){bump_unlock();return;}
     if(!vm_release_begin(0,UINT64_C(0x100000000))){bump_unlock();return;}
     memset(g_sys_mem_allocs,     0, sizeof(g_sys_mem_allocs));
     memset(g_sys_mem_containers, 0, sizeof(g_sys_mem_containers));
     memset(g_sys_mmapper_shared, 0, sizeof(g_sys_mmapper_shared));
     g_sys_mem_bump_ptr = 0;
     s_total_allocated  = 0;
+    ++s_native_vm_epoch;
+    if(!g_sys_memory_native_live)g_sys_memory_native_live=sys_memory_native_range_live;
     s_mapper_bump_ptr = SYS_MAPPER_BASE;
     memset(s_mapper_reservations, 0, sizeof(s_mapper_reservations));
+    memset(s_native_mapper_owners,0,sizeof(s_native_mapper_owners));
     bump_unlock();vm_release_end();
 
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
@@ -561,4 +586,95 @@ void sys_memory_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_MMAPPER_MAP_SHARED_MEMORY,  sys_mmapper_map_shared_memory);
     lv2_syscall_register(tbl, 341, sys_mmapper_allocate_memory);
     lv2_syscall_register(tbl, 342, sys_mmapper_allocate_memory_from_container);
+}
+
+/* A native owner participates in the real allocation registry and user pool.
+ * No guest syscall context/out-pointer is fabricated by these host APIs. */
+static int native_slot(const sys_memory_native_allocation* a)
+{
+    if(!a||!a->owner||!a->generation||a->vm_epoch!=s_native_vm_epoch||!VM_READY)return -1;
+    for(int i=0;i<SYS_MEMORY_ALLOC_MAX;++i){
+        const sys_mem_alloc_info* r=&g_sys_mem_allocs[i];const native_memory_info* n=&s_native_memory[i];
+        if(r->active&&r->addr==a->ea&&r->size==a->size&&n->owner==a->owner&&n->generation==a->generation&&n->vm==(uintptr_t)vm_base)return i;
+    }
+    return -1;
+}
+static int32_t native_allocate_profile(uint32_t bytes,uint32_t alignment,uint64_t owner,sys_memory_native_allocation* out,int user_pool)
+{
+    if(!out||!owner||!bytes||alignment<0x10000u||(alignment&(alignment-1u))||alignment>0x1000000u)return (int32_t)CELL_EINVAL;
+    uint64_t rounded=((uint64_t)bytes+alignment-1u)&~((uint64_t)alignment-1u);
+    if(rounded>UINT32_MAX)return (int32_t)CELL_EINVAL;
+    bump_lock();
+    if(!VM_READY||!s_native_vm_epoch||g_sys_memory_native_live!=sys_memory_native_range_live||!ps3_vm_release_guard.begin){bump_unlock();return (int32_t)CELL_EBUSY;}
+    if(s_native_generation==UINT64_MAX||(user_pool&&rounded>SYS_MEM_USER_TOTAL-s_total_allocated)){bump_unlock();return (int32_t)CELL_ENOMEM;}
+    int slot=-1;for(int i=0;i<SYS_MEMORY_ALLOC_MAX;++i)if(!g_sys_mem_allocs[i].active){slot=i;break;}
+    int mapper_slot=-1;
+    if(!user_pool)for(int i=0;i<SYS_MEMORY_ALLOC_MAX;++i)if(!s_mapper_reservations[i].start){mapper_slot=i;break;}
+    uint32_t ea=slot<0?0:(user_pool?user_address((uint32_t)rounded,alignment):(mapper_slot<0?0:mapper_candidate(rounded,alignment)));
+    if(!ea){bump_unlock();return (int32_t)CELL_ENOMEM;}
+    if(!vm_release_begin(ea,rounded)){bump_unlock();return (int32_t)CELL_EBUSY;}
+    if(vm_commit(ea,(uint32_t)rounded)!=CELL_OK){bump_unlock();vm_release_end();return (int32_t)CELL_ENOMEM;}
+    memset(vm_to_host(ea),0,(size_t)rounded);
+    sys_mem_alloc_info* r=&g_sys_mem_allocs[slot];r->active=1;r->addr=ea;r->size=(uint32_t)rounded;r->container_id=0;r->page_size=alignment;
+    native_memory_info* n=&s_native_memory[slot];memset(n,0,sizeof(*n));n->owner=owner;n->generation=++s_native_generation;n->vm=(uintptr_t)vm_base;
+    if(!user_pool){
+        n->mapper_slot=(uint32_t)mapper_slot+1;s_native_mapper_owners[mapper_slot]=slot+1;
+        s_mapper_reservations[mapper_slot]=(mapper_reservation){ea,ea+(uint32_t)rounded,ea+(uint32_t)rounded};
+        s_mapper_bump_ptr=ea+(uint32_t)rounded;
+    }
+    atomic_store_explicit(&s_native_ranges[slot],((uint64_t)ea<<32)|(uint32_t)rounded,memory_order_release);
+    if(user_pool){s_total_allocated+=(uint32_t)rounded;if(ea+rounded>g_sys_mem_bump_ptr)g_sys_mem_bump_ptr=ea+(uint32_t)rounded;}
+    *out=(sys_memory_native_allocation){ea,(uint32_t)rounded,s_native_vm_epoch,n->generation,owner};
+    bump_unlock();vm_release_end();return CELL_OK;
+}
+int32_t sys_memory_native_allocate(uint32_t bytes,uint32_t alignment,uint64_t owner,sys_memory_native_allocation* out)
+{return native_allocate_profile(bytes,alignment,owner,out,0);}
+int32_t sys_memory_native_allocate_user(uint32_t bytes,uint32_t alignment,uint64_t owner,sys_memory_native_allocation* out)
+{return native_allocate_profile(bytes,alignment,owner,out,1);}
+int32_t sys_memory_native_acquire(const sys_memory_native_allocation* a)
+{
+    bump_lock();int i=native_slot(a);int32_t rc=(int32_t)CELL_EINVAL;
+    if(i>=0){if(s_native_memory[i].pins==UINT32_MAX)rc=(int32_t)CELL_EBUSY;else{++s_native_memory[i].pins;rc=CELL_OK;}}
+    bump_unlock();return rc;
+}
+int32_t sys_memory_native_unpin(const sys_memory_native_allocation* a)
+{
+    bump_lock();int i=native_slot(a);int32_t rc=(int32_t)CELL_EINVAL;
+    if(i>=0&&s_native_memory[i].pins){--s_native_memory[i].pins;rc=CELL_OK;}bump_unlock();return rc;
+}
+int32_t sys_memory_native_mapping_ref(const sys_memory_native_allocation* a,int delta)
+{
+    if(delta!=1&&delta!=-1)return (int32_t)CELL_EINVAL;
+    bump_lock();int i=native_slot(a);int32_t rc=(int32_t)CELL_EINVAL;
+    if(i>=0&&s_native_memory[i].pins){uint32_t* count=&s_native_memory[i].mappings;
+        if(delta>0&&*count<UINT32_MAX){++*count;rc=CELL_OK;}else if(delta<0&&*count){--*count;rc=CELL_OK;}}
+    bump_unlock();return rc;
+}
+int32_t sys_memory_native_release(sys_memory_native_allocation* a)
+{
+    bump_lock();int i=native_slot(a);if(i<0){bump_unlock();return (int32_t)CELL_EINVAL;}
+    if(s_native_memory[i].pins||s_native_memory[i].mappings){bump_unlock();return (int32_t)CELL_EBUSY;}
+    s_native_release_slot=i;
+    if(!vm_release_begin(a->ea,a->size)){s_native_release_slot=-1;bump_unlock();return (int32_t)CELL_EBUSY;}
+    s_native_release_slot=-1;
+    if(s_native_memory[i].mapper_slot){
+        uint32_t m=s_native_memory[i].mapper_slot-1;
+        if((uint64_t)a->ea+a->size==s_mapper_bump_ptr)s_mapper_bump_ptr=a->ea;
+        memset(&s_mapper_reservations[m],0,sizeof(s_mapper_reservations[m]));s_native_mapper_owners[m]=0;
+    }else s_total_allocated-=a->size;
+    g_sys_mem_allocs[i].active=0;memset(&s_native_memory[i],0,sizeof(s_native_memory[i]));
+    atomic_store_explicit(&s_native_ranges[i],0,memory_order_release);memset(a,0,sizeof(*a));
+    bump_unlock();vm_release_end();return CELL_OK;
+}
+int sys_memory_native_range_live(uint64_t ea,uint64_t bytes)
+{
+    if(!bytes)return 0;
+    if(ea>=UINT64_C(0x100000000)||bytes>UINT64_C(0x100000000)-ea)return 1;
+    for(int i=0;i<SYS_MEMORY_ALLOC_MAX;++i){
+        if(i==s_native_release_slot)continue;
+        uint64_t range=atomic_load_explicit(&s_native_ranges[i],memory_order_acquire);
+        uint64_t base=range>>32,size=(uint32_t)range;
+        if(size&&ea<base+size&&base<ea+bytes)return 1;
+    }
+    return 0;
 }

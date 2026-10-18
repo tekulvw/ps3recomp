@@ -49,6 +49,8 @@ parts = [function(r'static void populate_offset_table\(u32 ea, u32 io, u32 size\
          function(r'static IoMapping\* find_mapping_by_io\(u32 io\)'),
          function(r'static IoMapping\* find_free_mapping\(void\)'),
          function(r'static u32 gcm_io_alloc\(u32 size\)\n\{'),
+         function(r'static int native_io_overlap\(u32 ea,u32 io,u32 size,int use_ea,int use_io\)'),
+         function(r'static s32 gcm_map_main_host_core\(u32 ea, u32 size, u32\* offset, int bounded\)\n\{'),
          function(r'static s32 cellGcmMapMainMemory_consumer_body\(u32 ea, u32 size, u32\* offset\)\n\{').replace('static s32 cellGcmMapMainMemory_consumer_body','s32 cellGcmMapMainMemory'),
          function(r'static s32 cellGcmUnmapIoAddress_consumer_body\(u32 io\)\n\{').replace('static s32 cellGcmUnmapIoAddress_consumer_body','s32 cellGcmUnmapIoAddress'),
          function(r'static void cellGcm_syscall_iomap_consumer_body\(u32 ea, u32 io, u32 size\)\n\{').replace('static void cellGcm_syscall_iomap_consumer_body','void cellGcm_syscall_iomap')]
@@ -72,6 +74,8 @@ static CellGcmConfig s_config = { 0x100000u, 0x200000u };
 typedef struct IoMapping { u32 ea; u32 io; u32 size; int active; } IoMapping;
 static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
 static int s_io_mapping_count = 0;
+static u64 s_native_io_generations[CELL_GCM_MAX_IO_MAPPINGS];
+static u32 s_io_map_reserved;
 static unsigned char mem[0x1000];
 static void vm_write32(u32 a, u32 v) { for (int i = 0; i < 4; i++) mem[a + i] = (unsigned char)(v >> (24 - 8 * i)); }
 static u32 rd32(u32 a) { return (u32)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }

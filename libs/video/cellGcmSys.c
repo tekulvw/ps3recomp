@@ -120,6 +120,10 @@ void cellGcm_rsx_consumer_end(void) {
 }
 static int gcm_report_vm_begin(uint64_t ea,uint64_t size) {
     cellGcm_rsx_consumer_begin();
+    if (g_sys_memory_native_live && g_sys_memory_native_live(ea,size)) {
+        fprintf(stderr,"[native output] VM transition refused: release owned native arena first ea=%llx size=%llx\n",(unsigned long long)ea,(unsigned long long)size);
+        cellGcm_rsx_consumer_end();return 0;
+    }
     if (s_reports.failed || rsx_reports_overlap(&s_reports,ea,size)) {
         fprintf(stderr,"[deferred reports] rejected overlapping VM transition ea=%llx size=%llx pending=%u failed=%u\n",
             (unsigned long long)ea,(unsigned long long)size,s_reports.count,s_reports.failed);
@@ -330,6 +334,18 @@ typedef struct IoMapping {
 
 static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
 static int s_io_mapping_count = 0;
+static u64 s_native_io_generations[CELL_GCM_MAX_IO_MAPPINGS];
+static sys_memory_native_allocation s_native_io_allocations[CELL_GCM_MAX_IO_MAPPINGS];
+static u64 s_native_io_generation;
+static int native_io_overlap(u32 ea,u32 io,u32 size,int use_ea,int use_io) {
+    for(int i=0;i<CELL_GCM_MAX_IO_MAPPINGS;++i){
+        const IoMapping* m=&s_io_mappings[i];
+        if(s_native_io_generations[i]&&m->active&&
+           ((use_ea&&(u64)ea<(u64)m->ea+m->size&&(u64)m->ea<(u64)ea+size)||
+            (use_io&&(u64)io<(u64)m->io+m->size&&(u64)m->io<(u64)io+size)))return 1;
+    }
+    return 0;
+}
 
 /* Callback handlers — these are GUEST OPD addresses passed by the
  * recompiled game, not host function pointers. Stored as uint32_t and
@@ -3679,7 +3695,7 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
     else fprintf(stderr,"[deferred reports] rejected cellGcmMapMainMemory after failure\n");
     cellGcm_rsx_consumer_end();return result;
 }
-static s32 cellGcmMapMainMemory_consumer_body(u32 ea, u32 size, u32* offset)
+static s32 gcm_map_main_host_core(u32 ea, u32 size, u32* offset, int bounded)
 {
     /* Log the REQUEST before validating it. Every rejection below used to
      * happen before the only printf in this function, so a title whose
@@ -3713,6 +3729,7 @@ static s32 cellGcmMapMainMemory_consumer_body(u32 ea, u32 size, u32* offset)
         return CELL_GCM_ERROR_NO_IO_PAGE_TABLE;
     }
 
+    if(native_io_overlap(ea,0,size,1,0))return CELL_GCM_ERROR_ADDRESS_OVERWRAP;
     /* A free slot first, then the IO region: allocating the region before
      * the slot check leaked IO space on every refused call. */
     IoMapping* mapping = find_free_mapping();
@@ -3721,11 +3738,19 @@ static s32 cellGcmMapMainMemory_consumer_body(u32 ea, u32 size, u32* offset)
         return CELL_GCM_ERROR_FAILURE;
     }
 
+    if(bounded){
+        if(!ea||(u64)ea+size>UINT64_C(0x100000000))return CELL_GCM_ERROR_INVALID_VALUE;
+        if(s_io_map_reserved>0x10000000u)return CELL_GCM_ERROR_FAILURE;
+        for(int i=0;i<CELL_GCM_MAX_IO_MAPPINGS;++i){const IoMapping* m=&s_io_mappings[i];
+            if(m->active&&(u64)ea<(u64)m->ea+m->size&&(u64)m->ea<(u64)ea+size)return CELL_GCM_ERROR_ADDRESS_OVERWRAP;}
+    }
     u32 io_offset = gcm_io_alloc(size);
     if (io_offset == 0xFFFFFFFFu) {
         printf("[cellGcmSys] MapMainMemory REFUSED: no free run of 0x%X bytes of IO space\n", size);
         return CELL_GCM_ERROR_NO_IO_PAGE_TABLE;
     }
+    /* Owned native mappings stay below the IO space the title reserved. */
+    if(bounded&&(u64)io_offset+size>0x10000000u-s_io_map_reserved)return CELL_GCM_ERROR_FAILURE;
     printf("[cellGcmSys] MapMainMemory -> io 0x%08X\n", io_offset);
 
     mapping->ea     = ea;
@@ -3736,8 +3761,15 @@ static s32 cellGcmMapMainMemory_consumer_body(u32 ea, u32 size, u32* offset)
 
     populate_offset_table(ea, io_offset, size);
 
-    vm_write32((uint32_t)(uintptr_t)offset, io_offset);   /* guest out-param */
+    *offset=io_offset; /* true host out-param; guest adapter translates below */
     return CELL_OK;
+}
+static s32 cellGcmMapMainMemory_consumer_body(u32 ea, u32 size, u32* offset)
+{
+    if(!offset)return CELL_GCM_ERROR_INVALID_VALUE;
+    u32 io=0;s32 rc=gcm_map_main_host_core(ea,size,&io,0);
+    if(rc==CELL_OK)vm_write32((u32)(uintptr_t)offset,io);
+    return rc;
 }
 
 /* NID: 0x5A41C10F */
@@ -3753,6 +3785,7 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
 }
 static s32 cellGcmMapEaIoAddress_consumer_body(u32 ea, u32 io, u32 size)
 {
+    if(native_io_overlap(ea,io,size,1,1))return CELL_GCM_ERROR_ADDRESS_OVERWRAP;
     /* Logged before validation, and every failure path named -- same reason as
      * cellGcmMapMainMemory above. Two of these returned silently AFTER the log
      * line as well, so even a call that got that far could vanish. */
@@ -3846,6 +3879,7 @@ static s32 cellGcmUnmapEaIoAddress_consumer_body(u32 ea)
     if (!mapping)
         return CELL_GCM_ERROR_FAILURE;
 
+    if(s_native_io_generations[mapping-s_io_mappings])return CELL_GCM_ERROR_FAILURE;
     printf("[cellGcmSys] UnmapEaIoAddress(ea=0x%08X)\n", ea);
 
     clear_offset_table(mapping->ea, mapping->io, mapping->size);
@@ -3872,6 +3906,7 @@ static s32 cellGcmUnmapIoAddress_consumer_body(u32 io)
     if (!mapping)
         return CELL_GCM_ERROR_FAILURE;
 
+    if(s_native_io_generations[mapping-s_io_mappings])return CELL_GCM_ERROR_FAILURE;
     printf("[cellGcmSys] UnmapIoAddress(io=0x%08X)\n", io);
 
     clear_offset_table(mapping->ea, mapping->io, mapping->size);
@@ -4334,6 +4369,9 @@ void cellGcmTerminate(void)
 }
 static void cellGcmTerminate_consumer_body(void)
 {
+    for(int i=0;i<CELL_GCM_MAX_IO_MAPPINGS;++i)if(s_native_io_generations[i]){
+        fprintf(stderr,"[native output] GCM terminate refused: quiesce and release owned native mappings first\n");return;
+    }
     printf("[cellGcmSys] Terminate\n");
 
     s_gcm_initialized = 0;
@@ -4712,6 +4750,7 @@ void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
 }
 static void cellGcm_syscall_iomap_consumer_body(u32 ea, u32 io, u32 size)
 {
+    if(native_io_overlap(ea,io,size,1,1)){fprintf(stderr,"[native output] guest iomap overlaps native arena; refused\n");return;}
     populate_offset_table(ea, io, size);
     /* A free slot, not s_io_mappings[count]: an unmap leaves a hole, and the
      * count then indexes a live slot. */
@@ -4734,6 +4773,7 @@ void cellGcm_syscall_iounmap(u32 io, u32 size)
 }
 static void cellGcm_syscall_iounmap_consumer_body(u32 io, u32 size)
 {
+    if(native_io_overlap(0,io,size,0,1)){fprintf(stderr,"[native output] guest iounmap overlaps native arena; refused\n");return;}
     u32 page = io >> 20;
     u32 ea = (page < 65536 && s_ea_address_table[page] != 0xFFFF)
              ? ((u32)s_ea_address_table[page] << 20) : 0;
@@ -4761,4 +4801,54 @@ static void cellGcm_syscall_set_fifo_consumer_body(u32 put, u32 get)
     /* Wake only after this real control-register publication. The consumer
      * still performs its acquire and ordinary FIFO/dependency validation. */
     cellGcm_fifo_kick_notify();
+}
+
+/* Host output mapping uses an owned allocation, never a guest out-param. */
+static int native_mapping_index(const CellGcmNativeOutputMapping* m)
+{
+    if(!m||!m->generation)return -1;
+    for(int i=0;i<CELL_GCM_MAX_IO_MAPPINGS;++i){
+        const sys_memory_native_allocation* a=&s_native_io_allocations[i];
+        if(s_io_mappings[i].active&&s_native_io_generations[i]==m->generation&&s_io_mappings[i].ea==m->allocation.ea&&s_io_mappings[i].io==m->io&&
+           a->ea==m->allocation.ea&&a->size==m->allocation.size&&a->owner==m->allocation.owner&&a->generation==m->allocation.generation&&a->vm_epoch==m->allocation.vm_epoch)return i;
+    }
+    return -1;
+}
+s32 cellGcmNativeMapMainMemory(const sys_memory_native_allocation* a,CellGcmNativeOutputMapping* out)
+{
+    if(!a||!out)return CELL_GCM_ERROR_INVALID_VALUE;
+    if(!s_deferred_reports)return CELL_GCM_ERROR_FAILURE;
+    if(sys_memory_native_acquire(a)!=CELL_OK)return CELL_GCM_ERROR_FAILURE;
+    if(sys_memory_native_mapping_ref(a,1)!=CELL_OK){sys_memory_native_unpin(a);return CELL_GCM_ERROR_FAILURE;}
+    cellGcm_rsx_consumer_begin();
+    s32 rc=CELL_GCM_ERROR_FAILURE;u32 io=0;
+    if(s_gcm_initialized&&s_native_io_generation!=UINT64_MAX&&gcm_reports_sync_barrier()){
+        rc=gcm_map_main_host_core(a->ea,a->size,&io,1);
+        if(rc==CELL_OK){
+            IoMapping* map=find_mapping_by_io(io);size_t i=(size_t)(map-s_io_mappings);
+            s_native_io_allocations[i]=*a;s_native_io_generations[i]=++s_native_io_generation;
+            *out=(CellGcmNativeOutputMapping){*a,io,s_native_io_generations[i]};
+        }
+    }
+    cellGcm_rsx_consumer_end();
+    if(rc!=CELL_OK)(void)sys_memory_native_mapping_ref(a,-1);
+    (void)sys_memory_native_unpin(a);return rc;
+}
+s32 cellGcmNativeUnmapMainMemory(CellGcmNativeOutputMapping* m,CellGcmNativeOutputQuiescent quiet,void* owner)
+{
+    if(!m||!quiet)return CELL_GCM_ERROR_INVALID_VALUE;
+    if(!s_deferred_reports||sys_memory_native_acquire(&m->allocation)!=CELL_OK)return CELL_GCM_ERROR_FAILURE;
+    cellGcm_rsx_consumer_begin();s32 rc=CELL_GCM_ERROR_FAILURE;
+    int i=native_mapping_index(m);
+    if(i>=0&&quiet(owner,m)&&gcm_reports_sync_barrier()){
+        IoMapping* map=&s_io_mappings[i];u32 io=map->io,size=map->size;
+        clear_offset_table(map->ea,io,size);map->active=0;--s_io_mapping_count;
+        s_native_io_generations[i]=0;memset(&s_native_io_allocations[i],0,sizeof(s_native_io_allocations[i]));
+        rc=CELL_OK;
+    }
+    cellGcm_rsx_consumer_end();
+    if(rc==CELL_OK)(void)sys_memory_native_mapping_ref(&m->allocation,-1);
+    (void)sys_memory_native_unpin(&m->allocation);
+    if(rc==CELL_OK)memset(m,0,sizeof(*m));
+    return rc;
 }

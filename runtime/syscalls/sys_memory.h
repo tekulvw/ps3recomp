@@ -6,6 +6,7 @@
 #define SYS_MEMORY_H
 
 #include "lv2_syscall_table.h"
+#include "sys_memory_native.h"
 #include "../ppu/ppu_context.h"
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/error_codes.h"
