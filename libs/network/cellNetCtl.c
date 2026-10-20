@@ -122,6 +122,30 @@ fallback:
     return 0;
 }
 
+/* Explicit per-process test readiness only. A hostname lookup can block the
+ * guest's caller indefinitely on local mDNS. Unset retains the original route;
+ * a present but malformed override is refused, never sent to the resolver. */
+static int netctl_parse_ipv4_override(const char* text, char output[16])
+{
+    size_t length = 0;
+    while (length < 16 && text[length]) ++length;
+    if (!length || length == 16) return 0;
+    const char* p = text;
+    for (unsigned part = 0; part < 4; ++part) {
+        const char* first = p;
+        unsigned value = 0, digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            if (++digits > 3) return 0;
+            value = value * 10 + (unsigned)(*p++ - '0');
+        }
+        if (!digits || value > 255 || (digits > 1 && *first == '0')) return 0;
+        if (part < 3) { if (*p++ != '.') return 0; }
+        else if (*p) return 0;
+    }
+    memcpy(output, text, length + 1);
+    return 1;
+}
+
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
@@ -222,7 +246,18 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_IP_ADDRESS:
-        netctl_get_host_ip(info->ip_address, sizeof(info->ip_address));
+        {
+            const char* override = getenv("PS3_NETCTL_IPV4_OVERRIDE");
+            if (override) {
+                if (!netctl_parse_ipv4_override(override, info->ip_address)) {
+                    fprintf(stderr, "[cellNetCtl] GetInfo(IP_ADDRESS) refused invalid PS3_NETCTL_IPV4_OVERRIDE\n");
+                    return CELL_NET_CTL_ERROR_NOT_AVAIL;
+                }
+                printf("[cellNetCtl] GetInfo(IP_ADDRESS) using explicit per-process IPv4 override\n");
+            } else {
+                netctl_get_host_ip(info->ip_address, sizeof(info->ip_address));
+            }
+        }
         break;
 
     case CELL_NET_CTL_INFO_NETMASK:
