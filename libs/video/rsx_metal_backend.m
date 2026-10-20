@@ -4115,6 +4115,10 @@ static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
  * in-flight semaphore instead, the same bound the vtable path uses, because
  * waiting on every frame is the one pattern where a driver cannot hide its
  * encoding work. */
+/* Latest real present command, retained only for the finite surface diagnostic. */
+static id<MTLCommandBuffer> s_capture_present_cb;
+static uint64_t s_capture_guest,s_capture_command,s_capture_submission,s_capture_drawable;
+static int s_capture_presented;
 static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submit,u64 *out_ticket)
 {
     if(out_ticket)*out_ticket=0;
@@ -4179,6 +4183,11 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
         const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
         MetalFrameTicket *ticket=drawable?fps_frame_ticket():nil;
         if(ticket){ticket->critical_command_id=critical_id;ticket->critical_capture_id=critical_start?critical_capture:0;}
+        if(present_dst && getenv("RSX_ENGINE_FRAME_CAPTURE")){
+            s_capture_present_cb=cb;s_capture_guest=s_present_guest_id;s_capture_command=critical_id;
+            s_capture_submission=ticket?ticket->submission_id:0;
+            s_capture_drawable=drawable?drawable.drawableID:0;s_capture_presented=presented;
+        }
         if(critical_start && windowed_present){uint64_t w[5]={critical_start,semaphore_start,semaphore_end,drawable_start,drawable_end};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_CLOCK,s_present_guest_id,critical_id,w,5);}
         if(critical_start && windowed_present){
             const uint64_t guest_id=s_present_guest_id;
@@ -4351,7 +4360,7 @@ static int eng_capture_texture_rgba8(void* user, u32 handle, const char* path)
             char meta[2048];
             if (snprintf(meta,sizeof meta,"%s.meta",path)<(int)sizeof meta) {
                 f=fopen(meta,"wb");
-                if (f) { fprintf(f,"handle=%u metal_format=%lu size=%zux%zu row_bytes=%zu rgba_bytes=%zu level=0 point_sample=1 before_consuming_draw=1 gpu_status=%ld\n",handle,(unsigned long)[src pixelFormat],w,h,w*4,w*h*4,(long)[cb status]); fclose(f); }
+                if (f) { fprintf(f,"handle=%u metal_format=%lu size=%zux%zu row_bytes=%zu rgba_bytes=%zu level=0 point_sample=1 capture_hook=texture_rgba8 gpu_status=%ld present_context=latest_actual_present guest_flip=%llu command=%llu submission=%llu drawable=%llu presented=%d headless=%d present_gpu_status=%ld present_gpu_error=%d backend_checked_failed=%d\n",handle,(unsigned long)[src pixelFormat],w,h,w*4,w*h*4,(long)[cb status],(unsigned long long)s_capture_guest,(unsigned long long)s_capture_command,(unsigned long long)s_capture_submission,(unsigned long long)s_capture_drawable,s_capture_presented,s_headless,(long)[s_capture_present_cb status],[s_capture_present_cb error]!=nil,atomic_load(&s_eng_checked_failed)); fclose(f); }
             }
         }
         return ok;
@@ -4452,6 +4461,9 @@ static void eng_present(void* user, u32 surface)
         eng_encode_and_commit(nil);
         eng_diag_end();
         return;
+    }
+    if(getenv("RSX_ENGINE_FRAME_CAPTURE")){
+        s_capture_present_cb=nil;s_capture_guest=s_capture_command=s_capture_submission=s_capture_drawable=0;s_capture_presented=0;
     }
     int presented = eng_encode_and_commit(src);
     eng_dump_frame(src, presented);
