@@ -15,7 +15,8 @@ static int capture(void*user,uint32_t handle,const char*path)
 }
 static struct {int(*capture_texture_rgba8)(void*,uint32_t,const char*);void*user;} backend={capture,NULL};
 static struct {unsigned frames;struct {unsigned handle,location,offset,w,h;}surfaces[1];typeof(backend)*be;}g={0,{{77,0,128,1,1}},&backend};
-uint64_t ps3_critical_now_ns(void){static uint64_t t=100;return ++t;}
+static uint64_t mock_ns=100;
+uint64_t ps3_critical_now_ns(void){return ++mock_ns;}
 #include "rsx_frame_capture.inc"
 static void write_text(const char*path,const char*text)
 {FILE*f=fopen(path,"w");assert(f);fputs(text,f);fclose(f);}
@@ -34,9 +35,11 @@ int main(int argc,char**argv)
  write_text(request,"2\n");frame_capture_present(0,0);frame_capture_draw(0x2002,0);
  snprintf(path,sizeof path,"%s-2.rgba",prefix);write_text(path,"OLD_PIXELS");frame_capture_present(0,0);assert(!callbacks);
  f=fopen(path,"r");assert(f);assert(fread(text,1,10,f)==10);fclose(f);assert(!memcmp(text,"OLD_PIXELS",10));
- write_text(request,"3\n");frame_capture_present(0,0);frame_capture_draw(0x3002,0);frame_capture_present(0,0);assert(callbacks==1);
+ write_text(request,"3\n");frame_capture_present(0,0);frame_capture_present(0,0);frame_capture_present(0,0);assert(callbacks==0&&s_frame_capture.gate.pending==3);frame_capture_draw(0x3002,0);frame_capture_present(0,0);assert(callbacks==1);
  snprintf(path,sizeof path,"%s-3.json",prefix);f=fopen(path,"r");assert(f);size_t n=fread(text,1,sizeof text-1,f);text[n]=0;fclose(f);assert(strstr(text,"\"saved\":true")&&strstr(text,"neutral-session"));
- write_text(request,"4\n");frame_capture_present(0,0);frame_capture_draw(0x4002,0);frame_capture_present(0,0);assert(callbacks==2);
- write_text(request,"5\n");frame_capture_present(0,0);frame_capture_draw(0x5002,0);frame_capture_present(0,0);assert(callbacks==2);
- puts("frame capture actual helper: default off, exclusive receipt/pixel collision refusal, complete frame and four-token bound PASS");
+ write_text(request,"4\n");frame_capture_present(0,0);mock_ns+=5000000001ull;frame_capture_present(0,0);
+ assert(!s_frame_capture.gate.pending&&s_frame_capture.gate.attempts==4);
+ frame_capture_draw(0x4002,0);frame_capture_present(0,0);assert(callbacks==1);
+ write_text(request,"5\n");frame_capture_present(0,0);frame_capture_draw(0x5002,0);frame_capture_present(0,0);assert(callbacks==1);
+ puts("frame capture actual helper: default off, exclusive receipt/pixel collision refusal, empty repeats retained, complete frame, deadline and four-token bound PASS");
 }
