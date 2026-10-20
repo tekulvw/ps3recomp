@@ -28,6 +28,7 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -2899,6 +2900,8 @@ done:
     errno=saved_errno;
 }
 
+#include "rsx_frame_capture.inc"
+
 static void sink_end_core(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -3119,6 +3122,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
      * evidence that the decompile-translate-compile path worked. */
     if (!pipeline_is_fixed) g.guest_draws++;
     DRAW_OBSERVER_STAGE("emitted");
+    frame_capture_draw(rsx_dsp_reg(&g.rsx,0x08E4),pipeline_is_fixed);
 
     if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
@@ -3231,6 +3235,7 @@ static void eng_present(u32 buffer_id)
     pd_present(target);
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
+    frame_capture_present(buffer_id,target);
     g.frames++;
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
