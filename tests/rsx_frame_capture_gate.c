@@ -6,6 +6,7 @@ int main(void) {
  assert(!rsx_frame_capture_step(&g,0));
  assert(!rsx_frame_capture_step(&g,5));
  assert(!rsx_frame_capture_step(&g,1)); /* arm never captures a partial frame */
+ for(unsigned empty=0;empty<3;empty++){assert(!rsx_frame_capture_step(&g,1));assert(g.pending==1&&!g.attempts);}
  rsx_frame_capture_draw(&g,0x102,0);rsx_frame_capture_draw(&g,0x102,0);rsx_frame_capture_draw(&g,0x202,1);
  assert(g.draws==3 && g.unique==2 && g.fixed==1 && g.counts[0]==2);
  assert(rsx_frame_capture_step(&g,1));assert(g.attempts==1);
@@ -25,5 +26,9 @@ int main(void) {
  rsx_frame_capture_draw(&cancelled,0x102,0);
  assert(!rsx_frame_capture_step(&cancelled,0));assert(!cancelled.pending && !cancelled.draws);
  assert(!rsx_frame_capture_step(&cancelled,1));assert(!cancelled.pending);
+ rsx_frame_capture_gate timeout={0};assert(!rsx_frame_capture_step(&timeout,1));
+ rsx_frame_capture_expire(&timeout);assert(!timeout.pending&&timeout.attempts==1);
+ rsx_frame_capture_draw(&timeout,0x102,0);assert(!timeout.draws);
+ assert(!rsx_frame_capture_step(&timeout,1));
  puts("frame capture: whole-frame arm, stale/invalid/replaced requests, exact programs, overflow and finite budget PASS");
 }

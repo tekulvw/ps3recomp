@@ -12,12 +12,14 @@ static inline void rsx_frame_capture_clear(rsx_frame_capture_gate*g)
  * boundary owns a complete interval. Stale/out-of-budget tokens never arm. */
 static inline int rsx_frame_capture_step(rsx_frame_capture_gate*g,unsigned request)
 {
- if(request && request==g->pending){g->pending=0;++g->attempts;return 1;}
+ if(request && request==g->pending){if(!g->draws)return 0;g->pending=0;++g->attempts;return 1;}
  if(request>g->last && request<=4 && g->attempts<4){
   g->last=request;g->pending=request;rsx_frame_capture_clear(g);
  }else if(g->pending){g->pending=0;rsx_frame_capture_clear(g);}
  return 0;
 }
+static inline void rsx_frame_capture_expire(rsx_frame_capture_gate*g)
+{if(g->pending){g->pending=0;++g->attempts;rsx_frame_capture_clear(g);}}
 static inline void rsx_frame_capture_draw(rsx_frame_capture_gate*g,uint32_t program,int fixed)
 {
  if(!g->pending)return;

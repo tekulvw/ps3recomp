@@ -7,7 +7,7 @@
 static struct {
  int configured,enabled;
  const char*prefix,*request,*session;
- uint64_t begin_ns;
+ uint64_t begin_ns,deadline_ns;
  rsx_frame_capture_gate gate;
 } s_frame_capture;
 static int frame_capture_enabled(void)
@@ -33,9 +33,17 @@ static void frame_capture_present_impl(uint32_t buffer,uint32_t target)
  FILE*f=fopen(s_frame_capture.request,"r");
  if(f){if(fscanf(f,"%u %c",&request,&tail)!=1)request=0;fclose(f);}
  rsx_frame_capture_gate*c=&s_frame_capture.gate;
+ const uint64_t boundary_ns=ps3_critical_now_ns();
+ if(c->pending&&boundary_ns>=s_frame_capture.deadline_ns){
+  fprintf(stderr,"[rsx frame capture] request=%u timeout=1 diagnostic_only=1\n",c->pending);
+  rsx_frame_capture_expire(c);
+ }
  unsigned previous=c->last;
  if(!rsx_frame_capture_step(c,request)){
-  if(c->last!=previous)s_frame_capture.begin_ns=ps3_critical_now_ns();
+  if(c->last!=previous)s_frame_capture.deadline_ns=boundary_ns+5000000000ull;
+  /* Repeated presentations with no emitted draws do not consume a request.
+   * Advance the interval boundary so a later inventory is one complete frame. */
+  if(c->last!=previous||(c->pending&&!c->draws))s_frame_capture.begin_ns=boundary_ns;
   return;
  }
  const uint64_t end_ns=ps3_critical_now_ns();
