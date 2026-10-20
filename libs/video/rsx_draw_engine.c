@@ -2240,7 +2240,8 @@ static void eng_producer_capture(u32 draw, const rsx_vertex_layout_plan* layout,
         if (strlen(directory)>1600 || !target ||
             !rsx_binding_capture_hex(&target,1,&loc) || loc>1 || *target++!=':' ||
             !rsx_binding_capture_hex(&target,8,&off) || *target ||
-            rsx_binding_capture_parse(selector,1,selectors)!=1) goto invalid;
+            (rsx_binding_capture_parse(selector,1,selectors)!=1 &&
+             (!selector || strcmp(selector,"*")))) goto invalid;
         location=(u32)loc;offset=(u32)off;
         const char* cap=getenv("RSX_ENGINE_PRODUCER_CAPTURE_LIMIT");
         if (cap && *cap) {
