@@ -22,6 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifndef _WIN32
+#include "pad_file_analog_io.h"
+#endif
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
@@ -927,9 +930,24 @@ emit:
     }
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
+#ifndef _WIN32
+        /* Optional owned PAD_FILE A1 extension. Hold the diagnostic lock through
+         * the actual guest copy; len=0 drain reads never consume a hold/release. */
+        uint8_t injected_axes[4];int injected_active=0;
+        int injected_lock=port_no==0&&pad_file_analog_begin(pad_now_ms(),injected_axes,&injected_active);
+        if(injected_active){
+            data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]=injected_axes[0];
+            data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]=injected_axes[1];
+            data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X]=injected_axes[2];
+            data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y]=injected_axes[3];
+        }
+#endif
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
         for (int _i = 0; _i < CELL_PAD_MAX_CODES; _i++)                    /* button[] u16 */
             vm_write16((unsigned long long)ea + 4 + (unsigned int)_i * 2, data->button[_i]);
+#ifndef _WIN32
+        if(injected_lock)pad_file_analog_commit(data->len>0,(long)getpid());
+#endif
     }
     return CELL_OK;
 }
