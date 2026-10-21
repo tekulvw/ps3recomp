@@ -1952,9 +1952,15 @@ static int s_spu_blk_w = 0;
 /* EA -> IO through the mapping list (range lookup; the by-ea helper is exact). */
 static u32 gcm_ea2io_range(u32 ea, u32* room)
 {
-    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+    /* Called for every SPU PUT. The table has 512 slots and a title maps a
+     * handful, so stop once every active mapping has been examined; the
+     * first match in slot order is returned exactly as a full scan would. */
+    int left = s_io_mapping_count;
+    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS && left > 0; i++) {
         IoMapping* m = &s_io_mappings[i];
-        if (!m->active || !m->size) continue;
+        if (!m->active) continue;
+        left--;
+        if (!m->size) continue;
         if (ea >= m->ea && ea < m->ea + m->size) {
             if (room) *room = m->ea + m->size - ea;
             return m->io + (ea - m->ea);
