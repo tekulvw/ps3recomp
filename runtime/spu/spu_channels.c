@@ -2522,8 +2522,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base) {
-            if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base))
+            if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
+                { static int s_log = -1; static atomic_int s_n;
+                  if (s_log < 0) s_log = getenv("SPU_RESIDENCY_CLEAR_LOG") != NULL;
+                  if (s_log && lsa != base && atomic_fetch_add(&s_n, 1) < 400)
+                      fprintf(stderr, "[residency-clear] img=%d slot_img=%d base=0x%05X span=0x%X src=0x%08X <- get lsa=0x%05X size=0x%X ea=0x%08X pc=0x%05X\n",
+                              ctx->image_id, ctx->resident_code[slot].image_id, base, ctx->resident_code[slot].size,
+                              ctx->resident_code[slot].source_ea, lsa, size, ea, (unsigned)(ctx->pc & SPU_LS_MASK)); }
                 ctx->resident_code[slot].image_id = 0;
+            }
             else if (ctx->resident_code[slot].verify_state)
                 ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
         }
