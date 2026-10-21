@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 #include "spu_coherency.h"
 
 #include <stdint.h>
@@ -129,15 +130,71 @@ static __attribute__((noinline)) void spu_lockline_lock_profiled(uintptr_t site)
              atomic_fetch_add_explicit(&p->wait_ns, t1 - t0, memory_order_relaxed); }
     t_llp.site = site; t_llp.t = t1;
 }
+/* Lock-policy experiment (local measurement only):
+ *   SPU_LOCKLINE_MODE=spin    trylock in a bare loop, never park (upstream's
+ *                             test-and-set spin on the same lock word)
+ *   SPU_LOCKLINE_MODE=mutex   pthread_mutex_lock at once (park when contended)
+ *   SPU_LOCKLINE_MODE=hybrid  the default below: up to 20 us of spaced
+ *                             retries, then park
+ *   SPU_LOCKLINE_HIST=1       log2 histograms of wait (lock call to acquire)
+ *                             and hold (acquire to release) wall time, printed
+ *                             every two seconds. A hold far beyond the
+ *                             sub-microsecond critical sections means the
+ *                             holder stopped running while it held the lock. */
+static int s_llx_mode;          /* 0 hybrid, 1 spin, 2 mutex */
+static int s_llx_hist;
+static atomic_ullong s_llx_wait[48], s_llx_hold[48];
+static __thread uint64_t t_llx_t;
+static int spu_lockline_config(void)
+{
+    const char* m = getenv("SPU_LOCKLINE_MODE");
+    s_llx_mode = m && !strcmp(m, "spin") ? 1 : m && !strcmp(m, "mutex") ? 2 : 0;
+    s_llx_hist = getenv("SPU_LOCKLINE_HIST") != NULL;
+    if (m || s_llx_hist) fprintf(stderr, "[lockline-hist] mode=%s hist=%d\n",
+                                 s_llx_mode == 1 ? "spin" : s_llx_mode == 2 ? "mutex" : "hybrid", s_llx_hist);
+    return (getenv("SPU_LOCKLINE_PROFILE") ? 1 : 0) | (m || s_llx_hist ? 2 : 0);
+}
+static unsigned llx_bucket(uint64_t ns) { return ns ? 64u - (unsigned)__builtin_clzll(ns) : 0u; }
+static void llx_report(void)
+{
+    static atomic_ullong next;
+    uint64_t now = llp_now(), due = atomic_load(&next);
+    if (now < due || !atomic_compare_exchange_strong(&next, &due, now + 2000000000ull)) return;
+    char w[1024], h[1024]; int wn = 0, hn = 0;
+    for (unsigned b = 0; b < 48; ++b) {
+        unsigned long long a = atomic_load(&s_llx_wait[b]), c = atomic_load(&s_llx_hold[b]);
+        if (a) wn += snprintf(w + wn, sizeof w - (size_t)wn, " %u:%llu", b, a);
+        if (c) hn += snprintf(h + hn, sizeof h - (size_t)hn, " %u:%llu", b, c);
+    }
+    fprintf(stderr, "[lockline-hist] t=%llu wait%s | hold%s\n", (unsigned long long)(now / 1000000u), w, h);
+}
+static void spu_lockline_lock_hybrid(void);
+static __attribute__((noinline)) void spu_lockline_lock_experiment(void)
+{
+    const uint64_t t0 = s_llx_hist ? llp_now() : 0;
+    if (s_llx_mode == 1) { while (pthread_mutex_trylock(&g_lockline)) { } }
+    else if (s_llx_mode == 2) { if (pthread_mutex_lock(&g_lockline)) abort(); }
+    else spu_lockline_lock_hybrid();
+    if (s_llx_hist) {
+        const uint64_t t1 = llp_now();
+        atomic_fetch_add_explicit(&s_llx_wait[llx_bucket(t1 - t0)], 1, memory_order_relaxed);
+        t_llx_t = t1;
+    }
+}
 void spu_lockline_lock(void)
 {
     /* Taken here: a cold-split profiling branch would report its own caller. */
     uintptr_t site = (uintptr_t)__builtin_return_address(0);
     __asm__ __volatile__("" : "+r"(site));
     if (__builtin_expect(s_llp_on != 0, 0)) {
-        if (s_llp_on < 0) s_llp_on = getenv("SPU_LOCKLINE_PROFILE") != NULL;
-        if (s_llp_on) { spu_lockline_lock_profiled(site); return; }
+        if (s_llp_on < 0) s_llp_on = spu_lockline_config();
+        if (s_llp_on & 1) { spu_lockline_lock_profiled(site); return; }
+        if (s_llp_on & 2) { spu_lockline_lock_experiment(); return; }
     }
+    spu_lockline_lock_hybrid();
+}
+static void spu_lockline_lock_hybrid(void)
+{
     if (!pthread_mutex_trylock(&g_lockline)) return;
     /* Up to 20 us of exponentially spaced retries, then park. A yield is
      * nearly free on current cores, so a count-bounded spin gave up after
@@ -153,6 +210,12 @@ void spu_lockline_lock(void)
 }
 void spu_lockline_unlock(void)
 {
+    if (__builtin_expect(s_llp_on > 1, 0) && !(s_llp_on & 1)) {
+        if (s_llx_hist) atomic_fetch_add_explicit(&s_llx_hold[llx_bucket(llp_now() - t_llx_t)], 1, memory_order_relaxed);
+        if (pthread_mutex_unlock(&g_lockline)) abort();
+        if (s_llx_hist) llx_report();
+        return;
+    }
     if (__builtin_expect(s_llp_on > 0, 0) && t_llp.site) {
         lockline_prof* p = llp_slot(t_llp.site);
         if (p) atomic_fetch_add_explicit(&p->hold_ns, llp_now() - t_llp.t, memory_order_relaxed);
