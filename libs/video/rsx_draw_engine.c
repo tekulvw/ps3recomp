@@ -136,6 +136,7 @@ typedef struct {
     u64 dirty_generation;
     u64 last_use_serial;
     u32 depth;                  /* slices of a 3D texture, else 1 */
+    int rewritten;              /* guest bytes rewritten by the engine itself */
 } eng_texture;
 
 typedef struct {
@@ -1220,7 +1221,14 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             const u64 sparse = identity ? 0 : eng_texture_sparse_hash(location, offset, span,
                                                                       &readable);
             if (!identity) s_tcs.sparse++;
-            if (identity || (readable && (sparse != e->sparse_hash ||
+            /* The engine just stored a surface or depth target over these
+             * bytes: they are new, so upload without hashing them all. The
+             * stored hash becomes unknown and the next ordinary check
+             * re-uploads once rather than miss a change. */
+            if (e->rewritten && !identity && readable) {
+                hash = ~e->content_hash;
+                e->rewritten = 0;
+            } else if (identity || (readable && (sparse != e->sparse_hash ||
                              eng_texture_full_rehash(span, e->last_full_frame)))) {
                 hash = eng_texture_content_hash(location, offset, span, identity, &readable);
                 e->last_full_frame = g.frames;
@@ -1301,6 +1309,7 @@ static void eng_textures_touch(u32 location, u32 offset, u32 bytes)
         if (e->location == location && e->offset >= offset && e->offset - offset < bytes) {
             e->last_hash_frame = g.frames - 1u;
             e->last_full_frame = g.frames - ENG_TEXHASH_FULL_EVERY;   /* hash it all */
+            e->rewritten = 1;
         }
     }
 }
