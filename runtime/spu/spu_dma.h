@@ -25,6 +25,7 @@
 #include "spu_dma_disposition.h"
 #include "../diagnostics/critical_write_trace.h"
 #include <stdint.h>
+#include <time.h>   /* nanosleep: repeated-transfer backoff */
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1270,7 +1271,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * GPU catches up, and 256 reads take well under a millisecond, so a
      * count-only rule halted a healthy job and wedged the frame. Halt only once
      * the repeats have also lasted SPU_DMA_REPEAT_SECS (default 30) of wall
-     * time. Below that, back off 1 ms per repeat rather than spinning. */
+     * time. Below that, back off rather than spinning: 50 us per repeat where
+     * the host can sleep that briefly. A whole millisecond per poll made a
+     * job waiting on an RSX label resume up to a millisecond after the GPU
+     * had already written it (MAG's material flush, every frame). */
     { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep;
       static SPU_THREAD_LOCAL unsigned long long s_since;
       static uint32_t s_limit = 0; static unsigned long long s_secs;
@@ -1290,7 +1294,14 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       (uint32_t)ea);
               fflush(stderr);
               spu_halt(spu);
-          } else if (s_rep >= s_limit) Sleep(1);
+          } else if (s_rep >= s_limit) {
+#ifdef _WIN32
+              Sleep(1);
+#else
+              const struct timespec backoff = { 0, 50000 };
+              nanosleep(&backoff, NULL);
+#endif
+          }
       } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0; } }
 
     /* Mark tag as in-progress */
