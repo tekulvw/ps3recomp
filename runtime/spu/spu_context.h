@@ -39,10 +39,11 @@ extern "C" {
  * Fires from every SPU image's spu_ls_read128/write128. Cheap: one cached
  * compare on the hot path when disabled.
  * -----------------------------------------------------------------------*/
-/* The check sits on every spu_ls_read128/write128, so the disabled case must
- * be one load and a branch: it was a real call (the function-local statics
- * kept it out of line) and ~9% of GH3's FMOD mixer task. The list lives in
- * spu_channels.c; g_spu_ls_watch_n is -1 until the first check reads the env. */
+/* spu_ls_read128/write128 reach the check only through their per-direction
+ * diagnostics gate (g_spu_ls_rdiag/wdiag, which counts an armed watch), so the
+ * disabled case costs them nothing here; other callers pay one load and a
+ * branch. The list lives in spu_channels.c; g_spu_ls_watch_n is -1 until the
+ * first check reads the env. */
 extern int g_spu_ls_watch_n;
 void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr);
 unsigned* spu_ls_watch_list(int* out_n);   /* the armed lines (n may be 0) */

@@ -90,6 +90,14 @@ static void gen_lane(int kind, uint32_t* x, uint32_t* y, uint32_t* z)
         *x = word(s0, ex, frac_any()); *y = word(s1, clampe((int)ex - 20 - (int)(rnd32() % 120)), frac_any());
         if (rnd32() & 1) { const uint32_t t = *x; *x = *y; *y = t; }
         *z = word(s2, clampe((int)ex + (int)(rnd32() % 120) - 60), frac_any()); break; }
+    case 8: {                                           /* fma results at and just below 2^-126 */
+        const int ex = 1 + (int)(rnd32() % 254), ey = 128 - ex + (int)(rnd32() % 40);
+        *x = word(s0, (uint32_t)ex, rnd32() & 0x7FFFFF); *y = word(s1, clampe(ey), rnd32() & 0x7FFFFF);
+        const double pd = (double)spu__sf_f(*x) * (double)spu__sf_f(*y);
+        const float zf = (float)((pd < 0 ? -0x1p-126 : 0x1p-126) - pd);   /* z ~ +-2^-126 - x*y */
+        memcpy(z, &zf, 4);
+        *z += (rnd32() % 9) - 4;
+        break; }
     default: {                                          /* zeros, denormals, extended range, mixed */
         uint32_t* w[3] = { x, y, z };
         for (int k = 0; k < 3; k++) {
@@ -145,12 +153,12 @@ int main(int argc, char** argv)
     const long lanes2 = s_lanes, N = 64L * 1000 * 1000 * scale;
     for (long it = 0; it < N; it++) {
         u128 a, b, c;
-        const int kind = (int)(it % 9);
+        const int kind = (int)(it % 10);
         for (int k = 0; k < 4; k++) {
             /* mostly one generator per vector, sometimes one per lane */
-            gen_lane((it & 0x30) ? kind : (int)(rnd32() % 9), &a._u32[k], &b._u32[k], &c._u32[k]);
+            gen_lane((it & 0x30) ? kind : (int)(rnd32() % 10), &a._u32[k], &b._u32[k], &c._u32[k]);
         }
-        run((int)((it / 9) % 6), a, b, c);
+        run((int)((it / 10) % 6), a, b, c);
     }
     printf("test_spu_float_exact: pass 3 (random): %ld lanes, %ld mismatches\n", s_lanes - lanes2, s_bad);
 
