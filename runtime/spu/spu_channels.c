@@ -34,6 +34,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <setjmp.h>
 /* setjmp/longjmp also save and restore the signal mask on POSIX: one
  * sigprocmask system call per halt, stack reset or task resume. These frames
@@ -2962,6 +2963,60 @@ static int spu_smc_microstep(spu_context* ctx)
     return 0;
 }
 
+#ifndef _WIN32
+/* SPU_IBHIST=1: which indirect-branch targets reach the full resolver. Kind
+ * bit 0: target == r0 (a return through the link register); bit 1: target ==
+ * the innermost drain's return pc. Process-wide table, dumped every 2 s. */
+#include <pthread.h>
+typedef struct { uint32_t pc; int image, ovl, kind; uint64_t n; } spu_ibhist_ent;
+static spu_ibhist_ent s_ibhist[4096];
+static pthread_mutex_t s_ibhist_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t s_ibhist_total, s_ibhist_last_ns;
+static int spu_ibhist_cmp(const void* a, const void* b)
+{
+    const uint64_t x = ((const spu_ibhist_ent*)a)->n, y = ((const spu_ibhist_ent*)b)->n;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+static void spu_ibhist_note(const spu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_IBHIST"); on = e && e[0] == '1'; }
+    if (!on) return;
+    const uint32_t pc = ctx->pc & SPU_LS_MASK;
+    const int kind = (pc == (ctx->gpr[0]._u32[0] & SPU_LS_MASK)) | (pc == ctx->drain_ret_pc) << 1;
+    const int ovl = ctx->resident_ovl;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t now = (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+    pthread_mutex_lock(&s_ibhist_lock);
+    unsigned h = ((pc >> 2) * 0x9E3779B1u ^ (unsigned)ctx->image_id * 31u ^ (unsigned)ovl * 7u ^ (unsigned)kind) & 4095u;
+    for (unsigned i = 0; i < 4096; ++i, h = (h + 1) & 4095u) {
+        spu_ibhist_ent* e = &s_ibhist[h];
+        if (!e->n) { e->pc = pc; e->image = ctx->image_id; e->ovl = ovl; e->kind = kind; }
+        if (e->pc == pc && e->image == ctx->image_id && e->ovl == ovl && e->kind == kind) { e->n++; break; }
+    }
+    s_ibhist_total++;
+    if (!s_ibhist_last_ns) s_ibhist_last_ns = now;
+    if (now - s_ibhist_last_ns >= 2000000000u) {
+        static spu_ibhist_ent snap[4096];
+        memcpy(snap, s_ibhist, sizeof snap);
+        const uint64_t total = s_ibhist_total, dt = now - s_ibhist_last_ns;
+        memset(s_ibhist, 0, sizeof s_ibhist); s_ibhist_total = 0; s_ibhist_last_ns = now;
+        pthread_mutex_unlock(&s_ibhist_lock);
+        qsort(snap, 4096, sizeof snap[0], spu_ibhist_cmp);
+        fprintf(stderr, "[ibhist] t=%llu total/s=%llu top:", (unsigned long long)(now / 1000000u),
+                (unsigned long long)(total * 1000000000u / dt));
+        for (int i = 0; i < 32 && snap[i].n; ++i)
+            fprintf(stderr, " img%d/ovl%d:%05X:k%d=%llu", snap[i].image, snap[i].ovl, snap[i].pc, snap[i].kind,
+                    (unsigned long long)(snap[i].n * 1000000000u / dt));
+        fprintf(stderr, "\n");
+        return;
+    }
+    pthread_mutex_unlock(&s_ibhist_lock);
+}
+#else
+static void spu_ibhist_note(const spu_context* ctx) { (void)ctx; }
+#endif
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -2970,6 +3025,7 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    spu_ibhist_note(ctx);
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first
