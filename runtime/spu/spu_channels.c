@@ -25,6 +25,7 @@
 #include "../diagnostics/job_io_recorder.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
+#include "spu_interp_attribution.h"
 #include "spu_verified_overlay.h"
 #include "spu_overlay_residency.h"
 #include "spu_native_service.h"
@@ -148,7 +149,7 @@ void spu_restart_dispatch(spu_context* ctx)
 {
     ctx->region_dispatch_valid=0;
     g_spu_trampoline_fn = 0;
-    if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
+    if (s_spu_halt_armed) spu_interp_attr_unwind(), SPU_LONGJMP(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
@@ -187,7 +188,7 @@ void spu_halt(spu_context* ctx)
                 ctx->gpr[80]._u32[0], ctx->gpr[85]._u32[0]);
         fflush(stderr);
       } }
-    if (s_spu_halt_armed) { s_spu_halt_armed = 0; SPU_LONGJMP(s_spu_halt_env, 1); }
+    if (s_spu_halt_armed) { s_spu_halt_armed = 0; spu_interp_attr_unwind(), SPU_LONGJMP(s_spu_halt_env, 1); }
 }
 
 /* Diagnostic: dump the taskset-policy scheduler's working tables (LS 0x2700..)
@@ -1950,6 +1951,32 @@ int spu_verified_code_enter(const spu_context* ctx, int image, uint32_t entry)
     return spu_verified_lookup(ctx, entry, &covered, &owner) != NULL && owner == image;
 }
 
+/* Why does indirect dispatch at `lsa` have no lifted function? Diagnostic
+ * only (SPU_INTERP_ATTRIBUTION); mirrors spu_verified_lookup and
+ * spu_lifted_lookup ownership without changing either. */
+int spu_interp_attr_classify(const spu_context* ctx, uint32_t lsa)
+{
+    lsa &= SPU_LS_MASK & ~3u;
+    int covered = 0, mismatch = 0, matched = 0;
+    for (unsigned i = 0; i < s_verified_count; ++i) {
+        const spu_verified_image* v = &s_verified_images[i];
+        if (lsa < v->lo || lsa >= v->hi || !ctx->policy_mode ||
+            ctx->ls != ctx->ls_store || ctx->image_id != v->policy) continue;
+        if (!v->entry_only) covered = 1;
+        if (!spu_lookup_exact(lsa, v->image)) continue;
+        covered = 1;
+        if (spu_verified_matches(ctx, v, lsa)) matched++; else mismatch = 1;
+    }
+    if (matched > 1) return SPU_IATTR_VERIFIED_AMBIGUOUS;
+    if (mismatch && !matched) return SPU_IATTR_VERIFIED_MISMATCH;
+    if (covered) return SPU_IATTR_VERIFIED_NO_ENTRY;
+    for (unsigned slot = 0; slot < 4; ++slot)
+        if (ctx->resident_code[slot].image_id && lsa >= ctx->resident_code[slot].lsa &&
+            lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
+            return SPU_IATTR_RESIDENT_NO_ENTRY;
+    return spu_image_of_function(lsa) >= 0 ? SPU_IATTR_OTHER_IMAGE : SPU_IATTR_UNLIFTED;
+}
+
 int spu_verified_code_enter_span(const spu_context* ctx, int image,
     uint32_t entry, uint32_t end)
 {
@@ -2361,7 +2388,7 @@ static void spu_check_stack_reset_scan(spu_context* ctx, void (*fn)(spu_context*
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
             ctx->region_dispatch_valid=0;
-            SPU_LONGJMP(s_spu_halt_env, 2);
+            spu_interp_attr_unwind(), SPU_LONGJMP(s_spu_halt_env, 2);
         }
 }
 
@@ -3094,7 +3121,7 @@ void spu_indirect_branch(spu_context* ctx)
             ctx->resident_task = ti;
             g_spu_trampoline_fn = 0;
             ctx->region_dispatch_valid=0;
-            SPU_LONGJMP(s_spu_halt_env, 2);
+            spu_interp_attr_unwind(), SPU_LONGJMP(s_spu_halt_env, 2);
         }
         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
         if (ti) ctx->resident_task = ti;
@@ -3477,8 +3504,14 @@ void spu_indirect_branch(spu_context* ctx)
      * WWS jobmanager writes a save/restore stub above its static
      * image and calls it). Interpret the live LS bytes; on success the next
      * branch re-enters lifted code via the trampoline. */
-    if (spu_smc_microstep(ctx))
-        return;
+    {   /* Default-off attribution of the interpreted run this miss starts. */
+        const int attr = spu_interp_attr_enabled();
+        const void* frame = __builtin_frame_address(0);
+        if (attr) spu_interp_attr_begin(ctx, ctx->pc, spu_interp_attr_classify(ctx, ctx->pc), frame);
+        const int handled = spu_smc_microstep(ctx);
+        if (attr) spu_interp_attr_end(frame);
+        if (handled) return;
+    }
     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
      * image (the FMOD mixer's overlay calls) exhaust it and silently hide
      * every other image's misses -- LBP's loading jobs skipped their command

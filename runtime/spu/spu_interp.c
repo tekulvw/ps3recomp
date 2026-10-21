@@ -10,6 +10,7 @@
 #include "spu_interp_observer.h"
 #include "spu_instruction_observer.h"
 #include "spu_helpers.h"
+#include "spu_interp_attribution.inc"
 #include "spu_pc_observer.h"
 #include "../diagnostics/critical_pc_trace.h"
 #include <stdio.h>
@@ -488,7 +489,23 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
 
+static _Thread_local uint64_t t_interp_steps;
+static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
+
+/* Default-off attribution wraps the whole run; a run nested inside an
+ * attributed indirect-dispatch miss only adds its instruction count. */
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    if (!spu_interp_attr_enabled()) return spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
+    const void* frame = __builtin_frame_address(0);
+    spu_interp_attr_begin(ctx, start_lsa, SPU_IATTR_DIRECT, frame);
+    t_interp_steps = 0;
+    uint32_t result = spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
+    spu_interp_attr_add_steps(t_interp_steps);
+    spu_interp_attr_end(frame);
+    return result;
+}
+
+static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
     /* Experimental same-binary switch. Cache the immutable environment once;
      * concurrent first callers may compute the same value without a data race. */
     static atomic_int prefilter_setting;
@@ -546,7 +563,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || ((prefilter != 2 || spu_lifted_entry_maybe(ctx->pc)) && spu_lifted_lookup(ctx, ctx->pc)))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || ((prefilter != 2 || spu_lifted_entry_maybe(ctx->pc)) && spu_lifted_lookup(ctx, ctx->pc)))) { g_spu_interp_steps = steps; t_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
@@ -618,7 +635,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             fprintf(stderr,"[spu-trace] LS ctx: RUN=%08X READY=%08X PEND=%08X ENA=%08X SIG=%08X WAIT=%08X | 2790=%08X 2794=%08X 27D8=%08X 2FB0=%08X\n",
                 LB(0x2700),LB(0x2710),LB(0x2720),LB(0x2730),LB(0x2740),LB(0x2750),LB(0x2790),LB(0x2794),LB(0x27D8),LB(0x2FB0));
             #undef LB
-            fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
+            fflush(stderr); _tr--; g_spu_interp_steps=steps; t_interp_steps=steps; return 0x2000u;
         }
         if (observe) {
             /* Observe only instructions this invocation will execute, after
@@ -659,7 +676,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                 ctx->status = SPU_STATUS_RUNNING;
                 continue;
             }
-            g_spu_interp_steps = steps;
+            g_spu_interp_steps = steps; t_interp_steps = steps;
             if (_tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
                     ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
                 for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
