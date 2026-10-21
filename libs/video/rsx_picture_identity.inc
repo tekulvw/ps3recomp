@@ -13,6 +13,9 @@ static PictureIdentity pic_slots[PIC_SLOTS];
 static PictureAlias pic_aliases[PIC_ALIASES],pic_commands[PIC_COMMANDS];
 static struct {u32 location,offset,bytes;} pic_offsets[PIC_OFFSETS];
 static u32 pic_offset_count,pic_bytes;
+/* Unconsumed pic_commands entries: texture-offset methods look one up on
+ * every bind, and with none outstanding the 4096-entry scan finds nothing. */
+static u32 pic_command_count;
 static u64 pic_serial;
 static int pic_failed;
 static atomic_flag pic_lock=ATOMIC_FLAG_INIT;
@@ -21,7 +24,7 @@ static void pic_leave(void){atomic_flag_clear_explicit(&pic_lock,memory_order_re
 static PictureIdentity* pic_find(u64 token){for(unsigned i=0;i<PIC_SLOTS;++i)if(token && pic_slots[i].token==token)return &pic_slots[i];return NULL;}
 static int pic_tracked(u32 location,u32 offset){for(u32 i=0;i<pic_offset_count;++i)if(pic_offsets[i].location==location && pic_offsets[i].offset==offset)return 1;return 0;}
 static int pic_requires_identity(u32 location,u32 offset,u32 bytes){pic_enter();int result=0;for(u32 i=0;i<pic_offset_count;++i)if(pic_offsets[i].location==location && (u64)offset+bytes>pic_offsets[i].offset && (u64)pic_offsets[i].offset+pic_offsets[i].bytes>offset){result=1;break;}pic_leave();return result;}
-static int pic_pending_command(u32 ea){pic_enter();int result=0;for(unsigned i=0;i<PIC_COMMANDS;++i)if(ea && pic_commands[i].ea==ea){result=1;break;}pic_leave();return result;}
+static int pic_pending_command(u32 ea){pic_enter();int result=0;if(pic_command_count)for(unsigned i=0;i<PIC_COMMANDS;++i)if(ea && pic_commands[i].ea==ea){result=1;break;}pic_leave();return result;}
 static void pic_drop(u64 token){PictureIdentity* p=pic_find(token);if(!p || !p->refs){pic_failed=1;return;}if(!--p->refs){pic_bytes-=p->bytes;free(p->pixels);memset(p,0,sizeof(*p));}}
 static int pic_hold(u64 token){PictureIdentity*p=pic_find(token);if(!p || p->refs==UINT32_MAX){pic_failed=1;return 0;}++p->refs;return 1;}
 u64 rsx_picture_create(u32 ea,u32 location,u32 offset,u32 bytes,const u8* pixels)
@@ -75,7 +78,7 @@ int rsx_picture_capture_command(u32 ea,u32 descriptor,u32 location,u32 offset)
         if(!pic_commands[i].ea && empty<0)empty=(int)i;
     }
     if(empty<0 || !pic_hold(token))goto fail;
-    pic_commands[empty]=(PictureAlias){ea,token};result=1;goto done;
+    pic_commands[empty]=(PictureAlias){ea,token};++pic_command_count;result=1;goto done;
 fail:pic_failed=1;
 done:pic_leave();return result;
 }
@@ -83,10 +86,10 @@ int rsx_picture_take_command(u32 ea,u32 location,u32 offset,u64* token)
 {
     if(!token)return -1;*token=0;pic_enter();int result=-1;
     if(pic_failed)goto done;
-    for(unsigned i=0;i<PIC_COMMANDS;++i)if(ea && pic_commands[i].ea==ea){
+    if(pic_command_count)for(unsigned i=0;i<PIC_COMMANDS;++i)if(ea && pic_commands[i].ea==ea){
         PictureIdentity*p=pic_find(pic_commands[i].token);
         if(!p || p->location!=location || p->offset!=offset)goto fail;
-        *token=p->token;pic_commands[i]=(PictureAlias){0,0};result=1;goto done;
+        *token=p->token;pic_commands[i]=(PictureAlias){0,0};--pic_command_count;result=1;goto done;
     }
     if(pic_tracked(location,offset))goto fail;
     result=0;goto done;
@@ -104,4 +107,4 @@ const u8* rsx_picture_data(u64 token,u32 location,u32 offset,u32 bytes)
 }
 int rsx_picture_ready(void){pic_enter();int result=!pic_failed;pic_leave();return result;}
 int rsx_picture_live_count(void){pic_enter();int result=0;for(unsigned i=0;i<PIC_SLOTS;++i)result+=!!pic_slots[i].token;pic_leave();return result;}
-int rsx_picture_reset(void){pic_enter();int result=1;for(unsigned i=0;i<PIC_SLOTS;++i)if(pic_slots[i].token){result=0;break;}if(result){memset(pic_aliases,0,sizeof(pic_aliases));memset(pic_commands,0,sizeof(pic_commands));pic_offset_count=pic_bytes=0;pic_failed=0;}pic_leave();return result;}
+int rsx_picture_reset(void){pic_enter();int result=1;for(unsigned i=0;i<PIC_SLOTS;++i)if(pic_slots[i].token){result=0;break;}if(result){memset(pic_aliases,0,sizeof(pic_aliases));memset(pic_commands,0,sizeof(pic_commands));pic_command_count=0;pic_offset_count=pic_bytes=0;pic_failed=0;}pic_leave();return result;}
