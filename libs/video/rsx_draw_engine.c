@@ -1183,14 +1183,30 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                : eng_texture_span(fmt, w, h, levels, pitch, cube);
     if (!span) return 0;
 
-    for (u32 i = 0; i < g.n_textures; i++) {
-        eng_texture* e = &g.textures[i];
+    /* A scene binds the same few hundred textures every frame, and a linear
+     * scan of the whole cache per bind averaged several hundred entries.
+     * Remember where each key was last found; a remembered slot is used only
+     * if its entry still matches, otherwise the scan runs as before. */
+    static u16 s_slot_memo[4096];
+    const u32 memo = (offset >> 4 ^ offset >> 16 ^ fmt * 0x9E37u ^ w * 31u ^ h ^
+                      location << 11 ^ (u32)identity) & 4095u;
+#define ENG_TEXTURE_KEY_MATCHES(e) ((e)->picture_identity == identity && (e)->location == location && \
+        (e)->offset == offset && (e)->format == fmt && (e)->width == w && (e)->height == h && \
+        (e)->pitch == pitch && (e)->remap == remap && (e)->cubemap == (u32)(cube != 0) && \
+        (e)->depth == depth)
+    eng_texture* hit = NULL;
+    if (s_slot_memo[memo] < g.n_textures && ENG_TEXTURE_KEY_MATCHES(&g.textures[s_slot_memo[memo]])) {
+        hit = &g.textures[s_slot_memo[memo]];
         s_tcs.scanned++;
-        if (e->picture_identity != identity || e->location != location || e->offset != offset ||
-            e->format != fmt || e->width != w || e->height != h ||
-            e->pitch != pitch || e->remap != remap ||
-            e->cubemap != (u32)(cube != 0) || e->depth != depth)
-            continue;
+    } else {
+        for (u32 i = 0; i < g.n_textures; i++) {
+            s_tcs.scanned++;
+            if (ENG_TEXTURE_KEY_MATCHES(&g.textures[i])) { hit = &g.textures[i]; s_slot_memo[memo] = (u16)i; break; }
+        }
+    }
+#undef ENG_TEXTURE_KEY_MATCHES
+    if (hit) {
+        eng_texture* e = hit;
         if (e->handle && (e->last_hash_frame != g.frames || e->dirty_generation != generation)) {
             /* Every cached texture used to be hashed in full every frame;
              * in a big scene that is hundreds of MB a second for the few
@@ -1218,6 +1234,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap, depth, identity);
                 s_tcs.uploads++; s_tcs.upload_bytes += span;
+                if (s_tcs.on > 0) { static unsigned logged; if (logged < 24 && span > 1u << 20) { logged++;
+                    fprintf(stderr, "[texcache] reupload loc=%u off=0x%08X fmt=0x%02X %ux%u levels=%u pitch=%u cube=%d depth=%u span=%u frame=%u\n",
+                            location, offset, fmt, w, h, levels, pitch, cube, depth, span, g.frames); } }
                 if (fresh) {
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
