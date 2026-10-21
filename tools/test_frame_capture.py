@@ -15,6 +15,10 @@ with tempfile.TemporaryDirectory(prefix="frame-capture-") as directory:
                     "-Ilibs/video", "tests/rsx_frame_capture_lifecycle.c", "-o", str(lifecycle)], cwd=root, check=True)
     subprocess.run([str(lifecycle), "off", str(directory)], check=True)
     subprocess.run([str(lifecycle), "on", str(directory)], check=True)
+    for mode in ("extended", "invalidlimit"):
+        output = directory / mode
+        output.mkdir()
+        subprocess.run([str(lifecycle), mode, str(output)], check=True)
     gpu = directory / "gpu"
     subprocess.run(["clang", "-O2", "-fobjc-arc", "-DPS3RECOMP_DISABLE_NATIVE_OSK", "-Iinclude", "-Ilibs/video",
                     "libs/video/tests/test_metal_frame_capture.m", "libs/video/rsx_texture_layout.c",

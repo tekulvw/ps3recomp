@@ -1,5 +1,5 @@
 /* Finite completed-surface diagnostic, deliberately outside rendering timing.
- * Prefix/request must be absolute. Request contains token1..4. A new token
+ * Prefix/request must be absolute. Request contains token1..configured finite limit (default4, max12). A new token
  * discards the current partial frame and captures the next complete interval.
  * Programs are the actual emitted RSX FP tokens, never guessed frame owners. */
 #include "rsx_frame_capture_gate.h"
@@ -19,7 +19,8 @@ static int frame_capture_enabled(void)
   s_frame_capture.session=getenv("RSX_ENGINE_FRAME_CAPTURE_SESSION");
   int valid_session=s_frame_capture.session&&*s_frame_capture.session&&strlen(s_frame_capture.session)<=128;
   if(valid_session)for(const char*p=s_frame_capture.session;*p;p++)if(!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||*p=='_'||*p=='-'))valid_session=0;
-  s_frame_capture.enabled=s_frame_capture.prefix&&s_frame_capture.prefix[0]=='/'&&
+  s_frame_capture.gate.limit=rsx_frame_capture_limit(getenv("RSX_ENGINE_FRAME_CAPTURE_LIMIT"));
+  s_frame_capture.enabled=s_frame_capture.gate.limit&&s_frame_capture.prefix&&s_frame_capture.prefix[0]=='/'&&
    s_frame_capture.request&&s_frame_capture.request[0]=='/'&&valid_session;
  }
  return s_frame_capture.enabled;
