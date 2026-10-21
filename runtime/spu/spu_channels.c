@@ -2279,13 +2279,25 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
     }
 }
 
+#if defined(_MSC_VER)
+static __declspec(noinline) void spu_check_stack_reset_scan(spu_context*, void (*)(spu_context*));
+#else
+static __attribute__((noinline, cold)) void spu_check_stack_reset_scan(spu_context*, void (*)(spu_context*));
+#endif
 /* Also called before direct trampoline transfers: generated calls can enter
  * a stack-switching routine without going through spu_indirect_branch. */
 void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
 {
     /* Runs on every drain transfer: test the registry before the
-     * thread-local halt state, which is a function call on Darwin. */
-    if (!s_stack_reset_count || !ctx->host_depth || ctx->policy_mode || !s_spu_halt_armed) return;
+     * thread-local halt state, which is a function call on Darwin, and keep
+     * the scan out of line so the common return needs no frame. */
+    if (!s_stack_reset_count || !ctx->host_depth || ctx->policy_mode) return;
+    spu_check_stack_reset_scan(ctx, fn);
+}
+
+static void spu_check_stack_reset_scan(spu_context* ctx, void (*fn)(spu_context*))
+{
+    if (!s_spu_halt_armed) return;
     for (unsigned i = 0; i < s_stack_reset_count; ++i)
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {

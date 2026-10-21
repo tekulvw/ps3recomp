@@ -70,11 +70,41 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
     return k;
 }
 
+#if defined(_MSC_VER)
+#define SPU_DRAIN_COLD __declspec(noinline)
+#else
+#define SPU_DRAIN_COLD __attribute__((noinline, cold))
+#endif
+static SPU_DRAIN_COLD void spu_task_launch_slow(spu_context* ctx);
+
+/* Any of the step diagnostics below armed by the environment. */
+static int spu_task_launch_diagnostics(void)
+{
+    static int s_on = -1;
+    if (s_on < 0)
+        s_on = getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
+               getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN");
+    return s_on;
+}
+
+/* Runs on every drain transfer. The common case -- no diagnostics, not a
+ * branch to LS 0 -- stays here; everything else is out of line so this
+ * function needs no frame of its own. */
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
     t_recent.pc[t_recent.n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    if (!spu_task_launch_diagnostics() && !g_pm_flow_ctx &&
+        (!ctx->steps || (ctx->pc & SPU_LS_MASK))) {
+        ctx->steps++;
+        return;
+    }
+    spu_task_launch_slow(ctx);
+}
+
+static void spu_task_launch_slow(spu_context* ctx)
+{
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
      * resident job manager, and with the job loaded at 0 that lands on its own
      * entry. Planting a return address in r0 catches the jobs that get there
