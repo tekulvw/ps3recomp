@@ -23,6 +23,11 @@ int g_cri_video_dma;
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 uint32_t g_barrier_sync_watch;
 void (*g_spu_put_hook)(uint32_t, uint32_t);
+/* Job I/O recorder (runtime/diagnostics): never armed here, so the fixture
+ * only needs the inactive pointer and an event sink that is never reached. */
+void* ps3_jobio_active;
+void ps3_jobio_event(struct spu_context* c, uint32_t k, uint32_t cmd, uint32_t lsa, uint64_t ea, uint32_t n, const uint8_t* b, uint32_t x)
+{ (void)c; (void)k; (void)cmd; (void)lsa; (void)ea; (void)n; (void)b; (void)x; }
 void* volatile g_sn_defer_ctx;
 volatile unsigned g_sn_defer;
 unsigned long long ps3_ms_now(void) { return 0; }
