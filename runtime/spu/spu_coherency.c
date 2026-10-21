@@ -63,7 +63,26 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
  * contended waiters; the mutex preserves the same non-recursive exclusion and
  * acquire/release publication for every reservation and coherent store. */
 static pthread_mutex_t g_lockline = PTHREAD_MUTEX_INITIALIZER;
-void spu_lockline_lock(void)   { if (pthread_mutex_lock(&g_lockline)) abort(); }
+/* Hold times are a line copy and a short list walk, far shorter than a
+ * kernel park and wake, and every SPU's policy module polls through here.
+ * Retry for a few microseconds before parking; the trylock is spaced out so
+ * the waiters do not keep stealing the lock's cache line from its owner. */
+static inline void spu_lockline_relax(void)
+{
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
+void spu_lockline_lock(void)
+{
+    for (unsigned attempt = 0; attempt < 32; ++attempt) {
+        if (!pthread_mutex_trylock(&g_lockline)) return;
+        for (unsigned i = 0; i < 32; ++i) spu_lockline_relax();
+    }
+    if (pthread_mutex_lock(&g_lockline)) abort();
+}
 void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort(); }
 #endif
 
