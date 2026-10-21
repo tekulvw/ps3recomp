@@ -2969,7 +2969,11 @@ void spu_indirect_branch(spu_context* ctx)
             /* cellSpursModulePoll: report "no contention — keep running".
              * (The host scheduler admits bounded workers; this service does not preempt.) */
             unsigned n = ++g_spurs_pm_polls;
-            if (n <= 4 || (n % 4096) == 0)
+            /* The poll count restarts with every policy-module run, which is
+             * thousands of runs a second: limit the log by process, not run. */
+            static atomic_uint s_poll_logs;
+            if ((n <= 4 || (n % 4096) == 0) &&
+                atomic_fetch_add_explicit(&s_poll_logs, 1, memory_order_relaxed) < 64)
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                         n, ctx->gpr[3]._u32[0]);
             /* The kernel ABI returns {selected wid, poll reason} in the
