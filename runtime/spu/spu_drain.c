@@ -7,6 +7,16 @@
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
 #include <setjmp.h>
+/* setjmp/longjmp also save and restore the signal mask on POSIX: one
+ * sigprocmask system call per halt, stack reset or task resume. These frames
+ * never cross a signal handler, so the mask is the same at both ends. */
+#if defined(_WIN32)
+#define SPU_SETJMP(env) setjmp(env)
+#define SPU_LONGJMP(env, v) longjmp(env, v)
+#else
+#define SPU_SETJMP(env) _setjmp(env)
+#define SPU_LONGJMP(env, v) _longjmp(env, v)
+#endif
 #include <stdatomic.h>
 
 /* See spu_context.h `irq_frame`. */
@@ -50,18 +60,19 @@ void* volatile    g_pm_flow_ctx = 0;
 extern void spu_halt(spu_context*);
 /* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
  * ended where it should not have (spurs_policy.c, [pm-end]). */
-static _Thread_local uint32_t t_recent[32];
-static _Thread_local uint32_t t_recent_n;
+/* One thread-local object: every Darwin TLV access is a call, and this runs
+ * on every drain transfer. */
+static _Thread_local struct { uint32_t pc[32]; uint32_t n; } t_recent;
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 {
-    unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
-    for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
+    unsigned n = t_recent.n < 32 ? t_recent.n : 32, k = n < max ? n : max;
+    for (unsigned i = 0; i < k; i++) out[i] = t_recent.pc[(t_recent.n - k + i) & 31];
     return k;
 }
 
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    t_recent.pc[t_recent.n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
@@ -261,7 +272,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
                                   ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
                     ctx->region_dispatch_valid=0;
-                    longjmp(f->env, 1);
+                    SPU_LONGJMP(f->env, 1);
                 }
                 if (!f && ctx->host_depth > 0) {
                     /* Taken by the top-level driver loop (depth 0), which
@@ -350,6 +361,10 @@ void spu_depth_guard(spu_context* ctx)
     enum { RING = 24 };
     static uint32_t s_ring[RING];
     static uint32_t s_n;
+    /* Record only in the upper half of the budget: a runaway passes through it
+     * on its way to the limit, and ordinary transfers from every SPU thread no
+     * longer write this shared line. */
+    if (ctx->host_depth < s_max / 2) return;
     s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
     s_n++;
 
@@ -512,7 +527,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         f.image_id = ctx->image_id;
                         ctx->irq_frame = &f;
                     }
-                    if (setjmp(f.env) == 0) {
+                    if (SPU_SETJMP(f.env) == 0) {
                         spu_region_dispatch_invoke(ctx,vf,1,return_pc);
                     } else {
                         ctx->region_dispatch_valid=0;

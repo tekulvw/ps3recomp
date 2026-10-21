@@ -34,6 +34,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+/* setjmp/longjmp also save and restore the signal mask on POSIX: one
+ * sigprocmask system call per halt, stack reset or task resume. These frames
+ * never cross a signal handler, so the mask is the same at both ends. */
+#if defined(_WIN32)
+#define SPU_SETJMP(env) setjmp(env)
+#define SPU_LONGJMP(env, v) longjmp(env, v)
+#else
+#define SPU_SETJMP(env) _setjmp(env)
+#define SPU_LONGJMP(env, v) _longjmp(env, v)
+#endif
 #ifndef _WIN32
 #include <sched.h>   /* sched_yield */
 #endif
@@ -138,7 +148,7 @@ void spu_restart_dispatch(spu_context* ctx)
 {
     ctx->region_dispatch_valid=0;
     g_spu_trampoline_fn = 0;
-    if (s_spu_halt_armed) longjmp(s_spu_halt_env, 2);
+    if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
@@ -177,7 +187,7 @@ void spu_halt(spu_context* ctx)
                 ctx->gpr[80]._u32[0], ctx->gpr[85]._u32[0]);
         fflush(stderr);
       } }
-    if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
+    if (s_spu_halt_armed) { s_spu_halt_armed = 0; SPU_LONGJMP(s_spu_halt_env, 1); }
 }
 
 /* Diagnostic: dump the taskset-policy scheduler's working tables (LS 0x2700..)
@@ -265,7 +275,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
-    switch (setjmp(s_spu_halt_env)) {
+    switch (SPU_SETJMP(s_spu_halt_env)) {
     case 1:
         ctx->region_dispatch_valid=0;
         halted = 1;
@@ -323,7 +333,7 @@ static int spu_native_service_call_impl(spu_context* ctx,uint32_t entry_pc,uint3
     if (outer_armed) memcpy(outer_env, s_spu_halt_env, sizeof outer_env);
     s_spu_halt_armed = 1;
     int result;
-    int reason = setjmp(s_spu_halt_env);
+    int reason = SPU_SETJMP(s_spu_halt_env);
     if (reason == 1) {
         result = 1;
     } else {
@@ -385,7 +395,7 @@ int spu_native_owner_call(spu_context* ctx, void (*body)(spu_context*))
     jmp_buf outer_env;
     if (outer_armed) memcpy(outer_env, s_spu_halt_env, sizeof outer_env);
     s_spu_halt_armed = 1;
-    int reason = setjmp(s_spu_halt_env);
+    int reason = SPU_SETJMP(s_spu_halt_env);
     if (!reason) body(ctx);
     if (reason) {
         ctx->host_depth = depth;
@@ -2273,13 +2283,15 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
  * a stack-switching routine without going through spu_indirect_branch. */
 void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
 {
-    if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
+    /* Runs on every drain transfer: test the registry before the
+     * thread-local halt state, which is a function call on Darwin. */
+    if (!s_stack_reset_count || !ctx->host_depth || ctx->policy_mode || !s_spu_halt_armed) return;
     for (unsigned i = 0; i < s_stack_reset_count; ++i)
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
             ctx->region_dispatch_valid=0;
-            longjmp(s_spu_halt_env, 2);
+            SPU_LONGJMP(s_spu_halt_env, 2);
         }
 }
 
@@ -3008,7 +3020,7 @@ void spu_indirect_branch(spu_context* ctx)
             ctx->resident_task = ti;
             g_spu_trampoline_fn = 0;
             ctx->region_dispatch_valid=0;
-            longjmp(s_spu_halt_env, 2);
+            SPU_LONGJMP(s_spu_halt_env, 2);
         }
         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
         if (ti) ctx->resident_task = ti;
