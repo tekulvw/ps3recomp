@@ -2099,6 +2099,26 @@ static spu_lifted_fn spu_verified_filter_legacy(uint32_t lsa, spu_fn fn)
     return (spu_lifted_fn)fn;
 }
 
+/* Indirect dispatch resolves the same (address, image) pairs millions of
+ * times a second. Each resolution walks the address's hash chain -- one entry
+ * per image registered there, about thirty for a shared job-code buffer --
+ * and the legacy filter walks it again per verified image. Memoize both
+ * results per host thread. Registration only appends, so the registry and
+ * verified-image counts are a complete generation. */
+typedef struct { uint32_t addr, reg_gen, ver_gen; int image; spu_fn raw, filtered; } spu_lookup_memo;
+static SPU_TLS spu_lookup_memo t_lookup_memo[512];
+static const spu_lookup_memo* spu_lookup_memoized(uint32_t addr, int image)
+{
+    spu_lookup_memo* m = &t_lookup_memo[((addr >> 2) ^ ((uint32_t)image * 0x9E3779B1u)) & 511u];
+    const uint32_t reg_gen = s_registry_count + 1, ver_gen = s_verified_count;
+    if (m->reg_gen != reg_gen || m->ver_gen != ver_gen || m->addr != addr || m->image != image) {
+        m->addr = addr; m->image = image; m->reg_gen = reg_gen; m->ver_gen = ver_gen;
+        m->raw = spu_lookup(addr, image);
+        m->filtered = (spu_fn)spu_verified_filter_legacy(addr, m->raw);
+    }
+    return m;
+}
+
 /* Shared by indirect dispatch and interpreter rejoin. A bounded resident
  * code owner is authoritative even if it has no lift at this LSA: falling
  * through would execute stale code registered under another image. Task and
@@ -2124,13 +2144,13 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
              * unverified: other images' functions there would be stale. */
             if (ctx->resident_code[slot].verify_state &&
                 !spu_overlay_resident_verified((spu_context*)ctx, slot)) return NULL;
-            return spu_verified_filter_legacy(lsa, spu_lookup(lsa, ctx->resident_code[slot].image_id));
+            return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx->resident_code[slot].image_id)->filtered;
         }
-    spu_fn fn = NULL;
-    if (ctx->resident_task) fn = spu_lookup(lsa, ctx->resident_task);
-    if (!fn && ctx->resident_ovl) fn = spu_lookup(lsa, ctx->resident_ovl);
-    if (!fn) fn = spu_lookup(lsa, ctx->image_id);
-    return spu_verified_filter_legacy(lsa, fn);
+    const spu_lookup_memo* m = NULL;
+    if (ctx->resident_task) m = spu_lookup_memoized(lsa, ctx->resident_task);
+    if ((!m || !m->raw) && ctx->resident_ovl) m = spu_lookup_memoized(lsa, ctx->resident_ovl);
+    if (!m || !m->raw) m = spu_lookup_memoized(lsa, ctx->image_id);
+    return (spu_lifted_fn)m->filtered;
 }
 
 /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
