@@ -12,6 +12,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "ps3emu/log_first.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -127,21 +128,21 @@ static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, size_t n)
     enum { SLOTS = 8 };
     static struct { const uint8_t* image; size_t n; uint64_t content, fp; } s_fp[SLOTS];
     static unsigned s_next;
-    static SRWLOCK s_fp_lock = SRWLOCK_INIT;
+    static atomic_flag s_fp_lock = ATOMIC_FLAG_INIT;   /* a few task starts per frame */
     const uint64_t content = spu_workload_content_hash(image, n);
-    AcquireSRWLockExclusive(&s_fp_lock);
+    while (atomic_flag_test_and_set_explicit(&s_fp_lock, memory_order_acquire)) {}
     for (unsigned i = 0; i < SLOTS; ++i)
         if (s_fp[i].image == image && s_fp[i].n == n && s_fp[i].content == content) {
             const uint64_t fp = s_fp[i].fp;
-            ReleaseSRWLockExclusive(&s_fp_lock);
+            atomic_flag_clear_explicit(&s_fp_lock, memory_order_release);
             return fp;
         }
-    ReleaseSRWLockExclusive(&s_fp_lock);
+    atomic_flag_clear_explicit(&s_fp_lock, memory_order_release);
     const uint64_t fp = spu_workload_fingerprint(image, n);
-    AcquireSRWLockExclusive(&s_fp_lock);
+    while (atomic_flag_test_and_set_explicit(&s_fp_lock, memory_order_acquire)) {}
     const unsigned slot = s_next++ % SLOTS;
     s_fp[slot].image = image; s_fp[slot].n = n; s_fp[slot].content = content; s_fp[slot].fp = fp;
-    ReleaseSRWLockExclusive(&s_fp_lock);
+    atomic_flag_clear_explicit(&s_fp_lock, memory_order_release);
     return fp;
 }
 
