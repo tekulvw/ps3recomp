@@ -221,8 +221,14 @@ void audio_chronology_consume(unsigned port,unsigned stage,uint64_t index,const 
     AC_RESTORE;
 }
 void audio_chronology_dma_begin(audio_chronology_dma_token* t,uint64_t ea,uint32_t size,uint32_t cmd) {
-    AC_SAVE;t->port=-1;
-    if(ac_active() && (cmd&0x20) && !(cmd&0x40) && size && ea<=0xFFFFFFFFull && size<=0x100000000ull-ea) {
+    t->port=-1;
+    /* Runs on every SPU DMA. Only the one-time init and the active path can
+     * touch errno or the last error, so only those are bracketed; the
+     * inactive path is plain loads. */
+    if(!AC_READY_LOAD(&s_ac.ready)) { AC_SAVE;InitOnceExecuteOnce(&s_ac.once,ac_init,NULL,NULL);AC_RESTORE; }
+    if(!(ac_active() && (cmd&0x20) && !(cmd&0x40) && size && ea<=0xFFFFFFFFull && size<=0x100000000ull-ea))return;
+    AC_SAVE;
+    {
         ac_lock();uint64_t now=ac_now();
         if(ac_window_locked(now))for(unsigned i=0;i<AC_PORTS;i++) {
             ac_port* p=&s_ac.ports[i];uint64_t end=(uint64_t)p->ea+p->block_bytes*p->blocks;
@@ -239,8 +245,9 @@ void audio_chronology_dma_begin(audio_chronology_dma_token* t,uint64_t ea,uint32
     AC_RESTORE;
 }
 void audio_chronology_dma_after(audio_chronology_dma_token* t,const uint8_t* destination) {
+    if(t->port<0)return;      /* begin found no port: nothing below runs */
     AC_SAVE;
-    if(t->port>=0 && ac_active()) {
+    if(ac_active()) {
         uint64_t now=ac_now();
         if(now<s_ac.start_us || now-s_ac.start_us>=s_ac.duration_us) {
             InterlockedExchange(&s_ac.window_active,0);AC_RESTORE;return;

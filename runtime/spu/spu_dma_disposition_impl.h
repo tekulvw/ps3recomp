@@ -79,14 +79,29 @@ static int dma_disp_armed(void) {
 #define DMA_DISP_READY_LOAD(p) __atomic_load_n((p),__ATOMIC_ACQUIRE)
 #endif
 void spu_dma_disposition_begin(spu_dma_disposition_token* t,uint32_t lsa,uint64_t ea,uint32_t size,uint32_t cmd) {
+    /* Runs on every SPU DMA. errno and the last error are preserved across
+     * the paths that can touch them: the one-time init and the enabled
+     * path. The chronology hook preserves them itself, and the disabled
+     * path below reads only plain fields, so neither is bracketed. */
+    audio_chronology_dma_begin(&t->chronology,ea,size,cmd);
+    t->seq=0;
+    if(!DMA_DISP_READY_LOAD(&s_dma_disposition.ready)) {
+        int init_errno=errno;
+#ifdef _WIN32
+        DWORD init_last=GetLastError();
+#endif
+        InitOnceExecuteOnce(&s_dma_disposition.once,dma_disp_init,NULL,NULL);
+        errno=init_errno;
+#ifdef _WIN32
+        SetLastError(init_last);
+#endif
+    }
+    if(!s_dma_disposition.enabled)return;
     int saved=errno;
 #ifdef _WIN32
     DWORD last=GetLastError();
 #endif
-    audio_chronology_dma_begin(&t->chronology,ea,size,cmd);
-    t->seq=0;
-    if(!DMA_DISP_READY_LOAD(&s_dma_disposition.ready))InitOnceExecuteOnce(&s_dma_disposition.once,dma_disp_init,NULL,NULL);
-    if(s_dma_disposition.enabled && ea<=0xFFFFFFFFull && (uint64_t)size<=0x100000000ull-ea &&
+    if(ea<=0xFFFFFFFFull && (uint64_t)size<=0x100000000ull-ea &&
        ea<s_dma_disposition.hi && ea+size>s_dma_disposition.lo &&
        (uint32_t)InterlockedCompareExchange(&s_dma_disposition.emitted,0,0)<s_dma_disposition.limit && dma_disp_armed()) {
         LONG n=InterlockedCompareExchange(&s_dma_disposition.emitted,0,0);
