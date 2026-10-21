@@ -1156,8 +1156,8 @@ static void eng_texcache_stats_tick(void)
 {
     if (s_tcs.on < 0) s_tcs.on = getenv("RSX_TEXCACHE_STATS") != NULL;
     if (!s_tcs.on) return;
-    extern unsigned long long ps3_ms_now(void);
-    const u64 now = ps3_ms_now();
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const u64 now = (u64)ts.tv_sec * 1000u + (u64)ts.tv_nsec / 1000000u;
     if (!s_tcs.t0) s_tcs.t0 = now;
     if (now - s_tcs.t0 < 2000) return;
     fprintf(stderr, "[texcache] per s: binds=%llu scanned=%llu sparse=%llu full=%llu uploads=%llu upload_MB=%.1f misses=%llu picture_binds=%llu entries=%u\n",
