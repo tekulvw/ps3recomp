@@ -769,6 +769,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         { uint32_t e = (uint32_t)ea;
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
+          /* The payload scan is a second pass over every byte of every PUT.
+           * Run it for a PUT into the region (its report line carries the
+           * result) and otherwise only when SPU_POISON_DMA_WATCH=1 arms the
+           * poison-only report. */
+          static int s_poison = -1;
+          if (s_poison < 0) s_poison = getenv("SPU_POISON_DMA_WATCH") ? 1 : 0;
+          if (hitregion || s_poison)
           for (uint32_t o = 0; o + 4 <= size; o += 4) {
               uint32_t w; memcpy(&w, (const char*)ls_ptr + o, 4);
               if (w == 0x08C708C7u) { haspoison = 1; break; } /* 0xC708C708 BE in LS bytes */
