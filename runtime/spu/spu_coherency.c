@@ -75,15 +75,73 @@ static inline void spu_lockline_relax(void)
     __builtin_ia32_pause();
 #endif
 }
+/* SPU_LOCKLINE_PROFILE=1: wait and hold time per acquiring call site (return
+ * address), printed every two seconds with the image slide so the sites can
+ * be symbolized offline (atos -l). Off, the lock pays one predictable branch. */
+#include <stdatomic.h>
+#include <time.h>
+#include <mach-o/dyld.h>
+typedef struct { _Atomic(uintptr_t) site; atomic_ullong n, wait_ns, hold_ns; } lockline_prof;
+static lockline_prof s_llp[512];
+static int s_llp_on = -1;
+static __thread struct { uintptr_t site; uint64_t t; } t_llp;
+static uint64_t llp_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static lockline_prof* llp_slot(uintptr_t site)
+{
+    for (unsigned i = (unsigned)(site >> 2) & 511u, k = 0; k < 512; ++k, i = (i + 1) & 511u) {
+        uintptr_t cur = atomic_load_explicit(&s_llp[i].site, memory_order_relaxed);
+        if (cur == site) return &s_llp[i];
+        if (!cur && atomic_compare_exchange_strong(&s_llp[i].site, &cur, site)) return &s_llp[i];
+        if (cur == site) return &s_llp[i];
+    }
+    return 0;
+}
+static void llp_report(void)
+{
+    static atomic_ullong next;
+    uint64_t now = llp_now(), due = atomic_load(&next);
+    if (now < due || !atomic_compare_exchange_strong(&next, &due, now + 2000000000ull)) return;
+    fprintf(stderr, "[lockline-prof] slide=0x%lx\n", (unsigned long)_dyld_get_image_vmaddr_slide(0));
+    for (unsigned i = 0; i < 512; ++i) {
+        uintptr_t s = atomic_load(&s_llp[i].site);
+        if (s) fprintf(stderr, "[lockline-prof] site=0x%lx n=%llu wait_us=%llu hold_us=%llu\n", (unsigned long)s,
+                       atomic_load(&s_llp[i].n), atomic_load(&s_llp[i].wait_ns) / 1000, atomic_load(&s_llp[i].hold_ns) / 1000);
+    }
+}
+static __attribute__((noinline)) void spu_lockline_lock_profiled(uintptr_t site)
+{
+    const uint64_t t0 = llp_now();
+    if (pthread_mutex_lock(&g_lockline)) abort();
+    const uint64_t t1 = llp_now();
+    lockline_prof* p = llp_slot(site);
+    if (p) { atomic_fetch_add_explicit(&p->n, 1, memory_order_relaxed);
+             atomic_fetch_add_explicit(&p->wait_ns, t1 - t0, memory_order_relaxed); }
+    t_llp.site = site; t_llp.t = t1;
+}
 void spu_lockline_lock(void)
 {
+    if (__builtin_expect(s_llp_on != 0, 0)) {
+        if (s_llp_on < 0) s_llp_on = getenv("SPU_LOCKLINE_PROFILE") != NULL;
+        if (s_llp_on) { spu_lockline_lock_profiled((uintptr_t)__builtin_return_address(0)); return; }
+    }
     for (unsigned attempt = 0; attempt < 32; ++attempt) {
         if (!pthread_mutex_trylock(&g_lockline)) return;
         for (unsigned i = 0; i < 32; ++i) spu_lockline_relax();
     }
     if (pthread_mutex_lock(&g_lockline)) abort();
 }
-void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort(); }
+void spu_lockline_unlock(void)
+{
+    if (__builtin_expect(s_llp_on > 0, 0) && t_llp.site) {
+        lockline_prof* p = llp_slot(t_llp.site);
+        if (p) atomic_fetch_add_explicit(&p->hold_ns, llp_now() - t_llp.t, memory_order_relaxed);
+        t_llp.site = 0;
+        if (pthread_mutex_unlock(&g_lockline)) abort();
+        llp_report();
+        return;
+    }
+    if (pthread_mutex_unlock(&g_lockline)) abort();
+}
 #endif
 
 /* ===========================================================================
