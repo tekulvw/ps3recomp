@@ -1278,8 +1278,13 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * count-only rule halted a healthy job and wedged the frame. Halt only once
      * the repeats have also lasted SPU_DMA_REPEAT_SECS (default 30) of wall
      * time. Below that, back off 1 ms per repeat rather than spinning. */
-    { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep;
-      static SPU_THREAD_LOCAL unsigned long long s_since;
+    /* One thread-local object: every Darwin TLV access is a call, and this
+     * runs on every MFC command. */
+    { static SPU_THREAD_LOCAL struct { uint32_t last_ea, last_lsa, rep; unsigned long long since; } t_rep;
+#define s_last_ea  t_rep.last_ea
+#define s_last_lsa t_rep.last_lsa
+#define s_rep      t_rep.rep
+#define s_since    t_rep.since
       static uint32_t s_limit = 0; static unsigned long long s_secs, s_backoff_ms;
       extern unsigned long long ps3_ms_now(void);
       if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
@@ -1312,7 +1317,12 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               else if (now - s_since < s_backoff_ms) SwitchToThread();
               else Sleep(1);
           }
-      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0; } }
+      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0; }
+#undef s_last_ea
+#undef s_last_lsa
+#undef s_rep
+#undef s_since
+    }
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
