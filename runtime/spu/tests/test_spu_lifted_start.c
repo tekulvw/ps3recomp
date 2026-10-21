@@ -45,6 +45,7 @@
  */
 
 #include "spu_interp.h"
+#include "spu_overlay_residency.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -412,6 +413,56 @@ static void test_resident_code_regions(void)
     free(ctx);
 }
 
+
+/* A streamed region registered with its code bytes dispatches by residency
+ * after one exact comparison per load, never on stale or unverified bytes. */
+static void code_verified(spu_context* ctx) { ctx->gpr[3]._u32[0] = 84; }
+static void test_verified_resident_code_regions(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate verified streamed code context"); return; }
+    spu_context_init(ctx, 0);
+    const uint32_t base = 0x13000, ea = 0x800000;
+    uint8_t code[0x40];
+    for (unsigned i = 0; i < sizeof code; ++i) code[i] = (uint8_t)(0x40 + i);
+    spu_begin_image(84); spu_register_function(base, code_verified);
+    spu_begin_image(85); spu_register_function(base, code_stale);
+    spu_begin_image(0);
+    const spu_overlay_code_segment seg = {base, sizeof code, code};
+    const spu_overlay_code_segment outside = {base + 0x3F0, sizeof code, code};
+    check(!spu_overlay_register_verified_region(ea, base, 0x400, 84, &outside, 1),
+          "verified region rejects code outside its span");
+    check(spu_overlay_register_verified_region(ea, base, 0x400, 84, &seg, 1),
+          "verified region registers");
+    ctx->image_id = 85;
+
+    memcpy(ctx->ls + base, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + base, 0x200);
+    check(ctx->resident_code[0].verify_state == 1, "a load leaves the region pending");
+    check(spu_lifted_lookup(ctx, base) == code_verified, "matching load dispatches its lifted code");
+    check(ctx->resident_code[0].verify_state == 2, "first dispatch verifies the load");
+    ctx->ls[base] ^= 0xFF; /* an untracked store is not re-compared per transfer */
+    check(spu_lifted_lookup(ctx, base) == code_verified, "verified load dispatches without recomparison");
+
+    spu_overlay_note_get(ctx, ea + 0x200, ctx->ls + base + 0x200, 0x100);
+    check(ctx->resident_code[0].verify_state == 1, "continuation GET re-arms verification");
+    check(spu_lifted_lookup(ctx, base) == NULL, "mismatching bytes stay interpreted");
+    check(spu_lifted_lookup(ctx, base) == NULL, "rejected load is not compared again");
+
+    memcpy(ctx->ls + base, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + base, 0x200);
+    check(spu_lifted_lookup(ctx, base) == code_verified, "a fresh load is verified again");
+
+    spu_overlay_note_get(ctx, 0x900000, ctx->ls + base + 0x80, 0x80);
+    check(spu_lifted_lookup(ctx, base) != code_verified, "foreign DMA into the span clears residency");
+
+    memset(ctx->resident_code, 0, sizeof ctx->resident_code);
+    memcpy(ctx->ls + base + 0x1000, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + base + 0x1000, 0x200);
+    check(!ctx->resident_code[0].image_id, "a load at another LS address is not resident");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
 
 /* Streamed code owns an LS interval even when its registry has a hole.
  * Rejoining a different image at that hole executes stale guest code. */
@@ -835,6 +886,7 @@ int main(void)
     test_smc_branch_hints();
     test_smc_xori();
     test_resident_code_regions();
+    test_verified_resident_code_regions();
     test_resident_interpreter_rejoin();
 #ifdef SPU_VERIFIED_OVERLAY_TEST
     test_verified_overlay();
