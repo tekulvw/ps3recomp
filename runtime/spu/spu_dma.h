@@ -1280,24 +1280,38 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * time. Below that, back off 1 ms per repeat rather than spinning. */
     { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep;
       static SPU_THREAD_LOCAL unsigned long long s_since;
-      static uint32_t s_limit = 0; static unsigned long long s_secs;
+      static uint32_t s_limit = 0; static unsigned long long s_secs, s_backoff_ms;
       extern unsigned long long ps3_ms_now(void);
       if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
                       s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u;
                       e = getenv("SPU_DMA_REPEAT_SECS");
-                      s_secs = e ? strtoull(e, 0, 0) : 30u; }
+                      s_secs = e ? strtoull(e, 0, 0) : 30u;
+                      e = getenv("SPU_DMA_REPEAT_BACKOFF_MS");
+                      s_backoff_ms = e ? strtoull(e, 0, 0) : 2u; }
       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
-          if (++s_rep >= s_limit && !s_since) s_since = ps3_ms_now();
-          if (s_rep >= s_limit && ps3_ms_now() - s_since >= s_secs * 1000u) {
-              s_rep = 0; s_since = 0;   /* re-arm: the chain may run this job again */
-              extern void spu_halt(spu_context*);
-              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
-                      "transfers to ea=0x%08X -- halting the SPU\n",
-                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
-                      (uint32_t)ea);
-              fflush(stderr);
-              spu_halt(spu);
-          } else if (s_rep >= s_limit) Sleep(1);
+          if (++s_rep >= s_limit) {
+              unsigned long long now = ps3_ms_now();
+              if (!s_since) s_since = now;
+              if (now - s_since >= s_secs * 1000u) {
+                  s_rep = 0; s_since = 0;   /* re-arm: the chain may run this job again */
+                  extern void spu_halt(spu_context*);
+                  fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
+                          "transfers to ea=0x%08X -- halting the SPU\n",
+                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
+                          (uint32_t)ea);
+                  fflush(stderr);
+                  spu_halt(spu);
+              }
+              /* A job re-reading a word another agent writes (an RSX label, a
+               * ring-space counter, a peer job's completion flag) is bound by
+               * that write, and a 1 ms sleep per poll lands it up to a
+               * millisecond late -- on the frame's critical path when the
+               * poller is the frame's longest job. Yield for the first
+               * SPU_DMA_REPEAT_BACKOFF_MS (default 2) of an episode, where a
+               * healthy wait ends, and back off 1 ms per repeat after that. */
+              else if (now - s_since < s_backoff_ms) SwitchToThread();
+              else Sleep(1);
+          }
       } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0; } }
 
     /* Mark tag as in-progress */
