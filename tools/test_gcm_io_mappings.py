@@ -76,6 +76,7 @@ static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
 static int s_io_mapping_count = 0;
 static u64 s_native_io_generations[CELL_GCM_MAX_IO_MAPPINGS];
 static u32 s_io_map_reserved;
+static int s_io_mapping_hw = 0;
 static unsigned char mem[0x1000];
 static void vm_write32(u32 a, u32 v) { for (int i = 0; i < 4; i++) mem[a + i] = (unsigned char)(v >> (24 - 8 * i)); }
 static u32 rd32(u32 a) { return (u32)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
