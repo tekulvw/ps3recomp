@@ -12,7 +12,7 @@ u32 g_rsx_last_reference;
 PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 void ppu_dump_guest_stack(ppu_context* c,const char* t) {(void)c;(void)t;}
 void ppu_dump_bctrl_ring(uint32_t id,const char* t) {(void)id;(void)t;}
-static unsigned locked, notified, broken, flushed, live_flushed;
+static unsigned locked, notified, broken, flushed, live_flushed, checked_flushes;
 static u32 watched = 0x2000430;
 static unsigned watch_writes;
 static int expect_publication = 1;
@@ -171,6 +171,26 @@ int main(void) {
     assert(vm_read32(label_ea)==0xaaaaaaaa&&s_reports.count==1);
     fixture_completed=fixture_issued;cellGcm_rsx_process_fifo();
     assert(vm_read32(label_ea)==0x55667788&&!s_reports.count);
+    /* NV308A inline data lands at its stream position after an earlier
+     * deferred NV406E release has published. The default barrier also drains
+     * GPU work once; the opt-in shortcut keeps only that report ordering. */
+    s_config.localAddress=0;
+    for(int mode=0;mode<2;mode++){
+        s_inline_no_gpu_wait=mode;
+        u32 dst=0x2200000+(u32)mode*0x1000;raw32(dst,0);raw32(dst+4,0);
+        label_ea=GCM_LABEL_GUEST_BASE+0x940;raw32(label_ea,0xaaaaaaaa);
+        const u32 w[]={0x40064,0x940,0x4006c,0x01020304,
+            (1u<<18)|(2u<<13)|0x184u,0xfeed0000,(1u<<18)|(2u<<13)|0x30cu,dst,
+            (1u<<18)|(2u<<13)|0x304u,0x01000000,(1u<<18)|(4u<<13)|0x304u,0,
+            (2u<<18)|(4u<<13)|0x400u,0xcafef00d,0x12345678};
+        for(unsigned i=0;i<sizeof w/sizeof w[0];i++)raw32(0x100000+i*4,w[i]);
+        fixture_completed=UINT64_MAX;cellGcm_syscall_set_fifo((u32)sizeof w,0);
+        unsigned before=checked_flushes;cellGcm_rsx_process_fifo();
+        assert(vm_read32(label_ea)==0x01020304&&!s_reports.count);
+        assert(vm_read32(dst)==0xcafef00d&&vm_read32(dst+4)==0x12345678);
+        assert(checked_flushes-before==(mode?0u:1u));
+    }
+    s_inline_no_gpu_wait=0;fixture_completed=fixture_issued;
     /* GPU error is sticky and never publishes success or grants a VM lease. */
     raw32(watched+12,0x10000);
     cellGcm_rsx_consumer_begin();gcm_get_report(0x01000430);cellGcm_rsx_consumer_end();
@@ -186,7 +206,7 @@ void rsx_draw_engine_guest_read(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b;
 void rsx_draw_engine_guest_wrote(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b;(void)c;(void)d;(void)e;}
 void rsx_draw_engine_note_flip(u32 a) {(void)a;}
 int rsx_draw_engine_checked_ready(void) { return 1; }
-int rsx_draw_engine_flush_checked(void) { return fixture_gpu_error?0:1; }
+int rsx_draw_engine_flush_checked(void) { checked_flushes++; return fixture_gpu_error?0:1; }
 
 /* Backend boundary required by the production guest-memory transfer path. */
 void rsx_draw_engine_mark_guest_dirty(u32 ea,u32 len) { (void)ea; (void)len; }

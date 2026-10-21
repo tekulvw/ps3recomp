@@ -1118,6 +1118,29 @@ static int gcm_reports_sync_barrier_at(u32 reason){
     if(start){uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};ps3_critical_emit_capture(capture,19,reason,0,w,7);}
     return ok;
 }
+/* NV308A/NV309E inline image data is applied below as an immediate CPU write
+ * at its stream position. It must not overtake earlier deferred guest reports
+ * or labels, so those publish first. The default barrier additionally commits
+ * all recorded GPU work and waits for it. That wait protects no data here: the
+ * register-file engine snapshots vertex, constant and texture bytes when it
+ * records a draw, and the backend never reads guest memory in place. It does
+ * cost one GPU round trip per packet -- every cellGcmSetFragmentProgramParameter
+ * -- about 1,100 per frame in MAG's menu. PS3RECOMP_GCM_INLINE_NO_GPU_WAIT=1
+ * keeps only the report ordering. Opt-in while it is measured. */
+static int s_inline_no_gpu_wait=-1;
+static int gcm_inline_image_barrier(void){
+    if(s_inline_no_gpu_wait<0){
+        const char *e=getenv("PS3RECOMP_GCM_INLINE_NO_GPU_WAIT");
+        s_inline_no_gpu_wait=e&&!strcmp(e,"1");
+    }
+    if(!s_inline_no_gpu_wait||!s_deferred_reports)return gcm_reports_sync_barrier();
+    uint64_t capture=ps3_critical_capture_id(),start=ps3_critical_enabled()?ps3_critical_now_ns():0;
+    uint64_t pending=s_reports.count,issued=s_reports.issued,published=s_reports.published;
+    int ok=gcm_reports_dependency();
+    if(ok&&rsx_live_draw_enabled())rsx_live_draw_flush();
+    if(start){uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};ps3_critical_emit_capture(capture,19,__LINE__,0,w,7);}
+    return ok;
+}
 /* Label writes retain the existing value/byte-order semantics, but release
  * guest reuse only after the same genuine ordered GPU completion as reports. */
 static int gcm_defer_label(u32 ea,u32 value,u32 method,u32 fifo_ea){
@@ -2705,7 +2728,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             }
             if(count && (subch==4u||subch==5u) && method<=0x7fcu &&
                (method>=0x400u || (type==0u && (u64)method+(u64)(count-1u)*4u>=0x400u)) &&
-               !gcm_reports_sync_barrier())return;
+               !gcm_inline_image_barrier())return;
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
