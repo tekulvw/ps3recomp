@@ -57,6 +57,7 @@ void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_loc
 void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
 #else
 #include <pthread.h>
+#include <time.h>
 /* The owner may be descheduled or wake a host channel waiter while holding
  * this global lock. An unbounded exchange loop then consumes whole cores and
  * competes with the owner and the remaining SPU workers. Let the host park
@@ -65,8 +66,18 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
 static pthread_mutex_t g_lockline = PTHREAD_MUTEX_INITIALIZER;
 /* Hold times are a line copy and a short list walk, far shorter than a
  * kernel park and wake, and every SPU's policy module polls through here.
- * Retry for a few microseconds before parking; the trylock is spaced out so
- * the waiters do not keep stealing the lock's cache line from its owner. */
+ * Retry before parking; the trylocks are spaced out so the waiters do not
+ * keep stealing the lock's cache line from its owner. */
+static inline uint64_t spu_lockline_now_ns(void)
+{
+#if defined(__APPLE__)
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+#endif
+}
 static inline void spu_lockline_relax(void)
 {
 #if defined(__aarch64__)
@@ -127,9 +138,16 @@ void spu_lockline_lock(void)
         if (s_llp_on < 0) s_llp_on = getenv("SPU_LOCKLINE_PROFILE") != NULL;
         if (s_llp_on) { spu_lockline_lock_profiled(site); return; }
     }
-    for (unsigned attempt = 0; attempt < 32; ++attempt) {
+    if (!pthread_mutex_trylock(&g_lockline)) return;
+    /* Up to 20 us of exponentially spaced retries, then park. A yield is
+     * nearly free on current cores, so a count-bounded spin gave up after
+     * about a microsecond and most contended waiters paid a kernel park and
+     * wake for a sub-microsecond critical section. */
+    const uint64_t give_up = spu_lockline_now_ns() + 20000u;
+    for (unsigned backoff = 16;; backoff = backoff < 1024u ? backoff * 2u : backoff) {
+        for (unsigned i = 0; i < backoff; ++i) spu_lockline_relax();
         if (!pthread_mutex_trylock(&g_lockline)) return;
-        for (unsigned i = 0; i < 32; ++i) spu_lockline_relax();
+        if (spu_lockline_now_ns() >= give_up) break;
     }
     if (pthread_mutex_lock(&g_lockline)) abort();
 }
