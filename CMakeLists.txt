@@ -422,6 +422,15 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_spu_lockline_wait PRIVATE Threads::Threads)
         add_test(NAME spu_lockline_wait COMMAND test_spu_lockline_wait)
         set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
+
+        # The vector single-precision ops against the exact per-lane references.
+        add_executable(test_spu_float_exact
+            runtime/spu/tests/test_spu_float_exact.c)
+        target_include_directories(test_spu_float_exact PRIVATE include runtime/spu)
+        target_compile_options(test_spu_float_exact PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_float_exact PRIVATE m)
+        add_test(NAME spu_float_exact COMMAND test_spu_float_exact)
+        set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
     endif()
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
