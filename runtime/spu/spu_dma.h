@@ -958,6 +958,50 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  * Submit and immediately execute an MFC command.
  * This is the main entry point called when the SPU writes to MFC_Cmd.
  */
+/* SPU_DMA_REPEAT_LOG support (see mfc_submit). Per-thread episode clock and
+ * counters; the per-image totals are per thread too, so no line is shared. */
+static inline uint64_t spu_dma_repeat_now_us(void)
+{
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64() * 1000u;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+#endif
+}
+static SPU_THREAD_LOCAL struct {
+    uint64_t start_us, lines, episodes;
+    uint32_t start_pc;
+    struct { int image; uint64_t n, us; } tot[16];
+} t_dma_repeat_log;
+static inline void spu_dma_repeat_log_start(const spu_context* spu)
+{
+    t_dma_repeat_log.start_us = spu_dma_repeat_now_us();
+    t_dma_repeat_log.start_pc = (uint32_t)spu->pc & SPU_LS_MASK;
+}
+static inline void spu_dma_repeat_log_end(const spu_context* spu, uint32_t ea, uint32_t lsa, uint32_t reps, int64_t limit)
+{
+    const uint64_t us = spu_dma_repeat_now_us() - t_dma_repeat_log.start_us;
+    if (t_dma_repeat_log.lines < (uint64_t)limit) {
+        t_dma_repeat_log.lines++;
+        fprintf(stderr, "[dma-repeat] spu=%u img=%d pc=0x%05X ea=0x%08X lsa=0x%05X size=%u repeats=%u us=%llu\n",
+                spu->spu_id & 7u, spu->image_id, t_dma_repeat_log.start_pc, ea, lsa, spu->mfc_size, reps,
+                (unsigned long long)us);
+    }
+    for (int i = 0; i < 16; i++) {
+        if (t_dma_repeat_log.tot[i].n && t_dma_repeat_log.tot[i].image != spu->image_id) continue;
+        t_dma_repeat_log.tot[i].image = spu->image_id; t_dma_repeat_log.tot[i].n++; t_dma_repeat_log.tot[i].us += us;
+        break;
+    }
+    if ((++t_dma_repeat_log.episodes % 4096u) == 0) {
+        fprintf(stderr, "[dma-repeat] spu=%u %llu episodes:", spu->spu_id & 7u, (unsigned long long)t_dma_repeat_log.episodes);
+        for (int i = 0; i < 16 && t_dma_repeat_log.tot[i].n; i++)
+            fprintf(stderr, " img%d n=%llu us=%llu", t_dma_repeat_log.tot[i].image,
+                    (unsigned long long)t_dma_repeat_log.tot[i].n, (unsigned long long)t_dma_repeat_log.tot[i].us);
+        fputc(10, stderr);
+    }
+}
+
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
@@ -1293,10 +1337,20 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                       s_secs = e ? strtoull(e, 0, 0) : 30u;
                       e = getenv("SPU_DMA_REPEAT_BACKOFF_MS");
                       s_backoff_ms = e ? strtoull(e, 0, 0) : 2u; }
+      /* SPU_DMA_REPEAT_LOG=<n>: report the first n repeat episodes per
+       * thread as they end (image, pc, transfer, repeats, duration), and a
+       * per-image total every 4096 episodes. Says what a job is polling and
+       * how long it waits -- the watchdog's back-off is on the critical path
+       * only when such episodes are. Unset: no cost beyond the existing test. */
+      static int64_t s_log = -1;
+      if (s_log < 0) { const char* e = getenv("SPU_DMA_REPEAT_LOG"); s_log = e ? atoll(e) : 0; }
       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
           if (++s_rep >= s_limit) {
               unsigned long long now = ps3_ms_now();
-              if (!s_since) s_since = now;
+              if (!s_since) {
+                  s_since = now;
+                  if (s_log) spu_dma_repeat_log_start(spu);
+              }
               if (now - s_since >= s_secs * 1000u) {
                   s_rep = 0; s_since = 0;   /* re-arm: the chain may run this job again */
                   extern void spu_halt(spu_context*);
@@ -1317,7 +1371,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               else if (now - s_since < s_backoff_ms) SwitchToThread();
               else Sleep(1);
           }
-      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0; }
+      } else {
+          if (s_log && s_rep >= s_limit) spu_dma_repeat_log_end(spu, s_last_ea, s_last_lsa, s_rep, s_log);
+          s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0;
+      }
 #undef s_last_ea
 #undef s_last_lsa
 #undef s_rep
