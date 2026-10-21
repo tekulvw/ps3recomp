@@ -2513,13 +2513,6 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
                 ea, size, os, on, ns, nn); }
 }
 
-static int spu_overlay_get_touches_code(const spu_ovl_src* o, uint32_t lsa, uint32_t size)
-{
-    for (unsigned i = 0; i < o->code_count; ++i)
-        if (lsa < o->code[i].lsa + o->code[i].size && o->code[i].lsa < lsa + size) return 1;
-    return 0;
-}
-
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
@@ -2529,14 +2522,6 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base) {
-            /* A verified region is identified by its code segments alone. A
-             * transfer into the rest of its span -- the job's own data -- can
-             * change no code byte, so it leaves the owner and its verdict in
-             * place; dropping them sent every later indirect branch of the
-             * running job to the interpreter. */
-            if (ctx->resident_code[slot].verify_state &&
-                !spu_overlay_get_touches_code(&s_ovl_src[ctx->resident_code[slot].source_index], lsa, size))
-                continue;
             if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
                 { static int s_log = -1; static atomic_int s_n;
                   if (s_log < 0) s_log = getenv("SPU_RESIDENCY_CLEAR_LOG") != NULL;
