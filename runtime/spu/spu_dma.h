@@ -971,13 +971,14 @@ static inline uint64_t spu_dma_repeat_now_us(void)
 }
 static SPU_THREAD_LOCAL struct {
     uint64_t start_us, lines, episodes;
-    uint32_t start_pc;
+    uint32_t start_pc, size;
     struct { int image; uint64_t n, us; } tot[16];
 } t_dma_repeat_log;
 static inline void spu_dma_repeat_log_start(const spu_context* spu)
 {
     t_dma_repeat_log.start_us = spu_dma_repeat_now_us();
     t_dma_repeat_log.start_pc = (uint32_t)spu->pc & SPU_LS_MASK;
+    t_dma_repeat_log.size = spu->mfc_size;   /* the repeated transfer's, not the one that ends the episode */
 }
 static inline void spu_dma_repeat_log_end(const spu_context* spu, uint32_t ea, uint32_t lsa, uint32_t reps, int64_t limit)
 {
@@ -985,7 +986,7 @@ static inline void spu_dma_repeat_log_end(const spu_context* spu, uint32_t ea, u
     if (t_dma_repeat_log.lines < (uint64_t)limit) {
         t_dma_repeat_log.lines++;
         fprintf(stderr, "[dma-repeat] spu=%u img=%d pc=0x%05X ea=0x%08X lsa=0x%05X size=%u repeats=%u us=%llu\n",
-                spu->spu_id & 7u, spu->image_id, t_dma_repeat_log.start_pc, ea, lsa, spu->mfc_size, reps,
+                spu->spu_id & 7u, spu->image_id, t_dma_repeat_log.start_pc, ea, lsa, t_dma_repeat_log.size, reps,
                 (unsigned long long)us);
     }
     for (int i = 0; i < 16; i++) {
