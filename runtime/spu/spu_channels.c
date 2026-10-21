@@ -74,6 +74,12 @@ static uint64_t spu_host_ns(void)
     return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
          + (uint64_t)(c.QuadPart % s_freq.QuadPart) * 1000000000ull
            / (uint64_t)s_freq.QuadPart;
+#elif defined(__APPLE__)
+    /* CLOCK_MONOTONIC on Darwin is gettimeofday plus the boot time, two
+     * calls per read; the raw monotonic clock is the commpage counter. Both
+     * are monotonic nanoseconds from an arbitrary origin, which is all the
+     * decrementer needs, and the raw clock is not slewed. */
+    return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
