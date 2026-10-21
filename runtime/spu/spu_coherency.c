@@ -120,9 +120,12 @@ static __attribute__((noinline)) void spu_lockline_lock_profiled(uintptr_t site)
 }
 void spu_lockline_lock(void)
 {
+    /* Taken here: a cold-split profiling branch would report its own caller. */
+    uintptr_t site = (uintptr_t)__builtin_return_address(0);
+    __asm__ __volatile__("" : "+r"(site));
     if (__builtin_expect(s_llp_on != 0, 0)) {
         if (s_llp_on < 0) s_llp_on = getenv("SPU_LOCKLINE_PROFILE") != NULL;
-        if (s_llp_on) { spu_lockline_lock_profiled((uintptr_t)__builtin_return_address(0)); return; }
+        if (s_llp_on) { spu_lockline_lock_profiled(site); return; }
     }
     for (unsigned attempt = 0; attempt < 32; ++attempt) {
         if (!pthread_mutex_trylock(&g_lockline)) return;
