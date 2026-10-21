@@ -2237,6 +2237,22 @@ static void spu_overlay_residency_stats(void)
     if (now < due || !atomic_compare_exchange_strong(&next_ms, &due, now + 2000)) return;
     spu_overlay_residency_print();
 }
+/* PS3_FTRACE job spans: the job running on this SPU thread, from its first
+ * verified dispatch until the next job's or the end of the policy-module run
+ * (spu_ft_job_end, called by the SPURS worker). */
+static SPU_TLS struct { uint64_t t0; uint32_t spu, image; } t_ft_job;
+static void spu_ft_job_begin(const spu_context* ctx, int image)
+{
+    const uint64_t now = ps3_ft_now();
+    if (t_ft_job.image) ps3_ft_span(PS3_FT_SPU_JOB, t_ft_job.spu, t_ft_job.image, 0, t_ft_job.t0, now);
+    t_ft_job.t0 = now; t_ft_job.spu = ctx->spu_id; t_ft_job.image = (uint32_t)image;
+}
+void spu_ft_job_end(void)
+{
+    if (!t_ft_job.image) return;
+    ps3_ft_span(PS3_FT_SPU_JOB, t_ft_job.spu, t_ft_job.image, 0, t_ft_job.t0, ps3_ft_now());
+    t_ft_job.image = 0;
+}
 static int spu_overlay_code_matches(const spu_context* ctx, const spu_ovl_src* o)
 {
     for (unsigned i = 0; i < o->code_count; ++i)
@@ -2251,6 +2267,8 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
     if (*state == SPU_OVERLAY_PENDING) {
         atomic_fetch_add_explicit(&s_ovl_res_checks, 1, memory_order_relaxed);
         *state = spu_overlay_code_matches(ctx, o) ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
+        if (*state == SPU_OVERLAY_VERIFIED && PS3_FT_ON())
+            spu_ft_job_begin(ctx, ctx->resident_code[slot].image_id);
         if (*state == SPU_OVERLAY_REJECTED)
             atomic_fetch_add_explicit(&s_ovl_res_rejects, 1, memory_order_relaxed);
     } else if (*state == SPU_OVERLAY_VERIFIED && spu_overlay_residency_shadow()) {

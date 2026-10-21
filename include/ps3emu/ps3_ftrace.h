@@ -57,6 +57,8 @@ enum ps3_ft_kind {
     PS3_FT_GPU_EXEC    = 14, /* Metal: a command buffer's own GPU time, ending when the CPU saw it
                               * complete; who = render passes, a = depth resolves | colour copies << 16,
                               * b = 1 present / 0 flush */
+    PS3_FT_SPU_JOB     = 15, /* who = SPU id, a = streamed job image, from its first verified
+                              * dispatch to the next job's or the end of the policy-module run */
 };
 
 #if defined(_MSC_VER)
