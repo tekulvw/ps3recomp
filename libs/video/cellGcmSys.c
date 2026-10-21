@@ -1759,9 +1759,14 @@ static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
 static atomic_int s_checked_ref_failed;
 static u64 s_checked_ref_receipt;
 static u64 s_ref_receipts[GCM_REF_QLEN];
+/* Read several times per command packet. A FIFO drain pass takes one reading
+ * at its start (s_checked_ref_pass); outside a pass the environment is read
+ * as before, so a caller that changes it between passes still sees the change. */
+static int s_checked_ref_pass = -1;
 static int gcm_checked_ref_mode(void)
 {
     if(cellGcm_native_consumer_enabled())return s_native_checked_ref;
+    if (s_checked_ref_pass >= 0) return s_checked_ref_pass;
     const char* e = getenv("PS3RECOMP_GCM_CHECKED_REF");
     return e && !strcmp(e, "1");
 }
@@ -2274,12 +2279,29 @@ static int gcm_get_eq_put(void)
     return eq;
 }
 
+static void gcm_rsx_process_fifo_pass(void);
 static void gcm_rsx_process_fifo_unlocked(void)
+{
+    const char* e = getenv("PS3RECOMP_GCM_CHECKED_REF");
+    s_checked_ref_pass = e && !strcmp(e, "1");
+    gcm_rsx_process_fifo_pass();
+    s_checked_ref_pass = -1;
+}
+
+/* Diagnostic switches the walker tests on every pass or semaphore: read once. */
+static int gcm_env_flag(int* cached, const char* name)
+{
+    if (*cached < 0) *cached = getenv(name) != NULL;
+    return *cached;
+}
+
+static void gcm_rsx_process_fifo_pass(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
-      if (getenv("GCM_RATE")) {
+      static int s_rate = -1;
+      if (gcm_env_flag(&s_rate, "GCM_RATE")) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
@@ -2321,7 +2343,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
      * its own, every field below moves with it and the FIFO the runtime walks
      * stops being the one the title fills. Reported on change, not per tick. */
-    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+    static int s_ctxdbg = -1;
+    if (gcm_env_flag(&s_ctxdbg, "GCM_CTXDBG") && s_gcm_ctx_out_ea) {
         static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
         u32 ptr = vm_read32(s_gcm_ctx_out_ea);
         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
@@ -2354,7 +2377,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * two very different causes -- we missed the command, or it was never
      * submitted -- and only a direct scan of the ring separates them. */
     { static int scanned = 0;
-      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+      static int s_scanref = -1;
+      if (!scanned && gcm_env_flag(&s_scanref, "GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
         unsigned found = 0;
         for (u32 io = 0; io + 8 <= put; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
@@ -2659,7 +2683,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
-                    { static int sn = 0; if (getenv("GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
+                    { static int sn = 0, recdbg = -1; if (gcm_env_flag(&recdbg, "GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     if(m==0x68u&&!gcm_reports_sync_barrier()){sem_blocked=1;break;}
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
