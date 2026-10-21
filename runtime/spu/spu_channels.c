@@ -2187,17 +2187,73 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     return 1;
 }
 
+/* Opt-in diagnostics. SPU_OVERLAY_RESIDENCY_SHADOW=1 re-compares on every
+ * residency dispatch and counts disagreements (a disagreement also rejects,
+ * so shadow mode never runs mismatched code). SPU_OVERLAY_RESIDENCY_STATS=1
+ * prints the counters at most every two seconds. */
+static atomic_ullong s_ovl_res_loads, s_ovl_res_checks, s_ovl_res_rejects,
+    s_ovl_res_dispatches, s_ovl_res_refused, s_ovl_res_shadow, s_ovl_res_shadow_bad;
+static int spu_overlay_residency_option(const char* name)
+{
+    const char* e = getenv(name);
+    return e && !strcmp(e, "1");
+}
+static int spu_overlay_residency_shadow(void)
+{
+    static int on = -1;
+    if (on < 0) on = spu_overlay_residency_option("SPU_OVERLAY_RESIDENCY_SHADOW");
+    return on;
+}
+static void spu_overlay_residency_print(void)
+{
+    fprintf(stderr, "[spu overlay residency] loads=%llu checks=%llu rejects=%llu dispatches=%llu"
+            " refused=%llu shadow_checks=%llu shadow_mismatches=%llu\n",
+            atomic_load(&s_ovl_res_loads), atomic_load(&s_ovl_res_checks),
+            atomic_load(&s_ovl_res_rejects), atomic_load(&s_ovl_res_dispatches),
+            atomic_load(&s_ovl_res_refused), atomic_load(&s_ovl_res_shadow),
+            atomic_load(&s_ovl_res_shadow_bad));
+}
+static void spu_overlay_residency_stats(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = spu_overlay_residency_option("SPU_OVERLAY_RESIDENCY_STATS");
+        if (on) atexit(spu_overlay_residency_print);
+    }
+    if (!on) return;
+    static atomic_ullong next_ms;
+    extern unsigned long long ps3_ms_now(void);
+    unsigned long long now = ps3_ms_now(), due = atomic_load_explicit(&next_ms, memory_order_relaxed);
+    if (now < due || !atomic_compare_exchange_strong(&next_ms, &due, now + 2000)) return;
+    spu_overlay_residency_print();
+}
+static int spu_overlay_code_matches(const spu_context* ctx, const spu_ovl_src* o)
+{
+    for (unsigned i = 0; i < o->code_count; ++i)
+        if (memcmp(ctx->ls + o->code[i].lsa, o->code[i].bytes, o->code[i].size)) return 0;
+    return 1;
+}
+
 static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
 {
     int* state = &ctx->resident_code[slot].verify_state;
+    const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
     if (*state == SPU_OVERLAY_PENDING) {
-        const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
-        int match = 1;
-        for (unsigned i = 0; match && i < o->code_count; ++i)
-            match = !memcmp(ctx->ls + o->code[i].lsa, o->code[i].bytes, o->code[i].size);
-        *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
+        atomic_fetch_add_explicit(&s_ovl_res_checks, 1, memory_order_relaxed);
+        *state = spu_overlay_code_matches(ctx, o) ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
+        if (*state == SPU_OVERLAY_REJECTED)
+            atomic_fetch_add_explicit(&s_ovl_res_rejects, 1, memory_order_relaxed);
+    } else if (*state == SPU_OVERLAY_VERIFIED && spu_overlay_residency_shadow()) {
+        atomic_fetch_add_explicit(&s_ovl_res_shadow, 1, memory_order_relaxed);
+        if (!spu_overlay_code_matches(ctx, o)) {
+            atomic_fetch_add_explicit(&s_ovl_res_shadow_bad, 1, memory_order_relaxed);
+            *state = SPU_OVERLAY_REJECTED;
+        }
     }
-    return *state == SPU_OVERLAY_VERIFIED;
+    const int ok = *state == SPU_OVERLAY_VERIFIED;
+    atomic_fetch_add_explicit(ok ? &s_ovl_res_dispatches : &s_ovl_res_refused, 1, memory_order_relaxed);
+    spu_overlay_residency_stats();
+    return ok;
 }
 
 /* Register one-way runtime entries that replace the guest call stack.
@@ -2380,6 +2436,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].source_ea = ea;
                     ctx->resident_code[slot].image_id = o->image_id;
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
+                    if (o->code) atomic_fetch_add_explicit(&s_ovl_res_loads, 1, memory_order_relaxed);
                     ctx->resident_code[slot].source_index = i;
                     return;
                 }

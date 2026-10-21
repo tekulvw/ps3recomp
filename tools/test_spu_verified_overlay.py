@@ -68,6 +68,11 @@ with tempfile.TemporaryDirectory(prefix='spu-verified-overlay-') as td:
   if r.returncode and 'FAIL:' not in r.stdout:print(r.stdout,r.stderr)
   return r
  original=work/'spu_recomp.c';r=run(original,'guarded');assert r.returncode==0
+ # Residency diagnostics: shadow mode must refuse the test's untracked store.
+ shadow=subprocess.run([str(work/'guarded')],capture_output=True,text=True,timeout=20,env={**env,'SPU_OVERLAY_RESIDENCY_SHADOW':'1','SPU_OVERLAY_RESIDENCY_STATS':'1'})
+ stats=[l for l in shadow.stderr.splitlines() if l.startswith('[spu overlay residency]')]
+ print('residency-shadow',shadow.returncode,stats[-1] if stats else 'no stats',flush=True)
+ assert shadow.returncode==0 and stats and 'shadow_mismatches=1' in stats[-1]
  if os.environ.get('MUTANT')=='1':
   # Preserve the new registry but reproduce pre-feature direct function bodies.
   src=original.read_text();lines=src.splitlines();removed=[l for l in lines if 'spu_verified_code_enter' in l and '(ctx,' in l];assert len(removed)==2

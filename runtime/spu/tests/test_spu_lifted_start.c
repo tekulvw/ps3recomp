@@ -442,7 +442,10 @@ static void test_verified_resident_code_regions(void)
     check(spu_lifted_lookup(ctx, base) == code_verified, "matching load dispatches its lifted code");
     check(ctx->resident_code[0].verify_state == 2, "first dispatch verifies the load");
     ctx->ls[base] ^= 0xFF; /* an untracked store is not re-compared per transfer */
-    check(spu_lifted_lookup(ctx, base) == code_verified, "verified load dispatches without recomparison");
+    if (getenv("SPU_OVERLAY_RESIDENCY_SHADOW"))
+        check(spu_lifted_lookup(ctx, base) == NULL, "shadow mode detects and refuses a changed span");
+    else
+        check(spu_lifted_lookup(ctx, base) == code_verified, "verified load dispatches without recomparison");
 
     spu_overlay_note_get(ctx, ea + 0x200, ctx->ls + base + 0x200, 0x100);
     check(ctx->resident_code[0].verify_state == 1, "continuation GET re-arms verification");
