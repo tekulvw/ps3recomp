@@ -1115,19 +1115,26 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined 
 #define SPU_PARKED_MAX 64
 static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
 static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
+/* Number of occupied slots. Every committed lock line (each successful
+ * PUTLLC on every SPU) asks whether a parked task waits on it; with nothing
+ * parked -- the whole run, for a title that never parks a taskset task --
+ * that answer costs one load instead of a 64-slot scan. Relaxed: the scan
+ * it guards reads the slots without ordering too, and a parker that races a
+ * commit is covered by the same best-effort contract as before. */
+static volatile int s_parked_count;
 
 void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == 0) { s_parked_obj[i] = wait_obj; s_parked[i] = key; return; }
+        if (s_parked[i] == 0) { s_parked_obj[i] = wait_obj; s_parked[i] = key; __atomic_fetch_add(&s_parked_count, 1, __ATOMIC_RELAXED); return; }
 }
 
 void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == key) { s_parked[i] = 0; return; }
+        if (s_parked[i] == key) { s_parked[i] = 0; __atomic_fetch_sub(&s_parked_count, 1, __ATOMIC_RELAXED); return; }
 }
 
 /* Event bits owed to a task, keyed by the OBJECT it waits on (flag - 0x80).
@@ -1304,6 +1311,7 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
  * re-checks. */
 void spu_taskset_line_committed(uint32_t line)
 {
+    if (!__atomic_load_n(&s_parked_count, __ATOMIC_RELAXED)) return;
     for (int i = 0; i < SPU_PARKED_MAX; i++) {
         const uint64_t k = s_parked[i];
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
