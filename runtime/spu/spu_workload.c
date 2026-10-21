@@ -102,6 +102,49 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
     return h;
 }
 
+/* Dispatch fingerprints the whole image on the calling PPU thread, one byte at
+ * a time, for every task it starts: about a millisecond for each of MAG's two
+ * or three task starts per frame. Remember recent results by address and
+ * size, and reuse one only while a word-wise content hash -- several times
+ * faster than the byte-serial fingerprint -- still matches the bytes. */
+static uint64_t spu_workload_content_hash(const uint8_t* p, size_t n)
+{
+    uint64_t h[4] = { 0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull };
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32)
+        for (int k = 0; k < 4; ++k) {
+            uint64_t w;
+            memcpy(&w, p + i + 8 * k, 8);
+            h[k] = (h[k] ^ w) * 0x100000001B3ull;
+            h[k] ^= h[k] >> 29;
+        }
+    uint64_t r = h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7) ^ n;
+    for (; i < n; ++i) r = (r ^ p[i]) * 0x100000001B3ull;
+    return r;
+}
+static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, size_t n)
+{
+    enum { SLOTS = 8 };
+    static struct { const uint8_t* image; size_t n; uint64_t content, fp; } s_fp[SLOTS];
+    static unsigned s_next;
+    static SRWLOCK s_fp_lock = SRWLOCK_INIT;
+    const uint64_t content = spu_workload_content_hash(image, n);
+    AcquireSRWLockExclusive(&s_fp_lock);
+    for (unsigned i = 0; i < SLOTS; ++i)
+        if (s_fp[i].image == image && s_fp[i].n == n && s_fp[i].content == content) {
+            const uint64_t fp = s_fp[i].fp;
+            ReleaseSRWLockExclusive(&s_fp_lock);
+            return fp;
+        }
+    ReleaseSRWLockExclusive(&s_fp_lock);
+    const uint64_t fp = spu_workload_fingerprint(image, n);
+    AcquireSRWLockExclusive(&s_fp_lock);
+    const unsigned slot = s_next++ % SLOTS;
+    s_fp[slot].image = image; s_fp[slot].n = n; s_fp[slot].content = content; s_fp[slot].fp = fp;
+    ReleaseSRWLockExclusive(&s_fp_lock);
+    return fp;
+}
+
 /* ---- registry ---------------------------------------------------------- */
 
 #ifndef SPU_WORKLOAD_MAX
@@ -263,7 +306,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -950,7 +993,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -1383,7 +1426,7 @@ int spu_workload_dispatch_async_owned(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
