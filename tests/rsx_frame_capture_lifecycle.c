@@ -29,6 +29,19 @@ int main(int argc,char**argv)
  }
  char prefix[1024],request[1024],path[2048];snprintf(prefix,sizeof prefix,"%s/frame",argv[2]);snprintf(request,sizeof request,"%s/request",argv[2]);
  setenv("RSX_ENGINE_FRAME_CAPTURE",prefix,1);setenv("RSX_ENGINE_FRAME_CAPTURE_REQUEST",request,1);setenv("RSX_ENGINE_FRAME_CAPTURE_SESSION","neutral-session",1);
+ if(!strcmp(argv[1],"invalidlimit")){
+  setenv("RSX_ENGINE_FRAME_CAPTURE_LIMIT","13",1);write_text(request,"1\n");frame_capture_present(0,0);frame_capture_draw(0x1002,0);frame_capture_present(0,0);assert(!callbacks&&!s_frame_capture.enabled);return 0;
+ }
+ if(!strcmp(argv[1],"extended")){
+  setenv("RSX_ENGINE_FRAME_CAPTURE_LIMIT","12",1);
+  for(unsigned token=1;token<=12;token++){
+   char value[16];snprintf(value,sizeof value,"%u\n",token);write_text(request,value);frame_capture_present(0,0);frame_capture_draw(0x1002,0);frame_capture_present(0,0);assert(callbacks==token);
+  }
+  assert(s_frame_capture.gate.attempts==12&&s_frame_capture.gate.limit==12);
+  write_text(request,"13\n");frame_capture_present(0,0);frame_capture_draw(0x1002,0);frame_capture_present(0,0);assert(callbacks==12);
+  write_text(request,"1\n");frame_capture_present(0,0);assert(!s_frame_capture.gate.pending);return 0;
+ }
+ unsetenv("RSX_ENGINE_FRAME_CAPTURE_LIMIT");
  write_text(request,"1\n");frame_capture_present(0,0);frame_capture_draw(0x1002,0);
  snprintf(path,sizeof path,"%s-1.json",prefix);write_text(path,"OLD_RECEIPT");
  frame_capture_present(0,0);assert(!callbacks);FILE*f=fopen(path,"r");assert(f);char text[4096];assert(fread(text,1,11,f)==11);fclose(f);assert(!memcmp(text,"OLD_RECEIPT",11));

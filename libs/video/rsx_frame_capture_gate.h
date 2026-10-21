@@ -3,17 +3,31 @@
 #define RSX_FRAME_CAPTURE_GATE_H
 #include <stdint.h>
 typedef struct {
- unsigned last,pending,attempts,draws,unique,fixed,overflow;
+ unsigned last,pending,attempts,draws,unique,fixed,overflow,limit;
  uint32_t programs[1024],counts[1024];
 } rsx_frame_capture_gate;
 static inline void rsx_frame_capture_clear(rsx_frame_capture_gate*g)
 {g->draws=g->unique=g->fixed=g->overflow=0;}
+/* Strict finite diagnostic override; absent preserves the original four. */
+static inline unsigned rsx_frame_capture_limit(const char*text)
+{
+ if(!text)return 4;
+ if(!*text||*text=='0')return 0;
+ unsigned value=0;
+ for(const char*p=text;*p;p++){
+  if(*p<'0'||*p>'9')return 0;
+  value=value*10u+(unsigned)(*p-'0');if(value>12)return 0;
+ }
+ return value;
+}
 /* A new token only starts tracking at a present boundary. The following
  * boundary owns a complete interval. Stale/out-of-budget tokens never arm. */
 static inline int rsx_frame_capture_step(rsx_frame_capture_gate*g,unsigned request)
 {
+ const unsigned limit=g->limit?g->limit:4;
+ if(limit>12)return 0;
  if(request && request==g->pending){if(!g->draws)return 0;g->pending=0;++g->attempts;return 1;}
- if(request>g->last && request<=4 && g->attempts<4){
+ if(request>g->last && request<=limit && g->attempts<limit){
   g->last=request;g->pending=request;rsx_frame_capture_clear(g);
  }else if(g->pending){g->pending=0;rsx_frame_capture_clear(g);}
  return 0;
