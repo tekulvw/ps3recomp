@@ -2509,6 +2509,11 @@ static u32 s_eng_stage_used, s_eng_stage_cap;
  * every commit. A committed arena goes back to this pool when the GPU has
  * finished with it; recording continues in another. */
 static id<MTLBuffer> s_eng_stage_buf;
+/* Shared staging for eng_depth_readback, grown to the largest copy seen. A
+ * readback waits for its blit before returning, so one buffer serves every
+ * call; a fresh allocation per call paid for zero-filling the whole copy. */
+static id<MTLBuffer> s_eng_depth_staging;
+
 static NSMutableArray<id<MTLBuffer>>* s_eng_stage_pool;
 static pthread_mutex_t s_eng_stage_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 enum { ENG_STAGE_POOL_KEEP = 8 };
@@ -2877,6 +2882,7 @@ static void eng_shutdown(void* user)
     s_eng_fence_cbs=nil;s_eng_fence_next=s_eng_fence_completed=0;
     s_eng_stage_buf = nil; s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
+    s_eng_depth_staging = nil;
     pthread_mutex_lock(&s_eng_stage_pool_lock);
     [s_eng_stage_pool removeAllObjects];
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
@@ -4551,8 +4557,10 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
         (size_t)(h - 1u) > (SIZE_MAX - row_bytes) / out_pitch)
         return -1;
     @autoreleasepool {
-        id<MTLBuffer> staging = [s_dev newBufferWithLength:copy_pitch * h
-                                                 options:MTLResourceStorageModeShared];
+        if (!s_eng_depth_staging || [s_eng_depth_staging length] < copy_pitch * h)
+            s_eng_depth_staging = [s_dev newBufferWithLength:copy_pitch * h
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = s_eng_depth_staging;
         if (!staging || ![staging contents]) return -1;
         const u32 snap = eng_depth_snapshot(user, depth, (u32)[src width],
                                                         (u32)[src height]);
