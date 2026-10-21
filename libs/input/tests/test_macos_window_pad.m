@@ -8,6 +8,7 @@
 #include "../../../runtime/ppu/ppu_memory.h"
 
 uint8_t* vm_base;
+u32 cellGcm_flip_request_count(void) { return 0; }   /* PAD_CLOCK=flips (#344) */
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }

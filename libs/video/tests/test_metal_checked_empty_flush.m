@@ -1,4 +1,5 @@
 #include "../rsx_metal_backend.m"
+float cellAvconfExt_display_gamma(void){return 1.0f;}   /* identity present gamma */
 #include <assert.h>
 int cellGcm_native_consumer_enabled(void){return 0;}
 void cellGcm_fifo_kick_notify(void){assert(!"inactive native consumer must not be kicked");}

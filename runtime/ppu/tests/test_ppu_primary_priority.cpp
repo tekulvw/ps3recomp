@@ -17,6 +17,7 @@ void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
 void cellGcm_ref_on_poll(void) { std::abort(); }
 uint32_t g_gcm_consumer_put_wake_ea = 0;
 void cellGcm_fifo_kick_notify(void) { std::abort(); }
+void sys_memory_set_image_query(uint64_t (*)(uint64_t, uint64_t)) {}
 HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }
 BOOL CloseHandle(HANDLE) { std::abort(); }
 DWORD GetFileAttributesA(const char*) { std::abort(); }

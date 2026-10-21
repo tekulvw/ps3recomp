@@ -1,5 +1,6 @@
 /* Real Metal textures/readback; built by tools/test_metal_first_nonblack.py. */
 #include "../rsx_metal_backend.m"
+float cellAvconfExt_display_gamma(void){return 1.0f;}   /* identity present gamma */
 #include <assert.h>
 #include <unistd.h>
 

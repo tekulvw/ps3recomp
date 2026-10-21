@@ -18,6 +18,7 @@ int spu_coh_is_reserved(uint32_t a) { (void)a;return 0; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t a) { (void)a; }
+u32 cellGcm_flip_request_count(void) { return 0; }   /* PAD_CLOCK=flips (#344) */
 
 @interface PS3RecompPadView (SyntheticFocus)
 - (void)windowBecameKey:(NSNotification*)note;

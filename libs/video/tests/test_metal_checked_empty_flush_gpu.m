@@ -1,4 +1,5 @@
 #include "../rsx_metal_backend.m"
+float cellAvconfExt_display_gamma(void){return 1.0f;}   /* identity present gamma */
 #include <assert.h>
 #include <unistd.h>
 int cellGcm_native_consumer_enabled(void){return 0;}

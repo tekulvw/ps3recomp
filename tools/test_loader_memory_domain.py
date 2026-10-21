@@ -19,6 +19,7 @@ uint8_t* vm_base; uint32_t ppu_vm_size; uint32_t ppu_hle_inject_base=0x20000000u
 uint32_t vm_read32(uint64_t a){auto p=vm_base+a;return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3];}
 void vm_write32(uint64_t a,uint32_t x){auto p=vm_base+a;p[0]=x>>24;p[1]=x>>16;p[2]=x>>8;p[3]=x;}
 uint32_t ps3_mmapper_block_size(uint32_t id){return id==1?0x100000u:0x200000u;}
+static void ps3_output_trace_mapper(uint32_t,uint32_t,uint32_t,uint64_t,uint64_t,uint64_t,uint32_t,uint32_t,uint32_t,uint64_t){}
 void actual_loader_cases(ppu_context* ctx){switch(ctx->gpr[11]){
 '''
  post='''default:std::abort();}}

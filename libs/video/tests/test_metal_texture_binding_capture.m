@@ -1,4 +1,5 @@
 #include "../rsx_metal_backend.m"
+float cellAvconfExt_display_gamma(void){return 1.0f;}   /* identity present gamma */
 #include <assert.h>
 
 static void expect_file(const char* path, u32 pixels, const u8 rgba[4])

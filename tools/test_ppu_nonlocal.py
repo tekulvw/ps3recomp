@@ -44,6 +44,7 @@ PROGRAM = {
 
 DRIVER = r'''
 #include "ppu_recomp.h"
+#include "ps3emu/log_first.h"
 #include "diagnostics/ppu_call_span.h"
 #include <cassert>
 #include <cstdio>
@@ -217,7 +218,7 @@ def main():
         module=make_lifter(prefix='module_');module.header_name='module.h'
         (out/'module.h').write_text(module.emit_header());(out/'module.cpp').write_text(module.emit_source())
         (out/'lifted.cpp').write_text(lifter.emit_source());(out/'driver.cpp').write_text(runtime_driver())
-        command=[compiler,'-DPPU_NO_INLINE_LOADS','-I'+str(ROOT/'runtime/ppu'),'-I'+str(ROOT/'runtime'),'-std=c++20','-O2','-pthread',str(out/'lifted.cpp'),str(out/'module.cpp'),str(out/'driver.cpp'),'-o',str(out/'test')]
+        command=[compiler,'-DPPU_NO_INLINE_LOADS','-I'+str(ROOT/'include'),'-I'+str(ROOT/'runtime/ppu'),'-I'+str(ROOT/'runtime'),'-std=c++20','-O2','-pthread',str(out/'lifted.cpp'),str(out/'module.cpp'),str(out/'driver.cpp'),'-o',str(out/'test')]
         hook=ROOT/'runtime/syscalls/ppu_host_unwind.c'
         if hook.exists():
             obj=out/'hook.o';subprocess.run([shutil.which('clang') or 'cc','-c',str(hook),'-o',str(obj)],check=True)

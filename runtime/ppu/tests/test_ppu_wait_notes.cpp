@@ -3,6 +3,7 @@
 #include <thread>
 #include <vector>
 #include "platform/win32_compat.h"
+#include "ps3emu/log_first.h"
 static std::atomic<unsigned> clocks,locks;static volatile LONG* watched;
 static LONG counted(volatile LONG*p,LONG a,LONG b){if(p==watched)locks++;return InterlockedCompareExchange(p,a,b);}
 #define InterlockedCompareExchange counted

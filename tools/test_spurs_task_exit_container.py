@@ -19,6 +19,8 @@ static int reject_admission;
 int spu_taskset_lifecycle_create(uint32_t ea,int taskset2) {(void)ea;assert(!taskset2);return 1;}
 int spu_taskset_lifecycle_enter(uint32_t ea) {(void)ea;++entered;return reject_admission ? -1 : 1;}
 void spu_taskset_lifecycle_leave(uint32_t ea) {(void)ea;++left;}
+void spu_taskset_mark_running(uint32_t ea,uint32_t t) {(void)ea;(void)t;}
+void spu_taskset2_set_exit(uint32_t ea,uint32_t t,int set,uint32_t code) {(void)ea;(void)t;(void)set;(void)code;}
 static uint32_t expected_task;
 static uint32_t expected_flags=3, expected_result=0;
 static int inject_terminal;
