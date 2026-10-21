@@ -71,6 +71,13 @@ static int dma_disp_armed(void) {
     if(exists)InterlockedExchange(&s_dma_disposition.armed,1);
     return exists;
 }
+/* Read on every SPU DMA: a compare-and-swap here took the shared line
+ * exclusively from each SPU thread. A plain acquire load suffices. */
+#ifdef _WIN32
+#define DMA_DISP_READY_LOAD(p) InterlockedCompareExchange((p),0,0)
+#else
+#define DMA_DISP_READY_LOAD(p) __atomic_load_n((p),__ATOMIC_ACQUIRE)
+#endif
 void spu_dma_disposition_begin(spu_dma_disposition_token* t,uint32_t lsa,uint64_t ea,uint32_t size,uint32_t cmd) {
     int saved=errno;
 #ifdef _WIN32
@@ -78,7 +85,7 @@ void spu_dma_disposition_begin(spu_dma_disposition_token* t,uint32_t lsa,uint64_
 #endif
     audio_chronology_dma_begin(&t->chronology,ea,size,cmd);
     t->seq=0;
-    if(!InterlockedCompareExchange(&s_dma_disposition.ready,0,0))InitOnceExecuteOnce(&s_dma_disposition.once,dma_disp_init,NULL,NULL);
+    if(!DMA_DISP_READY_LOAD(&s_dma_disposition.ready))InitOnceExecuteOnce(&s_dma_disposition.once,dma_disp_init,NULL,NULL);
     if(s_dma_disposition.enabled && ea<=0xFFFFFFFFull && (uint64_t)size<=0x100000000ull-ea &&
        ea<s_dma_disposition.hi && ea+size>s_dma_disposition.lo &&
        (uint32_t)InterlockedCompareExchange(&s_dma_disposition.emitted,0,0)<s_dma_disposition.limit && dma_disp_armed()) {

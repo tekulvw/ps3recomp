@@ -120,8 +120,15 @@ static BOOL WINAPI ac_init(PINIT_ONCE once,PVOID arg,PVOID* out) {
     s_ac_notes.scalar_enabled=s_ac_notes.enabled && scalar && !strcmp(scalar,"1");
     InterlockedExchange(&s_ac.ready,1); return TRUE;
 }
+/* Read on every SPU DMA: a compare-and-swap here took the shared line
+ * exclusively from each SPU thread. A plain acquire load suffices. */
+#ifdef _WIN32
+#define AC_READY_LOAD(p) InterlockedCompareExchange((p),0,0)
+#else
+#define AC_READY_LOAD(p) __atomic_load_n((p),__ATOMIC_ACQUIRE)
+#endif
 static int ac_enabled(void) {
-    if(!InterlockedCompareExchange(&s_ac.ready,0,0))InitOnceExecuteOnce(&s_ac.once,ac_init,NULL,NULL);
+    if(!AC_READY_LOAD(&s_ac.ready))InitOnceExecuteOnce(&s_ac.once,ac_init,NULL,NULL);
     return s_ac.enabled;
 }
 /* All registry/record accesses are serialized. This lock NEVER protects audio
