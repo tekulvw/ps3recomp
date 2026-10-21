@@ -872,6 +872,23 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
+        /* A PUTLLC that must fail needs no lock: the reservation is already
+         * gone, or the line no longer matches the snapshot -- and every write
+         * after the snapshot ends the reservation (spu_coh_reserve_fast), so a
+         * mismatch seen here means the locked compare would fail too. Contended
+         * job claims fail often. Diagnostics that report failures keep the
+         * locked path. */
+        { static int s_fail_diag = -1;
+          if (s_fail_diag < 0) s_fail_diag = getenv("SPU_PUTLLC_WHY") || getenv("SPU_ATOM_EA");
+          extern uint32_t g_barrier_sync_watch;
+          if (!s_fail_diag && !g_barrier_sync_watch &&
+              (!__atomic_load_n(&ctx->resv_valid, __ATOMIC_ACQUIRE) || ctx->resv_ea != ea ||
+               memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) != 0)) {
+              ctx->atomic_stat = 1;                  /* PUTLLC_FAILURE -> retry */
+              __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
+              spu_dma_publication_observe_atomic(ctx, lsa, ea, cmd, SPU_DMA_ATOMIC_PUTLLC_FAILURE);
+              return 1;
+          } }
         spu_lockline_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
