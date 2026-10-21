@@ -28,10 +28,17 @@ LPVOID VirtualAlloc(LPVOID a, SIZE_T n, DWORD t, DWORD p)
 SIZE_T VirtualQuery(LPCVOID a, PMEMORY_BASIC_INFORMATION m, SIZE_T n)
 { (void)a; (void)m; (void)n; return 0; }
 void (*g_spu_put_hook)(uint32_t, uint32_t);
+/* Job I/O recorder (runtime/diagnostics): never armed here, so the fixture
+ * only needs the inactive pointer and an event sink that is never reached. */
+void* ps3_jobio_active;
+void ps3_jobio_event(struct spu_context* c, uint32_t k, uint32_t cmd, uint32_t lsa, uint64_t ea, uint32_t n, const uint8_t* b, uint32_t x)
+{ (void)c; (void)k; (void)cmd; (void)lsa; (void)ea; (void)n; (void)b; (void)x; }
 void* volatile g_sn_defer_ctx;
 volatile unsigned g_sn_defer;
 unsigned spu_sn_defer_ticks(void) { return 0; }
 void spu_ch_wake(spu_context* s) { (void)s; }
+/* Reached only by the identical-transfer watchdog, which no fixture trips. */
+void spu_halt(spu_context* s) { (void)s; abort(); }
 unsigned* spu_ls_watch_list(int* n) { *n=0; return NULL; }
 void spu_overlay_note_get(spu_context* s, uint32_t ea, const uint8_t* p, uint32_t n)
 { (void)s; (void)ea; (void)p; (void)n; }

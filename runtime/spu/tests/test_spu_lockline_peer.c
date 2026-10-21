@@ -57,6 +57,12 @@
 static uint8_t g_guest_mem[1u << 20];
 uint8_t* vm_base = g_guest_mem;
 uint32_t ppu_vm_size = 0;
+/* Job I/O recorder (runtime/diagnostics): never armed here, so the fixture
+ * only needs the inactive pointer and an event sink that is never reached. */
+struct spu_context;
+void* ps3_jobio_active;
+void ps3_jobio_event(struct spu_context* c, uint32_t k, uint32_t cmd, uint32_t lsa, uint64_t ea, uint32_t n, const uint8_t* b, uint32_t x)
+{ (void)c; (void)k; (void)cmd; (void)lsa; (void)ea; (void)n; (void)b; (void)x; }
 
 /* The unit under test. */
 #include "../spu_channels.c"
