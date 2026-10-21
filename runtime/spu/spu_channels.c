@@ -2219,10 +2219,17 @@ static int s_ovl_src_count = 0;
 
 /* Every MFC GET is checked against the registered sources, and a job that
  * streams its data in small pieces issues thousands of GETs a frame against
- * ~100 sources that can only match by EA. The set holds every registered
- * source EA, so a GET too small for a signature match and whose EA was never
- * registered skips the scan. Entries go in before the count that publishes
- * them, so a racing GET sees at most what the scan would. */
+ * up to SPU_OVL_SRC_MAX sources. A GET under 512 bytes can only match a
+ * source by EA (signature entries need >= 512 bytes), so keep every
+ * registered source EA in an insert-only open-addressed set and skip the
+ * scan for a small GET whose EA was never registered.
+ *
+ * The set is a superset of the EA-keyed entries the scan can see: it has
+ * four times as many slots as there can be sources (so an insert always
+ * finds a slot, and a probe always reaches an empty one), nothing is ever
+ * removed, and an EA is inserted before the source count that publishes its
+ * entry is release-stored. spu_overlay_note_get acquire-loads the count
+ * before probing, so any entry the scan would visit is already in the set. */
 #define SPU_OVL_EA_SET 512u
 static uint32_t s_ovl_ea_set[SPU_OVL_EA_SET];
 static uint8_t s_ovl_ea_used[SPU_OVL_EA_SET];
@@ -2245,7 +2252,7 @@ static int spu_ovl_ea_known(uint32_t ea)
         if (!__atomic_load_n(&s_ovl_ea_used[i], __ATOMIC_ACQUIRE)) return 0;
         if (s_ovl_ea_set[i] == ea) return 1;
     }
-    return 1;
+    return 1;   /* full (cannot happen): never filter */
 }
 
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
@@ -2255,7 +2262,7 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
-        s_ovl_src_count++;
+        __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
 }
 
@@ -2690,8 +2697,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             }
         }
     }
+    int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
     if (size < 512 && !spu_ovl_ea_known(ea)) return;
-    for (int i = 0; i < s_ovl_src_count; i++) {
+    for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
                              : (o->src_ea == ea);
