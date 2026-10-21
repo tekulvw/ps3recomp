@@ -1311,10 +1311,16 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
  * re-checks. */
 void spu_taskset_line_committed(uint32_t line)
 {
-    if (!__atomic_load_n(&s_parked_count, __ATOMIC_RELAXED)) return;
-    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+    /* Visit only as many occupied slots as are parked: a title that parks a
+     * few taskset tasks for its whole run otherwise paid the full 64-slot
+     * scan on every committed line. Slot order and the first match are
+     * exactly those of the full scan. */
+    int left = __atomic_load_n(&s_parked_count, __ATOMIC_RELAXED);
+    for (int i = 0; i < SPU_PARKED_MAX && left > 0; i++) {
         const uint64_t k = s_parked[i];
-        if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
+        if (!k) continue;
+        left--;
+        if ((((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
 #ifdef _WIN32
         AcquireSRWLockExclusive(&s_sig_lock);
         WakeAllConditionVariable(&s_sig_cv);
