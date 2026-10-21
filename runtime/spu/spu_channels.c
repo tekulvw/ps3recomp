@@ -2211,9 +2211,41 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
 
+/* Every MFC GET is checked against the registered sources, and a job that
+ * streams its data in small pieces issues thousands of GETs a frame against
+ * ~100 sources that can only match by EA. The set holds every registered
+ * source EA, so a GET too small for a signature match and whose EA was never
+ * registered skips the scan. Entries go in before the count that publishes
+ * them, so a racing GET sees at most what the scan would. */
+#define SPU_OVL_EA_SET 512u
+static uint32_t s_ovl_ea_set[SPU_OVL_EA_SET];
+static uint8_t s_ovl_ea_used[SPU_OVL_EA_SET];
+static unsigned spu_ovl_ea_slot(uint32_t ea) { return (ea * 0x9E3779B1u) >> 23; }
+static void spu_ovl_ea_add(uint32_t ea)
+{
+    for (unsigned i = spu_ovl_ea_slot(ea), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
+        if (__atomic_load_n(&s_ovl_ea_used[i], __ATOMIC_ACQUIRE)) {
+            if (s_ovl_ea_set[i] == ea) return;
+            continue;
+        }
+        s_ovl_ea_set[i] = ea;
+        __atomic_store_n(&s_ovl_ea_used[i], 1, __ATOMIC_RELEASE);
+        return;
+    }
+}
+static int spu_ovl_ea_known(uint32_t ea)
+{
+    for (unsigned i = spu_ovl_ea_slot(ea), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
+        if (!__atomic_load_n(&s_ovl_ea_used[i], __ATOMIC_ACQUIRE)) return 0;
+        if (s_ovl_ea_set[i] == ea) return 1;
+    }
+    return 1;
+}
+
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
+        spu_ovl_ea_add(content_ea);
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
@@ -2536,6 +2568,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
         }
     }
+    if (size < 512 && !spu_ovl_ea_known(ea)) return;
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
