@@ -104,7 +104,13 @@ static void dma_pub_log(const spu_context* s,uint32_t lsa,uint64_t ea,
  * reads, writes, callbacks, locks or transfer changes. */
 static void dma_pub_observe(const spu_context* s,uint32_t lsa,uint64_t ea,
     uint32_t size,uint32_t cmd,unsigned outcome) {
+    /* Read on every SPU DMA: a compare-and-swap here took the shared line
+     * exclusively from each SPU thread. A plain acquire load suffices. */
+#ifdef _WIN32
     if(!InterlockedCompareExchange(&s_dma_publication.ready,0,0))
+#else
+    if(!__atomic_load_n(&s_dma_publication.ready,__ATOMIC_ACQUIRE))
+#endif
         InitOnceExecuteOnce(&s_dma_publication.once,dma_pub_init,NULL,NULL);
     if(!s_dma_publication.span && !s_dma_publication.match) return;
     if(outcome) {
