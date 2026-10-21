@@ -1149,9 +1149,28 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * cache full evicts the least recently used entry rather than returning
  * nothing: returning white "made the recovered orphanage render as flat
  * green/black geometry" (rsx_live_draw.c:2326-2334). */
+/* RSX_TEXCACHE_STATS=1: texture-cache counters every two seconds (diagnostic). */
+static struct { u64 binds, scanned, sparse, full, uploads, upload_bytes, misses, picture; u64 t0; int on; } s_tcs = { .on = -1 };
+static void eng_texcache_stats_tick(void)
+{
+    if (s_tcs.on < 0) s_tcs.on = getenv("RSX_TEXCACHE_STATS") != NULL;
+    if (!s_tcs.on) return;
+    extern unsigned long long ps3_ms_now(void);
+    const u64 now = ps3_ms_now();
+    if (!s_tcs.t0) s_tcs.t0 = now;
+    if (now - s_tcs.t0 < 2000) return;
+    fprintf(stderr, "[texcache] per s: binds=%llu scanned=%llu sparse=%llu full=%llu uploads=%llu upload_MB=%.1f misses=%llu picture_binds=%llu entries=%u\n",
+            s_tcs.binds * 1000 / (now - s_tcs.t0), s_tcs.scanned * 1000 / (now - s_tcs.t0),
+            s_tcs.sparse * 1000 / (now - s_tcs.t0), s_tcs.full * 1000 / (now - s_tcs.t0),
+            s_tcs.uploads * 1000 / (now - s_tcs.t0), s_tcs.upload_bytes / 1048576.0 * 1000 / (now - s_tcs.t0),
+            s_tcs.misses * 1000 / (now - s_tcs.t0), s_tcs.picture * 1000 / (now - s_tcs.t0), g.n_textures);
+    memset(&s_tcs, 0, offsetof(__typeof__(s_tcs), t0)); s_tcs.t0 = now;
+}
 static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                             u32 levels, u32 pitch, int cube, u32 remap, u32 depth, u64 identity)
 {
+    eng_texcache_stats_tick();
+    s_tcs.binds++; if (identity) s_tcs.picture++;
     const u32 identity_span=eng_texture_span(fmt,w,h,levels,pitch,cube);
     if(!rsx_picture_ready())return 0;
     if(!identity && pic_requires_identity(location,offset,identity_span)){
@@ -1166,6 +1185,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
 
     for (u32 i = 0; i < g.n_textures; i++) {
         eng_texture* e = &g.textures[i];
+        s_tcs.scanned++;
         if (e->picture_identity != identity || e->location != location || e->offset != offset ||
             e->format != fmt || e->width != w || e->height != h ||
             e->pitch != pitch || e->remap != remap ||
@@ -1183,10 +1203,12 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              * full; guest textures use the sparse per-frame check. */
             const u64 sparse = identity ? 0 : eng_texture_sparse_hash(location, offset, span,
                                                                       &readable);
+            if (!identity) s_tcs.sparse++;
             if (identity || (readable && (sparse != e->sparse_hash ||
                              eng_texture_full_rehash(span, e->last_full_frame)))) {
                 hash = eng_texture_content_hash(location, offset, span, identity, &readable);
                 e->last_full_frame = g.frames;
+                s_tcs.full++;
             }
             if (readable && !identity) e->sparse_hash = sparse;
             e->last_hash_frame = g.frames;
@@ -1195,6 +1217,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             if (readable && hash != e->content_hash) {
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap, depth, identity);
+                s_tcs.uploads++; s_tcs.upload_bytes += span;
                 if (fresh) {
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
@@ -1206,6 +1229,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         return e->handle;
     }
 
+    s_tcs.misses++; s_tcs.uploads++; s_tcs.upload_bytes += span;
     u32 index;
     u32 evicted = 0;
     if (g.n_textures < ENG_MAX_TEXTURES) {
