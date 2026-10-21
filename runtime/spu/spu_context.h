@@ -397,6 +397,9 @@ typedef struct spu_context {
     uint32_t drain_ret_pc;
     uint32_t region_dispatch_depth, region_return_pc;
     int region_dispatch_valid, region_has_return;
+    /* Nonzero while this context is in the coherence holder list
+     * (spu_coherency.c); lets its GETLLAR skip the lock-line lock. */
+    int coh_listed;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module

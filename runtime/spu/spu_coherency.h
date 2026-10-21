@@ -51,6 +51,11 @@ void spu_lockline_unlock(void);
  * mark costs one locked PPU store to a line the kernel owns anyway. */
 void spu_coh_reserve(spu_context* ctx, uint32_t ea);
 
+/* GETLLAR fast path: publish ctx's reservation of ea without the lock-line
+ * lock when ctx is already a registered holder and the line already reserved.
+ * Returns 0 when the caller must take the lock and call spu_coh_reserve. */
+int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea);
+
 /* PPU load-reserve/store-conditional generation. Caller holds lock-line.
  * Tracking a line arms coherent writes and records every subsequent store,
  * including stores to a different word or stores which restore the old bytes. */

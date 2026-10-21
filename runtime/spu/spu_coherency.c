@@ -215,7 +215,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 
     if (!ctx) return;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
-        if (entry->ctx == ctx) return;
+        if (entry->ctx == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELEASE); return; }
     spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
     if (!entry) {
         fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
@@ -225,6 +225,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     entry->ctx = ctx;
     entry->next = s_coh_ctxs;
     s_coh_ctxs = entry;
+    __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELEASE);
 }
 
 void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
@@ -277,6 +278,7 @@ void spu_coh_unregister(spu_context* ctx)
     spu_lockline_lock();
     for (spu_coh_entry** link = &s_coh_ctxs; *link; link = &(*link)->next) {
         if ((*link)->ctx != ctx) continue;
+        __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELEASE);
         spu_coh_entry* entry = *link;
         *link = entry->next;
         free(entry);
@@ -342,18 +344,49 @@ void ppu_resv_break_line_absent(uint32_t ea) { (void)ea; }
 __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
 #endif
 
+/* GETLLAR without the lock-line lock (spu_coh_reserve_fast).
+ *
+ * A writer copies its data and then, in the notifiers below, ends the
+ * reservation of every holder of the line. The fast GETLLAR publishes its
+ * reservation and then reads the line. With a full fence between the two
+ * steps on both sides, at least one sees the other: either the reader's copy
+ * contains the write, or the writer sees the reservation and ends it -- and a
+ * reader whose reservation was ended may hold a torn copy, but its PUTLLC
+ * fails and it takes SPU_EVENT_LR, exactly as for a write after a clean read. */
+static inline void spu_coh_writer_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+static inline int spu_coh_holds(const spu_context* c, uint32_t line)
+{
+    return __atomic_load_n(&c->resv_valid, __ATOMIC_RELAXED) &&
+           (__atomic_load_n(&c->resv_ea, __ATOMIC_RELAXED) & ~127u) == line;
+}
+
+/* Only for a context already registered as a holder (coh_listed, set under the
+ * lock below and read here by the context's own thread) and a line already in
+ * the bitmap, so every writer of the line runs the notifier. Otherwise the
+ * caller takes the lock and spu_coh_reserve. */
+int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
+{
+    if (!__atomic_load_n(&ctx->coh_listed, __ATOMIC_ACQUIRE) || !spu_coh_is_reserved(ea)) return 0;
+    __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return 1;
+}
+
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
     ppu_resv_break_line(ea);
     epoch_written(line);
     spu_coh_wake_watches(line);
+    spu_coh_writer_fence();
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c || (const void*)c == self) continue;
-        if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
-            c->resv_valid = 0;
+        if (spu_coh_holds(c, line)) {
+            __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);
+            __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);
             g_spu_lr_raise++;
             spu_ch_wake(c);
         }
@@ -366,12 +399,13 @@ void spu_coh_notify_write(uint32_t ea)
     ppu_resv_break_line(ea);
     epoch_written(line);
     spu_coh_wake_watches(line);
+    spu_coh_writer_fence();
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c) continue;
-        if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
-            c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
+        if (spu_coh_holds(c, line)) {
+            __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);
+            __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation lost, PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who
              * took it away -- a peer SPU, or the PPU committing to the line. */
