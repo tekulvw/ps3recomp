@@ -700,29 +700,40 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
                 if (a == a1) break;
             }
-            if (span_reserved && a0 != a1 && !ps3_critical_write_watched(ea,size)) {
+            if (span_reserved && a0 != a1 && ((a1 - a0) >> 7) < 64u * 3u &&
+                !ps3_critical_write_watched(ea,size)) {
                 /* Only the reserved lines need the lock: they are the ones a
                  * peer's compare-and-commit can be inside. The others are
                  * copied first, without it, exactly as the unreserved path
-                 * copies a whole span (a line reserved meanwhile is caught by
-                 * the notify scan below, as there). A multi-line PUT that
-                 * touches one queue line no longer holds every other SPU's
-                 * atomics off for the whole copy. */
+                 * copies a whole span. The locked pass copies the lines the
+                 * first one skipped and notifies every reserved line. A line
+                 * reserved after its unlocked copy is notified but NOT copied
+                 * again: a peer may already have reserved and committed it on
+                 * top of our bytes, and a second copy would write that commit
+                 * back over. A multi-line PUT that touches one queue line no
+                 * longer holds every other SPU's atomics off for the whole
+                 * copy. A 16 KiB transfer spans at most 129 lines. */
+                uint64_t locked_lines[3] = {0, 0, 0};
                 spu_dma_disposition_before(&disposition, ls_ptr, ea, size);
                 const uint32_t ea32 = (uint32_t)ea;
-                for (uint32_t a = a0; ; a += 128u) {
+                uint32_t i = 0;
+                for (uint32_t a = a0; ; a += 128u, i++) {
                     const uint32_t lo = a > ea32 ? a - ea32 : 0u;
                     const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
-                    if (!spu_coh_is_reserved(a)) memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                    if (spu_coh_is_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
+                    else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                     if (a == a1) break;
                 }
                 spu_lockline_lock();
-                for (uint32_t a = a0; ; a += 128u) {
+                i = 0;
+                for (uint32_t a = a0; ; a += 128u, i++) {
                     const uint32_t lo = a > ea32 ? a - ea32 : 0u;
                     const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
-                    if (spu_coh_is_reserved(a)) {
+                    if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
                         memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                         spu_coh_notify_write_except(a, spu);
+                    } else if (spu_coh_is_reserved(a)) {
+                        spu_coh_notify_write_except(a, spu);   /* reserved after its copy */
                     }
                     if (a == a1) break;
                 }
