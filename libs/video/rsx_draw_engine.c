@@ -3829,7 +3829,14 @@ void rsx_draw_engine_shutdown(void)
     g.be = be;
 }
 
+static void eng_method_core(u32 method, u32 arg);
 void rsx_draw_engine_method(u32 method, u32 arg)
+{
+    ENG_PH_BEGIN(ph);
+    eng_method_core(method, arg);
+    ENG_PH_END(ENG_PH_METHOD, ph);
+}
+static void eng_method_core(u32 method, u32 arg)
 {
     if (!g.ready || !rsx_picture_ready()) return;
     /* The subchannel is a binding slot, not an engine selector, and a title

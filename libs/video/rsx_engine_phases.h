@@ -11,6 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#endif
 
 enum {
     ENG_PH_DRAW,        /* sink_end: one draw, everything included */
@@ -26,12 +29,13 @@ enum {
     ENG_PH_FLUSH_CHK,   /* rsx_draw_engine_flush_checked */
     ENG_PH_ASYNC,       /* rsx_draw_engine_submit_async */
     ENG_PH_PRESENT,     /* eng_present */
+    ENG_PH_METHOD,      /* rsx_draw_engine_method: every FIFO method, sinks included */
     ENG_PH_COUNT
 };
 
 static const char* const s_eng_ph_names[ENG_PH_COUNT] = {
     "draw", "bind", "zdepth", "zd_flush", "zd_read", "zd_store", "surf_guest",
-    "tex_hash", "tex_upload", "flush", "flush_chk", "async", "present"
+    "tex_hash", "tex_upload", "flush", "flush_chk", "async", "present", "method"
 };
 
 static int s_eng_ph_on = -1;
@@ -47,11 +51,19 @@ static inline int eng_ph_enabled(void)
     return s_eng_ph_on;
 }
 
+/* Read per FIFO method, so the cheapest clock there is: the Mach absolute
+ * time, a register read, in ns. */
 static inline uint64_t eng_ph_now(void)
 {
+#if defined(__APPLE__)
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    return mach_absolute_time() * tb.numer / tb.denom;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
 }
 
 #define ENG_PH_BEGIN(v) const uint64_t v = eng_ph_enabled() ? eng_ph_now() : 0
