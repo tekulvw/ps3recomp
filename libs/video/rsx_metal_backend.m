@@ -2742,10 +2742,26 @@ static u32 eng_obj_add(id<MTLTexture> t)
     if (s_eng_obj_free_count) {
         slot = s_eng_obj_free[--s_eng_obj_free_count];
     } else {
-        if (s_eng_obj_count >= ENG_MAX_OBJECTS) return 0;
+        if (s_eng_obj_count >= ENG_MAX_OBJECTS) {
+            static int logged;
+            if (!logged) {
+                logged = 1;
+                fprintf(stderr, "[rsx engine/metal] object table full (%u live textures/targets); "
+                        "creation fails from here -- a handle is not being released\n",
+                        (unsigned)ENG_MAX_OBJECTS);
+            }
+            return 0;
+        }
         slot = s_eng_obj_count++;
     }
     s_eng_obj[slot] = t;
+    /* RSX_ENG_COUNTS=1: live backend objects every 4096 creations, to show
+     * a long session stays bounded. */
+    { static int on = -1; static unsigned long long made;
+      if (on < 0) on = getenv("RSX_ENG_COUNTS") ? 1 : 0;
+      if (on && ++made % 4096 == 0)
+          fprintf(stderr, "[rsx engine counts] created=%llu live=%u/%u\n", made,
+                  (unsigned)(s_eng_obj_count - s_eng_obj_free_count), (unsigned)ENG_MAX_OBJECTS); }
     return slot + 1;
 }
 

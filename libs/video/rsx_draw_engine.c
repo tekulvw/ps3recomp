@@ -952,6 +952,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
 
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
+    if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
@@ -977,6 +978,12 @@ static u32 eng_zdepth_snapshot(u32 slot)
     if (!g.be->depth_snapshot) return 0;
     const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
     if (!tex) return 0;
+    /* The previous snapshot is stale (a clear invalidated it): release it.
+     * Overwriting the handle leaked one backend object per depth pass that a
+     * later pass sampled, and after some minutes of play the backend's object
+     * table was full, every surface create failed, and checked submission
+     * stopped report publication for good. */
+    if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
     z->snapshot = tex;
     z->snapshot_valid = 1;
     return tex;

@@ -1530,6 +1530,46 @@ static void test_depth_read_as_color(void)
     engine_down();
 }
 
+/* A depth map sampled pass after pass: each clear makes the next sample take
+ * a new backend snapshot, and the one it replaces must be released. Leaking
+ * it filled a backend's object table in a long session. */
+static void test_depth_snapshot_released(void)
+{
+    printf("-- depth snapshot replaced after a clear is released\n");
+    engine_up();
+    u32 prev = 0;
+    int leaked = 0, taken = 0;
+    for (int pass = 0; pass < 4; pass++) {
+        m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+        m(M_SURFACE_FORMAT, 8u | (2u << 5));
+        m(M_ZETA_OFFSET, ZETA_OFFSET);
+        m(M_ZETA_PITCH, 256u * 4u);
+        m(M_COLOR_A_OFFSET, 0x90000u);
+        m(M_COLOR_MASK, 0u);
+        m(M_CLEAR_BUFFERS, RSX_CLEAR_DEPTH);
+        m(M_DEPTH_TEST, 1u);
+        m(M_DEPTH_WRITE, 1u);
+        draw_triangle();
+        /* Sample it as DEPTH24_D8 from a pass with another zeta bound. */
+        m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
+        m(M_DEPTH_TEST, 0u);
+        m(M_DEPTH_WRITE, 0u);
+        m(M_COLOR_MASK, 0x01010101u);
+        bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+        m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((RSX_TEX_FMT_DEPTH24_D8 | 0x20u) << 8) | (1u << 16));
+        const int before = stub.n_depth_snapshot;
+        draw_triangle();
+        if (stub.n_depth_snapshot != before + 1) continue;
+        taken++;
+        const u32 snap = stub.bound_tex[0];
+        if (prev && stub.alive[prev]) leaked++;
+        prev = snap;
+    }
+    CHECK(taken == 4, "each pass after a clear takes a new snapshot (%d)", taken);
+    CHECK(leaked == 0, "every replaced snapshot was released (%d still alive)", leaked);
+    engine_down();
+}
+
 static void test_color_read_as_float(void)
 {
     printf("-- colour target read as X32_FLOAT\n");
@@ -1725,6 +1765,7 @@ int main(void)
     test_antialiased_surface();
     test_surface_reuse_antialias();
     test_depth_read_as_color();
+    test_depth_snapshot_released();
     test_color_read_as_float();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
