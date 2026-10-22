@@ -8,12 +8,14 @@
 #define RSX_DEFERRED_REPORT_BATCH 32u
 typedef struct rsx_deferred_report {
  uint64_t ticket,generation,vm,capture,start_ns;
+ uint64_t enqueued_ns,issued_ns; /* diagnostic clock (RSX_ENGINE_PHASES); 0 when off */
  uint32_t ea,argument,context,index,main_memory,operation; /* 0 report;1 label */
 } rsx_deferred_report;
 typedef struct rsx_deferred_report_queue {
  rsx_deferred_report records[RSX_DEFERRED_REPORT_CAPACITY];
  uint32_t head,count,unissued,failed,max_pending;
  uint64_t generation,issued,published;
+ uint64_t (*clock)(void); /* diagnostic: stamps issue times when set */
 } rsx_deferred_report_queue;
 typedef struct rsx_deferred_report_ops {
  void *user;
@@ -38,7 +40,7 @@ static int rsx_reports_fail(rsx_deferred_report_queue *q,const rsx_deferred_repo
 static int rsx_reports_issue(rsx_deferred_report_queue *q,const rsx_deferred_report_ops *o){
  if(q->failed)return 0;if(!q->unissued)return 1;
  uint64_t ticket=o->issue(o->user);if(!ticket)return rsx_reports_fail(q,q->count?&q->records[q->head]:NULL,"issue-zero",0,0,0,0);
- for(uint32_t i=0;i<q->count;i++){rsx_deferred_report *r=&q->records[(q->head+i)%RSX_DEFERRED_REPORT_CAPACITY];if(!r->ticket)r->ticket=ticket;}
+ for(uint32_t i=0;i<q->count;i++){rsx_deferred_report *r=&q->records[(q->head+i)%RSX_DEFERRED_REPORT_CAPACITY];if(!r->ticket){r->ticket=ticket;r->issued_ns=q->clock?q->clock():0;}}
  q->unissued=0;q->issued++;return 1;
 }
 static int rsx_reports_progress(rsx_deferred_report_queue *q,const rsx_deferred_report_ops *o,int wait,int issue){

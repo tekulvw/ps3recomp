@@ -1043,8 +1043,55 @@ static int gcm_report_destination(u32 argument,u32 context,u32 *ea) {
     }
     return context==GCM_REPORT_DMA_LOCAL&&index<CELL_GCM_MAX_REPORT_COUNT;
 }
+/* RSX_ENGINE_PHASES=1: where the FIFO walker's time goes outside the draw
+ * engine -- whole passes, report barriers by call site, inline-image
+ * barriers, the end-of-pass report issue -- every two seconds. */
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#endif
+static int s_gph_on=-1;
+static int gph_enabled(void){if(s_gph_on<0){const char*e=getenv("RSX_ENGINE_PHASES");s_gph_on=e&&*e&&strcmp(e,"0");}return s_gph_on;}
+static uint64_t gph_now(void){
+#if defined(__APPLE__)
+    static mach_timebase_info_data_t tb;if(!tb.denom)mach_timebase_info(&tb);
+    return mach_absolute_time()*tb.numer/tb.denom;
+#else
+    struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
+#endif
+}
+enum{GPH_SITES=16};
+static struct{uint64_t pass_ns,pass_n,words,issue_ns,issue_n,inline_ns,inline_n,eng_ns,eng_n,legacy_ns,legacy_n,t0;
+    uint64_t lab_n,lab_wait_issue,lab_wait_done,lab_hist[8];
+    u32 site[GPH_SITES];uint64_t site_ns[GPH_SITES],site_n[GPH_SITES];}s_gph;
+static void gph_site(u32 site,uint64_t ns){
+    for(u32 i=0;i<GPH_SITES;i++)if(s_gph.site[i]==site||!s_gph.site[i]){s_gph.site[i]=site;s_gph.site_ns[i]+=ns;s_gph.site_n[i]++;return;}
+}
+static void gph_report(void){
+    const uint64_t now=gph_now();if(!s_gph.t0)s_gph.t0=now;
+    if(now-s_gph.t0<2000000000ull)return;
+    const double s=(double)(now-s_gph.t0)/1e9;char line[1024];
+    int n=snprintf(line,sizeof line,"[gcm phases] per s: pass=%.1fms/%.0f words=%.0f issue=%.1fms/%.0f inline=%.1fms/%.0f engine=%.1fms/%.0f legacy=%.1fms/%.0f barrier:",
+        s_gph.pass_ns/1e6/s,s_gph.pass_n/s,s_gph.words/s,s_gph.issue_ns/1e6/s,s_gph.issue_n/s,s_gph.inline_ns/1e6/s,s_gph.inline_n/s,
+        s_gph.eng_ns/1e6/s,s_gph.eng_n/s,s_gph.legacy_ns/1e6/s,s_gph.legacy_n/s);
+    for(u32 i=0;i<GPH_SITES&&s_gph.site[i]&&n>0&&(size_t)n<sizeof line;i++)
+        n+=snprintf(line+n,sizeof line-(size_t)n," L%u=%.1fms/%.0f",s_gph.site[i],s_gph.site_ns[i]/1e6/s,s_gph.site_n[i]/s);
+    if(s_gph.lab_n&&n>0&&(size_t)n<sizeof line)
+        n+=snprintf(line+n,sizeof line-(size_t)n," | labels %.0f/s enqueue->issue %.0fus issue->publish %.0fus; total <0.1/0.25/0.5/1/2/4/8ms/more: %llu %llu %llu %llu %llu %llu %llu %llu",
+            s_gph.lab_n/s,s_gph.lab_wait_issue/1e3/s_gph.lab_n,s_gph.lab_wait_done/1e3/s_gph.lab_n,
+            (unsigned long long)s_gph.lab_hist[0],(unsigned long long)s_gph.lab_hist[1],(unsigned long long)s_gph.lab_hist[2],(unsigned long long)s_gph.lab_hist[3],
+            (unsigned long long)s_gph.lab_hist[4],(unsigned long long)s_gph.lab_hist[5],(unsigned long long)s_gph.lab_hist[6],(unsigned long long)s_gph.lab_hist[7]);
+    fprintf(stderr,"%s\n",line);memset(&s_gph,0,sizeof s_gph);s_gph.t0=now;
+}
+static void gph_label_published(const rsx_deferred_report *r){
+    if(!r->enqueued_ns||!r->issued_ns)return;
+    const uint64_t now=gph_now(),total=now-r->enqueued_ns;
+    s_gph.lab_n++;s_gph.lab_wait_issue+=r->issued_ns-r->enqueued_ns;s_gph.lab_wait_done+=now-r->issued_ns;
+    static const uint64_t edge[7]={100000,250000,500000,1000000,2000000,4000000,8000000};
+    u32 b=0;while(b<7&&total>=edge[b])b++;s_gph.lab_hist[b]++;
+}
 static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     (void)user;u32 ea;
+    if(r->operation&&s_gph_on>0)gph_label_published(r);
     if(r->operation){
         u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
         if(!vm_base||r->vm!=(uintptr_t)vm_base||(u64)r->ea+4u>limit)return 0;
@@ -1122,39 +1169,6 @@ static int gcm_reports_dependency(void){
     cellGcm_rsx_consumer_begin();int ok=gcm_reports_progress(1,1);
     cellGcm_rsx_consumer_end();return ok;
 }
-/* RSX_ENGINE_PHASES=1: where the FIFO walker's time goes outside the draw
- * engine -- whole passes, report barriers by call site, inline-image
- * barriers, the end-of-pass report issue -- every two seconds. */
-#if defined(__APPLE__)
-#include <mach/mach_time.h>
-#endif
-static int s_gph_on=-1;
-static int gph_enabled(void){if(s_gph_on<0){const char*e=getenv("RSX_ENGINE_PHASES");s_gph_on=e&&*e&&strcmp(e,"0");}return s_gph_on;}
-static uint64_t gph_now(void){
-#if defined(__APPLE__)
-    static mach_timebase_info_data_t tb;if(!tb.denom)mach_timebase_info(&tb);
-    return mach_absolute_time()*tb.numer/tb.denom;
-#else
-    struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
-#endif
-}
-enum{GPH_SITES=16};
-static struct{uint64_t pass_ns,pass_n,words,issue_ns,issue_n,inline_ns,inline_n,eng_ns,eng_n,legacy_ns,legacy_n,t0;
-    u32 site[GPH_SITES];uint64_t site_ns[GPH_SITES],site_n[GPH_SITES];}s_gph;
-static void gph_site(u32 site,uint64_t ns){
-    for(u32 i=0;i<GPH_SITES;i++)if(s_gph.site[i]==site||!s_gph.site[i]){s_gph.site[i]=site;s_gph.site_ns[i]+=ns;s_gph.site_n[i]++;return;}
-}
-static void gph_report(void){
-    const uint64_t now=gph_now();if(!s_gph.t0)s_gph.t0=now;
-    if(now-s_gph.t0<2000000000ull)return;
-    const double s=(double)(now-s_gph.t0)/1e9;char line[1024];
-    int n=snprintf(line,sizeof line,"[gcm phases] per s: pass=%.1fms/%.0f words=%.0f issue=%.1fms/%.0f inline=%.1fms/%.0f engine=%.1fms/%.0f legacy=%.1fms/%.0f barrier:",
-        s_gph.pass_ns/1e6/s,s_gph.pass_n/s,s_gph.words/s,s_gph.issue_ns/1e6/s,s_gph.issue_n/s,s_gph.inline_ns/1e6/s,s_gph.inline_n/s,
-        s_gph.eng_ns/1e6/s,s_gph.eng_n/s,s_gph.legacy_ns/1e6/s,s_gph.legacy_n/s);
-    for(u32 i=0;i<GPH_SITES&&s_gph.site[i]&&n>0&&(size_t)n<sizeof line;i++)
-        n+=snprintf(line+n,sizeof line-(size_t)n," L%u=%.1fms/%.0f",s_gph.site[i],s_gph.site_ns[i]/1e6/s,s_gph.site_n[i]/s);
-    fprintf(stderr,"%s\n",line);memset(&s_gph,0,sizeof s_gph);s_gph.t0=now;
-}
 static int gcm_reports_sync_barrier_core(u32 reason);
 static int gcm_reports_sync_barrier_at(u32 reason){
     if(!gph_enabled())return gcm_reports_sync_barrier_core(reason);
@@ -1205,6 +1219,7 @@ static int gcm_inline_image_barrier_core(void){
 static int gcm_defer_label(u32 ea,u32 value,u32 method,u32 fifo_ea){
     ring_note(RSX_RING_DECODE,ea,value,0,((uint64_t)method<<32)|fifo_ea);
     rsx_deferred_report r={0};r.operation=1;r.main_memory=1;
+    if(gph_enabled()){r.enqueued_ns=gph_now();s_reports.clock=gph_now;}
     r.ea=ea;r.argument=value;r.context=method;r.vm=(uintptr_t)vm_base;
     r.capture=ps3_critical_capture_id();r.start_ns=ps3_critical_enabled()?ps3_critical_now_ns():0;
     u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
