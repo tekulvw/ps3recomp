@@ -2342,8 +2342,11 @@ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began wait
  * RSX_WALKER_PROF_TRIGGER=<file> exists (immediately when unset), a sampler
  * thread signals the walker every millisecond for RSX_WALKER_PROF_SECONDS
  * (default 10); the handler records the interrupted pc and the frame-pointer
- * chain. The file gets one sample per line, addresses relative to the main
- * image, for symbolizing offline. Diagnostic only; macOS arm64. */
+ * chain. The file gets one sample per line, innermost first: addresses in
+ * the main image relative to it, for symbolizing offline; addresses in other
+ * images as @symbol. The profiled thread is the first one to drain the FIFO.
+ * Diagnostic only, off unless RSX_WALKER_PROF is set; macOS arm64. While it
+ * samples, the walker takes a SIGPROF every millisecond (SA_RESTART). */
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <signal.h>
 #include <pthread.h>
@@ -2365,8 +2368,8 @@ static void wprof_handler(int sig, siginfo_t* si, void* ctx)
     const ucontext_t* uc = (const ucontext_t*)ctx;
     uintptr_t* o = s_wprof_buf[i];
     unsigned d = 0;
-    o[d++] = (uintptr_t)uc->uc_mcontext->__ss.__pc;
-    uintptr_t fp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
+    o[d++] = (uintptr_t)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+    uintptr_t fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
     while (d < WPROF_DEPTH && fp >= s_wprof_lo && fp + 16 <= s_wprof_hi && !(fp & 7u)) {
         const uintptr_t next = ((const uintptr_t*)fp)[0], ret = ((const uintptr_t*)fp)[1];
         if (!ret) break;
@@ -2375,7 +2378,8 @@ static void wprof_handler(int sig, siginfo_t* si, void* ctx)
         fp = next;
     }
     s_wprof_len[i] = (unsigned char)d;
-    atomic_store_explicit(&s_wprof_n, i + 1, memory_order_relaxed);
+    /* Release: the writer reads this sample's frames after it sees the count. */
+    atomic_store_explicit(&s_wprof_n, i + 1, memory_order_release);
 }
 static void* wprof_thread(void* arg)
 {
@@ -2399,7 +2403,7 @@ static void* wprof_thread(void* arg)
         nanosleep(&tick, NULL);
     }
     nanosleep(&poll, NULL);
-    const int n = atomic_load(&s_wprof_n);
+    const int n = atomic_load_explicit(&s_wprof_n, memory_order_acquire);
     FILE* f = fopen(out, "w");
     if (f) {
         const intptr_t slide = _dyld_get_image_vmaddr_slide(0);
@@ -2429,18 +2433,23 @@ static void* wprof_thread(void* arg)
 }
 static void wprof_note_walker(void)
 {
-    int st = atomic_load_explicit(&s_wprof_state, memory_order_relaxed);
-    if (st == 2) return;
-    if (st == 0) {
-        const char* out = getenv("RSX_WALKER_PROF");
-        if (!out || !*out) { atomic_store(&s_wprof_state, 2); return; }
-        s_wprof_buf = calloc(WPROF_MAX, sizeof *s_wprof_buf);
-        s_wprof_len = calloc(WPROF_MAX, 1);
-        if (!s_wprof_buf || !s_wprof_len) { atomic_store(&s_wprof_state, 2); return; }
-        s_wprof_target = pthread_self();
-        atomic_store(&s_wprof_state, 1);
-        pthread_t t; pthread_create(&t, NULL, wprof_thread, NULL); pthread_detach(t);
+    if (atomic_load_explicit(&s_wprof_state, memory_order_relaxed) != 0) return;
+    /* One caller arms it; that thread is the one sampled. */
+    int unset = 0;
+    if (!atomic_compare_exchange_strong(&s_wprof_state, &unset, 1)) return;
+    const char* out = getenv("RSX_WALKER_PROF");
+    if (!out || !*out) { atomic_store(&s_wprof_state, 2); return; }
+    s_wprof_buf = calloc(WPROF_MAX, sizeof *s_wprof_buf);
+    s_wprof_len = calloc(WPROF_MAX, 1);
+    if (!s_wprof_buf || !s_wprof_len) { atomic_store(&s_wprof_state, 2); return; }
+    s_wprof_target = pthread_self();
+    pthread_t t;
+    if (pthread_create(&t, NULL, wprof_thread, NULL) != 0) {
+        fprintf(stderr, "[walker prof] sampler thread not started\n");
+        atomic_store(&s_wprof_state, 2);
+        return;
     }
+    pthread_detach(t);
 }
 #else
 static void wprof_note_walker(void) {}
