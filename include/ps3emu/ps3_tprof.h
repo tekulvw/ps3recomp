@@ -37,13 +37,20 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <dlfcn.h>
-#include <mach/mach.h>
-#include <mach/thread_act.h>
+#include <mach/mach_types.h>
+#include <mach/thread_status.h>
 #include <mach-o/dyld.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Declared here rather than through <mach/mach.h>, whose vm_map.h collides
+ * with the runtime's own vm_protect. */
+extern kern_return_t thread_suspend(thread_act_t target_act);
+extern kern_return_t thread_resume(thread_act_t target_act);
+extern kern_return_t thread_get_state(thread_act_t target_act, thread_state_flavor_t flavor,
+                                      thread_state_t old_state, mach_msg_type_number_t* old_stateCnt);
 
 enum { PS3_TPROF_THREADS = 64, PS3_TPROF_DEPTH = 40 };
 
