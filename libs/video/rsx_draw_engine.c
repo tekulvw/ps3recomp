@@ -1454,6 +1454,15 @@ static int eng_zdepth_to_guest(u32 slot)
         s_depth_rows = n;
         s_depth_cap = w * h;
     }
+    if (bpp == 4u && g.be->depth_store_z24) {
+        u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset, (h - 1u) * z->pitch + w * 4u);
+        ENG_PH_BEGIN(ph_gpu);
+        if (!dst || !eng_report_barrier()) return 0;
+        if (g.be->depth_store_z24(g.be->user, z->handle, w, h, dst, z->pitch) == 0) {
+            ENG_PH_END(ENG_PH_ZD_READ, ph_gpu);
+            goto stored;
+        }
+    }
     ENG_PH_BEGIN(ph_flush);
     if(!eng_report_barrier())return 0;
     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
@@ -1470,6 +1479,7 @@ static int eng_zdepth_to_guest(u32 slot)
         eng_depth_row_to_guest(dst, s_depth_rows + (size_t)r * w, w, bpp);
     }
     ENG_PH_END(ENG_PH_ZD_STORE, ph_store);
+stored:
     z->guest_dirty = 0;
     eng_textures_touch(z->location, z->offset, z->pitch * h);
     if (eng_coherence_log())

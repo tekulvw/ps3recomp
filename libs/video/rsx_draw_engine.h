@@ -230,6 +230,15 @@ typedef struct rsx_draw_backend {
      * DEPTH16); left NULL, such a texture reads guest memory as it is. */
     int  (*depth_readback)(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                            float* out, u32 out_pitch);
+    /* Optional: store the top-left w x h of a depth target into `dst` as
+     * D24S8 lays it out -- one big-endian word per pixel, depth clamped to
+     * [0, 1] (NaN to 0) and rounded to 24 bits in the top three bytes, a zero
+     * stencil byte -- after every recorded draw, converting on the GPU. The
+     * bytes must equal what depth_readback plus the engine's own conversion
+     * store. Returns 0 on success; on failure the engine falls back to
+     * depth_readback. */
+    int  (*depth_store_z24)(void* user, u32 depth, u32 w, u32 h,
+                            u8* dst, u32 dst_pitch);
     /* Optional same-target colour feedback. Return a fresh, immutable texture
      * of the target's full physical extent and storage format. Its GPU copy
      * must execute after all preceding writes and before the next draw. The

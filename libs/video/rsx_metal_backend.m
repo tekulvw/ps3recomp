@@ -2513,6 +2513,10 @@ static id<MTLBuffer> s_eng_stage_buf;
  * readback waits for its blit before returning, so one buffer serves every
  * call; a fresh allocation per call paid for zero-filling the whole copy. */
 static id<MTLBuffer> s_eng_depth_staging;
+/* Work a synchronous commit encodes after the recorded draws, in the same
+ * command buffer: eng_depth_store_z24's conversion. */
+static void (^s_eng_tail_encode)(id<MTLCommandBuffer>);
+static id<MTLComputePipelineState> s_eng_z24_pso;
 
 static NSMutableArray<id<MTLBuffer>>* s_eng_stage_pool;
 static pthread_mutex_t s_eng_stage_pool_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2703,6 +2707,28 @@ static NSString* const kEngHelperMSL = @
 "                            depth2d<float> src [[texture(0)]],\n"
 "                            sampler s [[sampler(0)]]) {\n"
 "    return src.sample(s, i.uv);\n"
+"}\n"
+/* Depth to D24S8 words as guest memory holds them (eng_depth_store_z24). The
+ * rounding is the CPU path's (u32)((double)d * 16777215 + 0.5) done exactly
+ * in integers -- the product of a 24-bit mantissa and 2^24 - 1 fits in 48
+ * bits -- and the clamp works on the bits, so neither depends on the GPU's
+ * float or NaN handling. */
+"kernel void eng_depth_z24_cs(depth2d<float, access::read> src [[texture(0)]],\n"
+"                             device uint* out [[buffer(0)]],\n"
+"                             constant uint2& wh [[buffer(1)]],\n"
+"                             uint2 p [[thread_position_in_grid]]) {\n"
+"    if (p.x >= wh.x || p.y >= wh.y) return;\n"
+"    const uint b = as_type<uint>(src.read(p));\n"
+"    uint v;\n"
+"    if ((b & 0x80000000u) || b > 0x7F800000u) v = 0u;\n"
+"    else if (b >= 0x3F800000u) v = 0xFFFFFFu;\n"
+"    else {\n"
+"        const uint e = b >> 23, m = (b & 0x7FFFFFu) | (e ? 0x800000u : 0u);\n"
+"        const uint k = e ? 150u - e : 149u;\n"
+"        const ulong prod = (ulong)m * 16777215ul;\n"
+"        v = k >= 64u ? 0u : (uint)((prod + (1ul << (k - 1u))) >> k);\n"
+"    }\n"
+"    out[p.y * wh.x + p.x] = (v >> 16) | ((v >> 8) & 0xFFu) << 8 | (v & 0xFFu) << 16;\n"
 "}\n";
 
 static u32 eng_obj_add(id<MTLTexture> t)
@@ -2883,6 +2909,8 @@ static void eng_shutdown(void* user)
     s_eng_stage_buf = nil; s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
     s_eng_depth_staging = nil;
+    s_eng_z24_pso = nil;
+    s_eng_tail_encode = nil;
     pthread_mutex_lock(&s_eng_stage_pool_lock);
     [s_eng_stage_pool removeAllObjects];
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
@@ -4225,6 +4253,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
         u32 trace_handles[16];
         const u32 trace_count=eng_trace_targets(trace_handles, present_dst);
         eng_encode_records(cb, stage);
+        if (s_eng_tail_encode) { s_eng_tail_encode(cb); s_eng_tail_encode = nil; }
         int presented = eng_blit_to_display(cb, present_dst, dst);
         if (drawable && !presented) fps_note_skipped_blit();
         if (s_eng_diag.active && !presented && present_dst) s_eng_diag.reason = "blit_skipped";
@@ -4591,6 +4620,63 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
     }
 }
 
+/* Depth into guest memory as D24S8 words, converted by a compute pass encoded
+ * after the recorded draws in the same command buffer, so the store costs one
+ * GPU round trip: no separate flush, resolve or float copy. */
+static int eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32 dst_pitch)
+{
+    (void)user;
+    id<MTLTexture> src = eng_obj(depth);
+    if (!s_dev || !s_queue || !s_eng_helper_lib || !src || !dst || !w || !h ||
+        s_eng_obj_retired[depth - 1u] || [src pixelFormat] != MTL_DEPTH_FORMAT ||
+        [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
+        w > [src width] || h > [src height] || w > UINT32_MAX / 4u || dst_pitch < w * 4u)
+        return -1;
+    @autoreleasepool {
+        if (!s_eng_z24_pso) {
+            NSError* err = nil;
+            id<MTLFunction> fn = [s_eng_helper_lib newFunctionWithName:@"eng_depth_z24_cs"];
+            s_eng_z24_pso = fn ? [s_dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+            if (!s_eng_z24_pso) {
+                fprintf(stderr, "[rsx engine/metal] depth z24 pipeline failed: %s\n",
+                        err ? [[err localizedDescription] UTF8String] : "no function");
+                return -1;
+            }
+        }
+        const size_t bytes = (size_t)w * h * 4u;
+        if (!s_eng_depth_staging || [s_eng_depth_staging length] < bytes)
+            s_eng_depth_staging = [s_dev newBufferWithLength:bytes
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = s_eng_depth_staging;
+        if (!staging || ![staging contents]) return -1;
+        id<MTLComputePipelineState> pso = s_eng_z24_pso;
+        const struct { uint32_t w, h; } wh = { w, h };
+        s_eng_tail_encode = ^(id<MTLCommandBuffer> cb) {
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:pso];
+            [ce setTexture:src atIndex:0];
+            [ce setBuffer:staging offset:0 atIndex:0];
+            [ce setBytes:&wh length:sizeof wh atIndex:1];
+            const NSUInteger tw = [pso threadExecutionWidth];
+            const NSUInteger th = [pso maxTotalThreadsPerThreadgroup] / tw;
+            [ce dispatchThreads:MTLSizeMake(w, h, 1)
+          threadsPerThreadgroup:MTLSizeMake(tw, th ? th : 1, 1)];
+            [ce endEncoding];
+        };
+        eng_encode_and_commit(nil);
+        s_eng_tail_encode = nil;
+        if (!s_eng_checked_completed || atomic_load(&s_eng_checked_failed)) return -1;
+        const u8* bytes_in = [staging contents];
+        if (dst_pitch == w * 4u) {
+            memcpy(dst, bytes_in, bytes);
+        } else {
+            for (u32 row = 0; row < h; ++row)
+                memcpy(dst + (size_t)row * dst_pitch, bytes_in + (size_t)row * w * 4u, (size_t)w * 4u);
+        }
+        return 0;
+    }
+}
+
 static const rsx_draw_backend s_engine_backend = {
     .user                 = NULL,
     .init                 = eng_init,
@@ -4611,6 +4697,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_target_release = eng_obj_release,
     .depth_snapshot       = eng_depth_snapshot,
     .depth_readback       = eng_depth_readback,
+    .depth_store_z24      = eng_depth_store_z24,
     .color_snapshot       = eng_color_snapshot,
     .pipeline_create      = eng_pipeline_create,
     .pipeline_release     = eng_pipeline_release,
