@@ -255,7 +255,7 @@ static unsigned char s_spu_bitmap[SPU_COH_BITMAP_SZ];
 static int spu_coh_line_spu(uint32_t line)
 {
     const uint32_t l = line >> SPU_COH_LINE_SHIFT;
-    return (__atomic_load_n(&s_spu_bitmap[l >> 3], __ATOMIC_RELAXED) >> (l & 7)) & 1u;
+    return (__atomic_load_n(&s_spu_bitmap[l >> 3], __ATOMIC_ACQUIRE) >> (l & 7)) & 1u;
 }
 
 /* PPU-only lines serialize on a per-line shard, not the lock-line lock.
@@ -366,7 +366,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     if (!spu_coh_line_spu(ea)) {
         /* Under the shard: no PPU-only store is mid-flight on this line. */
         spu_coh_line_shard_lock(ea);
-        __atomic_fetch_or(&s_spu_bitmap[line >> 3], (unsigned char)(1u << (line & 7)), __ATOMIC_RELAXED);
+        __atomic_fetch_or(&s_spu_bitmap[line >> 3], (unsigned char)(1u << (line & 7)), __ATOMIC_RELEASE);
         spu_coh_line_shard_unlock(ea);
     }
     s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
