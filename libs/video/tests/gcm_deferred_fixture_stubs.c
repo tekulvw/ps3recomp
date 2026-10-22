@@ -1,6 +1,7 @@
 /* Optional backend seams for existing focused GCM fixtures. Strong fixture
  * definitions override these inert, default-off fallbacks. */
 #include "../rsx_draw_engine.h"
+#include "../rsx_commands.h"
 #include "../../../runtime/diagnostics/critical_trace.h"
 #include "../../../runtime/platform/win32_compat.h"
 #include <stdlib.h>
@@ -13,6 +14,9 @@ WEAK u64 rsx_draw_engine_submit_async(void){return 0;}
 WEAK int rsx_draw_engine_completion_status(u64 ticket,int wait){(void)ticket;(void)wait;return -1;}
 WEAK void rsx_draw_engine_set_report_barrier(int(*barrier)(void)){(void)barrier;}
 WEAK int rsx_draw_engine_enabled(void){return 0;}
+/* No vtable backend: with the draw engine on, the walker hands rsx_state
+ * only the methods with effects outside it. */
+WEAK rsx_backend* rsx_get_backend(void){return NULL;}
 WEAK int rsx_live_draw_enabled(void){return 0;}
 WEAK void rsx_draw_engine_flush(void){}
 WEAK void rsx_live_draw_flush(void){}
