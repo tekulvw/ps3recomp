@@ -2953,13 +2953,21 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
     if (start + bytes > s_eng_stage_cap) {
         u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
         while (start + bytes > cap) cap *= 2u;
-        id<MTLBuffer> n = eng_stage_buffer_acquire(cap);
-        if (!n) {eng_checked_fail();return 0;}
-        if (s_eng_stage_used) memcpy([n contents], s_eng_stage, s_eng_stage_used);
-        eng_stage_buffer_release(s_eng_stage_buf);   /* never committed */
-        s_eng_stage_buf = n;
-        s_eng_stage = (u8*)[n contents];
-        s_eng_stage_cap = (u32)[n length];
+        /* A pool of its own: the caller is the FIFO walker, a PPU host thread
+         * with no autorelease pool, and the driver's -contents autoreleases
+         * the buffer. Without the pool that reference stayed until the thread
+         * exited, so every arena the full pool dropped at completion stayed
+         * allocated: a retail title leaked 4 MB per such commit, some GB a
+         * minute, until the Mac ran out of memory. */
+        @autoreleasepool {
+            id<MTLBuffer> n = eng_stage_buffer_acquire(cap);
+            if (!n) {eng_checked_fail();return 0;}
+            if (s_eng_stage_used) memcpy([n contents], s_eng_stage, s_eng_stage_used);
+            eng_stage_buffer_release(s_eng_stage_buf);   /* never committed */
+            s_eng_stage_buf = n;
+            s_eng_stage = (u8*)[n contents];
+            s_eng_stage_cap = (u32)[n length];
+        }
     }
     *out_off = start;
     s_eng_stage_used = start + bytes;
