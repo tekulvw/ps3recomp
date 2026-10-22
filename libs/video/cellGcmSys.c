@@ -138,12 +138,17 @@ static void gcm_deferred_initialize(void) {
     const char *q=getenv("PS3RECOMP_RSX_QUERY_OBSERVE");s_query_observe=q&&!strcmp(q,"1");
     const char *e=getenv("PS3RECOMP_RSX_DEFERRED_REPORTS");
     s_deferred_reports=e && !strcmp(e,"1");
+    /* PS3RECOMP_RSX_DEFERRED_REPORT_BATCH=<n>: issue after n unissued
+     * records instead of RSX_DEFERRED_REPORT_BATCH (1..1024). */
+    { const char *b=getenv("PS3RECOMP_RSX_DEFERRED_REPORT_BATCH");
+      const long n=b?strtol(b,NULL,0):0;
+      if(n>0&&n<=(long)RSX_DEFERRED_REPORT_CAPACITY)s_reports.batch=(uint32_t)n; }
     if (s_deferred_reports) {
         rsx_draw_engine_set_report_barrier(gcm_reports_dependency);
         ps3_vm_release_guard.begin=gcm_report_vm_begin;
         ps3_vm_release_guard.end=cellGcm_rsx_consumer_end;
         fprintf(stderr,"[deferred reports] enabled batch=%u capacity=%u consumer-owned genuine completion\n",
-            RSX_DEFERRED_REPORT_BATCH,RSX_DEFERRED_REPORT_CAPACITY);
+            s_reports.batch?s_reports.batch:RSX_DEFERRED_REPORT_BATCH,RSX_DEFERRED_REPORT_CAPACITY);
     }
 }
 
