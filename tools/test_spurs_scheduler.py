@@ -17,5 +17,5 @@ with tempfile.TemporaryDirectory(prefix='spurs-scheduler-') as tmp:
         str(r/'tests/test_spurs_scheduler.c'),
         str(r/'libs/spurs/spurs_taskset.c'),
         *[str(r/'runtime/spu'/f'{u}.c') for u in units],
-        str(r/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out)],check=True)
+        str(r/'runtime/platform/win32_compat.c'),str(r/'runtime/diagnostics/job_io_recorder.c'),'-pthread','-lm','-o',str(out)],check=True)
     subprocess.run([str(out)],check=True,timeout=15)
