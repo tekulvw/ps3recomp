@@ -251,6 +251,52 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 fprintf(stderr, "[dma-range] %.0f B/s put, %.0f B/s get\n",
                         s_put * 1000.0 / (now - s_t0), s_get * 1000.0 / (now - s_t0));
                 s_put = s_get = 0; s_t0 = now; } } } }
+    /* SPU_DMA_IMAGES=<id>[,<id>...] (decimal image ids, up to 8): for each
+     * listed image, its first 48 transfers (command, LSA, EA, size, pc) and,
+     * every 2000 of its PUTs, where they landed by 64 KB EA bucket. Answers
+     * "does this job run, and where does its output go" -- e.g. whether a
+     * producer writes the buffer a draw reads, or a different address. */
+    { static int s_init; static int s_ids[8], s_n; static unsigned s_first[8];
+      static unsigned long long s_puts[8];
+      static struct { uint32_t page; unsigned long long n; } s_hist[8][16];
+      if (!s_init) { s_init = 1; const char* e = getenv("SPU_DMA_IMAGES");
+          while (e && *e && s_n < 8) { char* d; long v = strtol(e, &d, 10); if (d == e) break;
+              s_ids[s_n++] = (int)v; e = *d == ',' ? d + 1 : d; if (*d != ',') break; } }
+      /* Every 20000 PUTs, which image ids issued them: a listed id that
+       * never appears here is not the id its code runs under. */
+      if (s_n && mfc_is_put(cmd)) {
+          static unsigned long long s_all;
+          static struct { int id; unsigned long long n; } s_by[16];
+          int j = 0;
+          while (j < 16 && s_by[j].n && s_by[j].id != spu->image_id) j++;
+          if (j < 16) { s_by[j].id = spu->image_id; s_by[j].n++; }
+          if (++s_all % 20000 == 0) {
+              fprintf(stderr, "[dma-img] all puts=%llu by image:", s_all);
+              for (j = 0; j < 16 && s_by[j].n; j++) fprintf(stderr, " %d:%llu", s_by[j].id, s_by[j].n);
+              fputc('\n', stderr);
+          }
+      }
+      for (int k = 0; k < s_n; k++) {
+          if (spu->image_id != s_ids[k]) continue;
+          if (s_first[k] < 48) {
+              s_first[k]++;
+              fprintf(stderr, "[dma-img] img=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+          }
+          if (mfc_is_put(cmd)) {
+              const uint32_t page = (uint32_t)ea & ~0xFFFFu;
+              int j = 0;
+              while (j < 16 && s_hist[k][j].n && s_hist[k][j].page != page) j++;
+              if (j < 16) { s_hist[k][j].page = page; s_hist[k][j].n++; }
+              if (++s_puts[k] % 2000 == 0) {
+                  fprintf(stderr, "[dma-img] img=%d puts=%llu by 64K page:", spu->image_id, s_puts[k]);
+                  for (j = 0; j < 16 && s_hist[k][j].n; j++)
+                      fprintf(stderr, " %08X:%llu", s_hist[k][j].page, s_hist[k][j].n);
+                  fputc('\n', stderr);
+              }
+          }
+          break;
+      } }
     /* Malformed transfers are REJECTED, as the hardware MFC does. The rules
      * are the ones the SDK's own dma.h asserts: a non-zero size, at most
      * 16 KB, a multiple of 16 once >= 16 bytes, and LSA/EA sharing 16-byte
