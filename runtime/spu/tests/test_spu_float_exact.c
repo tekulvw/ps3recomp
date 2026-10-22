@@ -110,9 +110,10 @@ static void gen_lane(int kind, uint32_t* x, uint32_t* y, uint32_t* z)
     }
 }
 
-int main(int argc, char** argv)
+static int all_passes(long scale, const char* mode)
 {
-    const long scale = argc > 1 ? atol(argv[1]) : 1;
+    s_bad = 0; s_lanes = 0;
+    printf("test_spu_float_exact: FPCR %s\n", mode);
 
     /* pass 1: every pair of the class words for fa, fs, fm */
     static uint32_t cls[256 * NFRAC * 2];
@@ -165,4 +166,55 @@ int main(int argc, char** argv)
     if (s_bad) { printf("test_spu_float_exact: FAILED, %ld mismatching lanes of %ld\n", s_bad, s_lanes); return 1; }
     printf("test_spu_float_exact: ok, %ld lanes bit-identical\n", s_lanes);
     return 0;
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+static uint64_t fpcr_get(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
+static void fpcr_set(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
+/* SPU_FLOAT_RZ: double precision and frds must give the default-FPCR answer on a thread whose
+ * FPCR is round toward zero with flush-to-zero; FPCR must be back afterwards. */
+static long dp_under_rz(long n)
+{
+    long bad = 0;
+    for (long it = 0; it < n; it++) {
+        u128 a, b, c;
+        for (int k = 0; k < 4; k++) {
+            a._u32[k] = rnd32(); b._u32[k] = rnd32(); c._u32[k] = rnd32();
+            if (it & 1) { a._u32[k & ~1] &= 0x800FFFFFu; }   /* denormal doubles */
+            if (it & 2) { b._u32[k & ~1] = (b._u32[k & ~1] & 0x800FFFFFu) | 0x3FF00000u; }
+        }
+        u128 want[12], got[12];
+        want[0] = spu_dfa(a, b); want[1] = spu_dfs(a, b); want[2] = spu_dfm(a, b);
+        want[3] = spu_dfma(a, b, c); want[4] = spu_dfms(a, b, c); want[5] = spu_dfnms(a, b, c);
+        want[6] = spu_dfnma(a, b, c); want[7] = spu_frds(a); want[8] = spu_dfceq(a, b);
+        want[9] = spu_dfcmeq(a, b); want[10] = spu_dfcgt(a, b); want[11] = spu_dfcmgt(a, b);
+        fpcr_set(SPU_FPCR_RZFZ);
+        got[0] = spu_dfa(a, b); got[1] = spu_dfs(a, b); got[2] = spu_dfm(a, b);
+        got[3] = spu_dfma(a, b, c); got[4] = spu_dfms(a, b, c); got[5] = spu_dfnms(a, b, c);
+        got[6] = spu_dfnma(a, b, c); got[7] = spu_frds(a); got[8] = spu_dfceq(a, b);
+        got[9] = spu_dfcmeq(a, b); got[10] = spu_dfcgt(a, b); got[11] = spu_dfcmgt(a, b);
+        const uint64_t after = fpcr_get();
+        fpcr_set(0);
+        if (after != SPU_FPCR_RZFZ) bad++;
+        for (int k = 0; k < 12; k++) bad += memcmp(&want[k], &got[k], 16) != 0;
+    }
+    return bad;
+}
+#endif
+
+int main(int argc, char** argv)
+{
+    const long scale = argc > 1 ? atol(argv[1]) : 1;
+    int rc = all_passes(scale, "default (round to nearest)");
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+    /* SPU_FLOAT_RZ: the same passes on a thread running round toward zero with flush-to-zero,
+     * where spu_fa.. take their native form. */
+    fpcr_set(SPU_FPCR_RZFZ);
+    rc |= all_passes(scale, "round toward zero, flush-to-zero (SPU_FLOAT_RZ)");
+    fpcr_set(0);
+    const long dbad = dp_under_rz(4L * 1000 * 1000);
+    printf("test_spu_float_exact: double precision under SPU_FLOAT_RZ: %ld mismatches\n", dbad);
+    rc |= dbad != 0;
+#endif
+    return rc;
 }
