@@ -1939,7 +1939,25 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
 }
 static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra)
 {
-    if (s_store_watch < 0) s_store_watch = getenv("PPU_WVAL") || getenv("PPU_WWATCH") ? 1 : 0;
+    if (s_store_watch < 0) s_store_watch = getenv("PPU_WVAL") || getenv("PPU_WWATCH") ||
+                                           getenv("PPU_WWATCH_DYNAMIC") ? 1 : 0;
+    /* PPU_WWATCH_DYNAMIC=1: every guest store is checked against the window
+     * g_ww_lo..g_ww_hi as it stands NOW, which another component may move at
+     * run time (RSX_ENGINE_VTX_PROBE_FP points it at the vertex record a
+     * probed draw read). For buffers whose address is only known once the
+     * title has allocated them. HLE stores already report through the same
+     * window (PS3_WW_CHECK). Costs a call per guest store while armed. */
+    { static int s_dyn = -1;
+      if (s_dyn < 0) s_dyn = getenv("PPU_WWATCH_DYNAMIC") ? 1 : 0;
+      const uint32_t lo = g_ww_lo, hi = g_ww_hi;
+      if (s_dyn && lo && a >= lo && a < hi) {
+          static int _n = 0;
+          if (PS3_LOG_FIRST(_n, 256)) {
+              fprintf(stderr, "[ww-dyn] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X window 0x%08X-0x%08X\n",
+                      a, v, width, ppu_prof_resolve_host(ra), lo, hi);
+              fflush(stderr);
+          }
+      } }
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
      * copied from node to node down a list, that only ever catches the copy.

@@ -63,6 +63,13 @@ int main(int argc,char** argv) {
         assert(spu_dma_disposition_finish(&t,(spu_context*)1,0x100,0x12000,32,0x20,0,SPU_DMA_DISPOSITION_PUT)==0);
         return 0;
     }
+    if(argc>1 && !strcmp(argv[1],"resident")) {
+        /* A WWS job's PUT: the context keeps the policy's image id while the
+         * job's code is resident (SPU_DMA_IMAGES attribution). */
+        s.resident_code[1].image_id=224; s.resident_code[1].lsa=0x4000; s.resident_code[1].size=0x1000;
+        assert(mfc_do_transfer(&s,0x100,0x12000,32,0x20)==0);
+        return 0;
+    }
     if(argc>1 && !strcmp(argv[1],"tag-failure")) {
         mfc_engine m; memset(&m,0,sizeof m);
         s.mfc_lsa=SPU_LS_SIZE-16; s.mfc_eal=0x12000; s.mfc_size=32; s.mfc_tag=5;

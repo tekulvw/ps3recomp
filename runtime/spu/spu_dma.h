@@ -255,7 +255,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * listed image, its first 48 transfers (command, LSA, EA, size, pc) and,
      * every 2000 of its PUTs, where they landed by 64 KB EA bucket. Answers
      * "does this job run, and where does its output go" -- e.g. whether a
-     * producer writes the buffer a draw reads, or a different address. */
+     * producer writes the buffer a draw reads, or a different address.
+     * A WWS job runs inside the job manager's context, whose image id stays
+     * the policy's, so an id also matches when it is one of the images with
+     * code RESIDENT in local store at the time of the transfer (the running
+     * job, and a prefetched next one); res= lists them. */
     { static int s_init; static int s_ids[8], s_n; static unsigned s_first[8];
       static unsigned long long s_puts[8];
       static struct { uint32_t page; unsigned long long n; } s_hist[8][16];
@@ -264,24 +268,36 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               s_ids[s_n++] = (int)v; e = *d == ',' ? d + 1 : d; if (*d != ',') break; } }
       /* Every 20000 PUTs, which image ids issued them: a listed id that
        * never appears here is not the id its code runs under. */
+      int res[4], n_res = 0;
+      for (int r = 0; r < 4; r++)
+          if (spu->resident_code[r].image_id) res[n_res++] = spu->resident_code[r].image_id;
+      /* The owner a summary counts: the lowest-slot resident code image,
+       * else the context's own image. */
+      const int owner = n_res ? res[0] : spu->image_id;
       if (s_n && mfc_is_put(cmd)) {
           static unsigned long long s_all;
           static struct { int id; unsigned long long n; } s_by[16];
           int j = 0;
-          while (j < 16 && s_by[j].n && s_by[j].id != spu->image_id) j++;
-          if (j < 16) { s_by[j].id = spu->image_id; s_by[j].n++; }
+          while (j < 16 && s_by[j].n && s_by[j].id != owner) j++;
+          if (j < 16) { s_by[j].id = owner; s_by[j].n++; }
           if (++s_all % 20000 == 0) {
-              fprintf(stderr, "[dma-img] all puts=%llu by image:", s_all);
+              fprintf(stderr, "[dma-img] all puts=%llu by owner:", s_all);
               for (j = 0; j < 16 && s_by[j].n; j++) fprintf(stderr, " %d:%llu", s_by[j].id, s_by[j].n);
               fputc('\n', stderr);
           }
       }
       for (int k = 0; k < s_n; k++) {
-          if (spu->image_id != s_ids[k]) continue;
+          int hit = spu->image_id == s_ids[k];
+          for (int r = 0; r < n_res; r++) hit |= res[r] == s_ids[k];
+          if (!hit) continue;
           if (s_first[k] < 48) {
               s_first[k]++;
-              fprintf(stderr, "[dma-img] img=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
-                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+              char rs[48] = "-"; int o = 0;
+              for (int r = 0; r < n_res && o < 40; r++)
+                  o += snprintf(rs + o, sizeof rs - o, "%s%d", r ? "/" : "", res[r]);
+              fprintf(stderr, "[dma-img] id=%d img=%d res=%s pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                      s_ids[k], spu->image_id, rs, (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa,
+                      (uint32_t)ea, size);
           }
           if (mfc_is_put(cmd)) {
               const uint32_t page = (uint32_t)ea & ~0xFFFFu;
@@ -289,7 +305,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               while (j < 16 && s_hist[k][j].n && s_hist[k][j].page != page) j++;
               if (j < 16) { s_hist[k][j].page = page; s_hist[k][j].n++; }
               if (++s_puts[k] % 2000 == 0) {
-                  fprintf(stderr, "[dma-img] img=%d puts=%llu by 64K page:", spu->image_id, s_puts[k]);
+                  fprintf(stderr, "[dma-img] id=%d puts=%llu by 64K page:", s_ids[k], s_puts[k]);
                   for (j = 0; j < 16 && s_hist[k][j].n; j++)
                       fprintf(stderr, " %08X:%llu", s_hist[k][j].page, s_hist[k][j].n);
                   fputc('\n', stderr);
