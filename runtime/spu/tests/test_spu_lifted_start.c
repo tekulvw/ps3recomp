@@ -967,6 +967,71 @@ static void test_overlay_source_prefilter(void)
 #include "test_spu_verified_overlay_fixture.h"
 #endif
 
+/* The dispatch cache (SPU_DISPATCH_CACHE=1 or =shadow) must answer exactly as
+ * the resolver would after each input it keys on changes: a registration, a
+ * resident-code change through spu_overlay_note_get, the resident task and
+ * overlay, and a context re-initialised at the same address. */
+static void dc_primary(spu_context* c) { c->gpr[9]._u32[0] = 1; }
+static void dc_overlay(spu_context* c) { c->gpr[9]._u32[0] = 2; }
+static void dc_task(spu_context* c)    { c->gpr[9]._u32[0] = 3; }
+static void dc_region(spu_context* c)  { c->gpr[9]._u32[0] = 4; }
+static void test_dispatch_cache(void)
+{
+    const uint32_t a = 0x1C000;
+    spu_context* c = calloc(1, sizeof *c);
+    spu_context* d = calloc(1, sizeof *d);
+    if (!c || !d) { check(0, "allocate dispatch cache contexts"); free(c); free(d); return; }
+    spu_context_init(c, 0); spu_context_init(d, 1);
+    spu_begin_image(121); spu_register_function(a, dc_primary);
+    spu_begin_image(122); spu_register_function(a, dc_overlay);
+    spu_begin_image(124); spu_register_function(a, dc_region);
+    spu_begin_image(0);
+    c->image_id = 121; d->image_id = 121;
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: first lookup resolves the primary image");
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: repeated lookup gives the same answer");
+
+    c->resident_ovl = 122;
+    check(spu_lifted_lookup(c, a) == dc_overlay, "dcache: a resident overlay changes the answer");
+    c->resident_task = 123;   /* nothing registered for the task here yet */
+    check(spu_lifted_lookup(c, a) == dc_overlay, "dcache: task miss falls through to the overlay");
+    spu_begin_image(123); spu_register_function(a, dc_task); spu_begin_image(0);
+    check(spu_lifted_lookup(c, a) == dc_task, "dcache: a later registration is seen at once");
+    c->resident_task = 0; c->resident_ovl = 0;
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: clearing task and overlay restores the primary");
+
+    spu_overlay_register_region(0x830000, 0x100, 124);
+    spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_region, "dcache: a resident region takes over");
+    check(spu_lifted_lookup(d, a) == dc_primary, "dcache: another context on the thread keeps its own answer");
+    spu_overlay_note_get(c, 0x840000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: a foreign GET into the region drops it");
+
+    spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_region, "dcache: the region is resident again");
+    spu_context_init(c, 0); c->image_id = 121;   /* same address, new lifetime */
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: a re-initialised context does not inherit entries");
+    /* A fresh lifetime that reaches the same residency count through another
+     * region must not meet the old lifetime's entry either. */
+    spu_context_init(c, 0); c->image_id = 121;
+    spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_region, "dcache: region resident in this lifetime");
+    spu_context_init(c, 0); c->image_id = 121;
+    spu_overlay_register_region(0x850000, 0x100, 125);
+    spu_overlay_note_get(c, 0x850000, c->ls + a + 0x800, 16);
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: equal residency count in a new lifetime is a miss");
+
+    { const char* m = getenv("SPU_DISPATCH_CACHE"); if (m && !strcmp(m, "1")) {
+        /* Only spu_overlay_note_get may change resident code; a direct write
+         * that bypasses it keeps the cached answer, which shows the cache is
+         * on in this run. */
+        spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+        check(spu_lifted_lookup(c, a) == dc_region, "dcache: region resident before the bypass");
+        memset(c->resident_code, 0, sizeof c->resident_code);
+        check(spu_lifted_lookup(c, a) == dc_region, "dcache: on (a hit skips the resolver)");
+    } }
+    free(c); free(d);
+}
+
 int main(void)
 {
     printf("SPU lifted thread-group start\n");
@@ -988,6 +1053,7 @@ int main(void)
     test_alternate_link_return();
     test_nonzero_link_return();
     test_overlay_source_prefilter();
+    test_dispatch_cache();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);

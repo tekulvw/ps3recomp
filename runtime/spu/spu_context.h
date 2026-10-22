@@ -401,6 +401,13 @@ typedef struct spu_context {
     /* Nonzero while this context is in the coherence holder list
      * (spu_coherency.c); lets its GETLLAR skip the lock-line lock. */
     int coh_listed;
+    /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
+     * context's current lifetime: 0 after spu_context_init (or a zeroed
+     * allocation) until its first cached dispatch, so a context reset at the
+     * same address never meets an earlier lifetime's entries. dcache_residency
+     * is bumped on every change to resident_code, dropping the cached
+     * resolutions of this context. */
+    uint32_t dcache_id, dcache_residency;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
