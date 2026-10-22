@@ -1096,8 +1096,11 @@ class SPULifter:
                         if self.verified_code_spans else
                         f"spu_verified_code_enter(ctx, {self.verified_code_image}, 0x{f.start_addr:X}u)")
                 lines.append(f"    if (!{gate}) {{ ctx->pc = 0x{f.start_addr:X}u; g_spu_trampoline_fn = spu_indirect_branch; return; }}")
-            for b in f.body_lines:
-                lines.append(b if b.endswith(":") else f"    {b}")
+            body = [b if b.endswith(":") else f"    {b}" for b in f.body_lines]
+            if getattr(self, "promote_registers", False):
+                from spu_promote import promote_lines
+                body = promote_lines(body)
+            lines.extend(body)
             lines.append("}")
             lines.append("")
 
@@ -1206,6 +1209,11 @@ def main() -> None:
                         "by trampolines. Every chunk is still emitted and "
                         "registered on its own for indirect entry, so this only "
                         "changes speed, not which code can be reached.")
+    p.add_argument("--promote-registers", action="store_true",
+                   help="Keep guest registers in C locals across each straight-line "
+                        "run of register and local-store instructions, writing "
+                        "ctx->gpr back once at the run's end (tools/spu_promote.py). "
+                        "Not applied with --connected-regions.")
     p.add_argument("--max-group-insns", type=int, default=4000,
                    help="Cap on instructions per merged group (keeps clang fast).")
     p.add_argument("--force-indirect", default="",
@@ -1340,6 +1348,7 @@ def main() -> None:
                       verified_code_image=args.verified_code_image,
                       verified_code_spans=args.verified_code_spans,
                       connected_regions=args.connected_regions, region_bytes=args.region_bytes)
+    lifter.promote_registers = args.promote_registers
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
