@@ -1122,7 +1122,45 @@ static int gcm_reports_dependency(void){
     cellGcm_rsx_consumer_begin();int ok=gcm_reports_progress(1,1);
     cellGcm_rsx_consumer_end();return ok;
 }
+/* RSX_ENGINE_PHASES=1: where the FIFO walker's time goes outside the draw
+ * engine -- whole passes, report barriers by call site, inline-image
+ * barriers, the end-of-pass report issue -- every two seconds. */
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#endif
+static int s_gph_on=-1;
+static int gph_enabled(void){if(s_gph_on<0){const char*e=getenv("RSX_ENGINE_PHASES");s_gph_on=e&&*e&&strcmp(e,"0");}return s_gph_on;}
+static uint64_t gph_now(void){
+#if defined(__APPLE__)
+    static mach_timebase_info_data_t tb;if(!tb.denom)mach_timebase_info(&tb);
+    return mach_absolute_time()*tb.numer/tb.denom;
+#else
+    struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
+#endif
+}
+enum{GPH_SITES=16};
+static struct{uint64_t pass_ns,pass_n,words,issue_ns,issue_n,inline_ns,inline_n,t0;
+    u32 site[GPH_SITES];uint64_t site_ns[GPH_SITES],site_n[GPH_SITES];}s_gph;
+static void gph_site(u32 site,uint64_t ns){
+    for(u32 i=0;i<GPH_SITES;i++)if(s_gph.site[i]==site||!s_gph.site[i]){s_gph.site[i]=site;s_gph.site_ns[i]+=ns;s_gph.site_n[i]++;return;}
+}
+static void gph_report(void){
+    const uint64_t now=gph_now();if(!s_gph.t0)s_gph.t0=now;
+    if(now-s_gph.t0<2000000000ull)return;
+    const double s=(double)(now-s_gph.t0)/1e9;char line[1024];
+    int n=snprintf(line,sizeof line,"[gcm phases] per s: pass=%.1fms/%.0f words=%.0f issue=%.1fms/%.0f inline=%.1fms/%.0f barrier:",
+        s_gph.pass_ns/1e6/s,s_gph.pass_n/s,s_gph.words/s,s_gph.issue_ns/1e6/s,s_gph.issue_n/s,s_gph.inline_ns/1e6/s,s_gph.inline_n/s);
+    for(u32 i=0;i<GPH_SITES&&s_gph.site[i]&&n>0&&(size_t)n<sizeof line;i++)
+        n+=snprintf(line+n,sizeof line-(size_t)n," L%u=%.1fms/%.0f",s_gph.site[i],s_gph.site_ns[i]/1e6/s,s_gph.site_n[i]/s);
+    fprintf(stderr,"%s\n",line);memset(&s_gph,0,sizeof s_gph);s_gph.t0=now;
+}
+static int gcm_reports_sync_barrier_core(u32 reason);
 static int gcm_reports_sync_barrier_at(u32 reason){
+    if(!gph_enabled())return gcm_reports_sync_barrier_core(reason);
+    const uint64_t t0=gph_now();const int ok=gcm_reports_sync_barrier_core(reason);
+    gph_site(reason,gph_now()-t0);return ok;
+}
+static int gcm_reports_sync_barrier_core(u32 reason){
     if(!s_deferred_reports)return 1;
     uint64_t capture=ps3_critical_capture_id(),start=ps3_critical_enabled()?ps3_critical_now_ns():0;
     uint64_t pending=s_reports.count,issued=s_reports.issued,published=s_reports.published;
@@ -1142,7 +1180,13 @@ static int gcm_reports_sync_barrier_at(u32 reason){
  * -- about 1,100 per frame in MAG's menu. PS3RECOMP_GCM_INLINE_NO_GPU_WAIT=1
  * keeps only the report ordering. Opt-in while it is measured. */
 static int s_inline_no_gpu_wait=-1;
+static int gcm_inline_image_barrier_core(void);
 static int gcm_inline_image_barrier(void){
+    if(!gph_enabled())return gcm_inline_image_barrier_core();
+    const uint64_t t0=gph_now();const int ok=gcm_inline_image_barrier_core();
+    s_gph.inline_ns+=gph_now()-t0;s_gph.inline_n++;return ok;
+}
+static int gcm_inline_image_barrier_core(void){
     if(s_inline_no_gpu_wait<0){
         const char *e=getenv("PS3RECOMP_GCM_INLINE_NO_GPU_WAIT");
         s_inline_no_gpu_wait=e&&!strcmp(e,"1");
@@ -2279,7 +2323,10 @@ void cellGcm_rsx_process_fifo(void)
         AcquireSRWLockExclusive(&s_gcm_fifo_lock);gcm_rsx_process_fifo_unlocked();ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
     } else {
         cellGcm_rsx_consumer_begin();
-        if(gcm_reports_progress(0,0)){gcm_rsx_process_fifo_unlocked();gcm_reports_progress(0,1);}
+        const int ph=gph_enabled();uint64_t p0=ph?gph_now():0,p1=0;const u32 g0=s_fifo_getoff;
+        if(gcm_reports_progress(0,0)){gcm_rsx_process_fifo_unlocked();if(ph)p1=gph_now();gcm_reports_progress(0,1);}
+        if(ph){const uint64_t p2=gph_now();if(p1){s_gph.pass_ns+=p1-p0;s_gph.pass_n++;s_gph.issue_ns+=p2-p1;s_gph.issue_n++;}
+               if(s_fifo_getoff>=g0)s_gph.words+=(s_fifo_getoff-g0)/4u;gph_report();}
         cellGcm_rsx_consumer_end();
     }
     if (ft_t0) {
