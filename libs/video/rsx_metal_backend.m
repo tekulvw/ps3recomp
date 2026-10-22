@@ -2517,6 +2517,10 @@ static id<MTLBuffer> s_eng_depth_staging;
  * command buffer: eng_depth_store_z24's conversion. */
 static void (^s_eng_tail_encode)(id<MTLCommandBuffer>);
 static id<MTLComputePipelineState> s_eng_z24_pso;
+/* What the last successful eng_depth_store_z24 left in s_eng_depth_staging:
+ * w x h words, w * 4 bytes a row. Any other use of the buffer clears it. */
+static u32 s_eng_z24_w, s_eng_z24_h;
+static int s_eng_z24_valid;
 
 static NSMutableArray<id<MTLBuffer>>* s_eng_stage_pool;
 static pthread_mutex_t s_eng_stage_pool_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2910,6 +2914,7 @@ static void eng_shutdown(void* user)
     s_eng_stage_used = s_eng_stage_cap = 0;
     s_eng_depth_staging = nil;
     s_eng_z24_pso = nil;
+    s_eng_z24_valid = 0;
     s_eng_tail_encode = nil;
     pthread_mutex_lock(&s_eng_stage_pool_lock);
     [s_eng_stage_pool removeAllObjects];
@@ -4590,6 +4595,7 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
             s_eng_depth_staging = [s_dev newBufferWithLength:copy_pitch * h
                                                      options:MTLResourceStorageModeShared];
         id<MTLBuffer> staging = s_eng_depth_staging;
+        s_eng_z24_valid = 0;
         if (!staging || ![staging contents]) return -1;
         const u32 snap = eng_depth_snapshot(user, depth, (u32)[src width],
                                                         (u32)[src height]);
@@ -4648,6 +4654,7 @@ static int eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32
             s_eng_depth_staging = [s_dev newBufferWithLength:bytes
                                                      options:MTLResourceStorageModeShared];
         id<MTLBuffer> staging = s_eng_depth_staging;
+        s_eng_z24_valid = 0;
         if (!staging || ![staging contents]) return -1;
         id<MTLComputePipelineState> pso = s_eng_z24_pso;
         const struct { uint32_t w, h; } wh = { w, h };
@@ -4666,6 +4673,7 @@ static int eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32
         eng_encode_and_commit(nil);
         s_eng_tail_encode = nil;
         if (!s_eng_checked_completed || atomic_load(&s_eng_checked_failed)) return -1;
+        s_eng_z24_w = w; s_eng_z24_h = h; s_eng_z24_valid = 1;
         const u8* bytes_in = [staging contents];
         if (dst_pitch == w * 4u) {
             memcpy(dst, bytes_in, bytes);
@@ -4674,6 +4682,64 @@ static int eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32
                 memcpy(dst + (size_t)row * dst_pitch, bytes_in + (size_t)row * w * 4u, (size_t)w * 4u);
         }
         return 0;
+    }
+}
+
+/* The stored words as a linear A8R8G8B8/D8R8G8B8 texture without decoding
+ * them: the texture holds the guest bytes A,R,G,B in components 0..3 and its
+ * swizzle composes the decode's rotation (host R,G,B,A = components 1,2,3,0;
+ * D8R8G8B8's alpha reads one) with the crossbar eng_texture_create applies.
+ * A blit from the staging copy fills it, queued ahead of any later commit. */
+static MTLTextureSwizzle eng_z24_raw_channel(MTLTextureSwizzle decoded, int rotate, int alpha_one)
+{
+    switch (decoded) {
+    case MTLTextureSwizzleRed:   return rotate ? MTLTextureSwizzleGreen : MTLTextureSwizzleRed;
+    case MTLTextureSwizzleGreen: return rotate ? MTLTextureSwizzleBlue : MTLTextureSwizzleGreen;
+    case MTLTextureSwizzleBlue:  return rotate ? MTLTextureSwizzleAlpha : MTLTextureSwizzleBlue;
+    case MTLTextureSwizzleAlpha: return alpha_one ? MTLTextureSwizzleOne
+                                       : rotate ? MTLTextureSwizzleRed : MTLTextureSwizzleAlpha;
+    default:                     return decoded;
+    }
+}
+
+static u32 eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    const u32 base = rsx_fmt & 0x9Fu;
+    if (!s_dev || !s_queue || !s_eng_z24_valid || !s_eng_depth_staging || !w || !h ||
+        w > s_eng_z24_w || h > s_eng_z24_h || (base != 0x85u && base != 0x9Eu))
+        return 0;
+    @autoreleasepool {
+        const int rotate = !rsx_texture_argb_is_rgba(), alpha_one = base == 0x9Eu;
+        u8 sel[4];
+        rsx_texture_component_remap(remap, base, sel);
+        MTLTextureDescriptor* td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                               width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        td.swizzle = MTLTextureSwizzleChannelsMake(
+            eng_z24_raw_channel(swizzle_sel(sel[1]), rotate, alpha_one),
+            eng_z24_raw_channel(swizzle_sel(sel[2]), rotate, alpha_one),
+            eng_z24_raw_channel(swizzle_sel(sel[3]), rotate, alpha_one),
+            eng_z24_raw_channel(swizzle_sel(sel[0]), rotate, alpha_one));
+        id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+        id<MTLCommandBuffer> cb = t ? [s_queue commandBuffer] : nil;
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        if (!blit) return 0;
+        [blit copyFromBuffer:s_eng_depth_staging sourceOffset:0
+           sourceBytesPerRow:(NSUInteger)s_eng_z24_w * 4u
+         sourceBytesPerImage:(NSUInteger)s_eng_z24_w * 4u * h
+                  sourceSize:MTLSizeMake(w, h, 1)
+                   toTexture:t destinationSlice:0 destinationLevel:0
+           destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if ([done status] != MTLCommandBufferStatusCompleted || [done error])
+                eng_checked_fail();
+        }];
+        [cb commit];
+        return eng_obj_add(t);
     }
 }
 
@@ -4698,6 +4764,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_snapshot       = eng_depth_snapshot,
     .depth_readback       = eng_depth_readback,
     .depth_store_z24      = eng_depth_store_z24,
+    .depth_z24_texture    = eng_depth_z24_texture,
     .color_snapshot       = eng_color_snapshot,
     .pipeline_create      = eng_pipeline_create,
     .pipeline_release     = eng_pipeline_release,

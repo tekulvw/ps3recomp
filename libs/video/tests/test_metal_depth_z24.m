@@ -124,6 +124,67 @@ int main(void)
         CHECK(eng_depth_store_z24(NULL, small, 5, 3, via_gpu, 20) == 0, "tight store");
         CHECK(!memcmp(via_cpu, via_gpu, sizeof via_cpu), "store equals readback + CPU conversion");
 
+        /* The GPU-built alias samples as the decoded upload does: same
+         * texels through read() for both formats and a spread of crossbars. */
+        {
+            enum { AW = 37, AH = 9, SW = 40 };   /* texture inside a wider store */
+            u32 big = eng_depth_target_create(NULL, SW, AH + 2);
+            for (u32 i = 0; i < SW * (AH + 2); i++) {
+                float f = (float)((i * 2654435761u) & 0xFFFFFF) / 16777215.0f;
+                memcpy(&bits[i], &f, 4);
+            }
+            CHECK(fill_depth(big, bits, SW, AH + 2), "alias source depth");
+            u8 words[SW * (AH + 2) * 4];
+            CHECK(eng_depth_store_z24(NULL, big, SW, AH + 2, words, SW * 4) == 0, "alias store");
+            NSError* err = nil;
+            id<MTLLibrary> lib = [s_dev newLibraryWithSource:
+                @"#include <metal_stdlib>\nusing namespace metal;\n"
+                 "kernel void rd(texture2d<float, access::read> t [[texture(0)]], device float4* o [[buffer(0)]],"
+                 " uint2 p [[thread_position_in_grid]]) { if (p.x < t.get_width() && p.y < t.get_height())"
+                 " o[p.y * t.get_width() + p.x] = t.read(p); }" options:nil error:&err];
+            id<MTLComputePipelineState> rd = [s_dev newComputePipelineStateWithFunction:
+                [lib newFunctionWithName:@"rd"] error:&err];
+            CHECK(rd != nil, "read kernel");
+            static const u32 remaps[] = { 0xAAE4u, 0xAA93u, 0xAA1Bu, 0x55E4u, 0xAAD8u, 0x0000u, 0xFF39u, 0xAA4Eu };
+            static const u32 fmts[] = { 0xA5u, 0xBEu };
+            int same = 1, built = 1;
+            for (u32 fi = 0; fi < 2; fi++) for (u32 ri = 0; ri < sizeof remaps / sizeof remaps[0]; ri++) {
+                rsx_tex_layout tl; rsx_texture_layout(fmts[fi], AW, AH, &tl);
+                tl.row_bytes = SW * 4;    /* the texture's pitch is the store's */
+                u8 dec[AW * AH * 4];
+                rsx_texture_decode(dec, AW * 4, words, AW, AH, &tl, rsx_texture_argb_is_rgba());
+                u32 cpu = eng_texture_create(NULL, RSX_BE_FMT_R8G8B8A8, AW, AH, 1, 1, remaps[ri], fmts[fi]);
+                eng_texture_upload(NULL, cpu, 0, 0, AW, AH, dec, AW * 4, AH);
+                u32 gpu = eng_depth_z24_texture(NULL, AW, AH, remaps[ri], fmts[fi]);
+                built &= gpu != 0;
+                if (!gpu) { eng_obj_release(NULL, cpu); continue; }
+                id<MTLBuffer> a = [s_dev newBufferWithLength:AW * AH * 16 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> b = [s_dev newBufferWithLength:AW * AH * 16 options:MTLResourceStorageModeShared];
+                id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:rd];
+                [ce setTexture:eng_obj(cpu) atIndex:0]; [ce setBuffer:a offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(AW, AH, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                [ce setTexture:eng_obj(gpu) atIndex:0]; [ce setBuffer:b offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(AW, AH, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                if (memcmp([a contents], [b contents], AW * AH * 16)) {
+                    same = 0;
+                    const float* x = [a contents]; const float* y = [b contents];
+                    fprintf(stderr, "fmt %02X remap %04X: cpu %g %g %g %g gpu %g %g %g %g\n", fmts[fi], remaps[ri],
+                            x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]);
+                }
+                eng_obj_release(NULL, cpu); eng_obj_release(NULL, gpu);
+            }
+            CHECK(built, "alias textures built on the GPU");
+            CHECK(same, "GPU alias texels equal the decoded upload's");
+            CHECK(eng_depth_z24_texture(NULL, SW + 1, AH, 0xAAE4u, 0xA5u) == 0, "alias wider than the store rejected");
+            CHECK(eng_depth_z24_texture(NULL, AW, AH, 0xAAE4u, 0x81u) == 0, "other formats rejected");
+            float fl1; CHECK(eng_depth_readback(NULL, big, 0, 0, 1, 1, &fl1, 4) == 0, "float readback reuses staging");
+            CHECK(eng_depth_z24_texture(NULL, AW, AH, 0xAAE4u, 0xA5u) == 0, "staging reused: alias refused");
+            eng_obj_release(NULL, big);
+        }
+
         u32 color = eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, 4, 3, NULL, 0);
         u8 guard[16]; memset(guard, 0x5A, sizeof guard);
         CHECK(eng_depth_store_z24(NULL, color, 1, 1, guard, 4) != 0, "colour target rejected");
