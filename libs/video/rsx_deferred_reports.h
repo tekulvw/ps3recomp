@@ -16,6 +16,7 @@ typedef struct rsx_deferred_report_queue {
  uint32_t head,count,unissued,failed,max_pending;
  uint64_t generation,issued,published;
  uint64_t (*clock)(void); /* diagnostic: stamps issue times when set */
+ uint32_t batch;           /* unissued records that force an issue; 0 = RSX_DEFERRED_REPORT_BATCH */
 } rsx_deferred_report_queue;
 typedef struct rsx_deferred_report_ops {
  void *user;
@@ -60,7 +61,7 @@ static int rsx_reports_enqueue(rsx_deferred_report_queue *q,const rsx_deferred_r
  if(q->count==RSX_DEFERRED_REPORT_CAPACITY)return rsx_reports_fail(q,&q->records[q->head],"capacity-after-blocking-progress",q->records[q->head].ticket,0,1,0);
  r.ticket=0;r.generation=q->generation;q->records[(q->head+q->count)%RSX_DEFERRED_REPORT_CAPACITY]=r;
  q->count++;q->unissued++;if(q->count>q->max_pending)q->max_pending=q->count;
- if(q->unissued>=RSX_DEFERRED_REPORT_BATCH&&!rsx_reports_issue(q,o))return 0;
+ if(q->unissued>=(q->batch?q->batch:RSX_DEFERRED_REPORT_BATCH)&&!rsx_reports_issue(q,o))return 0;
  return rsx_reports_progress(q,o,0,0);
 }
 static int rsx_reports_overlap(const rsx_deferred_report_queue *q,uint64_t ea,uint64_t bytes){
