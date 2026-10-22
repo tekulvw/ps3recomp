@@ -12,6 +12,7 @@ def main():
   q=subprocess.run([str(exe)],env=env,capture_output=True,text=True);assert q.returncode==0,q.stdout+q.stderr
   prof=t/'prof.txt';env.update(PS3_TPROF=str(prof),PS3_TPROF_SECONDS='0.3')
   q=subprocess.run([str(exe)],env=env,capture_output=True,text=True);assert q.returncode==0,q.stdout+q.stderr
+  q=subprocess.run([str(exe)],env={**env,'PS3_TPROF_PPU':'1','PS3_TPROF':str(t/'ppu.txt')},capture_output=True,text=True);assert q.returncode==0,q.stdout+q.stderr
   syms={}
   for l in subprocess.run(['nm','-n',str(exe)],capture_output=True,text=True).stdout.splitlines():
    p=l.split()

@@ -10,7 +10,9 @@
  *
  * <path> gets one sample per line:
  *   <kind> <who> <t us> <pc> <return addresses...>
- * kind is S (SPU, who = SPU id) or P (PPU, who = thread id). Main-image
+ * kind is S (SPU, who = SPU id) or P (PPU, who = thread id). PPU threads are
+ * sampled only with PS3_TPROF_PPU=1: a signal cuts their host sleeps and
+ * waits short, and guest-visible syscalls built on them can fail with it. Main-image
  * addresses are written image-relative in hex for offline symbolizing; frames
  * in other images are named "@symbol" with dladdr. Times are on the
  * PS3_FTRACE clock and relative to its base when it is recording, so samples
@@ -184,6 +186,10 @@ static inline void ps3_tprof_thread(char kind, uint32_t who)
     int on = __atomic_load_n(&s->on, __ATOMIC_ACQUIRE);
     if (__builtin_expect(on == 3, 1)) return;
     if (on != 2 && !ps3_tprof_init()) return;
+    if (kind == 'P') {
+        const char* ppu = getenv("PS3_TPROF_PPU");
+        if (!ppu || strcmp(ppu, "1")) return;
+    }
     const pthread_t self = pthread_self();
     /* Each header copy has its own statics, so slots are claimed atomically
      * from the shared state rather than under a lock. */
