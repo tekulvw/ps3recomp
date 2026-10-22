@@ -3080,18 +3080,8 @@ static void gcm_rsx_process_fifo_pass(void)
                   if (eng < 0) eng = rsx_draw_engine_enabled();
                   if (eng) {
                       const uint64_t e0=s_gph_on>0?gph_now():0;
-                      const u32 arg = vm_read32(dea);
-                      rsx_draw_engine_method_at((subch << 13) | m, arg, dea);
+                      rsx_draw_engine_method_at((subch << 13) | m, vm_read32(dea),dea);
                       if(e0){s_gph.eng_ns+=gph_now()-e0;s_gph.eng_n++;}
-                      /* A label the GPU has finished waited for the end of
-                       * the pass to be published, however long the pass;
-                       * a job polling it waited with it. Publish what has
-                       * completed after each draw instead: the same
-                       * in-order, completion-gated step the pass runs at
-                       * its start, without waiting or issuing. */
-                      if ((m & 0x1FFCu) == 0x1808u && !arg && s_deferred_reports && s_reports.count &&
-                          !gcm_reports_progress(0, 0))
-                          return;
                   } }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
