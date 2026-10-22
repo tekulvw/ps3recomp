@@ -2116,6 +2116,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         WakeAllConditionVariable(&si->wake);
     }
     ReleaseSRWLockExclusive(&si->lock);
+    ps3_tprof_thread_exit();
     return 0;
 }
 
