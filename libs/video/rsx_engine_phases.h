@@ -58,6 +58,28 @@ static inline uint64_t eng_ph_now(void)
 #define ENG_PH_END(phase, v) do { if (v) { s_eng_ph_ns[phase] += eng_ph_now() - (v); \
                                            s_eng_ph_n[phase]++; } } while (0)
 
+/* Draw stages: the time from one DRAW_OBSERVER_STAGE mark to the next, by
+ * stage name (string literals, so the pointer is the key). */
+enum { ENG_PH_STAGES = 32 };
+static const char* s_eng_ph_stage[ENG_PH_STAGES];
+static uint64_t s_eng_ph_stage_ns[ENG_PH_STAGES];
+static int s_eng_ph_nstages;
+static const char* s_eng_ph_cur;
+static uint64_t s_eng_ph_mark;
+
+static inline void eng_ph_stage(const char* name)
+{
+    const uint64_t now = eng_ph_now();
+    if (s_eng_ph_cur) {
+        int i = 0;
+        while (i < s_eng_ph_nstages && s_eng_ph_stage[i] != s_eng_ph_cur) i++;
+        if (i == s_eng_ph_nstages && i < ENG_PH_STAGES) s_eng_ph_stage[s_eng_ph_nstages++] = s_eng_ph_cur;
+        if (i < ENG_PH_STAGES) s_eng_ph_stage_ns[i] += now - s_eng_ph_mark;
+    }
+    s_eng_ph_cur = name;
+    s_eng_ph_mark = now;
+}
+
 static inline void eng_ph_frame(void)
 {
     if (!eng_ph_enabled() || ++s_eng_ph_frames < 60) return;
@@ -68,6 +90,12 @@ static inline void eng_ph_frame(void)
                       (double)s_eng_ph_ns[i] / 1e6 / s_eng_ph_frames,
                       (double)s_eng_ph_n[i] / s_eng_ph_frames);
     fprintf(stderr, "%s\n", line);
+    n = snprintf(line, sizeof line, "[rsx phases] draw stages per frame:");
+    for (int i = 0; i < s_eng_ph_nstages && n > 0 && (size_t)n < sizeof line; i++)
+        n += snprintf(line + n, sizeof line - (size_t)n, " %s=%.3fms", s_eng_ph_stage[i],
+                      (double)s_eng_ph_stage_ns[i] / 1e6 / s_eng_ph_frames);
+    fprintf(stderr, "%s\n", line);
+    memset(s_eng_ph_stage_ns, 0, sizeof s_eng_ph_stage_ns);
     memset(s_eng_ph_ns, 0, sizeof s_eng_ph_ns);
     memset(s_eng_ph_n, 0, sizeof s_eng_ph_n);
     s_eng_ph_frames = 0;
