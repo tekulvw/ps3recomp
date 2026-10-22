@@ -46,6 +46,7 @@ void spu_lockline_unlock(void);
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
  * reservation holder. Called from the SPU's GETLLAR with the lock held.
  *
+ * Takes the line's PPU-store shard while first adding SPU interest.
  * Lines are marked and never unmarked. A line the SPURS kernel reserves is
  * reserved again microseconds later, so unmarking would buy nothing; a stale
  * mark costs one locked PPU store to a line the kernel owns anyway. */
@@ -60,6 +61,18 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea);
  * Tracking a line arms coherent writes and records every subsequent store,
  * including stores to a different word or stores which restore the old bytes. */
 uint64_t spu_coh_line_epoch(uint32_t ea);
+
+/* A PPU plain store to a marked line. spu_coh_ppu_store_lock returns 1 with the
+ * line's shard held when no SPU or watch has an interest in the line; the
+ * caller writes and calls spu_coh_ppu_store_unlock, which does the PPU-side
+ * notify (reservation break, epoch) and drops the shard. On 0 the caller takes
+ * the lock-line lock and notifies as for any other coherent write. */
+int  spu_coh_ppu_store_lock(uint32_t ea);
+void spu_coh_ppu_store_unlock(uint32_t ea);
+/* A PPU store-conditional holds this inside the lock-line lock, across its
+ * epoch check, compare-and-swap and notify. */
+void spu_coh_line_shard_lock(uint32_t ea);
+void spu_coh_line_shard_unlock(uint32_t ea);
 
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */
