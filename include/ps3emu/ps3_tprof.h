@@ -40,6 +40,7 @@
 #include <mach/mach_types.h>
 #include <mach/thread_status.h>
 #include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -108,8 +109,15 @@ static inline void ps3_tprof_write(const char* out, uint32_t n)
     FILE* f = fopen(out, "w");
     if (!f) { fprintf(stderr, "[tprof] cannot write %s\n", out); return; }
     const intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-    Dl_info self_info; uintptr_t self_base = 0;
-    if (dladdr(_dyld_get_image_header(0), &self_info)) self_base = (uintptr_t)self_info.dli_fbase;
+    /* The main image's text range is written as offsets without asking
+     * dladdr, and the few other addresses go through a small cache: one
+     * dladdr per frame made a 40k-sample dump take minutes. */
+    const struct mach_header_64* mh = (const struct mach_header_64*)_dyld_get_image_header(0);
+    const struct segment_command_64* text = getsegbyname("__TEXT");
+    const uintptr_t self_lo = (uintptr_t)mh;
+    const uintptr_t self_hi = self_lo + (text ? (uintptr_t)text->vmsize : 0);
+    enum { CACHE = 4096 };
+    static struct { uintptr_t pc; const char* name; } cache[CACHE];
     const uint64_t base = g_ps3_ft.base;
     fprintf(f, "# tprof samples %u slide 0x%llx ftrace_base %d image %s\n", n,
             (unsigned long long)slide, base != 0, _dyld_get_image_name(0));
@@ -119,11 +127,18 @@ static inline void ps3_tprof_write(const char* out, uint32_t n)
         fprintf(f, "%c %u %.3f", r->kind, r->who, (double)(r->t - base) / 1e3);
         for (unsigned d = 0; d < r->depth; d++) {
             const uintptr_t pc = r->pc[d];
-            Dl_info info;
-            if (dladdr((const void*)pc, &info) && (uintptr_t)info.dli_fbase != self_base && info.dli_sname)
-                fprintf(f, " @%s", info.dli_sname);
-            else
-                fprintf(f, " %llx", (unsigned long long)(pc - (uintptr_t)slide));
+            const char* sym = NULL;
+            if (pc < self_lo || pc >= self_hi) {
+                const unsigned h = (unsigned)((pc >> 2) * 0x9E3779B1u) % CACHE;
+                if (cache[h].pc == pc) sym = cache[h].name;
+                else {
+                    Dl_info info;
+                    sym = dladdr((const void*)pc, &info) && info.dli_sname ? info.dli_sname : NULL;
+                    cache[h].pc = pc; cache[h].name = sym;
+                }
+            }
+            if (sym) fprintf(f, " @%s", sym);
+            else fprintf(f, " %llx", (unsigned long long)(pc - (uintptr_t)slide));
         }
         fputc('\n', f);
     }
