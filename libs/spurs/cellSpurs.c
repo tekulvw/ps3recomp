@@ -136,13 +136,14 @@ static EventFlagSync* ef_sync_find(uint32_t ea)
     return NULL;
 }
 
+static void spurs_commit_hook(uint32_t line);
 static EventFlagSync* ef_sync_alloc(uint32_t ea)
 {
     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
         if (!s_ef_sync[i].initialized) {
             s_ef_sync[i].ea = ea;
             { extern void (*g_spu_line_commit_hook)(uint32_t);
-              g_spu_line_commit_hook = ef_line_committed; }
+              g_spu_line_commit_hook = spurs_commit_hook; }
 #ifdef _WIN32
             InitializeCriticalSection(&s_ef_sync[i].cs);
             InitializeConditionVariable(&s_ef_sync[i].cv);
@@ -456,6 +457,7 @@ static struct SpursInst {
     u32 ea, nspus;
     char prefix[16];
     int kernel_live, stopping, starting;
+    int kick;   /* an SPU committed the request line since the coordinator's last pass */
     SRWLOCK lock;
     CONDITION_VARIABLE wake;
     HANDLE coordinator;
@@ -464,6 +466,29 @@ static struct SpursInst {
     u32 cursor, pass_no;
 } s_inst[MAX_SPURS_INST];
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
+
+/* An SPU kicks a workload the way a PPU does, with an atomic on the instance's
+ * first line -- wklReadyCount1, wklFlag and wklSignal1 all live in it. The PUTLLC
+ * wakes nobody, so the coordinator only saw the request on its next timed pass,
+ * up to a millisecond later, with the SPUs idle meanwhile. Wake it on every
+ * committed write to that line; one that raised nothing only costs a pass. The
+ * kick flag covers a commit that lands while the coordinator is mid-pass. Called
+ * with no lock-line lock held. */
+static void spurs_line_committed(uint32_t line)
+{
+    for (int i = 0; i < MAX_SPURS_INST; i++) {
+        struct SpursInst* si = &s_inst[i];
+        const u32 ea = __atomic_load_n(&si->ea, __ATOMIC_ACQUIRE);
+        if (!ea || (ea & ~127u) != line || !__atomic_load_n(&si->kernel_live, __ATOMIC_ACQUIRE)) continue;
+        __atomic_store_n(&si->kick, 1, __ATOMIC_RELEASE);
+        WakeAllConditionVariable(&si->wake);
+    }
+}
+static void spurs_commit_hook(uint32_t line)
+{
+    ef_line_committed(line);
+    spurs_line_committed(line);
+}
 static SRWLOCK s_workload_registry_lock = SRWLOCK_INIT;
 
 static s32 spurs_remove_workload_locked(struct SpursInst*, CellSpurs*, u32, int);
@@ -2118,7 +2143,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     const long poll_us = poll_option ? atol(poll_option) : 0;
     AcquireSRWLockExclusive(&si->lock);
     while (!si->stopping) {
-        if (poll_us > 0 && poll_us < 1000) {
+        if (__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL)) {
+            /* an SPU raised a request during the last pass: scan again now */
+        } else if (poll_us > 0 && poll_us < 1000) {
             ReleaseSRWLockExclusive(&si->lock);
 #ifdef _WIN32
             Sleep(0);
@@ -2202,6 +2229,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 static s32 spurs_scheduler_start(struct SpursInst* si)
 {
     si->stopping = 0; si->cursor = si->pass_no = 0;
+    { extern void (*g_spu_line_commit_hook)(uint32_t);
+      g_spu_line_commit_hook = spurs_commit_hook; }
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
     for (u32 sn = 0; sn < si->nspus; sn++) {
