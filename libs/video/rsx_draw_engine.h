@@ -239,6 +239,13 @@ typedef struct rsx_draw_backend {
      * depth_readback. */
     int  (*depth_store_z24)(void* user, u32 depth, u32 w, u32 h,
                             u8* dst, u32 dst_pitch);
+    /* Optional, with depth_store_z24: a texture reading the top-left w x h
+     * of the words the last successful store wrote as linear A8R8G8B8 or
+     * D8R8G8B8 (rsx_fmt, crossbar `remap`), sampling exactly as
+     * texture_create + texture_upload of their decoded bytes would, built
+     * on the GPU from the backend's own copy. 0 when it cannot; the engine
+     * then decodes and uploads. */
+    u32  (*depth_z24_texture)(void* user, u32 w, u32 h, u32 remap, u32 rsx_fmt);
     /* Optional same-target colour feedback. Return a fresh, immutable texture
      * of the target's full physical extent and storage format. Its GPU copy
      * must execute after all preceding writes and before the next draw. The

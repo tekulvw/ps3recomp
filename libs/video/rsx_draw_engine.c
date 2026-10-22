@@ -1109,12 +1109,26 @@ static int eng_staging_reserve(u32 bytes)
 
 /* Decode a guest texture out of guest memory and hand every face and level to
  * the backend. Returns the backend handle, or 0. */
+/* The depth words eng_zdepth_to_guest just stored through depth_store_z24,
+ * while the texture unit that asked for them is being bound: an upload of
+ * exactly those bytes as a linear 32-bit colour texture is built on the GPU
+ * from the backend's copy instead of decoded here. */
+static struct { int valid; u32 location, offset, pitch, w, h; } s_z24_stored;
+
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap, u32 depth, u64 identity)
 {
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     if (!nlv || !lv[0].tl.face_bytes) return 0;
+    if (s_z24_stored.valid && g.be->depth_z24_texture && !identity && !cube && depth <= 1 &&
+        nlv == 1 && location == s_z24_stored.location && offset == s_z24_stored.offset &&
+        pitch == s_z24_stored.pitch && w <= s_z24_stored.w && h <= s_z24_stored.h &&
+        (fmt & RSX_TEX_FMT_LINEAR) && !lv[0].tl.swizzled && lv[0].tl.bytes_per_texel == 4u &&
+        ((fmt & RSX_TEX_FMT_BASE_MASK) == 0x85u || (fmt & RSX_TEX_FMT_BASE_MASK) == 0x9Eu)) {
+        const u32 handle = g.be->depth_z24_texture(g.be->user, w, h, remap, fmt);
+        if (handle) return handle;
+    }
     /* A volume: every slice of every level decoded and uploaded on its own.
      * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
      * first slice and sampled in 2D it darkened whole boxes round every prop. */
@@ -1460,6 +1474,9 @@ static int eng_zdepth_to_guest(u32 slot)
         if (!dst || !eng_report_barrier()) return 0;
         if (g.be->depth_store_z24(g.be->user, z->handle, w, h, dst, z->pitch) == 0) {
             ENG_PH_END(ENG_PH_ZD_READ, ph_gpu);
+            s_z24_stored.valid = 1;
+            s_z24_stored.location = z->location; s_z24_stored.offset = z->offset;
+            s_z24_stored.pitch = z->pitch; s_z24_stored.w = w; s_z24_stored.h = h;
             goto stored;
         }
     }
@@ -2701,8 +2718,10 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                                t.width, t.height, t.mipmaps, t.pitch,
                                                (int)t.cubemap, t.remap & 0xFFFFu,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u, 0);
+                s_z24_stored.valid = 0;
                 continue;
             }
+            s_z24_stored.valid = 0;
         }
         if (own && zsrc < 0 && g.be->color_snapshot) {
             eng_surface* s = &g.surfaces[surface_at];

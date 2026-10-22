@@ -91,11 +91,62 @@ static void packing_case(u32 bpp)
     CHECK(stub.last_clear_depth==1.0f,"far-plane clear decoding remains unchanged");
     engine_down();
 }
+/* A backend with the GPU store and alias texture: the guest bytes are the
+ * same, the alias comes from depth_z24_texture rather than an upload, and a
+ * refused alias still decodes and uploads. */
+static int n_store,n_alias,alias_refuses;
+static u32 alias_w,alias_h,alias_remap,alias_fmt;
+static int gpu_store(void* user,u32 depth,u32 w,u32 h,u8* dst,u32 pitch)
+{
+    (void)user;(void)depth;n_store++;
+    if(w!=PACK_W || h!=PACK_H || pitch!=PACK_PITCH)return -1;
+    for(u32 y=0;y<h;y++)for(u32 x=0;x<w;x++){
+        float d=samples[sample_at(x,y)];d=d>0.0f?d:0.0f;d=d<1.0f?d:1.0f;
+        u32 v=(u32)((double)d*16777215.0+0.5);u8* q=dst+y*pitch+x*4;
+        q[0]=(u8)(v>>16);q[1]=(u8)(v>>8);q[2]=(u8)v;q[3]=0;
+    }
+    return 0;
+}
+static u32 gpu_alias(void* user,u32 w,u32 h,u32 remap,u32 fmt)
+{
+    n_alias++;alias_w=w;alias_h=h;alias_remap=remap;alias_fmt=fmt;
+    return alias_refuses?0:stub_texture_create(user,RSX_BE_FMT_R8G8B8A8,w,h,1,1,remap,fmt);
+}
+static void gpu_case(int refuse)
+{
+    rsx_draw_backend be=g_stub_backend;be.depth_readback=varied_depth;be.texture_create=capture_create;be.texture_upload=capture_upload;
+    be.depth_store_z24=gpu_store;be.depth_z24_texture=gpu_alias;
+    memset(&stub,0,sizeof stub);n_store=n_alias=0;alias_refuses=refuse;rsx_draw_engine_set_backend(&be);
+    CHECK(rsx_draw_engine_init(32,8)==0,"gpu-store engine initializes");
+    m(M_CONTEXT_DMA_COLOR_A,DMA_LOCAL);m(M_SURFACE_CLIP_H,PACK_W<<16);m(M_SURFACE_CLIP_V,PACK_H<<16);
+    m(M_VTXFMT,2u|(4u<<4)|(16u<<8));m(M_VTXBUF_OFFSET,0x80000000u|VTX_OFFSET);
+    m(M_CONTEXT_DMA_ZETA,DMA_LOCAL);m(M_SURFACE_FORMAT,8u|(2u<<5));
+    m(M_ZETA_OFFSET,ZETA_OFFSET);m(M_ZETA_PITCH,PACK_PITCH);m(M_COLOR_A_OFFSET,0x90000u);
+    u8* guest=vm_base+GUEST_LOCAL_EA+ZETA_OFFSET;memset(guest-16,0xA6,PACK_PITCH*3+16);
+    bind_texture_unit(RSX_LOCATION_LOCAL,ZETA_OFFSET);m(M_TEX_UNIT+0x18,(PACK_W<<16)|PACK_H);m(0x1840,PACK_PITCH);
+    changed=0;draw_triangle();
+    CHECK(n_store==0 && n_alias==0,"no store or alias before any depth write");
+    for(int pass=0;pass<2;pass++){
+        changed=pass;m(M_TEX_UNIT+0x0C,0);m(M_COLOR_A_OFFSET,ZETA_OFFSET);m(M_COLOR_MASK,0);m(M_DEPTH_TEST,1);m(M_DEPTH_WRITE,1);draw_triangle();
+        m(M_COLOR_A_OFFSET,0x90000u);m(M_COLOR_MASK,0x01010101);m(M_DEPTH_TEST,0);m(M_DEPTH_WRITE,0);m(M_TEX_UNIT+0x0C,0x80000000u);
+        const int uploads=stub.n_texture_upload;draw_triangle();
+        CHECK(n_store==pass+1 && stub.n_depth_readback==0,"dirty D24S8 depth stored through the GPU store, not the readback");
+        check_guest(4);
+        CHECK(n_alias==pass+1 && alias_w==PACK_W && alias_h==PACK_H && alias_remap==0xAAE4u && (alias_fmt&0x9Fu)==0x85u,
+              "alias asked of the backend with the unit's size, crossbar and format");
+        if(refuse){CHECK(stub.n_texture_upload==uploads+1,"refused alias decodes and uploads");check_upload(4);}
+        else CHECK(stub.n_texture_upload==uploads && stub.bound_tex[0],"GPU alias bound without an upload");
+        const u32 stable=stub.bound_tex[0];const int stable_uploads=stub.n_texture_upload;draw_triangle();
+        CHECK(n_store==pass+1 && n_alias==pass+1 && stub.n_texture_upload==stable_uploads && stub.bound_tex[0]==stable,
+              "unchanged depth reuses the alias without another store");
+    }
+    engine_down();
+}
 int main(void)
 {
     vm_base=calloc(1,GUEST_BYTES);if(!vm_base)return 1;ppu_vm_size=GUEST_BYTES;
     for(u32 i=0;i<12;i++){u8* p=vm_base+VTX_OFFSET+i*4;p[0]=0x3F;p[1]=0x80;}
     samples[0]=1;samples[1]=nextafterf(1,0);samples[2]=nextafterf(samples[1],0);samples[3]=.5f;samples[4]=0;samples[5]=NAN;samples[6]=-.25f;samples[7]=1.25f;samples[8]=INFINITY;samples[9]=-INFINITY;samples[10]=.75f;samples[11]=.25f;
-    packing_case(4);packing_case(2);free(vm_base);
+    packing_case(4);packing_case(2);gpu_case(0);gpu_case(1);free(vm_base);
     printf("depth packing: %d failures\n",g_failures);return g_failures?1:0;
 }
