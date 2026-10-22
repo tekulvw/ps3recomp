@@ -1851,6 +1851,55 @@ static int eng_debug_fp(u64 fp_hash, u32 pipeline)
  * RSX_ENGINE_VTX_PROBE_TRIGGER=<file> holds the probe until that file exists
  * (checked once a frame), so the draws probed are the ones on screen when
  * the effect is. */
+static struct {
+    u64 fp_hash;
+    const u8* p;
+    u32 seq, attr, location, offset, bytes, due[2], left;
+} s_vtx_recheck[32];
+
+static void eng_vtx_probe_dump(const char* tag, u64 fp_hash, u32 seq, u32 attr,
+                               u32 location, u32 offset, const u8* p, u32 bytes)
+{
+    fprintf(stderr, "[vtx probe]  %s fp %016llx draw %u frame %u a%u loc %u off 0x%08X ea 0x%08X:",
+            tag, (unsigned long long)fp_hash, seq, g.frames, attr, location, offset,
+            p && vm_base ? (u32)(p - vm_base) : 0u);
+    if (!p) fputs(" unresolved", stderr);
+    else for (u32 i = 0; i < bytes; i++) fprintf(stderr, "%s%02X", (i & 3) ? "" : " ", p[i]);
+    fputc('\n', stderr);
+}
+
+static void eng_vtx_probe_record(u64 fp_hash, u32 seq, u32 attr, u32 location,
+                                 u32 offset, const u8* p, u32 bytes)
+{
+    eng_vtx_probe_dump("record", fp_hash, seq, attr, location, offset, p, bytes);
+    if (!p) return;
+    for (u32 i = 0; i < 32; i++) {
+        if (s_vtx_recheck[i].left) continue;
+        s_vtx_recheck[i].fp_hash = fp_hash; s_vtx_recheck[i].p = p;
+        s_vtx_recheck[i].seq = seq; s_vtx_recheck[i].attr = attr;
+        s_vtx_recheck[i].location = location; s_vtx_recheck[i].offset = offset;
+        s_vtx_recheck[i].bytes = bytes;
+        s_vtx_recheck[i].due[0] = g.frames + 1; s_vtx_recheck[i].due[1] = g.frames + 30;
+        s_vtx_recheck[i].left = 2;
+        return;
+    }
+}
+
+/* At each present: the probed records whose recheck frame has come. */
+static void eng_vtx_probe_recheck(void)
+{
+    for (u32 i = 0; i < 32; i++) {
+        if (!s_vtx_recheck[i].left) continue;
+        const u32 k = 2u - s_vtx_recheck[i].left;
+        if (g.frames < s_vtx_recheck[i].due[k]) continue;
+        eng_vtx_probe_dump(k ? "later30" : "later1", s_vtx_recheck[i].fp_hash,
+                           s_vtx_recheck[i].seq, s_vtx_recheck[i].attr,
+                           s_vtx_recheck[i].location, s_vtx_recheck[i].offset,
+                           s_vtx_recheck[i].p, s_vtx_recheck[i].bytes);
+        s_vtx_recheck[i].left--;
+    }
+}
+
 static void eng_vtx_probe(u64 fp_hash, u32 pipeline, u32 prim, int blended,
                           const rsx_vertex_layout_plan* layout)
 {
@@ -1931,6 +1980,21 @@ static void eng_vtx_probe(u64 fp_hash, u32 pipeline, u32 prim, int blended,
                 a, rsx_dsp_reg(&g.rsx, 0x1740u + a * 4u), d.type, d.size, d.stride, d.frequency,
                 ((rsx_dsp_reg(&g.rsx, 0x1FC0) >> a) & 1u) ? "mod" : "div", d.offset, d.location,
                 cur[0], cur[1], cur[2], cur[3], seen, fed ? " read" : "");
+    }
+    /* The first per-instance (divided) array's first record as raw guest
+     * bytes, with its effective address, and the same bytes again one and
+     * thirty frames later (eng_vtx_probe_recheck): data that arrives after the
+     * draw is told apart from data that never arrives. */
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+        rsx_dsp_vertex_attr d;
+        rsx_dsp_get_vertex_attr(&g.rsx, a, &d);
+        if (!d.size || d.frequency <= 1 || ((rsx_dsp_reg(&g.rsx, 0x1FC0) >> a) & 1u)) continue;
+        const u32 first = dc.n_refs ? dc.refs[0].vertex_id / d.frequency : 0;
+        const u32 off = rsx_dsp_vertex_data_base_offset(&g.rsx) + d.offset + first * d.stride;
+        const u32 bytes = d.stride < 64u ? (d.stride ? d.stride : 16u) : 64u;
+        const u8* p = eng_guest_ptr(NULL, d.location, off, bytes);
+        eng_vtx_probe_record(fp_hash, seq, a, d.location, off, p, bytes);
+        break;
     }
     const u32 nv = dc.n_verts < 8u ? dc.n_verts : 8u;
     for (u32 v = 0; v < nv; v++) {
@@ -3943,6 +4007,7 @@ static void eng_present_core(u32 buffer_id)
     g.be->present(g.be->user, g.surfaces[target].handle);
     frame_capture_present(buffer_id,target);
     g.frames++;
+    eng_vtx_probe_recheck();
     eng_ph_frame();
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;

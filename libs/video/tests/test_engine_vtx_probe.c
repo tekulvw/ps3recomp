@@ -101,6 +101,9 @@ int main(int argc, char** argv)
     draw_triangle();                                   /* probed */
     upload_vp_from_attr(3);
     draw_triangle();                                   /* over the limit: silent */
+    /* The record is rewritten after the draw: the next frame's recheck sees it. */
+    store_be_f32(vm_base + VTX_OFFSET, 42.0f);
+    rsx_draw_engine_present();
     engine_down();
 
     fflush(stderr);
@@ -137,6 +140,13 @@ int main(int argc, char** argv)
           strstr(out, "c6 (") == NULL,
           "the listed constant rows only");
     CHECK(strstr(out, "viewport scale") != NULL, "the viewport");
+    char rec[160];
+    snprintf(rec, sizeof rec, "record fp %s draw 0 frame %u a0 loc 1 off 0x%08X ea 0x%08X: 41200000 BF800000",
+             env, trig ? 1u : 0u, VTX_OFFSET, VTX_OFFSET);
+    CHECK(strstr(out, rec) != NULL, "the first divided record's raw bytes and address");
+    snprintf(rec, sizeof rec, "later1 fp %s draw 0 frame %u a0 loc 1 off 0x%08X ea 0x%08X: 42280000 BF800000",
+             env, trig ? 2u : 1u, VTX_OFFSET, VTX_OFFSET);
+    CHECK(strstr(out, rec) != NULL, "and the same record one frame later, rewritten");
     if (trig) {
         unlink(trigger_path);
         CHECK(strstr(out, "[vtx probe] armed at frame 1") != NULL, "armed by the trigger file a frame later");
