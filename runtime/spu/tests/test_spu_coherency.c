@@ -422,6 +422,53 @@ static void test_many_contexts(void)
 /* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
+/* ===========================================================================
+ * A line only the PPU has load-reserved
+ *
+ * spu_coh_line_epoch marks a line so every later store bumps its epoch (the
+ * PPU store-conditional's ABA check). No SPU holds it and no watch covers it,
+ * so its notify does only the PPU bookkeeping -- until an SPU reserves it,
+ * after which a store is an SPU event again. The fast GETLLAR must not take
+ * such a line: its holder would be invisible to that cheaper notify.
+ * ===========================================================================*/
+static void test_ppu_only_line(void)
+{
+    const uint32_t LINE_E = 0x00040600u;
+    spu_reset(&g_spu_b, 1);
+    g_wakes = 0;
+    unsigned long raised_before = g_spu_lr_raise;
+
+    spu_lockline_lock();
+    uint64_t e0 = spu_coh_line_epoch(LINE_E);
+    spu_lockline_unlock();
+    TEST("a PPU load-reserved line is marked");
+    CHECK(spu_coh_is_reserved(LINE_E) != 0);
+
+    TEST("a store to it bumps the epoch and raises nothing");
+    vm_write32(LINE_E + 4, 0x12345678u);
+    spu_lockline_lock();
+    uint64_t e1 = spu_coh_line_epoch(LINE_E);
+    spu_lockline_unlock();
+    CHECK(e1 == e0 + 1);
+    CHECK(g_wakes == 0 && g_spu_lr_raise == raised_before);
+    CHECK_EQ_U32(vm_read32(LINE_E + 4), 0x12345678u);
+
+    TEST("a listed SPU's fast GETLLAR refuses the PPU-only line");
+    spu_getllar(&g_spu_b, LINE_A);          /* lists g_spu_b as a holder */
+    g_spu_b.resv_valid = 0;
+    CHECK(spu_coh_reserve_fast(&g_spu_b, LINE_E) == 0);
+
+    TEST("once an SPU reserves it, a store raises SPU_EVENT_LR");
+    g_spu_b.event_status = 0;
+    spu_getllar(&g_spu_b, LINE_E);
+    vm_write32(LINE_E + 4, 0x9ABCDEF0u);
+    CHECK_EQ_U32(g_spu_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_spu_b.resv_valid == 0);
+    spu_lockline_lock();
+    CHECK(spu_coh_line_epoch(LINE_E) == e1 + 1);
+    spu_lockline_unlock();
+}
+
 int main(void)
 {
     test_bitmap();
@@ -430,6 +477,7 @@ int main(void)
     test_all_store_widths();
     test_store_conditional();
     test_block_stores();
+    test_ppu_only_line();
     spu_coh_unregister(&g_spu_a);
     spu_coh_unregister(&g_spu_b);
     test_many_contexts();

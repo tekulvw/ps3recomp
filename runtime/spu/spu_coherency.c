@@ -245,6 +245,18 @@ void spu_lockline_unlock(void)
 #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
 
 static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+/* The subset of marked lines an SPU or a watch has ever had an interest in.
+ * A line marked only because the PPU load-reserved it (spu_coh_line_epoch)
+ * has no SPU reservation holder and no watch, so its notify needs only the
+ * PPU-side bookkeeping. Every reservation holder's line is in here before the
+ * reservation is published: the slow GETLLAR marks it under the lock, and the
+ * fast GETLLAR requires it (spu_coh_reserve_fast). */
+static unsigned char s_spu_bitmap[SPU_COH_BITMAP_SZ];
+static int spu_coh_line_spu(uint32_t line)
+{
+    const uint32_t l = line >> SPU_COH_LINE_SHIFT;
+    return (__atomic_load_n(&s_spu_bitmap[l >> 3], __ATOMIC_RELAXED) >> (l & 7)) & 1u;
+}
 
 /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
  * bitmap entirely for a title that runs no SPU code, and keeps every existing
@@ -277,7 +289,9 @@ uint64_t spu_coh_line_epoch(uint32_t ea)
     coh_epoch* p = (coh_epoch*)malloc(sizeof(*p));
     if (!p) abort();
     p->line = line; p->value = 0; p->next = *bucket; *bucket = p;
-    spu_coh_reserve(NULL, line);
+    /* Marks the line for the PPU only: no SPU holder or watch exists on it. */
+    { uint32_t l = line >> SPU_COH_LINE_SHIFT;
+      s_coh_bitmap[l >> 3] |= (unsigned char)(1u << (l & 7)); s_coh_armed = 1; }
     return 0;
 }
 static void epoch_written(uint32_t line)
@@ -291,6 +305,7 @@ unsigned long g_spu_lr_raise = 0;
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
+    __atomic_fetch_or(&s_spu_bitmap[line >> 3], (unsigned char)(1u << (line & 7)), __ATOMIC_RELAXED);
     s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
     s_coh_armed = 1;
 
@@ -447,7 +462,7 @@ static inline int spu_coh_holds(const spu_context* c, uint32_t line)
  * caller takes the lock and spu_coh_reserve. */
 int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
 {
-    if (!__atomic_load_n(&ctx->coh_listed, __ATOMIC_ACQUIRE) || !spu_coh_is_reserved(ea)) return 0;
+    if (!__atomic_load_n(&ctx->coh_listed, __ATOMIC_ACQUIRE) || !spu_coh_line_spu(ea & ~127u)) return 0;
     __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
@@ -460,6 +475,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     uint32_t line = ea & ~127u;
     ppu_resv_break_line(ea);
     epoch_written(line);
+    if (!spu_coh_line_spu(line)) return;   /* PPU-only line: no holder, no watch */
     spu_coh_wake_watches(line);
     spu_coh_writer_fence();
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
@@ -529,6 +545,7 @@ void spu_coh_notify_write(uint32_t ea)
     }
     ppu_resv_break_line(ea);
     epoch_written(line);
+    if (!spu_coh_line_spu(line)) return;   /* PPU-only line: no holder, no watch */
     spu_coh_wake_watches(line);
     spu_coh_writer_fence();
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
