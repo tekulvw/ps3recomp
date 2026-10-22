@@ -700,7 +700,36 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
                 if (a == a1) break;
             }
-            if (span_reserved) {
+            if (span_reserved && a0 != a1 && !ps3_critical_write_watched(ea,size)) {
+                /* Only the reserved lines need the lock: they are the ones a
+                 * peer's compare-and-commit can be inside. The others are
+                 * copied first, without it, exactly as the unreserved path
+                 * copies a whole span (a line reserved meanwhile is caught by
+                 * the notify scan below, as there). A multi-line PUT that
+                 * touches one queue line no longer holds every other SPU's
+                 * atomics off for the whole copy. */
+                spu_dma_disposition_before(&disposition, ls_ptr, ea, size);
+                const uint32_t ea32 = (uint32_t)ea;
+                for (uint32_t a = a0; ; a += 128u) {
+                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
+                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
+                    if (!spu_coh_is_reserved(a)) memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                    if (a == a1) break;
+                }
+                spu_lockline_lock();
+                for (uint32_t a = a0; ; a += 128u) {
+                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
+                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
+                    if (spu_coh_is_reserved(a)) {
+                        memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                        spu_coh_notify_write_except(a, spu);
+                    }
+                    if (a == a1) break;
+                }
+                spu_lockline_unlock();
+                spu_dma_disposition_after(&disposition, ea_ptr);
+                copy_disposition = SPU_DMA_DISPOSITION_PUT;
+            } else if (span_reserved) {
                 spu_lockline_lock();
                 spu_dma_disposition_before(&disposition, ls_ptr, ea, size);
                 if(ps3_critical_write_watched(ea,size))ps3_critical_write_begin(&critical_write,(uint64_t)(uintptr_t)spu,ea,size,ea_ptr,ls_ptr,9,cmd|((uint32_t)spu->image_id<<16),spu->pc,spu->gpr[0]._u32[0],critical_generation,1);
