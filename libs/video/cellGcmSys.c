@@ -2317,8 +2317,106 @@ void cellGcm_ref_on_poll(void)
 
 static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
 
+/* RSX_WALKER_PROF=<file>: an in-process sampling profile of the FIFO walker
+ * thread, for hosts where an external sampler cannot attach. Once
+ * RSX_WALKER_PROF_TRIGGER=<file> exists (immediately when unset), a sampler
+ * thread signals the walker every millisecond for RSX_WALKER_PROF_SECONDS
+ * (default 10); the handler records the interrupted pc and the frame-pointer
+ * chain. The file gets one sample per line, addresses relative to the main
+ * image, for symbolizing offline. Diagnostic only; macOS arm64. */
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <signal.h>
+#include <pthread.h>
+#include <sys/ucontext.h>
+#include <mach-o/dyld.h>
+enum { WPROF_MAX = 120000, WPROF_DEPTH = 32 };
+static uintptr_t (*s_wprof_buf)[WPROF_DEPTH];
+static unsigned char* s_wprof_len;
+static atomic_int s_wprof_n;
+static pthread_t s_wprof_target;
+static atomic_int s_wprof_state;     /* 0 unset, 1 armed, 2 done */
+static uintptr_t s_wprof_lo, s_wprof_hi;
+static void wprof_handler(int sig, siginfo_t* si, void* ctx)
+{
+    (void)sig; (void)si;
+    const int i = atomic_load_explicit(&s_wprof_n, memory_order_relaxed);
+    if (i >= WPROF_MAX || !s_wprof_buf) return;
+    const ucontext_t* uc = (const ucontext_t*)ctx;
+    uintptr_t* o = s_wprof_buf[i];
+    unsigned d = 0;
+    o[d++] = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+    uintptr_t fp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
+    while (d < WPROF_DEPTH && fp >= s_wprof_lo && fp + 16 <= s_wprof_hi && !(fp & 7u)) {
+        const uintptr_t next = ((const uintptr_t*)fp)[0], ret = ((const uintptr_t*)fp)[1];
+        if (!ret) break;
+        o[d++] = ret;
+        if (next <= fp) break;
+        fp = next;
+    }
+    s_wprof_len[i] = (unsigned char)d;
+    atomic_store_explicit(&s_wprof_n, i + 1, memory_order_relaxed);
+}
+static void* wprof_thread(void* arg)
+{
+    (void)arg;
+    const char* out = getenv("RSX_WALKER_PROF");
+    const char* trig = getenv("RSX_WALKER_PROF_TRIGGER");
+    const char* secs_e = getenv("RSX_WALKER_PROF_SECONDS");
+    const int secs = secs_e && atoi(secs_e) > 0 ? atoi(secs_e) : 10;
+    struct timespec poll = {0, 100000000}, tick = {0, 1000000};
+    while (trig && *trig && access(trig, F_OK) != 0) nanosleep(&poll, NULL);
+    void* top = pthread_get_stackaddr_np(s_wprof_target);
+    const size_t size = pthread_get_stacksize_np(s_wprof_target);
+    s_wprof_hi = (uintptr_t)top; s_wprof_lo = (uintptr_t)top - size;
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = wprof_handler; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPROF, &sa, NULL);
+    fprintf(stderr, "[walker prof] sampling for %d s\n", secs);
+    for (int k = 0; k < secs * 1000 && atomic_load(&s_wprof_n) < WPROF_MAX; k++) {
+        pthread_kill(s_wprof_target, SIGPROF);
+        nanosleep(&tick, NULL);
+    }
+    nanosleep(&poll, NULL);
+    const int n = atomic_load(&s_wprof_n);
+    FILE* f = fopen(out, "w");
+    if (f) {
+        const intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+        fprintf(f, "# walker samples %d slide 0x%llx image %s\n", n, (unsigned long long)slide,
+                _dyld_get_image_name(0));
+        for (int i = 0; i < n; i++) {
+            for (unsigned d = 0; d < s_wprof_len[i]; d++)
+                fprintf(f, "%s%llx", d ? " " : "", (unsigned long long)(s_wprof_buf[i][d] - (uintptr_t)slide));
+            fputc('\n', f);
+        }
+        fclose(f);
+    }
+    fprintf(stderr, "[walker prof] %d samples -> %s\n", n, out ? out : "(none)");
+    atomic_store(&s_wprof_state, 2);
+    return NULL;
+}
+static void wprof_note_walker(void)
+{
+    int st = atomic_load_explicit(&s_wprof_state, memory_order_relaxed);
+    if (st == 2) return;
+    if (st == 0) {
+        const char* out = getenv("RSX_WALKER_PROF");
+        if (!out || !*out) { atomic_store(&s_wprof_state, 2); return; }
+        s_wprof_buf = calloc(WPROF_MAX, sizeof *s_wprof_buf);
+        s_wprof_len = calloc(WPROF_MAX, 1);
+        if (!s_wprof_buf || !s_wprof_len) { atomic_store(&s_wprof_state, 2); return; }
+        s_wprof_target = pthread_self();
+        atomic_store(&s_wprof_state, 1);
+        pthread_t t; pthread_create(&t, NULL, wprof_thread, NULL); pthread_detach(t);
+    }
+}
+#else
+static void wprof_note_walker(void) {}
+#endif
+
 void cellGcm_rsx_process_fifo(void)
 {
+    wprof_note_walker();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     if(!s_deferred_reports){
         AcquireSRWLockExclusive(&s_gcm_fifo_lock);gcm_rsx_process_fifo_unlocked();ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
