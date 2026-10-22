@@ -2459,6 +2459,21 @@ static int gcm_env_flag(int* cached, const char* name)
     return *cached;
 }
 
+/* The methods rsx_process_method acts on beyond its own rsx_state: notify
+ * and semaphore DMA contexts, the notify write, back-end label writes and
+ * SET_REFERENCE (g_rsx_last_reference). Everything else only updates state
+ * for a vtable backend. */
+static int gcm_legacy_method_has_effect(u32 m)
+{
+    switch (m) {
+    case 0x0050u: case 0x0104u: case 0x0180u: case 0x01A4u:
+    case 0x1D6Cu: case 0x1D70u: case 0x1D74u:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static void gcm_rsx_process_fifo_pass(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
@@ -2486,6 +2501,13 @@ static void gcm_rsx_process_fifo_pass(void)
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed)) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
+    /* rsx_state feeds only the legacy vtable backend. With the draw engine
+     * up and no vtable registered, the state it builds is never read, and
+     * the only methods worth handing it are the ones with effects outside
+     * it (gcm_legacy_method_has_effect). RSX_TRACE still sees every method. */
+    static int s_rsx_trace = -1;
+    const int legacy_state_live = rsx_get_backend() != NULL || !rsx_draw_engine_enabled() ||
+                                  gcm_env_flag(&s_rsx_trace, "RSX_TRACE");
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
      * offset in the control register), decoding method headers and following
@@ -3082,6 +3104,7 @@ static void gcm_rsx_process_fifo_pass(void)
                         continue;
                     }
                     if((m==0x1d70u||m==0x1d74u)&&!gcm_reports_sync_barrier())return;
+                    if (legacy_state_live || gcm_legacy_method_has_effect(m))
                     { const uint64_t l0=s_gph_on>0?gph_now():0;
                       rsx_process_method(&s_state, m, vm_read32(dea));
                       if(l0){s_gph.legacy_ns+=gph_now()-l0;s_gph.legacy_n++;} }
