@@ -3216,8 +3216,9 @@ done:
     errno = saved;
 }
 
-#define DRAW_OBSERVER_STAGE(stage) do { if (s_draw_observer.active) \
-    s_draw_observer.outcome = (stage); } while (0)
+#define DRAW_OBSERVER_STAGE(stage) do { const char* stage_ = (stage); \
+    if (s_draw_observer.active) s_draw_observer.outcome = stage_; \
+    if (s_eng_ph_on > 0) eng_ph_stage(stage_); } while (0)
 
 static void draw_observer_finish(void)
 {
@@ -3606,6 +3607,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     draw_observer_begin();
     sink_end_core(user, r);
     draw_observer_finish();
+    if (ph_draw) eng_ph_stage(NULL);
     ENG_PH_END(ENG_PH_DRAW, ph_draw);
 }
 
