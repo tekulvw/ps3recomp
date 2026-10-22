@@ -1868,6 +1868,45 @@ static void eng_vtx_probe_dump(const char* tag, u64 fp_hash, u32 seq, u32 attr,
     fputc('\n', stderr);
 }
 
+/* RSX_ENGINE_VTX_PROBE_WATCH=1: the first probed record's buffer becomes a
+ * write watch, so whoever fills it (or does not) is named in later frames.
+ * SPU PUTs that overlap it are logged here through the runtime's SPU PUT
+ * notification (chained, not replaced). PPU stores are reported by the
+ * runtime's store watch through the same g_ww_lo/g_ww_hi window: HLE stores
+ * always, guest stores when PPU_WWATCH_DYNAMIC=1. Both symbols are weak here
+ * so the draw engine also links where no runtime provides them. */
+__attribute__((weak)) uint32_t g_ww_lo, g_ww_hi;
+__attribute__((weak)) void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+static void (*s_rec_prev_hook)(uint32_t, uint32_t);
+static volatile u32 s_rec_lo, s_rec_hi;
+static void eng_rec_spu_put(uint32_t ea, uint32_t size)
+{
+    const u32 lo = s_rec_lo, hi = s_rec_hi;
+    if (hi && ea < hi && ea + size > lo) {
+        static atomic_int n;
+        if (atomic_fetch_add(&n, 1) < 256)
+            fprintf(stderr, "[vtx probe]  spu-put ea 0x%08X size %u into watched 0x%08X-0x%08X\n",
+                    ea, size, lo, hi);
+    }
+    if (s_rec_prev_hook) s_rec_prev_hook(ea, size);
+}
+static void eng_vtx_probe_watch(u32 ea, u32 bytes)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_ENGINE_VTX_PROBE_WATCH"); on = e && *e && *e != '0'; }
+    if (!on || s_rec_hi || !ea || !bytes) return;
+    if (bytes > 0x40000u) bytes = 0x40000u;
+    s_rec_lo = ea;
+    s_rec_hi = ea + bytes;
+    g_ww_lo = ea & ~15u;
+    g_ww_hi = ea + bytes;
+    if (g_spu_put_hook != eng_rec_spu_put) {
+        s_rec_prev_hook = g_spu_put_hook;
+        g_spu_put_hook = eng_rec_spu_put;
+    }
+    fprintf(stderr, "[vtx probe]  watch armed 0x%08X-0x%08X at frame %u\n", ea, ea + bytes, g.frames);
+}
+
 static void eng_vtx_probe_record(u64 fp_hash, u32 seq, u32 attr, u32 location,
                                  u32 offset, const u8* p, u32 bytes)
 {
@@ -1994,6 +2033,10 @@ static void eng_vtx_probe(u64 fp_hash, u32 pipeline, u32 prim, int blended,
         const u32 bytes = d.stride < 64u ? (d.stride ? d.stride : 16u) : 64u;
         const u8* p = eng_guest_ptr(NULL, d.location, off, bytes);
         eng_vtx_probe_record(fp_hash, seq, a, d.location, off, p, bytes);
+        if (p && vm_base) {
+            const u32 instances = dc.n_source_refs / d.frequency + 1u;
+            eng_vtx_probe_watch((u32)(p - vm_base), instances * (d.stride ? d.stride : 16u));
+        }
         break;
     }
     const u32 nv = dc.n_verts < 8u ? dc.n_verts : 8u;

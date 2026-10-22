@@ -10,6 +10,11 @@
 #include "rsx_fp_decompiler.h"
 #include <unistd.h>
 
+extern uint32_t g_ww_lo, g_ww_hi;
+extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+static int prev_hook_calls;
+static void prev_hook(uint32_t ea, uint32_t size) { (void)ea; (void)size; prev_hook_calls++; }
+
 static void store_be_f32(u8* p, float f)
 {
     u32 w; memcpy(&w, &f, 4);
@@ -31,6 +36,11 @@ int main(int argc, char** argv)
 {
     const int any = argc > 1 && !strcmp(argv[1], "any");
     const int trig = argc > 1 && !strcmp(argv[1], "trigger");
+    const int watch = argc > 1 && !strcmp(argv[1], "watch");
+    if (watch) {
+        setenv("RSX_ENGINE_VTX_PROBE_WATCH", "1", 1);
+        g_spu_put_hook = prev_hook;                    /* the runtime's own hook */
+    }
     char trigger_path[1024];
     const char* tmpdir = getenv("TMPDIR");
     snprintf(trigger_path, sizeof trigger_path, "%s/vtx_probe_trigger_XXXXXX",
@@ -101,6 +111,10 @@ int main(int argc, char** argv)
     draw_triangle();                                   /* probed */
     upload_vp_from_attr(3);
     draw_triangle();                                   /* over the limit: silent */
+    if (watch) {
+        g_spu_put_hook(VTX_OFFSET + 4u, 4u);           /* inside the record buffer */
+        g_spu_put_hook(VTX_OFFSET + 0x1000u, 16u);     /* elsewhere */
+    }
     /* The record is rewritten after the draw: the next frame's recheck sees it. */
     store_be_f32(vm_base + VTX_OFFSET, 42.0f);
     rsx_draw_engine_present();
@@ -147,6 +161,17 @@ int main(int argc, char** argv)
     snprintf(rec, sizeof rec, "later1 fp %s draw 0 frame %u a0 loc 1 off 0x%08X ea 0x%08X: 42280000 BF800000",
              env, trig ? 2u : 1u, VTX_OFFSET, VTX_OFFSET);
     CHECK(strstr(out, rec) != NULL, "and the same record one frame later, rewritten");
+    if (watch) {
+        /* Three vertices of a frequency-4 array: one 8-byte record. */
+        snprintf(rec, sizeof rec, "watch armed 0x%08X-0x%08X", VTX_OFFSET, VTX_OFFSET + 8u);
+        CHECK(strstr(out, rec) != NULL, "the probed record's buffer becomes the watch window");
+        CHECK(g_ww_lo == VTX_OFFSET && g_ww_hi == VTX_OFFSET + 8u, "and the PPU store window (0x%X-0x%X)",
+              g_ww_lo, g_ww_hi);
+        snprintf(rec, sizeof rec, "spu-put ea 0x%08X size 4 into watched", VTX_OFFSET + 4u);
+        CHECK(strstr(out, rec) != NULL, "an SPU PUT into the record is reported");
+        CHECK(strstr(out, "spu-put ea 0x00011000") == NULL, "a PUT elsewhere is not");
+        CHECK(prev_hook_calls == 2, "the runtime's own hook still sees every PUT (%d)", prev_hook_calls);
+    }
     if (trig) {
         unlink(trigger_path);
         CHECK(strstr(out, "[vtx probe] armed at frame 1") != NULL, "armed by the trigger file a frame later");
