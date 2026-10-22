@@ -1139,7 +1139,7 @@ static uint64_t gph_now(void){
 #endif
 }
 enum{GPH_SITES=16};
-static struct{uint64_t pass_ns,pass_n,words,issue_ns,issue_n,inline_ns,inline_n,t0;
+static struct{uint64_t pass_ns,pass_n,words,issue_ns,issue_n,inline_ns,inline_n,eng_ns,eng_n,legacy_ns,legacy_n,t0;
     u32 site[GPH_SITES];uint64_t site_ns[GPH_SITES],site_n[GPH_SITES];}s_gph;
 static void gph_site(u32 site,uint64_t ns){
     for(u32 i=0;i<GPH_SITES;i++)if(s_gph.site[i]==site||!s_gph.site[i]){s_gph.site[i]=site;s_gph.site_ns[i]+=ns;s_gph.site_n[i]++;return;}
@@ -1148,8 +1148,9 @@ static void gph_report(void){
     const uint64_t now=gph_now();if(!s_gph.t0)s_gph.t0=now;
     if(now-s_gph.t0<2000000000ull)return;
     const double s=(double)(now-s_gph.t0)/1e9;char line[1024];
-    int n=snprintf(line,sizeof line,"[gcm phases] per s: pass=%.1fms/%.0f words=%.0f issue=%.1fms/%.0f inline=%.1fms/%.0f barrier:",
-        s_gph.pass_ns/1e6/s,s_gph.pass_n/s,s_gph.words/s,s_gph.issue_ns/1e6/s,s_gph.issue_n/s,s_gph.inline_ns/1e6/s,s_gph.inline_n/s);
+    int n=snprintf(line,sizeof line,"[gcm phases] per s: pass=%.1fms/%.0f words=%.0f issue=%.1fms/%.0f inline=%.1fms/%.0f engine=%.1fms/%.0f legacy=%.1fms/%.0f barrier:",
+        s_gph.pass_ns/1e6/s,s_gph.pass_n/s,s_gph.words/s,s_gph.issue_ns/1e6/s,s_gph.issue_n/s,s_gph.inline_ns/1e6/s,s_gph.inline_n/s,
+        s_gph.eng_ns/1e6/s,s_gph.eng_n/s,s_gph.legacy_ns/1e6/s,s_gph.legacy_n/s);
     for(u32 i=0;i<GPH_SITES&&s_gph.site[i]&&n>0&&(size_t)n<sizeof line;i++)
         n+=snprintf(line+n,sizeof line-(size_t)n," L%u=%.1fms/%.0f",s_gph.site[i],s_gph.site_ns[i]/1e6/s,s_gph.site_n[i]/s);
     fprintf(stderr,"%s\n",line);memset(&s_gph,0,sizeof s_gph);s_gph.t0=now;
@@ -2942,7 +2943,11 @@ static void gcm_rsx_process_fifo_pass(void)
                  * same reason the live engine does, and masks them itself. */
                 { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method_at((subch << 13) | m, vm_read32(dea),dea); }
+                  if (eng) {
+                      const uint64_t e0=s_gph_on>0?gph_now():0;
+                      rsx_draw_engine_method_at((subch << 13) | m, vm_read32(dea),dea);
+                      if(e0){s_gph.eng_ns+=gph_now()-e0;s_gph.eng_n++;}
+                  } }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -2979,7 +2984,9 @@ static void gcm_rsx_process_fifo_pass(void)
                         continue;
                     }
                     if((m==0x1d70u||m==0x1d74u)&&!gcm_reports_sync_barrier())return;
-                    rsx_process_method(&s_state, m, vm_read32(dea));
+                    { const uint64_t l0=s_gph_on>0?gph_now():0;
+                      rsx_process_method(&s_state, m, vm_read32(dea));
+                      if(l0){s_gph.legacy_ns+=gph_now()-l0;s_gph.legacy_n++;} }
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
