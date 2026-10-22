@@ -2759,6 +2759,15 @@ static u32 eng_obj_add(id<MTLTexture> t)
      * a long session stays bounded. */
     { static int on = -1; static unsigned long long made;
       if (on < 0) on = getenv("RSX_ENG_COUNTS") ? 1 : 0;
+      static long long limit_mb = -1;
+      if (limit_mb < 0) { const char* e = getenv("RSX_ENG_ALLOC_LIMIT_GB");
+                          limit_mb = e ? atoll(e) * 1024 : 0; }
+      static unsigned long long seen; ++seen;
+      if (limit_mb && (seen & 63) == 0 && (long long)([s_dev currentAllocatedSize] >> 20) > limit_mb) {
+          fprintf(stderr, "[rsx engine counts] metal_allocated %lluMB over RSX_ENG_ALLOC_LIMIT_GB; stopping\n",
+                  (unsigned long long)([s_dev currentAllocatedSize] >> 20));
+          fflush(stderr); _Exit(87);
+      }
       if (on && ++made % 1024 == 0)
           fprintf(stderr, "[rsx engine counts] created=%llu live=%u/%u metal_allocated=%lluMB\n", made,
                   (unsigned)(s_eng_obj_count - s_eng_obj_free_count), (unsigned)ENG_MAX_OBJECTS,

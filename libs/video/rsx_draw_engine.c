@@ -974,6 +974,8 @@ static u32 eng_zdepth_snapshot(u32 slot)
 {
     eng_zdepth* z = &g.zdepths[slot];
     if (!z->handle || !z->had_write) return 0;
+    { static int off = -1; if (off < 0) off = getenv("RSX_ENG_NO_DEPTH_SNAPSHOT") ? 1 : 0;
+      if (off) return 0; }
     if (z->snapshot_valid && z->snapshot) return z->snapshot;
     if (!g.be->depth_snapshot) return 0;
     const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
@@ -1133,7 +1135,9 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     if (!nlv || !lv[0].tl.face_bytes) return 0;
-    if (s_z24_stored.valid && g.be->depth_z24_texture && !identity && !cube && depth <= 1 &&
+    static int no_z24 = -1;
+    if (no_z24 < 0) no_z24 = getenv("RSX_ENG_NO_Z24_GPU") ? 1 : 0;
+    if (!no_z24 && s_z24_stored.valid && g.be->depth_z24_texture && !identity && !cube && depth <= 1 &&
         nlv == 1 && location == s_z24_stored.location && offset == s_z24_stored.offset &&
         pitch == s_z24_stored.pitch && w <= s_z24_stored.w && h <= s_z24_stored.h &&
         (fmt & RSX_TEX_FMT_LINEAR) && !lv[0].tl.swizzled && lv[0].tl.bytes_per_texel == 4u &&
@@ -1480,7 +1484,9 @@ static int eng_zdepth_to_guest(u32 slot)
         s_depth_rows = n;
         s_depth_cap = w * h;
     }
-    if (bpp == 4u && g.be->depth_store_z24) {
+    static int no_z24_store = -1;
+    if (no_z24_store < 0) no_z24_store = getenv("RSX_ENG_NO_Z24_GPU") ? 1 : 0;
+    if (bpp == 4u && g.be->depth_store_z24 && !no_z24_store) {
         u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset, (h - 1u) * z->pitch + w * 4u);
         ENG_PH_BEGIN(ph_gpu);
         if (!dst || !eng_report_barrier()) return 0;
