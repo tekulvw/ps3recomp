@@ -2390,10 +2390,15 @@ static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
  * nothing is tagged and the sites cost one branch. */
 enum { ENG_SITE_TEXTURE, ENG_SITE_TEXTURE_3D, ENG_SITE_COLOR_TARGET, ENG_SITE_SURFACE_VIEW,
        ENG_SITE_COLOR_SNAPSHOT, ENG_SITE_DEPTH_TARGET, ENG_SITE_DEPTH_SNAPSHOT,
-       ENG_SITE_Z24_TEXTURE, ENG_SITE_STAGE_BUFFER, ENG_SITE_DEPTH_STAGING, ENG_SITE_COUNT };
+       ENG_SITE_Z24_TEXTURE, ENG_SITE_STAGE_BUFFER, ENG_SITE_DEPTH_STAGING,
+       ENG_SITE_COMMAND_BUFFER, ENG_SITE_COUNT };
 static const char* const s_eng_site_name[ENG_SITE_COUNT] = {
     "texture", "texture3d", "color_target", "surface_view", "color_snapshot",
-    "depth_target", "depth_snapshot", "z24_texture", "stage_buffer", "depth_staging" };
+    "depth_target", "depth_snapshot", "z24_texture", "stage_buffer", "depth_staging",
+    "command_buffer" };
+/* Staging pool traffic, for the same report. */
+static _Atomic unsigned long long s_eng_pool_hit, s_eng_pool_miss, s_eng_pool_kept, s_eng_pool_dropped,
+    s_eng_pool_handoff, s_eng_pool_handler;
 static _Atomic unsigned long long s_eng_site_made[ENG_SITE_COUNT], s_eng_site_freed[ENG_SITE_COUNT],
     s_eng_site_made_bytes[ENG_SITE_COUNT], s_eng_site_freed_bytes[ENG_SITE_COUNT];
 @interface EngAllocTag : NSObject { @public int site; unsigned long long bytes; }
@@ -2411,16 +2416,21 @@ static int eng_site_tracking(void)
     if (on < 0) on = getenv("RSX_ENG_COUNTS") ? 1 : 0;
     return on;
 }
-static void eng_site_tag(id<MTLResource> r, int site)
+static void eng_site_tag_bytes(id r, int site, unsigned long long bytes)
 {
     if (!r || !eng_site_tracking()) return;
     EngAllocTag* t = [EngAllocTag new];
     t->site = site;
-    t->bytes = [r allocatedSize];
+    t->bytes = bytes;
     atomic_fetch_add(&s_eng_site_made[site], 1ull);
     atomic_fetch_add(&s_eng_site_made_bytes[site], t->bytes);
     objc_setAssociatedObject(r, (const void*)&s_eng_site_name[site], t,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static void eng_site_tag(id<MTLResource> r, int site)
+{
+    if (!r || !eng_site_tracking()) return;
+    eng_site_tag_bytes(r, site, [r allocatedSize]);
 }
 static void eng_site_report(void)
 {
@@ -2433,6 +2443,9 @@ static void eng_site_report(void)
         fprintf(stderr, "[rsx engine sites] %-14s made=%llu freed=%llu live=%llu live_bytes=%lluMB\n",
                 s_eng_site_name[s], made, freed, made - freed, (mb - fb) >> 20);
     }
+    fprintf(stderr, "[rsx engine sites] stage pool: hit=%llu miss=%llu kept=%llu dropped=%llu handoff=%llu handler=%llu\n",
+            atomic_load(&s_eng_pool_hit), atomic_load(&s_eng_pool_miss), atomic_load(&s_eng_pool_kept),
+            atomic_load(&s_eng_pool_dropped), atomic_load(&s_eng_pool_handoff), atomic_load(&s_eng_pool_handler));
 }
 
 typedef struct {
@@ -2911,6 +2924,7 @@ static id<MTLBuffer> eng_stage_buffer_acquire(u32 cap)
             break;
         }
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
+    atomic_fetch_add(buf ? &s_eng_pool_hit : &s_eng_pool_miss, 1ull);
     if (!buf) { buf = [s_dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
                 eng_site_tag(buf, ENG_SITE_STAGE_BUFFER); }
     return buf;
@@ -2920,7 +2934,8 @@ static void eng_stage_buffer_release(id<MTLBuffer> buf)
     if (!buf) return;
     pthread_mutex_lock(&s_eng_stage_pool_lock);
     if (!s_eng_stage_pool) s_eng_stage_pool = [NSMutableArray new];
-    if ([s_eng_stage_pool count] < ENG_STAGE_POOL_KEEP) [s_eng_stage_pool addObject:buf];
+    if ([s_eng_stage_pool count] < ENG_STAGE_POOL_KEEP) { [s_eng_stage_pool addObject:buf]; atomic_fetch_add(&s_eng_pool_kept, 1ull); }
+    else atomic_fetch_add(&s_eng_pool_dropped, 1ull);
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
 }
 
@@ -4313,7 +4328,8 @@ static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
 static void eng_stage_hand_off(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 {
     if (!stage) return;
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> unused) { (void)unused; eng_stage_buffer_release(stage); }];
+    atomic_fetch_add(&s_eng_pool_handoff, 1ull);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> unused) { (void)unused; atomic_fetch_add(&s_eng_pool_handler, 1ull); eng_stage_buffer_release(stage); }];
     s_eng_stage_buf = nil; s_eng_stage = NULL; s_eng_stage_cap = 0;
 }
 static id<MTLCommandBuffer> s_capture_present_cb;
@@ -4363,6 +4379,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
 
         id<MTLBuffer> stage = s_eng_stage_used ? s_eng_stage_buf : nil;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        eng_site_tag_bytes(cb, ENG_SITE_COMMAND_BUFFER, 0);
         if(!cb || (s_eng_stage_used && !stage)) {
             eng_checked_fail();fps_note_submission_failure();
             if(windowed_present)dispatch_semaphore_signal(s_inflight);
