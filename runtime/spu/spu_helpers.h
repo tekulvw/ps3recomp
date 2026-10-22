@@ -775,12 +775,12 @@ SPU__NV_INLINE u128 spu__nv_fa(u128 a, u128 b, uint32_t negb) {
     return spu__nv_u128(r);
 }
 /* SPU_FLOAT_RZ: a host thread running SPU code may set FPCR to round toward zero with
- * flush-to-zero (spu_float_thread_mode, runtime/spu/spu_channels.c). The host's own single-precision
+ * flush-to-zero (spu_float_mode_enter, runtime/spu/spu_channels.c). The host's own single-precision
  * ops then truncate like the SPU and read and write a denormal as zero, so what is left of the
  * exact forms above is the range check and the +0 rule: one native op per vector, about three
  * times the throughput. The mode is read with mrs, which costs about a quarter of a nanosecond and,
  * being a plain asm with no memory effects, is hoisted and shared by the compiler; it changes only
- * where spu_float_thread_mode writes it, outside generated code. */
+ * in spu_run_with_halt, outside generated code. */
 #define SPU_FPCR_RZFZ 0x01C00000ull   /* FZ (bit 24), RMode = 0b11 round toward zero (bits 22-23) */
 SPU__NV_INLINE int spu__nv_rz(void) { uint64_t v; __asm__("mrs %0, fpcr" : "=r"(v)); return v == SPU_FPCR_RZFZ; }
 SPU__NV_INLINE u128 spu__rz_fa(u128 a, u128 b, uint32_t negb) {
