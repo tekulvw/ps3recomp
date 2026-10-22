@@ -50,6 +50,7 @@
  * so it cannot grow into the real pipeline.
  */
 #import <Metal/Metal.h>
+#import <objc/runtime.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/QuartzCore.h>
 #if !TARGET_OS_IPHONE
@@ -2382,6 +2383,58 @@ static u32 s_eng_obj_free[ENG_MAX_OBJECTS];
 static u32 s_eng_obj_free_count;
 static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
 
+/* RSX_ENG_COUNTS=1: live Metal resources by creation site. A tag is
+ * associated with each resource the engine creates and its dealloc runs when
+ * the resource's wrapper goes away, so made - freed is what something still
+ * retains, whether or not the object table still names it. Off by default:
+ * nothing is tagged and the sites cost one branch. */
+enum { ENG_SITE_TEXTURE, ENG_SITE_TEXTURE_3D, ENG_SITE_COLOR_TARGET, ENG_SITE_SURFACE_VIEW,
+       ENG_SITE_COLOR_SNAPSHOT, ENG_SITE_DEPTH_TARGET, ENG_SITE_DEPTH_SNAPSHOT,
+       ENG_SITE_Z24_TEXTURE, ENG_SITE_STAGE_BUFFER, ENG_SITE_DEPTH_STAGING, ENG_SITE_COUNT };
+static const char* const s_eng_site_name[ENG_SITE_COUNT] = {
+    "texture", "texture3d", "color_target", "surface_view", "color_snapshot",
+    "depth_target", "depth_snapshot", "z24_texture", "stage_buffer", "depth_staging" };
+static _Atomic unsigned long long s_eng_site_made[ENG_SITE_COUNT], s_eng_site_freed[ENG_SITE_COUNT],
+    s_eng_site_made_bytes[ENG_SITE_COUNT], s_eng_site_freed_bytes[ENG_SITE_COUNT];
+@interface EngAllocTag : NSObject { @public int site; unsigned long long bytes; }
+@end
+@implementation EngAllocTag
+- (void)dealloc
+{
+    atomic_fetch_add(&s_eng_site_freed[site], 1ull);
+    atomic_fetch_add(&s_eng_site_freed_bytes[site], bytes);
+}
+@end
+static int eng_site_tracking(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RSX_ENG_COUNTS") ? 1 : 0;
+    return on;
+}
+static void eng_site_tag(id<MTLResource> r, int site)
+{
+    if (!r || !eng_site_tracking()) return;
+    EngAllocTag* t = [EngAllocTag new];
+    t->site = site;
+    t->bytes = [r allocatedSize];
+    atomic_fetch_add(&s_eng_site_made[site], 1ull);
+    atomic_fetch_add(&s_eng_site_made_bytes[site], t->bytes);
+    objc_setAssociatedObject(r, (const void*)&s_eng_site_name[site], t,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static void eng_site_report(void)
+{
+    for (int s = 0; s < ENG_SITE_COUNT; s++) {
+        const unsigned long long made = atomic_load(&s_eng_site_made[s]),
+                                 freed = atomic_load(&s_eng_site_freed[s]),
+                                 mb = atomic_load(&s_eng_site_made_bytes[s]),
+                                 fb = atomic_load(&s_eng_site_freed_bytes[s]);
+        if (!made) continue;
+        fprintf(stderr, "[rsx engine sites] %-14s made=%llu freed=%llu live=%llu live_bytes=%lluMB\n",
+                s_eng_site_name[s], made, freed, made - freed, (mb - fb) >> 20);
+    }
+}
+
 typedef struct {
     id<MTLRenderPipelineState> pso;
     id<MTLDepthStencilState>   ds;
@@ -2782,6 +2835,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
           }
           fprintf(stderr, "[rsx engine counts] table textures=%u bytes=%lluMB >=16MB:%u (last %ux%u)\n",
                   n, tex >> 20, big, bw, bh);
+          eng_site_report();
       } }
     return slot + 1;
 }
@@ -2857,7 +2911,8 @@ static id<MTLBuffer> eng_stage_buffer_acquire(u32 cap)
             break;
         }
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
-    if (!buf) buf = [s_dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
+    if (!buf) { buf = [s_dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
+                eng_site_tag(buf, ENG_SITE_STAGE_BUFFER); }
     return buf;
 }
 static void eng_stage_buffer_release(id<MTLBuffer> buf)
@@ -3080,7 +3135,9 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     td.swizzle = MTLTextureSwizzleChannelsMake(
         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    eng_site_tag(t, ENG_SITE_TEXTURE);
+    return eng_obj_add(t);
 }
 
 static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
@@ -3118,7 +3175,9 @@ static u32 eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
     td.swizzle = MTLTextureSwizzleChannelsMake(
         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    eng_site_tag(t, ENG_SITE_TEXTURE_3D);
+    return eng_obj_add(t);
 }
 
 static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
@@ -3150,6 +3209,7 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                MTLTextureUsagePixelFormatView;
     id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
     if (!t) return 0;
+    eng_site_tag(t, ENG_SITE_COLOR_TARGET);
     if (seed && seed_row_bytes)
         [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
                withBytes:seed bytesPerRow:seed_row_bytes];
@@ -3176,6 +3236,7 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
                                  swizzle:MTLTextureSwizzleChannelsMake(
                                              swizzle_sel(sel[1]), swizzle_sel(sel[2]),
                                              swizzle_sel(sel[3]), swizzle_sel(sel[0]))];
+    eng_site_tag(v, ENG_SITE_SURFACE_VIEW);
     const u32 handle = eng_obj_add(v);
     if (!handle) return 0;
     s_eng_view[s_eng_view_count].surface = surface;
@@ -3199,7 +3260,9 @@ static u32 eng_color_snapshot(void* user, u32 surface)
                          width:[src width] height:[src height] mipmapped:NO];
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-    const u32 copy = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    id<MTLTexture> copy_tex = [s_dev newTextureWithDescriptor:td];
+    eng_site_tag(copy_tex, ENG_SITE_COLOR_SNAPSHOT);
+    const u32 copy = eng_obj_add(copy_tex);
     if (!copy) { s_eng_dropped++; eng_checked_fail(); return 0; }
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
@@ -3221,7 +3284,9 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
      * pass that samples this as a depth2d, so it cannot be write-only. */
     td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModePrivate;
-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    eng_site_tag(t, ENG_SITE_DEPTH_TARGET);
+    return eng_obj_add(t);
 }
 
 /* The sampleable copy of a depth target. The copy is a record in the stream,
@@ -3250,7 +3315,9 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
                                                            width:w height:h
                                                        mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    id<MTLTexture> dst_tex = [s_dev newTextureWithDescriptor:td];
+    eng_site_tag(dst_tex, ENG_SITE_DEPTH_SNAPSHOT);
+    const u32 dst = eng_obj_add(dst_tex);
     if (!dst) return 0;
 
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -4641,8 +4708,9 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
         return -1;
     @autoreleasepool {
         if (!s_eng_depth_staging || [s_eng_depth_staging length] < copy_pitch * h)
-            s_eng_depth_staging = [s_dev newBufferWithLength:copy_pitch * h
+          { s_eng_depth_staging = [s_dev newBufferWithLength:copy_pitch * h
                                                      options:MTLResourceStorageModeShared];
+            eng_site_tag(s_eng_depth_staging, ENG_SITE_DEPTH_STAGING); }
         id<MTLBuffer> staging = s_eng_depth_staging;
         s_eng_z24_valid = 0;
         if (!staging || ![staging contents]) return -1;
@@ -4700,8 +4768,9 @@ static int eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32
         }
         const size_t bytes = (size_t)w * h * 4u;
         if (!s_eng_depth_staging || [s_eng_depth_staging length] < bytes)
-            s_eng_depth_staging = [s_dev newBufferWithLength:bytes
+          { s_eng_depth_staging = [s_dev newBufferWithLength:bytes
                                                      options:MTLResourceStorageModeShared];
+            eng_site_tag(s_eng_depth_staging, ENG_SITE_DEPTH_STAGING); }
         id<MTLBuffer> staging = s_eng_depth_staging;
         s_eng_z24_valid = 0;
         if (!staging || ![staging contents]) return -1;
@@ -4773,6 +4842,7 @@ static u32 eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fm
             eng_z24_raw_channel(swizzle_sel(sel[3]), rotate, alpha_one),
             eng_z24_raw_channel(swizzle_sel(sel[0]), rotate, alpha_one));
         id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+        eng_site_tag(t, ENG_SITE_Z24_TEXTURE);
         id<MTLCommandBuffer> cb = t ? [s_queue commandBuffer] : nil;
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         if (!blit) return 0;
