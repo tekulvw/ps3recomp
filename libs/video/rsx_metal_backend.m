@@ -2762,7 +2762,18 @@ static u32 eng_obj_add(id<MTLTexture> t)
       if (on && ++made % 1024 == 0)
           fprintf(stderr, "[rsx engine counts] created=%llu live=%u/%u metal_allocated=%lluMB\n", made,
                   (unsigned)(s_eng_obj_count - s_eng_obj_free_count), (unsigned)ENG_MAX_OBJECTS,
-                  (unsigned long long)([s_dev currentAllocatedSize] >> 20)); }
+                  (unsigned long long)([s_dev currentAllocatedSize] >> 20));
+      if (on && made % 1024 == 0) {
+          unsigned long long tex = 0; u32 big = 0, bw = 0, bh = 0, n = 0;
+          for (u32 i = 0; i < s_eng_obj_count; i++) {
+              id<MTLTexture> o = s_eng_obj[i];
+              if (!o) continue;
+              n++; tex += [o allocatedSize];
+              if ([o allocatedSize] >= (16u << 20)) { big++; bw = (u32)[o width]; bh = (u32)[o height]; }
+          }
+          fprintf(stderr, "[rsx engine counts] table textures=%u bytes=%lluMB >=16MB:%u (last %ux%u)\n",
+                  n, tex >> 20, big, bw, bh);
+      } }
     return slot + 1;
 }
 
