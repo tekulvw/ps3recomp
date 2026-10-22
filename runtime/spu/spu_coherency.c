@@ -258,6 +258,61 @@ static int spu_coh_line_spu(uint32_t line)
     return (__atomic_load_n(&s_spu_bitmap[l >> 3], __ATOMIC_RELAXED) >> (l & 7)) & 1u;
 }
 
+/* PPU-only lines serialize on a per-line shard, not the lock-line lock.
+ *
+ * On a line the PPU load-reserved and no SPU or watch has an interest in, the
+ * only transaction to protect is a PPU store-conditional's epoch check and CAS
+ * against a store landing in between (the store bumps the epoch after writing).
+ * Taking the process-wide lock-line lock for that made every plain PPU store to
+ * such a line -- stack slots beside a lock word, refcounted fields -- contend
+ * with every SPU atomic in the process. Instead:
+ *  - a plain PPU store to a PPU-only line holds only the line's shard;
+ *  - a PPU store-conditional holds the lock-line lock, then the shard, so it
+ *    excludes the shard-only stores and every writer holding the lock-line lock;
+ *  - a line gains SPU interest (spu_coh_reserve, under the lock-line lock) only
+ *    while holding its shard, and a shard-only store re-checks the interest
+ *    under the shard, so none is in flight on the shard path once an SPU can
+ *    hold a reservation on the line.
+ * A lock-line-lock writer and a shard-only store may overlap on one line: both
+ * only write guest bytes and bump the epoch atomically, and the
+ * store-conditional excludes both. */
+#if defined(_WIN32)
+#include <windows.h>
+static inline void spu_coh_yield(void) { SwitchToThread(); }
+#else
+#include <sched.h>
+static inline void spu_coh_yield(void) { sched_yield(); }
+#endif
+static inline void spu_coh_spin_relax(void)
+{
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(_M_ARM64)
+    __yield();
+#elif defined(_M_X64)
+    _mm_pause();
+#endif
+}
+#define SPU_COH_PPU_SHARDS 256u
+static struct { uint32_t v; char pad[60]; } s_ppu_shard[SPU_COH_PPU_SHARDS];
+static inline uint32_t* spu_coh_shard(uint32_t ea)
+{
+    return &s_ppu_shard[(ea >> SPU_COH_LINE_SHIFT) & (SPU_COH_PPU_SHARDS - 1u)].v;
+}
+void spu_coh_line_shard_lock(uint32_t ea)
+{
+    uint32_t* l = spu_coh_shard(ea);
+    for (;;) {
+        uint32_t z = 0;
+        if (__atomic_compare_exchange_n(l, &z, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+        for (unsigned n = 0; __atomic_load_n(l, __ATOMIC_RELAXED); )
+            if (++n < 256u) spu_coh_spin_relax(); else { n = 0; spu_coh_yield(); }
+    }
+}
+void spu_coh_line_shard_unlock(uint32_t ea) { __atomic_store_n(spu_coh_shard(ea), 0u, __ATOMIC_RELEASE); }
+
 /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
  * bitmap entirely for a title that runs no SPU code, and keeps every existing
  * test that stores through vm_write* paying one compare against a hot global.
@@ -284,11 +339,14 @@ uint64_t spu_coh_line_epoch(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
     coh_epoch** bucket = epoch_bucket(line);
-    for (coh_epoch* p = *bucket; p; p = p->next)
-        if (p->line == line) return p->value;
+    for (coh_epoch* p = __atomic_load_n(bucket, __ATOMIC_ACQUIRE); p; p = p->next)
+        if (p->line == line) return __atomic_load_n(&p->value, __ATOMIC_RELAXED);
     coh_epoch* p = (coh_epoch*)malloc(sizeof(*p));
     if (!p) abort();
-    p->line = line; p->value = 0; p->next = *bucket; *bucket = p;
+    /* Inserted under the lock-line lock only; shard-path stores walk the
+     * bucket concurrently, so the node is published complete. */
+    p->line = line; p->value = 0; p->next = *bucket;
+    __atomic_store_n(bucket, p, __ATOMIC_RELEASE);
     /* Marks the line for the PPU only: no SPU holder or watch exists on it. */
     { uint32_t l = line >> SPU_COH_LINE_SHIFT;
       s_coh_bitmap[l >> 3] |= (unsigned char)(1u << (l & 7)); s_coh_armed = 1; }
@@ -296,8 +354,8 @@ uint64_t spu_coh_line_epoch(uint32_t ea)
 }
 static void epoch_written(uint32_t line)
 {
-    for (coh_epoch* p = *epoch_bucket(line); p; p = p->next)
-        if (p->line == line) { ++p->value; return; }
+    for (coh_epoch* p = __atomic_load_n(epoch_bucket(line), __ATOMIC_ACQUIRE); p; p = p->next)
+        if (p->line == line) { __atomic_fetch_add(&p->value, 1u, __ATOMIC_RELAXED); return; }
 }
 
 unsigned long g_spu_lr_raise = 0;
@@ -305,7 +363,12 @@ unsigned long g_spu_lr_raise = 0;
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    __atomic_fetch_or(&s_spu_bitmap[line >> 3], (unsigned char)(1u << (line & 7)), __ATOMIC_RELAXED);
+    if (!spu_coh_line_spu(ea)) {
+        /* Under the shard: no PPU-only store is mid-flight on this line. */
+        spu_coh_line_shard_lock(ea);
+        __atomic_fetch_or(&s_spu_bitmap[line >> 3], (unsigned char)(1u << (line & 7)), __ATOMIC_RELAXED);
+        spu_coh_line_shard_unlock(ea);
+    }
     s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
     s_coh_armed = 1;
 
@@ -488,6 +551,21 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
             spu_ch_wake(c);
         }
     }
+}
+
+int spu_coh_ppu_store_lock(uint32_t ea)
+{
+    if (spu_coh_line_spu(ea)) return 0;
+    spu_coh_line_shard_lock(ea);
+    if (!spu_coh_line_spu(ea)) return 1;
+    spu_coh_line_shard_unlock(ea);
+    return 0;
+}
+void spu_coh_ppu_store_unlock(uint32_t ea)
+{
+    ppu_resv_break_line(ea);
+    epoch_written(ea & ~127u);
+    spu_coh_line_shard_unlock(ea);
 }
 
 /* SPU_COH_LINE_HIST=1: which lines the locked notify is run for, how often,

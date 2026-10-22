@@ -777,6 +777,10 @@ extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" void spu_coh_notify_write(uint32_t addr);
 extern "C" uint64_t spu_coh_line_epoch(uint32_t addr);
+extern "C" int  spu_coh_ppu_store_lock(uint32_t addr);
+extern "C" void spu_coh_ppu_store_unlock(uint32_t addr);
+extern "C" void spu_coh_line_shard_lock(uint32_t addr);
+extern "C" void spu_coh_line_shard_unlock(uint32_t addr);
 
 /* The architectural reservation belongs to the executing host thread. No
  * pointers are registered in coherence, so short-lived guest contexts cannot
@@ -1047,14 +1051,17 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
             if ((++n % 100000) == 1)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
-    if (coh) spu_lockline_lock();
+    /* The shard excludes PPU-only-line stores, which skip the lock-line lock,
+     * across the epoch check and the compare-and-swap. */
+    if (coh) { spu_lockline_lock(); spu_coh_line_shard_lock((uint32_t)ea); }
     if (coh && !ppu_reservation_line_check(self, (uint32_t)ea)) {
-        spu_lockline_unlock(); resv_unlock(L); return 0;
+        spu_coh_line_shard_unlock((uint32_t)ea); spu_lockline_unlock(); resv_unlock(L); return 0;
     }
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
+        spu_coh_line_shard_unlock((uint32_t)ea);
         spu_lockline_unlock();
     }
     if (ok) ppu_resv_break(ea);
@@ -1121,13 +1128,14 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
-    if (coh) spu_lockline_lock();
+    if (coh) { spu_lockline_lock(); spu_coh_line_shard_lock((uint32_t)ea); }
     if (coh && !ppu_reservation_line_check(self, (uint32_t)ea)) {
-        spu_lockline_unlock(); resv_unlock(L); return 0;
+        spu_coh_line_shard_unlock((uint32_t)ea); spu_lockline_unlock(); resv_unlock(L); return 0;
     }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
+        spu_coh_line_shard_unlock((uint32_t)ea);
         spu_lockline_unlock();
     }
     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
@@ -1587,12 +1595,15 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
     do {                                                                      \
         ps3_critical_write_token _critical_write = {0};                      \
         if (spu_coh_is_reserved((uint32_t)(a))) {                             \
-            spu_lockline_lock();                                              \
+            /* A line no SPU or watch is interested in serializes on its    \
+             * own shard (spu_coherency.c), not the lock-line lock. */       \
+            const int _ppu_only = spu_coh_ppu_store_lock((uint32_t)(a));      \
+            if (!_ppu_only) spu_lockline_lock();                              \
             if(ps3_critical_write_watched((a),(n)))ps3_critical_write_begin(&_critical_write,(uint64_t)(uintptr_t)g_active_ctx,(a),(n),vm_base+(uint32_t)(a),(src),10,0,g_active_ctx?g_active_ctx->cia:0,g_active_ctx?g_active_ctx->lr:0,g_active_ctx?(uint32_t)g_active_ctx->thread_id:0,1); \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             if(_critical_write.capture)ps3_critical_write_end(&_critical_write,vm_base+(uint32_t)(a)); \
-            spu_coh_notify_write((uint32_t)(a));                              \
-            spu_lockline_unlock();                                            \
+            if (_ppu_only) spu_coh_ppu_store_unlock((uint32_t)(a));           \
+            else { spu_coh_notify_write((uint32_t)(a)); spu_lockline_unlock(); } \
         } else {                                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             if(_critical_write.capture)ps3_critical_write_end(&_critical_write,vm_base+(uint32_t)(a)); \
