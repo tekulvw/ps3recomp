@@ -474,9 +474,59 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     }
 }
 
+/* SPU_COH_LINE_HIST=1: which lines the locked notify is run for, how often,
+ * from where, and how often a holder was actually there to be told. Called
+ * under the lock-line lock, so the table needs no atomics. Every two seconds
+ * the busiest lines are printed with the last caller (an address in this
+ * process; subtract the printed slide to symbolize). */
+#if defined(__APPLE__)
+static int s_clh_on = -1;
+static struct { uint32_t line; unsigned long long n, held; uintptr_t site; } s_clh[4096];
+static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held)
+{
+    unsigned i = (line >> 7) * 0x9E3779B1u >> 20;
+    for (unsigned k = 0; k < 4096; ++k, i = (i + 1) & 4095u) {
+        if (s_clh[i].n && s_clh[i].line != line) continue;
+        s_clh[i].line = line; s_clh[i].n++; s_clh[i].held += held != 0; s_clh[i].site = site;
+        break;
+    }
+    static uint64_t next;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (now < next) return;
+    next = now + 2000000000ull;
+    unsigned top[12] = {0}; int nt = 0;
+    for (unsigned j = 0; j < 4096; ++j) {
+        if (!s_clh[j].n) continue;
+        int pos = nt < 12 ? nt++ : 11;
+        if (pos == 11 && nt == 12 && s_clh[top[11]].n >= s_clh[j].n) continue;
+        top[pos] = j;
+        for (; pos > 0 && s_clh[top[pos - 1]].n < s_clh[top[pos]].n; --pos) {
+            unsigned t = top[pos]; top[pos] = top[pos - 1]; top[pos - 1] = t;
+        }
+    }
+    fprintf(stderr, "[coh-line] slide=0x%lx\n", (unsigned long)_dyld_get_image_vmaddr_slide(0));
+    for (int j = 0; j < nt; ++j)
+        fprintf(stderr, "[coh-line] line=0x%08X n=%llu held=%llu site=0x%lx\n", s_clh[top[j]].line,
+                s_clh[top[j]].n, s_clh[top[j]].held, (unsigned long)s_clh[top[j]].site);
+}
+#else
+static const int s_clh_on = 0;
+static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held) { (void)line; (void)site; (void)held; }
+#endif
+
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
+    if (__builtin_expect(s_clh_on != 0, 0)) {
+#if defined(__APPLE__)
+        if (s_clh_on < 0) s_clh_on = getenv("SPU_COH_LINE_HIST") ? 1 : 0;
+#endif
+        if (s_clh_on) {
+            int held = 0;
+            for (spu_coh_entry* e = s_coh_ctxs; e; e = e->next) held |= e->ctx && spu_coh_holds(e->ctx, line);
+            spu_coh_line_hist(line, (uintptr_t)__builtin_return_address(0), held);
+        }
+    }
     ppu_resv_break_line(ea);
     epoch_written(line);
     spu_coh_wake_watches(line);
