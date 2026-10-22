@@ -2349,6 +2349,7 @@ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began wait
 #include <pthread.h>
 #include <sys/ucontext.h>
 #include <mach-o/dyld.h>
+#include <dlfcn.h>
 enum { WPROF_MAX = 120000, WPROF_DEPTH = 32 };
 static uintptr_t (*s_wprof_buf)[WPROF_DEPTH];
 static unsigned char* s_wprof_len;
@@ -2404,9 +2405,20 @@ static void* wprof_thread(void* arg)
         const intptr_t slide = _dyld_get_image_vmaddr_slide(0);
         fprintf(f, "# walker samples %d slide 0x%llx image %s\n", n, (unsigned long long)slide,
                 _dyld_get_image_name(0));
+        /* Addresses outside the main image (system frameworks) are named
+         * here with dladdr, since only this process knows where they are. */
+        const struct mach_header* mh = _dyld_get_image_header(0);
+        Dl_info self_info; uintptr_t self_lo = 0;
+        if (dladdr(mh, &self_info)) self_lo = (uintptr_t)self_info.dli_fbase;
         for (int i = 0; i < n; i++) {
-            for (unsigned d = 0; d < s_wprof_len[i]; d++)
-                fprintf(f, "%s%llx", d ? " " : "", (unsigned long long)(s_wprof_buf[i][d] - (uintptr_t)slide));
+            for (unsigned d = 0; d < s_wprof_len[i]; d++) {
+                const uintptr_t pc = s_wprof_buf[i][d];
+                Dl_info info;
+                if (dladdr((const void*)pc, &info) && (uintptr_t)info.dli_fbase != self_lo && info.dli_sname)
+                    fprintf(f, "%s@%s", d ? " " : "", info.dli_sname);
+                else
+                    fprintf(f, "%s%llx", d ? " " : "", (unsigned long long)(pc - (uintptr_t)slide));
+            }
             fputc('\n', f);
         }
         fclose(f);
