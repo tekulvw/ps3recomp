@@ -18,6 +18,7 @@
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE policy-module run spans */
+#include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -2061,6 +2062,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
+    ps3_tprof_thread('S', (uint32_t)slot->spu_num);
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)

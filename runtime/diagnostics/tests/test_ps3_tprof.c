@@ -1,7 +1,8 @@
-/* PS3_TPROF: two registered threads (one spinning in a named function, one
- * blocked) and one unregistered spinner. The profile must hold samples of the
- * registered threads only, with the spinner's function on its stacks, and
- * nothing at all when PS3_TPROF is unset. Build:
+/* PS3_TPROF: two registered threads (an SPU-kind one spinning in a named
+ * function, a PPU-kind one sleeping) and one unregistered spinner. The
+ * profile must hold samples of the registered threads only -- the PPU one
+ * only with PS3_TPROF_PPU=1 -- and nothing at all when PS3_TPROF is unset.
+ * Build:
  *   cc -O1 -pthread -Iinclude runtime/diagnostics/tests/test_ps3_tprof.c */
 #include "ps3emu/ps3_tprof.h"
 #include <stdio.h>
@@ -63,7 +64,8 @@ int main(int argc, char** argv)
     }
     fclose(f);
     printf("header=%u S7=%u P3=%u other=%u\n", header, s7, p3, other);
-    if (header != 1 || s7 < 100 || p3 < 100 || other) { printf("FAIL\n"); return 1; }
+    const int want_ppu = getenv("PS3_TPROF_PPU") && !strcmp(getenv("PS3_TPROF_PPU"), "1");
+    if (header != 1 || s7 < 100 || (want_ppu ? p3 < 100 : p3 != 0) || other) { printf("FAIL\n"); return 1; }
     printf("PASS on\n");
     (void)argc; (void)argv;
 #endif
