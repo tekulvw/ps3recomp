@@ -2111,9 +2111,25 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
     const char* target_option = getenv("PS3RECOMP_SPURS_READY_TARGET");
     const int target_mode = target_option && !strcmp(target_option, "1");
+    /* PS3RECOMP_SPURS_POLL_US=<n>: look for requests every n microseconds instead of
+     * sleeping up to a millisecond. A guest that raises a ready count or signal with a
+     * plain store wakes nobody, so without it new work waits for the next pass. */
+    const char* poll_option = getenv("PS3RECOMP_SPURS_POLL_US");
+    const long poll_us = poll_option ? atol(poll_option) : 0;
     AcquireSRWLockExclusive(&si->lock);
     while (!si->stopping) {
-        SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
+        if (poll_us > 0 && poll_us < 1000) {
+            ReleaseSRWLockExclusive(&si->lock);
+#ifdef _WIN32
+            Sleep(0);
+#else
+            const struct timespec ts = { 0, poll_us * 1000 };
+            nanosleep(&ts, NULL);
+#endif
+            AcquireSRWLockExclusive(&si->lock);
+        } else {
+            SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
+        }
         if (si->stopping) break;
         if (disabled) continue;
         u32 ea = si->ea;
