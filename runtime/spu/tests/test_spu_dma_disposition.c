@@ -28,6 +28,8 @@ LPVOID VirtualAlloc(LPVOID a, SIZE_T n, DWORD t, DWORD p)
 SIZE_T VirtualQuery(LPCVOID a, PMEMORY_BASIC_INFORMATION m, SIZE_T n)
 { (void)a; (void)m; (void)n; return 0; }
 void (*g_spu_put_hook)(uint32_t, uint32_t);
+/* The runtime's store-watch window, which SPU_DMA_RANGE=watch follows. */
+uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 /* Job I/O recorder (runtime/diagnostics): never armed here, so the fixture
  * only needs the inactive pointer and an event sink that is never reached. */
 void* ps3_jobio_active;
@@ -61,6 +63,28 @@ int main(int argc,char** argv) {
         spu_dma_disposition_before(&t,(const uint8_t*)1,0x12000,32);
         spu_dma_disposition_after(&t,(const uint8_t*)1);
         assert(spu_dma_disposition_finish(&t,(spu_context*)1,0x100,0x12000,32,0x20,0,SPU_DMA_DISPOSITION_PUT)==0);
+        return 0;
+    }
+    if(argc>1 && !strcmp(argv[1],"watch")) {
+        /* SPU_DMA_RANGE=watch follows g_ww_lo..g_ww_hi as it stands at each
+         * transfer: a PUT outside the window before it is armed, one inside
+         * once armed (with a resident job named), one outside again, and a
+         * GET inside after the window moves. */
+        assert(mfc_do_transfer(&s,0x100,0x12000,32,0x20)==0);
+        g_ww_lo=0x12000; g_ww_hi=0x12020;
+        s.resident_code[1].image_id=224; s.resident_code[1].lsa=0x4000; s.resident_code[1].size=0x1000;
+        assert(mfc_do_transfer(&s,0x100,0x12010,32,0x20)==0);
+        assert(mfc_do_transfer(&s,0x100,0x13000,32,0x20)==0);
+        g_ww_lo=0x13000; g_ww_hi=0x13040;
+        assert(mfc_do_transfer(&s,0x100,0x13000,32,0x40)==0);
+        return 0;
+    }
+    if(argc>1 && !strcmp(argv[1],"census")) {
+        /* Ten malformed transfers from two sites: the first 8 are logged one
+         * by one, the 9th opens the census, which names both sites. */
+        s.resident_code[1].image_id=224; s.resident_code[1].lsa=0x4000; s.resident_code[1].size=0x1000;
+        for(int i=0;i<9;i++){ s.pc=0x2340; assert(mfc_do_transfer(&s,0x100,0x12000,0,0x40)==0); }
+        s.pc=0x2400; assert(mfc_do_transfer(&s,0x104,0x12000,32,0x20)==0);
         return 0;
     }
     if(argc>1 && !strcmp(argv[1],"resident")) {

@@ -671,6 +671,18 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
+    /* SPU_DMA_RANGE (spu_dma_range_window): atomic line ops touching the
+     * window. The plain-transfer log in mfc_do_transfer never sees these, and
+     * a ring cursor next to the buffer it allocates is exactly what they hit. */
+    { uint32_t w_lo, w_hi;
+      if (spu_dma_range_window(&w_lo, &w_hi) && ea < w_hi && ea + MFC_ATOMIC_LINE > w_lo) {
+          static int _n = 0;
+          if (PS3_LOG_FIRST(_n, 256)) {
+              char rs[48];
+              spu_dma_resident_text(ctx, rs, sizeof rs);
+              fprintf(stderr, "[dma-range] pc=0x%05X atomic cmd=0x%X lsa=0x%05X ea=0x%08X size=%u img=%d res=%s window=0x%08X-0x%08X\n",
+                      (uint32_t)ctx->pc & SPU_LS_MASK, cmd, lsa, ea, (unsigned)MFC_ATOMIC_LINE,
+                      ctx->image_id, rs, w_lo, w_hi); } } }
     ps3_critical_write_token critical_write = {0};
     uint32_t critical_generation = ps3_critical_write_watched(ea,128) ? ps3_critical_context_generation(ctx) : 0;
 

@@ -169,6 +169,42 @@ static inline int mfc_is_fence(uint32_t cmd)
     return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
 }
 
+/* The SPU_DMA_RANGE window. SPU_DMA_RANGE=<lo>-<hi> (hex EAs) is fixed for
+ * the run; SPU_DMA_RANGE=watch follows the runtime's store-watch window
+ * g_ww_lo..g_ww_hi as it stands NOW, which another component moves at run
+ * time (RSX_ENGINE_VTX_PROBE_WATCH points it at the vertex record a probed
+ * draw read), for buffers whose address is only known once the title has
+ * allocated them. Returns 0 when no window is set. Static state per
+ * including unit; parsing is idempotent. The window pair is weak here so a
+ * fixture that links no runtime store watch still links (the runtime's own
+ * definition, and a fixture's, override it). */
+__attribute__((weak)) uint32_t g_ww_lo, g_ww_hi;
+static inline int spu_dma_range_window(uint32_t* lo, uint32_t* hi)
+{
+    static uint32_t s_lo = 1, s_hi; static int s_watch;
+    if (s_lo == 1) {
+        const char* e = getenv("SPU_DMA_RANGE"); s_lo = 0;
+        if (e && !strcmp(e, "watch")) s_watch = 1;
+        else if (e) { char* d; s_lo = (uint32_t)strtoul(e, &d, 16);
+                      if (*d == '-') s_hi = (uint32_t)strtoul(d + 1, 0, 16); }
+    }
+    if (s_watch) { *lo = g_ww_lo; *hi = g_ww_hi; return *hi != 0 && *lo != 0xFFFFFFFFu; }
+    *lo = s_lo; *hi = s_hi;
+    return s_hi != 0;
+}
+/* "res=a/b" for a log line: the images whose code is resident in local
+ * store (a WWS job runs under the policy's context image id). */
+static inline void spu_dma_resident_text(const spu_context* spu, char* out, size_t n)
+{
+    size_t o = 0; int any = 0;
+    for (int r = 0; r < 4 && o + 8 < n; r++)
+        if (spu->resident_code[r].image_id) {
+            o += (size_t)snprintf(out + o, n - o, "%s%d", any ? "/" : "", spu->resident_code[r].image_id);
+            any = 1;
+        }
+    if (!any && n) { out[0] = '-'; out[1] = 0; }
+}
+
 /*
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
@@ -231,16 +267,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
-    /* SPU_DMA_RANGE=<lo>-<hi> (hex EAs): log transfers touching [lo,hi), first
-     * 64 -- who reads or writes a buffer the RSX shares with the SPUs. */
-    { static uint32_t s_lo = 1, s_hi;
-      if (s_lo == 1) { const char* e = getenv("SPU_DMA_RANGE"); s_lo = 0;
-          if (e) { char* d; s_lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') s_hi = (uint32_t)strtoul(d + 1, 0, 16); } }
-      if (s_hi && (uint32_t)ea < s_hi && (uint32_t)ea + size > s_lo) {
+    /* SPU_DMA_RANGE=<lo>-<hi> (hex EAs) or =watch (spu_dma_range_window): log
+     * transfers touching the window, first 256 -- who reads or writes a
+     * buffer the RSX shares with the SPUs -- with the context image and the
+     * resident job images, since a WWS job's transfers carry the policy's id. */
+    { uint32_t s_lo, s_hi;
+      if (spu_dma_range_window(&s_lo, &s_hi) && (uint32_t)ea < s_hi && (uint32_t)ea + size > s_lo) {
           static int _n = 0;
-          if (PS3_LOG_FIRST(_n, 64))
-              fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
-                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+          if (PS3_LOG_FIRST(_n, 256)) {
+              char rs[48];
+              spu_dma_resident_text(spu, rs, sizeof rs);
+              fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u img=%d res=%s window=0x%08X-0x%08X\n",
+                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
+                      spu->image_id, rs, s_lo, s_hi); }
           /* ...and every 5 s, the bytes PUT into / GOT from the range. */
           { static volatile long long s_put, s_get; static unsigned long long s_t0;
             extern unsigned long long ps3_ms_now(void);
@@ -346,6 +385,32 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                   " cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
                           spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd,
                           lsa, (uint32_t)ea, size);
+              /* Past those 8 lines a rejection is silent, and a title whose
+               * startup spends them (MAG's job manager issues 8 size-0 GETs)
+               * hides every later one. A census by issue site, printed at
+               * the first rejection past the cap and then every 1024, keeps
+               * a producer whose output is refused visible: the resident job
+               * images name it when the context's id is the policy's. */
+              { static struct { uint32_t pc, cmd, size, ea; int img; char res[24]; unsigned long long n; } s_site[16];
+                static unsigned long long s_total; static int s_sites;
+                const uint32_t pc = (uint32_t)spu->pc & SPU_LS_MASK;
+                int j = 0;
+                while (j < s_sites && (s_site[j].pc != pc || s_site[j].cmd != cmd)) j++;
+                if (j == s_sites && j < 16) {
+                    s_site[j].pc = pc; s_site[j].cmd = cmd; s_site[j].size = size;
+                    s_site[j].ea = (uint32_t)ea; s_site[j].img = spu->image_id;
+                    spu_dma_resident_text(spu, s_site[j].res, sizeof s_site[j].res);
+                    s_sites++;
+                }
+                if (j < 16) s_site[j].n++;
+                if (++s_total == 9 || s_total % 1024 == 0) {
+                    fprintf(stderr, "[mfc] rejected census: %llu rejections by (pc,cmd):", s_total);
+                    for (int k = 0; k < s_sites; k++)
+                        fprintf(stderr, " pc=0x%05X cmd=0x%X n=%llu img=%d res=%s first(ea/size)=0x%08X/%u",
+                                s_site[k].pc, s_site[k].cmd, s_site[k].n, s_site[k].img, s_site[k].res,
+                                s_site[k].ea, s_site[k].size);
+                    fputc('\n', stderr);
+                } }
               return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, 0, SPU_DMA_DISPOSITION_MALFORMED);
           } } }
     /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own

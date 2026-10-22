@@ -2033,9 +2033,14 @@ static void eng_vtx_probe(u64 fp_hash, u32 pipeline, u32 prim, int blended,
         const u32 bytes = d.stride < 64u ? (d.stride ? d.stride : 16u) : 64u;
         const u8* p = eng_guest_ptr(NULL, d.location, off, bytes);
         eng_vtx_probe_record(fp_hash, seq, a, d.location, off, p, bytes);
+        /* The watch covers the array from its record 0 through the probed
+         * instance, not only the probed record: a producer that fills the
+         * batch front to back, or a different record of it, is still seen. */
         if (p && vm_base) {
-            const u32 instances = dc.n_source_refs / d.frequency + 1u;
-            eng_vtx_probe_watch((u32)(p - vm_base), instances * (d.stride ? d.stride : 16u));
+            const u32 instances = first + dc.n_source_refs / d.frequency + 1u;
+            const u32 stride = d.stride ? d.stride : 16u;
+            const u8* base = eng_guest_ptr(NULL, d.location, rsx_dsp_vertex_data_base_offset(&g.rsx) + d.offset, stride);
+            eng_vtx_probe_watch((u32)((base ? base : p) - vm_base), (base ? instances : instances - first) * stride);
         }
         break;
     }
