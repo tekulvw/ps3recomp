@@ -1837,6 +1837,127 @@ static int eng_debug_fp(u64 fp_hash, u32 pipeline)
     return 0;
 }
 
+/* RSX_ENGINE_VTX_PROBE_FP=<hex>[,<hex>...] prints, for the first draws
+ * through each of those fragment programs (RSX_ENGINE_VTX_PROBE_MAX per
+ * program, default 4, at most 64), what the vertex program is actually fed:
+ * every attribute's array format, offset and CURRENT (constant) value with
+ * its write count, the draw's batches, the first fetched vertices exactly as
+ * uploaded, and the transform constants (RSX_ENGINE_VTX_PROBE_CONST=
+ * "21,27,256-263,467" lists rows; default every non-zero row). Together with
+ * RSX_ENGINE_SHADER_DUMP's vertex program this lets a draw that changes no
+ * pixels be evaluated off line: zero-sized, faded-out or off-screen.
+ * RSX_ENGINE_VTX_PROBE_FP=* probes every BLENDED draw instead, per program,
+ * for finding an effect whose programs are not known yet (up to 256).
+ * RSX_ENGINE_VTX_PROBE_TRIGGER=<file> holds the probe until that file exists
+ * (checked once a frame), so the draws probed are the ones on screen when
+ * the effect is. */
+static void eng_vtx_probe(u64 fp_hash, u32 pipeline, u32 prim, int blended,
+                          const rsx_vertex_layout_plan* layout)
+{
+    enum { PROBE_SLOTS = 256 };
+    static int init, any;
+    static u64 want[PROBE_SLOTS];
+    static u32 n_want, max_per = 4, done[PROBE_SLOTS];
+    static u8 rows[RSX_DSP_NUM_CONSTANTS];
+    static int rows_listed, armed;
+    static const char* trigger;
+    static u32 checked_frame = UINT32_MAX;
+    if (!init) {
+        init = 1;
+        trigger = getenv("RSX_ENGINE_VTX_PROBE_TRIGGER");
+        armed = !trigger || !*trigger;
+        const char* list = getenv("RSX_ENGINE_VTX_PROBE_FP");
+        any = list && list[0] == '*';
+        if (!any) n_want = eng_parse_hash_list("RSX_ENGINE_VTX_PROBE_FP", want);
+        const char* m = getenv("RSX_ENGINE_VTX_PROBE_MAX");
+        if (m && *m) { max_per = (u32)strtoul(m, NULL, 10); if (max_per > 64) max_per = 64; }
+        const char* c = getenv("RSX_ENGINE_VTX_PROBE_CONST");
+        while (c && *c) {
+            char* end;
+            unsigned long lo = strtoul(c, &end, 10), hi = lo;
+            if (end == c) break;
+            if (*end == '-') { c = end + 1; hi = strtoul(c, &end, 10); if (end == c) break; }
+            for (unsigned long r = lo; r <= hi && r < RSX_DSP_NUM_CONSTANTS; r++) rows[r] = 1;
+            rows_listed = 1;
+            c = *end == ',' ? end + 1 : end;
+            if (*end != ',') break;
+        }
+    }
+    if (!n_want && !any) return;
+    if (any && !blended) return;
+    if (!armed) {
+        if (checked_frame == g.frames) return;
+        checked_frame = g.frames;
+        FILE* f = fopen(trigger, "rb");
+        if (!f) return;
+        fclose(f);
+        armed = 1;
+        fprintf(stderr, "[vtx probe] armed at frame %u\n", g.frames);
+    }
+    u32 i = 0;
+    for (; i < n_want; i++) if (want[i] == fp_hash) break;
+    if (i == n_want) {
+        if (!any || n_want == PROBE_SLOTS) return;
+        want[n_want++] = fp_hash;
+    }
+    if (done[i] >= max_per) return;
+    const u32 seq = done[i]++;
+    FILE* o = stderr;
+    fprintf(o, "[vtx probe] fp %016llx pipe %u frame %u draw %u prim %u batches arr %u idx %u"
+               " refs %u verts %u immediate %u base_off 0x%08X base_idx %u divider 0x%04X"
+               " layout 0x%04X\n",
+            (unsigned long long)fp_hash, pipeline, g.frames, seq, prim, dc.n_arr, dc.n_idx,
+            dc.n_source_refs, dc.n_verts, dc.n_immediate,
+            rsx_dsp_vertex_data_base_offset(&g.rsx), rsx_dsp_vertex_data_base_index(&g.rsx),
+            rsx_dsp_reg(&g.rsx, 0x1FC0) & 0xFFFFu, layout->mask);
+    for (u32 b = 0; b < dc.n_arr && b < 4; b++)
+        fprintf(o, "[vtx probe]  arr[%u] first %u count %u\n", b, dc.arr[b].first, dc.arr[b].count);
+    for (u32 b = 0; b < dc.n_idx && b < 4; b++)
+        fprintf(o, "[vtx probe]  idx[%u] first %u count %u\n", b, dc.idx[b].first, dc.idx[b].count);
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+        rsx_dsp_vertex_attr d;
+        rsx_dsp_get_vertex_attr(&g.rsx, a, &d);
+        const u32 base = (0x1C00u + a * 0x10u) >> 2;
+        u32 seen = 0;
+        for (u32 k = 0; k < 4; k++) seen += g.rsx.seen[base + k];
+        float cur[4];
+        rsx_dsp_vertex_default(&g.rsx, a, cur);
+        const float* fed = NULL;
+        if (layout->slot_by_attr[a] >= 0 && dc.n_verts)
+            fed = (const float*)(dc.verts + (u32)layout->slot_by_attr[a] * 16u);
+        if (!d.size && !seen && !fed) continue;
+        fprintf(o, "[vtx probe]  a%-2u fmt 0x%08X type %u size %u stride %u freq %u %s off 0x%08X loc %u"
+                   " current (%g %g %g %g) writes %u%s\n",
+                a, rsx_dsp_reg(&g.rsx, 0x1740u + a * 4u), d.type, d.size, d.stride, d.frequency,
+                ((rsx_dsp_reg(&g.rsx, 0x1FC0) >> a) & 1u) ? "mod" : "div", d.offset, d.location,
+                cur[0], cur[1], cur[2], cur[3], seen, fed ? " read" : "");
+    }
+    const u32 nv = dc.n_verts < 8u ? dc.n_verts : 8u;
+    for (u32 v = 0; v < nv; v++) {
+        fprintf(o, "[vtx probe]  v%u ref %u:", v, dc.refs[v].vertex_id);
+        for (u32 s = 0; s < layout->count; s++) {
+            const float* f = (const float*)(dc.verts + (size_t)v * layout->stride + s * 16u);
+            fprintf(o, " a%u(%g %g %g %g)", layout->attrs[s], f[0], f[1], f[2], f[3]);
+        }
+        fputc('\n', o);
+    }
+    for (u32 r = 0; r < RSX_DSP_NUM_CONSTANTS; r++) {
+        float f[4];
+        memcpy(f, g.rsx.constants[r], sizeof f);
+        if (rows_listed ? !rows[r] : !(f[0] != 0.0f || f[1] != 0.0f || f[2] != 0.0f || f[3] != 0.0f))
+            continue;
+        fprintf(o, "[vtx probe]  c%u (%.9g %.9g %.9g %.9g)\n", r, f[0], f[1], f[2], f[3]);
+    }
+    rsx_dsp_viewport vp;
+    rsx_dsp_get_viewport(&g.rsx, &vp);
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    fprintf(o, "[vtx probe]  viewport scale (%g %g %g) translate (%g %g %g) clip %ux%u aa %ux%u\n",
+            vp.scale[0], vp.scale[1], vp.scale[2], vp.translate[0], vp.translate[1],
+            vp.translate[2], sf.clip_w, sf.clip_h, sf.aa_sx, sf.aa_sy);
+    fprintf(o, "[vtx probe] fp %016llx draw %u end\n", (unsigned long long)fp_hash, seq);
+}
+
 /* A guest fragment program's name for the debug knobs: its structural hash
  * (inline constants excluded) seeded with the FNV offset basis, the value
  * RSX_FP_DEBUG matches in the decompiler. Unlike a backend pipeline handle it
@@ -3557,6 +3678,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
                                           &fp_hash);
     if (!pipeline) {ENG_CHECKED_FAIL();return;}
     if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
+    if (fp_hash) eng_vtx_probe(fp_hash, pipeline, prim, rs.blend_enable, &layout);
 
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */
