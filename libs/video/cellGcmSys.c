@@ -1166,11 +1166,6 @@ static int gcm_defer_label(u32 ea,u32 value,u32 method,u32 fifo_ea){
     if(!vm_base||(u64)ea+4u>limit){s_reports.failed=1;fprintf(stderr,"[deferred reports] invalid label destination %08X; publication stopped\n",ea);return 0;}
     unsigned failed=s_reports.failed;
     int ok=rsx_reports_enqueue(&s_reports,&s_report_ops,r);
-    /* Experiment: commit the work ahead of a label at once instead of when
-     * the report batch fills, so a guest polling it waits one GPU round trip
-     * rather than for the walker to decode another batch. */
-    { static int issue_now=-1; if(issue_now<0){const char*e=getenv("PS3RECOMP_GCM_LABEL_ISSUE");issue_now=e&&!strcmp(e,"1");}
-      if(ok&&issue_now)ok=rsx_reports_issue(&s_reports,&s_report_ops); }
     ring_note(RSX_RING_ENQUEUE,ea,value,0,((uint64_t)(ok!=0)<<63)|s_reports.count);
     if(!ok&&!failed)fprintf(stderr,"[deferred reports] label enqueue FAILED; publication stopped\n");
     return ok;
