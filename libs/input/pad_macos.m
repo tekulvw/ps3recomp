@@ -16,7 +16,7 @@ static const struct { unsigned short code; uint16_t button; } s_map[] = {
     {3, CELL_PAD_CTRL_L3}, {5, CELL_PAD_CTRL_R3},
     {123, CELL_PAD_CTRL_LEFT}, {124, CELL_PAD_CTRL_RIGHT},
     {125, CELL_PAD_CTRL_DOWN}, {126, CELL_PAD_CTRL_UP},
-    /* Stick keys have no digital-button alias: IJKL left, WASD right. */
+    /* Stick keys have no digital-button alias: WASD left, IJKL right. */
     {34, 0}, {40, 0}, {38, 0}, {37, 0},
     {13, 0}, {1, 0}, {0, 0}, {2, 0},
 };
@@ -37,10 +37,10 @@ PS3RecompMacOSPadState ps3recomp_pad_macos_state(void) {
     uint32_t keys = atomic_load(&s_keys);
     for (unsigned i=0; i<sizeof(s_map)/sizeof(s_map[0]); i++)
         if (keys & (1u << i)) state.buttons |= s_map[i].button;
-    state.analog_lx = stick_axis(keys, 38, 37); /* J / L */
-    state.analog_ly = stick_axis(keys, 34, 40); /* I / K */
-    state.analog_rx = stick_axis(keys, 0, 2);   /* A / D */
-    state.analog_ry = stick_axis(keys, 13, 1);  /* W / S */
+    state.analog_lx = stick_axis(keys, 0, 2);   /* A / D */
+    state.analog_ly = stick_axis(keys, 13, 1);  /* W / S */
+    state.analog_rx = stick_axis(keys, 38, 37); /* J / L */
+    state.analog_ry = stick_axis(keys, 34, 40); /* I / K */
     return state;
 }
 uint16_t ps3recomp_pad_macos_buttons(void) {
