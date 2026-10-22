@@ -17,15 +17,14 @@
  * cases that must stay quiet are here for the same reason they are in the PPU
  * test -- an over-eager notify is a livelock, not a safe approximation.
  *
- * The last test is the event acknowledge. An SPU acknowledging the events it
- * has read is a read-modify-write of the same word every one of those raises
- * writes, so an edge landing between the read and the write is dropped and the
- * SPU goes back to sleep holding a reservation it has already lost. The
- * interleaving is built with the lock-line lock rather than raced for: the main
- * thread takes the lock, a second thread starts the acknowledge and is held at
- * that lock, that the acknowledge has NOT completed while the lock is held is
- * asserted, the raise then happens under the lock, and only afterwards is the
- * acknowledge let through.
+ * The last tests are the event acknowledge and the MFC event producers. An SPU
+ * acknowledging the events it has read is a read-modify-write of the same word
+ * every one of those raises writes, so an edge landing between the read and
+ * the write would be dropped and the SPU would go back to sleep holding a
+ * reservation it has already lost. Every writer of event_status is an atomic
+ * RMW and none of them takes the lock-line lock: the tests pin that they
+ * complete while the lock is held, that a raise after them is kept, and race
+ * an acknowledge against a raise for real.
  *
  * spu_channels.c is compiled in rather than linked, because spu_mfc_atomic()
  * is file-static: the same reason test_spu_mfc_slots.c does it.
@@ -385,43 +384,44 @@ static void test_unaligned_wide_put_around_a_reserved_line(void)
 /* ===========================================================================
  * The event acknowledge against a concurrent raise
  *
- * Built with the lock rather than raced for. The main thread holds the
- * lock-line lock, so the acknowledge cannot get past it, and that it has not
- * completed is asserted -- which is what makes the interleaving a fact of the
- * run rather than a hope. The raise then happens under the same lock, and the
- * acknowledge is let through afterwards: exactly the order that loses the edge
- * when the acknowledge is a bare read-modify-write.
+ * Every producer of an event bit -- a peer's reservation-lost notification,
+ * the PPU coherent store, a DMA stall-and-notify, a tag-status update -- sets
+ * it with an atomic OR, and the acknowledge clears with an atomic AND. None of
+ * them takes the lock-line lock, so the interleaving can no longer be built by
+ * holding that lock. Two things are checked instead:
  *
- * The two waits below decide nothing. An acknowledge that has not started yet
- * lands after the raise and keeps it just the same; what the assertion rules
- * out is the acknowledge COMPLETING while the lock is held, which is the only
- * way the raise can be read, overwritten and lost.
+ *   - that the acknowledge and the producers really are lock-free (they
+ *     complete while the lock is held), so the notify that happens under the
+ *     lock afterwards is an ordinary later raise that must survive; and
+ *   - a real race, many rounds, of an acknowledge against a notify. A bare
+ *     read-modify-write on either side can drop the other side's update; the
+ *     atomics cannot, so every round must end with the LR edge kept and the
+ *     acknowledged bit gone. The race is a smoke test, not a proof: the proof
+ *     is that every writer of event_status is an atomic RMW.
  * ===========================================================================*/
 #define ACK_TAG_EVENT  0x1u    /* MFC tag-status update: what the ack asks for */
 
-static volatile int g_ack_entered;
-static volatile int g_ack_done;
+static atomic_int g_ack_entered, g_ack_done;
 
 static void* ack_thread(void* arg)
 {
     (void)arg;
-    g_ack_entered = 1;
+    atomic_store(&g_ack_entered, 1);
     wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
-    g_ack_done = 1;
+    atomic_store(&g_ack_done, 1);
     return NULL;
 }
 
 static void test_ack_keeps_a_concurrent_raise(void)
 {
     reset_pair();
-    g_ack_entered = 0;
-    g_ack_done = 0;
+    atomic_store(&g_ack_entered, 0);
+    atomic_store(&g_ack_done, 0);
 
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
     g_a.event_status = ACK_TAG_EVENT;      /* the event the SPU is acking */
 
     spu_lockline_lock();
-
     pthread_t t;
     if (pthread_create(&t, NULL, ack_thread, NULL) != 0) {
         spu_lockline_unlock();
@@ -429,31 +429,93 @@ static void test_ack_keeps_a_concurrent_raise(void)
         CHECK(0);
         return;
     }
+    for (int i = 0; i < 2000 && !atomic_load(&g_ack_done); i++) Sleep(1);
 
-    while (!g_ack_entered) YieldProcessor();
-    Sleep(2);                              /* time to arrive at the lock */
-
-    TEST("the acknowledge cannot complete while the lock-line lock is held");
-    CHECK(g_ack_done == 0);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
+    TEST("the acknowledge does not wait for the lock-line lock");
+    CHECK(atomic_load(&g_ack_done) == 1);
+    CHECK_EQ_U32(g_a.event_status, 0);
 
     /* The raise a peer's commit would make, under the lock that peer holds. */
     spu_coh_notify_write(LINE_A);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
-
     spu_lockline_unlock();
     pthread_join(t, NULL);
 
-    TEST("the acknowledge clears what it asked for and keeps the raise");
-    CHECK(g_ack_done == 1);
+    TEST("a raise after the acknowledge is kept");
     CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
     CHECK(g_a.resv_valid == 0);
 }
 
+#define ACK_RACE_ROUNDS 200000
+static atomic_int g_ackr_go, g_ackr_ack_done, g_ackr_raise_done;
 
-/* Hold the reservation-writer lock while a real MFC producer starts. Its
- * event update must wait: otherwise a peer's LR read/modify/write can overwrite
- * the DMA notification. Atomic fixture flags synchronize the host threads. */
+static void* ackr_acker(void* arg)
+{
+    (void)arg;
+    for (int k = 1; k <= ACK_RACE_ROUNDS; k++) {
+        while (atomic_load(&g_ackr_go) != k) { }
+        for (unsigned i = 0; i < ((unsigned)(k * 7) & 15u); i++) YieldProcessor();
+        wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
+        atomic_store(&g_ackr_ack_done, k);
+    }
+    return NULL;
+}
+
+static void* ackr_raiser(void* arg)
+{
+    (void)arg;
+    for (int k = 1; k <= ACK_RACE_ROUNDS; k++) {
+        while (atomic_load(&g_ackr_go) != k) { }
+        for (unsigned i = 0; i < ((unsigned)(k * 13) & 15u); i++) YieldProcessor();
+        spu_lockline_lock();
+        spu_coh_notify_write(LINE_A);
+        spu_lockline_unlock();
+        atomic_store(&g_ackr_raise_done, k);
+    }
+    return NULL;
+}
+
+static void test_ack_races_a_raise(void)
+{
+    reset_pair();
+    atomic_store(&g_ackr_go, 0);
+    atomic_store(&g_ackr_ack_done, 0);
+    atomic_store(&g_ackr_raise_done, 0);
+
+    pthread_t a, r;
+    if (pthread_create(&a, NULL, ackr_acker, NULL) != 0) {
+        TEST("ack race threads start"); CHECK(0); return;
+    }
+    if (pthread_create(&r, NULL, ackr_raiser, NULL) != 0) {
+        atomic_store(&g_ackr_go, -1);
+        TEST("ack race threads start"); CHECK(0); return;
+    }
+
+    unsigned long lost_raise = 0, kept_ack = 0;
+    for (int k = 1; k <= ACK_RACE_ROUNDS; k++) {
+        spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+        g_a.event_status = ACK_TAG_EVENT;
+        atomic_store(&g_ackr_go, k);
+        while (atomic_load(&g_ackr_ack_done) != k ||
+               atomic_load(&g_ackr_raise_done) != k) { }
+        uint32_t s = __atomic_load_n(&g_a.event_status, __ATOMIC_ACQUIRE);
+        if (!(s & SPU_EVENT_LR)) lost_raise++;
+        if (s & ACK_TAG_EVENT)   kept_ack++;
+    }
+    pthread_join(a, NULL);
+    pthread_join(r, NULL);
+
+    TEST("an acknowledge racing a reservation-lost raise never drops the raise");
+    CHECK(lost_raise == 0);
+    TEST("...and always clears the bit it acknowledged");
+    CHECK(kept_ack == 0);
+}
+
+
+/* A real MFC producer started while another thread holds the lock-line lock.
+ * Its event update is an atomic OR and does not wait for the lock; a peer's LR
+ * raise made under the lock afterwards must not replace the DMA notification,
+ * nor the notification the raise. Atomic fixture flags synchronize the host
+ * threads. */
 static atomic_int g_raise_entered, g_raise_done;
 static unsigned g_raise_mode;
 static void* raise_thread(void* ignored)
@@ -485,11 +547,10 @@ static void test_producer_keeps_peer_event(unsigned bit)
     if (pthread_create(&t, NULL, raise_thread, NULL)) {
         spu_lockline_unlock(); CHECK(0); return;
     }
-    while (!atomic_load(&g_raise_entered)) YieldProcessor();
-    Sleep(10);
-    TEST("MFC producer serializes with concurrent reservation writer");
-    CHECK(atomic_load(&g_raise_done) == 0);
-    CHECK_EQ_U32(g_a.event_status, 0);
+    for (int i = 0; i < 2000 && !atomic_load(&g_raise_done); i++) Sleep(1);
+    TEST("MFC event producer does not wait for the lock-line lock");
+    CHECK(atomic_load(&g_raise_done) == 1);
+    CHECK_EQ_U32(g_a.event_status, bit);
     spu_coh_notify_write(LINE_A);
     spu_lockline_unlock();
     pthread_join(t, NULL);
@@ -515,6 +576,7 @@ int main(void)
     test_wide_put_finds_the_reserved_line();
     test_unaligned_wide_put_around_a_reserved_line();
     test_ack_keeps_a_concurrent_raise();
+    test_ack_races_a_raise();
     test_producer_keeps_peer_event(2);
     test_producer_keeps_peer_event(1);
 
