@@ -238,10 +238,34 @@ void spu_stop(spu_context* ctx)
     if (s_halt) spu_halt(ctx);
 }
 
+/* SPU_FLOAT_RZ=1: a host thread that runs SPU code keeps FPCR at round toward zero with
+ * flush-to-zero from its first run on, so the single-precision helpers take their native form
+ * (spu_helpers.h, spu__nv_rz). Set once per thread -- an FPCR write serializes -- and never put
+ * back: these threads run SPU code and the runtime around it, whose host arithmetic is integer
+ * apart from diagnostics' timing printouts; double precision restores the default around itself.
+ * arm64 only; elsewhere the exact forms always run. */
+static void spu_float_thread_mode(void)
+{
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+    static atomic_int s_on = -1;
+    int on = atomic_load_explicit(&s_on, memory_order_relaxed);
+    if (on < 0) {
+        const char* e = getenv("SPU_FLOAT_RZ");
+        on = e && !strcmp(e, "1");
+        atomic_store_explicit(&s_on, on, memory_order_relaxed);
+    }
+    if (!on) return;
+    uint64_t v;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(v));
+    if (v != SPU_FPCR_RZFZ) __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
+#endif
+}
+
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
+    spu_float_thread_mode();
     ctx->region_dispatch_valid=0;
     int halted = 0;
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
