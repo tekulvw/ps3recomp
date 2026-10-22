@@ -337,6 +337,26 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               fprintf(stderr, "[dma-img] id=%d img=%d res=%s pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
                       s_ids[k], spu->image_id, rs, (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa,
                       (uint32_t)ea, size);
+              /* SPU_DMA_IMAGES_DUMP=1: the payload of those first transfers
+               * when it is small (<= 256 B) -- a job's parameter block as the
+               * PPU wrote it (a GET's source in main memory), or the
+               * descriptor a job publishes (a PUT's source in local store).
+               * Words as stored, big-endian. */
+              { static int s_dump = -1;
+                if (s_dump < 0) { const char* e = getenv("SPU_DMA_IMAGES_DUMP"); s_dump = e && *e && *e != '0'; }
+                const int is_get = (cmd & 0xF0) == 0x40;
+                const uint8_t* src = NULL;
+                if (s_dump && size && size <= 256) {
+                    if (is_get) { if (vm_base && (uint64_t)ea + size <= 0x100000000ull && mfc_ea_range_committed(ea, size)) src = vm_base + (uint32_t)ea; }
+                    else if (spu->ls && lsa + size <= SPU_LS_SIZE) src = spu->ls + lsa;
+                }
+                if (src) {
+                    fprintf(stderr, "[dma-img]   %s @0x%08X:", is_get ? "get" : "put", is_get ? (uint32_t)ea : lsa);
+                    for (uint32_t i = 0; i < size; i += 4)
+                        fprintf(stderr, "%s%02X%02X%02X%02X", (i & 31) ? " " : "\n[dma-img]     ",
+                                src[i], i + 1 < size ? src[i + 1] : 0, i + 2 < size ? src[i + 2] : 0, i + 3 < size ? src[i + 3] : 0);
+                    fputc('\n', stderr);
+                } }
           }
           if (mfc_is_put(cmd)) {
               const uint32_t page = (uint32_t)ea & ~0xFFFFu;

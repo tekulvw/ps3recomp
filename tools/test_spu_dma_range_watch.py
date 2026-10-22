@@ -33,4 +33,13 @@ with tempfile.TemporaryDirectory(prefix='dma-range-') as tmp:
     assert len(logged) == 8 and len(census) == 1, p.stderr
     c = dict(re.findall(r'(\w+)=(\S+)', census[0]))
     assert c['pc'] == '0x02340' and c['cmd'] == '0x40' and c['n'] == '9' and c['res'] == '224', census
+    # SPU_DMA_IMAGES_DUMP=1: a listed image's small transfers carry their
+    # payload -- a GET's source words from main memory (0x55 fill), a PUT's
+    # source words from local store (0x3F800000+i).
+    p = subprocess.run([str(binary)], env=dict(env, SPU_DMA_IMAGES='7', SPU_DMA_IMAGES_DUMP='1'), capture_output=True, text=True, check=True, timeout=10)
+    dump = [l for l in p.stderr.splitlines() if l.startswith('[dma-img]  ')]
+    assert any('put @0x00000100:' in l for l in dump) and any('3F800000 3F800001' in l for l in dump), dump
+    gets = [i for i, l in enumerate(dump) if 'get @0x00012000:' in l]
+    assert gets and dump[gets[0] + 1].split()[1:3] == ['3F800000', '3F800001'], dump
+    print('spu dma images dump: ok')
 print('spu dma range watch: ok')
