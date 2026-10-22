@@ -5,6 +5,7 @@
  * Build:
  *   cc -O1 -pthread -Iinclude runtime/diagnostics/tests/test_ps3_tprof.c */
 #include "ps3emu/ps3_tprof.h"
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
