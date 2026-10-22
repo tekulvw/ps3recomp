@@ -2759,9 +2759,10 @@ static u32 eng_obj_add(id<MTLTexture> t)
      * a long session stays bounded. */
     { static int on = -1; static unsigned long long made;
       if (on < 0) on = getenv("RSX_ENG_COUNTS") ? 1 : 0;
-      if (on && ++made % 4096 == 0)
-          fprintf(stderr, "[rsx engine counts] created=%llu live=%u/%u\n", made,
-                  (unsigned)(s_eng_obj_count - s_eng_obj_free_count), (unsigned)ENG_MAX_OBJECTS); }
+      if (on && ++made % 1024 == 0)
+          fprintf(stderr, "[rsx engine counts] created=%llu live=%u/%u metal_allocated=%lluMB\n", made,
+                  (unsigned)(s_eng_obj_count - s_eng_obj_free_count), (unsigned)ENG_MAX_OBJECTS,
+                  (unsigned long long)([s_dev currentAllocatedSize] >> 20)); }
     return slot + 1;
 }
 
