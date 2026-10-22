@@ -1728,7 +1728,6 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     s_registry[i].addr = addr;
     s_registry[i].fn = fn;
     s_registry[i].image_id = s_reg_image;
-    s_registry_count = i + 1;
     uint32_t h = spu_fn_hash(addr);
     s_hash_next[i] = 0;
     if (s_hash_head[h] == 0)
@@ -1740,6 +1739,9 @@ void spu_register_function(uint32_t addr, spu_fn fn)
         uint32_t word = addr >> 2;
         s_entry_bits[word >> 3] |= (uint8_t)(1u << (word & 7u));
     }
+    /* Published after the entry is linked: the dispatch cache keys its entries
+     * by this count, so a lookup that sees the new count also finds the entry. */
+    __atomic_store_n(&s_registry_count, i + 1, __ATOMIC_RELEASE);
 }
 
 /* Report a CROSS-IMAGE match: the registry served a function some other image
@@ -1878,7 +1880,8 @@ static int spu_verified_register(int policy, int image,
         next.segments[i].bytes = copy + at;
         at += segments[i].size;
     }
-    s_verified_images[s_verified_count++] = next;
+    s_verified_images[s_verified_count] = next;
+    __atomic_store_n(&s_verified_count, s_verified_count + 1, __ATOMIC_RELEASE);   /* the dispatch cache keys by it */
     s_verified_bytes += total;
     return 1;
 }
@@ -2614,16 +2617,17 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
  * tracked. Misses are not cached. =shadow runs the full resolver on every
  * hit, counts disagreements and returns the full answer. */
 typedef struct {
-    const spu_context* ctx; spu_lifted_fn fn;
-    uint32_t lsa, rgen, vgen, repoch, vsum; uint16_t vmask;
+    spu_lifted_fn fn;
+    uint32_t id, lsa, rgen, vgen, residency, vsum; uint16_t vmask;
     int image, ovl, task; uint8_t flags;
 } spu_dcache_ent;
 typedef struct {
-    uint32_t repoch, vepoch[SPU_VERIFIED_IMAGES];
+    uint32_t vepoch[SPU_VERIFIED_IMAGES];
     spu_dcache_ent ent[512];
 } spu_dcache_tls;
 static SPU_TLS spu_dcache_tls t_dcache;   /* one TLS object: Darwin TLV access is a call */
 static atomic_ullong s_dcache_hits, s_dcache_misses, s_dcache_shadow_bad;
+static uint32_t s_dcache_next_id;
 static int spu_dcache_mode(void)
 {
     static atomic_int mode;
@@ -2649,10 +2653,9 @@ static void spu_dcache_note_get(uint32_t lsa, uint32_t size)
             }
     }
 }
-static void spu_dcache_residency_changed(void)
-{
-    if (spu_dcache_mode()) t_dcache.repoch++;
-}
+/* Per context, not per thread: a context's resident code is what its cached
+ * resolutions depend on, whichever thread changed it. */
+static void spu_dcache_residency_changed(spu_context* ctx) { ctx->dcache_residency++; }
 static void spu_dcache_stats(void)
 {
     const unsigned long long n = atomic_fetch_add_explicit(&s_dcache_hits, 0, memory_order_relaxed) +
@@ -2666,18 +2669,28 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     const int mode = spu_dcache_mode();
     if (!mode || !ctx || (s_verified_leaf_count && spu_verified_leaf_mode()) || spu_overlay_residency_shadow())
         return spu_lifted_lookup_full(ctx, lsa);
+    spu_context* c = (spu_context*)ctx;
+    uint32_t id = c->dcache_id;   /* 0 after spu_context_init: a fresh lifetime takes a fresh id */
+    if (!id) {
+        do id = __atomic_add_fetch(&s_dcache_next_id, 1, __ATOMIC_RELAXED); while (!id);
+        c->dcache_id = id;
+    }
+    /* Read before the resolver walks the registries: an entry is never keyed
+     * by a count newer than the registry it saw. */
+    const uint32_t rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
+    const uint32_t vgen = __atomic_load_n(&s_verified_count, __ATOMIC_ACQUIRE);
     spu_dcache_tls* t = &t_dcache;
     const uint8_t flags = (uint8_t)((ctx->policy_mode ? 1 : 0) | (ctx->ls != ctx->ls_store ? 2 : 0));
     uint16_t vmask = 0; uint32_t vsum = 0;
-    for (unsigned i = 0; i < s_verified_count; ++i)
+    for (unsigned i = 0; i < vgen; ++i)
         if (lsa >= s_verified_images[i].lo && lsa < s_verified_images[i].hi) {
             vmask |= (uint16_t)(1u << i); vsum += t->vepoch[i];
         }
-    spu_dcache_ent* e = &t->ent[(((lsa >> 2) ^ ((uint32_t)(uintptr_t)ctx >> 6)) * 0x9E3779B1u) >> 23];
-    if (e->fn && e->ctx == ctx && e->lsa == lsa && e->image == ctx->image_id &&
+    spu_dcache_ent* e = &t->ent[(((lsa >> 2) ^ id) * 0x9E3779B1u) >> 23];
+    if (e->fn && e->id == id && e->lsa == lsa && e->image == ctx->image_id &&
         e->ovl == ctx->resident_ovl && e->task == ctx->resident_task && e->flags == flags &&
-        e->rgen == s_registry_count && e->vgen == s_verified_count &&
-        e->repoch == t->repoch && e->vmask == vmask && e->vsum == vsum) {
+        e->rgen == rgen && e->vgen == vgen &&
+        e->residency == c->dcache_residency && e->vmask == vmask && e->vsum == vsum) {
         if (mode == 2) {
             atomic_fetch_add_explicit(&s_dcache_hits, 1, memory_order_relaxed);
             spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa);
@@ -2701,10 +2714,10 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
      * read the epochs after it so the entry describes the state it saw. */
     spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa);
     if (fn) {
-        e->ctx = ctx; e->fn = fn; e->lsa = lsa; e->image = ctx->image_id;
+        e->id = id; e->fn = fn; e->lsa = lsa; e->image = ctx->image_id;
         e->ovl = ctx->resident_ovl; e->task = ctx->resident_task; e->flags = flags;
-        e->rgen = s_registry_count; e->vgen = s_verified_count;
-        e->repoch = t->repoch; e->vmask = vmask; e->vsum = vsum;
+        e->rgen = rgen; e->vgen = vgen;
+        e->residency = c->dcache_residency; e->vmask = vmask; e->vsum = vsum;
     }
     return fn;
 }
@@ -2727,11 +2740,11 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                               ctx->image_id, ctx->resident_code[slot].image_id, base, ctx->resident_code[slot].size,
                               ctx->resident_code[slot].source_ea, lsa, size, ea, (unsigned)(ctx->pc & SPU_LS_MASK)); }
                 ctx->resident_code[slot].image_id = 0;
-                spu_dcache_residency_changed();
+                spu_dcache_residency_changed(ctx);
             }
             else if (ctx->resident_code[slot].verify_state) {
                 ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
-                spu_dcache_residency_changed();
+                spu_dcache_residency_changed(ctx);
             }
         }
     }
@@ -2756,7 +2769,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
                     if (o->code) atomic_fetch_add_explicit(&s_ovl_res_loads, 1, memory_order_relaxed);
                     ctx->resident_code[slot].source_index = i;
-                    spu_dcache_residency_changed();
+                    spu_dcache_residency_changed(ctx);
                     return;
                 }
                 fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
