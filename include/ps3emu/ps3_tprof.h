@@ -41,6 +41,7 @@
 #include <mach/thread_status.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <sched.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -164,8 +165,16 @@ static inline void* ps3_tprof_sampler(void* arg)
     uint32_t n = 0;
     while (ps3_ft_now() < end && n < s->cap) {
         const int nt = __atomic_load_n(&s->nthreads, __ATOMIC_ACQUIRE);
-        for (int k = 0; k < nt && k < PS3_TPROF_THREADS && n < s->cap; k++)
-            if (__atomic_load_n(&s->th[k].ready, __ATOMIC_ACQUIRE) && ps3_tprof_take(k, &s->buf[n])) n++;
+        for (int k = 0; k < nt && k < PS3_TPROF_THREADS && n < s->cap; k++) {
+            /* Claim the slot so ps3_tprof_thread_exit waits for this sample:
+             * the thread cannot end, and its port and stack cannot go away,
+             * while it is suspended or its stack is being read. */
+            int ready = 1;
+            if (!__atomic_compare_exchange_n(&s->th[k].ready, &ready, 2, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+            if (ps3_tprof_take(k, &s->buf[n])) n++;
+            __atomic_store_n(&s->th[k].ready, 1, __ATOMIC_RELEASE);
+        }
         nanosleep(&tick, NULL);
     }
     __atomic_store_n(&s->n, n, __ATOMIC_RELEASE);
@@ -226,8 +235,8 @@ static inline void ps3_tprof_thread(char kind, uint32_t who)
 }
 
 /* Remove the calling thread before it ends; the sampler skips its slot. A
- * sample already in progress finishes against a still-live thread, since the
- * thread is the one calling here. */
+ * sample in progress is waited out (the sampler holds the slot at 2), so the
+ * thread is never suspended or its stack read after it has gone. */
 static inline void ps3_tprof_thread_exit(void)
 {
     ps3_tprof_state* s = &g_ps3_tprof;
@@ -235,8 +244,14 @@ static inline void ps3_tprof_thread_exit(void)
     const mach_port_t self = pthread_mach_thread_np(pthread_self());
     const int nt = __atomic_load_n(&s->nthreads, __ATOMIC_ACQUIRE);
     for (int k = 0; k < nt && k < PS3_TPROF_THREADS; k++)
-        if (__atomic_load_n(&s->th[k].ready, __ATOMIC_ACQUIRE) && s->th[k].port == self)
-            __atomic_store_n(&s->th[k].ready, 0, __ATOMIC_RELEASE);
+        if (s->th[k].port == self) {
+            for (;;) {
+                int ready = 1;
+                if (__atomic_compare_exchange_n(&s->th[k].ready, &ready, 0, 0,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || ready == 0) break;
+                sched_yield();   /* 2: the sampler is reading this thread */
+            }
+        }
 }
 
 #ifdef __cplusplus
