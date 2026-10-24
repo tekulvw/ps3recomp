@@ -1856,6 +1856,10 @@ typedef struct {
 } spu_verified_image;
 static spu_verified_image s_verified_images[SPU_VERIFIED_IMAGES];
 static unsigned s_verified_count;
+/* Serialized registration copies immutable ranges/bytes. Even generations
+ * describe complete snapshots; odd means append publication is in progress.
+ * Failed validation/allocation and rejected replacements never change it. */
+static uint32_t s_verified_generation;
 static uint32_t s_verified_bytes;
 
 static int spu_verified_register(int policy, int image,
@@ -1892,9 +1896,11 @@ static int spu_verified_register(int policy, int image,
         next.segments[i].bytes = copy + at;
         at += segments[i].size;
     }
+    __atomic_add_fetch(&s_verified_generation,1,__ATOMIC_ACQ_REL);
     s_verified_images[s_verified_count] = next;
     __atomic_store_n(&s_verified_count, s_verified_count + 1, __ATOMIC_RELEASE);   /* the dispatch cache keys by it */
     s_verified_bytes += total;
+    __atomic_add_fetch(&s_verified_generation,1,__ATOMIC_RELEASE);
     return 1;
 }
 
@@ -2621,7 +2627,7 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
  * task and overlay registries. The answer only changes when one of its
  * inputs does, so remember it per host thread, keyed by everything the
  * resolver reads from the context, and drop it when the inputs move:
- *  - registrations (registry and verified-image counts are in the key);
+ *  - registrations (registry/verified counts and verified publication generation);
  *  - resident code slots: spu_overlay_note_get bumps the residency epoch on
  *    every slot change, as it is the only runtime writer of those slots;
  *  - verified-image bytes: a GET overlapping an image's code segments bumps
@@ -2633,7 +2639,7 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
  * hit, counts disagreements and returns the full answer. */
 typedef struct {
     spu_lifted_fn fn;
-    uint32_t id, lsa, rgen, vgen, residency, vsum; uint16_t vmask;
+    uint32_t id, lsa, rgen, vgen, vregistration, residency, vsum; uint16_t vmask;
     int image, ovl, task; uint8_t flags;
 } spu_dcache_ent;
 typedef struct {
@@ -2679,6 +2685,24 @@ static void spu_dcache_stats(void)
         fprintf(stderr, "[spu-dcache] hits=%llu misses=%llu shadow_mismatches=%llu\n",
                 atomic_load(&s_dcache_hits), atomic_load(&s_dcache_misses), atomic_load(&s_dcache_shadow_bad));
 }
+/* Range coverage depends only on the LSA and immutable registration snapshot.
+ * Keep all overlapping bounding spans: a DMA into a later segment can change
+ * the owner at this LSA even when it does not touch the current owner's code. */
+static uint16_t spu_dcache_coverage_mask(uint32_t lsa, unsigned count)
+{
+    uint16_t mask=0;
+    for(unsigned i=0;i<count;++i)
+        if(lsa>=s_verified_images[i].lo && lsa<s_verified_images[i].hi)
+            mask|=(uint16_t)(1u<<i);
+    return mask;
+}
+static uint32_t spu_dcache_epoch_sum(const spu_dcache_tls* t,uint16_t mask)
+{
+    uint32_t sum=0;
+    for(unsigned i=0;mask;++i,mask>>=1)
+        if(mask&1u)sum+=t->vepoch[i];
+    return sum;
+}
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
     const int mode = spu_dcache_mode();
@@ -2693,19 +2717,23 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     /* Read before the resolver walks the registries: an entry is never keyed
      * by a count newer than the registry it saw. */
     const uint32_t rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
+    const uint32_t vregistration=__atomic_load_n(&s_verified_generation,__ATOMIC_ACQUIRE);
+    if(vregistration&1u)return spu_lifted_lookup_full(ctx,lsa);
     const uint32_t vgen = __atomic_load_n(&s_verified_count, __ATOMIC_ACQUIRE);
+    if(__atomic_load_n(&s_verified_generation,__ATOMIC_ACQUIRE)!=vregistration)
+        return spu_lifted_lookup_full(ctx,lsa);
     spu_dcache_tls* t = &t_dcache;
     const uint8_t flags = (uint8_t)((ctx->policy_mode ? 1 : 0) | (ctx->ls != ctx->ls_store ? 2 : 0));
-    uint16_t vmask = 0; uint32_t vsum = 0;
-    for (unsigned i = 0; i < vgen; ++i)
-        if (lsa >= s_verified_images[i].lo && lsa < s_verified_images[i].hi) {
-            vmask |= (uint16_t)(1u << i); vsum += t->vepoch[i];
-        }
     spu_dcache_ent* e = &t->ent[(((lsa >> 2) ^ id) * 0x9E3779B1u) >> 23];
+    const uint16_t vmask=e->fn && e->lsa==lsa && e->vgen==vgen &&
+        e->vregistration==vregistration ? e->vmask : spu_dcache_coverage_mask(lsa,vgen);
+    uint32_t vsum=spu_dcache_epoch_sum(t,vmask);
     if (e->fn && e->id == id && e->lsa == lsa && e->image == ctx->image_id &&
         e->ovl == ctx->resident_ovl && e->task == ctx->resident_task && e->flags == flags &&
         e->rgen == rgen && e->vgen == vgen &&
-        e->residency == c->dcache_residency && e->vmask == vmask && e->vsum == vsum) {
+        e->vregistration==vregistration &&
+        e->residency == c->dcache_residency && e->vmask == vmask && e->vsum == vsum &&
+        __atomic_load_n(&s_verified_generation,__ATOMIC_ACQUIRE)==vregistration) {
         if (mode == 2) {
             atomic_fetch_add_explicit(&s_dcache_hits, 1, memory_order_relaxed);
             spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa);
@@ -2728,10 +2756,11 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     /* The full resolver may verify a resident slot (pending -> verified);
      * read the epochs after it so the entry describes the state it saw. */
     spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa);
-    if (fn) {
+    if (fn && __atomic_load_n(&s_verified_generation,__ATOMIC_ACQUIRE)==vregistration) {
+        vsum=spu_dcache_epoch_sum(t,vmask);
         e->id = id; e->fn = fn; e->lsa = lsa; e->image = ctx->image_id;
         e->ovl = ctx->resident_ovl; e->task = ctx->resident_task; e->flags = flags;
-        e->rgen = rgen; e->vgen = vgen;
+        e->rgen = rgen; e->vgen = vgen; e->vregistration=vregistration;
         e->residency = c->dcache_residency; e->vmask = vmask; e->vsum = vsum;
     }
     return fn;
