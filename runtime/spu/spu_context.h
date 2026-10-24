@@ -845,6 +845,13 @@ extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 /* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
 void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
 void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    */
+/* Complete ordered transfer checkpoint; the launch-only ABI remains above. */
+void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*));
+extern unsigned g_spu_stack_reset_count;
+static inline int spu_stack_reset_needed(const spu_context* ctx) {
+    unsigned count=__atomic_load_n(&g_spu_stack_reset_count,__ATOMIC_ACQUIRE);
+    return count && ctx->host_depth && !ctx->policy_mode;
+}
 /* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
  * persistent LS-0xA00 workload module if one is set. */
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
@@ -857,6 +864,12 @@ void spu_ch_wake(spu_context* ctx);
  * SPU code is looping. Report the SPU pc/image once and halt instead.
  * SPU_HOST_DEPTH_MAX overrides the limit. */
 void spu_depth_guard(spu_context* ctx);
+extern uint32_t g_spu_depth_guard_limit;
+static inline void spu_depth_guard_check(spu_context* ctx) {
+    /* Preserve collection throughout the upper half of the depth budget. */
+    uint32_t limit=g_spu_depth_guard_limit;
+    if(!limit || ctx->host_depth>=limit/2)spu_depth_guard(ctx);
+}
 int  spu_tailret_enabled(void);
 /* Actual native dispatch ownership; nested drains invalidate rather than restore. */
 extern int g_spu_region_scope_mode;
@@ -945,7 +958,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
  * none remain. The one central hook site for the faithful execution model. */
 #define SPU_DRAIN(ctx) do {                                    \
         (ctx)->region_dispatch_valid=0;                        \
-        spu_depth_guard(ctx);                                  \
+        spu_depth_guard_check(ctx);                            \
         while (g_spu_trampoline_fn) {                           \
             /* SPU_TAILRET=1: a pending transfer whose target equals the   \
              * link register IS a return. SPU_RET only recognises `bi $r0`;\
@@ -962,8 +975,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             }                                                              \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
-            yz_lockstep_tick(ctx);                             \
-            spu_task_launch_check((ctx), (void*)_tf);          \
+            spu_drain_hop((ctx), _tf);                          \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \

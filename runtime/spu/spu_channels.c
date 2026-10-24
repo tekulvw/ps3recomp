@@ -2454,12 +2454,14 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
  * Matching the resolved function, not just its LS address, avoids affecting
  * unrelated overlays using the same address. Registration precedes execution. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
-static unsigned s_stack_reset_count;
+unsigned g_spu_stack_reset_count;
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
-    if (s_stack_reset_count < 16) {
-        s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
-        s_stack_reset[s_stack_reset_count++].image_id = image_id;
+    unsigned n=__atomic_load_n(&g_spu_stack_reset_count,__ATOMIC_ACQUIRE);
+    if (n < 16) {
+        s_stack_reset[n].entry = entry & SPU_LS_MASK;
+        s_stack_reset[n].image_id = image_id;
+        __atomic_store_n(&g_spu_stack_reset_count,n+1,__ATOMIC_RELEASE);
     }
 }
 
@@ -2475,14 +2477,15 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
     /* Runs on every drain transfer: test the registry before the
      * thread-local halt state, which is a function call on Darwin, and keep
      * the scan out of line so the common return needs no frame. */
-    if (!s_stack_reset_count || !ctx->host_depth || ctx->policy_mode) return;
+    if (!spu_stack_reset_needed(ctx)) return;
     spu_check_stack_reset_scan(ctx, fn);
 }
 
 static void spu_check_stack_reset_scan(spu_context* ctx, void (*fn)(spu_context*))
 {
     if (!s_spu_halt_armed) return;
-    for (unsigned i = 0; i < s_stack_reset_count; ++i)
+    const unsigned count=__atomic_load_n(&g_spu_stack_reset_count,__ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < count; ++i)
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;

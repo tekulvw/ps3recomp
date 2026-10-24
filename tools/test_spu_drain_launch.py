@@ -39,6 +39,12 @@ with tempfile.TemporaryDirectory(prefix='spu-drain-launch-') as td:
         if diagnostics:testenv.update(SPU_STEPTRACE='906',SPU_EXITTRACE='906')
         result=subprocess.run([str(exe)],env=testenv,capture_output=True,text=True,timeout=10)
         print(name,result.returncode,result.stdout.strip(),flush=True)
+        if name=='o2':
+            depth=subprocess.run([str(exe),'depth'],env=dict(testenv,SPU_HOST_DEPTH_MAX='8'),
+                                 capture_output=True,text=True,timeout=10)
+            assert depth.returncode==0,depth.stdout+depth.stderr
+            assert '[spu-depth] recent drain sites (oldest first): 0A010 0A014 0A01C 0A020' in depth.stderr,depth.stderr
+            print('PASS half-depth diagnostic ring',flush=True)
         return result
     for name,sanitize,diagnostics in [('o2',False,False),('ubsan',True,False),('diagnostics',False,True)]:
         result=run(name,source,sanitize,diagnostics)
@@ -51,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix='spu-drain-launch-') as td:
         controls={
             'history':(history_line,''),
             'steps':('ctx->steps++;','/* bug: missing hot step increment */'),
-            'reset':('spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);','/* bug: skipped reset */'),
+            'reset':('spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);','/* bug: skipped reset */ (void)fn;'),
             'irq':('if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {','if (0) {'),
             'flow':('g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;','/* bug: missing PM-flow checkpoint */;'),
         }

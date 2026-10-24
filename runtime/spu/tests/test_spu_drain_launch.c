@@ -10,6 +10,7 @@ extern uint32_t g_pm_flow_buf[8192];
 extern volatile unsigned g_pm_flow_n;
 extern void* volatile g_pm_flow_ctx;
 extern void spu_register_stack_reset_entry(uint32_t,int);
+extern volatile int g_yz_lockstep_on;
 
 static void history(const uint32_t* want,unsigned n)
 {
@@ -42,6 +43,7 @@ static void nested_first(spu_context* c)
 static void final_leaf(spu_context* c)
 {
     CHECK(c->steps==4 && c->drain_ret_pc==0x101c);
+    CHECK(c->lockstep_quantum_ctr==1);g_yz_lockstep_on=0;
     CHECK(g_pm_flow_n==1 && g_pm_flow_buf[0]==0x1014);
     g_pm_flow_ctx=0;c->pc=0x101c;g_spu_trampoline_fn=spu_indirect_branch;
 }
@@ -67,15 +69,35 @@ static void outer(spu_context* c)
     CHECK(spu_run_with_halt(async_entry,async)==1);CHECK(async->steps==1);
     release_context(async);
     g_pm_flow_n=0;g_pm_flow_ctx=c;
+    /* A disabled predicate must be read again after the guest enables it.
+     * Stay below one quantum so no synthetic ring membership is needed. */
+    g_yz_lockstep_on=1;
     c->pc=0x1014;g_spu_trampoline_fn=final_leaf;
 }
 static void context_history(void)
 {
+    g_yz_lockstep_on=0;
     spu_context* c=make_context(901);c->pc=0x1000;
     g_spu_trampoline_fn=outer;spu_drain_call(c,0x101c);
     const uint32_t want[]={0x1000,0x2000,0x1004,0x1008,0x2004,0x3000,0x1014};
     history(want,7);CHECK(c->steps==4 && !g_spu_trampoline_fn);
     release_context(c);
+}
+static void macro_target(spu_context* c)
+{
+    CHECK(c->steps==2 && c->lockstep_quantum_ctr==1);c->pc=0x9008;
+}
+static void checkpoint_paths(void)
+{
+    spu_context* c=make_context(909);c->policy_mode=1;c->pc=0x9000;
+    g_yz_lockstep_on=1;
+    spu_task_launch_check(c,(void*)macro_target);
+    CHECK(c->steps==1 && c->lockstep_quantum_ctr==0); /* launch-only ABI */
+    c->pc=0x9004;g_spu_trampoline_fn=macro_target;SPU_DRAIN(c);
+    CHECK(spu_region_local_step(c,macro_target)==1);
+    CHECK(c->steps==3 && c->lockstep_quantum_ctr==2);
+    const uint32_t want[]={0x9000,0x9004,0x9008};history(want,3);
+    g_yz_lockstep_on=0;release_context(c);
 }
 static unsigned irq_count,stale_handler,irq_finished;
 static u128 irq_expected[128];
@@ -131,6 +153,8 @@ static void reset_target(spu_context* c)
 }
 static void reset_bridge(spu_context* c)
 {
+    /* Registration occurs after the owning and nested drains have begun. */
+    spu_register_stack_reset_entry(0x5004,905);
     c->pc=0x5004;g_spu_trampoline_fn=reset_target;
 }
 static void reset_inner(spu_context* c)
@@ -175,13 +199,26 @@ static void* thread_history(void* arg)
     CHECK(spu_recent_pcs(got,32)==1 && got[0]==pc && c->steps==1);
     release_context(c);return NULL;
 }
-int main(void)
+static void depth_probe(spu_context* c)
 {
+    const unsigned depths[]={3,4,5,7,8};
+    for(unsigned i=0;i<5;++i){
+        c->host_depth=depths[i];c->pc=0xa000+depths[i]*4;
+        SPU_DRAIN(c);
+    }
+    CHECK(0); /* depth 8 must halt through the real owning driver */
+}
+int main(int argc,char** argv)
+{
+    if(argc==2 && !strcmp(argv[1],"depth")){
+        spu_context* c=make_context(908);
+        CHECK(spu_run_with_halt(depth_probe,c)==1);release_context(c);
+        printf("DEPTH passed=%d failed=%d\n",g_pass,g_fail);return g_fail?1:0;
+    }
     spu_begin_image(904);spu_register_function(0x8000,irq_handler);
     spu_register_function(0x4104,irq_resume);spu_begin_image(905);
     spu_register_function(0x5004,reset_target);spu_begin_image(0);
-    spu_register_stack_reset_entry(0x5004,905);
-    context_history();dynamic_irq(0);dynamic_irq(1);stack_reset();ls0_completion();
+    context_history();checkpoint_paths();dynamic_irq(0);dynamic_irq(1);stack_reset();ls0_completion();
     uint32_t before[32],after[32];unsigned n=spu_recent_pcs(before,32);
     /* Separate fresh host threads must not inherit the caller's TLS history.
      * Join each before checking so fixture accounting itself has no data race. */
