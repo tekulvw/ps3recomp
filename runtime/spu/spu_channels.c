@@ -1,3 +1,4 @@
+#include "spu_atomic_observe.h"
 /*
  * ps3recomp - SPU channel + indirect-branch runtime glue
  *
@@ -671,6 +672,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
+    const uint64_t observe=__atomic_load_n(&g_spu_atomic_observe_state,__ATOMIC_ACQUIRE);
+    const int observing=observe ? spu_atomic_observe_begin(ctx,cmd,ea,observe) : 0;
     /* SPU_DMA_RANGE (spu_dma_range_window): atomic line ops touching the
      * window. The plain-transfer log in mfc_do_transfer never sees these, and
      * a ring cursor next to the buffer it allocates is exactly what they hit. */
@@ -743,6 +746,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         } else {
             ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
         }
+        if(observing)spu_atomic_observe_end(ctx->atomic_stat);
         return 1;
     }
 
@@ -923,6 +927,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                   fflush(stderr);
               }
           } }
+        if(observing)spu_atomic_observe_end(ctx->atomic_stat);
         return 1;
 
     case MFC_PUTLLC_CMD:
@@ -945,7 +950,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               ctx->atomic_stat = 1;                  /* PUTLLC_FAILURE -> retry */
               __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
               spu_dma_publication_observe_atomic(ctx, lsa, ea, cmd, SPU_DMA_ATOMIC_PUTLLC_FAILURE);
-              return 1;
+              if(observing)spu_atomic_observe_end(ctx->atomic_stat);
+        return 1;
           } }
         spu_lockline_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
@@ -1046,6 +1052,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         }
+        if(observing)spu_atomic_observe_end(ctx->atomic_stat);
         return 1;
 
     case MFC_PUTLLUC_CMD:
@@ -1066,6 +1073,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+        if(observing)spu_atomic_observe_end(ctx->atomic_stat);
         return 1;
 
     default:

@@ -13,6 +13,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include "spu_coherency.h"
+#include "spu_atomic_observe.h"
+uint64_t g_spu_atomic_observe_state;
+static void obs_lock_begin(void);
+static void obs_lock_contended(void);
+static void obs_lock_acquired(void);
+static void obs_unlock(void);
+static void obs_walk(unsigned);
 
 #include <stdint.h>
 #include <stdio.h>
@@ -191,7 +198,10 @@ void spu_lockline_lock(void)
         if (s_llp_on & 1) { spu_lockline_lock_profiled(site); return; }
         if (s_llp_on & 2) { spu_lockline_lock_experiment(); return; }
     }
+    const int observing=__atomic_load_n(&g_spu_atomic_observe_state,__ATOMIC_RELAXED)!=0;
+    if(observing)obs_lock_begin();
     spu_lockline_lock_hybrid();
+    if(observing)obs_lock_acquired();
 }
 static void spu_lockline_lock_hybrid(void)
 {
@@ -201,6 +211,7 @@ static void spu_lockline_lock_hybrid(void)
      * about a microsecond and most contended waiters paid a kernel park and
      * wake for a sub-microsecond critical section. */
     const uint64_t give_up = spu_lockline_now_ns() + 20000u;
+    if(__atomic_load_n(&g_spu_atomic_observe_state,__ATOMIC_RELAXED))obs_lock_contended();
     for (unsigned backoff = 16;; backoff = backoff < 1024u ? backoff * 2u : backoff) {
         for (unsigned i = 0; i < backoff; ++i) spu_lockline_relax();
         if (!pthread_mutex_trylock(&g_lockline)) return;
@@ -210,6 +221,7 @@ static void spu_lockline_lock_hybrid(void)
 }
 void spu_lockline_unlock(void)
 {
+    if(__atomic_load_n(&g_spu_atomic_observe_state,__ATOMIC_RELAXED))obs_unlock();
     if (__builtin_expect(s_llp_on > 1, 0) && !(s_llp_on & 1)) {
         if (s_llx_hist) atomic_fetch_add_explicit(&s_llx_hold[llx_bucket(llp_now() - t_llx_t)], 1, memory_order_relaxed);
         if (pthread_mutex_unlock(&g_lockline)) abort();
@@ -412,8 +424,13 @@ void spu_coh_watch_remove(spu_coh_watch* watch)
 
 static void spu_coh_wake_watches(uint32_t line)
 {
-    for (spu_coh_watch* w = s_coh_watches; w; w = w->next)
-        if (w->line == line) w->wake(w->opaque);
+    for (spu_coh_watch* w = s_coh_watches; w; w = w->next) {
+        if(__atomic_load_n(&g_spu_atomic_observe_state,__ATOMIC_RELAXED))obs_walk(1);
+        if (w->line == line) {
+            if(__atomic_load_n(&g_spu_atomic_observe_state,__ATOMIC_RELAXED))obs_walk(3);
+            w->wake(w->opaque);
+        }
+    }
 }
 
 /* Drop a context from the reserving set.
@@ -542,9 +559,11 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     spu_coh_wake_watches(line);
     spu_coh_writer_fence();
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
+        if(__atomic_load_n(&g_spu_atomic_observe_state,__ATOMIC_RELAXED))obs_walk(0);
         spu_context* c = entry->ctx;
         if (!c || (const void*)c == self) continue;
         if (spu_coh_holds(c, line)) {
+            if(__atomic_load_n(&g_spu_atomic_observe_state,__ATOMIC_RELAXED))obs_walk(2);
             __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);
             __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);
             g_spu_lr_raise++;
@@ -627,9 +646,11 @@ void spu_coh_notify_write(uint32_t ea)
     spu_coh_wake_watches(line);
     spu_coh_writer_fence();
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
+        if(__atomic_load_n(&g_spu_atomic_observe_state,__ATOMIC_RELAXED))obs_walk(0);
         spu_context* c = entry->ctx;
         if (!c) continue;
         if (spu_coh_holds(c, line)) {
+            if(__atomic_load_n(&g_spu_atomic_observe_state,__ATOMIC_RELAXED))obs_walk(2);
             __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);
             __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation lost, PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
@@ -653,3 +674,5 @@ void spu_coh_notify_write(uint32_t ea)
 #ifdef __cplusplus
 }
 #endif
+
+#include "spu_atomic_observe.inc"
