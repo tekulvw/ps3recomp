@@ -142,7 +142,8 @@ struct CellSpursTasksetAttribute {
     u32  flags;
     u64  args;
     u8   priority[CELL_SPURS_MAX_SPU];
-    u8   _padding[64];
+    u32  tasksetSize; /* host-layout attribute; retained through creation */
+    u8   _padding[60];
 };
 
 /* Guest ABI storage only: access fields through the BE offset helpers.
@@ -281,6 +282,8 @@ s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
 
 s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr);
 s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode);
+s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* attr,
+                                               CellSpursTaskExitCode* exitCode);
 
 /* ---------------------------------------------------------------------------
  * Workload functions
