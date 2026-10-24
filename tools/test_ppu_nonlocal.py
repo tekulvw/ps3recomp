@@ -44,6 +44,7 @@ PROGRAM = {
 
 DRIVER = r'''
 #include "ppu_recomp.h"
+// ACTUAL_PLATFORM_BACKTRACE
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -156,7 +157,7 @@ def runtime_driver():
     end=source.index('    /* Garbage virtual-call guard:',start)
     block=source[start:end]
     block=block.replace('static thread_local int s_depth = 0;', 'static thread_local int s_depth = 0; observed_depth=s_depth;')
-    return DRIVER.replace('// ACTUAL_ACTIVE_SCOPE',guard).replace('// ACTUAL_DISPATCH_BLOCK',block)
+    return DRIVER.replace('// ACTUAL_PLATFORM_BACKTRACE', '#include \"'+(ROOT/'runtime/platform/win32_backtrace.h').as_posix()+'\"').replace('// ACTUAL_ACTIVE_SCOPE',guard).replace('// ACTUAL_DISPATCH_BLOCK',block)
 
 
 def expect_invalid(action):
