@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Execute real lifted reserve instructions and runtime coherence publication."""
-import os,sys,subprocess,tempfile
+import os,sys,subprocess,tempfile,shutil
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import ppu_lifter as L
@@ -19,6 +19,18 @@ extern "C" void spu_ch_wake(spu_context*) {std::abort();}
 extern "C" int spu_raw_reg_load(uint32_t,uint32_t*) {std::abort();}
 extern "C" void spu_raw_reg_store(uint32_t,uint32_t,unsigned) {std::abort();}
 extern "C" void cellGcm_ref_on_poll(void) {std::abort();}
+// COFF retains loader sections whose imports ELF/Mach-O can discard. Provide
+// their exact runtime interfaces, and fail if this reservation-only fixture
+// accidentally enters profiling, syscall dispatch, or guest-thread startup.
+extern "C" uint32_t spu_registry_size(void) {std::abort();}
+extern "C" int spu_registry_entry(uint32_t,void**,uint32_t*) {std::abort();}
+extern "C" uint32_t ps3_hle_count(void) {std::abort();}
+extern "C" void ps3_msf(const char*,...) {std::abort();}
+extern "C" void ppu_prof_stamp(void*,unsigned) {std::abort();}
+extern "C" uint32_t ps3_mmapper_block_size(uint32_t) {std::abort();}
+extern "C" int lv2_try_syscall(ppu_context*) {std::abort();}
+extern "C" uint64_t ppu_thread_register_main_priority(int32_t) {std::abort();}
+extern "C" { void (*g_ppu_thread_entry_trampoline)(ppu_context*)=nullptr; }
 static unsigned char arena[0x20000];
 static void publish(uint32_t ea,uint32_t value){spu_lockline_lock();uint32_t raw=__builtin_bswap32(value);memcpy(vm_base+ea,&raw,4);spu_coh_notify_write(ea);spu_lockline_unlock();}
 int main(){vm_base=arena;ppu_vm_size=sizeof(arena);ppu_context c{};g_active_ctx=&c;c.gpr[4]=0x10008;c.gpr[5]=21;vm_write64(0x10008,20);
@@ -58,7 +70,12 @@ with tempfile.TemporaryDirectory(prefix='ppu-spu-lines-') as tmp:
   ops=[Instruction(a,0,m,('r3,0,r4' if 'arx' in m else 'r5,0,r4')),Instruction(a+4,0,'blr','')];l.lift_function(ops,a,a+8)
  (p/'ppu_recomp.h').write_text(l.emit_header());(p/'lifted.cpp').write_text(l.emit_source());(p/'driver.cpp').write_text(driver)
  common=['-O1','-ffunction-sections','-fdata-sections']
- subprocess.run([os.environ.get('CC','cc'),'-std=gnu17',*common,'-c',str(root/'runtime/spu/spu_coherency.c'),'-o',str(p/'coh.o')],check=True)
- subprocess.run([os.environ.get('CC','cc'),*common,'-c',str(root/'runtime/platform/win32_compat.c'),'-o',str(p/'compat.o')],check=True)
- subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-UNDEBUG',*common,'-I'+str(p),'-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform'),str(root/'runtime/ppu/ppu_loader.cpp'),str(p/'driver.cpp'),str(p/'lifted.cpp'),str(p/'coh.o'),str(p/'compat.o'),'-pthread',('-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'),'-o',str(p/'test')],check=True)
+ # The Windows loader contains SEH; use the MSVC-compatible clang toolchain
+ # available in CI rather than an unrelated MinGW c++ from PATH.
+ cc=os.environ.get('CC') or shutil.which('clang') or 'cc'
+ cxx=os.environ.get('CXX') or shutil.which('clang++') or 'c++'
+ linker='-Wl,/OPT:REF' if sys.platform=='win32' else ('-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections')
+ subprocess.run([cc,'-std=gnu17',*common,'-c',str(root/'runtime/spu/spu_coherency.c'),'-o',str(p/'coh.o')],check=True)
+ subprocess.run([cc,*common,'-c',str(root/'runtime/platform/win32_compat.c'),'-o',str(p/'compat.o')],check=True)
+ subprocess.run([cxx,'-std=c++17','-UNDEBUG',*common,'-I'+str(p),'-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform'),str(root/'runtime/ppu/ppu_loader.cpp'),str(p/'driver.cpp'),str(p/'lifted.cpp'),str(p/'coh.o'),str(p/'compat.o'),'-pthread',linker,'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True,timeout=10)

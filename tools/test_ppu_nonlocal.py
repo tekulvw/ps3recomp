@@ -44,6 +44,7 @@ PROGRAM = {
 
 DRIVER = r'''
 #include "ppu_recomp.h"
+// ACTUAL_PLATFORM_BACKTRACE
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -106,6 +107,25 @@ int main(int argc,char** argv){
     assert(argc==2);mode=argv[1];ppu_context ctx{};active=&ctx;
     ctx.gpr[1]=0x8000;ctx.gpr[2]=0x12345678;ctx.gpr[14]=0xabcdef;ctx.lr=0x9998;ctx.thread_id=17;
     ctx.cr=0xaabbccdd;ctx.fpr[14]=17.25;std::memset(&ctx.vr[20],0x5a,16);
+    if(!std::strcmp(mode,"hostscope")) {
+        // Windows longjmp may unwind C++ scopes after the explicit hook.
+        // Exercise those real generated destructors on every host as well.
+        try {
+            ps3recomp_nonlocal::checkpoint a{0x1234,ctx.gpr[1],true}, b=a;
+            ps3recomp_nonlocal::frame outer(&ctx,&a,1), inner(&ctx,&b,1);
+            ps3_ppu_notify_host_unwind();
+            assert(ps3recomp_nonlocal::live==nullptr);
+            throw 42;
+        } catch(int n) { assert(n==42); }
+        assert(ps3recomp_nonlocal::live==nullptr);
+        mode="basic";
+    }
+    if(!std::strcmp(mode,"corruptscope")) {
+        ps3recomp_nonlocal::checkpoint slot{0x1234,ctx.gpr[1],true};
+        ps3recomp_nonlocal::frame owner(&ctx,&slot,1);
+        ps3recomp_nonlocal::live=nullptr; // no intentional host-unwind notification
+        return 0; // destructor must still reject corruption
+    }
     if(!std::strcmp(mode,"hostexit")){
         if(!setjmp(host_exit))func_00001000(&ctx);
         mode="basic";ctx.gpr[1]=0x8000;ctx.lr=0x9998;func_00001000(&ctx);
@@ -156,7 +176,7 @@ def runtime_driver():
     end=source.index('    /* Garbage virtual-call guard:',start)
     block=source[start:end]
     block=block.replace('static thread_local int s_depth = 0;', 'static thread_local int s_depth = 0; observed_depth=s_depth;')
-    return DRIVER.replace('// ACTUAL_ACTIVE_SCOPE',guard).replace('// ACTUAL_DISPATCH_BLOCK',block)
+    return DRIVER.replace('// ACTUAL_PLATFORM_BACKTRACE', '#include \"'+(ROOT/'runtime/platform/win32_backtrace.h').as_posix()+'\"').replace('// ACTUAL_ACTIVE_SCOPE',guard).replace('// ACTUAL_DISPATCH_BLOCK',block)
 
 
 def expect_invalid(action):
@@ -221,12 +241,14 @@ def main():
         subprocess.run(command,check=True)
         result=subprocess.run([str(out/'test'),'basic'],capture_output=True,text=True)
         assert result.returncode==0, 'protected nonlocal return failed: '+result.stderr
-        for mode in ['zero','recursive','outer','unrelated','crossmodule']:
+        for mode in ['zero','recursive','outer','unrelated','crossmodule','hostscope']:
             result=subprocess.run([str(out/'test'),mode],capture_output=True,text=True)
             assert result.returncode==0,(mode,result.stderr)
         for mode in ['wrongsp','wrongtarget','wrongctx','wrongthread','stale','hostexit']:
             result=subprocess.run([str(out/'test'),mode],capture_output=True,text=True)
             assert result.returncode!=0 and 'no live continuation' in result.stderr,(mode,result.returncode,result.stderr)
+        result=subprocess.run([str(out/'test'),'corruptscope'],capture_output=True,text=True)
+        assert result.returncode!=0 and 'corrupt continuation lifetime' in result.stderr, (result.returncode,result.stderr)
     print('PASS real generated nonlocal transfer, registers, recursion, identity, teardown and host-unwind reentry')
 
 if __name__=='__main__':main()

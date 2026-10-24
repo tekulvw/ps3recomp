@@ -137,3 +137,6 @@ int main(void)
     free(vm_base);
     puts("SPURS receiver ownership and real policy entry/poll PASS");
 }
+
+/* No lv2 SPU thread is published by this standalone workload fixture. */
+void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }

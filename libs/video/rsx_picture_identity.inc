@@ -46,7 +46,9 @@ void rsx_picture_release(u64 token){if(!token)return;pic_enter();pic_drop(token)
 int rsx_picture_retain(u64 token){pic_enter();int result=!pic_failed && pic_hold(token);pic_leave();return result;}
 int rsx_picture_bind_descriptor(u32 ea,u64 token)
 {
-    if(!ea)return -1;pic_enter();int result=-1,empty=-1;
+    if (!ea) return -1;
+    pic_enter();
+    int result=-1,empty=-1;
     if(pic_failed && token)goto done;
     for(unsigned i=0;i<PIC_ALIASES;++i){
         if(pic_aliases[i].ea==ea){
@@ -81,7 +83,10 @@ done:pic_leave();return result;
 }
 int rsx_picture_take_command(u32 ea,u32 location,u32 offset,u64* token)
 {
-    if(!token)return -1;*token=0;pic_enter();int result=-1;
+    if (!token) return -1;
+    *token=0;
+    pic_enter();
+    int result=-1;
     if(pic_failed)goto done;
     for(unsigned i=0;i<PIC_COMMANDS;++i)if(ea && pic_commands[i].ea==ea){
         PictureIdentity*p=pic_find(pic_commands[i].token);

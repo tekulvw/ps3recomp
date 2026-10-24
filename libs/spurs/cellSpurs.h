@@ -98,6 +98,7 @@ typedef struct CellSpursTaskset2 CellSpursTaskset2;
 typedef struct CellSpursTasksetAttribute2 CellSpursTasksetAttribute2;
 typedef struct CellSpursTask CellSpursTask;
 typedef struct CellSpursTaskAttribute CellSpursTaskAttribute;
+typedef struct CellSpursTaskExitCode CellSpursTaskExitCode;
 typedef struct CellSpursEventFlag CellSpursEventFlag;
 typedef struct CellSpursWorkloadAttribute CellSpursWorkloadAttribute;
 typedef struct CellSpursWorkloadFlag CellSpursWorkloadFlag;
@@ -174,6 +175,18 @@ struct CellSpursTaskAttribute {
     u32  lsPattern_ea;
     u32  argument_ea;
     u8   _padding[48];
+};
+
+/* Guest-owned exit container: unlike the legacy host records above, both its
+ * 128-byte size and its guest address alignment are part of the API. */
+struct CellSpursTaskExitCode {
+#if defined(_MSC_VER)
+    __declspec(align(128)) u8 reserved[128];
+#elif defined(__cplusplus)
+    alignas(128) u8 reserved[128];
+#else
+    _Alignas(128) u8 reserved[128];
+#endif
 };
 
 /* Event flag -- SPURS-level event synchronization */
@@ -267,6 +280,7 @@ s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
 s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
 
 s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr);
+s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode);
 
 /* ---------------------------------------------------------------------------
  * Workload functions
