@@ -24,6 +24,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include "spurs_pm_darwin_qos.h"
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
@@ -2084,6 +2085,9 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
     struct SpursInst* si = slot->instance;
+#if defined(__APPLE__)
+    spurs_pm_darwin_qos((unsigned)slot->spu_num);
+#endif
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
