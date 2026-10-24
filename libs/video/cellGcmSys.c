@@ -835,11 +835,9 @@ invalid:
  * recycle path teleports these when it resets a ring without a JUMP command. */
 unsigned long long ps3_ms_now(void)
 {
-#ifdef _WIN32
+    /* The platform wrapper also supplies a monotonic millisecond clock on
+     * POSIX. A zero stub prevents elapsed-time diagnostic windows firing. */
     return (unsigned long long)GetTickCount64();
-#else
-    return 0;
-#endif
 }
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
