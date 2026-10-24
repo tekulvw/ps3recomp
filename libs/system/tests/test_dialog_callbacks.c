@@ -15,6 +15,17 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void np_psnr_pump(void) {}
 void cellOskDialog_tick(void) {}
+/* Network completion pumps are linked explicitly; this dialog fixture owns
+ * no NP transaction. Check that every sysutil poll still ticks both services,
+ * including the nested callback poll whose guest drain must stay deferred. */
+static unsigned eula_ticks, ticket_ticks, pumps;
+void ps3_np_eula_tick(void) { ++eula_ticks; }
+void ps3_np_ticket_tick(void) { ++ticket_ticks; }
+static void pump(void) {
+    ++pumps;
+    assert(cellSysutilCheckCallback() == CELL_OK);
+    assert(eula_ticks == pumps && ticket_ticks == pumps);
+}
 
 static unsigned calls;
 static int waiting;
@@ -28,7 +39,7 @@ static void callback(u32 opd, u64 result, u64 user, u64 c, u64 d,
     if (calls == 1) {
         assert(cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO,
             (void*)0x200, (void*)0x100, (void*)0x1234, NULL) == CELL_OK);
-        cellSysutilCheckCallback();
+        pump();
         assert(calls == 1);
     }
 }
@@ -41,18 +52,18 @@ int main(void)
                             (void*)0x1234, NULL) == CELL_OK);
     assert(calls == 0);
     waiting = 1;
-    cellSysutilCheckCallback(); assert(calls == 1 && last_result == CELL_MSGDIALOG_BUTTON_OK);
-    cellSysutilCheckCallback(); assert(calls == 2 && last_result == CELL_MSGDIALOG_BUTTON_YES);
-    cellSysutilCheckCallback(); assert(calls == 2);
+    pump(); assert(calls == 1 && last_result == CELL_MSGDIALOG_BUTTON_OK);
+    pump(); assert(calls == 2 && last_result == CELL_MSGDIALOG_BUTTON_YES);
+    pump(); assert(calls == 2);
     assert(cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_PROGRESSBAR_SINGLE,
         (void*)0x200, (void*)0x100, (void*)0x1234, NULL) == CELL_OK);
-    cellSysutilCheckCallback(); assert(calls == 2);
+    pump(); assert(calls == 2);
     assert(cellMsgDialogClose(0) == CELL_OK); assert(calls == 2);
     g_ps3_guest_caller = NULL;
-    cellSysutilCheckCallback(); assert(calls == 2);
+    pump(); assert(calls == 2);
     g_ps3_guest_caller = callback;
-    cellSysutilCheckCallback(); assert(calls == 3 && last_result == CELL_MSGDIALOG_BUTTON_NONE);
-    cellSysutilCheckCallback(); assert(calls == 3);
+    pump(); assert(calls == 3 && last_result == CELL_MSGDIALOG_BUTTON_NONE);
+    pump(); assert(calls == 3);
 
     /* The yes/no auto-answer. DEFAULT is a blanket YES, including for a prompt
      * that offers to abort something -- see cellMsgDialog.c for why the
@@ -64,7 +75,7 @@ int main(void)
     assert(cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL |
                               CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO,
                               (void*)0x300, (void*)0x100, (void*)0x1234, NULL) == CELL_OK);
-    cellSysutilCheckCallback();
+    pump();
     assert(calls == 4 && last_result == CELL_MSGDIALOG_BUTTON_YES);
 
     /* The heuristic =auto would use, tested directly: the decision is cached on
