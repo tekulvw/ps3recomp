@@ -13,13 +13,13 @@ def run_fixture(args, env=None):
         # Preserve a native backtrace on CI before the temporary executable is
         # removed. The fixture is rerun only after failure, never skipped.
         if error.returncode < 0:
-            subprocess.run(["lldb","--batch","-o","run","-o","thread backtrace all","--",*args],
+            subprocess.run(["lldb","--batch","-o","run","-k","thread backtrace all","--",*args],
                            env=env,check=False,timeout=60)
         raise
 
 with tempfile.TemporaryDirectory(prefix="macos-pad-") as tmp:
     tmp=Path(tmp)
-    flags=["-std=gnu17","-O1","-UNDEBUG","-ffunction-sections","-fdata-sections","-I",str(root/"include")]
+    flags=["-std=gnu17","-O1","-g","-UNDEBUG","-ffunction-sections","-fdata-sections","-I",str(root/"include")]
     sdl=subprocess.check_output(["sdl2-config","--cflags","--libs"],text=True).split()
     flags += ["-I"+str(Path(x[2:]).parent) for x in sdl if x.startswith("-I") and Path(x[2:]).name=="SDL2"]
     subprocess.run(["clang",*flags,"-c",str(root/"libs/input/cellPad.c"),*filter(lambda x:x.startswith("-I") or x.startswith("-D"),sdl),"-o",str(tmp/"pad.o")],check=True)
