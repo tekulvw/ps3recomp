@@ -24,10 +24,10 @@ static unsigned obs_busy,obs_registered;
 static int obs_fd=-1;
 typedef struct {
     uint32_t image,pc,spu,cmd,ea,outcome;
-    uint64_t n,locks,contended,samples,wait_ns,hold_ns,holders,watches,matches,callbacks;
+    uint64_t n,samples,transaction_ns;
 } obs_row;
 typedef struct {
-    uint64_t tid,generation,commands,started,late,budget_exhausted,overflow,lock_samples;
+    uint64_t tid,generation,commands,started,late,budget_exhausted,overflow;
     uint64_t first_ns,last_ns;
     obs_row rows[OBS_ROWS];
 } obs_payload;
@@ -39,8 +39,7 @@ static __thread struct {
     uint64_t generation,budget;
     obs_payload data;
     obs_row current;
-    uint64_t wait_start,acquired;
-    unsigned timing;
+    uint64_t transaction_start;
 } obs_tls;
 static void obs_seal(void)
 {
@@ -80,21 +79,30 @@ int spu_atomic_observe_begin(spu_context* c,uint32_t cmd,uint32_t ea,uint64_t st
     memset(&obs_tls.current,0,sizeof(obs_tls.current));
     obs_tls.current.image=c->image_id;obs_tls.current.pc=c->pc;
     obs_tls.current.spu=c->spu_id;obs_tls.current.cmd=cmd;obs_tls.current.ea=ea;
-    obs_tls.data.started++;obs_tls.recording=1;return 1;
+    obs_tls.data.started++;obs_tls.recording=1;
+    /* Observable TLS state is established before entering any legacy lock.
+     * Only the whole handler interval is sampled; no observer hook runs inside
+     * a lock/notifier, including cold PPU threads when ARM changes state. */
+    if(!--obs_tls.countdown){
+        obs_tls.random=obs_tls.random*1664525u+1013904223u;
+        obs_tls.countdown=128u+(obs_tls.random>>24);
+        obs_tls.current.samples=1;obs_tls.transaction_start=obs_now();
+    }
+    return 1;
 }
 void spu_atomic_observe_end(uint32_t outcome)
 {
     if(!obs_tls.recording)return;
-    obs_row* r=&obs_tls.current;r->outcome=outcome;
+    obs_row* r=&obs_tls.current;
+    if(r->samples)r->transaction_ns=obs_now()-obs_tls.transaction_start;
+    r->outcome=outcome;
     unsigned h=(r->ea>>7)^r->pc^(r->image*0x9e3779b9u)^r->cmd^(r->outcome*17u)^r->spu;
     unsigned k;
     for(k=0;k<OBS_PROBES;k++){
         obs_row* p=&obs_tls.data.rows[(h+k)&(OBS_ROWS-1u)];
         if(!p->n){*p=*r;p->n=1;break;}
         if(p->image==r->image&&p->pc==r->pc&&p->spu==r->spu&&p->cmd==r->cmd&&p->ea==r->ea&&p->outcome==r->outcome){
-            p->n++;p->locks+=r->locks;p->contended+=r->contended;p->samples+=r->samples;
-            p->wait_ns+=r->wait_ns;p->hold_ns+=r->hold_ns;p->holders+=r->holders;
-            p->watches+=r->watches;p->matches+=r->matches;p->callbacks+=r->callbacks;break;
+            p->n++;p->samples+=r->samples;p->transaction_ns+=r->transaction_ns;break;
         }
     }
     if(k==OBS_PROBES)obs_tls.data.overflow++;
@@ -106,38 +114,6 @@ void spu_atomic_observe_end(uint32_t outcome)
     if(state!=((obs_tls.generation<<2)|OBS_ACTIVE)||obs_tls.data.budget_exhausted){
         obs_tls.data.last_ns=obs_now();obs_seal();
     }
-}
-static void obs_lock_begin(void)
-{
-    if(!obs_tls.recording)return;
-    obs_tls.current.locks++;obs_tls.timing=0;
-    if(!--obs_tls.countdown){
-        /* Jitter avoids sampling only one opcode in a periodic claim loop.
-         * Intervals 128..383, mean approximately 1/256 acquisitions. */
-        obs_tls.random=obs_tls.random*1664525u+1013904223u;
-        obs_tls.countdown=128u+(obs_tls.random>>24);
-        obs_tls.timing=1;obs_tls.wait_start=obs_now();
-    }
-}
-static void obs_lock_contended(void){if(obs_tls.recording)obs_tls.current.contended++;}
-static void obs_lock_acquired(void)
-{
-    if(obs_tls.recording&&obs_tls.timing){
-        obs_tls.acquired=obs_now();obs_tls.current.wait_ns+=obs_tls.acquired-obs_tls.wait_start;
-        obs_tls.current.samples++;obs_tls.data.lock_samples++;
-    }
-}
-static void obs_unlock(void)
-{
-    if(obs_tls.recording&&obs_tls.timing){obs_tls.current.hold_ns+=obs_now()-obs_tls.acquired;obs_tls.timing=0;}
-}
-static void obs_walk(unsigned kind)
-{
-    if(!obs_tls.recording||!obs_tls.timing)return;
-    if(kind==0)obs_tls.current.holders++;
-    else if(kind==1)obs_tls.current.watches++;
-    else if(kind==2)obs_tls.current.matches++;
-    else obs_tls.current.callbacks++;
 }
 int ps3_spu_atomic_observe_arm(uint64_t id,uint64_t budget,const char* path)
 {
@@ -178,7 +154,7 @@ int ps3_spu_atomic_observe_dump(uint64_t id)
         /* Freeze one acquire-validated report set: late ACK cannot change totals
          * between header and rows. Payloads in this set are immutable. */
         for(unsigned i=0;i<limit;i++)if(__atomic_load_n(&obs_reports[i].sealed,__ATOMIC_ACQUIRE)==obs_serial){published|=1u<<i;total+=obs_reports[i].data.commands;late+=obs_reports[i].data.late;ready++;}
-        fprintf(f,"{\"schema\":1,\"clock\":\"hybrid_uptime_raw_ns\",\"id\":%llu,\"generation\":%llu,\"start_ns\":%llu,\"stop_ns\":%llu,\"commands\":%llu,\"completed_after_stop\":%llu,\"registered_lifetime_threads\":%u,\"reported_threads\":%u,\"missing_unknown\":%u,\"thread_capacity_overflow\":%u,\"owner_attribution\":false,\"unseen_idle_threads\":\"unknown\",\"scope\":\"published threads only; external all-worker qualification required\",\"key_capacity\":128,\"max_key_probes\":4,\"reports\":[",(unsigned long long)id,(unsigned long long)obs_serial,(unsigned long long)obs_clock_start,(unsigned long long)obs_clock_stop,(unsigned long long)total,(unsigned long long)late,n,ready,limit-ready,n>OBS_THREADS?n-OBS_THREADS:0);
+        fprintf(f,"{\"schema\":1,\"clock\":\"hybrid_uptime_raw_ns\",\"id\":%llu,\"generation\":%llu,\"start_ns\":%llu,\"stop_ns\":%llu,\"commands\":%llu,\"completed_after_stop\":%llu,\"registered_lifetime_threads\":%u,\"reported_threads\":%u,\"missing_unknown\":%u,\"thread_capacity_overflow\":%u,\"unseen_idle_threads\":\"unknown\",\"scope\":\"published threads only; external all-worker qualification required\",\"key_capacity\":128,\"max_key_probes\":4,\"reports\":[",(unsigned long long)id,(unsigned long long)obs_serial,(unsigned long long)obs_clock_start,(unsigned long long)obs_clock_stop,(unsigned long long)total,(unsigned long long)late,n,ready,limit-ready,n>OBS_THREADS?n-OBS_THREADS:0);
         unsigned out=0;
         for(unsigned i=0;i<limit;i++){
             if(!(published&(1u<<i)))continue;
@@ -186,7 +162,7 @@ int ps3_spu_atomic_observe_dump(uint64_t id)
             fprintf(f,"%s{\"slot\":%u,\"thread\":%llu,\"started\":%llu,\"commands\":%llu,\"completed_after_stop\":%llu,\"budget_exhausted\":%s,\"key_overflow\":%llu,\"first_ns\":%llu,\"last_ns\":%llu,\"rows\":[",out++?",":"",i,(unsigned long long)p->tid,(unsigned long long)p->started,(unsigned long long)p->commands,(unsigned long long)p->late,p->budget_exhausted?"true":"false",(unsigned long long)p->overflow,(unsigned long long)p->first_ns,(unsigned long long)p->last_ns);
             unsigned row=0;
             for(unsigned j=0;j<OBS_ROWS;j++){const obs_row* r=p->rows+j;if(!r->n)continue;
-                fprintf(f,"%s{\"ctx_image_id_snapshot\":%u,\"ctx_pc_snapshot\":%u,\"ctx_spu_id_snapshot\":%u,\"current_executing_image\":\"unknown\",\"cmd\":%u,\"ea\":%u,\"outcome\":%u,\"n\":%llu,\"locks\":%llu,\"contended\":%llu,\"timed_locks\":%llu,\"sample_wait_ns\":%llu,\"sample_hold_ns\":%llu,\"sample_holder_visits\":%llu,\"sample_watch_visits\":%llu,\"sample_holder_matches\":%llu,\"sample_watch_callbacks\":%llu}",row++?",":"",r->image,r->pc,r->spu,r->cmd,r->ea,r->outcome,(unsigned long long)r->n,(unsigned long long)r->locks,(unsigned long long)r->contended,(unsigned long long)r->samples,(unsigned long long)r->wait_ns,(unsigned long long)r->hold_ns,(unsigned long long)r->holders,(unsigned long long)r->watches,(unsigned long long)r->matches,(unsigned long long)r->callbacks);
+                fprintf(f,"%s{\"ctx_image_id_snapshot\":%u,\"ctx_pc_snapshot\":%u,\"ctx_spu_id_snapshot\":%u,\"current_executing_image\":\"unknown\",\"cmd\":%u,\"ea\":%u,\"outcome\":%u,\"n\":%llu,\"timed_transactions\":%llu,\"sample_transaction_ns\":%llu}",row++?",":"",r->image,r->pc,r->spu,r->cmd,r->ea,r->outcome,(unsigned long long)r->n,(unsigned long long)r->samples,(unsigned long long)r->transaction_ns);
             }fputs("]}",f);
         }fputs("]}\n",f);int bad=ferror(f);rc=fclose(f);if(bad)rc=-1;
     }else close(obs_fd);
@@ -213,11 +189,6 @@ int ps3_spu_atomic_observe_control_request(const char* line)
     return 1;
 }
 #else
-static void obs_lock_begin(void){}
-static void obs_lock_contended(void){}
-static void obs_lock_acquired(void){}
-static void obs_unlock(void){}
-static void obs_walk(unsigned k){(void)k;}
 int spu_atomic_observe_begin(spu_context* c,uint32_t cmd,uint32_t ea,uint64_t s){(void)c;(void)cmd;(void)ea;(void)s;return 0;}
 void spu_atomic_observe_end(uint32_t x){(void)x;}
 int ps3_spu_atomic_observe_arm(uint64_t i,uint64_t n,const char* p){(void)i;(void)n;(void)p;return -1;}

@@ -43,9 +43,10 @@ with tempfile.TemporaryDirectory(prefix='spu-atomic-observe-') as td:
         if name=='cleanup':
             assert data['reported_threads']==0 and data['missing_unknown']==32 and data['thread_capacity_overflow']==1,data
         if name=='sample':
-            r=data['reports'][0]['rows'][0];assert data['commands']==2048 and r['locks']==2048
-            assert 1<=r['timed_locks']<32 and r['sample_hold_ns']>0 and r['sample_wait_ns']>0,r
-            assert r['sample_watch_callbacks']==r['timed_locks'],r
+            r=data['reports'][0]['rows'][0];assert data['commands']==2048
+            assert 'sample_transaction_ns' in r and 'timed_transactions' in r,r
+            assert 1<=r['timed_transactions']<32 and r['sample_transaction_ns']>0,r
+            assert not ({'locks','contended','timed_locks','sample_wait_ns','sample_hold_ns','sample_holder_visits','sample_watch_callbacks'} & set(r)),r
         if name=='lateack':assert data['commands']==1 and data['completed_after_stop']==1,data
         if name=='late':
             assert data['commands']==0 and data['missing_unknown']==1,data
