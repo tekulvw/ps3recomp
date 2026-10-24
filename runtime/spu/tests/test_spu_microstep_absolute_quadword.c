@@ -104,6 +104,7 @@ int main(void) {
     return failures?1:0;
 }
 /* Link-only boundaries outside this CPU-only fixture. Fail if any is reached. */
+void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
 void ppu_resv_break_store(uint64_t ea) { (void)ea; abort(); }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
 unsigned long long ps3_ms_now(void) { abort(); }

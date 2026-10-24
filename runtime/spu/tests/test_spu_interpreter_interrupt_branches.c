@@ -85,6 +85,7 @@ int main(void){spu_begin_image(77);spu_register_function(0x240,callee);cases(0);
 #endif
  printf("PASS: %u encoded interrupt branch cases\n",checks);return 0;}
 void ppu_resv_break_store(uint64_t ea){(void)ea;abort();}
+void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;abort();}
 unsigned long long ps3_ms_now(void){abort();}
 uint32_t g_ww_lo=0xFFFFFFFFu,g_ww_hi;int g_resv_store_active;
