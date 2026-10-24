@@ -192,3 +192,6 @@ int main(void) {
     puts("PASS: Taskset2 bounded destroy, invalid inputs, pending and real worker lifetime");
     free(vm_base); return 0;
 }
+
+/* No lv2 SPU thread is published by this standalone workload fixture. */
+void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
