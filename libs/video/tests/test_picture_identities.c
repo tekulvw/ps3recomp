@@ -24,7 +24,8 @@ int main(int argc,char**argv){
     if(!strcmp(argv[1],"threaded")){
         threaded_token=rsx_picture_create(0x1000,1,0x2000,32,a);assert(threaded_token);pthread_t t[3];
         assert(!pthread_create(&t[0],NULL,reader,(void*)(uintptr_t)0));assert(!pthread_create(&t[1],NULL,reader,(void*)(uintptr_t)1));assert(!pthread_create(&t[2],NULL,producer,NULL));
-        for(unsigned i=0;i<3;++i)assert(!pthread_join(t[i],NULL));assert(rsx_picture_live_count()==1);rsx_picture_release(threaded_token);assert(rsx_picture_live_count()==0 && rsx_picture_reset());puts("PASS30000 concurrent producer/descriptor/command lifetime iterations");return 0;
+        for (unsigned i=0; i<3; ++i) { assert(!pthread_join(t[i],NULL)); }
+        assert(rsx_picture_live_count()==1);rsx_picture_release(threaded_token);assert(rsx_picture_live_count()==0 && rsx_picture_reset());puts("PASS30000 concurrent producer/descriptor/command lifetime iterations");return 0;
     }
     if(!strcmp(argv[1],"capacity")){
         u64 tokens[32];for(unsigned i=0;i<32;++i){tokens[i]=rsx_picture_create(0x1000,1,0x2000,32,a);assert(tokens[i]);}

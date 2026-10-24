@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Execute real lifted reserve instructions and runtime coherence publication."""
-import os,sys,subprocess,tempfile
+import os,sys,subprocess,tempfile,shutil
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import ppu_lifter as L
@@ -58,7 +58,12 @@ with tempfile.TemporaryDirectory(prefix='ppu-spu-lines-') as tmp:
   ops=[Instruction(a,0,m,('r3,0,r4' if 'arx' in m else 'r5,0,r4')),Instruction(a+4,0,'blr','')];l.lift_function(ops,a,a+8)
  (p/'ppu_recomp.h').write_text(l.emit_header());(p/'lifted.cpp').write_text(l.emit_source());(p/'driver.cpp').write_text(driver)
  common=['-O1','-ffunction-sections','-fdata-sections']
- subprocess.run([os.environ.get('CC','cc'),'-std=gnu17',*common,'-c',str(root/'runtime/spu/spu_coherency.c'),'-o',str(p/'coh.o')],check=True)
- subprocess.run([os.environ.get('CC','cc'),*common,'-c',str(root/'runtime/platform/win32_compat.c'),'-o',str(p/'compat.o')],check=True)
- subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-UNDEBUG',*common,'-I'+str(p),'-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform'),str(root/'runtime/ppu/ppu_loader.cpp'),str(p/'driver.cpp'),str(p/'lifted.cpp'),str(p/'coh.o'),str(p/'compat.o'),'-pthread',('-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'),'-o',str(p/'test')],check=True)
+ # The Windows loader contains SEH; use the MSVC-compatible clang toolchain
+ # available in CI rather than an unrelated MinGW c++ from PATH.
+ cc=os.environ.get('CC') or shutil.which('clang') or 'cc'
+ cxx=os.environ.get('CXX') or shutil.which('clang++') or 'c++'
+ linker='-Wl,/OPT:REF' if sys.platform=='win32' else ('-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections')
+ subprocess.run([cc,'-std=gnu17',*common,'-c',str(root/'runtime/spu/spu_coherency.c'),'-o',str(p/'coh.o')],check=True)
+ subprocess.run([cc,*common,'-c',str(root/'runtime/platform/win32_compat.c'),'-o',str(p/'compat.o')],check=True)
+ subprocess.run([cxx,'-std=c++17','-UNDEBUG',*common,'-I'+str(p),'-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform'),str(root/'runtime/ppu/ppu_loader.cpp'),str(p/'driver.cpp'),str(p/'lifted.cpp'),str(p/'coh.o'),str(p/'compat.o'),'-pthread',linker,'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True,timeout=10)
