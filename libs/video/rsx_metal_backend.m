@@ -866,6 +866,8 @@ static int create_window_impl(const char* title)
                     backing:NSBackingStoreBuffered
                       defer:NO];
     if (!s_window) return -1;
+    /* ARC owns the window; close must not schedule an extra release. */
+    s_window.releasedWhenClosed = NO;
     window_close_observer_start(s_window);
 
     [s_window setTitle:[NSString stringWithUTF8String:(title ? title : "ps3recomp")]];
