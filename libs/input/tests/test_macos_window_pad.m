@@ -120,14 +120,21 @@ int main(int argc, char** argv) { @autoreleasepool {
     key(view,NSEventTypeKeyUp,126,0); assert(report()==0);
     key(view,NSEventTypeKeyDown,123,0); assert(report()==CELL_PAD_CTRL_LEFT);
     assert(vm_read16(0x1000+4+CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X*2)==128);
-    NSWindow* other=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,100,80) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    NSWindow* __attribute__((objc_precise_lifetime)) other=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,100,80) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    other.releasedWhenClosed = NO; // owned by ARC, just like the production window
+    __weak NSWindow* other_live = other;
     [other makeKeyAndOrderFront:nil]; wait_key(other); assert(report()==0);
     key(view,NSEventTypeKeyDown,7,0); assert(report()==0); /* unfocused */
     [s_window makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; wait_key(s_window); [s_window makeFirstResponder:view];
     key(view,NSEventTypeKeyDown,7,NSEventModifierFlagCommand); assert(report()==0);
     key(view,NSEventTypeKeyDown,7,0); assert(report()==CELL_PAD_CTRL_CROSS);
-    [other close];
-    [s_window orderOut:nil]; [s_window close]; assert(report()==0);
+    @autoreleasepool { [other close]; }
+    assert(other_live != nil && "close must preserve the ARC owner's window");
+    __weak NSWindow* main_live = s_window;
+    @autoreleasepool { [s_window orderOut:nil]; [s_window close]; }
+    assert(main_live != nil && "production close must preserve the ARC owner");
+    assert(report()==0);
+    s_window = nil;
     assert(cellPadEnd()==CELL_OK); free(vm_base);
     puts("macOS native window keyboard -> guest pad checks passed");
 } return 0; }
