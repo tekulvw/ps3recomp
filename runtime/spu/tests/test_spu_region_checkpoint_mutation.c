@@ -9,17 +9,16 @@
 #undef spu_interp_run_until
 #include "mutation_program.h"
 extern uint32_t spu_interp_run_until(spu_context*,uint32_t,uint32_t);
-extern void mutation_real_task_launch_check(spu_context*,void*);
 extern void mutation_legacy_spu_recomp_register(void);
 extern void mutation_region_spu_recomp_register(void);
 static unsigned hook_calls, mutation_count, rejects, fallback_calls, finishes;
 static int mutation_armed;
 static uint32_t rejected_pc, rejected_entry, fallback_pc;
 
-void spu_task_launch_check(spu_context* c,void* target)
+void mutation_observe_task_launch(spu_context* c,void* target)
 {
+    (void)target;
     ++hook_calls;
-    mutation_real_task_launch_check(c,target);
     if(mutation_armed && !mutation_count && c->pc==0x10008) {
         CHECK(c->host_depth==0 && c->int_enable==0 && c->drain_ret_pc==0);
         /* ori r21,r22,99 replaces ori r21,r22,7 after the real checkpoint. */
@@ -39,6 +38,20 @@ uint32_t mutation_observed_run_until(spu_context* c,uint32_t pc,uint32_t stop)
     return spu_interp_run_until(c,pc,stop);
 }
 static void sentinel(spu_context* c) { (void)c;abort(); }
+static void observed_drain_target(spu_context* c)
+{
+    c->pc=0x33004;g_spu_trampoline_fn=spu_indirect_branch;
+}
+static void check_drain_observer(void)
+{
+    spu_context* c=calloc(1,sizeof(*c));CHECK(c!=NULL);
+    spu_context_init(c,0);c->policy_mode=1;c->pc=0x33000;
+    const unsigned hooks=hook_calls;
+    g_spu_trampoline_fn=observed_drain_target;
+    spu_drain_call(c,0x33004);
+    CHECK(hook_calls==hooks+1 && c->steps==1 && c->pc==0x33004);
+    CHECK(!g_spu_trampoline_fn);free(c);
+}
 static void finish(spu_context* c)
 {
     ++finishes;c->status=SPU_STATUS_STOPPED_BY_STOP;spu_halt(c);
@@ -84,7 +97,7 @@ static void driver(spu_context* c)
 }
 int main(int argc,char** argv)
 {
-    CHECK(argc==2);check_deopts();
+    CHECK(argc==2);check_deopts();check_drain_observer();
     const int regions=atoi(argv[1]);
     spu_context* c=calloc(1,sizeof(*c));CHECK(c != NULL);
     spu_context_init(c,0);c->policy_mode=1;c->image_id=501;c->pc=0x10000;

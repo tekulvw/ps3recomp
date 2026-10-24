@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Checkpoint LS mutation must precede the full destination body guard.
 
-Only a temporary copy of the real drain's task-hook definition is renamed;
-the observing fixture delegates unchanged and then changes neutral guest bytes.
+Only a temporary copy of the real drain's common task checkpoint is wrapped;
+the observer runs after unchanged bookkeeping and changes neutral guest bytes.
 Persistent runtime/emitter/shared fixtures are not modified.
 """
 import json
@@ -46,8 +46,23 @@ def run():
             if name=='region':
                 assert 'spu_region_local_step(ctx, mutation_region_spu_func_00010008)' in (out/'spu_recomp.c').read_text()
         drain=(SPU/'spu_drain.c').read_text()
-        drain,count=re.subn(r'\bvoid spu_task_launch_check\(',
-                            'void mutation_real_task_launch_check(',drain)
+        drain,count=re.subn(r'\bvoid spu_task_launch_check_inline\(',
+                            'void mutation_real_task_launch_check_inline(',drain)
+        assert count==1,count
+        # Observe the shared checkpoint used by both the public wrapper and
+        # the owning drain. Renaming only the exported wrapper would miss
+        # drain hops once the common bookkeeping is inline.
+        observer='''
+extern void mutation_observe_task_launch(spu_context*,void*);
+SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx,void* fn,
+                                                  spu_recent_history* recent)
+{
+    mutation_real_task_launch_check_inline(ctx,fn,recent);
+    mutation_observe_task_launch(ctx,fn);
+}
+'''
+        drain,count=re.subn(r'(?=\bvoid spu_task_launch_check\()',
+                            lambda _:observer,drain)
         assert count==1,count
         (p/'observed_drain.c').write_text(drain)
         flags=['-std=gnu17','-O2','-UNDEBUG','-I'+str(ROOT/'include'),
