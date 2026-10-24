@@ -16,7 +16,7 @@ def main():
         tmp=Path(temporary)
         binary=tmp/'fixture'
         gc='-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'
-        subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-ffunction-sections','-fdata-sections',
+        subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-D_GNU_SOURCE','-O1','-ffunction-sections','-fdata-sections',
             '-I'+str(root/'include'),str(root/'tests/test_cellfs_vfs_root.c'),
             str(root/'libs/filesystem/cellFs.c'),str(root/'runtime/syscalls/sys_fs.c'),
             gc,'-o',str(binary)],check=True,timeout=45)

@@ -2,6 +2,8 @@
 #import <AppKit/AppKit.h>
 #include <assert.h>
 #include <unistd.h>
+#include <execinfo.h>
+#include <signal.h>
 #include <SDL2/SDL.h>
 #include "../../video/rsx_metal_backend.m"
 #include "../cellPad.h"
@@ -17,6 +19,17 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 
+/* Record the first failure in the original process: a debugger rerun may
+ * change application activation and hide the original fault behind a focus
+ * assertion. This is diagnostics only; every fatal signal still fails. */
+static void fixture_fault(int signo) {
+    static const char message[] = "native pad fixture fatal signal: stack follows\n";
+    void* frames[64];
+    int count = backtrace(frames, 64);
+    write(STDERR_FILENO, message, sizeof(message) - 1);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    _exit(128 + signo);
+}
 static void key(NSView* view, NSEventType type, unsigned short code, NSEventModifierFlags mods) {
     NSEvent* e = [NSEvent keyEventWithType:type location:NSZeroPoint modifierFlags:mods
         timestamp:0 windowNumber:s_window.windowNumber context:nil characters:@"x"
@@ -40,6 +53,9 @@ static void wait_key(NSWindow* window) {
     assert(window.isKeyWindow);
 }
 int main(int argc, char** argv) { @autoreleasepool {
+    signal(SIGSEGV, fixture_fault);
+    signal(SIGBUS, fixture_fault);
+    signal(SIGABRT, fixture_fault);
     vm_base = calloc(1, 0x10000); assert(vm_base);
     SDL_Joystick* virtual_pad=NULL;
     if (argc==2 && !strcmp(argv[1],"controller")) {
@@ -104,14 +120,21 @@ int main(int argc, char** argv) { @autoreleasepool {
     key(view,NSEventTypeKeyUp,126,0); assert(report()==0);
     key(view,NSEventTypeKeyDown,123,0); assert(report()==CELL_PAD_CTRL_LEFT);
     assert(vm_read16(0x1000+4+CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X*2)==128);
-    NSWindow* other=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,100,80) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    NSWindow* __attribute__((objc_precise_lifetime)) other=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,100,80) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    other.releasedWhenClosed = NO; // owned by ARC, just like the production window
+    __weak NSWindow* other_live = other;
     [other makeKeyAndOrderFront:nil]; wait_key(other); assert(report()==0);
     key(view,NSEventTypeKeyDown,7,0); assert(report()==0); /* unfocused */
     [s_window makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; wait_key(s_window); [s_window makeFirstResponder:view];
     key(view,NSEventTypeKeyDown,7,NSEventModifierFlagCommand); assert(report()==0);
     key(view,NSEventTypeKeyDown,7,0); assert(report()==CELL_PAD_CTRL_CROSS);
-    [other close];
-    [s_window orderOut:nil]; [s_window close]; assert(report()==0);
+    @autoreleasepool { [other close]; }
+    assert(other_live != nil && "close must preserve the ARC owner's window");
+    __weak NSWindow* main_live = s_window;
+    @autoreleasepool { [s_window orderOut:nil]; [s_window close]; }
+    assert(main_live != nil && "production close must preserve the ARC owner");
+    assert(report()==0);
+    s_window = nil;
     assert(cellPadEnd()==CELL_OK); free(vm_base);
     puts("macOS native window keyboard -> guest pad checks passed");
 } return 0; }
