@@ -84,7 +84,7 @@ struct frame;
 struct checkpoint { uint64_t target; uint64_t sp; bool armed; };
 struct transfer { frame* owner; ppu_context* ctx; uint64_t thread; uint64_t sp; uint64_t target; };
 inline thread_local frame* live = nullptr;
-inline void host_unwind() { live = nullptr; }
+inline void host_unwind();
 [[noreturn]] inline void fail(const char* why, ppu_context* ctx) {
     std::fprintf(stderr, "[ppu-nonlocal] %s ctx=%p thread=%llu sp=0x%llx lr=0x%llx\n",
                  why, static_cast<void*>(ctx), static_cast<unsigned long long>(ctx->thread_id),
@@ -97,6 +97,7 @@ struct frame {
     checkpoint* slots;
     size_t count;
     frame* previous;
+    bool retired_by_host = false;
     frame(ppu_context* context, checkpoint* entries, size_t size)
         : ctx(context), thread(context->thread_id), slots(entries), count(size), previous(live) {
         ps3_ppu_set_host_unwind_handler(host_unwind);
@@ -105,6 +106,9 @@ struct frame {
     frame(const frame&) = delete;
     frame& operator=(const frame&) = delete;
     ~frame() {
+        // MSVC longjmp can run C++ destructors after the explicit host hook.
+        // A retired frame must neither reject nor restore its abandoned chain.
+        if (retired_by_host) return;
         if (live != this) fail("corrupt continuation lifetime", ctx);
         live = previous;
     }
@@ -125,6 +129,13 @@ struct frame {
             !matches(ctx, signal.sp, signal.target)) fail("invalid accepted transfer", ctx);
     }
 };
+inline void host_unwind() {
+    while (live) {
+        frame* owner = live;
+        live = owner->previous;
+        owner->retired_by_host = true;
+    }
+}
 [[noreturn]] inline void raise(ppu_context* ctx) {
     for (frame* owner = live; owner; owner = owner->previous) {
         if (owner->matches(ctx, ctx->gpr[1], ctx->lr)) {
