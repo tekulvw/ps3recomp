@@ -1406,10 +1406,12 @@ static s32 spurs_create_task(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
-            printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
-                   " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
-                   s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
-                   context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]);
+            if (ps3_log_verbose()) {
+                printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
+                       " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
+                       s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
+                       context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]);
+            }
 
             /* One-shot: dump the memory the task argument points at, to find the
              * pointer that reads back 0 (the task GETs from EA 0 -> some field of
@@ -1537,8 +1539,10 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
       if (s_r8) {
           attr->argument_ea  = (u32)sizeContext;   /* r8 */
           attr->lsPattern_ea = 0;                  /* r9 was a leftover */
-          printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
-                 attr->argument_ea, (u32)(uintptr_t)argument);
+          if (ps3_log_verbose()) {
+              printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
+                     attr->argument_ea, (u32)(uintptr_t)argument);
+          }
       } }
     /* SPURS_TASKATTR_DESC: a THIRD caller shape, found in Saints Row 2. Its
      * taskset builder (func_009F56E0) does not pass eaContext/sizeContext/
@@ -1571,9 +1575,11 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
                  d, (u32)attr->eaContext, attr->sizeContext,
                  attr->lsPattern_ea, attr->argument_ea);
       } }
-    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
-           (u32)eaElf, (u32)eaContext, sizeContext,
-           attr->lsPattern_ea, attr->argument_ea);
+    if (ps3_log_verbose()) {
+        printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
+               (u32)eaElf, (u32)eaContext, sizeContext,
+               attr->lsPattern_ea, attr->argument_ea);
+    }
     return CELL_OK;
 }
 
