@@ -87,6 +87,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 
 #include <ctype.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 
 #if defined(YZ_PERF_CLEAN)
@@ -216,6 +217,7 @@ typedef struct {
     /* Top-left windows of the surface for smaller aliasing textures (see surface_window). */
     struct { ID3D12Resource* tex; ID3D12Resource* src; u32 w, h, wgen, used; } swin[LD_SWIN_PER];
     u32 swin_wgen;            /* bumped by every write into the surface; a window older than it is recopied */
+    u64 last_write_serial;    /* production ordering for same-address typed copy sources */
 #if !defined(YZ_PERF_CLEAN)
     u32 resource_serial;
     u32 last_write_generation;
@@ -308,6 +310,7 @@ typedef struct {
     u32                        rtv_step;
 
     surface_t                  surfaces[MAX_SURFACES];
+    u64                        surface_write_serial;
     u32                        n_surfaces;
     display_buffer_t           display_buffers[8];
 
@@ -508,6 +511,7 @@ static void ld_surface_note_write(u32 target, u32 kind)
     if (target >= MAX_SURFACES)
         return;
     surface_t* surface = &g.surfaces[target];
+    surface->last_write_serial = ++g.surface_write_serial;
     const u32 generation = ++g_ld_surface_generation;
     surface->swin_wgen++;
     surface->last_write_generation = generation;
@@ -538,7 +542,10 @@ static void ld_surface_note_write(u32 target, u32 kind)
 }
 #else
 #define ld_surface_note_write(target, kind) \
-    do { if ((target) < MAX_SURFACES) g.surfaces[(target)].swin_wgen++; } while (0)
+    do { if ((target) < MAX_SURFACES) { \
+        g.surfaces[(target)].swin_wgen++; \
+        g.surfaces[(target)].last_write_serial = ++g.surface_write_serial; \
+    } } while (0)
 #endif
 
 #define LD_LAYOUT_CACHE_CAP 256u
@@ -1376,15 +1383,30 @@ static u32 ld_rt_count(u32 sel)
     }
 }
 
+static DXGI_FORMAT ld_color_format(u32 format)
+{
+    if (format == RSX_SURFACE_FMT_F_W16Z16Y16X16)
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (format == RSX_SURFACE_FMT_F_W32Z32Y32X32)
+        return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    return DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
+static u32 ld_surface_texel_bytes(DXGI_FORMAT format)
+{
+    if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) return 16u;
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) return 8u;
+    return 4u;
+}
+
 typedef struct {
     u32 alpha_test_enable, alpha_func, alpha_ref_raw, alpha_ref_format;
     u32 blend_enable, sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
     u32 depth_test, depth_write, depth_func;
     u32 cull_enable, cull_face, front_face;
     u32 color_mask;
-    /* TM: this title renders HDR into FP16 (SURFACE_FORMAT 0xB) targets;
-     * the RTV format is PSO state, so it belongs in the key. */
-    u32 rt_fp16;
+    /* Numeric target format is PSO state; FP32 must not alias UNORM or FP16. */
+    u32 rt_format;
     /* Colour targets the draw writes (SURFACE_COLOR_TARGET: A, AB, ABC,
      * ABCD). GH3's venue pass writes A and B; the post pass then samples B.
      * With only A bound, B stayed empty and that pass painted the scene
@@ -1407,7 +1429,7 @@ static void decode_render_state(render_state_t* rs)
     rsx_dsp_surface alpha_surface;
     rsx_dsp_get_surface(&g.rsx, &alpha_surface);
     rs->alpha_ref_format = alpha_surface.color_format;
-    rs->rt_fp16 = alpha_surface.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
+    rs->rt_format = (u32)ld_color_format(alpha_surface.color_format);
     rs->rt_count = ld_rt_count(alpha_surface.color_target);
     rs->blend_enable = rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1;
     const u32 sf = rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR);
@@ -3096,6 +3118,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->resource_serial = ++g_ld_surface_resource_serial;
 #endif
     ld_surface_note_write(slot, LD_SURFACE_WRITE_CREATE);
+    s->last_write_serial = 0;  /* allocation alone must not supersede written pixels */
     /* RTVs for surfaces live above the swap-chain backbuffer RTVs */
     g.dev->lpVtbl->CreateRenderTargetView(g.dev, s->tex,
         NULL, rtv_handle(LD_SWAP_BUFFERS + slot));
@@ -3149,7 +3172,7 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
     if (!ld_swin_on() || !s->tex || !w || !h) return -1;
     if (w == s->w && h == s->h) return -1;           /* exact-size alias: the whole surface, unchanged */
     if (w > s->w || h > s->h) return -1;
-    const u32 sb = s->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;   /* the surface formats live-draw creates */
+    const u32 sb = ld_surface_texel_bytes(s->fmt);
     const u32 tb = ld_tex_texel_bytes(t->format);
     if (t->dimension != 2u || t->cubemap || !(t->format & TEX_FMT_LINEAR) || !s->pitch ||
         t->pitch != s->pitch || tb != sb) {
@@ -3284,15 +3307,25 @@ static u32 surface_feedback_srv(u32 slot)
 /* Find the live surface whose guest rows (at `pitch`) contain byte `abs`, with
  * room for a w x h rect there. Returns the slot and the rect's origin. */
 static int surface_containing(u32 location, u32 abs, u32 pitch, u32 w, u32 h,
-                              u32* ox, u32* oy)
+                              DXGI_FORMAT required_format, u32* ox, u32* oy)
 {
+    int best = -1;
     for (u32 i = 0; i < g.n_surfaces; i++) {
         const surface_t* s = &g.surfaces[i];
         if (!s->tex || s->location != location || abs < s->offset) continue;
-        const u32 d = abs - s->offset, y = d / pitch, x = (d % pitch) / 4u;
-        if (x + w <= s->w && y + h <= s->h) { *ox = x; *oy = y; return (int)i; }
+        if (required_format != DXGI_FORMAT_UNKNOWN && s->fmt != required_format) continue;
+        if (!pitch || (s->pitch && s->pitch != pitch)) continue;
+        const u32 bytes = ld_surface_texel_bytes(s->fmt);
+        const u32 d = abs - s->offset;
+        if ((d % pitch) % bytes) continue;
+        const u32 y = d / pitch, x = (d % pitch) / bytes;
+        if ((u64)x + w <= s->w && (u64)y + h <= s->h &&
+            (best < 0 || (s->offset == g.surfaces[best].offset &&
+             s->last_write_serial > g.surfaces[best].last_write_serial))) {
+            best = (int)i; *ox = x; *oy = y;
+        }
     }
-    return -1;
+    return best;
 }
 
 /* NV3089 scaled-image blit whose SOURCE is a live surface: the pixels exist
@@ -3323,7 +3356,7 @@ int rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
       if (!(s_csv_file && s_csv_gate_open)) n = 0;
       else if (dir && r == 1 && n < 4) {
           u32 dx, dy;
-          const int di = surface_containing(dst_loc, dst_abs, dst_pitch, w, h, &dx, &dy);
+          const int di = surface_containing(dst_loc, dst_abs, dst_pitch, w, h, DXGI_FORMAT_UNKNOWN, &dx, &dy);
           if (di >= 0) {
               char path[MAX_PATH * 2];
               snprintf(path, sizeof(path), "%s\\blit_f%06u_%u_dst%08X.ppm", dir, g_ld_frames, n,
@@ -3631,7 +3664,11 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
         const u32 d = src_abs - s->offset;
         if (d / src_pitch >= 2u * s->h) continue;
         if (si >= 0 && g.surfaces[si].offset > s->offset) continue;
-        si = (int)i; gx = (d % src_pitch) / 4u; gy = d / src_pitch;
+        if (si >= 0 && g.surfaces[si].offset == s->offset &&
+            g.surfaces[si].last_write_serial >= s->last_write_serial) continue;
+        const u32 bytes = ld_surface_texel_bytes(s->fmt);
+        if ((d % src_pitch) % bytes) continue;
+        si = (int)i; gx = (d % src_pitch) / bytes; gy = d / src_pitch;
     }
     if (si < 0) return 0;
     /* Destination: the display buffer this tile writes into. */
@@ -3643,6 +3680,8 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
     }
     if (bi < 0) return 0;
     const display_buffer_t* db = &g.display_buffers[bi];
+    /* Display-buffer guest addresses retain their 32-bit scanout pixel
+     * units, independently of the source's floating-point texel size. */
     const u32 dx = (dst_abs - db->offset) % db->pitch / 4u + out_x;
     const u32 dy = (dst_abs - db->offset) / db->pitch + out_y;
     const u32 slot = surface_get(db->location, db->offset, db->width, db->height, g.surfaces[si].fmt);
@@ -3727,11 +3766,13 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
 {
     if (!g.ready || !src_pitch || !dst_pitch || !w || !h) return 0;
     u32 sx, sy, dx = 0, dy = 0;
-    const int si = surface_containing(src_loc, src_abs, src_pitch, w, h, &sx, &sy);
+    const int si = surface_containing(src_loc, src_abs, src_pitch, w, h, DXGI_FORMAT_UNKNOWN, &sx, &sy);
     if (si < 0) return -1;            /* source is not a live surface */
-    int di = surface_containing(dst_loc, dst_abs, dst_pitch, w, h, &dx, &dy);
+    int di = surface_containing(dst_loc, dst_abs, dst_pitch, w, h, g.surfaces[si].fmt, &dx, &dy);
     if (di < 0) {
-        const u32 slot = surface_get(dst_loc, dst_abs, dst_pitch / 4u, h,
+        const u32 bytes = ld_surface_texel_bytes(g.surfaces[si].fmt);
+        if (dst_pitch % bytes) return -3;
+        const u32 slot = surface_get(dst_loc, dst_abs, dst_pitch / bytes, h,
                                      g.surfaces[si].fmt);
         if (slot == LD_INVALID_SURFACE) return -2;
         di = (int)slot;
@@ -3770,9 +3811,7 @@ static u32 current_surface(void)
     rsx_dsp_get_surface(&g.rsx, &sf);
     const u32 slot = surface_get(sf.color_location[0], sf.color_offset[0],
                                  sf.clip_w, sf.clip_h,
-                                 sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
-                                     ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                     : DXGI_FORMAT_R8G8B8A8_UNORM);
+                                 ld_color_format(sf.color_format));
     if (slot != LD_INVALID_SURFACE) g.surfaces[slot].pitch = sf.color_pitch[0];
     return slot;
 }
@@ -4299,7 +4338,7 @@ static u64 ld_hash_structural_render_state(
     LD_HASH_RENDER_FIELD(cull_face);
     LD_HASH_RENDER_FIELD(front_face);
     LD_HASH_RENDER_FIELD(color_mask);
-    LD_HASH_RENDER_FIELD(rt_fp16);
+    LD_HASH_RENDER_FIELD(rt_format);
     LD_HASH_RENDER_FIELD(rt_count);
     LD_HASH_RENDER_FIELD(stencil_enable);
     LD_HASH_RENDER_FIELD(stencil_two_sided);
@@ -4723,8 +4762,7 @@ static ID3D12PipelineState* build_pso(
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = rs->rt_count ? rs->rt_count : 1;
     for (u32 r = 0; r < pd.NumRenderTargets; r++)
-        pd.RTVFormats[r] = rs->rt_fp16 ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                       : DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.RTVFormats[r] = (DXGI_FORMAT)rs->rt_format;
     pd.SampleDesc.Count = 1;
     ID3D12PipelineState* pso = NULL;
 #if defined(YZ_PERF_PROFILE)
@@ -7528,9 +7566,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         for (u32 r = 1; r < want; r++) {
             const u32 s = surface_get(msf.color_location[r], msf.color_offset[r],
                                       msf.clip_w, msf.clip_h,
-                                      msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
-                                          ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                          : DXGI_FORMAT_R8G8B8A8_UNORM);
+                                      ld_color_format(msf.color_format));
             if (s == LD_INVALID_SURFACE || s == target) break;
             mrt[n_mrt++] = s;
         }
@@ -7658,6 +7694,17 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               const surface_t* sf_i = &g.surfaces[i];
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
                   i == target)
+                  continue;
+              /* Multiple typed resources can occupy the same guest address.
+               * A floating texture must select the corresponding numeric
+               * surface, not an earlier UNORM declaration of that address. */
+              const u32 base_format = t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+              const DXGI_FORMAT wanted = base_format == RSX_TEX_FMT_W32Z32Y32X32_FLOAT
+                  ? DXGI_FORMAT_R32G32B32A32_FLOAT
+                  : base_format == RSX_TEX_FMT_W16Z16Y16X16_FLOAT
+                      ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+              if ((wanted != DXGI_FORMAT_R8G8B8A8_UNORM ||
+                   sf_i->fmt != DXGI_FORMAT_R8G8B8A8_UNORM) && sf_i->fmt != wanted)
                   continue;
               if (sf_i->w == t.width && sf_i->h == t.height) { sampled = (int)i; break; }
               if (sampled < 0 || sf_i->last_draw_generation > best_gen) {
@@ -9111,23 +9158,29 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
 /* Env-gated (RSX_DUMP) framebuffer dump: read the current color surface back
  * and write a binary PPM. Self-contained -- creates + releases its own readback
  * buffer, so no init/struct changes. Uses g.list which ld_flush leaves open. */
-/* Readback texel -> 8-bit RGB.  This title renders HDR into FP16 targets, so a
- * dump has to tone it down rather than reinterpret the bytes.  Reinhard keeps
+/* Readback texel -> 8-bit RGB. Floating targets must be decoded numerically,
+ * rather than reinterpreted as bytes. Reinhard keeps
  * the whole range visible without pretending to match the guest tonemapper. */
-static void ld_dump_texel_rgb(const u8* p, int fp16, u8* out)
+static void ld_dump_texel_rgb(const u8* p, DXGI_FORMAT format, u8* out)
 {
-    if (!fp16) { out[0] = p[0]; out[1] = p[1]; out[2] = p[2]; return; }
+    if (format == DXGI_FORMAT_R8G8B8A8_UNORM) { out[0] = p[0]; out[1] = p[1]; out[2] = p[2]; return; }
     for (int c = 0; c < 3; c++) {
-        const u16 h = (u16)(p[c * 2] | (p[c * 2 + 1] << 8));
-        const int ex = (h >> 10) & 0x1F, ma = h & 0x3FF;
         float f;
-        if (ex == 0)       f = (float)ma * (1.0f / 16384.0f) * (1.0f / 64.0f);
-        else if (ex == 31) f = 65504.0f;
-        else { f = 1.0f + (float)ma / 1024.0f;
-               int k = ex - 15;
-               while (k > 0) { f *= 2.0f; k--; }
-               while (k < 0) { f *= 0.5f; k++; } }
-        if (h & 0x8000) f = 0.0f;
+        if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+            memcpy(&f, p + c * 4, sizeof(f));
+            if (!(f > 0.0f)) { out[c] = 0; continue; }
+            if (!isfinite(f)) { out[c] = 255; continue; }
+        } else {
+            const u16 h = (u16)(p[c * 2] | (p[c * 2 + 1] << 8));
+            const int ex = (h >> 10) & 0x1F, ma = h & 0x3FF;
+            if (ex == 0)       f = (float)ma * (1.0f / 16384.0f) * (1.0f / 64.0f);
+            else if (ex == 31) f = 65504.0f;
+            else { f = 1.0f + (float)ma / 1024.0f;
+                   int k = ex - 15;
+                   while (k > 0) { f *= 2.0f; k--; }
+                   while (k < 0) { f *= 0.5f; k++; } }
+            if (h & 0x8000) f = 0.0f;
+        }
         f = f / (1.0f + f);                          /* Reinhard */
         out[c] = (u8)(f * 255.0f + 0.5f);
     }
@@ -9145,8 +9198,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
     const u32 width = surface->w;
     const u32 height = surface->h;
     if (!width || !height) return UINT64_MAX;
-    const int fp16 = surface->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    const u32 texel = fp16 ? 8u : 4u;
+    const u32 texel = ld_surface_texel_bytes(surface->fmt);
     const u32 pitch = (width * texel + 255) & ~255u;             /* 256-align */
     const UINT64 rb_size = (UINT64)pitch * height;
 
@@ -9203,7 +9255,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
                 const u8* row = px + (SIZE_T)y * pitch;
                 for (u32 x = 0; x < width; x++) {
                     const u8* pixel = row + x * texel;
-                    u8 rgb[3]; ld_dump_texel_rgb(pixel, fp16, rgb);
+                    u8 rgb[3]; ld_dump_texel_rgb(pixel, surface->fmt, rgb);
                     if (rgb[0] || rgb[1] || rgb[2])
                         nonblack++;
                     fingerprint = fnv1a(rgb, 3, fingerprint);
@@ -9219,7 +9271,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
                 const u8* row = px + (SIZE_T)y * pitch;
                 for (u32 x = 0; x < width; x++) {
                     const u8* pixel = row + x * texel;
-                    u8 rgb[3]; ld_dump_texel_rgb(pixel, fp16, rgb);
+                    u8 rgb[3]; ld_dump_texel_rgb(pixel, surface->fmt, rgb);
                     if (rgb[0] || rgb[1] || rgb[2])
                         nonblack++;
                     fingerprint = fnv1a(rgb, 3, fingerprint);

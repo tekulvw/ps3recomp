@@ -172,6 +172,7 @@ typedef struct rsx_dsp_surface {
     u32 color_format;    /* SURFACE_FORMAT color field (5 = A8R8G8B8)      */
 /* SET_SURFACE_FORMAT colour field: FP16 RGBA, the HDR target format. */
 #define RSX_SURFACE_FMT_F_W16Z16Y16X16 0xB
+#define RSX_SURFACE_FMT_F_W32Z32Y32X32 0xC
     u32 depth_format;
     u32 raster_type;     /* 1 = pitch (linear), 2 = swizzle                */
     u32 clip_x, clip_y, clip_w, clip_h;
