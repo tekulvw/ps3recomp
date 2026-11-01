@@ -9,9 +9,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#endif
 extern uint32_t ppu_vm_size; /* zero denotes the whole 32-bit mapping */
 #define OSK_PARAM ((int32_t)0x8002B504)
 #define OSK_UNKNOWN ((int32_t)0x8002B503)
@@ -29,13 +33,22 @@ static void unlock(void){atomic_flag_clear_explicit(&s_lock,memory_order_release
  * (including pre-open/stale commands), and never publish a guest completion. */
 static int s_control_initialized;
 static char s_control_path[4096];
+#ifdef _WIN32
+static WCHAR s_control_path_w[4096];
+#endif
 static void control_init(void){ /* caller holds lifecycle lock */
  if(s_control_initialized)return;
  s_control_initialized=1;
+#ifdef _WIN32
+ DWORD n=GetEnvironmentVariableW(L"OSK_NATIVE_CONTROL_FILE",s_control_path_w,4096);
+ if(n && n<4096)s_control_path[0]=1;
+ else s_control_path_w[0]=0;
+#else
  const char* path=getenv("OSK_NATIVE_CONTROL_FILE");
  if(path && *path){size_t n=strnlen(path,sizeof(s_control_path));
   if(n<sizeof(s_control_path))memcpy(s_control_path,path,n+1);
  }
+#endif
 }
 static uint64_t control_command(const unsigned char* command,size_t n){
  static const char prefix[]="confirm ";
@@ -52,6 +65,21 @@ static uint64_t control_command(const unsigned char* command,size_t n){
 }
 static uint64_t control_poll(void){ /* caller holds lifecycle lock */
  control_init();if(!s_control_path[0])return 0;
+#ifdef _WIN32
+ unsigned char command[64];DWORD count=0;uint64_t token=0;
+ HANDLE file=CreateFileW(s_control_path_w,GENERIC_READ|DELETE,FILE_SHARE_READ,NULL,
+     OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+ if(file==INVALID_HANDLE_VALUE)return 0;
+ BY_HANDLE_FILE_INFORMATION info;LARGE_INTEGER size;
+ const int regular=GetFileType(file)==FILE_TYPE_DISK && GetFileInformationByHandle(file,&info)
+    && !(info.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT));
+ if(regular && GetFileSizeEx(file,&size) && size.QuadPart>0 && size.QuadPart<=64
+    && ReadFile(file,command,sizeof command,&count,NULL) && count==(DWORD)size.QuadPart)
+  token=control_command(command,count);
+ FILE_DISPOSITION_INFO dispose={TRUE};
+ int consumed=regular && SetFileInformationByHandle(file,FileDispositionInfo,&dispose,sizeof dispose)!=0;
+ if(!CloseHandle(file) || !consumed)token=0;
+#else
  int fd=open(s_control_path,O_RDONLY|O_NONBLOCK|O_NOFOLLOW);
  if(fd<0)return 0;
  struct stat st;unsigned char command[64];ssize_t n=-1;
@@ -59,6 +87,7 @@ static uint64_t control_poll(void){ /* caller holds lifecycle lock */
   n=read(fd,command,sizeof(command));
  close(fd);unlink(s_control_path);
  uint64_t token=n>0 && n==st.st_size?control_command(command,(size_t)n):0;
+#endif
  if(token && token==s.token && s.state==OPEN && !s.control_confirmed){
   s.control_confirmed=1;return token;
  }
@@ -78,9 +107,7 @@ static int guest_text(uint32_t ea,uint16_t* out,uint32_t cap){
 }
 /* The explicit host default is UTF-8. Validate the whole value before copying
  * any of it, including a suffix beyond the guest's UTF-16 content limit. */
-static void host_initial_text(uint16_t* initial,uint32_t limit){
- const unsigned char* p=(const unsigned char*)getenv("PS3RECOMP_OSK_INITIAL_TEXT");
- if(!p)return;
+static void host_initial_utf8(uint16_t* initial,uint32_t limit,const unsigned char* p){
  uint16_t text[513]={0};uint32_t n=0;int truncated=0;
  while(*p){
   uint32_t cp=*p++,minimum=0;unsigned remaining=0;
@@ -100,6 +127,26 @@ static void host_initial_text(uint16_t* initial,uint32_t limit){
   else text[n++]=(uint16_t)cp;
  }
  memcpy(initial,text,(n+1)*sizeof(text[0]));
+}
+static void host_initial_text(uint16_t* initial,uint32_t limit){
+#ifdef _WIN32
+ SetLastError(ERROR_SUCCESS);
+ DWORD count=GetEnvironmentVariableW(L"PS3RECOMP_OSK_INITIAL_TEXT",NULL,0);
+ if(!count){if(GetLastError()==ERROR_SUCCESS)initial[0]=0;return;}
+ if(count>32768)return;
+ WCHAR* wide=malloc((size_t)count*sizeof(WCHAR));if(!wide)return;
+ wide[0]=0;SetLastError(ERROR_SUCCESS);
+ DWORD copied=GetEnvironmentVariableW(L"PS3RECOMP_OSK_INITIAL_TEXT",wide,count);
+ if(copied>=count || (!copied && GetLastError()!=ERROR_SUCCESS)){free(wide);return;}
+ int bytes=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,wide,-1,NULL,0,NULL,NULL);
+ unsigned char* utf8=bytes>0?malloc((size_t)bytes):NULL;
+ if(utf8 && WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,wide,-1,(char*)utf8,bytes,NULL,NULL))
+  host_initial_utf8(initial,limit,utf8);
+ free(utf8);free(wide);
+#else
+ const unsigned char* p=(const unsigned char*)getenv("PS3RECOMP_OSK_INITIAL_TEXT");
+ if(p)host_initial_utf8(initial,limit,p);
+#endif
 }
 int32_t osk_native_load(uint32_t param,uint32_t input){
  if(!valid(param,20)||!valid(input,12)) return OSK_PARAM;

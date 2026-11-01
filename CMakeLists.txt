@@ -320,6 +320,12 @@ endif()
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
+if(WIN32)
+    option(PS3RECOMP_NATIVE_OSK_WINDOWS "Build real native Windows text input" ON)
+    if(PS3RECOMP_NATIVE_OSK_WINDOWS)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_WINDOWS=1)
+    endif()
+endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
         -Wall -Wextra -Wno-unused-parameter

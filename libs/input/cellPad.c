@@ -18,6 +18,7 @@
 #endif
 #endif
 #include "cellPad.h"
+#include "../misc/osk_native.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -188,6 +189,9 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
 #ifdef _WIN32
 static int pad_host_window_focused(void)
 {
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    if(osk_native_win32_input_active())return 0;
+#endif
     HWND fg = GetForegroundWindow();
     if (!fg) return 0;
     DWORD pid = 0;
@@ -979,6 +983,23 @@ skip_inject: ;
     }  /* end connected block */
 
 emit:
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    if(osk_native_win32_input_active()){
+        /* The system dialog owns input. Cancel mailbox work above first, then
+         * neutralize this guest payload without changing host state/freshness. */
+        for(unsigned i=2;i<CELL_PAD_MAX_CODES;i++)data->button[i]=0;
+        data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X]=128;
+        data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y]=128;
+        data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]=128;
+        data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]=128;
+        if(port_no<PAD_MAX_HOST_PORTS && (s_port_setting[port_no]&CELL_PAD_SETTING_SENSOR_ON)){
+            data->button[CELL_PAD_BTN_OFFSET_SENSOR_X]=512;
+            data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y]=399;
+            data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z]=512;
+            data->button[CELL_PAD_BTN_OFFSET_SENSOR_G]=512;
+        }
+    }
+#endif
     /* A non-zero len means "here is a CHANGE packet" -- the constant is literally
      * named CELL_PAD_LEN_CHANGE_DEFAULT. Hardware reports len = 0 once the port
      * has nothing new, and titles DRAIN on that: The Simpsons Arcade Game's

@@ -19,12 +19,12 @@ def main():
         work = Path(temp)
         binary = work / 'fixture.exe'
         subprocess.run([compiler, '/nologo', '/std:c17', '/O1', '/W4', '/WX', '/MT', '/UNDEBUG',
-                        '/D_CRT_SECURE_NO_WARNINGS', '/I'+str(root/'include'),
+                        '/D_CRT_SECURE_NO_WARNINGS', '/DPS3RECOMP_NATIVE_OSK_WINDOWS=1','/I'+str(root/'include'),
                         str(root/'libs/input/tests/test_pad_file_focus_windows.c'),
                         '/Fo'+str(work/'fixture.obj'), '/Fe'+str(binary), '/link', 'user32.lib', 'xinput.lib'],
                        cwd=work, check=True, timeout=60)
         env = {k: v for k, v in os.environ.items() if not k.startswith(('PAD_', 'YDKJ_'))}
-        for mode in ('late-unfocused', 'locked-admission', 'focused', 'no-controller', 'blocked-discard', 'long-path', 'legacy', 'zero', 'no-file'):
+        for mode in ('osk-owner','late-unfocused', 'locked-admission', 'focused', 'no-controller', 'blocked-discard', 'long-path', 'legacy', 'zero', 'no-file'):
             subprocess.run([str(binary), mode, str(work/(mode+'.txt'))],
                            cwd=work, env=env, check=True, timeout=10)
     return 0

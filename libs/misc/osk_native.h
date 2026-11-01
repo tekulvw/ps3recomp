@@ -2,7 +2,7 @@
 #ifndef PS3RECOMP_OSK_NATIVE_H
 #define PS3RECOMP_OSK_NATIVE_H
 #include <stdint.h>
-#if (defined(__APPLE__) && !defined(PS3RECOMP_DISABLE_NATIVE_OSK)) || defined(PS3RECOMP_TEST_NATIVE_OSK)
+#if ((defined(__APPLE__) || (defined(_WIN32) && defined(PS3RECOMP_NATIVE_OSK_WINDOWS))) && !defined(PS3RECOMP_DISABLE_NATIVE_OSK)) || defined(PS3RECOMP_TEST_NATIVE_OSK)
 #define PS3RECOMP_NATIVE_OSK 1
 #endif
 #ifdef __cplusplus
@@ -31,6 +31,13 @@ int32_t osk_native_unload(uint32_t result);
 int32_t osk_native_get_text(uint32_t result);
 int32_t osk_native_abort(void);
 void cellOskDialog_tick(void);
+#if defined(_WIN32) && defined(PS3RECOMP_NATIVE_OSK_WINDOWS) && !defined(PS3RECOMP_DISABLE_NATIVE_OSK)
+#define OSK_NATIVE_HAS_WIN32_HOST 1
+void osk_native_win32_set_window(void* window);
+void osk_native_win32_pump(void);
+int osk_native_win32_handle_message(void* message);
+int osk_native_win32_input_active(void);
+#endif
 #ifdef __cplusplus
 }
 #endif

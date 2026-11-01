@@ -10,11 +10,15 @@ static int fixture_focus=2;
 static int fixture_connected=1;
 static unsigned focus_queries,file_opens;
 static WORD physical_buttons;
+static int physical_axes;
+static int fixture_osk_active;
+int osk_native_win32_input_active(void){return fixture_osk_active;}
 static ULONGLONG WINAPI fixture_ticks(void){return fixture_ms;}
 static HWND WINAPI fixture_foreground(void){++focus_queries;return fixture_focus?(HWND)(uintptr_t)1:NULL;}
 static DWORD WINAPI fixture_window_pid(HWND window,DWORD* pid){(void)window;*pid=GetCurrentProcessId()+(fixture_focus==2);return 1;}
 static DWORD WINAPI fixture_xinput(DWORD port,XINPUT_STATE* state){
     ZeroMemory(state,sizeof(*state));state->Gamepad.wButtons=physical_buttons;
+    if(physical_axes){state->Gamepad.sThumbLX=16384;state->Gamepad.sThumbLY=-16384;state->Gamepad.sThumbRX=24576;state->Gamepad.sThumbRY=-24576;}
     return port||!fixture_connected?ERROR_DEVICE_NOT_CONNECTED:ERROR_SUCCESS;
 }
 static FILE* fixture_fopen(const char* path,const char* mode){++file_opens;return fopen(path,mode);}
@@ -52,6 +56,11 @@ static void publish(const char* text){FILE*f=fopen(mailbox,"wb");assert(f);asser
 static long queued(void){FILE*f=fopen(mailbox,"rb");assert(f);assert(!fseek(f,0,SEEK_END));long n=ftell(f);assert(!fclose(f));return n;}
 static int report(int advance){if(advance)fixture_ms+=4;assert(cellPadGetData(0,(CellPadData*)(uintptr_t)0x100)==CELL_OK);return (int32_t)vm_read32(0x100);}
 static unsigned buttons(void){return vm_read16(0x108)|(vm_read16(0x10A)<<8);}
+static void neutral_payload(void){
+    assert(!buttons());
+    for(unsigned i=4;i<=7;i++)assert(vm_read16(0x104+2*i)==128);
+    for(unsigned i=8;i<=19;i++)assert(!vm_read16(0x104+2*i));
+}
 int main(int argc,char**argv){
     assert(argc==3);const char*mode=argv[1];mailbox=argv[2];
     static uint8_t memory[65536];vm_base=memory;ppu_vm_size=sizeof memory;
@@ -60,7 +69,22 @@ int main(int argc,char**argv){
     if(!strcmp(mode,"no-controller")){fixture_connected=0;assert(!_putenv_s("PAD_NO_KEYBOARD","1"));}
     if(!strcmp(mode,"long-path")){char path[600];memset(path,'x',sizeof(path)-1);path[sizeof(path)-1]=0;assert(!_putenv_s("PAD_FILE",path));}
     assert(cellPadInit(7)==CELL_OK);publish("0x4000 3\n");
-    if(!strcmp(mode,"long-path")){
+    if(!strcmp(mode,"osk-owner")){
+        assert(cellPadSetPortSetting(0,CELL_PAD_SETTING_PRESS_ON)==CELL_OK);
+        fixture_focus=1;assert(report(0)>0&&buttons()==CELL_PAD_CTRL_CROSS&&!queued());
+        unsigned header=vm_read16(0x106);
+        publish("0x0008 4\n");fixture_osk_active=1;physical_buttons=XINPUT_GAMEPAD_B;physical_axes=1;
+        assert(!report(0)&&!buttons()&&!queued());
+        assert(report(1)>0);neutral_payload();assert(vm_read16(0x106)==header);
+        assert(s_host_state[0].buttons==CELL_PAD_CTRL_CIRCLE && s_host_state[0].analog_lx!=128);
+        fixture_osk_active=0;assert(report(1)>0&&buttons()==CELL_PAD_CTRL_CIRCLE);
+        assert(vm_read16(0x104+2*CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X)!=128);
+        assert(vm_read16(0x104+2*CELL_PAD_BTN_OFFSET_PRESS_CIRCLE)==255);
+        assert(report(1)>0&&buttons()==CELL_PAD_CTRL_CIRCLE);
+        publish("0x4000 2\n");assert(report(1)>0&&buttons()==(CELL_PAD_CTRL_CROSS|CELL_PAD_CTRL_CIRCLE));
+        assert(report(1)>0&&buttons()==(CELL_PAD_CTRL_CROSS|CELL_PAD_CTRL_CIRCLE));
+        assert(report(1)>0&&buttons()==CELL_PAD_CTRL_CIRCLE);
+    }else if(!strcmp(mode,"long-path")){
         assert(report(0)>0&&!buttons()&&queued()>0&&!file_opens);
     }else if(!strcmp(mode,"late-unfocused")){
         assert(report(0)>0&&!buttons()&&!queued());

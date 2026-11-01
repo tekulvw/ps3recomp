@@ -19,6 +19,7 @@
 #include <time.h>
 #include "ps3emu/log_first.h"
 #include "rsx_d3d12_backend.h"
+#include "../misc/osk_native.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
@@ -6696,11 +6697,17 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     s_d3d.last_fps_time = GetTickCount64();
 
     printf("[D3D12] Backend ready: %ux%u\n", width, height);
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    osk_native_win32_set_window(s_d3d.hwnd);
+#endif
     return 0;
 }
 
 void rsx_d3d12_backend_shutdown(void)
 {
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    osk_native_win32_set_window(NULL);
+#endif
     if (!s_d3d.initialized) return;
 
     wait_for_gpu();
@@ -6738,11 +6745,25 @@ void rsx_d3d12_backend_shutdown(void)
 
 int rsx_d3d12_backend_pump_messages(void)
 {
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    osk_native_win32_pump();
+#endif
     MSG msg;
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+#else
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+#endif
         if (msg.message == WM_QUIT) return -1;
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+        if(osk_native_win32_handle_message(&msg))continue;
+#endif
         TranslateMessage(&msg);
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+        DispatchMessageW(&msg);
+#else
         DispatchMessageA(&msg);
+#endif
     }
     return s_d3d.window_closed ? -1 : 0;
 }
