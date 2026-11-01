@@ -57,6 +57,7 @@ void ppu_dump_bctrl_ring(uint32_t id,const char* t) {(void)id;(void)t;}
 static unsigned locked, notified, broken, flushed, live_flushed;
 static int external_backend,external_ready=1;
 static unsigned checked_calls;
+static int expect_live_ea;static unsigned live_ea_words;
 static u32 watched = 0x2000430;
 static unsigned watch_writes;
 static int expect_publication = 1;
@@ -110,7 +111,12 @@ int main(int argc,char**argv) {
     assert(vm_base!=MAP_FAILED);ppu_vm_size=0x4000000;ppu_hle_inject_base=0x3000000;
     memset(s_ea_address_table,0xFF,sizeof(s_ea_address_table));s_ea_address_table[0]=1;
     s_gcm_syscall_mode=1;raw32(GCM_CONTROL_GUEST_ADDR+8,0xA5A5A5A5u);
-    if(!strncmp(argv[1],"external_",9)) {
+    if(!strcmp(argv[1],"live_data_ea")) {
+        expect_live_ea=1;
+        raw32(0x100000,0x00087A00);raw32(0x100004,0x30000);raw32(0x100008,0x1A521);
+        cellGcm_syscall_set_fifo(12,0);cellGcm_rsx_process_fifo();
+        assert(live_ea_words==2);
+    } else if(!strncmp(argv[1],"external_",9)) {
         external_backend=1;
         assert(!cellGcm_checked_reference_ready());
         assert(!cellGcm_set_checked_completion(&external_backend,external_is_ready,NULL));
@@ -237,3 +243,12 @@ void rsx_draw_engine_mark_guest_dirty(u32 ea,u32 len) { (void)ea; (void)len; }
 void rsx_draw_engine_guest_read(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b;(void)c;(void)d;(void)e;}
 void rsx_draw_engine_guest_wrote(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b;(void)c;(void)d;(void)e;}
 void rsx_draw_engine_note_flip(u32 a) {(void)a;}
+
+void rsx_live_draw_method_at(u32 method,u32 arg,u32 data_ea) {
+    if(expect_live_ea){
+        assert(live_ea_words<2 && data_ea==0x100004+4*live_ea_words);
+        assert(method==0x7A00+4*live_ea_words);
+        assert(arg==(live_ea_words?0x1A521:0x30000));live_ea_words++;
+    }
+    rsx_live_draw_method(method,arg);
+}

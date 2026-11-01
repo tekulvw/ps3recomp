@@ -25,6 +25,9 @@ static PictureIdentity* pic_find(u64 token){for(unsigned i=0;i<PIC_SLOTS;++i)if(
 static int pic_tracked(u32 location,u32 offset){for(u32 i=0;i<pic_offset_count;++i)if(pic_offsets[i].location==location && pic_offsets[i].offset==offset)return 1;return 0;}
 static int pic_requires_identity(u32 location,u32 offset,u32 bytes){pic_enter();int result=0;for(u32 i=0;i<pic_offset_count;++i)if(pic_offsets[i].location==location && (u64)offset+bytes>pic_offsets[i].offset && (u64)pic_offsets[i].offset+pic_offsets[i].bytes>offset){result=1;break;}pic_leave();return result;}
 static int pic_pending_command(u32 ea){pic_enter();int result=0;if(pic_command_count)for(unsigned i=0;i<PIC_COMMANDS;++i)if(ea && pic_commands[i].ea==ea){result=1;break;}pic_leave();return result;}
+int rsx_picture_requires_identity(u32 location,u32 offset,u32 bytes){return pic_requires_identity(location,offset,bytes);}
+int rsx_picture_pending_command(u32 ea){return pic_pending_command(ea);}
+void rsx_picture_fail(void){pic_enter();pic_failed=1;pic_leave();}
 static void pic_drop(u64 token){PictureIdentity* p=pic_find(token);if(!p || !p->refs){pic_failed=1;return;}if(!--p->refs){pic_bytes-=p->bytes;free(p->pixels);memset(p,0,sizeof(*p));}}
 static int pic_hold(u64 token){PictureIdentity*p=pic_find(token);if(!p || p->refs==UINT32_MAX){pic_failed=1;return 0;}++p->refs;return 1;}
 u64 rsx_picture_create(u32 ea,u32 location,u32 offset,u32 bytes,const u8* pixels)

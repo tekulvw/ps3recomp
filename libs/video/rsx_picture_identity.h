@@ -10,6 +10,10 @@ u64 rsx_picture_create(u32 ea,u32 location,u32 offset,u32 bytes,const u8* pixels
 int rsx_picture_bind_descriptor(u32 descriptor,u64 token);
 int rsx_picture_capture_command(u32 data_ea,u32 descriptor,u32 location,u32 offset);
 int rsx_picture_take_command(u32 data_ea,u32 location,u32 offset,u64* token);
+/* Consumer queries share the same registry as descriptor/command ownership. */
+int rsx_picture_requires_identity(u32 location,u32 offset,u32 bytes);
+int rsx_picture_pending_command(u32 data_ea);
+void rsx_picture_fail(void);
 /* Borrowed bytes require the caller's retained token for the entire read;
  * never release that ownership concurrently. */
 const u8* rsx_picture_data(u64 token,u32 location,u32 offset,u32 bytes);

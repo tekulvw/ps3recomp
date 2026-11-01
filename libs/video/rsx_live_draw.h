@@ -69,6 +69,9 @@ void rsx_live_draw_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 
 /* Feed one NV method write. No-op when disabled or uninitialized. */
 void rsx_live_draw_method(u32 method, u32 arg);
+#define RSX_LIVE_HAS_PICTURE_IDENTITIES 1
+/* FIFO consumer entry: data_ea identifies the command's immutable picture. */
+void rsx_live_draw_method_at(u32 method, u32 arg, u32 data_ea);
 
 /* Publish the FIFO bounds associated with the next flip method.  The live
  * consumer calls this only for driver-queue methods; ordinary method traffic

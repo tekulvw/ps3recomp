@@ -146,3 +146,5 @@ int main(int argc, char** argv)
     free(vm_base);
     return fails ? 1 : 0;
 }
+
+void rsx_live_draw_method_at(u32 method,u32 arg,u32 data_ea) { (void)data_ea;rsx_live_draw_method(method,arg); }

@@ -210,3 +210,5 @@ int rsx_draw_engine_flush_checked(void) { checked_flushes++; return fixture_gpu_
 
 /* Backend boundary required by the production guest-memory transfer path. */
 void rsx_draw_engine_mark_guest_dirty(u32 ea,u32 len) { (void)ea; (void)len; }
+
+void rsx_live_draw_method_at(u32 method,u32 arg,u32 data_ea) { (void)data_ea;rsx_live_draw_method(method,arg); }

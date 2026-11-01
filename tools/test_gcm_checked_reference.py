@@ -28,5 +28,5 @@ with tempfile.TemporaryDirectory(prefix="gcm-report-") as tmp:
            "-pthread", "-lm", "-o", str(out)]
     subprocess.run(cmd, check=True, timeout=60)
 
-    for mode in ("park_patch","park_branch","park_wrap","park_invalid","circling","invalid_jump","held","repeat_wrap","malformed","incomplete","success","failure","rescue","overflow","external_success","external_failure","external_notready","external_report_success","external_report_failure","external_held"):
+    for mode in ("live_data_ea","park_patch","park_branch","park_wrap","park_invalid","circling","invalid_jump","held","repeat_wrap","malformed","incomplete","success","failure","rescue","overflow","external_success","external_failure","external_notready","external_report_success","external_report_failure","external_held"):
         subprocess.run([str(out),mode],check=True,timeout=10)

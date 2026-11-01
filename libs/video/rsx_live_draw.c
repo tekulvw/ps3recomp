@@ -37,6 +37,7 @@ void rsx_live_draw_set_display_buffer(
     u32 b, u32 l, u32 o, u32 p, u32 w, u32 h)
 { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
+void rsx_live_draw_method_at(u32 m, u32 a, u32 ea) { (void)m; (void)a; (void)ea; }
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
 void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
 { (void)d; (void)o; (void)v; }
@@ -103,6 +104,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <initguid.h>
 #include <d3d12.h>
 #include "rsx_d3d12_checked_fence.h"
+#include "rsx_picture_identity.h"
 #include <stdatomic.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
@@ -256,6 +258,7 @@ typedef struct {
     u64 content_hash;
     u32 last_hash_frame;
     u64 last_use_serial;
+    u64 picture_token;
 } texcache_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch;
@@ -399,6 +402,20 @@ typedef struct {
 } ld_state;
 
 static ld_state g;
+/* Only the serialized FIFO consumer owns these binding references. */
+static u64 s_picture_bound[16];
+static u32 s_picture_offset_ea[16];
+static u8 s_picture_offset_pending[16];
+static void ld_picture_fail(void) { rsx_picture_fail();g.ready=0; }
+static int ld_picture_resolve(u32 unit)
+{
+    if(!s_picture_offset_pending[unit])return rsx_picture_ready();
+    rsx_dsp_texture t;rsx_dsp_get_texture(&g.rsx,unit,&t);u64 token=0;
+    if(rsx_picture_take_command(s_picture_offset_ea[unit],t.location,t.offset,&token)<0){
+        ld_picture_fail();return 0;
+    }
+    s_picture_bound[unit]=token;s_picture_offset_pending[unit]=0;return 1;
+}
 
 #define LD_VERTEX_HOIST_FETCH       (1u << 0)
 #define LD_VERTEX_MASK_SIGNATURE    (1u << 1)
@@ -1800,21 +1817,37 @@ void rsx_live_draw_flush(void)
 {
     if (g.ready) ld_flush(LD_FLUSH_GUEST_REFERENCE);
 }
-int rsx_live_draw_checked_ready(void) { return g.ready!=0; }
+int rsx_live_draw_checked_ready(void) { return g.ready && rsx_picture_ready(); }
 int rsx_live_draw_flush_checked(void)
 {
-    if(!g.ready || g.rsx.in_begin_end) return 0;
+    if(!g.ready || !rsx_picture_ready() || g.rsx.in_begin_end) return 0;
     ld_flush(LD_FLUSH_GUEST_REFERENCE);
-    return g.ready!=0;
+    return g.ready && rsx_picture_ready();
 }
 
-static void retire_texture(ID3D12Resource* tex)
+static int retire_texture(ID3D12Resource* tex)
 {
-    if (!tex) return;
+    if (!tex) return 1;
     if (g.n_retired_textures >= MAX_RETIRED_TEXTURES)
         ld_flush(LD_FLUSH_RETIRE_QUEUE);
+    if(!g.ready || g.n_retired_textures>=MAX_RETIRED_TEXTURES){g.ready=0;return 0;}
     g.retired_textures[g.n_retired_textures++] = tex;
     ld_profile_note_ring_highwater();
+    return 1;
+}
+static int ld_picture_unbind(u32 unit)
+{
+    const u64 token=s_picture_bound[unit];s_picture_bound[unit]=0;
+    if(!token)return 1;
+    for(u32 i=0;i<16;i++)if(s_picture_bound[i]==token){rsx_picture_release(token);return 1;}
+    /* A decoded movie must not keep one GPU allocation for every past frame.
+     * Earlier draws own copied descriptors; retire their resource at the fence. */
+    for(u32 i=0;i<g.n_textures;i++)if(g.textures[i].picture_token==token){
+        ID3D12Resource* old=g.textures[i].tex;
+        if(!retire_texture(old)){s_picture_bound[unit]=token;return 0;}
+        memset(&g.textures[i],0,sizeof(g.textures[i]));
+    }
+    rsx_picture_release(token);return 1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2096,10 +2129,22 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
     return t->cubemap ? span * 6 : span;
 }
 
-static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
+static const u8* texture_source(const rsx_dsp_texture* t,u32 span,u64 token)
+{
+    if(token){
+        const u8* result=rsx_picture_data(token,t->location,t->offset,span);
+        if(!result)ld_picture_fail();
+        return result;
+    }
+    if(rsx_picture_requires_identity(t->location,t->offset,span)){
+        ld_picture_fail();return NULL;
+    }
+    return span?guest_ptr(t->location,t->offset,span):NULL;
+}
+static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable,u64 token)
 {
     const u32 span = texture_source_span(t);
-    const u8* src = span ? guest_ptr(t->location, t->offset, span) : NULL;
+    const u8* src = texture_source(t,span,token);
     if (!src) {
         *readable = 0;
         return 0;
@@ -2148,7 +2193,7 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
     return hash;
 }
 
-static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap,u64 token)
 {
     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
     const int linear = (t->format & TEX_FMT_LINEAR) != 0;
@@ -2177,7 +2222,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
                                                            : DXGI_FORMAT_BC3_UNORM;
         const u32 block = base_fmt == TEX_FMT_DXT1 ? 8 : 16;
         const u32 total = texture_source_span(t);
-        const u8* src = guest_ptr(t->location, t->offset, total);
+        const u8* src = texture_source(t,total,token);
         if (!src) return NULL;
         if (t->cubemap) {
             n_mips = 1;
@@ -2239,7 +2284,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
     }
     if (!linear && ((w & (w - 1)) || (h & (h - 1)))) return NULL;
     const u32 span = texture_source_span(t);
-    const u8* src = guest_ptr(t->location, t->offset, span);
+    const u8* src = texture_source(t,span,token);
     if (!src) return NULL;
 
     if (t->cubemap) {
@@ -2397,13 +2442,13 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
 }
 
 static ID3D12Resource* decode_guest_texture_profiled(
-    const rsx_dsp_texture* texture, u32 remap)
+    const rsx_dsp_texture* texture, u32 remap,u64 token)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG begin = ld_profile_qpc();
     g_ld_profile.total.texture_decode_calls++;
 #endif
-    ID3D12Resource* result = decode_guest_texture(texture, remap);
+    ID3D12Resource* result = decode_guest_texture(texture, remap,token);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.texture_decode_qpc +=
         (u64)(ld_profile_qpc() - begin);
@@ -2470,7 +2515,7 @@ static void write_texture_srv(u32 index, const texcache_t* entry)
 /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
  * descriptor-only cache, re-hash the source once per frame and refresh the
  * D3D resource when the game rewrites the same guest address. */
-static u32 texture_srv_slot(const rsx_dsp_texture* t)
+static u32 texture_srv_slot(const rsx_dsp_texture* t,u64 token)
 {
     const u32 remap = t->remap & 0xFFFF;
     static int refresh_enabled = -1;
@@ -2479,7 +2524,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
 
     for (u32 i = 0; i < g.n_textures; i++) {
         texcache_t* entry = &g.textures[i];
-        if (entry->location != t->location || entry->offset != t->offset ||
+        if (entry->picture_token!=token || entry->location != t->location || entry->offset != t->offset ||
             entry->format != t->format || entry->width != t->width ||
             entry->height != t->height || entry->pitch != t->pitch ||
             entry->remap != remap || entry->cubemap != t->cubemap)
@@ -2487,7 +2532,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         if (refresh_enabled && entry->tex &&
             entry->last_hash_frame != g_ld_frames) {
             int readable = 0;
-            const u64 hash = texture_content_hash(t, &readable);
+            const u64 hash = texture_content_hash(t, &readable,token);
             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
              * reads are microseconds apart, so they can only disagree if a
              * guest thread is writing this texture right now -- i.e. we are
@@ -2497,7 +2542,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
               if (race < 0) race = getenv("LD_TEX_RACE") ? 1 : 0;
               if (race && readable) {
                   int r2 = 0;
-                  const u64 again = texture_content_hash(t, &r2);
+                  const u64 again = texture_content_hash(t, &r2,token);
                   static unsigned long long checks = 0, torn = 0;
                   checks++;
                   if (r2 && again != hash) torn++;
@@ -2535,7 +2580,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             entry->last_hash_frame = g_ld_frames;
             if (readable && hash != entry->content_hash) {
                 ID3D12Resource* replacement =
-                    decode_guest_texture_profiled(t, remap);
+                    decode_guest_texture_profiled(t, remap,token);
                 if (replacement) {
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
@@ -2559,8 +2604,11 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
 
     u32 index;
     ID3D12Resource* evicted = NULL;
-    const int cache_was_full = g.n_textures >= MAX_TEXTURES;
-    if (!cache_was_full) {
+    for(index=0;index<g.n_textures;index++)if(!g.textures[index].tex && !g.textures[index].width)break;
+    const int cache_was_full = index==g.n_textures && g.n_textures >= MAX_TEXTURES;
+    if(index<g.n_textures){
+        /* Reuse a retired immutable-picture cache slot. */
+    } else if (!cache_was_full) {
         index = g.n_textures++;
     } else {
         /*
@@ -2600,11 +2648,12 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     replacement.cubemap = t->cubemap;
     replacement.last_hash_frame = g_ld_frames;
     replacement.last_use_serial = ++g_ld_texture_use_serial;
+    replacement.picture_token=token;
     {
         int readable = 0;
-        replacement.content_hash = texture_content_hash(t, &readable);
+        replacement.content_hash = texture_content_hash(t, &readable,token);
     }
-    replacement.tex = decode_guest_texture_profiled(t, remap);
+    replacement.tex = decode_guest_texture_profiled(t, remap,token);
     if (replacement.tex) {
         texcache_t* entry = &g.textures[index];
         if (evicted)
@@ -2612,6 +2661,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         *entry = replacement;
         write_texture_srv(index, entry);
     } else {
+        if(token)ld_picture_fail();
         if (!cache_was_full)
             g.textures[index] = replacement;
         g_ld_texture_decode_fail++;
@@ -7477,6 +7527,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         if (!t.enabled) continue;
         texture_mask |= 1u << u;
         smp_slots[u] = sampler_slot(&t, sampler_key(&t));
+        if(!ld_picture_resolve(u))return;
+        if(s_picture_bound[u] || rsx_picture_requires_identity(t.location,t.offset,texture_source_span(&t))){
+            slots[u]=texture_srv_slot(&t,s_picture_bound[u]);
+            if(!g.ready || !rsx_picture_ready())return;
+            g_ld_bind_real++;continue;
+        }
         /* Pick WHICH surface at this offset to sample.
          *
          * Matching on (location, offset) alone was fine when only one surface
@@ -7685,7 +7741,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                 if (!seen && n_zdepth_used < SRV_TABLE_SIZE)
                     zdepth_used[n_zdepth_used++] = (u32)sampled_depth;
             } else {
-                slots[u] = texture_srv_slot(&t);
+                slots[u] = texture_srv_slot(&t,0);
                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
             }
         }
@@ -8576,7 +8632,33 @@ void rsx_live_draw_set_display_buffer(
             buffer_id, location, offset, pitch, width, height);
 }
 
-void rsx_live_draw_method(u32 method, u32 arg)
+static void ld_method_core(u32 method,u32 arg,u32 data_ea)
+{
+    if(!g.ready || !rsx_picture_ready())return;
+    const u32 raw=method&0xFFFCu;
+    /* Driver queue opcodes retain their encoded subchannel bits. All other
+     * NV methods are independent of their binding slot, including slot 7. */
+    const int driver=raw==0xE920u || raw==0xE924u || raw==0xE944u || raw==0xEB00u || raw==0xEB04u;
+    const u32 m=driver?raw:(method&0x1FFCu);
+    if(m>=0x1A00 && m<0x1C00 && g.rsx.in_begin_end && dc.n_packets){
+        const u32 unit=(m-0x1A00)/32;
+        if(s_picture_bound[unit] || rsx_picture_pending_command(s_picture_offset_ea[unit]) || rsx_picture_pending_command(data_ea)){
+            ld_picture_fail();return;
+        }
+    }
+    if(m>=0x1A00 && m<0x1C00 && !((m-0x1A00)&31)){
+        const u32 unit=(m-0x1A00)/32;
+        if(s_picture_offset_pending[unit] && rsx_picture_pending_command(s_picture_offset_ea[unit])){
+            ld_picture_fail();return;
+        }
+        if(!ld_picture_unbind(unit))return;
+        s_picture_offset_ea[unit]=data_ea;s_picture_offset_pending[unit]=1;
+    }
+    rsx_dispatch_method(&g.rsx,m,arg);
+    if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))ld_picture_resolve((m-0x1A04)/32);
+}
+void rsx_live_draw_method(u32 method,u32 arg) {rsx_live_draw_method_at(method,arg,0);}
+void rsx_live_draw_method_at(u32 method, u32 arg,u32 data_ea)
 {
     /* Bounded ingress trace for the a010 live-vs-capture comparison.  Keep the
      * raw method (including its FIFO subchannel bits) visible: if an SPU-built
@@ -8626,7 +8708,7 @@ void rsx_live_draw_method(u32 method, u32 arg)
                         return;
                     }
                 }
-                rsx_dispatch_method(&g.rsx, method, arg);
+                ld_method_core(method,arg,data_ea);
                 ReleaseSRWLockExclusive(&g_ld_access_lock);
                 return;
             }
@@ -8634,7 +8716,7 @@ void rsx_live_draw_method(u32 method, u32 arg)
             MemoryBarrier();
             if (!g_ld_movie_mode && !g_ld_host_waiting) {
                 if (g.ready)
-                    rsx_dispatch_method(&g.rsx, method, arg);
+                    ld_method_core(method,arg,data_ea);
                 InterlockedDecrement(&g_ld_guest_active);
                 return;
             }
@@ -8648,7 +8730,7 @@ void rsx_live_draw_method(u32 method, u32 arg)
             g_ld_movie_track_rsx = getenv("RSX_MOVIE_TRACK") ? 1 : 0;
         if (!g_ld_movie_track_rsx) return;
     }
-    rsx_dispatch_method(&g.rsx, method, arg);
+    ld_method_core(method,arg,data_ea);
 }
 
 void rsx_live_draw_set_movie_mode(int on)
@@ -10327,6 +10409,11 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
+    /* Uploads copy immutable CPU bytes; D3D resources retain GPU ownership. */
+    for(u32 i=0;i<16;i++){
+        rsx_picture_release(s_picture_bound[i]);s_picture_bound[i]=0;
+        s_picture_offset_pending[i]=0;s_picture_offset_ea[i]=0;
+    }
     if (!g.ready) return;
     ld_vertex_diag_emit("shutdown", 1);
     ld_present_measure_dump();

@@ -3101,7 +3101,7 @@ static void gcm_rsx_process_fifo_pass(void)
                  * canonicalises with & 0x1FFC itself. */
                 { static int live = -1;
                   if (live < 0) live = rsx_live_draw_enabled();
-                  if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
+                  if (live) rsx_live_draw_method_at((subch << 13) | m, vm_read32(dea),dea); }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
                  * what a frame is actually made of when nothing draws. */
