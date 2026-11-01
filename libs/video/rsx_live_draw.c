@@ -73,6 +73,7 @@ void rsx_live_draw_shutdown(void) {}
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "rsx_dispatch.h"
+#include "rsx_texture_layout.h"
 #include "rsx_fp_decompiler.h"
 static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_surf = 0;
 /* Set once PS1 VRAM actually holds a drawn frame (see the PS1_PC heartbeat).
@@ -2068,10 +2069,38 @@ static ID3D12Resource* create_texture_rgba(const u8* rgba, u32 w, u32 h)
     return create_texture_mipped(DXGI_FORMAT_R8G8B8A8_UNORM, &lv, 1);
 }
 
+/* Float4 keeps its native precision. Share the layout rules with the other
+ * backends instead of routing it through the live RGBA8 decoder. */
+static u32 texture_float4_layout(const rsx_dsp_texture* t,
+                                rsx_tex_level levels[RSX_MAX_TEXTURE_LEVELS],
+                                u32* count)
+{
+    const int linear = (t->format & TEX_FMT_LINEAR) != 0;
+    if (!t->width || !t->height || t->width > 4096 || t->height > 4096 ||
+        t->dimension != 2 || (t->cubemap && t->width != t->height) ||
+        (linear && t->pitch && t->pitch < t->width * 16u) ||
+        (!linear && ((t->width & (t->width - 1u)) ||
+                     (t->height & (t->height - 1u)))))
+        return 0;
+    const u32 n = rsx_texture_mip_chain(t->format, t->width, t->height,
+        linear ? 1u : t->mipmaps, t->pitch, levels);
+    if (!n) return 0;
+    const u64 face = (u64)levels[n - 1].offset + levels[n - 1].tl.face_bytes;
+    const u64 stride = t->cubemap ? (face + 127u) & ~(u64)127u : face;
+    const u64 span = stride * (t->cubemap ? 6u : 1u);
+    if (span > UINT32_MAX) return 0;
+    *count = n;
+    return (u32)span;
+}
+
 static u32 texture_source_span(const rsx_dsp_texture* t)
 {
     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
     const int linear = (t->format & TEX_FMT_LINEAR) != 0;
+    if (base_fmt == RSX_TEX_FMT_W32Z32Y32X32_FLOAT) {
+        rsx_tex_level levels[RSX_MAX_TEXTURE_LEVELS]; u32 count;
+        return texture_float4_layout(t, levels, &count);
+    }
     u32 texel_size = 0, block_size = 0;
     switch (base_fmt) {
     case TEX_FMT_DXT1:  block_size = 8; break;
@@ -2193,9 +2222,55 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable,u64 toke
     return hash;
 }
 
+static ID3D12Resource* decode_guest_float4(const rsx_dsp_texture* t, u64 token)
+{
+    rsx_tex_level layout[RSX_MAX_TEXTURE_LEVELS]; u32 n_mips;
+    const u32 span = texture_float4_layout(t, layout, &n_mips);
+    if (!span) return NULL;
+    const u8* src = texture_source(t, span, token);
+    if (!src) return NULL;
+    const u32 faces = t->cubemap ? 6u : 1u;
+    const u32 face_stride = span / faces;
+    /* Check the whole upload before recording any copy. The common uploaders
+     * cannot represent a texture whose footprints exceed this ring. */
+    u64 upload = g.upload_used;
+    for (u32 face = 0; face < faces; face++)
+        for (u32 mip = 0; mip < n_mips; mip++) {
+            upload = ((upload + 511u) & ~(u64)511u) +
+                (u64)((layout[mip].tl.dst_row_bytes + 255u) & ~255u) * layout[mip].h;
+            if (upload > UPLOAD_SIZE) return NULL;
+        }
+    u8* staging[6 * RSX_MAX_TEXTURE_LEVELS] = {0};
+    tex_level_t levels[6 * RSX_MAX_TEXTURE_LEVELS];
+    u32 prepared = 0;
+    for (u32 face = 0; face < faces; face++)
+        for (u32 mip = 0; mip < n_mips; mip++) {
+            const rsx_tex_level* level = &layout[mip];
+            const u32 index = face * n_mips + mip;
+            staging[index] = (u8*)malloc((size_t)level->tl.dst_row_bytes * level->h);
+            if (!staging[index]) goto done;
+            prepared++;
+            rsx_texture_decode(staging[index], level->tl.dst_row_bytes,
+                src + (size_t)face * face_stride + level->offset,
+                level->w, level->h, &level->tl, 0);
+            levels[index] = (tex_level_t){level->w, level->h, staging[index],
+                                         level->tl.dst_row_bytes, level->h};
+        }
+done: ;
+    ID3D12Resource* result = NULL;
+    if (prepared == faces * n_mips)
+        result = t->cubemap
+            ? create_texture_cube(DXGI_FORMAT_R32G32B32A32_FLOAT, levels, n_mips)
+            : create_texture_mipped(DXGI_FORMAT_R32G32B32A32_FLOAT, levels, n_mips);
+    for (u32 i = 0; i < prepared; i++) free(staging[i]);
+    return result;
+}
+
 static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap,u64 token)
 {
     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    if (base_fmt == RSX_TEX_FMT_W32Z32Y32X32_FLOAT)
+        return decode_guest_float4(t, token);
     const int linear = (t->format & TEX_FMT_LINEAR) != 0;
     const u32 w = t->width, h = t->height;
     if (!w || !h || w > 4096 || h > 4096 || t->dimension != 2)
@@ -2459,6 +2534,24 @@ static ID3D12Resource* decode_guest_texture_profiled(
 static void write_texture_srv(u32 index, const texcache_t* entry)
 {
     const u32 base_fmt = entry->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    if (base_fmt == RSX_TEX_FMT_W32Z32Y32X32_FLOAT) {
+        u8 mapping[4];
+        rsx_texture_component_remap(entry->remap, entry->format, mapping);
+        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
+        desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        desc.Shader4ComponentMapping = mapping[1] | ((u32)mapping[2] << 3) |
+            ((u32)mapping[3] << 6) | ((u32)mapping[0] << 9) | (1u << 12);
+        if (entry->cubemap) {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            desc.TextureCube.MipLevels = (UINT)-1;
+        } else {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            desc.Texture2D.MipLevels = (UINT)-1;
+        }
+        g.dev->lpVtbl->CreateShaderResourceView(
+            g.dev, entry->tex, &desc, srv_cpu(SRV_TEXTURE_BASE + index));
+        return;
+    }
     const int compressed = base_fmt == TEX_FMT_DXT1 ||
                            base_fmt == TEX_FMT_DXT23 ||
                            base_fmt == TEX_FMT_DXT45;
