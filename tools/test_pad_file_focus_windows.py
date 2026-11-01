@@ -24,7 +24,8 @@ def main():
                         '/Fo'+str(work/'fixture.obj'), '/Fe'+str(binary), '/link', 'user32.lib', 'xinput.lib'],
                        cwd=work, check=True, timeout=60)
         env = {k: v for k, v in os.environ.items() if not k.startswith(('PAD_', 'YDKJ_'))}
-        for mode in ('osk-owner','late-unfocused', 'locked-admission', 'focused', 'no-controller', 'blocked-discard', 'long-path', 'legacy', 'zero', 'no-file'):
+        for mode in ('analog-reparse','reparse','analog','analog-no-controller','analog-focus','analog-osk','analog-invalid','analog-locked','analog-mixed','analog-off','analog-no-focus',
+                     'osk-owner','late-unfocused', 'locked-admission', 'focused', 'no-controller', 'blocked-discard', 'long-path', 'legacy', 'zero', 'no-file'):
             subprocess.run([str(binary), mode, str(work/(mode+'.txt'))],
                            cwd=work, env=env, check=True, timeout=10)
     return 0

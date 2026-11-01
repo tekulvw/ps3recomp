@@ -23,7 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include "pad_file_analog_win32.h"
+#else
 #include "pad_file_analog_io.h"
 #endif
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
@@ -613,6 +615,9 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 
     if (port_no >= s_max_connect || !data_guest)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+#ifdef _WIN32
+    int analog_allowed=0;
+#endif
 
     /* Build in a local host struct, then copy to guest memory big-endian. */
     CellPadData _d; CellPadData* data = &_d;
@@ -823,9 +828,12 @@ skip_inject: ;
                   held_mask=0;held_n=0;admit=0;
                   HANDLE file=CreateFileA(pf_path,GENERIC_WRITE,
                       FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,
-                      TRUNCATE_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+                      OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OPEN_REPARSE_POINT,NULL);
                   if (file!=INVALID_HANDLE_VALUE) {
-                      if (CloseHandle(file) && focused) discard_pending=0;
+                      LARGE_INTEGER zero;zero.QuadPart=0;
+                      const int cleared=pad_file_windows_ordinary(file)
+                          && SetFilePointerEx(file,zero,NULL,FILE_BEGIN)&&SetEndOfFile(file);
+                      if (CloseHandle(file) && cleared && focused) discard_pending=0;
                   } else {
                       DWORD error=GetLastError();
                       if (focused && (error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND))
@@ -834,6 +842,7 @@ skip_inject: ;
                   if (!discard_pending) { printf("[cellPad] PAD_FILE focus ready; pending commands discarded\n");fflush(stdout); }
               }
           }
+          analog_allowed=require_focus&&admit;
 #endif
           if (admit) {
           if (held_n <= 0) {
@@ -842,10 +851,10 @@ skip_inject: ;
                   /* Read and consume the same inspected file before admitting
                    * input. A read-only sharing lock must not cause replay. */
                   HANDLE file=CreateFileA(pf_path,GENERIC_READ|GENERIC_WRITE,
-                      FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+                      FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OPEN_REPARSE_POINT,NULL);
                   if (file!=INVALID_HANDLE_VALUE) {
                       char buf[64]={0};DWORD bytes=0;unsigned mask=0;int reports=0;
-                      if (ReadFile(file,buf,sizeof buf-1,&bytes,NULL) && bytes) {
+                      if (pad_file_windows_ordinary(file) && ReadFile(file,buf,sizeof buf-1,&bytes,NULL) && bytes) {
                           char* rest;mask=(unsigned)strtoul(buf,&rest,0);
                           reports=(int)strtol(rest,NULL,0);
                       }
@@ -1027,22 +1036,34 @@ emit:
      * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
-#ifndef _WIN32
         /* Optional owned PAD_FILE A1 extension. Hold the diagnostic lock through
          * the actual guest copy; len=0 drain reads never consume a hold/release. */
         uint8_t injected_axes[4];int injected_active=0;
+#ifdef _WIN32
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+        if(osk_native_win32_input_active())analog_allowed=0;
+#endif
+        int injected_lock=port_no==0&&pad_file_analog_begin(pad_now_ms(),injected_axes,&injected_active,analog_allowed);
+        /* A disconnected host's cached axes can still be zero. This optional
+         * virtual controller must stay neutral between acknowledged commands. */
+        if(port_no==0 && !s_host_state[0].connected && pad_file_analog_enabled() && !injected_active){
+            memset(injected_axes,128,sizeof injected_axes);injected_active=1;
+        }
+#else
         int injected_lock=port_no==0&&pad_file_analog_begin(pad_now_ms(),injected_axes,&injected_active);
+#endif
         if(injected_active){
             data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]=injected_axes[0];
             data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]=injected_axes[1];
             data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X]=injected_axes[2];
             data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y]=injected_axes[3];
         }
-#endif
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
         for (int _i = 0; _i < CELL_PAD_MAX_CODES; _i++)                    /* button[] u16 */
             vm_write16((unsigned long long)ea + 4 + (unsigned int)_i * 2, data->button[_i]);
-#ifndef _WIN32
+#ifdef _WIN32
+        if(injected_lock)pad_file_analog_commit(data->len>0,(long)GetCurrentProcessId());
+#else
         if(injected_lock)pad_file_analog_commit(data->len>0,(long)getpid());
 #endif
     }

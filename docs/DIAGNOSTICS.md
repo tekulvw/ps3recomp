@@ -507,10 +507,31 @@ not changed while a title runs.
 - **`PAD_FILE`** — _(no description in source)_
   `libs/input/cellPad.c:665`
 
+- **`PAD_FILE_ANALOG_NONCE`** — Enable the optional closed-loop A1 controller
+  channel. On Windows this also requires `PAD_FILE_REQUIRE_FOCUS=1` and a
+  drive-absolute `PAD_FILE` path shorter than 512 bytes. Use a fresh nonce of
+  1–64 ASCII letters, digits, `_`, or `-` for each owned run.
+  A command is `A1 NONCE SEQUENCE REPORTS DEADLINE_MS LX LY RX RY` with decimal
+  fields. Sequences increase, axes are 0–255, and a hold has at most 120 positive
+  guest reports and a deadline within the next 10 seconds of the host monotonic
+  clock (`GetTickCount64` on Windows). Zero reports explicitly releases all four
+  axes and requires four neutral values of 128. Drain polls never advance a
+  hold or certify release. `<PAD_FILE>.ack` is atomically replaced only after
+  the actual neutral guest packet; it records the session, sequence, PID,
+  delivered/requested counts, axes, and terminal status. Windows focus or OSK
+  cancellation reports `canceled`, clears held and queued input, and requires
+  a fresh command after the focused-ready observation. Invalid, stale, or
+  unconsumable requests stay unadmitted. Legacy button commands keep their
+  existing behavior; cached physical controller state remains intact. An enabled
+  Windows A1 channel keeps a disconnected virtual pad's idle axes neutral.
+  `libs/input/pad_file_analog.h`, `libs/input/pad_file_analog_win32.h`
+
 - **`PAD_FILE_REQUIRE_FOCUS=1`** — Windows only: cancel held and queued `PAD_FILE`
   commands when the foreground window belongs to another process or is absent.
   Cancellation runs on drain reads too. Failed mailbox truncation keeps input
   blocked until the stale request is discarded; missing files are not created.
+  Admission and cancellation inspect an ordinary disk handle without following
+  a final reparse point; rejected handles keep cancellation blocked.
   The first focused poll purges again, then logs `PAD_FILE focus ready`; submit
   a fresh command after that observation. Focus return never resumes canceled
   input. Physical controller input and the default mailbox behavior remain unchanged.
