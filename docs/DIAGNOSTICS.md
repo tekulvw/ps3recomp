@@ -506,6 +506,15 @@ not changed while a title runs.
   `libs/input/cellPad.c:595`
 - **`PAD_FILE`** — _(no description in source)_
   `libs/input/cellPad.c:665`
+
+- **`PAD_FILE_REQUIRE_FOCUS=1`** — Windows only: cancel held and queued `PAD_FILE`
+  commands when the foreground window belongs to another process or is absent.
+  Cancellation runs on drain reads too. Failed mailbox truncation keeps input
+  blocked until the stale request is discarded; missing files are not created.
+  The first focused poll purges again, then logs `PAD_FILE focus ready`; submit
+  a fresh command after that observation. Focus return never resumes canceled
+  input. Physical controller input and the default mailbox behavior remain unchanged.
+  `libs/input/cellPad.c`
 - **`PAD_NO_KEYBOARD`** — _(no description in source)_
   `libs/input/cellPad.c:146`
 - **`PAD_SCRIPT`** — _(no description in source)_

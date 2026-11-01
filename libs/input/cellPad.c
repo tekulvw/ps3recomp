@@ -780,14 +780,82 @@ skip_inject: ;
      *   echo 0x4000 > pad.txt    # CROSS
      *   echo 0x0040 4 > pad.txt  # DOWN for 4 reports (menus auto-repeat a
      *                            # long hold; the default is 40)
+     * Windows PAD_FILE_REQUIRE_FOCUS=1 cancels held and queued mailbox input
+     * whenever another process (or no window) owns foreground focus. Reacquiring
+     * focus requires a fresh command. Default mailbox behavior is unchanged.
      */
     { static int s_pf = -1; static char pf_path[512];
       static unsigned held_mask = 0; static int held_n = 0;
+#ifdef _WIN32
+      static int require_focus = 0, discard_pending = 0, last_focus = -1;
+#endif
       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
                       s_pf = (e && *e) ? 1 : 0;
+#ifdef _WIN32
+                      const char* focus = getenv("PAD_FILE_REQUIRE_FOCUS");
+                      require_focus = focus && !strcmp(focus,"1");
+                      if (s_pf && require_focus && strlen(e)>=sizeof pf_path) {
+                          fprintf(stderr,"[cellPad] focused PAD_FILE path is too long; mailbox input disabled\n");
+                          s_pf=0;
+                      }
+#endif
                       if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
       if (s_pf && port_no == 0) {
+          int admit = 1;
+#ifdef _WIN32
+          if (require_focus) {
+              const int focused=pad_host_window_focused();
+              if (!focused) {
+                  if (last_focus!=0) { printf("[cellPad] PAD_FILE focus lost; canceling mailbox input\n");fflush(stdout); }
+                  discard_pending=1;
+              } else if (last_focus<0 && !discard_pending) {
+                  printf("[cellPad] PAD_FILE focus ready\n");fflush(stdout);
+              }
+              last_focus=focused;
+              if (discard_pending) {
+                  /* Cancel even on len0 drain reads. Never replay a held or
+                   * queued command after focus returns. Keep blocking if the
+                   * existing mailbox cannot be discarded (e.g. sharing lock). */
+                  held_mask=0;held_n=0;admit=0;
+                  HANDLE file=CreateFileA(pf_path,GENERIC_WRITE,
+                      FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,
+                      TRUNCATE_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+                  if (file!=INVALID_HANDLE_VALUE) {
+                      if (CloseHandle(file) && focused) discard_pending=0;
+                  } else {
+                      DWORD error=GetLastError();
+                      if (focused && (error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND))
+                          discard_pending=0;
+                  }
+                  if (!discard_pending) { printf("[cellPad] PAD_FILE focus ready; pending commands discarded\n");fflush(stdout); }
+              }
+          }
+#endif
+          if (admit) {
           if (held_n <= 0) {
+#ifdef _WIN32
+              if (require_focus) {
+                  /* Read and consume the same inspected file before admitting
+                   * input. A read-only sharing lock must not cause replay. */
+                  HANDLE file=CreateFileA(pf_path,GENERIC_READ|GENERIC_WRITE,
+                      FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+                  if (file!=INVALID_HANDLE_VALUE) {
+                      char buf[64]={0};DWORD bytes=0;unsigned mask=0;int reports=0;
+                      if (ReadFile(file,buf,sizeof buf-1,&bytes,NULL) && bytes) {
+                          char* rest;mask=(unsigned)strtoul(buf,&rest,0);
+                          reports=(int)strtol(rest,NULL,0);
+                      }
+                      LARGE_INTEGER zero;zero.QuadPart=0;
+                      const int consumed=mask && SetFilePointerEx(file,zero,NULL,FILE_BEGIN) && SetEndOfFile(file);
+                      const int closed=CloseHandle(file)!=0;
+                      if (consumed && closed) {
+                          held_mask=mask;held_n=reports>0?reports:40;
+                          printf("[cellPad] PAD_FILE press 0x%04X\n",mask);fflush(stdout);
+                      }
+                  }
+              } else
+#endif
+              {
               FILE* f = fopen(pf_path, "rb");
               if (f) {
                   char buf[64]; buf[0] = 0;
@@ -801,11 +869,13 @@ skip_inject: ;
                   fclose(f);
                   if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
               }
+              }
           }
           if (held_n > 0) {
               if (data->len > 0) held_n--;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
+          }
       } }
 
     /* Analog sticks */
