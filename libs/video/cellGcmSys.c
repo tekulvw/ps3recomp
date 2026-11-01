@@ -11,6 +11,7 @@
 
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
+#include "gcm_checked_completion.h"
 #include "rsx_deferred_reports.h"
 #include "rsx_ring_progress_observer.h"
 #include "cellGcmSys.h"
@@ -25,6 +26,22 @@
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
 static u32 s_gcm_context_ea = 0;
+static u32 s_fifo_getoff = 0;
+static void* s_checked_completion_user;
+static int (*s_checked_completion_ready)(void*);
+static int (*s_checked_completion_flush)(void*);
+static int gcm_checked_ref_mode(void);
+static void gcm_checked_ref_fail(const char* why, u32 io);
+static int gcm_checked_backend_ready(void) {
+    return s_checked_completion_ready ?
+        s_checked_completion_ready(s_checked_completion_user)==1 : rsx_draw_engine_checked_ready();
+}
+static int gcm_checked_backend_flush(void) {
+    if(s_checked_completion_ready)
+        return s_checked_completion_ready(s_checked_completion_user)==1 &&
+               s_checked_completion_flush(s_checked_completion_user)==1;
+    return rsx_draw_engine_enabled() && rsx_draw_engine_flush_checked()==1;
+}
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1266,8 +1283,12 @@ static void gcm_get_report(u32 argument){
         return;
     }
     if(!gcm_reports_dependency())goto invalid;
-    if(rsx_live_draw_enabled())rsx_live_draw_flush();
-    if(rsx_draw_engine_enabled())rsx_draw_engine_flush();
+    if(gcm_checked_ref_mode() && s_checked_completion_ready) {
+        if(!gcm_checked_backend_flush()) {gcm_checked_ref_fail("report-backend-completion",s_fifo_getoff);goto invalid;}
+    } else {
+        if(rsx_live_draw_enabled())rsx_live_draw_flush();
+        if(rsx_draw_engine_enabled())rsx_draw_engine_flush();
+    }
     if(gcm_report_publish(NULL,&r))return;
 invalid:
     if(r.start_ns){uint64_t w[5]={r.start_ns,r.ea,argument,r.context,0};ps3_critical_emit_capture(r.capture,PS3_CRITICAL_REPORT,r.ea,r.index,w,5);}
@@ -1309,7 +1330,6 @@ static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park 
  * this is the amount of already-consumed head room it gets. */
 #define GCM_RECYCLE_MARGIN 0x20000u
 static u32 gcm_ea2io(u32 ea);   /* defined with the wrap callback below */
-static u32 s_fifo_getoff  = 0;
 /* Backward JUMPs the walker has taken. The ring recycle waits for this to move:
  * it is the walker following the JUMP-to-begin the recycle wrote, i.e. having
  * consumed the whole tail. g_gcm_fifo_drained_ea == begin cannot say that on its
@@ -2005,7 +2025,16 @@ static int nv0039_packet(u32 w,u32 put)
 int cellGcm_checked_reference_ready(void)
 {
     return gcm_checked_ref_mode() && !atomic_load(&s_checked_ref_failed) &&
-        rsx_draw_engine_checked_ready();
+        gcm_checked_backend_ready();
+}
+
+int cellGcm_set_checked_completion(void* user,int (*ready)(void*),int (*flush)(void*))
+{
+    if((ready==NULL)!=(flush==NULL) || s_ref_qhead!=s_ref_qtail) return 0;
+    s_checked_completion_user=user;
+    s_checked_completion_ready=ready;
+    s_checked_completion_flush=flush;
+    return 1;
 }
 
 /* ---- SPU-built pushbuffers ------------------------------------------------
@@ -3155,7 +3184,7 @@ static void gcm_rsx_process_fifo_pass(void)
                     if (m == 0x50) {
                         if(gcm_checked_ref_mode() && (count!=1 || method!=0x50)){gcm_checked_ref_fail("malformed-reference",s_fifo_getoff);continue;}
                         if (gcm_checked_ref_mode() &&
-                            (!rsx_draw_engine_enabled() || rsx_draw_engine_flush_checked() != 1))
+                            !gcm_checked_backend_flush())
                             gcm_checked_ref_fail("backend-completion", s_fifo_getoff);
                         else gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
                     }

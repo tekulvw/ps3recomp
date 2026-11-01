@@ -97,6 +97,10 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
  * fence). Mirrors RPCS3 nv406e::set_reference's sync() so REF advances only
  * after the GPU has really caught up. */
 void rsx_live_draw_flush(void);
+/* Checked synchronous completion for GCM references/reports. A partial
+ * primitive, failed submission, device loss or timed-out wait returns 0. */
+int rsx_live_draw_checked_ready(void);
+int rsx_live_draw_flush_checked(void);
 
 /* Present the given display buffer id (called from the flip path). */
 void rsx_live_draw_present(u32 buffer_id);

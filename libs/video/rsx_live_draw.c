@@ -49,6 +49,8 @@ int  rsx_live_draw_resolve_blit(u32 sl, u32 sa, u32 sp, u32 ds, u32 dt, u32 dl, 
 void rsx_live_draw_note_resolve(u32 sl, u32 sa, u32 dl, u32 da)
 { (void)sl; (void)sa; (void)dl; (void)da; }
 void rsx_live_draw_flush(void) {}
+int rsx_live_draw_checked_ready(void) { return 0; }
+int rsx_live_draw_flush_checked(void) { return 0; }
 void rsx_live_draw_present(u32 b) { (void)b; }
 void rsx_live_draw_set_movie_mode(int on) { (void)on; }
 void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
@@ -100,6 +102,8 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <windows.h>
 #include <initguid.h>
 #include <d3d12.h>
+#include "rsx_d3d12_checked_fence.h"
+#include <stdatomic.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
@@ -284,7 +288,7 @@ typedef struct {
 
 typedef struct {
     int              enabled;    /* RSX_DRAW resolved                     */
-    int              ready;      /* device + resources up                    */
+    atomic_int       ready;      /* publish resource readiness across threads */
 
     ID3D12Device*              dev;
     ID3D12CommandQueue*        queue;
@@ -1720,6 +1724,7 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
  * -----------------------------------------------------------------------*/
 static void ld_flush(ld_flush_reason reason)
 {
+    if(!g.ready || g.fence_value>=UINT64_MAX-1) {g.ready=0;return;}
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG flush_begin = ld_profile_qpc();
     g_ld_profile.total.flush_reason[reason]++;
@@ -1749,29 +1754,20 @@ static void ld_flush(ld_flush_reason reason)
         g.ready = 0;
         return;
     }
-    if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
 #if defined(YZ_PERF_PROFILE)
         const LONGLONG wait_begin = ld_profile_qpc();
 #endif
-        const HRESULT event_hr =
-            g.fence->lpVtbl->SetEventOnCompletion(
-                g.fence, v, g.fence_event);
-        if (FAILED(event_hr)) {
-            fprintf(stderr,
-                    "[d3d-fail] fence SetEventOnCompletion "
-                    "hr=0x%08lX frame=%u\n",
-                    (unsigned long)event_hr, g_ld_frames);
-            ld_dump_dred("SetEventOnCompletion", event_hr);
-            g.ready = 0;
-            return;
-        }
-        WaitForSingleObject(g.fence_event, INFINITE);
+    if(!rsx_d3d12_wait_checked(g.dev,g.fence,g.fence_event,v,6000,WaitForSingleObject)) {
+        HRESULT removed=g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
+        fprintf(stderr,"[d3d-fail] checked fence incomplete value=%llu frame=%u removed=0x%08lX\n",
+                (unsigned long long)v,g_ld_frames,(unsigned long)removed);
+        ld_dump_dred("checked fence",removed);g.ready=0;return;
+    }
 #if defined(YZ_PERF_PROFILE)
         const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
         g_ld_profile.total.fence_wait_qpc += wait_ticks;
         g_ld_profile.total.fence_reason_qpc[reason] += wait_ticks;
 #endif
-    }
     ld_drain_info_queue("flush");
     /* Dynamic guest textures can replace a cached D3D resource while an
      * earlier draw in this command list still references the old one.  The
@@ -1780,8 +1776,12 @@ static void ld_flush(ld_flush_reason reason)
     for (u32 i = 0; i < g.n_retired_textures; i++)
         g.retired_textures[i]->lpVtbl->Release(g.retired_textures[i]);
     g.n_retired_textures = 0;
-    g.alloc->lpVtbl->Reset(g.alloc);
-    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    HRESULT reset_hr=g.alloc->lpVtbl->Reset(g.alloc);
+    if(SUCCEEDED(reset_hr))reset_hr=g.list->lpVtbl->Reset(g.list,g.alloc,NULL);
+    if(FAILED(reset_hr)) {
+        fprintf(stderr,"[d3d-fail] post-completion Reset hr=0x%08lX frame=%u\n",(unsigned long)reset_hr,g_ld_frames);
+        ld_dump_dred("Reset",reset_hr);g.ready=0;return;
+    }
     g.upload_used = 0;
 #if defined(YZ_PERF_PROFILE)
     const u64 flush_ticks = (u64)(ld_profile_qpc() - flush_begin);
@@ -1799,6 +1799,13 @@ static void ld_flush(ld_flush_reason reason)
 void rsx_live_draw_flush(void)
 {
     if (g.ready) ld_flush(LD_FLUSH_GUEST_REFERENCE);
+}
+int rsx_live_draw_checked_ready(void) { return g.ready!=0; }
+int rsx_live_draw_flush_checked(void)
+{
+    if(!g.ready || g.rsx.in_begin_end) return 0;
+    ld_flush(LD_FLUSH_GUEST_REFERENCE);
+    return g.ready!=0;
 }
 
 static void retire_texture(ID3D12Resource* tex)

@@ -8,7 +8,9 @@
 #define WEAK __attribute__((weak))
 /* Legacy fixtures leave the consumer experiment OFF. Any attempted wake is
  * a test failure; the consumer event fixture links the strong real service. */
+#ifndef _WIN32
 WEAK BOOL SetEvent(HANDLE event){(void)event;abort();}
+#endif
 WEAK int rsx_draw_engine_async_available(void){return 0;}
 WEAK u64 rsx_draw_engine_submit_async(void){return 0;}
 WEAK int rsx_draw_engine_completion_status(u64 ticket,int wait){(void)ticket;(void)wait;return -1;}
