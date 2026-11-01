@@ -1722,11 +1722,96 @@ static inline uint32_t spu_fn_hash(uint32_t addr)
  * LS, so each registers under a distinct id via spu_begin_image() before calling
  * its (prefixed) spu_recomp_register(). Single-image callers leave it 0. */
 static int s_reg_image = 0;
-void spu_begin_image(int image_id) { s_reg_image = image_id; }
+/* Registration is serialized by the same startup contract as s_reg_image.
+ * Diagnostics describe actual insertions; they never change admission. */
+static int s_registry_trace_on = -1;
+static unsigned s_registry_trace_lines, s_registry_trace_batch;
+static struct {
+    unsigned functions, duplicates, null_functions, function_overflows;
+    unsigned regions, region_rejections;
+} s_registry_trace;
+static int spu_registry_trace_on(void)
+{
+    if (s_registry_trace_on < 0) {
+        const char* option = getenv("SPU_REGISTRY_TRACE");
+        s_registry_trace_on = option && !strcmp(option, "1");
+    }
+    return s_registry_trace_on;
+}
+static int spu_registry_trace_row(void)
+{
+    if (!spu_registry_trace_on()) return 0;
+    if (s_registry_trace_lines >= 512) {
+        if (s_registry_trace_lines == 512) {
+            fputs("[spu-registry] event=limit rows=512 truncated=1\n", stderr);
+            s_registry_trace_lines++;
+        }
+        return 0;
+    }
+    s_registry_trace_lines++;
+    return 1;
+}
+void spu_begin_image(int image_id)
+{
+    if (spu_registry_trace_on()) {
+        if ((s_registry_trace.functions || s_registry_trace.function_overflows ||
+             s_registry_trace.regions || s_registry_trace.region_rejections) &&
+            spu_registry_trace_row())
+            fprintf(stderr, "[spu-registry] event=batch image=%d batch=%u functions=%u"
+                " duplicates=%u null_functions=%u function_overflows=%u regions=%u"
+                " region_rejections=%u\n", s_reg_image, s_registry_trace_batch,
+                s_registry_trace.functions, s_registry_trace.duplicates,
+                s_registry_trace.null_functions, s_registry_trace.function_overflows,
+                s_registry_trace.regions, s_registry_trace.region_rejections);
+        memset(&s_registry_trace, 0, sizeof s_registry_trace);
+        s_registry_trace_batch++;
+    }
+    s_reg_image = image_id;
+}
+
+static void spu_registry_trace_function(unsigned index)
+{
+    if (!spu_registry_trace_on()) return;
+    const spu_reg_entry* entry = &s_registry[index];
+    for (uint32_t n = s_hash_head[spu_fn_hash(entry->addr)]; n; n = s_hash_next[n - 1]) {
+        if (n - 1 == index) continue;
+        if (s_registry[n - 1].addr == entry->addr &&
+            s_registry[n - 1].image_id == entry->image_id) {
+            s_registry_trace.duplicates++;
+            break;
+        }
+    }
+    s_registry_trace.functions++;
+    if (!entry->fn) s_registry_trace.null_functions++;
+}
+
+static int spu_registry_trace_region(uint32_t ea, uint32_t lsa, uint32_t span,
+    int image, unsigned segments, int result, const char* reason, int duplicate)
+{
+    if (!spu_registry_trace_on()) return result;
+    const int matches = image == s_reg_image;
+    if (matches) {
+        if (result) s_registry_trace.regions++;
+        else s_registry_trace.region_rejections++;
+    }
+    if (spu_registry_trace_row()) {
+        fprintf(stderr, "[spu-registry] event=region result=%s reason=%s image=%d"
+            " batch=%u ea=0x%08X lsa=0x%05X span=0x%X segments=%u"
+            " duplicate_region=%d batch_matches=%d", result ? "inserted" : "rejected",
+            reason, image, s_registry_trace_batch, ea, lsa, span, segments, duplicate, matches);
+        if (matches)
+            fprintf(stderr, " functions=%u duplicates=%u null_functions=%u function_overflows=%u\n",
+                s_registry_trace.functions, s_registry_trace.duplicates,
+                s_registry_trace.null_functions, s_registry_trace.function_overflows);
+        else fputs(" functions=unknown duplicates=unknown null_functions=unknown function_overflows=unknown\n", stderr);
+    }
+    return result;
+}
 
 void spu_register_function(uint32_t addr, spu_fn fn)
 {
     if (s_registry_count >= SPU_FN_REGISTRY_MAX) {
+        if (spu_registry_trace_on()) s_registry_trace.function_overflows++;
         /* Silent truncation here dropped whole late-registered SPU images and
          * cost a multi-round hunt (the branch-to-0 looked like a lifter/overlay
          * bug). Never again: say so, once, loudly, with the number to raise the
@@ -1762,6 +1847,7 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     /* Published after the entry is linked: the dispatch cache keys its entries
      * by this count, so a lookup that sees the new count also finds the entry. */
     __atomic_store_n(&s_registry_count, i + 1, __ATOMIC_RELEASE);
+    spu_registry_trace_function(i);
 }
 
 /* Report a CROSS-IMAGE match: the registry served a function some other image
@@ -2358,16 +2444,21 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
 {
     if (!span || load_lsa >= SPU_LS_SIZE || span > SPU_LS_SIZE - load_lsa || image_id <= 0 ||
         !code || !count || count > SPU_OVERLAY_CODE_SEGMENTS || s_ovl_src_count >= SPU_OVL_SRC_MAX)
-        return 0;
+        return spu_registry_trace_region(content_ea, load_lsa, span, image_id, count, 0,
+            s_ovl_src_count >= SPU_OVL_SRC_MAX ? "capacity" : "invalid_input", 0);
     size_t total = 0;
     for (unsigned i = 0; i < count; ++i) {
         const spu_overlay_code_segment* c = &code[i];
         if (!c->bytes || !c->size || c->lsa < load_lsa || c->size > span ||
-            c->lsa - load_lsa > span - c->size) return 0;
+            c->lsa - load_lsa > span - c->size)
+            return spu_registry_trace_region(content_ea, load_lsa, span, image_id, count, 0,
+                                              "invalid_segment", 0);
         total += c->size;
     }
     spu_overlay_code_segment* copy = (spu_overlay_code_segment*)malloc(count * sizeof *copy + total);
-    if (!copy) return 0;
+    if (!copy)
+        return spu_registry_trace_region(content_ea, load_lsa, span, image_id, count, 0,
+                                          "allocation", 0);
     uint8_t* bytes = (uint8_t*)(copy + count);
     for (unsigned i = 0; i < count; ++i) {
         copy[i] = code[i];
@@ -2375,10 +2466,18 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
         copy[i].bytes = bytes;
         bytes += code[i].size;
     }
+    int duplicate = 0;
+    if (spu_registry_trace_on())
+        for (int i = 0; i < s_ovl_src_count; i++)
+            if (s_ovl_src[i].src_ea == content_ea && s_ovl_src[i].load_lsa == load_lsa &&
+                s_ovl_src[i].span == span && s_ovl_src[i].image_id == image_id) {
+                duplicate = 1;
+                break;
+            }
     spu_overlay_register_region(content_ea, span, image_id);
     spu_ovl_src* o = &s_ovl_src[s_ovl_src_count - 1];
     o->load_lsa = load_lsa; o->code = copy; o->code_count = count;
-    return 1;
+    return spu_registry_trace_region(content_ea, load_lsa, span, image_id, count, 1, "none", duplicate);
 }
 
 /* Opt-in diagnostics. SPU_OVERLAY_RESIDENCY_SHADOW=1 re-compares on every
