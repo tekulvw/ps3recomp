@@ -111,6 +111,14 @@ add_library(ps3recomp_runtime STATIC
 
 target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_CRITICAL_WRITE_AVAILABLE=1)
 
+if(MSVC)
+    # Generated PPU nonlocal transfers are C++ exceptions crossing extern-C
+    # HLE/dispatcher bridges. Keep synchronous C++ unwinding, but explicitly
+    # undo CMake's /EHsc assumption that those bridges cannot throw. PUBLIC is
+    # required for game-owned generated/loader C++ sources as well as the SDK.
+    target_compile_options(ps3recomp_runtime PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/EHsc->)
+endif()
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SailFFmpeg.cmake")
 ps3recomp_enable_sail_video(ps3recomp_runtime)
 
