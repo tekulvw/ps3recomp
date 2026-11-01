@@ -3256,6 +3256,47 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
     return (int)(SRV_SURF_WIN_BASE + si * LD_SWIN_PER + k);
 }
 
+/* Exact physical-layout reads of the current target need its ordered
+ * snapshot, even if a stale resource of another size shares its address.
+ * Keep existing remap/reinterpretation/subrectangle routes, and let a newer
+ * covering write through the same guest rows remain the sampled source. */
+static int surface_feedback_matches(const surface_t* s, const rsx_dsp_texture* t,
+                                    const rsx_dsp_surface* sf)
+{
+    const u32 base = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    u32 color = 0;
+    if (s->fmt == DXGI_FORMAT_R8G8B8A8_UNORM && base == RSX_TEX_FMT_A8R8G8B8)
+        color = 8;
+    else if (s->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT && base == RSX_TEX_FMT_W16Z16Y16X16_FLOAT)
+        color = 11;
+    else if (s->fmt == DXGI_FORMAT_R32G32B32A32_FLOAT && base == RSX_TEX_FMT_W32Z32Y32X32_FLOAT)
+        color = 12;
+    if (!color || (t->remap & 0xffffu) != 0xaae4u ||
+        sf->color_format != color || sf->raster_type != 1 ||
+        s->location != t->location || s->offset != t->offset ||
+        !(t->format & TEX_FMT_LINEAR) || t->dimension != 2 ||
+        t->cubemap || t->mipmaps > 1 || t->depth > 1 ||
+        t->width != s->w || t->height != s->h)
+        return 0;
+    const u64 row = (u64)s->w * ld_surface_texel_bytes(s->fmt);
+    const u64 sp = s->pitch ? s->pitch : row;
+    const u64 tp = t->pitch ? t->pitch : row;
+    if (!row || sp < row || tp != sp) return 0;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const surface_t* other = &g.surfaces[i];
+        if (other == s || !other->tex || other->location != s->location ||
+            other->offset != s->offset || other->fmt != s->fmt ||
+            other->w < t->width || other->h < t->height ||
+            other->last_write_serial <= s->last_write_serial)
+            continue;
+        const u64 other_row = (u64)other->w * ld_surface_texel_bytes(other->fmt);
+        const u64 other_pitch = other->pitch ? other->pitch : other_row;
+        if (other_pitch == sp && other_pitch >= other_row)
+            return 0;
+    }
+    return 1;
+}
+
 /* A draw that samples its own render target. RSX reads and writes the same
  * surface in one pass (GH3's post pass reads the scene at 0x200000 while
  * drawing into 0x200000); D3D12 cannot, and the lookup used to fall back to
@@ -7689,7 +7730,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                     zeta_pref = 1;
                     break;
                 }
-        if (!zeta_pref) { u32 best_gen = 0;
+        const int current_feedback = !zeta_pref &&
+            surface_feedback_matches(&g.surfaces[target], &t, &sf);
+        if (!zeta_pref && !current_feedback) { u32 best_gen = 0;
           for (u32 i = 0; i < g.n_surfaces; i++) {
               const surface_t* sf_i = &g.surfaces[i];
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
