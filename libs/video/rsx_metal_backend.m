@@ -65,6 +65,9 @@
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 #include "rsx_frontend_internal.h"
+#include "rsx_draw_engine.h"
+#define RSX_NATIVE_OWNER_PTHREAD
+#include "rsx_native_owner_gate.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_primitives.h"
 #include "rsx_vp_decompiler.h"
@@ -94,6 +97,79 @@ static int                 s_ready;
 static rsx_frontend_device *s_frontend;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
+
+/* Temporary owner seam: original consumer -> recording gate -> backend locks.
+ * Native callbacks never acquire the consumer lease or wait for GPU work. */
+extern void cellGcm_rsx_consumer_begin(void) __attribute__((weak_import));
+extern void cellGcm_rsx_consumer_end(void) __attribute__((weak_import));
+static int frontend_ordering_ready(void);
+static int fps_backend_failed(void);
+static rsx_native_owner_gate s_metal_owner=RSX_NATIVE_OWNER_GATE_INIT;
+static _Thread_local rsx_native_owner_thread s_metal_owner_thread;
+static _Thread_local int s_metal_consumer;
+static uint64_t s_metal_lifetime,s_metal_commits;
+static int s_metal_shutdown_pending;
+static unsigned s_metal_partial_primitives;
+static atomic_int s_metal_unscoped_commit;
+static int metal_owner_enabled(void){
+    static atomic_int setting=-1;int value=atomic_load_explicit(&setting,memory_order_relaxed);
+    if(value<0){const char* text=getenv("PS3RECOMP_RSX_NATIVE_OWNER");value=text&&!strcmp(text,"1");int expected=-1;
+        if(!atomic_compare_exchange_strong_explicit(&setting,&expected,value,memory_order_relaxed,memory_order_relaxed))value=expected;}
+    return value;
+}
+static int metal_owner_begin(int dirty){
+    if(!metal_owner_enabled())return 1;
+    if(s_metal_owner_thread.native){if(dirty)s_metal_owner.failed=1;return 0;}
+    if(!s_metal_owner_thread.original_depth){
+        s_metal_consumer=cellGcm_rsx_consumer_begin&&cellGcm_rsx_consumer_end;
+        if(s_metal_consumer)cellGcm_rsx_consumer_begin();
+    }
+    if(rsx_owner_original_begin(&s_metal_owner,&s_metal_owner_thread))return 0;
+    if(dirty)rsx_owner_dirty(&s_metal_owner,&s_metal_owner_thread);
+    return 1;
+}
+static void metal_owner_finish(int preserve){
+    if(!metal_owner_enabled())return;
+    if(!preserve)rsx_owner_dirty(&s_metal_owner,&s_metal_owner_thread);
+    if(fps_backend_failed()||atomic_load(&s_metal_unscoped_commit))rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,0);
+    const int outer=s_metal_owner_thread.original_depth==1;
+    rsx_owner_original_end(&s_metal_owner,&s_metal_owner_thread);
+    if(outer&&s_metal_consumer){s_metal_consumer=0;cellGcm_rsx_consumer_end();}
+}
+static int metal_owner_common_begin(void* user,uint32_t flags){
+    (void)user;if(!metal_owner_begin((flags&RSX_ORIGINAL_MUTATE)!=0))return 0;
+    if((flags&RSX_ORIGINAL_LIFECYCLE_BIT)&&s_metal_owner.retained){metal_owner_finish(0);return 0;}
+    return 1;
+}
+static void metal_owner_common_end(void* user,uint32_t flags,int delta,int preserve){
+    (void)user;
+    if(flags&RSX_ORIGINAL_FAILURE_BIT)rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,0);
+    if(delta>0){if(s_metal_partial_primitives==UINT_MAX)rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,0);else ++s_metal_partial_primitives;}
+    else if(delta<0){if(!s_metal_partial_primitives)rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,0);else --s_metal_partial_primitives;}
+    metal_owner_finish(preserve&&!s_metal_partial_primitives);
+}
+static const rsx_original_owner_hooks s_metal_original_hooks={NULL,metal_owner_common_begin,metal_owner_common_end};
+static void metal_owner_install_hooks(void){
+    rsx_draw_engine_set_owner_hooks(&s_metal_original_hooks);
+    rsx_commands_set_owner_hooks(&s_metal_original_hooks);
+}
+static void metal_owner_committed(void){
+    if(!metal_owner_enabled())return;
+    if(!s_metal_owner_thread.original_depth){atomic_store(&s_metal_unscoped_commit,1);return;}
+    if(s_metal_commits==UINT64_MAX)rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,0);else ++s_metal_commits;
+}
+static int metal_owner_boundary(uint64_t before){
+    if(!metal_owner_enabled())return 1;
+    const int clean=s_metal_commits>before&&!s_metal_partial_primitives&&frontend_ordering_ready()&&!fps_backend_failed()&&!atomic_load(&s_metal_unscoped_commit);
+    if(clean)rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,1);
+    return clean;
+}
+static int metal_owner_activate(void){
+    if(s_metal_lifetime==UINT64_MAX)return -1;
+    if(rsx_owner_generation(&s_metal_owner,&s_metal_owner_thread,++s_metal_lifetime))return -1;
+    s_metal_shutdown_pending=0;atomic_store(&s_metal_unscoped_commit,0);return 0;
+}
+
 
 /* Each initialization owns its counters. A drawable callback retained by the
  * compositor can outlive shutdown without writing into a later session. */
@@ -636,22 +712,44 @@ static void mtl_latch_state(void* ud, const rsx_state* state)
 static void mtl_draw_arrays(void*, u32, u32, u32);
 static void mtl_draw_indexed(void*, u32, u32, u32);
 
+/* Every registered original backend entry shares the host owner gate. */
+static void owner_mtl_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil){
+    if(!metal_owner_begin(1)){return;}
+    mtl_clear(ud,flags,color,depth,stencil);metal_owner_finish(0);
+}
+static void owner_mtl_set_render_target(void* ud, const rsx_state* state){
+    if(!metal_owner_begin(1)){return;}
+    mtl_set_render_target(ud,state);metal_owner_finish(0);
+}
+static void owner_mtl_latch_state(void* ud, const rsx_state* state){
+    if(!metal_owner_begin(1)){return;}
+    mtl_latch_state(ud,state);metal_owner_finish(0);
+}
+static void owner_mtl_draw_arrays(void* ud, u32 primitive, u32 first, u32 count){
+    if(!metal_owner_begin(1)){return;}
+    mtl_draw_arrays(ud,primitive,first,count);metal_owner_finish(0);
+}
+static void owner_mtl_draw_indexed(void* ud, u32 primitive, u32 index_offset, u32 count){
+    if(!metal_owner_begin(1)){return;}
+    mtl_draw_indexed(ud,primitive,index_offset,count);metal_owner_finish(0);
+}
+
 static rsx_backend s_backend_vtable = {
     .userdata           = NULL,
-    .clear              = mtl_clear,
-    .set_render_target  = mtl_set_render_target,
-    .set_vertex_attribs = mtl_latch_state,
-    .set_blend          = mtl_latch_state,
-    .set_depth_stencil  = mtl_latch_state,
-    .set_viewport       = mtl_latch_state,
-    .set_color_mask     = mtl_latch_state,
-    .set_alpha_test     = mtl_latch_state,
+    .clear              = owner_mtl_clear,
+    .set_render_target  = owner_mtl_set_render_target,
+    .set_vertex_attribs = owner_mtl_latch_state,
+    .set_blend          = owner_mtl_latch_state,
+    .set_depth_stencil  = owner_mtl_latch_state,
+    .set_viewport       = owner_mtl_latch_state,
+    .set_color_mask     = owner_mtl_latch_state,
+    .set_alpha_test     = owner_mtl_latch_state,
     /* Programs are resolved when the draw is recorded, from the live state:
      * SET_SHADER_PROGRAM, the transform program words and SHADER_CONTROL
      * all land there before BEGIN_END fires this. */
-    .set_shader         = mtl_latch_state,
-    .draw_arrays        = mtl_draw_arrays,
-    .draw_indexed       = mtl_draw_indexed,
+    .set_shader         = owner_mtl_latch_state,
+    .draw_arrays        = owner_mtl_draw_arrays,
+    .draw_indexed       = owner_mtl_draw_indexed,
 };
 
 /* ---- helpers ------------------------------------------------------------- */
@@ -3802,7 +3900,7 @@ static int eng_prepare_cpu_read(id<MTLTexture> t, int fence_shared)
         [blit synchronizeResource:t];
         [blit endEncoding];
     }
-    [cb commit];
+    [cb commit]; metal_owner_committed();
     [cb waitUntilCompleted];
     return [cb status] == MTLCommandBufferStatusCompleted;
 }
@@ -4440,7 +4538,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
             }
             if(critical_start)critical_commit=ps3_critical_now_ns();
             eng_stage_hand_off(cb, stage);
-            [cb commit];
+            [cb commit]; metal_owner_committed();
             if(async_submit&&out_ticket&&*out_ticket&&rsx_ring_progress_metal_committed)
                 rsx_ring_progress_metal_committed(*out_ticket,s_eng_rec_count);
             fps_frame_committed(ticket);
@@ -4448,7 +4546,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
             if(critical_start)critical_commit=ps3_critical_now_ns();
             const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
             eng_stage_hand_off(cb, stage);
-            [cb commit];
+            [cb commit]; metal_owner_committed();
             if(critical_start)critical_wait=ps3_critical_now_ns();
             [cb waitUntilCompleted];
             if (ft_w0) {
@@ -4528,7 +4626,7 @@ static void eng_capture_raw_1x1(id<MTLTexture> src, const char* path)
             [blit copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
                 sourceSize:MTLSizeMake(1,1,1) toBuffer:buffer destinationOffset:0
                 destinationBytesPerRow:256 destinationBytesPerImage:256];
-            [blit endEncoding]; [cb commit]; [cb waitUntilCompleted]; gpu_status=(long)[cb status];
+            [blit endEncoding]; [cb commit]; metal_owner_committed(); [cb waitUntilCompleted]; gpu_status=(long)[cb status];
             status="gpu_failed";
             if ([cb status]==MTLCommandBufferStatusCompleted && ![cb error]) {
                 FILE* f=fopen(raw,"wb"); status="file_failed";
@@ -4576,7 +4674,7 @@ static int eng_capture_texture_rgba8(void* user, u32 handle, const char* path)
             if (!blit) return 0;
             [blit synchronizeResource:dst]; [blit endEncoding];
         }
-        [cb commit]; [cb waitUntilCompleted];
+        [cb commit]; metal_owner_committed(); [cb waitUntilCompleted];
         if ([cb status]!=MTLCommandBufferStatusCompleted || [cb error]) return 0;
         u8* pixels=malloc(w*h*4); if (!pixels) return 0;
         [dst getBytes:pixels bytesPerRow:w*4 fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
@@ -4757,7 +4855,7 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                     toBuffer:staging destinationOffset:0
          destinationBytesPerRow:copy_pitch destinationBytesPerImage:copy_pitch * h];
         [blit endEncoding];
-        [cb commit]; [cb waitUntilCompleted];
+        [cb commit]; metal_owner_committed(); [cb waitUntilCompleted];
         const int ok = [cb status] == MTLCommandBufferStatusCompleted && ![cb error];
         if (ok) {
             const u8* bytes = [staging contents];
@@ -4884,56 +4982,220 @@ static u32 eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fm
             if ([done status] != MTLCommandBufferStatusCompleted || [done error])
                 eng_checked_fail();
         }];
-        [cb commit];
+        [cb commit]; metal_owner_committed();
         return eng_obj_add(t);
     }
 }
 
+/* Every registered original backend entry shares the host owner gate. */
+static int owner_eng_init(void* user, u32 width, u32 height){
+    if(!metal_owner_begin(1)){return -1;}
+    int result=eng_init(user,width,height);metal_owner_finish(0);return result;
+}
+static void owner_eng_shutdown(void* user){
+    if(!metal_owner_begin(1)){return;}
+    eng_shutdown(user);metal_owner_finish(0);
+}
+static void owner_eng_submit_and_wait(void* user, u32 reason){
+    if(!metal_owner_begin(1)){return;}uint64_t before=s_metal_commits;
+    eng_submit_and_wait(user,reason);metal_owner_finish(metal_owner_boundary(before));
+}
+static int owner_eng_submit_and_wait_checked(void* user, u32 reason){
+    if(!metal_owner_begin(1)){return 0;}uint64_t before=s_metal_commits;
+    int result=eng_submit_and_wait_checked(user,reason);metal_owner_finish(metal_owner_boundary(before));return result;
+}
+static u64 owner_eng_submit_async(void *user,u32 reason){
+    if(!metal_owner_begin(1)){return 0;}uint64_t before=s_metal_commits;
+    u64 result=eng_submit_async(user,reason);metal_owner_finish(metal_owner_boundary(before));return result;
+}
+static int owner_eng_completion_status(void *user,u64 ticket,int wait){
+    if(!metal_owner_begin(0)){return -1;}
+    int result=eng_completion_status(user,ticket,wait);metal_owner_finish(1);return result;
+}
+static u32 owner_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+                              u32 mips, u32 faces, u32 remap, u32 rsx_fmt){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_texture_create(user,fmt,w,h,mips,faces,remap,rsx_fmt);metal_owner_finish(0);return result;
+}
+static void owner_eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
+                               u32 w, u32 h, const void* src, u32 row_bytes,
+                               u32 rows){
+    if(!metal_owner_begin(1)){return;}
+    eng_texture_upload(user,handle,face,mip,w,h,src,row_bytes,rows);metal_owner_finish(0);
+}
+static void owner_eng_obj_release(void* user, u32 handle){
+    if(!metal_owner_begin(1)){return;}
+    eng_obj_release(user,handle);metal_owner_finish(0);
+}
+static u32 owner_eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                 u32 depth, u32 mips, u32 remap, u32 rsx_fmt){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_texture_create_3d(user,fmt,w,h,depth,mips,remap,rsx_fmt);metal_owner_finish(0);return result;
+}
+static void owner_eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
+                                  u32 w, u32 h, const void* src, u32 row_bytes){
+    if(!metal_owner_begin(1)){return;}
+    eng_texture_upload_3d(user,handle,z,mip,w,h,src,row_bytes);metal_owner_finish(0);
+}
+static u32 owner_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                   const void* seed, u32 seed_row_bytes){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_color_target_create(user,fmt,w,h,seed,seed_row_bytes);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_surface_view(user,surface,remap,rsx_format);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_depth_target_create(void* user, u32 w, u32 h){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_depth_target_create(user,w,h);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_depth_snapshot(user,depth,w,h);metal_owner_finish(0);return result;
+}
+static int owner_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+                              float* out, u32 out_pitch){
+    if(!metal_owner_begin(1)){return -1;}
+    int result=eng_depth_readback(user,depth,x,y,w,h,out,out_pitch);metal_owner_finish(0);return result;
+}
+static int owner_eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32 dst_pitch){
+    if(!metal_owner_begin(1)){return -1;}
+    int result=eng_depth_store_z24(user,depth,w,h,dst,dst_pitch);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fmt){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_depth_z24_texture(user,w,h,remap,rsx_fmt);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_color_snapshot(void* user, u32 surface){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_color_snapshot(user,surface);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                               const rsx_be_render_state* rs,
+                               const rsx_vertex_layout_plan* layout,
+                               u32 vertex_stride, rsx_be_format rt_fmt,
+                               u32 rt_count){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_pipeline_create(user,vs_hlsl,ps_hlsl,rs,layout,vertex_stride,rt_fmt,rt_count);metal_owner_finish(0);return result;
+}
+static void owner_eng_pipeline_release(void* user, u32 pipeline){
+    if(!metal_owner_begin(1)){return;}
+    eng_pipeline_release(user,pipeline);metal_owner_finish(0);
+}
+static void owner_eng_bind_targets(void* user, const u32* surfaces, u32 count,
+                             u32 depth){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_targets(user,surfaces,count,depth);metal_owner_finish(0);
+}
+static void owner_eng_bind_pipeline(void* user, u32 pipeline){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_pipeline(user,pipeline);metal_owner_finish(0);
+}
+static void owner_eng_bind_vs_constants(void* user, const void* data, u32 bytes){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_vs_constants(user,data,bytes);metal_owner_finish(0);
+}
+static void owner_eng_bind_ps_constants(void* user, const void* data, u32 bytes){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_ps_constants(user,data,bytes);metal_owner_finish(0);
+}
+static void owner_eng_bind_textures(void* user, const u32* textures,
+                              const rsx_be_sampler_desc* samplers, u32 mask){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_textures(user,textures,samplers,mask);metal_owner_finish(0);
+}
+static void owner_eng_bind_vertex_textures(void* user, const u32* textures,
+                                     const rsx_be_sampler_desc* samplers, u32 mask){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_vertex_textures(user,textures,samplers,mask);metal_owner_finish(0);
+}
+static void owner_eng_set_viewport(void* user, float x, float y, float w, float h){
+    if(!metal_owner_begin(1)){return;}
+    eng_set_viewport(user,x,y,w,h);metal_owner_finish(0);
+}
+static void owner_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h){
+    if(!metal_owner_begin(1)){return;}
+    eng_set_scissor(user,x,y,w,h);metal_owner_finish(0);
+}
+static void owner_eng_set_stencil_ref(void* user, u32 ref){
+    if(!metal_owner_begin(1)){return;}
+    eng_set_stencil_ref(user,ref);metal_owner_finish(0);
+}
+static void owner_eng_draw(void* user, rsx_topology topology, const void* vertices,
+                     u32 vertex_count, u32 stride, const u32* indices,
+                     u32 index_count){
+    if(!metal_owner_begin(1)){return;}
+    eng_draw(user,topology,vertices,vertex_count,stride,indices,index_count);metal_owner_finish(0);
+}
+static void owner_eng_clear_color(void* user, u32 surface, const float rgba[4]){
+    if(!metal_owner_begin(1)){return;}
+    eng_clear_color(user,surface,rgba);metal_owner_finish(0);
+}
+static void owner_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+                                    float depth_value, u8 stencil){
+    if(!metal_owner_begin(1)){return;}
+    eng_clear_depth_stencil(user,depth,flags,depth_value,stencil);metal_owner_finish(0);
+}
+static void owner_eng_present(void* user, u32 surface){
+    if(!metal_owner_begin(1)){return;}uint64_t before=s_metal_commits;
+    eng_present(user,surface);metal_owner_finish(metal_owner_boundary(before));
+}
+static void owner_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                         void* out, u32 out_pitch){
+    if(!metal_owner_begin(1)){return;}
+    eng_readback(user,surface,x,y,w,h,out,out_pitch);metal_owner_finish(0);
+}
+static int owner_eng_capture_texture_rgba8(void* user, u32 handle, const char* path){
+    if(!metal_owner_begin(1)){return -1;}
+    int result=eng_capture_texture_rgba8(user,handle,path);metal_owner_finish(0);return result;
+}
+
 static const rsx_draw_backend s_engine_backend = {
     .user                 = NULL,
-    .init                 = eng_init,
-    .shutdown             = eng_shutdown,
-    .submit_and_wait      = eng_submit_and_wait,
-    .submit_and_wait_checked = eng_submit_and_wait_checked,
-    .submit_async = eng_submit_async,
-    .completion_status = eng_completion_status,
-    .texture_create       = eng_texture_create,
-    .texture_upload       = eng_texture_upload,
-    .texture_release      = eng_obj_release,
-    .texture_create_3d    = eng_texture_create_3d,
-    .texture_upload_3d    = eng_texture_upload_3d,
-    .color_target_create  = eng_color_target_create,
-    .color_target_release = eng_obj_release,
-    .surface_view         = eng_surface_view,
-    .depth_target_create  = eng_depth_target_create,
-    .depth_target_release = eng_obj_release,
-    .depth_snapshot       = eng_depth_snapshot,
-    .depth_readback       = eng_depth_readback,
-    .depth_store_z24      = eng_depth_store_z24,
-    .depth_z24_texture    = eng_depth_z24_texture,
-    .color_snapshot       = eng_color_snapshot,
-    .pipeline_create      = eng_pipeline_create,
-    .pipeline_release     = eng_pipeline_release,
-    .bind_targets         = eng_bind_targets,
-    .bind_pipeline        = eng_bind_pipeline,
-    .bind_vs_constants    = eng_bind_vs_constants,
-    .bind_ps_constants    = eng_bind_ps_constants,
-    .bind_textures        = eng_bind_textures,
-    .bind_vertex_textures = eng_bind_vertex_textures,
-    .set_viewport         = eng_set_viewport,
-    .set_scissor          = eng_set_scissor,
-    .set_stencil_ref      = eng_set_stencil_ref,
-    .draw                 = eng_draw,
-    .clear_color          = eng_clear_color,
-    .clear_depth_stencil  = eng_clear_depth_stencil,
-    .present              = eng_present,
-    .readback             = eng_readback,
-    .capture_texture_rgba8 = eng_capture_texture_rgba8,
+    .init                 = owner_eng_init,
+    .shutdown             = owner_eng_shutdown,
+    .submit_and_wait      = owner_eng_submit_and_wait,
+    .submit_and_wait_checked = owner_eng_submit_and_wait_checked,
+    .submit_async = owner_eng_submit_async,
+    .completion_status = owner_eng_completion_status,
+    .texture_create       = owner_eng_texture_create,
+    .texture_upload       = owner_eng_texture_upload,
+    .texture_release      = owner_eng_obj_release,
+    .texture_create_3d    = owner_eng_texture_create_3d,
+    .texture_upload_3d    = owner_eng_texture_upload_3d,
+    .color_target_create  = owner_eng_color_target_create,
+    .color_target_release = owner_eng_obj_release,
+    .surface_view         = owner_eng_surface_view,
+    .depth_target_create  = owner_eng_depth_target_create,
+    .depth_target_release = owner_eng_obj_release,
+    .depth_snapshot       = owner_eng_depth_snapshot,
+    .depth_readback       = owner_eng_depth_readback,
+    .depth_store_z24      = owner_eng_depth_store_z24,
+    .depth_z24_texture    = owner_eng_depth_z24_texture,
+    .color_snapshot       = owner_eng_color_snapshot,
+    .pipeline_create      = owner_eng_pipeline_create,
+    .pipeline_release     = owner_eng_pipeline_release,
+    .bind_targets         = owner_eng_bind_targets,
+    .bind_pipeline        = owner_eng_bind_pipeline,
+    .bind_vs_constants    = owner_eng_bind_vs_constants,
+    .bind_ps_constants    = owner_eng_bind_ps_constants,
+    .bind_textures        = owner_eng_bind_textures,
+    .bind_vertex_textures = owner_eng_bind_vertex_textures,
+    .set_viewport         = owner_eng_set_viewport,
+    .set_scissor          = owner_eng_set_scissor,
+    .set_stencil_ref      = owner_eng_set_stencil_ref,
+    .draw                 = owner_eng_draw,
+    .clear_color          = owner_eng_clear_color,
+    .clear_depth_stencil  = owner_eng_clear_depth_stencil,
+    .present              = owner_eng_present,
+    .readback             = owner_eng_readback,
+    .capture_texture_rgba8 = owner_eng_capture_texture_rgba8,
 };
 
 /* ---- public API ---------------------------------------------------------- */
 
-int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+static int metal_original_init(u32 width, u32 height, const char* title)
 {
     @autoreleasepool {
         if (width)  s_width  = width;
@@ -5034,12 +5296,13 @@ static int frontend_ordering_ready(void)
 
 rsx_frontend_device *rsx_metal_backend_frontend(void)
 {
+    if(metal_owner_enabled())return NULL; /* extracted native owner is exclusive with this legacy path */
     if (!s_ready || !s_dev || !s_queue) return NULL;
     if (!s_frontend) s_frontend = rsx_frontend_metal_create(s_dev, s_queue, frontend_ordering_ready);
     return s_frontend;
 }
 
-void rsx_metal_backend_shutdown(void)
+static void metal_original_shutdown(void)
 {
     @autoreleasepool {
         rsx_frontend_close(s_frontend); s_frontend = NULL;
@@ -5125,7 +5388,7 @@ int rsx_metal_backend_pump_messages(void)
 #endif
 }
 
-void rsx_metal_backend_present(void)
+static void metal_original_present(void)
 {
     if (!s_ready) return;
     /* Under the draw engine the frame belongs to it: a host that drives the
@@ -5225,7 +5488,7 @@ void rsx_metal_backend_present(void)
 
         if (s_headless) {
             /* The readback below must see a completed frame. */
-            [cb commit];
+            [cb commit]; metal_owner_committed();
             [cb waitUntilCompleted];
         } else {
             dispatch_semaphore_t sem = s_inflight;
@@ -5234,7 +5497,7 @@ void rsx_metal_backend_present(void)
                 dispatch_semaphore_signal(sem);
             }];
             eng_wake_consumer_on_completion(cb);
-            [cb commit];        /* no wait: the CPU goes on to the next frame */
+            [cb commit]; metal_owner_committed();        /* no wait: the CPU goes on to the next frame */
             if(cb)fps_frame_committed(ticket);
         }
 
@@ -5285,7 +5548,7 @@ u32 rsx_metal_backend_guest_draws(void)
 /* Tag the existing presentation call only. Buffer selection, guest callbacks,
  * command encoding, fences, and presentation scheduling retain their behavior.
  * Untagged boot redraws and engine-internal sink flips keep guest ID zero. */
-void rsx_metal_backend_present_guest_frame(uint64_t guest_flip_id,uint32_t buffer_id)
+static void metal_original_present_guest_frame(uint64_t guest_flip_id,uint32_t buffer_id)
 {
     const uint64_t previous_id=s_present_guest_id;
     const uint32_t previous_buffer=s_present_buffer_id;
@@ -5293,4 +5556,79 @@ void rsx_metal_backend_present_guest_frame(uint64_t guest_flip_id,uint32_t buffe
     rsx_metal_backend_note_guest_frame();
     rsx_metal_backend_present();
     s_present_guest_id=previous_id;s_present_buffer_id=previous_buffer;
+}
+
+int rsx_metal_backend_init(u32 w,u32 h,const char* title){
+    if(!metal_owner_begin(1))return -1;
+    if(metal_owner_enabled()&&(s_metal_owner.retained||s_dev||s_frontend)){metal_owner_finish(0);return -1;}
+    if(metal_owner_enabled())metal_owner_install_hooks();
+    int result=metal_original_init(w,h,title);
+    if(metal_owner_enabled()&&!result&&metal_owner_activate())result=-1;
+    metal_owner_finish(0);return result;
+}
+void rsx_metal_backend_shutdown(void){
+    if(!metal_owner_begin(1))return;
+    if(metal_owner_enabled()){
+        s_metal_owner.closing=1;s_metal_shutdown_pending=s_dev!=nil;
+        if(s_metal_owner.retained||s_metal_owner.failed||fps_backend_failed()){metal_owner_finish(0);return;}
+    }
+    metal_original_shutdown();if(metal_owner_enabled()&&!s_dev)s_metal_shutdown_pending=0;
+    metal_owner_finish(0);
+}
+void rsx_metal_backend_present(void){
+    if(!metal_owner_begin(1))return;
+    uint64_t before=s_metal_commits;
+    metal_original_present();metal_owner_finish(metal_owner_boundary(before));
+}
+void rsx_metal_backend_present_guest_frame(uint64_t frame,uint32_t buffer){
+    if(!metal_owner_begin(1))return;
+    uint64_t before=s_metal_commits;
+    metal_original_present_guest_frame(frame,buffer);metal_owner_finish(metal_owner_boundary(before));
+}
+static int metal_borrow_retain(void* user,uint64_t life){return user==&s_metal_owner?rsx_owner_retain(&s_metal_owner,&s_metal_owner_thread,life):-3;}
+static void metal_borrow_release(void* user,uint64_t life){if(user==&s_metal_owner)(void)rsx_owner_release(&s_metal_owner,&s_metal_owner_thread,life);}
+static int metal_borrow_begin(void* user,uint64_t life){
+    if(user!=&s_metal_owner)return -3;
+    int status=rsx_owner_native_begin(&s_metal_owner,&s_metal_owner_thread,life);if(status)return status;
+    if(!s_ready||!s_dev||!s_queue||fps_backend_failed()||atomic_load(&s_metal_unscoped_commit)){
+        s_metal_owner.failed=1;rsx_owner_native_end(&s_metal_owner,&s_metal_owner_thread);return -6;}
+    if(s_metal_partial_primitives||!frontend_ordering_ready()){rsx_owner_native_end(&s_metal_owner,&s_metal_owner_thread);return -4;}
+    return 0;
+}
+static void metal_borrow_end(void* user,uint64_t life){
+    if(user==&s_metal_owner&&s_metal_owner_thread.gate==&s_metal_owner&&s_metal_owner_thread.native&&life==s_metal_owner.generation)
+        rsx_owner_native_end(&s_metal_owner,&s_metal_owner_thread);
+}
+int rsx_metal_backend_borrow_owner(rsx_native_owner* out){
+    if(!out||out->abi_version!=1||out->struct_size!=sizeof(*out))return -1;
+    if(!metal_owner_enabled())return -2;
+    if(s_metal_owner_thread.gate||!rsx_owner_lock_try(&s_metal_owner.lock))return -4;
+    int status=0;
+    if(!s_ready||!s_dev||!s_queue||s_metal_owner.closing)status=-3;
+    else if(s_frontend)status=-2;
+    else if(s_metal_owner.failed||fps_backend_failed()||atomic_load(&s_metal_unscoped_commit))status=-6;
+    else{
+        if(!s_metal_owner.generation){if(s_metal_lifetime==UINT64_MAX)status=-6;else s_metal_owner.generation=++s_metal_lifetime;}
+        if(!status)metal_owner_install_hooks();
+        if(!status)*out=(rsx_native_owner){.abi_version=1,.struct_size=sizeof(*out),.backend=RSX_NATIVE_OWNER_METAL,
+            .lifetime=s_metal_owner.generation,.device=(__bridge void*)s_dev,.queue=(__bridge void*)s_queue,.userdata=&s_metal_owner,
+            .retain=metal_borrow_retain,.release=metal_borrow_release,.try_begin=metal_borrow_begin,.end=metal_borrow_end};
+    }
+    rsx_owner_lock_release(&s_metal_owner.lock);return status;
+}
+int rsx_metal_backend_owner_shutdown_requested(uint64_t life){
+    if(!metal_owner_enabled())return -2;
+    if(!metal_owner_begin(0))return -4;
+    int status=life&&life==s_metal_owner.generation?s_metal_shutdown_pending:-3;metal_owner_finish(1);return status;
+}
+int rsx_metal_backend_owner_retry_shutdown(uint64_t life){
+    if(!metal_owner_enabled())return -2;
+    if(!metal_owner_begin(0))return -4;
+    int status=0;
+    if(!life||life!=s_metal_owner.generation)status=-3;
+    else if(!s_metal_shutdown_pending)status=0;
+    else if(s_metal_owner.retained)status=-4;
+    else if(s_metal_owner.failed||fps_backend_failed())status=-6;
+    else{metal_original_shutdown();status=s_dev?-6:1;if(status==1)s_metal_shutdown_pending=0;}
+    metal_owner_finish(status==1?0:1);return status;
 }

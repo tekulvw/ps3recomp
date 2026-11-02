@@ -27,6 +27,8 @@ jobs:
           arch: x64
       - name: Compile and execute actual owner synchronization fixture
         run: python tools/test_native_owner_gate.py
+      - name: Execute real common-engine partial-primitive ownership fixture
+        run: python tools/test_original_owner_ingress.py
       - name: Compile Windows LIVE ownership integration
         if: runner.os == 'Windows'
         run: >

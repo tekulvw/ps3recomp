@@ -3,6 +3,7 @@
 #undef NDEBUG
 #endif
 #include "../rsx_native_owner_gate.h"
+#include "../../../runtime/platform/win32_compat.h"
 #include <assert.h>
 #include <stdio.h>
 static rsx_native_owner_gate gate = RSX_NATIVE_OWNER_GATE_INIT;

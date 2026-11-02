@@ -1,3 +1,4 @@
+#include "rsx_original_owner.h"
 /*
  * ps3recomp - platform-neutral RSX draw engine over the register file
  *
@@ -396,6 +397,8 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
                                             const u32* cuts, u32 cut_count,
                                             const u32* occurrence_to_unique,
                                             u32* indices);
+
+void rsx_draw_engine_set_owner_hooks(const rsx_original_owner_hooks *hooks);
 
 #ifdef __cplusplus
 }

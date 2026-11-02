@@ -46,6 +46,9 @@
 #include "rsx_vulkan_backend.h"
 #include "rsx_frontend_vulkan.h"
 #include "rsx_frontend_internal.h"
+#define RSX_NATIVE_OWNER_PTHREAD
+#include "rsx_native_owner_gate.h"
+#include <stdatomic.h>
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
 #include "rsx_vp_decompiler.h"
@@ -242,11 +245,83 @@ typedef struct vk_state {
 static vk_state s_vk;
 static rsx_frontend_device *s_vk_frontend;
 
+extern void cellGcm_rsx_consumer_begin(void) __attribute__((weak));
+extern void cellGcm_rsx_consumer_end(void) __attribute__((weak));
+static rsx_native_owner_gate s_vulkan_owner=RSX_NATIVE_OWNER_GATE_INIT;
+static _Thread_local rsx_native_owner_thread s_vulkan_owner_thread;
+static _Thread_local int s_vulkan_consumer;
+static uint64_t s_vulkan_lifetime,s_vulkan_commits;
+static int s_vulkan_shutdown_pending;
+static unsigned s_vulkan_partial_primitives;
+static atomic_int s_vulkan_unscoped_submit;
+static int vulkan_owner_enabled(void){
+    static atomic_int setting=-1;int value=atomic_load_explicit(&setting,memory_order_relaxed);
+    if(value<0){const char* text=getenv("PS3RECOMP_RSX_NATIVE_OWNER");value=text&&!strcmp(text,"1");int expected=-1;
+        if(!atomic_compare_exchange_strong_explicit(&setting,&expected,value,memory_order_relaxed,memory_order_relaxed))value=expected;}
+    return value;
+}
+static int vulkan_owner_begin(int dirty){
+    if(!vulkan_owner_enabled())return 1;
+    if(s_vulkan_owner_thread.native){if(dirty)s_vulkan_owner.failed=1;return 0;}
+    if(!s_vulkan_owner_thread.original_depth){s_vulkan_consumer=cellGcm_rsx_consumer_begin&&cellGcm_rsx_consumer_end;
+        if(s_vulkan_consumer)cellGcm_rsx_consumer_begin();}
+    if(rsx_owner_original_begin(&s_vulkan_owner,&s_vulkan_owner_thread))return 0;
+    if(dirty)rsx_owner_dirty(&s_vulkan_owner,&s_vulkan_owner_thread);
+    return 1;
+}
+static void vulkan_owner_finish(int preserve){
+    if(!vulkan_owner_enabled())return;
+    if(!preserve)rsx_owner_dirty(&s_vulkan_owner,&s_vulkan_owner_thread);
+    if(atomic_load(&s_vulkan_unscoped_submit))rsx_owner_submitted(&s_vulkan_owner,&s_vulkan_owner_thread,0);
+    const int outer=s_vulkan_owner_thread.original_depth==1;
+    rsx_owner_original_end(&s_vulkan_owner,&s_vulkan_owner_thread);
+    if(outer&&s_vulkan_consumer){s_vulkan_consumer=0;cellGcm_rsx_consumer_end();}
+}
+static int vulkan_owner_common_begin(void* user,uint32_t flags){
+    (void)user;if(!vulkan_owner_begin((flags&RSX_ORIGINAL_MUTATE)!=0))return 0;
+    if((flags&RSX_ORIGINAL_LIFECYCLE_BIT)&&s_vulkan_owner.retained){vulkan_owner_finish(0);return 0;}
+    return 1;
+}
+static void vulkan_owner_common_end(void* user,uint32_t flags,int delta,int preserve){
+    (void)user;
+    if(flags&RSX_ORIGINAL_FAILURE_BIT)rsx_owner_submitted(&s_vulkan_owner,&s_vulkan_owner_thread,0);
+    if(delta>0){if(s_vulkan_partial_primitives==UINT_MAX)rsx_owner_submitted(&s_vulkan_owner,&s_vulkan_owner_thread,0);else ++s_vulkan_partial_primitives;}
+    else if(delta<0){if(!s_vulkan_partial_primitives)rsx_owner_submitted(&s_vulkan_owner,&s_vulkan_owner_thread,0);else --s_vulkan_partial_primitives;}
+    vulkan_owner_finish(preserve&&!s_vulkan_partial_primitives);
+}
+static const rsx_original_owner_hooks s_vulkan_original_hooks={NULL,vulkan_owner_common_begin,vulkan_owner_common_end};
+static void vulkan_owner_install_hooks(void){
+    rsx_draw_engine_set_owner_hooks(&s_vulkan_original_hooks);
+    rsx_commands_set_owner_hooks(&s_vulkan_original_hooks);
+}
+static void vulkan_owner_fault(void){
+    if(vulkan_owner_enabled()&&s_vulkan_owner_thread.original_depth)
+        rsx_owner_submitted(&s_vulkan_owner,&s_vulkan_owner_thread,0);
+}
+static void vulkan_owner_submitted(VkResult status){
+    if(!vulkan_owner_enabled())return;
+    if(!s_vulkan_owner_thread.original_depth){atomic_store(&s_vulkan_unscoped_submit,1);return;}
+    if(status!=VK_SUCCESS||s_vulkan_commits==UINT64_MAX)vulkan_owner_fault();else ++s_vulkan_commits;
+}
+static int vulkan_owner_boundary(uint64_t before){
+    if(!vulkan_owner_enabled())return 1;
+    const int clean=s_vulkan_commits>before&&!s_vulkan_partial_primitives&&!s_vk.frontend_recording&&!s_vulkan_owner.failed;
+    if(clean)rsx_owner_submitted(&s_vulkan_owner,&s_vulkan_owner_thread,1);
+    return clean;
+}
+static int vulkan_owner_activate(void){
+    if(s_vulkan_lifetime==UINT64_MAX)return -1;
+    if(rsx_owner_generation(&s_vulkan_owner,&s_vulkan_owner_thread,++s_vulkan_lifetime))return -1;
+    s_vulkan_shutdown_pending=0;atomic_store(&s_vulkan_unscoped_submit,0);return 0;
+}
+
+
 #define VK_LOG(...)  fprintf(stderr, "[RSX vulkan] " __VA_ARGS__)
 #define VK_CHECK(call, what)                                               \
     do { VkResult r_ = (call);                                             \
          if (r_ != VK_SUCCESS) {                                           \
              VK_LOG("%s failed (VkResult %d)\n", (what), (int)r_);         \
+             vulkan_owner_fault();                                        \
              return -1; } } while (0)
 
 /* ---------------------------------------------------------------------------
@@ -521,6 +596,7 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
 {
     pthread_mutex_lock(&s_vk.queue_mu);
     const VkResult r = pvkQueueSubmit(s_vk.queue, 1, si, fence);
+    vulkan_owner_submitted(r);
     pthread_mutex_unlock(&s_vk.queue_mu);
     return r;
 }
@@ -537,7 +613,8 @@ static void vk_device_idle(void)
 {
     if (!s_vk.device || !pvkDeviceWaitIdle) return;
     pthread_mutex_lock(&s_vk.queue_mu);
-    pvkDeviceWaitIdle(s_vk.device);
+    VkResult status=pvkDeviceWaitIdle(s_vk.device);
+    if(status!=VK_SUCCESS)vulkan_owner_fault();
     pthread_mutex_unlock(&s_vk.queue_mu);
 }
 
@@ -2247,7 +2324,8 @@ static void vk_eng_shutdown(void* user)
 
 static void vk_eng_submit_and_wait(void* user, u32 reason)
 {
-    (void)user; (void)reason;      /* every submission has already completed */
+    (void)user; (void)reason;      /* default path submissions already completed */
+    if(vulkan_owner_enabled() && (vk_begin() || vk_submit_and_wait()))vulkan_owner_fault();
 }
 
 static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
@@ -3439,52 +3517,212 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     vk_submit_and_wait();
 }
 
+/* Every registered original backend entry shares the host owner gate. */
+static int owner_vk_eng_init(void* user, u32 width, u32 height){
+    if(!vulkan_owner_begin(1)){return -1;}uint64_t before=s_vulkan_commits;
+    int result=vk_eng_init(user,width,height);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static void owner_vk_eng_shutdown(void* user){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_shutdown(user);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_submit_and_wait(void* user, u32 reason){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_submit_and_wait(user,reason);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static u32 owner_vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                 u32 mips, u32 faces, u32 remap, u32 rsx_fmt){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u32 result=vk_eng_texture_create(user,fmt,w,h,mips,faces,remap,rsx_fmt);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static void owner_vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u32 w, u32 h,
+                                  const void* src, u32 row_bytes, u32 rows){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_texture_upload(user,texture,face,mip,w,h,src,row_bytes,rows);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_release(void* user, u32 handle){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_release(user,handle);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static u32 owner_vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                      const void* seed, u32 seed_row_bytes){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u32 result=vk_eng_color_target_create(user,fmt,w,h,seed,seed_row_bytes);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static u32 owner_vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u32 result=vk_eng_surface_view(user,surface,remap,rsx_format);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static u32 owner_vk_eng_depth_target_create(void* user, u32 w, u32 h){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u32 result=vk_eng_depth_target_create(user,w,h);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static u32 owner_vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u32 result=vk_eng_depth_snapshot(user,depth,w,h);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static u32 owner_vk_eng_color_snapshot(void* user, u32 surface){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u32 result=vk_eng_color_snapshot(user,surface);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static u32 owner_vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                  const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
+                                  u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u32 result=vk_eng_pipeline_create(user,vs_hlsl,ps_hlsl,rs,layout,vertex_stride,rt_fmt,rt_count);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static void owner_vk_eng_pipeline_release(void* user, u32 pipeline){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_pipeline_release(user,pipeline);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_bind_targets(void* user, const u32* surfaces, u32 count, u32 depth){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_bind_targets(user,surfaces,count,depth);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_bind_pipeline(void* user, u32 pipeline){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_bind_pipeline(user,pipeline);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_bind_vs_constants(user,data,bytes);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_bind_ps_constants(user,data,bytes);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_bind_textures(void* user, const u32* textures,
+                                 const rsx_be_sampler_desc* samplers, u32 mask){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_bind_textures(user,textures,samplers,mask);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_bind_vertex_textures(void* user, const u32* textures,
+                                        const rsx_be_sampler_desc* samplers, u32 mask){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_bind_vertex_textures(user,textures,samplers,mask);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_set_viewport(void* user, float x, float y, float w, float h){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_set_viewport(user,x,y,w,h);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_set_scissor(user,x,y,w,h);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_set_stencil_ref(void* user, u32 ref){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_set_stencil_ref(user,ref);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_set_depth_bounds(void* user, float min, float max){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_set_depth_bounds(user,min,max);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
+                        u32 stride, const u32* indices, u32 index_count){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_draw(user,topology,vertices,vertex_count,stride,indices,index_count);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_clear_color(void* user, u32 surface, const float rgba[4]){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_clear_color(user,surface,rgba);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+                                       float depth_value, u8 stencil){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_clear_depth_stencil(user,depth,flags,depth_value,stencil);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_present(void* user, u32 surface){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_present(user,surface);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                            void* out, u32 out_pitch){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_readback(user,surface,x,y,w,h,out,out_pitch);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static int owner_vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+                                 float* out, u32 out_pitch){
+    if(!vulkan_owner_begin(1)){return -1;}uint64_t before=s_vulkan_commits;
+    int result=vk_eng_depth_readback(user,depth,x,y,w,h,out,out_pitch);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static void owner_vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
+                                      u32 w, u32 h, const void* rows, u32 row_bytes){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_color_target_write(user,surface,x,y,w,h,rows,row_bytes);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+
 static const rsx_draw_backend s_vk_engine_backend = {
     .user                 = NULL,
-    .init                 = vk_eng_init,
-    .shutdown             = vk_eng_shutdown,
-    .submit_and_wait      = vk_eng_submit_and_wait,
-    .texture_create       = vk_eng_texture_create,
-    .texture_upload       = vk_eng_texture_upload,
-    .texture_release      = vk_eng_release,
-    .color_target_create  = vk_eng_color_target_create,
-    .color_target_release = vk_eng_release,
-    .surface_view         = vk_eng_surface_view,
-    .depth_target_create  = vk_eng_depth_target_create,
-    .depth_target_release = vk_eng_release,
-    .depth_snapshot       = vk_eng_depth_snapshot,
-    .color_snapshot       = vk_eng_color_snapshot,
-    .pipeline_create      = vk_eng_pipeline_create,
-    .pipeline_release     = vk_eng_pipeline_release,
-    .bind_targets         = vk_eng_bind_targets,
-    .bind_pipeline        = vk_eng_bind_pipeline,
-    .bind_vs_constants    = vk_eng_bind_vs_constants,
-    .bind_ps_constants    = vk_eng_bind_ps_constants,
-    .bind_textures        = vk_eng_bind_textures,
-    .bind_vertex_textures = vk_eng_bind_vertex_textures,
-    .set_viewport         = vk_eng_set_viewport,
-    .set_scissor          = vk_eng_set_scissor,
-    .set_stencil_ref      = vk_eng_set_stencil_ref,
-    .set_depth_bounds     = vk_eng_set_depth_bounds,
-    .draw                 = vk_eng_draw,
-    .clear_color          = vk_eng_clear_color,
-    .clear_depth_stencil  = vk_eng_clear_depth_stencil,
-    .present              = vk_eng_present,
-    .readback             = vk_eng_readback,
-    .depth_readback       = vk_eng_depth_readback,
-    .color_target_write   = vk_eng_color_target_write,
+    .init                 = owner_vk_eng_init,
+    .shutdown             = owner_vk_eng_shutdown,
+    .submit_and_wait      = owner_vk_eng_submit_and_wait,
+    .texture_create       = owner_vk_eng_texture_create,
+    .texture_upload       = owner_vk_eng_texture_upload,
+    .texture_release      = owner_vk_eng_release,
+    .color_target_create  = owner_vk_eng_color_target_create,
+    .color_target_release = owner_vk_eng_release,
+    .surface_view         = owner_vk_eng_surface_view,
+    .depth_target_create  = owner_vk_eng_depth_target_create,
+    .depth_target_release = owner_vk_eng_release,
+    .depth_snapshot       = owner_vk_eng_depth_snapshot,
+    .color_snapshot       = owner_vk_eng_color_snapshot,
+    .pipeline_create      = owner_vk_eng_pipeline_create,
+    .pipeline_release     = owner_vk_eng_pipeline_release,
+    .bind_targets         = owner_vk_eng_bind_targets,
+    .bind_pipeline        = owner_vk_eng_bind_pipeline,
+    .bind_vs_constants    = owner_vk_eng_bind_vs_constants,
+    .bind_ps_constants    = owner_vk_eng_bind_ps_constants,
+    .bind_textures        = owner_vk_eng_bind_textures,
+    .bind_vertex_textures = owner_vk_eng_bind_vertex_textures,
+    .set_viewport         = owner_vk_eng_set_viewport,
+    .set_scissor          = owner_vk_eng_set_scissor,
+    .set_stencil_ref      = owner_vk_eng_set_stencil_ref,
+    .set_depth_bounds     = owner_vk_eng_set_depth_bounds,
+    .draw                 = owner_vk_eng_draw,
+    .clear_color          = owner_vk_eng_clear_color,
+    .clear_depth_stencil  = owner_vk_eng_clear_depth_stencil,
+    .present              = owner_vk_eng_present,
+    .readback             = owner_vk_eng_readback,
+    .depth_readback       = owner_vk_eng_depth_readback,
+    .color_target_write   = owner_vk_eng_color_target_write,
 };
+
+/* Every registered original backend entry shares the host owner gate. */
+static void owner_vk_cb_track_state(void* ud, const rsx_state* state){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_cb_track_state(ud,state);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_cb_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_cb_clear(ud,flags,color,depth,stencil);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_cb_draw_arrays(void* ud, u32 primitive, u32 first, u32 count){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_cb_draw_arrays(ud,primitive,first,count);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_cb_draw_indexed(void* ud, u32 primitive, u32 offset, u32 count){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_cb_draw_indexed(ud,primitive,offset,count);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_cb_bind_texture(void* ud, u32 unit, const rsx_texture_state* t){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_cb_bind_texture(ud,unit,t);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static void owner_vk_cb_present(void* ud, u32 buffer_id){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_cb_present(ud,buffer_id);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
 
 static rsx_backend s_vulkan_backend = {
     .userdata           = &s_vk,
-    .set_render_target  = vk_cb_track_state,
-    .set_vertex_attribs = vk_cb_track_state,
-    .set_depth_stencil  = vk_cb_track_state,
-    .clear              = vk_cb_clear,
-    .draw_arrays        = vk_cb_draw_arrays,
-    .draw_indexed       = vk_cb_draw_indexed,
-    .bind_texture       = vk_cb_bind_texture,
-    .present            = vk_cb_present,
+    .set_render_target  = owner_vk_cb_track_state,
+    .set_vertex_attribs = owner_vk_cb_track_state,
+    .set_depth_stencil  = owner_vk_cb_track_state,
+    .clear              = owner_vk_cb_clear,
+    .draw_arrays        = owner_vk_cb_draw_arrays,
+    .draw_indexed       = owner_vk_cb_draw_indexed,
+    .bind_texture       = owner_vk_cb_bind_texture,
+    .present            = owner_vk_cb_present,
 };
 
 /* ---------------------------------------------------------------------------
@@ -3507,7 +3745,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (vk_load_library()) return -1;
 
     const char *frontend = getenv("PS3RECOMP_VK_FRONTEND");
-    s_vk.frontend_enabled = frontend && !strcmp(frontend, "1");
+    s_vk.frontend_enabled = (frontend && !strcmp(frontend, "1")) || vulkan_owner_enabled();
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                               .pApplicationName = "ps3recomp", .pEngineName = "ps3recomp RSX",
                               .apiVersion = s_vk.frontend_enabled ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0 };
@@ -3563,7 +3801,13 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
                                .ppEnabledExtensionNames = s_vk.windowed ? dev_exts : NULL,
                                .pEnabledFeatures = &want };
-    VK_CHECK(pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device), "vkCreateDevice");
+    /* External synthetic fixtures may enable a checked, supported feature for
+     * deterministic GPU delay on this same public-init owner. Production is
+     * exactly the original loaded API call, with no extra feature requested. */
+#ifndef PS3RECOMP_VK_TEST_CREATE_DEVICE
+#define PS3RECOMP_VK_TEST_CREATE_DEVICE pvkCreateDevice
+#endif
+    VK_CHECK(PS3RECOMP_VK_TEST_CREATE_DEVICE(s_vk.phys, &dci, NULL, &s_vk.device), "vkCreateDevice");
     if (vk_load_device_functions()) return -1;
     if (s_vk.windowed && vk_load_wsi_device_functions())
         vk_window_drop("the driver has no swapchain functions");
@@ -3628,7 +3872,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     return 0;
 }
 
-int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
+static int vulkan_original_init(u32 width, u32 height, const char* title)
 {
     memset(&s_vk, 0, sizeof s_vk);
     if (vk_init_all(width, height, title)) {
@@ -3675,6 +3919,7 @@ int rsx_vulkan_backend_frontend_available(void)
 }
 rsx_frontend_device *rsx_vulkan_backend_frontend(void)
 {
+    if(vulkan_owner_enabled())return NULL; /* exclusive extracted native owner */
     if (!rsx_vulkan_backend_frontend_available()) return NULL;
     if (!s_vk_frontend) {
         rsx_frontend_vulkan_owner owner = {0};
@@ -3687,7 +3932,7 @@ rsx_frontend_device *rsx_vulkan_backend_frontend(void)
     return s_vk_frontend;
 }
 
-void rsx_vulkan_backend_shutdown(void)
+static void vulkan_original_shutdown(void)
 {
     rsx_frontend_close(s_vk_frontend); s_vk_frontend = NULL;
     rsx_vulkan_backend_present_finish();   /* a host that began one and quit */
@@ -3706,6 +3951,7 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         vk_device_idle();
+        if(vulkan_owner_enabled()&&s_vulkan_owner.failed)return;
         vk_guest_shutdown();
         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);
@@ -3758,7 +4004,7 @@ void rsx_vulkan_backend_present(void)
     rsx_vulkan_backend_present_finish();
 }
 
-void rsx_vulkan_backend_present_begin(void)
+static void vulkan_original_present_begin(void)
 {
     if (!s_vk.device) return;
     s_vk.present_split = 1;
@@ -3767,7 +4013,7 @@ void rsx_vulkan_backend_present_begin(void)
     s_vk.present_split = 0;
 }
 
-void rsx_vulkan_backend_present_finish(void)
+static void vulkan_original_present_finish(void)
 {
     if (!s_vk.device) return;
     pthread_mutex_lock(&s_vk.present_mu);
@@ -3782,7 +4028,7 @@ u32 rsx_vulkan_backend_presented_center(void)
 
 u32 rsx_vulkan_backend_debug_color(void) { return s_vk.clear_argb; }
 
-u32 rsx_vulkan_backend_readback_center(void)
+static u32 vulkan_original_readback_center(void)
 {
     if (s_vk.eng_active) return rsx_draw_engine_readback_center();
     return s_vk.presented ? (0xFF000000u | s_vk.last_center) : 0u;
@@ -3798,4 +4044,88 @@ int rsx_vulkan_backend_depth_bounds(void)
     return s_vk.eng_active && s_vk.depth_bounds_ok;
 }
 
+
+int rsx_vulkan_backend_init(u32 w,u32 h,const char* title){
+    if(!vulkan_owner_begin(1))return -1;
+    if(vulkan_owner_enabled()&&(s_vulkan_owner.retained||s_vk.device||s_vk_frontend)){vulkan_owner_finish(0);return -1;}
+    if(vulkan_owner_enabled())vulkan_owner_install_hooks();
+    int result=vulkan_original_init(w,h,title);
+    if(vulkan_owner_enabled()&&!result&&vulkan_owner_activate())result=-1;
+    vulkan_owner_finish(0);return result;
+}
+void rsx_vulkan_backend_shutdown(void){
+    if(!vulkan_owner_begin(1))return;
+    if(vulkan_owner_enabled()){
+        s_vulkan_owner.closing=1;s_vulkan_shutdown_pending=s_vk.device!=VK_NULL_HANDLE;
+        if(s_vulkan_owner.retained||s_vulkan_owner.failed){vulkan_owner_finish(0);return;}
+    }
+    vulkan_original_shutdown();if(vulkan_owner_enabled()&&!s_vk.device)s_vulkan_shutdown_pending=0;
+    vulkan_owner_finish(0);
+}
+void rsx_vulkan_backend_present_begin(void){
+    if(!vulkan_owner_begin(1))return;
+    uint64_t before=s_vulkan_commits;
+    vulkan_original_present_begin();vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+void rsx_vulkan_backend_present_finish(void){
+    if(!vulkan_owner_begin(0))return;
+    vulkan_original_present_finish();vulkan_owner_finish(1);
+}
+u32 rsx_vulkan_backend_readback_center(void){
+    if(!vulkan_owner_begin(1))return 0;
+    uint64_t before=s_vulkan_commits;
+    u32 result=vulkan_original_readback_center();vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static int vulkan_borrow_retain(void* user,uint64_t life){return user==&s_vulkan_owner?rsx_owner_retain(&s_vulkan_owner,&s_vulkan_owner_thread,life):-3;}
+static void vulkan_borrow_release(void* user,uint64_t life){if(user==&s_vulkan_owner)(void)rsx_owner_release(&s_vulkan_owner,&s_vulkan_owner_thread,life);}
+static int vulkan_borrow_begin(void* user,uint64_t life){
+    if(user!=&s_vulkan_owner)return -3;
+    int status=rsx_owner_native_begin(&s_vulkan_owner,&s_vulkan_owner_thread,life);if(status)return status;
+    if(!s_vk.device||!s_vk.queue||atomic_load(&s_vulkan_unscoped_submit)){
+        s_vulkan_owner.failed=1;rsx_owner_native_end(&s_vulkan_owner,&s_vulkan_owner_thread);return -6;}
+    if(s_vulkan_partial_primitives||s_vk.frontend_recording||pthread_mutex_trylock(&s_vk.present_mu)){rsx_owner_native_end(&s_vulkan_owner,&s_vulkan_owner_thread);return -4;}
+    if(pthread_mutex_trylock(&s_vk.queue_mu)){pthread_mutex_unlock(&s_vk.present_mu);rsx_owner_native_end(&s_vulkan_owner,&s_vulkan_owner_thread);return -4;}
+    return 0;
+}
+static void vulkan_borrow_end(void* user,uint64_t life){
+    if(user==&s_vulkan_owner&&s_vulkan_owner_thread.gate==&s_vulkan_owner&&s_vulkan_owner_thread.native&&life==s_vulkan_owner.generation){
+        pthread_mutex_unlock(&s_vk.queue_mu);pthread_mutex_unlock(&s_vk.present_mu);rsx_owner_native_end(&s_vulkan_owner,&s_vulkan_owner_thread);}
+}
+static rsx_native_proc vulkan_owner_instance_proc(void* instance,const char* name){return (rsx_native_proc)pvkGetInstanceProcAddr((VkInstance)instance,name);}
+static rsx_native_proc vulkan_owner_device_proc(void* device,const char* name){return (rsx_native_proc)pvkGetDeviceProcAddr((VkDevice)device,name);}
+int rsx_vulkan_backend_borrow_owner(rsx_native_owner* out){
+    if(!out||out->abi_version!=1||out->struct_size!=sizeof(*out))return -1;
+    if(!vulkan_owner_enabled())return -2;
+    if(s_vulkan_owner_thread.gate||!rsx_owner_lock_try(&s_vulkan_owner.lock))return -4;
+    int status=0;
+    if(!s_vk.device||!s_vk.queue||s_vulkan_owner.closing)status=-3;
+    else if(s_vk_frontend)status=-2;
+    else if(s_vulkan_owner.failed||atomic_load(&s_vulkan_unscoped_submit))status=-6;
+    else if(!rsx_vulkan_backend_frontend_available())status=-2;
+    else{
+        if(!s_vulkan_owner.generation){if(s_vulkan_lifetime==UINT64_MAX)status=-6;else s_vulkan_owner.generation=++s_vulkan_lifetime;}
+        if(!status)vulkan_owner_install_hooks();
+        if(!status)*out=(rsx_native_owner){.abi_version=1,.struct_size=sizeof(*out),.backend=RSX_NATIVE_OWNER_VULKAN,
+            .lifetime=s_vulkan_owner.generation,.device=(void*)s_vk.device,.queue=(void*)s_vk.queue,.userdata=&s_vulkan_owner,.queue_family=s_vk.queue_family,
+            .instance=(void*)s_vk.instance,.physical_device=(void*)s_vk.phys,.get_instance_proc=vulkan_owner_instance_proc,.get_device_proc=vulkan_owner_device_proc,
+            .retain=vulkan_borrow_retain,.release=vulkan_borrow_release,.try_begin=vulkan_borrow_begin,.end=vulkan_borrow_end};
+    }
+    rsx_owner_lock_release(&s_vulkan_owner.lock);return status;
+}
+int rsx_vulkan_backend_owner_shutdown_requested(uint64_t life){
+    if(!vulkan_owner_enabled())return -2;
+    if(!vulkan_owner_begin(0))return -4;
+    int status=life&&life==s_vulkan_owner.generation?s_vulkan_shutdown_pending:-3;vulkan_owner_finish(1);return status;
+}
+int rsx_vulkan_backend_owner_retry_shutdown(uint64_t life){
+    if(!vulkan_owner_enabled())return -2;
+    if(!vulkan_owner_begin(0))return -4;
+    int status=0;
+    if(!life||life!=s_vulkan_owner.generation)status=-3;
+    else if(!s_vulkan_shutdown_pending)status=0;
+    else if(s_vulkan_owner.retained)status=-4;
+    else if(s_vulkan_owner.failed)status=-6;
+    else{vulkan_original_shutdown();status=s_vk.device?-6:1;if(status==1)s_vulkan_shutdown_pending=0;}
+    vulkan_owner_finish(status==1?0:1);return status;
+}
 #endif /* !_WIN32 */

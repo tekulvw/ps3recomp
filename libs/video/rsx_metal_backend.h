@@ -17,6 +17,7 @@
 
 #include "ps3emu/ps3types.h"
 #include "rsx_frontend.h"
+#include "rsx_native_owner.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -72,6 +73,11 @@ u32  rsx_metal_backend_readback_center(void);
  * programs asserts this is non-zero, because the built-in path would draw
  * the same test triangle and a pixel check alone could not tell them apart. */
 u32  rsx_metal_backend_guest_draws(void);
+
+/* Borrow existing native ownership only; no device/queue is created. */
+int rsx_metal_backend_borrow_owner(rsx_native_owner *);
+int rsx_metal_backend_owner_shutdown_requested(uint64_t lifetime);
+int rsx_metal_backend_owner_retry_shutdown(uint64_t lifetime);
 
 #ifdef __cplusplus
 }

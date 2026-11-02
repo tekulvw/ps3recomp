@@ -1,3 +1,4 @@
+#include "rsx_original_owner.h"
 /*
  * ps3recomp - RSX Command Buffer Processor
  *
@@ -441,6 +442,8 @@ void rsx_set_backend(rsx_backend* backend);
 
 /* Get the current backend (or NULL if none set). */
 rsx_backend* rsx_get_backend(void);
+
+void rsx_commands_set_owner_hooks(const rsx_original_owner_hooks *hooks);
 
 #ifdef __cplusplus
 }
