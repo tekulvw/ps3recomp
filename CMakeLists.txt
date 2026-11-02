@@ -357,7 +357,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     include(CheckCCompilerFlag)
     check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
     if(PS3RECOMP_HAS_MSSE41)
-        target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
+        # Lifted consumers compile the same static-inline SPU helpers. Export
+        # the runtime's existing ISA requirement so their fast path agrees.
+        target_compile_options(ps3recomp_runtime PUBLIC -msse4.1)
     endif()
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
@@ -470,6 +472,15 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_shufb
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_shufb.py")
+        find_program(PS3RECOMP_TEST_NINJA NAMES ninja ninja-build)
+        if(PS3RECOMP_TEST_NINJA)
+            add_test(NAME spu_isa_consumer
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_isa_consumer.py"
+                    --cmake "${CMAKE_COMMAND}" --ninja "${PS3RECOMP_TEST_NINJA}"
+                    --cc "${CMAKE_C_COMPILER}" --cxx "${CMAKE_CXX_COMPILER}")
+            set_tests_properties(spu_isa_consumer PROPERTIES TIMEOUT 180)
+        endif()
         if(NOT WIN32)
             add_test(NAME rsx_wpos_scale
                 COMMAND "${Python3_EXECUTABLE}"
