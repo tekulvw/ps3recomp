@@ -4521,6 +4521,36 @@ u32 cellGcmResolveIO(u32 offset)
     return 0;
 }
 
+s32 cellGcmNativeReadLocatedRange(u32 location,u32 offset,u32 requested,
+                                u32* host_ea,u32* host_bytes)
+{
+    if (!host_ea || !host_bytes || host_ea == host_bytes || !s_gcm_initialized ||
+        !requested || (u64)offset + requested > 0x100000000ull)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    u32 ea, bytes;
+    if (location == CELL_GCM_LOCATION_LOCAL) {
+        if (!s_config.localAddress || (u64)offset + requested > s_config.localSize ||
+            (u64)s_config.localAddress + offset + requested > 0x100000000ull)
+            return CELL_GCM_ERROR_INVALID_VALUE;
+        ea = s_config.localAddress + offset;
+        bytes = requested;
+    } else if (location == CELL_GCM_LOCATION_MAIN) {
+        const u32 page = offset >> 20;
+        const u16 mapped = s_ea_address_table[page];
+        if (mapped >= GCM_OFFSET_TABLE_PAGES)
+            return CELL_GCM_ERROR_INVALID_VALUE;
+        ea = ((u32)mapped << 20) | (offset & 0xFFFFFu);
+        bytes = 0x100000u - (offset & 0xFFFFFu);
+        if (bytes > requested) bytes = requested;
+    } else return CELL_GCM_ERROR_INVALID_VALUE;
+    if (ea < 0x10000u || (u64)ea + bytes > 0x100000000ull ||
+        (ppu_vm_size && (u64)ea + bytes > ppu_vm_size))
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    *host_ea = ea;
+    *host_bytes = bytes;
+    return CELL_OK;
+}
+
 /* Location-aware resolve. RSX offsets are TWO overlapping number spaces --
  * LOCAL (VRAM, ea = localAddress + offset) and MAIN (IO-mapped, via the
  * offset table). cellGcmResolveOffset guesses table-first, which breaks when

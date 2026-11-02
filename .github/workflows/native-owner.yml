@@ -29,6 +29,8 @@ jobs:
         run: python tools/test_native_owner_gate.py
       - name: Execute real common-engine partial-primitive ownership fixture
         run: python tools/test_original_owner_ingress.py
+      - name: Verify actual host-only located source translation
+        run: python tools/test_gcm_native_located_range.py
       - name: Exact FIFO publication and existing source-target lookup
         if: runner.os != 'Windows'
         run: python tools/test_gcm_native_handoff.py
