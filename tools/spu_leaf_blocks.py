@@ -5,13 +5,13 @@ IRQ/state changes and all unknown translations remain on the original path.
 """
 import hashlib,re
 from spu_disasm import spu_decode,sign_extend
-from spu_lifter import SPULifter,LiftedFunction
+from spu_lifter import SPULifter,LiftedFunction,ORIGINAL_OBSERVER_PREAMBLE
 DIRECT={'br','bra','brz','brnz','brhz','brhnz'}
 INDIRECT={'bi','biz','binz','bihz','bihnz'}
 DENY={'brsl','brasl','bisl','bisled','iret','rdch','rchcnt','wrch','stop','stopd',
       'hgt','hlgt','heq','hgti','hlgti','heqi','sync','syncc','dsync',
       'fscrrd','fscrwr','mfspr','mtspr'}
-def emit(raw,base,bounds,image,prefix):
+def emit(raw,base,bounds,image,prefix,observe_original_work=False):
  if not raw or len(raw)&3 or base&3 or base<0 or base+len(raw)>0x40000 or image<=0:
   raise ValueError('invalid code buffer/image')
  if not re.fullmatch(r'[A-Za-z_]\w*',prefix):raise ValueError('invalid symbol prefix')
@@ -52,11 +52,14 @@ def emit(raw,base,bounds,image,prefix):
   if reason:skipped.append({'start':start,'end':end,'reason':reason});continue
   name=f'{prefix}block_{start:08X}';definitions.append(f'void {name}(spu_context* ctx) {{')
   definitions.append(f'    if (!spu_verified_leaf_enter(ctx,{image},0x{start:X}u,0x{end:X}u)) {{ ctx->pc=0x{start:X}u; g_spu_trampoline_fn=spu_indirect_branch; return; }}')
-  for pc,c in ops:definitions.append('    '+c)
+  for pc,c in ops:
+   if observe_original_work:definitions.append(f'    PS3_ORIGINAL_STEP(ctx,0x{pc:X}u,PS3_ORIGINAL_LEAF);')
+   definitions.append('    '+c)
   definitions.extend(['    '+transfer(end),'}'])
   units.append({'start':start,'end':end,'symbol':name,'sha256':hashlib.sha256(raw[start-base:end-base]).hexdigest()})
  header='#pragma once\n#include "spu_context.h"\n#include "spu_verified_overlay.h"\n'+f'int {prefix}spu_leaf_register(void);\n'
  source='#pragma STDC FP_CONTRACT OFF\n#include "spu_recomp.h"\n#include "spu_helpers.h"\n'+ '\n'.join(definitions)+'\n'
+ if observe_original_work:source=ORIGINAL_OBSERVER_PREAMBLE+source
  if units:
   source+='static const spu_verified_leaf_unit units[]={\n'
   source+=''.join(f'    {{0x{u["start"]:X}u,0x{u["end"]:X}u,{u["symbol"]}}},\n'for u in units)+'};\n'

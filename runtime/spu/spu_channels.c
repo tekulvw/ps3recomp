@@ -24,6 +24,7 @@
 #include "spu_decrementer_observer.h"
 #include "../diagnostics/critical_pc_trace.h"
 #include "../diagnostics/job_io_recorder.h"
+#include "../diagnostics/original_work_observer.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include "spu_interp_attribution.h"
@@ -3166,7 +3167,7 @@ static int spu_smc_microstep(spu_context* ctx)
         (void)rb;
 
         if (op11 == 0x1A8 || op11 == 0x1A9 || op11 == 0x1AA || op11 == 0x1AB) {
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             /* bi / bisl / iret / bisled (+E/D interrupt bits) */
             if (op11 == 0x1AB &&                       /* bisled: only on event */
                 (ctx->event_status & ctx->event_mask) == 0) { pc += 4; continue; }
@@ -3181,7 +3182,7 @@ static int spu_smc_microstep(spu_context* ctx)
             return 1;
         }
         if (op11 >= 0x128 && op11 <= 0x12B) {
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             /* biz / binz / bihz / bihnz rt,ra (+E/D bits, taken-only) */
             uint32_t cv = ctx->gpr[rt]._u32[0];
             int taken;
@@ -3199,7 +3200,7 @@ static int spu_smc_microstep(spu_context* ctx)
             return 1;
         }
         if (op9 == 0x064 || op9 == 0x060 || op9 == 0x066 || op9 == 0x062) {
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             /* br / bra / brsl / brasl */
             uint32_t tgt = (op9 == 0x060 || op9 == 0x062)
                          ? ((uint32_t)i16 << 2)
@@ -3211,7 +3212,7 @@ static int spu_smc_microstep(spu_context* ctx)
             return 1;
         }
         if (op9 == 0x040 || op9 == 0x042 || op9 == 0x044 || op9 == 0x046) {
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             /* brz / brnz / brhz / brhnz rt,label (relative) */
             uint32_t cv = ctx->gpr[rt]._u32[0];
             int taken;
@@ -3227,19 +3228,19 @@ static int spu_smc_microstep(spu_context* ctx)
             return 1;
         }
         if (op8 == 0x24) {                                    /* stqd rt,i10(ra) */
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             uint32_t a = (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u;
             spu_ls_write128(ctx, a, ctx->gpr[rt]);
             pc += 4; continue;
         }
         if (op8 == 0x34) {                                    /* lqd rt,i10(ra) */
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             uint32_t a = (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u;
             ctx->gpr[rt] = spu_ls_read128(ctx, a);
             pc += 4; continue;
         }
         if (op9 == 0x041 || op9 == 0x061) {                   /* stqa / lqa (abs) */
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             /* LSA = I16 << 2 (SPU ISA, RI16 form), as in spu_interp.c and
              * the lifter. */
             uint32_t a = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u;
@@ -3248,41 +3249,41 @@ static int spu_smc_microstep(spu_context* ctx)
             pc += 4; continue;
         }
         if (op9 == 0x047 || op9 == 0x067) {                   /* stqr / lqr (rel) */
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             uint32_t a = (pc + ((uint32_t)i16 << 2)) & SPU_LS_MASK & ~15u;
             if (op9 == 0x047) spu_ls_write128(ctx, a, ctx->gpr[rt]);
             else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
             pc += 4; continue;
         }
         if (op8 == 0x44) {                                    /* xori rt,ra,i10 */
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             /* Runtime-generated job stubs toggle their own instruction words.
              * Use the signed RI10 immediate, just like statically lifted xori. */
             ctx->gpr[rt] = spu_xori(ctx->gpr[ra], i10);
             pc += 4; continue;
         }
         if (op8 == 0x1C) {                                    /* ai rt,ra,i10 */
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             u128 r = ctx->gpr[ra];
             for (int k = 0; k < 4; k++) r._u32[k] += (uint32_t)i10;
             ctx->gpr[rt] = r; pc += 4; continue;
         }
         if (op11 == 0x040 || op11 == 0x0C0) {                 /* sf / a (word) */
-            spu_pc_observe_cached(ctx, pc, w, &observe);
+            PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe);
             u128 x = ctx->gpr[ra], y = ctx->gpr[rb], r;
             for (int k = 0; k < 4; k++)
                 r._u32[k] = (op11 == 0x040) ? y._u32[k] - x._u32[k]
                                             : x._u32[k] + y._u32[k];
             ctx->gpr[rt] = r; pc += 4; continue;
         }
-        if (op9 == 0x081) { spu_pc_observe_cached(ctx, pc, w, &observe); ctx->gpr[rt] = spu_splat_u32((uint32_t)i16); pc += 4; continue; }  /* il  */
-        if (op9 == 0x082) { spu_pc_observe_cached(ctx, pc, w, &observe); ctx->gpr[rt] = spu_splat_u32(((w >> 7) & 0xFFFF) << 16); pc += 4; continue; } /* ilhu */
-        if (op9 == 0x0C1) { spu_pc_observe_cached(ctx, pc, w, &observe); u128 r = ctx->gpr[rt];            /* iohl */
+        if (op9 == 0x081) { PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe); ctx->gpr[rt] = spu_splat_u32((uint32_t)i16); pc += 4; continue; }  /* il  */
+        if (op9 == 0x082) { PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe); ctx->gpr[rt] = spu_splat_u32(((w >> 7) & 0xFFFF) << 16); pc += 4; continue; } /* ilhu */
+        if (op9 == 0x0C1) { PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe); u128 r = ctx->gpr[rt];            /* iohl */
             for (int k = 0; k < 4; k++) r._u32[k] |= (w >> 7) & 0xFFFF;
             ctx->gpr[rt] = r; pc += 4; continue; }
-        if (op7 == 0x21)  { spu_pc_observe_cached(ctx, pc, w, &observe); ctx->gpr[rt] = spu_splat_u32((w >> 7) & 0x3FFFF); pc += 4; continue; } /* ila */
-        if (op11 == 0x201 || op11 == 0x001) { spu_pc_observe_cached(ctx, pc, w, &observe); pc += 4; continue; }  /* nop/lnop */
-        if (op11 == 0x002 || op11 == 0x003) { spu_pc_observe_cached(ctx, pc, w, &observe); pc += 4; continue; }  /* sync/dsync */
+        if (op7 == 0x21)  { PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe); ctx->gpr[rt] = spu_splat_u32((w >> 7) & 0x3FFFF); pc += 4; continue; } /* ila */
+        if (op11 == 0x201 || op11 == 0x001) { PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe); pc += 4; continue; }  /* nop/lnop */
+        if (op11 == 0x002 || op11 == 0x003) { PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe); pc += 4; continue; }  /* sync/dsync */
         /* Branch hints, all no-ops for execution: hbr is the 11-bit-opcode RR
          * form (0x1AC), hbra and hbrr are the 7-bit-opcode RI18 form (0x08,
          * 0x09) -- the same op7 group as ila (0x21) above, NOT op9. Testing
@@ -3293,7 +3294,7 @@ static int spu_smc_microstep(spu_context* ctx)
          * witness (hbrr 0x1200048C rather than 0x12033296). Same line, same
          * diagnosis, arrived at separately -- which is about as good as
          * corroboration gets for a decode bug. */
-        if (op11 == 0x1AC || op7 == 0x08 || op7 == 0x09) { spu_pc_observe_cached(ctx, pc, w, &observe); pc += 4; continue; } /* hbr/hbra/hbrr */
+        if (op11 == 0x1AC || op7 == 0x08 || op7 == 0x09) { PS3_ORIGINAL_STEP(ctx,pc,PS3_ORIGINAL_MICROSTEP); spu_pc_observe_cached(ctx, pc, w, &observe); pc += 4; continue; } /* hbr/hbra/hbrr */
 
         /* Hand off to the real interpreter rather than giving up.
          *

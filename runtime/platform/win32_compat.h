@@ -51,6 +51,16 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+#  if defined(__MINGW32__)
+/* The Microsoft SDK supplies these volatile access helpers; MinGW headers do
+ * not. Keep the same actual acquire/release semantics on that compiler. */
+#    ifndef ReadAcquire
+#      define ReadAcquire(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#    endif
+#    ifndef WriteRelease
+#      define WriteRelease(p,v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#    endif
+#  endif
 #else
 
 #include <pthread.h>

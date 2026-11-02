@@ -947,7 +947,9 @@ class PPULifter:
     """Translates PPU instructions into C source."""
 
     def __init__(self, prefix: str = "", weak_emit: bool = False, *,
-                 nonlocal_return_functions=None, nonlocal_continuations=None):
+                 nonlocal_return_functions=None, nonlocal_continuations=None,
+                 observe_original_work: bool = False):
+        self.observe_original_work = observe_original_work
         self.nonlocal_return_functions = set(nonlocal_return_functions or ())
         self.nonlocal_continuations = {owner: set(targets) for owner, targets in (nonlocal_continuations or {}).items()}
         self.functions: list[LiftedFunction] = []
@@ -1114,6 +1116,8 @@ class PPULifter:
             if insn.addr + 4 in resumes and (not c_line or "ctx->lr =" not in c_line or "(ctx);" not in c_line):
                 raise ValueError("nonlocal checkpoint call was not emitted")
             if c_line:
+                if self.observe_original_work:
+                    func.body_lines.append(f"    PS3_ORIGINAL_STEP(ctx, 0x{insn.addr:X}ULL, PS3_ORIGINAL_PPU);")
                 func.body_lines.append(f"    {c_line}")
 
         # An in-range branch target with no decoded instruction at its address
@@ -3966,6 +3970,8 @@ class PPULifter:
         self-contained)."""
         lines = [SOURCE_PREAMBLE.replace('#include "ppu_recomp.h"',
                  f'#include "{getattr(self, "header_name", "ppu_recomp.h")}"')]
+        if self.observe_original_work:
+            lines.insert(0, '#if !defined(PS3RECOMP_ORIGINAL_OBSERVER) || !PS3RECOMP_ORIGINAL_OBSERVER\n#error "Observed generated code requires PS3RECOMP_ORIGINAL_OBSERVER"\n#endif\n#include "original_work_observer.h"\n')
 
         # Emit helper macros
         lines.append("/* Rotate helpers */")
@@ -4876,11 +4882,13 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, nonlocal_return_functions=None, nonlocal_continuations=None):
+                 toc_base=0, nonlocal_return_functions=None, nonlocal_continuations=None,
+                 observe_original_work=False):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
     _WORKER_STATE["prefix"] = prefix
+    _WORKER_STATE["observe_original_work"] = observe_original_work
     _WORKER_STATE["toc_base"] = toc_base
     _WORKER_STATE["nonlocal_return_functions"] = nonlocal_return_functions or set()
     _WORKER_STATE["nonlocal_continuations"] = nonlocal_continuations or {}
@@ -4898,6 +4906,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
 def _worker_lift(task):
     idx0, bounds = task
     lifter = PPULifter(prefix=_WORKER_STATE.get("prefix", ""),
+                       observe_original_work=_WORKER_STATE.get("observe_original_work", False),
                        nonlocal_return_functions=_WORKER_STATE.get("nonlocal_return_functions"),
                        nonlocal_continuations=_WORKER_STATE.get("nonlocal_continuations"))
     lifter.name_map = _WORKER_STATE["names"]
@@ -4945,7 +4954,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0),
-                             lifter.nonlocal_return_functions, lifter.nonlocal_continuations))
+                             lifter.nonlocal_return_functions, lifter.nonlocal_continuations,
+                             lifter.observe_original_work))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -5025,6 +5035,8 @@ def main() -> None:
                         help="Emit lifted function definitions as weak symbols "
                              "so a port's idiomatic overrides (strong symbols "
                              "of the same name) shadow them at link time")
+    parser.add_argument("--observe-original-work", action="store_true",
+                        help="Diagnostic per-instruction original body witnesses; requires compiled observer and source-qualified private manifest")
     parser.add_argument("--hle-stubs", metavar="FILE", default=None,
                         help="EBOOT.imports.json ([{library,nid,stub}]). Each "
                              "import stub address is lifted as ps3_hle_call(nid) "
@@ -5470,6 +5482,7 @@ def main() -> None:
     print(f"Lifting {len(func_bounds)} functions...")
 
     lifter = PPULifter(prefix=args.symbol_prefix, weak_emit=args.weak,
+                       observe_original_work=args.observe_original_work,
                        nonlocal_return_functions=nonlocal_returns,
                        nonlocal_continuations=nonlocal_continuations)
     lifter.header_name = args.header_name
