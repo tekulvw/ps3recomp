@@ -5593,6 +5593,38 @@ void rsx_metal_backend_present_guest_frame(uint64_t frame,uint32_t buffer){
     uint64_t before=s_metal_commits;
     metal_original_present_guest_frame(frame,buffer);metal_owner_finish(metal_owner_boundary(before));
 }
+int rsx_metal_backend_native_boundary(uint64_t *original_ticket){
+    if(!original_ticket)return -1;
+    *original_ticket=0;
+    if(!metal_owner_enabled())return -2;
+    if(!metal_owner_begin(0))return -4;
+    int status=0;
+    const uint64_t before=s_metal_commits,previous_ticket=s_eng_fence_next;
+    @try {
+    if(!s_ready||!s_eng_active||s_metal_owner.closing)status=-3;
+    else if(s_metal_owner.failed||fps_backend_failed())status=-6;
+    else if(s_metal_partial_primitives||eng_trace_enabled())status=-4;
+    else if(!rsx_draw_engine_async_available())status=-2;
+    else {
+        /* Retire only already-terminal receipts; never enter the ordinary
+         * eng_submit_async cap path, which is allowed to GPU-wait. */
+        if(s_eng_fence_next&&eng_completion_status(NULL,s_eng_fence_next,0)<0)status=-6;
+        if(!status&&[s_eng_fence_cbs count]>=64)status=-4;
+        if(!status){
+            uint64_t ticket=rsx_draw_engine_submit_async();
+            if(s_metal_commits!=before){
+                *original_ticket=s_eng_fence_next>previous_ticket?s_eng_fence_next:ticket;
+                status=ticket&&*original_ticket&&!fps_backend_failed()?0:1;
+            }else status=fps_backend_failed()?-6:-4;
+        }
+    }
+    }@catch(NSException *exception){
+        (void)exception;
+        if(s_metal_commits!=before){*original_ticket=s_eng_fence_next>previous_ticket?s_eng_fence_next:0;status=1;}
+        else status=-6;
+    }@finally{metal_owner_finish(metal_owner_boundary(before));}
+    return status;
+}
 static int metal_borrow_retain(void* user,uint64_t life){return user==&s_metal_owner?rsx_owner_retain(&s_metal_owner,&s_metal_owner_thread,life):-3;}
 static void metal_borrow_release(void* user,uint64_t life){if(user==&s_metal_owner)(void)rsx_owner_release(&s_metal_owner,&s_metal_owner_thread,life);}
 static int metal_borrow_begin(void* user,uint64_t life){

@@ -76,6 +76,13 @@ u32  rsx_metal_backend_readback_center(void);
  * the same test triangle and a pixel check alone could not tell them apart. */
 u32  rsx_metal_backend_guest_draws(void);
 
+/* Commit already-recorded original work before a source-qualified native/UI
+ * handoff. No GPU wait: refuses active primitives, tracing and a full async
+ * receipt queue.0accepted,1indeterminate (never replay), negative uncommitted.
+ * Caller owns the serialized GCM consumer and is outside the owner queue gate.
+ * Does not present, select/create a target, or enable original async defaults. */
+int rsx_metal_backend_native_boundary(uint64_t *original_ticket);
+
 /* Borrow existing native ownership only; no device/queue is created. */
 int rsx_metal_backend_borrow_owner(rsx_native_owner *);
 int rsx_metal_backend_borrow_image(uint64_t owner_lifetime,uint32_t backend_surface,rsx_native_image *);
