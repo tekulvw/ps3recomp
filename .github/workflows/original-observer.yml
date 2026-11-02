@@ -33,8 +33,7 @@ jobs:
       - name: Real generated PPU mid-function witness and normal guest result
         if: runner.os != 'Windows'
         run: python tools/test_ppu_original_work.py
-      - name: Real POSIX worker creation, pthread-exit cleanup and diagnostic drain
-        if: runner.os != 'Windows'
+      - name: Real native worker creation, early-exit cleanup and diagnostic drain
         run: python tools/test_original_work_threads.py
       - name: Reject omitted interpreter and fabricated skipped-PC witnesses
         if: runner.os != 'Windows'

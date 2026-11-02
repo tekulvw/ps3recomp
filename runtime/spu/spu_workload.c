@@ -16,7 +16,7 @@
 #include <stdatomic.h>
 #include "ps3emu/log_first.h"
 #ifdef _WIN32
-#include <windows.h>
+#include "../platform/win32_compat.h"
 #else
 #include <pthread.h>
 #include <errno.h>

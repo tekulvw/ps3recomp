@@ -6,7 +6,8 @@
  * the interlocked intrinsics behind the PPU reservation spinlock, and the
  * scalar typedefs (DWORD, ULONGLONG, SIZE_T, ...) those call sites use. This
  * header supplies all of it on POSIX so the call sites compile unchanged. On
- * Windows it is a no-op passthrough to <windows.h>.
+ * Windows it defaults to a passthrough to <windows.h>. Explicit original-work
+ * diagnostics additionally wrap native thread factories and exit functions.
  *
  * Usable from C AND C++. That is deliberate: the runtime library is C but the
  * PPU boot scaffold is C++, and both need these names. Nothing in here may use
@@ -60,6 +61,16 @@
 #    ifndef WriteRelease
 #      define WriteRelease(p,v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 #    endif
+#  endif
+#  if defined(PS3RECOMP_ORIGINAL_OBSERVER) && PS3RECOMP_ORIGINAL_OBSERVER
+/* Only observed runtime/scaffold sources opt in. Include the real declarations
+ * before aliases, so SDK prototypes and calling conventions remain untouched.
+ * Normal builds still call the native factories directly. */
+#    include "../diagnostics/original_work_threads.h"
+#    define CreateThread ps3_original_CreateThread
+#    define _beginthreadex ps3_original_beginthreadex
+#    define ExitThread ps3_original_ExitThread
+#    define _endthreadex ps3_original_endthreadex
 #  endif
 #else
 

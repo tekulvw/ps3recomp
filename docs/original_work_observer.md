@@ -102,9 +102,23 @@ The actual POSIX PPU factory, SPU group/async factories and POSIX Win32-compatib
 workers and native guest-callback threads created through the shim. Main guest
 execution has separate fixed host enrollment of ID1/generation1 before
 `ppu_run`; its real body entry registers, and return/unwind retires it. Unexpected
-worker routes still invalidate rather than auto-enroll at an instruction. Native
-Windows thread-factory enrollment remains a separate integration requirement;
-portable collector/CPU execution tests alone do not establish it.
+worker routes still invalidate rather than auto-enroll at an instruction.
+
+Observed Windows runtime/scaffold sources route the actual `CreateThread` and
+CRT `_beginthreadex` calls through the native Windows adapter. It enrolls before
+creation and registers on the new worker before its original body. Security,
+stack reservation, suspended creation, thread IDs, return handles, arguments and
+exit codes pass through the real APIs. Normal return and explicitly wrapped
+`ExitThread`/`_endthreadex` retire after the last original body execution. Forced
+termination, unhandled exceptions and unwrapped early exits do not establish
+retirement; retain incomplete capture state. A genuine creation failure cancels
+only the never-started enrollment. Observer/setup allocation failure preserves
+the original native factory call and invalidates proof instead of suppressing
+the guest thread. Normal builds retain direct Windows/CRT calls with no wrapper.
+The Windows fixture checks both factories, genuine suspended/resume behavior,
+normal return and explicit exit with two observed witnesses through drain.
+Cross-linking that fixture alone is not evidence of Windows execution or a
+client's complete thread lifecycle.
 
 `ps3_original_live_status` and `ps3_original_live_total` are diagnostic-only APIs.
 Their report deliberately has no drained-through field. Per-worker single-writer
@@ -136,4 +150,6 @@ interpreter witness or fabricating a skipped halt-PC witness must fail after the
 exact guest result has already been checked. `--compile-only` is an explicitly
 separate cross-build mode and never claims execution. The dedicated CI workflow
 runs the execution checks on all three host operating systems; Windows uses
-clang-cl for the collector and MinGW/winpthreads for the actual runtime fixture.
+clang-cl for the collector/native Windows lifecycle and MinGW/winpthreads for
+the actual SPU runtime fixture. Actual Windows lifecycle acceptance remains
+pending until that dedicated job executes successfully.
