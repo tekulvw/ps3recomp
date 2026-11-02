@@ -18,6 +18,7 @@
 #include "ps3emu/ps3types.h"
 #include "rsx_frontend.h"
 #include "rsx_native_owner.h"
+#include "rsx_native_image.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,6 +77,7 @@ u32  rsx_metal_backend_guest_draws(void);
 
 /* Borrow existing native ownership only; no device/queue is created. */
 int rsx_metal_backend_borrow_owner(rsx_native_owner *);
+int rsx_metal_backend_borrow_image(uint64_t owner_lifetime,uint32_t backend_surface,rsx_native_image *);
 int rsx_metal_backend_owner_shutdown_requested(uint64_t lifetime);
 int rsx_metal_backend_owner_retry_shutdown(uint64_t lifetime);
 

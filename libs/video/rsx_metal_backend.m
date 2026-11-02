@@ -2482,6 +2482,10 @@ static u32 s_eng_obj_count;
 static u32 s_eng_obj_free[ENG_MAX_OBJECTS];
 static u32 s_eng_obj_free_count;
 static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
+/* Never reused even across device reinitialization; native image import is
+ * scoped by both owner lifetime and this allocation generation. */
+static uint64_t s_eng_obj_generation[ENG_MAX_OBJECTS],s_eng_next_obj_generation;
+static unsigned s_eng_obj_native_pins[ENG_MAX_OBJECTS];
 
 /* RSX_ENG_COUNTS=1: live Metal resources by creation site. A tag is
  * associated with each resource the engine creates and its dealloc runs when
@@ -2904,6 +2908,7 @@ static NSString* const kEngHelperMSL = @
 static u32 eng_obj_add(id<MTLTexture> t)
 {
     if (!t) return 0;
+    if(metal_owner_enabled()&&s_eng_next_obj_generation==UINT64_MAX)return 0;
     u32 slot;
     if (s_eng_obj_free_count) {
         slot = s_eng_obj_free[--s_eng_obj_free_count];
@@ -2921,6 +2926,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
         slot = s_eng_obj_count++;
     }
     s_eng_obj[slot] = t;
+    if(metal_owner_enabled())s_eng_obj_generation[slot]=++s_eng_next_obj_generation;
     /* RSX_ENG_COUNTS=1: live backend objects every 4096 creations, to show
      * a long session stays bounded. */
     { static int on = -1; static unsigned long long made;
@@ -2965,7 +2971,7 @@ static void eng_collect_retired_objects(void)
 {
     if (s_eng_rec_count) return;
     for (u32 i = 0; i < s_eng_obj_count; ++i) {
-        if (!s_eng_obj_retired[i]) continue;
+        if (!s_eng_obj_retired[i]||s_eng_obj_native_pins[i]) continue;
         s_eng_obj_retired[i] = 0;
         s_eng_obj[i] = nil;
         s_eng_obj_free[s_eng_obj_free_count++] = i;
@@ -5631,4 +5637,49 @@ int rsx_metal_backend_owner_retry_shutdown(uint64_t life){
     else if(s_metal_owner.failed||fps_backend_failed())status=-6;
     else{metal_original_shutdown();status=s_dev?-6:1;if(status==1)s_metal_shutdown_pending=0;}
     metal_owner_finish(status==1?0:1);return status;
+}
+
+/* A native image lease keeps the original table slot alive, while independent
+ * validation prevents encoding a new frame against a retired allocation. */
+static int metal_image_identity(uint64_t life,uint64_t id,uint64_t generation,int retired_ok){
+ if(!life||life!=s_metal_owner.generation||!id||id>s_eng_obj_count||!generation||s_eng_obj_generation[id-1]!=generation||!s_eng_obj[id-1]||(!retired_ok&&s_eng_obj_retired[id-1]))return -3;
+ return 0;
+}
+static int metal_image_retain(void *user,uint64_t life,uint64_t id,uint64_t generation){
+ if(user!=&s_metal_owner)return -3;
+ if(s_metal_owner_thread.gate||!rsx_owner_lock_try(&s_metal_owner.lock))return -4;
+ int status=metal_image_identity(life,id,generation,0);
+ if(!status&&s_metal_owner.closing)status=-3;
+ if(!status&&(s_metal_owner.failed||fps_backend_failed()))status=-6;
+ if(!status&&(s_metal_owner.retained==UINT_MAX||s_eng_obj_native_pins[id-1]==UINT_MAX))status=-4;
+ if(!status){++s_metal_owner.retained;++s_eng_obj_native_pins[id-1];}
+ rsx_owner_lock_release(&s_metal_owner.lock);return status;
+}
+static void metal_image_release(void *user,uint64_t life,uint64_t id,uint64_t generation){
+ if(user!=&s_metal_owner||s_metal_owner_thread.gate)return;
+ rsx_owner_lock_acquire(&s_metal_owner.lock);
+ if(!metal_image_identity(life,id,generation,1)&&s_eng_obj_native_pins[id-1]&&s_metal_owner.retained){--s_eng_obj_native_pins[id-1];--s_metal_owner.retained;eng_collect_retired_objects();}
+ rsx_owner_lock_release(&s_metal_owner.lock);
+}
+static int metal_image_validate(void *user,uint64_t life,uint64_t id,uint64_t generation){
+ if(user!=&s_metal_owner)return -3;
+ if(s_metal_owner_thread.gate!=&s_metal_owner||!s_metal_owner_thread.native)return -4;
+ if(s_metal_owner.closing)return -3;
+ if(s_metal_owner.failed||fps_backend_failed())return -6;
+ return metal_image_identity(life,id,generation,0);
+}
+int rsx_metal_backend_borrow_image(uint64_t life,uint32_t handle,rsx_native_image *out){
+ if(!out||out->abi_version!=RSX_NATIVE_IMAGE_ABI||out->struct_size!=sizeof(*out))return -1;
+ if(!metal_owner_enabled())return -2;
+ if(!metal_owner_begin(0))return -4;
+ int status=0;
+ if(!s_ready||s_metal_owner.closing||life!=s_metal_owner.generation||!handle||handle>s_eng_obj_count||s_eng_obj_retired[handle-1]||!s_eng_obj[handle-1]||!s_eng_obj_generation[handle-1])status=-3;
+ else if(s_metal_owner.failed||fps_backend_failed())status=-6;
+ else{ id<MTLTexture> image=s_eng_obj[handle-1];uint32_t format=0;
+  if(image.pixelFormat==MTLPixelFormatRGBA8Unorm)format=RSX_NATIVE_IMAGE_RGBA8;
+  else if(image.pixelFormat==MTLPixelFormatBGRA8Unorm)format=RSX_NATIVE_IMAGE_BGRA8;
+  else status=-2;
+  if(!status)*out=(rsx_native_image){.abi_version=RSX_NATIVE_IMAGE_ABI,.struct_size=sizeof(*out),.backend=RSX_NATIVE_OWNER_METAL,.format=format,.width=(uint32_t)image.width,.height=(uint32_t)image.height,.owner_lifetime=life,.resource_id=handle,.resource_generation=s_eng_obj_generation[handle-1],.image=(__bridge void*)image,.userdata=&s_metal_owner,.retain=metal_image_retain,.release=metal_image_release,.validate=metal_image_validate};
+ }
+ metal_owner_finish(1);return status;
 }
