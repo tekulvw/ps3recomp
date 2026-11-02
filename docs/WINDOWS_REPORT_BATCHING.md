@@ -41,6 +41,7 @@ Real D3D12 adapter, upload-pressure and ownership checks are explicit:
 
 ```text
 python tools/test_live_draw_report_batch.py --runtime-library <path-to-MT-ps3recomp_runtime.lib>
+python tools/test_gcm_live_report_gpu.py --runtime-library <path-to-MT-ps3recomp_runtime.lib>
 ```
 
 Run this from an initialized Windows native compiler environment using the
