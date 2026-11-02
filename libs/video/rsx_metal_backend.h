@@ -16,6 +16,7 @@
 #define PS3RECOMP_RSX_METAL_BACKEND_H
 
 #include "ps3emu/ps3types.h"
+#include "rsx_frontend.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,10 @@ extern "C" {
 /* Create the device, surface and command queue, and register the backend with
  * the RSX command processor. Returns 0 on success, -1 on failure. */
 int  rsx_metal_backend_init(u32 width, u32 height, const char* title);
+
+/* Lazily borrow the existing device/queue for explicit semantic compute.
+ * NULL before backend initialization; no change to existing rendering paths. */
+rsx_frontend_device *rsx_metal_backend_frontend(void);
 
 /* Unregister, then tear down the surface and device. Safe if init failed. */
 void rsx_metal_backend_shutdown(void);

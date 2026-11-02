@@ -69,6 +69,7 @@ endif()
 if(APPLE)
     enable_language(OBJC)
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_frontend_metal.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_macos.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc/osk_macos.m")
 endif()
@@ -187,6 +188,7 @@ if(APPLE)
     )
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_frontend_metal.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_macos.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc/osk_macos.m"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")

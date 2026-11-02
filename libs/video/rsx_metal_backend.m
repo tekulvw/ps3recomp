@@ -64,6 +64,7 @@
 #include "metal_frame_measurement.h"
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
+#include "rsx_frontend_internal.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_primitives.h"
 #include "rsx_vp_decompiler.h"
@@ -90,6 +91,7 @@ static atomic_int          s_closed;
 static id                  s_window_close_observer;
 #endif
 static int                 s_ready;
+static rsx_frontend_device *s_frontend;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
 
@@ -5022,9 +5024,25 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
     }
 }
 
+static int frontend_ordering_ready(void)
+{
+    /* No frontend command may overtake uncommitted original-engine/vtable work.
+     * Already committed commands use this same queue and remain ordered. */
+    return !s_eng_rec_count && !s_eng_stage_used && !s_eng_tail_encode &&
+           !s_rec_count && !s_vert_count;
+}
+
+rsx_frontend_device *rsx_metal_backend_frontend(void)
+{
+    if (!s_ready || !s_dev || !s_queue) return NULL;
+    if (!s_frontend) s_frontend = rsx_frontend_metal_create(s_dev, s_queue, frontend_ordering_ready);
+    return s_frontend;
+}
+
 void rsx_metal_backend_shutdown(void)
 {
     @autoreleasepool {
+        rsx_frontend_close(s_frontend); s_frontend = NULL;
         if (s_ready) rsx_set_backend(NULL);
         if (s_eng_active) rsx_draw_engine_shutdown();
         rsx_draw_engine_set_backend(NULL);
