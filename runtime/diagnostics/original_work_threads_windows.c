@@ -116,5 +116,8 @@ DECLSPEC_NORETURN void WINAPI ps3_original_ExitThread(DWORD code) {
 DECLSPEC_NORETURN void __cdecl ps3_original_endthreadex(unsigned code) {
   retire();
   _endthreadex(code);
+  /* Some UCRT headers omit noreturn on _endthreadex. Keep the wrapper
+   * terminal even with that declaration, after the single retirement above. */
+  ExitThread(code);
 }
 #endif
