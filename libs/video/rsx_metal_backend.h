@@ -19,6 +19,7 @@
 #include "rsx_frontend.h"
 #include "rsx_native_owner.h"
 #include "rsx_native_image.h"
+#include "rsx_native_frame.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,6 +79,10 @@ u32  rsx_metal_backend_guest_draws(void);
 /* Borrow existing native ownership only; no device/queue is created. */
 int rsx_metal_backend_borrow_owner(rsx_native_owner *);
 int rsx_metal_backend_borrow_image(uint64_t owner_lifetime,uint32_t backend_surface,rsx_native_image *);
+int rsx_metal_backend_reserve_frame(const rsx_native_image *,const rsx_native_frame_source *,rsx_native_frame *);
+int rsx_metal_backend_cancel_frame(uint64_t owner_lifetime,uint64_t reservation);
+int rsx_metal_backend_poll_frames(rsx_native_frame_event *,uint32_t capacity,uint32_t *count);
+
 int rsx_metal_backend_owner_shutdown_requested(uint64_t lifetime);
 int rsx_metal_backend_owner_retry_shutdown(uint64_t lifetime);
 

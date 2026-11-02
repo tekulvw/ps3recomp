@@ -109,6 +109,7 @@ static _Thread_local rsx_native_owner_thread s_metal_owner_thread;
 static _Thread_local int s_metal_consumer;
 static uint64_t s_metal_lifetime,s_metal_commits;
 static int s_metal_shutdown_pending;
+static void metal_native_frame_present(id<MTLCommandBuffer>,id<MTLTexture>,id<CAMetalDrawable>,int);
 static unsigned s_metal_partial_primitives;
 static atomic_int s_metal_unscoped_commit;
 static int metal_owner_enabled(void){
@@ -4507,6 +4508,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
         eng_encode_records(cb, stage);
         if (s_eng_tail_encode) { s_eng_tail_encode(cb); s_eng_tail_encode = nil; }
         int presented = eng_blit_to_display(cb, present_dst, dst);
+        if(present_dst)metal_native_frame_present(cb,present_dst,drawable,presented);
         if (drawable && !presented) fps_note_skipped_blit();
         if (s_eng_diag.active && !presented && present_dst) s_eng_diag.reason = "blit_skipped";
         const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
@@ -5682,4 +5684,95 @@ int rsx_metal_backend_borrow_image(uint64_t life,uint32_t handle,rsx_native_imag
   if(!status)*out=(rsx_native_image){.abi_version=RSX_NATIVE_IMAGE_ABI,.struct_size=sizeof(*out),.backend=RSX_NATIVE_OWNER_METAL,.format=format,.width=(uint32_t)image.width,.height=(uint32_t)image.height,.owner_lifetime=life,.resource_id=handle,.resource_generation=s_eng_obj_generation[handle-1],.image=(__bridge void*)image,.userdata=&s_metal_owner,.retain=metal_image_retain,.release=metal_image_release,.validate=metal_image_validate};
  }
  metal_owner_finish(1);return status;
+}
+
+/* Bounded cross-owner frame association. Async GPU/compositor callbacks use
+ * only this independent mutex; they never take the owner/consumer lease or
+ * release host pins. Poll retires pins on the caller's host lifecycle thread. */
+@interface MetalNativeFrame : NSObject {
+@public rsx_native_frame_source source;
+ uint64_t owner,reservation,target,generation,native_device,native_submission;
+ uint64_t guest,drawable;uint32_t buffer,disposition;
+ int phase,final_done,present_done; /* 0reserved,1nativequeued,2finalattached */
+}
+@end
+@implementation MetalNativeFrame @end
+static pthread_mutex_t s_native_frame_mu=PTHREAD_MUTEX_INITIALIZER;
+static MetalNativeFrame *s_native_frames[2];
+static uint64_t s_native_next_frame;
+static rsx_native_frame_event s_native_frame_events[64];
+static unsigned s_native_frame_head,s_native_frame_count;
+static int s_native_frame_overflow;
+static MetalNativeFrame *metal_native_frame_find(uint64_t life,uint64_t reservation){
+ for(unsigned i=0;i<2;++i){MetalNativeFrame *f=s_native_frames[i];if(f&&f->owner==life&&f->reservation==reservation)return f;}return nil;
+}
+static void metal_native_frame_event(MetalNativeFrame *f,uint32_t kind,uint32_t success,uint32_t status,double time){
+ if(s_native_frame_count==64){s_native_frame_overflow=1;return;}
+ unsigned i=(s_native_frame_head+s_native_frame_count++)%64;
+ s_native_frame_events[i]=(rsx_native_frame_event){.abi_version=1,.struct_size=sizeof(rsx_native_frame_event),.kind=kind,.succeeded=success,.owner_lifetime=f->owner,.reservation=f->reservation,.source=f->source,.native_device_generation=f->native_device,.native_submission=f->native_submission,.target_id=f->target,.target_generation=f->generation,.guest_flip_id=f->guest,.drawable_id=f->drawable,.guest_buffer_id=f->buffer,.native_status=status,.presented_time=time};
+}
+static int metal_native_frame_preflight(void *user,uint64_t life,uint64_t reservation,uint64_t id,uint64_t generation){
+ if(user!=&s_metal_owner)return -3;
+ if(s_metal_owner_thread.gate!=&s_metal_owner||!s_metal_owner_thread.native)return -4;
+ int status=metal_image_identity(life,id,generation,0);if(status)return status;
+ pthread_mutex_lock(&s_native_frame_mu);MetalNativeFrame *f=metal_native_frame_find(life,reservation);
+ status=!f||f->target!=id||f->generation!=generation?-3:f->phase?-4:0;
+ if(s_native_frame_overflow)status=-6;pthread_mutex_unlock(&s_native_frame_mu);return status;
+}
+static int metal_native_frame_committed(void *user,uint64_t life,uint64_t reservation,uint64_t device,uint64_t submission,uint32_t disposition){
+ if(user!=&s_metal_owner)return -3;
+ if(s_metal_owner_thread.gate!=&s_metal_owner||!s_metal_owner_thread.native)return -4;
+ if(!device||!submission||disposition>1)return -1;
+ pthread_mutex_lock(&s_native_frame_mu);MetalNativeFrame *f=metal_native_frame_find(life,reservation);
+ int status=!f?-3:f->phase?-4:0;
+ if(!status){f->native_device=device;f->native_submission=submission;f->disposition=disposition;f->phase=1;metal_native_frame_event(f,RSX_NATIVE_FRAME_NATIVE_QUEUED,disposition==0,disposition,0);if(s_native_frame_overflow)status=-6;}
+ pthread_mutex_unlock(&s_native_frame_mu);return status;
+}
+int rsx_metal_backend_cancel_frame(uint64_t life,uint64_t reservation){
+ if(!metal_owner_enabled())return -2;
+ int native=s_metal_owner_thread.gate==&s_metal_owner&&s_metal_owner_thread.native;
+ if(!native&&!metal_owner_begin(0))return -4;
+ pthread_mutex_lock(&s_native_frame_mu);MetalNativeFrame *f=metal_native_frame_find(life,reservation);int status=!f?-3:f->phase?-4:0;
+ if(!status){for(unsigned i=0;i<2;++i)if(s_native_frames[i]==f)s_native_frames[i]=nil;}
+ pthread_mutex_unlock(&s_native_frame_mu);
+ if(!status){if(!metal_image_identity(life,f->target,f->generation,1)&&s_eng_obj_native_pins[f->target-1]&&s_metal_owner.retained){--s_eng_obj_native_pins[f->target-1];--s_metal_owner.retained;eng_collect_retired_objects();}else status=-6;}
+ if(!native)metal_owner_finish(1);return status;
+}
+static int metal_native_frame_cancel(void *user,uint64_t life,uint64_t reservation){return user==&s_metal_owner?rsx_metal_backend_cancel_frame(life,reservation):-3;}
+int rsx_metal_backend_reserve_frame(const rsx_native_image *image,const rsx_native_frame_source *source,rsx_native_frame *out){
+ if(!image||!source||!out||image->abi_version!=1||image->struct_size!=sizeof(*image)||source->abi_version!=1||source->struct_size!=sizeof(*source)||out->abi_version!=1||out->struct_size!=sizeof(*out)||!source->cohort_id||!source->source_publication||!source->pass_occurrence)return -1;
+ if(!metal_owner_enabled())return -2;
+ if(!metal_owner_begin(0))return -4;
+ int status=metal_image_identity(image->owner_lifetime,image->resource_id,image->resource_generation,0);
+ if(!status&&(image->userdata!=&s_metal_owner||s_metal_owner.closing))status=-3;
+ if(!status&&(s_metal_owner.failed||fps_backend_failed()))status=-6;
+ pthread_mutex_lock(&s_native_frame_mu);unsigned slot=2;
+ if(!status){for(unsigned i=0;i<2;++i){MetalNativeFrame *f=s_native_frames[i];if(!f){if(slot==2)slot=i;continue;}if(f->owner==image->owner_lifetime&&f->target==image->resource_id&&f->generation==image->resource_generation&&f->phase<2)status=-4;}}
+ if(!status&&(slot==2||s_native_frame_count>56))status=-4;
+ if(!status&&(s_native_next_frame==UINT64_MAX||s_native_frame_overflow))status=-6;
+ if(!status&&(s_metal_owner.retained==UINT_MAX||s_eng_obj_native_pins[image->resource_id-1]==UINT_MAX))status=-4;
+ if(!status){MetalNativeFrame *f=[MetalNativeFrame new];if(!f)status=-5;else{f->source=*source;f->owner=image->owner_lifetime;f->reservation=++s_native_next_frame;f->target=image->resource_id;f->generation=image->resource_generation;s_native_frames[slot]=f;++s_metal_owner.retained;++s_eng_obj_native_pins[f->target-1];*out=(rsx_native_frame){.abi_version=1,.struct_size=sizeof(*out),.owner_lifetime=f->owner,.reservation=f->reservation,.userdata=&s_metal_owner,.preflight=metal_native_frame_preflight,.committed=metal_native_frame_committed,.cancel=metal_native_frame_cancel};}}
+ pthread_mutex_unlock(&s_native_frame_mu);metal_owner_finish(1);return status;
+}
+static void metal_native_frame_present(id<MTLCommandBuffer> cb,id<MTLTexture> target,id<CAMetalDrawable> drawable,int blitted){
+ if(!metal_owner_enabled()||!cb||!target)return;
+ pthread_mutex_lock(&s_native_frame_mu);MetalNativeFrame *frame=nil;
+ for(unsigned i=0;i<2;++i){MetalNativeFrame *f=s_native_frames[i];if(f&&f->owner==s_metal_owner.generation&&f->phase==1&&!metal_image_identity(f->owner,f->target,f->generation,1)&&eng_obj((u32)f->target)==target){frame=f;break;}}
+ if(frame){frame->phase=2;frame->guest=s_present_guest_id;frame->buffer=s_present_buffer_id;frame->drawable=drawable?drawable.drawableID:0;
+  if(!drawable||!blitted){frame->present_done=1;metal_native_frame_event(frame,RSX_NATIVE_FRAME_SKIPPED,0,blitted?0:1,0);}}
+ pthread_mutex_unlock(&s_native_frame_mu);if(!frame)return;
+ [cb addCompletedHandler:^(id<MTLCommandBuffer> finished){pthread_mutex_lock(&s_native_frame_mu);frame->final_done=1;metal_native_frame_event(frame,RSX_NATIVE_FRAME_FINAL_GPU_TERMINAL,finished.status==MTLCommandBufferStatusCompleted&&!finished.error,(uint32_t)finished.status,0);pthread_mutex_unlock(&s_native_frame_mu);}];
+ if(drawable&&blitted)[drawable addPresentedHandler:^(id<MTLDrawable> shown){double time=shown.presentedTime;pthread_mutex_lock(&s_native_frame_mu);frame->present_done=1;metal_native_frame_event(frame,isfinite(time)&&time>0?RSX_NATIVE_FRAME_PRESENTED:RSX_NATIVE_FRAME_SKIPPED,isfinite(time)&&time>0,0,time);pthread_mutex_unlock(&s_native_frame_mu);}];
+}
+int rsx_metal_backend_poll_frames(rsx_native_frame_event *events,uint32_t capacity,uint32_t *count){
+ if(count)*count=0;if(!events||!count||!capacity||capacity>64)return -1;
+ if(!metal_owner_enabled())return -2;
+ if(s_metal_owner_thread.gate)return -4;
+ MetalNativeFrame *retire[2]={nil,nil};unsigned retired=0;int overflow;
+ pthread_mutex_lock(&s_native_frame_mu);
+ while(s_native_frame_count&&*count<capacity){events[(*count)++]=s_native_frame_events[s_native_frame_head];s_native_frame_head=(s_native_frame_head+1)%64;--s_native_frame_count;}
+ if(!s_native_frame_count){for(unsigned i=0;i<2;++i){MetalNativeFrame *f=s_native_frames[i];if(f&&f->final_done&&f->present_done){retire[retired++]=f;s_native_frames[i]=nil;}}}
+ overflow=s_native_frame_overflow;pthread_mutex_unlock(&s_native_frame_mu);
+ for(unsigned i=0;i<retired;++i){MetalNativeFrame *f=retire[i];metal_image_release(&s_metal_owner,f->owner,f->target,f->generation);}
+ return *count?0:overflow?-6:0;
 }
