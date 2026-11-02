@@ -15,6 +15,7 @@
 #include "rsx_deferred_reports.h"
 #include "rsx_ring_progress_observer.h"
 #include "cellGcmSys.h"
+#include "rsx_native_handoff.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
@@ -48,6 +49,147 @@ static int gcm_checked_backend_flush(void) {
 #include <stdint.h>
 #include "ps3emu/log_first.h"
 #include <stdatomic.h>
+
+/* Source-qualified, one-shot command publication. No work is done in the
+ * ordinary path until an explicit producer arms an entry. The registry lock
+ * is never held across user code or the owner/consumer lock hierarchy. */
+#define GCM_NATIVE_HANDOFF_CAPACITY 64u
+static SRWLOCK s_native_handoff_lock = SRWLOCK_INIT;
+static atomic_uint s_native_handoff_count;
+static uint64_t s_native_handoff_next = 1;
+static struct {
+    uint64_t cookie;
+    uintptr_t vm_base_identity;
+    unsigned phase; /* 1 armed, 2 published, 3 callback active */
+    rsx_native_handoff_arm source;
+} s_native_handoffs[GCM_NATIVE_HANDOFF_CAPACITY];
+static void gcm_native_handoff_remove(unsigned i)
+{
+    memset(&s_native_handoffs[i], 0, sizeof(s_native_handoffs[i]));
+    atomic_fetch_sub_explicit(&s_native_handoff_count, 1, memory_order_release);
+}
+int cellGcm_native_handoff_arm(const rsx_native_handoff_arm* source, uint64_t* cookie)
+{
+    if (cookie) *cookie = 0;
+    if (!source || !cookie || source->abi_version != RSX_NATIVE_HANDOFF_ABI ||
+        source->struct_size != sizeof(*source) || !source->consume || !source->source_observation ||
+        !vm_base || !source->vm_identity ||
+        !source->context_ea || (source->context_ea & 3u) || source->context_ea > UINT32_MAX - 16u ||
+        !source->header_ea || (source->header_ea & 3u) || source->header_ea > UINT32_MAX - 8u ||
+        /* One ordinary method with exactly one argument; no branches/fake opcodes. */
+        (source->expected_header & 0xFFFF0003u) != 0x00040000u)
+        return -1;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    int result = -4;
+    if (vm_read32(source->context_ea + 8) != source->header_ea ||
+        vm_read32(source->context_ea) > source->header_ea ||
+        vm_read32(source->context_ea + 4) < source->header_ea + 8u) {
+        result = -3;
+    } else if (s_native_handoff_next != 0) {
+        unsigned free_slot = GCM_NATIVE_HANDOFF_CAPACITY;
+        int duplicate = 0;
+        for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+            if (!s_native_handoffs[i].phase) free_slot = i;
+            else if (s_native_handoffs[i].source.vm_identity == source->vm_identity &&
+                     s_native_handoffs[i].source.header_ea == source->header_ea) duplicate = 1;
+        }
+        if (!duplicate && free_slot < GCM_NATIVE_HANDOFF_CAPACITY) {
+            s_native_handoffs[free_slot].source = *source;
+            s_native_handoffs[free_slot].vm_base_identity = (uintptr_t)vm_base;
+            s_native_handoffs[free_slot].cookie = s_native_handoff_next++;
+            s_native_handoffs[free_slot].phase = 1;
+            *cookie = s_native_handoffs[free_slot].cookie;
+            atomic_fetch_add_explicit(&s_native_handoff_count, 1, memory_order_release);
+            result = 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    return result;
+}
+int cellGcm_native_handoff_publish(uint64_t cookie)
+{
+    if (!cookie) return -3;
+    int result = -3;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+        if (s_native_handoffs[i].cookie != cookie) continue;
+        const rsx_native_handoff_arm* a = &s_native_handoffs[i].source;
+        if (s_native_handoffs[i].phase == 1 && s_native_handoffs[i].vm_base_identity == (uintptr_t)vm_base &&
+            vm_read32(a->context_ea + 8) == a->header_ea + 8u &&
+            vm_read32(a->header_ea) == a->expected_header &&
+            vm_read32(a->header_ea + 4) == a->expected_argument) {
+            s_native_handoffs[i].phase = 2;
+            result = 0;
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    return result;
+}
+int cellGcm_native_handoff_cancel(uint64_t cookie)
+{
+    if (!cookie) return -3;
+    int result = -3;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+        if (s_native_handoffs[i].cookie != cookie) continue;
+        if (s_native_handoffs[i].phase == 3) result = -4;
+        else { gcm_native_handoff_remove(i); result = 0; }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    return result;
+}
+/* 1 waits for the armed actual writer; 0 allows ordinary decoding. */
+static int gcm_native_handoff_consume(u32 ea, u32 get, u32 put)
+{
+    if (!atomic_load_explicit(&s_native_handoff_count, memory_order_acquire)) return 0;
+    rsx_native_handoff_arm source;
+    uint64_t cookie = 0;
+    unsigned slot = GCM_NATIVE_HANDOFF_CAPACITY;
+    int waiting = 0;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+        if (!s_native_handoffs[i].phase || s_native_handoffs[i].source.header_ea != ea) continue;
+        source = s_native_handoffs[i].source;
+        if (s_native_handoffs[i].vm_base_identity != (uintptr_t)vm_base) {
+            gcm_native_handoff_remove(i);
+        } else if (s_native_handoffs[i].phase == 1) {
+            waiting = 1;
+        } else if (s_native_handoffs[i].phase == 2) {
+            if (vm_read32(ea) != source.expected_header || vm_read32(ea + 4) != source.expected_argument) {
+                gcm_native_handoff_remove(i);
+            } else {
+                s_native_handoffs[i].phase = 3;
+                cookie = s_native_handoffs[i].cookie;
+                slot = i;
+            }
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    if (cookie) {
+        rsx_native_handoff_event event = {0};
+        event.abi_version = RSX_NATIVE_HANDOFF_ABI;
+        event.struct_size = sizeof(event);
+        event.cookie = cookie;
+        event.vm_identity = source.vm_identity;
+        event.vm_base_identity = (uint64_t)(uintptr_t)vm_base;
+        event.source_observation = source.source_observation;
+        event.context_ea = source.context_ea;
+        event.header_ea = ea;
+        event.header = source.expected_header;
+        event.argument = source.expected_argument;
+        event.fifo_get = get;
+        event.fifo_put = put;
+        rsx_draw_engine_native_source_target(&event.target);
+        source.consume(source.userdata, &event);
+        AcquireSRWLockExclusive(&s_native_handoff_lock);
+        gcm_native_handoff_remove(slot);
+        ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    }
+    return waiting;
+}
 
 /* Explicitly initialized by the application before guest/consumer threads.
  * Only launch-static diagnostic configuration is frozen. Runtime diagnostic
@@ -2779,6 +2921,9 @@ static void gcm_rsx_process_fifo_pass(void)
             s_fifo_flips_reached = s_fifo_flips_queued;
             why = "no-io-mapping";
             break;
+        }
+        if (gcm_native_handoff_consume(ea, s_fifo_getoff, put)) {
+            why = "native-source-publication"; producer_waiting = 1; break;
         }
         u32 w = vm_read32(ea);
         gcm_observer_packet(s_fifo_getoff,w,put);

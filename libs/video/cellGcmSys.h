@@ -17,6 +17,7 @@
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
 #include "../../runtime/syscalls/sys_memory_native.h"
+#include "rsx_native_handoff.h"
 
 #ifdef __cplusplus
 extern "C" {

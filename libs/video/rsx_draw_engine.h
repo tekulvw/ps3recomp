@@ -30,6 +30,7 @@
 #define PS3RECOMP_RSX_DRAW_ENGINE_H
 
 #include "rsx_dispatch.h"
+#include "rsx_native_handoff.h"
 #include "rsx_primitives.h"
 #include "rsx_texture_layout.h"
 #include "rsx_vertex_compact.h"

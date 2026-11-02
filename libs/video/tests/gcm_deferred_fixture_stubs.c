@@ -41,3 +41,5 @@ WEAK uint32_t ppu_vm_size;
 WEAK int32_t sys_memory_native_acquire(const sys_memory_native_allocation* a){(void)a;return -1;}
 WEAK int32_t sys_memory_native_unpin(const sys_memory_native_allocation* a){(void)a;return -1;}
 WEAK int32_t sys_memory_native_mapping_ref(const sys_memory_native_allocation* a,int delta){(void)a;(void)delta;return -1;}
+
+WEAK int rsx_draw_engine_native_source_target(rsx_native_source_target* out){if(out)*out=(rsx_native_source_target){0};return 0;}

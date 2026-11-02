@@ -4461,6 +4461,45 @@ int rsx_draw_engine_completion_status(u64 ticket,int wait){
     if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
     return result;
 }
+int rsx_draw_engine_native_source_target(rsx_native_source_target* out)
+{
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    const rsx_original_owner_hooks* owner = atomic_load_explicit(&s_original_owner_hooks, memory_order_acquire);
+    if (owner && !owner->begin(owner->user, RSX_ORIGINAL_READ)) return 0;
+    if (g.ready && !g.rsx.in_begin_end && !atomic_load(&s_checked_failed)) {
+        rsx_dsp_surface sf;
+        rsx_dsp_get_surface(&g.rsx, &sf);
+        const u32 horizontal = rsx_dsp_reg(&g.rsx, 0x0200u);
+        const u32 vertical = rsx_dsp_reg(&g.rsx, 0x0204u);
+        out->color_a_offset = sf.color_offset[0];
+        out->color_a_dma = rsx_dsp_reg(&g.rsx, 0x0194u);
+        out->color_a_pitch = sf.color_pitch[0];
+        out->surface_format = rsx_dsp_reg(&g.rsx, 0x0208u);
+        out->clip_x = horizontal & 0xffffu; out->clip_width = horizontal >> 16;
+        out->clip_y = vertical & 0xffffu; out->clip_height = vertical >> 16;
+        out->color_target = sf.color_target;
+        out->viewport_z_scale_bits = rsx_dsp_reg(&g.rsx, 0x0a38u);
+        out->viewport_z_offset_bits = rsx_dsp_reg(&g.rsx, 0x0a28u);
+        /* Lookup only: never call eng_current_target_set/eng_surface_get,
+         * which could create/reseed a target after the original scene. */
+        if (sf.color_target && sf.color_target != CELL_GCM_SURFACE_TARGET_1 && sf.clip_w && sf.clip_h) {
+            for (u32 i = 0; i < g.n_surfaces; ++i) {
+                const eng_surface* surface = &g.surfaces[i];
+                if (!surface->handle || surface->location != sf.color_location[0] ||
+                    surface->offset != sf.color_offset[0] || surface->fmt != eng_surface_format(sf.color_format) ||
+                    surface->pitch != sf.color_pitch[0] || surface->aa_grid != (sf.aa_sx | (sf.aa_sy << 8)) ||
+                    surface->w < sf.clip_w || surface->h < sf.clip_h) continue;
+                if (out->native_surface) { out->native_surface = 0; break; } /* ambiguous allocation */
+                out->native_surface = surface->handle;
+                out->native_width = surface->w; out->native_height = surface->h;
+            }
+        }
+        out->ready = out->native_surface != 0;
+    }
+    if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
+    return out->ready != 0;
+}
 int rsx_draw_engine_checked_ready(void){
     const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
     if(owner && !owner->begin(owner->user,RSX_ORIGINAL_READ)){return 0;}
