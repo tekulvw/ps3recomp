@@ -90,8 +90,8 @@ tests, borrows the frontend, and asserts no layer, window or NSApplication was c
 requires a real Metal device; a missing device is a failure, never software/null acceptance.
 The subprocess has a 20-second run deadline. It verifies runtime shader compilation, exact
 synthetic transform/compaction outputs, zero/oversized bounds, stable selected order, two-ticket
-pressure, original-work ordering gates, manifest alignment, unsupported headed arrays, immutable
-version retention across a real shared-event delay, exactly-once terminal polling, metadata
+pressure, original-work ordering gates, manifest alignment, unsupported headed arrays, retention
+of prior CPU uploads across a real shared-event delay, exactly-once terminal polling, metadata
 retirement, shutdown drain and stale context rejection. Diagnostic readback is used only after
 terminal completion. These are synthetic Metal compute results, not complete scene, D3D12,
 Vulkan, game visual or match-performance acceptance.
@@ -126,14 +126,17 @@ From Linux with a C compiler, Python3, SDL2/Vulkan development headers and loade
 ```sh
 python3 tools/test_frontend_vulkan.py --contract-only
 python3 tools/test_frontend_vulkan.py --shader-root <generated-shader-root> --build-only
-python3 tools/test_frontend_vulkan.py --shader-root <generated-shader-root> \
+python3 tools/test_frontend_vulkan.py --shader-root <generated-shader-root> --require-validation \
   --require-hardware --gpu-index <index> --vendor-id <PCI-vendor> --device-id <PCI-device> \
   --report build/frontend-vulkan-hardware.json
 ```
 
 Hardware mode matches vendor/device IDs and rejects CPU, virtual and unspecified devices.
-The no-window fixture uses one existing-owner device/queue. A host-signaled Vulkan event
-delays queue progress while two compute tickets retain released old CPU versions. It checks
+The no-window fixture uses one existing-owner device/queue. A host-signaled timeline semaphore
+delays queue progress while two compute tickets retain released old CPU versions. Timeline
+support is enabled only on the fixture device; normal backend requirements remain unchanged.
+Required validation mode fails if the Khronos layer cannot initialize, and every VUID in the
+captured output fails the runner before it writes a success receipt. It checks
 exact transform/compaction outputs, zero/oversized bounds, ordering gates, alignment/layout
 rejection, pressure, pending-read protection, new publication and exactly-once terminal polling.
 The CPU-only driver-fault test injects fence responses without creating a GPU device. Receipts
@@ -143,3 +146,27 @@ The dedicated Linux workflow builds with GCC/Clang and runs lavapipe diagnostics
 using pinned authored shader sources. A green software result is never hardware acceptance.
 Full scenes, original-surface interop, presentation, fault injection, D3D12 and full M2 remain
 separate obligations.
+
+## Dedicated CI and shader provenance
+
+The explicit native fixture runners require generated shader directories and platform tools;
+generic `tools/test_*.py` discovery excludes those two runners. Dedicated workflows supply the
+inputs and invoke strict checks rather than treating a missing argument or device as a pass.
+The Metal workflow compiles the native fixture by default with `--build-only`, explicitly leaving
+GPU execution pending. An explicitly requested manual hardware mode runs the actual fixture and
+fails if no real device is available. The Vulkan workflow runs its CPU driver-fault regression
+and software diagnostics with required Khronos validation; every VUID fails the native runner.
+
+Both workflows pin the authored shader tool and WGSL to public source checkpoint
+[`33f0ad6f26dc2d951a6b937c28a1b1383ae7ddd4`](https://github.com/tekulvw/mag-recomp/tree/33f0ad6f26dc2d951a6b937c28a1b1383ae7ddd4/crates/mag-render-shaders),
+which locks Naga 30.0.1 and Rust 1.99.0. MSL 2.0, HLSL `cs_6_0`, SPIR-V 1.3/Vulkan 1.1 and binding/layout
+metadata are explicit. Generated shader binaries/manifests belong to one source-bound set;
+native test receipts retain their hashes independently of translated compiler metadata.
+The workflows have read-only repository permissions and no release publication jobs.
+
+The old host-set Vulkan event gate was invalid while a submitted command referenced it.
+The supported fixture uses a timeline semaphore with its feature/extension enabled only on
+the synthetic owner device. This does not raise normal Vulkan backend requirements. Native
+hardware results must come from the corrected gate under required validation, not from the
+older event fixture's output. No shader translation, software result or compile-only job
+establishes real-match performance or full frontend acceptance.

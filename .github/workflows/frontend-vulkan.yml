@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: tekulvw/mag-recomp
-          ref: e6ffef5afac11c36ca02c6ce1e746807d7db2969
+          ref: 33f0ad6f26dc2d951a6b937c28a1b1383ae7ddd4
           path: frontend-shader-source
           persist-credentials: false
       - name: Pinned shader toolchain
@@ -51,7 +51,7 @@ jobs:
       - name: Software diagnostics under validation (hardware acceptance remains pending)
         run: |
           set -o pipefail
-          python tools/test_frontend_vulkan.py --shader-root build/frontend-shaders --report build/frontend-software-report.json 2>&1 | tee build/frontend-software.log
+          python tools/test_frontend_vulkan.py --shader-root build/frontend-shaders --require-validation --report build/frontend-software-report.json 2>&1 | tee build/frontend-software.log
           if grep -q 'VUID-' build/frontend-software.log; then exit 1; fi
       - name: Retain synthetic diagnostic receipt
         uses: actions/upload-artifact@v4

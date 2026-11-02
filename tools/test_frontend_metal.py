@@ -10,6 +10,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shader-root", type=Path, required=True,
                         help="generated copy_transform and compact directories with manifests")
+    parser.add_argument("--build-only", action="store_true", help="compile the native fixture without claiming GPU execution")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="frontend-metal-") as temporary:
         binary = Path(temporary) / "fixture"
@@ -20,6 +21,9 @@ def main():
                    "libs/input/pad_macos.m", "-Wl,-dead_strip", "-framework", "Metal",
                    "-framework", "Cocoa", "-framework", "QuartzCore", "-o", str(binary)]
         subprocess.run(command, cwd=ROOT, check=True, timeout=90)
+        if args.build_only:
+            print("Metal frontend fixture compiled; GPU execution not performed")
+            return
         shaders = args.shader_root.resolve()
         subprocess.run([str(binary), str(shaders / "copy_transform"), str(shaders / "compact")], cwd=ROOT, check=True, timeout=20)
 

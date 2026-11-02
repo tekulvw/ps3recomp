@@ -48,6 +48,7 @@ def main():
     parser.add_argument("--device-id", default="0")
     parser.add_argument("--gpu-index", default="0")
     parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--require-validation", action="store_true", help="require Khronos validation layer and reject every VUID")
     parser.add_argument("--shader-root", type=Path)
     parser.add_argument("--contract-only", action="store_true", help="CPU-only injected driver-fault boundary")
     parser.add_argument("--report", type=Path)
@@ -76,6 +77,8 @@ def main():
         subprocess.run(command, cwd=ROOT, check=True, timeout=90)
         if not args.build_only:
             environment = dict(os.environ, PS3RECOMP_VK_DEVICE=args.gpu_index)
+            if args.require_validation:
+                environment["MAG_FRONTEND_REQUIRE_VALIDATION"] = "1"
             # SDK uses dlopen rather than linking Vulkan. Ephemeral package
             # environments may expose headers/pkg-config without loader search
             # paths; set only this owned subprocess's library path.
@@ -86,12 +89,15 @@ def main():
                                     cwd=ROOT, env=environment, timeout=20, capture_output=True, text=True)
             print(result.stdout, end=""); print(result.stderr, end="")
             result.check_returncode()
+            if "VUID-" in result.stdout + result.stderr:
+                raise RuntimeError("Vulkan validation rejected the fixture; no success receipt written")
             if args.report:
                 sources = ["libs/video/rsx_frontend.h", "libs/video/rsx_frontend.c", "libs/video/rsx_frontend_vulkan.h",
                            "libs/video/rsx_frontend_vulkan.c", "libs/video/rsx_vulkan_backend.c",
                            "libs/video/tests/test_frontend_vulkan.c", "libs/video/tests/test_frontend_vulkan_contract.c",
                            "tools/test_frontend_vulkan.py"]
                 record = {"status": "passed", "hardware_required": args.require_hardware,
+                          "validation_required": args.require_validation,
                           "execution": "hardware" if args.require_hardware else "diagnostic_only",
                           "gpu_index": args.gpu_index, "vendor_id": args.vendor_id, "device_id": args.device_id,
                           "source_hashes": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},

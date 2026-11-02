@@ -84,13 +84,13 @@ static void transform_test(rsx_frontend_device *device) {
     assert(rsx_frontend_submit(device, &frame, &ticket) == RSX_FRONTEND_INVALID && !ticket.submission_id);
     bindings[2].buffer = uniform; bindings[2].offset = 0; release_buffer(device, bad);
 
-    PFN_vkCreateEvent create_event = (PFN_vkCreateEvent)pvkGetDeviceProcAddr(s_vk.device, "vkCreateEvent");
-    PFN_vkDestroyEvent destroy_event = (PFN_vkDestroyEvent)pvkGetDeviceProcAddr(s_vk.device, "vkDestroyEvent");
-    PFN_vkCmdWaitEvents wait_event = (PFN_vkCmdWaitEvents)pvkGetDeviceProcAddr(s_vk.device, "vkCmdWaitEvents");
-    PFN_vkSetEvent set_event = (PFN_vkSetEvent)pvkGetDeviceProcAddr(s_vk.device, "vkSetEvent");
-    assert(create_event && destroy_event && wait_event && set_event);
-    VkEvent gate; VkEventCreateInfo event_info = {.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
-    assert(create_event(s_vk.device, &event_info, NULL, &gate) == VK_SUCCESS);
+    PFN_vkSignalSemaphoreKHR signal_gate = (PFN_vkSignalSemaphoreKHR)pvkGetDeviceProcAddr(s_vk.device, "vkSignalSemaphoreKHR");
+    assert(signal_gate);
+    VkSemaphore gate;
+    VkSemaphoreTypeCreateInfo type = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = 0};
+    VkSemaphoreCreateInfo event_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type};
+    assert(pvkCreateSemaphore(s_vk.device, &event_info, NULL, &gate) == VK_SUCCESS);
     VkCommandPool pool; VkCommandBuffer command;
     VkCommandPoolCreateInfo pool_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = s_vk.queue_family};
     assert(pvkCreateCommandPool(s_vk.device, &pool_info, NULL, &pool) == VK_SUCCESS);
@@ -99,9 +99,17 @@ static void transform_test(rsx_frontend_device *device) {
     assert(pvkAllocateCommandBuffers(s_vk.device, &allocation, &command) == VK_SUCCESS);
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     assert(pvkBeginCommandBuffer(command, &begin) == VK_SUCCESS);
-    wait_event(command, 1, &gate, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, NULL, 0, NULL, 0, NULL);
+    /* This prior barrier participates in the following frontend command's
+     * ALL_COMMANDS dependency. Its queue wait is a valid host timeline signal. */
+    pvkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 0, NULL);
     assert(pvkEndCommandBuffer(command) == VK_SUCCESS);
-    VkSubmitInfo prior = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &command};
+    const uint64_t wait_value = 1; VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkTimelineSemaphoreSubmitInfo timeline = {.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .waitSemaphoreValueCount = 1, .pWaitSemaphoreValues = &wait_value};
+    VkSubmitInfo prior = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &timeline,
+        .waitSemaphoreCount = 1, .pWaitSemaphores = &gate, .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = 1, .pCommandBuffers = &command};
     assert(vk_queue_submit(&prior, VK_NULL_HANDLE) == VK_SUCCESS);
     rsx_frontend_ticket pending[2];
     assert(rsx_frontend_submit(device, &frame, &pending[0]) == 0);
@@ -117,10 +125,11 @@ static void transform_test(rsx_frontend_device *device) {
     assert(rsx_frontend_buffer_update(device, src, &update, &newer) == 0 && newer.version > src.version && newer.id == src.id);
     release_buffer(device, src); assert(rsx_frontend_buffer_release(device, src) == RSX_FRONTEND_STALE);
     assert(rsx_frontend_pipeline_release(device, p) == 0);
-    assert(set_event(s_vk.device, gate) == VK_SUCCESS); drain(device, pending, 2);
+    VkSemaphoreSignalInfo signal = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = gate, .value = 1};
+    assert(signal_gate(s_vk.device, &signal) == VK_SUCCESS); drain(device, pending, 2);
     assert(rsx_frontend_buffer_read(device, dst, 0, output, sizeof(output)) == 0); equal_floats(output, expected, 8);
     assert(rsx_frontend_buffer_read(device, dst2, 0, output, sizeof(output)) == 0); equal_floats(output, expected, 8);
-    destroy_event(s_vk.device, gate, NULL); pvkDestroyCommandPool(s_vk.device, pool, NULL);
+    pvkDestroySemaphore(s_vk.device, gate, NULL); pvkDestroyCommandPool(s_vk.device, pool, NULL);
     release_buffer(device, newer); release_buffer(device, dst); release_buffer(device, dst2); release_buffer(device, uniform);
     puts("PASS Vulkan transform: zero/oversized bounds, exact outputs, original/present ordering gates, delayed two-ticket retention and immutable CPU publication");
 }
@@ -152,12 +161,27 @@ static void owner_init(void)
     assert(vk_load_library() == 0);
     VkApplicationInfo application = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_1};
     VkInstanceCreateInfo instance = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &application};
+    const char *validation = "VK_LAYER_KHRONOS_validation";
+    if (getenv("MAG_FRONTEND_REQUIRE_VALIDATION")) {
+        instance.enabledLayerCount = 1; instance.ppEnabledLayerNames = &validation;
+        puts("Vulkan validation layer explicitly required");
+    }
     assert(pvkCreateInstance(&instance, NULL, &s_vk.instance) == VK_SUCCESS);
     assert(vk_load_instance_functions() == 0 && vk_pick_device() == 0);
     float priority = 1;
     VkDeviceQueueCreateInfo queue = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = s_vk.queue_family, .queueCount = 1, .pQueuePriorities = &priority};
-    VkDeviceCreateInfo device = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue};
+    /* Timeline signaling is enabled only on this explicit fixture device.
+     * Ordinary SDK backend requirements remain Vulkan1.1 without timeline. */
+    assert(vk_has_device_extension(s_vk.phys, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME));
+    PFN_vkGetPhysicalDeviceFeatures2 query = (PFN_vkGetPhysicalDeviceFeatures2)pvkGetInstanceProcAddr(s_vk.instance, "vkGetPhysicalDeviceFeatures2");
+    assert(query);
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &timeline};
+    query(s_vk.phys, &features); assert(timeline.timelineSemaphore);
+    const char *extension = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
+    VkDeviceCreateInfo device = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = &queue, .pNext = &timeline, .enabledExtensionCount = 1, .ppEnabledExtensionNames = &extension};
     assert(pvkCreateDevice(s_vk.phys, &device, NULL, &s_vk.device) == VK_SUCCESS);
     assert(vk_load_device_functions() == 0);
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
