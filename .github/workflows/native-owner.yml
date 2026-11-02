@@ -1,0 +1,35 @@
+name: Native owner synchronization
+on:
+  push:
+    branches: [main, master, codex/render-frontend-api]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  synchronization:
+    name: Owner synchronization (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Windows compiler environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile and execute actual owner synchronization fixture
+        run: python tools/test_native_owner_gate.py
+      - name: Compile Windows LIVE ownership integration
+        if: runner.os == 'Windows'
+        run: >
+          clang-cl /nologo /std:c17 /W0 /D_CRT_SECURE_NO_WARNINGS
+          /Iinclude /Ilibs/video /Iruntime/platform
+          /c libs/video/rsx_live_draw.c /Folive-owner.obj

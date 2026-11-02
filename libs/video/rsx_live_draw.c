@@ -20,6 +20,7 @@
  */
 
 #include "rsx_live_draw.h"
+#include "rsx_live_draw_owner.h"
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/log_first.h"
@@ -27,6 +28,9 @@
 #if !defined(_WIN32)
 
 /* Non-Windows: the whole path is a no-op (D3D12 is Windows-only). */
+int rsx_live_draw_borrow_owner(rsx_live_draw_owner* owner) { (void)owner; return -2; }
+int rsx_live_draw_owner_shutdown_requested(uint64_t lifetime) { (void)lifetime;return -2; }
+int rsx_live_draw_owner_retry_shutdown(uint64_t lifetime) { (void)lifetime;return -2; }
 int  rsx_live_draw_enabled(void) { return 0; }
 int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
 { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
@@ -114,6 +118,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <initguid.h>
 #include <d3d12.h>
 #include "rsx_d3d12_checked_fence.h"
+#include "rsx_native_owner_gate.h"
 #include "rsx_picture_identity.h"
 #include <stdatomic.h>
 #include <d3d12sdklayers.h>
@@ -1271,6 +1276,57 @@ static SRWLOCK g_ld_access_lock = SRWLOCK_INIT;
 static volatile LONG g_ld_guest_active = 0;
 static volatile LONG g_ld_host_waiting = 0;
 
+/* Not reset with g: old borrowed owners never acquire a new device lifetime. */
+static u64 s_report_lifetime;
+static int (*s_report_barrier)(void);
+static void (*s_report_lease_begin)(void);
+static void (*s_report_lease_end)(void);
+static SRWLOCK s_owner_consumer_config = SRWLOCK_INIT;
+static rsx_native_owner_gate s_native_owner = RSX_NATIVE_OWNER_GATE_INIT;
+static int s_native_shutdown_pending;
+static _Thread_local rsx_native_owner_thread s_native_thread;
+static _Thread_local void (*s_native_consumer_end)(void);
+static int ld_native_owner_enabled(void) {
+    static atomic_int cached = -1;
+    int value=atomic_load_explicit(&cached,memory_order_relaxed);
+    if(value<0){const char *setting=getenv("PS3RECOMP_RSX_NATIVE_OWNER");
+        value=setting && !strcmp(setting,"1");int expected=-1;
+        if(!atomic_compare_exchange_strong_explicit(&cached,&expected,value,memory_order_relaxed,memory_order_relaxed))value=expected;}
+    return value!=0;
+}
+static int ld_owner_read_begin(void) {
+    if(!ld_native_owner_enabled())return 1;
+    if(s_native_thread.native)return 0;
+    const int outer=!s_native_thread.original_depth;
+    if(outer){
+        AcquireSRWLockShared(&s_owner_consumer_config);
+        void(*begin)(void)=s_report_lease_begin;s_native_consumer_end=s_report_lease_end;
+        ReleaseSRWLockShared(&s_owner_consumer_config);
+        if(begin)begin();
+    }
+    if(rsx_owner_original_begin(&s_native_owner,&s_native_thread)){
+        if(outer && s_native_consumer_end)s_native_consumer_end();return 0;}
+    return 1;
+}
+static int ld_owner_original_begin(void) {
+    if(ld_native_owner_enabled() && s_native_thread.native){s_native_owner.failed=1;g.ready=0;return 0;}
+    if(!ld_owner_read_begin())return 0;
+    if(ld_native_owner_enabled())rsx_owner_dirty(&s_native_owner,&s_native_thread);
+    return 1;
+}
+static void ld_owner_original_finish(int preserve_boundary) {
+    if(!ld_native_owner_enabled())return;
+    if(!preserve_boundary)rsx_owner_dirty(&s_native_owner,&s_native_thread);
+    if(!preserve_boundary && s_native_owner.generation && !g.ready)rsx_owner_submitted(&s_native_owner,&s_native_thread,0);
+    const int outer=s_native_thread.original_depth==1;
+    rsx_owner_original_end(&s_native_owner,&s_native_thread);
+    if(outer){void(*end)(void)=s_native_consumer_end;s_native_consumer_end=NULL;if(end)end();}
+}
+static void ld_owner_failed_boundary(void) {
+    if(ld_native_owner_enabled())rsx_owner_submitted(&s_native_owner,&s_native_thread,0);
+}
+
+
 static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
 {
     if (!g.guest_ptr) return NULL;
@@ -1773,7 +1829,7 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
  * -----------------------------------------------------------------------*/
 static void ld_flush(ld_flush_reason reason)
 {
-    if(!g.ready || g.fence_value>=UINT64_MAX-1) {g.ready=0;return;}
+    if(!g.ready || g.fence_value>=UINT64_MAX-1) {g.ready=0;ld_owner_failed_boundary();return;}
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG flush_begin = ld_profile_qpc();
     g_ld_profile.total.flush_reason[reason]++;
@@ -1788,7 +1844,7 @@ static void ld_flush(ld_flush_reason reason)
                 (unsigned long)close_hr, g_ld_frames);
         ld_dump_dred("Close", close_hr);
         g.ready = 0;
-        return;
+        ld_owner_failed_boundary();return;
     }
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
@@ -1801,7 +1857,7 @@ static void ld_flush(ld_flush_reason reason)
                 (unsigned long)signal_hr, g_ld_frames);
         ld_dump_dred("Signal", signal_hr);
         g.ready = 0;
-        return;
+        ld_owner_failed_boundary();return;
     }
 #if defined(YZ_PERF_PROFILE)
         const LONGLONG wait_begin = ld_profile_qpc();
@@ -1810,7 +1866,7 @@ static void ld_flush(ld_flush_reason reason)
         HRESULT removed=g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
         fprintf(stderr,"[d3d-fail] checked fence incomplete value=%llu frame=%u removed=0x%08lX\n",
                 (unsigned long long)v,g_ld_frames,(unsigned long)removed);
-        ld_dump_dred("checked fence",removed);g.ready=0;return;
+        ld_dump_dred("checked fence",removed);g.ready=0;ld_owner_failed_boundary();return;
     }
 #if defined(YZ_PERF_PROFILE)
         const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
@@ -1829,7 +1885,7 @@ static void ld_flush(ld_flush_reason reason)
     if(SUCCEEDED(reset_hr))reset_hr=g.list->lpVtbl->Reset(g.list,g.alloc,NULL);
     if(FAILED(reset_hr)) {
         fprintf(stderr,"[d3d-fail] post-completion Reset hr=0x%08lX frame=%u\n",(unsigned long)reset_hr,g_ld_frames);
-        ld_dump_dred("Reset",reset_hr);g.ready=0;return;
+        ld_dump_dred("Reset",reset_hr);g.ready=0;ld_owner_failed_boundary();return;
     }
     g.upload_used = 0;
 #if defined(YZ_PERF_PROFILE)
@@ -1847,60 +1903,80 @@ static void ld_flush(ld_flush_reason reason)
  * at the call site by RSX_FENCE_SYNC. */
 void rsx_live_draw_flush(void)
 {
-    if (g.ready) ld_flush(LD_FLUSH_GUEST_REFERENCE);
+    if(!ld_owner_original_begin())return;
+    const u64 previous=g.fence_value;
+    if(g.ready)ld_flush(LD_FLUSH_GUEST_REFERENCE);
+    const int clean=g.ready && g.fence_value>previous && !g.rsx.in_begin_end;
+    if(ld_native_owner_enabled() && clean)rsx_owner_submitted(&s_native_owner,&s_native_thread,1);
+    ld_owner_original_finish(clean);
 }
-int rsx_live_draw_checked_ready(void) { return g.ready && rsx_picture_ready(); }
+int rsx_live_draw_checked_ready(void) {
+    if(!ld_owner_read_begin())return 0;
+    int result=g.ready && rsx_picture_ready();ld_owner_original_finish(1);return result;
+}
 int rsx_live_draw_flush_checked(void)
 {
-    if(!g.ready || !rsx_picture_ready() || g.rsx.in_begin_end) return 0;
+    if(!ld_owner_original_begin())return 0;
+    if(!g.ready || !rsx_picture_ready() || g.rsx.in_begin_end){ld_owner_original_finish(0);return 0;}
+    const u64 previous=g.fence_value;
     ld_flush(LD_FLUSH_GUEST_REFERENCE);
-    return g.ready && rsx_picture_ready();
+    const int clean=g.ready && rsx_picture_ready() && g.fence_value>previous;
+    if(ld_native_owner_enabled() && clean)rsx_owner_submitted(&s_native_owner,&s_native_thread,1);
+    ld_owner_original_finish(clean);return clean;
 }
-
-/* Not reset with g: a new D3D device/fence must never validate an old ticket. */
-static u64 s_report_lifetime;
-static int (*s_report_barrier)(void);
-static void (*s_report_lease_begin)(void);
-static void (*s_report_lease_end)(void);
 
 uint64_t rsx_live_draw_report_batch_lifetime(void)
 {
-    return rsx_live_draw_checked_ready() ? s_report_lifetime : 0;
+    if(!ld_owner_read_begin())return 0;
+    const uint64_t result=rsx_live_draw_checked_ready()?s_report_lifetime:0;
+    ld_owner_original_finish(1);return result;
 }
 int rsx_live_draw_report_batch_admit(uint64_t lifetime)
 {
-    return lifetime && lifetime == rsx_live_draw_report_batch_lifetime() &&
-        !g.rsx.in_begin_end;
+    if(!ld_owner_read_begin())return 0;
+    const int result=lifetime && lifetime==rsx_live_draw_report_batch_lifetime() && !g.rsx.in_begin_end;
+    ld_owner_original_finish(1);return result;
 }
 uint64_t rsx_live_draw_report_batch_issue(uint64_t lifetime)
 {
-    if (!rsx_live_draw_report_batch_admit(lifetime)) return 0;
-    const u64 previous = g.fence_value;
-    if (!rsx_live_draw_flush_checked() || g.fence_value <= previous) return 0;
-    return g.fence_value;
+    if(!ld_owner_read_begin())return 0;
+    uint64_t result=0;
+    if(rsx_live_draw_report_batch_admit(lifetime)){
+        const u64 previous=g.fence_value;
+        if(rsx_live_draw_flush_checked() && g.fence_value>previous)result=g.fence_value;
+    }
+    ld_owner_original_finish(1);return result;
 }
-int rsx_live_draw_report_batch_status(uint64_t lifetime, uint64_t fence, int wait)
+int rsx_live_draw_report_batch_status(uint64_t lifetime,uint64_t fence,int wait)
 {
     (void)wait; /* Issue already performed the original synchronous checked wait. */
-    if (!lifetime || lifetime != rsx_live_draw_report_batch_lifetime() ||
-        !fence || fence > g.fence_value || !g.fence || !g.dev)
-        return -1;
-    const u64 completed = g.fence->lpVtbl->GetCompletedValue(g.fence);
-    if (completed == UINT64_MAX || completed < fence ||
-        g.dev->lpVtbl->GetDeviceRemovedReason(g.dev) != S_OK)
-        return -1;
-    return 1;
+    if(!ld_owner_read_begin())return -1;
+    int result=-1;
+    if(lifetime && lifetime==rsx_live_draw_report_batch_lifetime() && fence &&
+       fence<=g.fence_value && g.fence && g.dev){
+        const u64 completed=g.fence->lpVtbl->GetCompletedValue(g.fence);
+        if(completed!=UINT64_MAX && completed>=fence &&
+           g.dev->lpVtbl->GetDeviceRemovedReason(g.dev)==S_OK)result=1;
+    }
+    ld_owner_original_finish(1);return result;
 }
-void rsx_live_draw_set_report_barrier(int (*barrier)(void))
+static void ld_owner_set_report_barrier_body(int (*barrier)(void))
 { s_report_barrier = barrier; }
-int rsx_live_draw_set_report_lease(void (*begin)(void), void (*end)(void))
+static int ld_owner_set_report_lease_body(void (*begin)(void), void (*end)(void))
 {
     if ((begin == NULL) != (end == NULL)) return 0;
+    AcquireSRWLockExclusive(&s_owner_consumer_config);
     s_report_lease_begin = begin; s_report_lease_end = end;
+    ReleaseSRWLockExclusive(&s_owner_consumer_config);
     return 1;
 }
 static int ld_report_effect_begin(void)
 {
+    if(ld_native_owner_enabled()){
+        if(!ld_owner_original_begin())return 0;
+        if(s_report_barrier && !s_report_barrier()){ld_owner_original_finish(0);return 0;}
+        rsx_owner_dirty(&s_native_owner,&s_native_thread);return 1;
+    }
     if (s_report_lease_begin) s_report_lease_begin();
     if (s_report_barrier && !s_report_barrier()) {
         if (s_report_lease_end) s_report_lease_end();
@@ -1909,7 +1985,7 @@ static int ld_report_effect_begin(void)
     return 1;
 }
 static void ld_report_effect_end(void)
-{ if (s_report_lease_end) s_report_lease_end(); }
+{ if(ld_native_owner_enabled())ld_owner_original_finish(0);else if(s_report_lease_end)s_report_lease_end(); }
 
 static int retire_texture(ID3D12Resource* tex)
 {
@@ -5866,7 +5942,7 @@ typedef struct ld_stats {
 
 static ld_stats g_ld_stats;
 
-void rsx_live_draw_a010_probe_begin(void)
+static void ld_owner_a010_probe_begin_body(void)
 {
     if ((!getenv("RSX_A010_PROBE") &&
          !getenv("RSX_A010_SURFACE_DUMP")) || !g.ready)
@@ -6687,7 +6763,7 @@ static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count
     g_ld_stats.packets_queued++;
 }
 
-void rsx_live_draw_set_a010_camera_matrix(const float* matrix16)
+static void ld_owner_set_a010_camera_matrix_body(const float* matrix16)
 {
     if (!matrix16) {
         InterlockedExchange(&g_ld_a010_camera_ready, 0);
@@ -8872,23 +8948,25 @@ static int ld_init_body(void* hwnd, u32 width, u32 height,
     g.enabled = 1;
     if (s_report_lifetime == UINT64_MAX) { g.ready = 0; return -1; }
     ++s_report_lifetime;
+    if(ld_native_owner_enabled() && rsx_owner_generation(&s_native_owner,&s_native_thread,s_report_lifetime)) {g.ready=0;return -1;}
+    if(ld_native_owner_enabled())s_native_shutdown_pending=0;
     return 0;
 }
 
-void rsx_live_draw_seed_registers(const u32* regs, u32 count)
+static void ld_owner_seed_registers_body(const u32* regs, u32 count)
 {
     if (g.ready) rsx_dispatch_seed_registers(&g.rsx, regs, count);
 }
-void rsx_live_draw_seed_transform_program(const u32* words, u32 count)
+static void ld_owner_seed_transform_program_body(const u32* words, u32 count)
 {
     if (g.ready) rsx_dispatch_seed_transform_program(&g.rsx, words, count);
 }
-void rsx_live_draw_seed_transform_constants(const u32* words, u32 count)
+static void ld_owner_seed_transform_constants_body(const u32* words, u32 count)
 {
     if (g.ready) rsx_dispatch_seed_transform_constants(&g.rsx, words, count);
 }
 
-void rsx_live_draw_set_display_buffer(
+static void ld_owner_set_display_buffer_body(
     u32 buffer_id, u32 location, u32 offset, u32 pitch, u32 width, u32 height)
 {
     if (buffer_id >= 8) return;
@@ -8931,7 +9009,7 @@ static void ld_method_core(u32 method,u32 arg,u32 data_ea)
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))ld_picture_resolve((m-0x1A04)/32);
 }
 void rsx_live_draw_method(u32 method,u32 arg) {rsx_live_draw_method_at(method,arg,0);}
-void rsx_live_draw_method_at(u32 method, u32 arg,u32 data_ea)
+static void ld_owner_method_at_body(u32 method, u32 arg,u32 data_ea)
 {
     /* Bounded ingress trace for the a010 live-vs-capture comparison.  Keep the
      * raw method (including its FIFO subchannel bits) visible: if an SPU-built
@@ -9075,7 +9153,7 @@ static void ld_set_movie_mode_body(int on)
 
 u32 rsx_live_draw_get_frames(void) { return g_ld_frames; }
 
-void rsx_live_draw_set_fifo_position(u32 get, u32 put)
+static void ld_owner_set_fifo_position_body(u32 get, u32 put)
 {
 #if defined(YZ_PERF_CLEAN)
     (void)get;
@@ -9086,7 +9164,7 @@ void rsx_live_draw_set_fifo_position(u32 get, u32 put)
 #endif
 }
 
-void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value)
+static void ld_owner_note_inline_transfer_body(u32 dma, u32 offset, u32 value)
 {
 #if defined(YZ_PERF_CLEAN)
     (void)dma;
@@ -9171,7 +9249,7 @@ double rsx_live_draw_get_present_fps(void)
         : 0.0;
 }
 
-void rsx_live_draw_dump_present_samples(void)
+static void ld_owner_dump_present_samples_body(void)
 {
     ld_present_measure_dump();
 }
@@ -10698,6 +10776,7 @@ static void ld_shutdown_body(void)
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    if(ld_native_owner_enabled() && s_native_owner.failed)return; /* Unknown original access retains all native objects. */
 #if defined(YZ_PERF_PROFILE)
     fprintf(stderr,
             "[rsx-perf-summary] frames=%u "
@@ -10958,6 +11037,8 @@ static void ld_shutdown_body(void)
 int rsx_live_draw_init(void* hwnd,u32 w,u32 h,rsx_live_guest_ptr_fn f,void* user)
 {
     if (!ld_report_effect_begin()) return -1;
+    if(ld_native_owner_enabled() && !g.ready &&
+       (s_native_owner.retained || (s_native_owner.failed && g.dev))){ld_report_effect_end();return -1;}
     int result=ld_init_body(hwnd,w,h,f,user);
     ld_report_effect_end(); return result;
 }
@@ -11003,7 +11084,80 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!ld_report_effect_begin()) return;
-    ld_shutdown_body(); ld_report_effect_end();
+    if(ld_native_owner_enabled()){
+        s_native_owner.closing=1;
+        s_native_shutdown_pending=g.dev!=NULL;
+        if(s_native_owner.retained || (s_native_owner.failed && g.dev)){fprintf(stderr,"[native owner] shutdown deferred: retained or failed owner\n");ld_report_effect_end();return;}
+    }
+    ld_shutdown_body();
+    if(ld_native_owner_enabled() && !g.dev)s_native_shutdown_pending=0;
+    ld_report_effect_end();
+}
+
+/* All direct generated-import mutation routes use this temporary owner gate.
+ * Internal calls recurse only through the original TLS scope, never native. */
+void rsx_live_draw_seed_registers(const u32* v,u32 n){if(!ld_owner_original_begin())return;ld_owner_seed_registers_body(v,n);ld_owner_original_finish(0);}
+void rsx_live_draw_seed_transform_program(const u32* v,u32 n){if(!ld_owner_original_begin())return;ld_owner_seed_transform_program_body(v,n);ld_owner_original_finish(0);}
+void rsx_live_draw_seed_transform_constants(const u32* v,u32 n){if(!ld_owner_original_begin())return;ld_owner_seed_transform_constants_body(v,n);ld_owner_original_finish(0);}
+void rsx_live_draw_set_display_buffer(u32 a,u32 b,u32 c,u32 d,u32 e,u32 f){if(!ld_owner_original_begin())return;ld_owner_set_display_buffer_body(a,b,c,d,e,f);ld_owner_original_finish(0);}
+void rsx_live_draw_method_at(u32 a,u32 b,u32 c){if(!ld_owner_original_begin())return;ld_owner_method_at_body(a,b,c);ld_owner_original_finish(0);}
+void rsx_live_draw_set_fifo_position(u32 a,u32 b){if(!ld_owner_original_begin())return;ld_owner_set_fifo_position_body(a,b);ld_owner_original_finish(0);}
+void rsx_live_draw_note_inline_transfer(u32 a,u32 b,u32 c){if(!ld_owner_original_begin())return;ld_owner_note_inline_transfer_body(a,b,c);ld_owner_original_finish(0);}
+void rsx_live_draw_a010_probe_begin(void){if(!ld_owner_original_begin())return;ld_owner_a010_probe_begin_body();ld_owner_original_finish(0);}
+void rsx_live_draw_set_a010_camera_matrix(const float* v){if(!ld_owner_original_begin())return;ld_owner_set_a010_camera_matrix_body(v);ld_owner_original_finish(0);}
+void rsx_live_draw_dump_present_samples(void){if(!ld_owner_original_begin())return;ld_owner_dump_present_samples_body();ld_owner_original_finish(0);}
+void rsx_live_draw_set_report_barrier(int(*barrier)(void)){if(!ld_owner_original_begin())return;ld_owner_set_report_barrier_body(barrier);ld_owner_original_finish(0);}
+int rsx_live_draw_set_report_lease(void(*begin)(void),void(*end)(void)){
+    if(!ld_owner_original_begin())return 0;int result=ld_owner_set_report_lease_body(begin,end);ld_owner_original_finish(0);return result;
+}
+static int ld_borrowed_retain(void *user,uint64_t lifetime) {
+    return user==&s_native_owner?rsx_owner_retain(&s_native_owner,&s_native_thread,lifetime):-3;
+}
+static void ld_borrowed_release(void *user,uint64_t lifetime) {
+    if(user==&s_native_owner && rsx_owner_release(&s_native_owner,&s_native_thread,lifetime))
+        fprintf(stderr,"[native owner] invalid/reentrant release refused\n");
+}
+static int ld_borrowed_begin(void *user,uint64_t lifetime) {
+    if(user!=&s_native_owner)return -3;
+    int status=rsx_owner_native_begin(&s_native_owner,&s_native_thread,lifetime);
+    if(status)return status;
+    if(!g.ready || !g.dev || !g.queue || g.dev->lpVtbl->GetDeviceRemovedReason(g.dev)!=S_OK){
+        s_native_owner.failed=1;rsx_owner_native_end(&s_native_owner,&s_native_thread);return -6;}
+    return 0;
+}
+static void ld_borrowed_end(void *user,uint64_t lifetime) {
+    if(user==&s_native_owner && s_native_thread.gate==&s_native_owner &&
+       s_native_thread.native && lifetime==s_native_owner.generation)
+        rsx_owner_native_end(&s_native_owner,&s_native_thread);
+}
+int rsx_live_draw_owner_shutdown_requested(uint64_t lifetime) {
+    if(!ld_native_owner_enabled())return -2;
+    if(!ld_owner_read_begin())return -4;
+    const int result=lifetime && lifetime==s_native_owner.generation?s_native_shutdown_pending:-3;
+    ld_owner_original_finish(1);return result;
+}
+int rsx_live_draw_owner_retry_shutdown(uint64_t lifetime) {
+    if(!ld_native_owner_enabled())return -2;
+    if(!ld_owner_read_begin())return -4;
+    int status=0;
+    if(!lifetime || lifetime!=s_native_owner.generation)status=-3;
+    else if(!s_native_shutdown_pending)status=0;
+    else if(s_native_owner.retained)status=-4;
+    else if(s_native_owner.failed && g.dev)status=-6;
+    else if(s_report_barrier && !s_report_barrier())status=-6;
+    else {ld_shutdown_body();status=g.dev?-6:1;if(status==1)s_native_shutdown_pending=0;}
+    ld_owner_original_finish(status==1?0:1);return status;
+}
+int rsx_live_draw_borrow_owner(rsx_live_draw_owner *out) {
+    if(!out || out->struct_size!=sizeof(*out) || out->abi_version!=RSX_LIVE_DRAW_OWNER_ABI)return -1;
+    if(!ld_native_owner_enabled())return -2;
+    if(s_native_thread.gate || !TryAcquireSRWLockExclusive(&s_native_owner.lock))return -4;
+    int status=0;
+    if(!g.ready || !g.dev || !g.queue || !s_native_owner.generation || s_native_owner.closing)status=-3;
+    else if(s_native_owner.failed)status=-6;
+    else *out=(rsx_live_draw_owner){sizeof(*out),RSX_LIVE_DRAW_OWNER_ABI,s_native_owner.generation,
+        g.dev,g.queue,&s_native_owner,ld_borrowed_retain,ld_borrowed_release,ld_borrowed_begin,ld_borrowed_end};
+    ReleaseSRWLockExclusive(&s_native_owner.lock);return status;
 }
 
 #endif /* _WIN32 */
