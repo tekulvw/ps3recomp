@@ -13,6 +13,8 @@
 #include <time.h>
 #if defined(__APPLE__)
 #include <mach/mach_time.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 
 enum {
@@ -59,6 +61,11 @@ static inline uint64_t eng_ph_now(void)
     static mach_timebase_info_data_t tb;
     if (!tb.denom) mach_timebase_info(&tb);
     return mach_absolute_time() * tb.numer / tb.denom;
+#elif defined(_WIN32)
+    LARGE_INTEGER count, frequency;
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        !QueryPerformanceCounter(&count)) return 0;
+    return (uint64_t)((double)count.QuadPart * 1e9 / (double)frequency.QuadPart);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

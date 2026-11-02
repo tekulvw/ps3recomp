@@ -94,12 +94,14 @@ static inline void spu_lockline_relax(void)
  * be symbolized offline (atos -l). Off, the lock pays one predictable branch. */
 #include <stdatomic.h>
 #include <time.h>
+#if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#endif
 typedef struct { _Atomic(uintptr_t) site; atomic_ullong n, wait_ns, hold_ns; } lockline_prof;
 static lockline_prof s_llp[512];
 static int s_llp_on = -1;
 static __thread struct { uintptr_t site; uint64_t t; } t_llp;
-static uint64_t llp_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static uint64_t llp_now(void) { return spu_lockline_now_ns(); }
 static lockline_prof* llp_slot(uintptr_t site)
 {
     for (unsigned i = (unsigned)(site >> 2) & 511u, k = 0; k < 512; ++k, i = (i + 1) & 511u) {
@@ -115,7 +117,11 @@ static void llp_report(void)
     static atomic_ullong next;
     uint64_t now = llp_now(), due = atomic_load(&next);
     if (now < due || !atomic_compare_exchange_strong(&next, &due, now + 2000000000ull)) return;
+#if defined(__APPLE__)
     fprintf(stderr, "[lockline-prof] slide=0x%lx\n", (unsigned long)_dyld_get_image_vmaddr_slide(0));
+#else
+    fprintf(stderr, "[lockline-prof] slide=unavailable (not a Mach-O image)\n");
+#endif
     for (unsigned i = 0; i < 512; ++i) {
         uintptr_t s = atomic_load(&s_llp[i].site);
         if (s) fprintf(stderr, "[lockline-prof] site=0x%lx n=%llu wait_us=%llu hold_us=%llu\n", (unsigned long)s,

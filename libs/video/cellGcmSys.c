@@ -1104,6 +1104,8 @@ static uint64_t gph_now(void){
 #if defined(__APPLE__)
     static mach_timebase_info_data_t tb;if(!tb.denom)mach_timebase_info(&tb);
     return mach_absolute_time()*tb.numer/tb.denom;
+#elif defined(_WIN32)
+    return get_timestamp_ns();
 #else
     struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
 #endif
