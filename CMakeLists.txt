@@ -460,6 +460,15 @@ if(PS3RECOMP_BUILD_TESTS)
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        if(WIN32)
+            # CPU-only actual-GCM fixture; real D3D12 coverage is an explicit
+            # tools/test_live_draw_report_batch.py invocation with a runtime lib.
+            add_test(NAME gcm_live_report_batch
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_live_report_batch.py")
+            set_tests_properties(gcm_live_report_batch PROPERTIES
+                TIMEOUT 300 ENVIRONMENT "CC=${CMAKE_C_COMPILER}")
+        endif()
         add_test(NAME ppu_hle_toc
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_hle_toc.py")

@@ -121,10 +121,17 @@ void rsx_ring_progress_metal_completed(uint64_t ticket,uint64_t status){
 static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
 static _Thread_local unsigned s_consumer_depth;
 static int s_deferred_reports;
+static int s_live_report_batch;
+/* Every queued LIVE record belongs to this one physical renderer lifetime.
+ * Cleared only after the entire consumer-owned queue has published. */
+static uint64_t s_report_live_lifetime;
 static int s_query_observe;
 static rsx_deferred_report_queue s_reports = {.generation=1};
 static u32 s_backend_label_offset;
+static u32 s_backend_label_dma;
 static int gcm_reports_dependency(void);
+static int gcm_reports_progress(int wait,int issue);
+static int gcm_reports_live(void) { return s_live_report_batch && rsx_live_draw_enabled(); }
 static int gcm_reports_sync_barrier_at(u32 reason);
 #define gcm_reports_sync_barrier() gcm_reports_sync_barrier_at(__LINE__)
 void cellGcm_rsx_consumer_begin(void) {
@@ -141,6 +148,9 @@ static int gcm_report_vm_begin(uint64_t ea,uint64_t size) {
         fprintf(stderr,"[native output] VM transition refused: release owned native arena first ea=%llx size=%llx\n",(unsigned long long)ea,(unsigned long long)size);
         cellGcm_rsx_consumer_end();return 0;
     }
+    if(gcm_reports_live()&&!gcm_reports_progress(1,1)){
+        cellGcm_rsx_consumer_end();return 0;
+    }
     if (s_reports.failed || rsx_reports_overlap(&s_reports,ea,size)) {
         fprintf(stderr,"[deferred reports] rejected overlapping VM transition ea=%llx size=%llx pending=%u failed=%u\n",
             (unsigned long long)ea,(unsigned long long)size,s_reports.count,s_reports.failed);
@@ -148,13 +158,19 @@ static int gcm_report_vm_begin(uint64_t ea,uint64_t size) {
     }
     return 1;
 }
+static SRWLOCK s_deferred_init_lock = SRWLOCK_INIT;
+static int s_deferred_initialized;
 #if defined(__GNUC__)
 __attribute__((constructor))
 #endif
 static void gcm_deferred_initialize(void) {
+    AcquireSRWLockExclusive(&s_deferred_init_lock);
+    if(s_deferred_initialized){ReleaseSRWLockExclusive(&s_deferred_init_lock);return;}
     const char *q=getenv("PS3RECOMP_RSX_QUERY_OBSERVE");s_query_observe=q&&!strcmp(q,"1");
     const char *e=getenv("PS3RECOMP_RSX_DEFERRED_REPORTS");
     s_deferred_reports=e && !strcmp(e,"1");
+    {const char *live=getenv("PS3RECOMP_GCM_LIVE_REPORT_BATCH");
+     s_live_report_batch=s_deferred_reports&&live&&!strcmp(live,"1");}
     /* PS3RECOMP_RSX_DEFERRED_REPORT_BATCH=<n>: issue after n unissued
      * records instead of RSX_DEFERRED_REPORT_BATCH (1..1024). */
     { const char *b=getenv("PS3RECOMP_RSX_DEFERRED_REPORT_BATCH");
@@ -162,11 +178,17 @@ static void gcm_deferred_initialize(void) {
       if(n>0&&n<=(long)RSX_DEFERRED_REPORT_CAPACITY)s_reports.batch=(uint32_t)n; }
     if (s_deferred_reports) {
         rsx_draw_engine_set_report_barrier(gcm_reports_dependency);
+        if(s_live_report_batch){
+            if(!rsx_live_draw_set_report_lease(cellGcm_rsx_consumer_begin,cellGcm_rsx_consumer_end))s_reports.failed=1;
+            rsx_live_draw_set_report_barrier(gcm_reports_dependency);
+        }
         ps3_vm_release_guard.begin=gcm_report_vm_begin;
         ps3_vm_release_guard.end=cellGcm_rsx_consumer_end;
         fprintf(stderr,"[deferred reports] enabled batch=%u capacity=%u consumer-owned genuine completion\n",
             s_reports.batch?s_reports.batch:RSX_DEFERRED_REPORT_BATCH,RSX_DEFERRED_REPORT_CAPACITY);
     }
+    s_deferred_initialized=1;
+    ReleaseSRWLockExclusive(&s_deferred_init_lock);
 }
 
 /* ---------------------------------------------------------------------------
@@ -966,6 +988,11 @@ void ppu_gcm_pump(void)
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
     u64 user = GCM_USER_PENDING_TAKE();
+    /* An empty HLE pump is hot. Only an actual notification can expose a
+     * completion/callback and needs the consumer dependency. */
+    if((p||user)&&gcm_reports_live()&&!gcm_reports_dependency()){
+        GCM_PUMP_LEAVE();return;
+    }
     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
     { static int d = -1; static unsigned nv, nf, calls;
       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
@@ -1142,6 +1169,10 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
 }
 static uint64_t gcm_report_issue(void *user){
     (void)user;uint32_t target=ring_target(),value=0,selected=0;
+    if(s_report_live_lifetime){
+        if(!gcm_reports_live()||rsx_live_draw_report_batch_lifetime()!=s_report_live_lifetime)return 0;
+        return rsx_live_draw_report_batch_issue(s_report_live_lifetime);
+    }
     if(!target)return rsx_draw_engine_submit_async();
     if(target)for(uint32_t i=0;i<s_reports.count;i++){
         const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_CAPACITY];
@@ -1161,7 +1192,12 @@ static uint64_t gcm_report_issue(void *user){
     return ticket;
 }
 static int gcm_report_status(void *user,uint64_t ticket,int wait){
-    (void)user;int ready=rsx_draw_engine_completion_status(ticket,wait);
+    (void)user;
+    if(s_report_live_lifetime){
+        if(!gcm_reports_live()||rsx_live_draw_report_batch_lifetime()!=s_report_live_lifetime)return -1;
+        return rsx_live_draw_report_batch_status(s_report_live_lifetime,ticket,wait);
+    }
+    int ready=rsx_draw_engine_completion_status(ticket,wait);
     /* A left-censored ticket may already have been retired by the backend
      * before arming. Record its genuine positive API result once as well. */
     if(ready==1)rsx_ring_progress_metal_completed(ticket,UINT64_C(0x8000000000000001));
@@ -1183,8 +1219,25 @@ static int gcm_reports_progress(int wait,int issue){
     }
     int was_failed=s_reports.failed;
     int ok=rsx_reports_progress(&s_reports,&s_report_ops,wait,issue);
+    if(ok&&!s_reports.count)s_report_live_lifetime=0;
     if(!ok&&!was_failed)fprintf(stderr,"[deferred reports] FAILED; publication stopped pending=%u issued=%llu published=%llu\n",s_reports.count,(unsigned long long)s_reports.issued,(unsigned long long)s_reports.published);
     return ok;
+}
+static int gcm_reports_can_defer(void){
+    return s_deferred_reports&&(gcm_reports_live()||(!rsx_live_draw_enabled()&&rsx_draw_engine_async_available()));
+}
+/* Validate the original stream position, not the later issue position. The
+ * single provider binding cannot change while any queued record remains. */
+static int gcm_reports_admit(void){
+    if(s_reports.failed)return 0;
+    if(gcm_reports_live()){
+        uint64_t lifetime=rsx_live_draw_report_batch_lifetime();
+        if(!lifetime||!rsx_live_draw_report_batch_admit(lifetime)||
+           (s_reports.count&&s_report_live_lifetime!=lifetime))
+            return rsx_reports_fail(&s_reports,NULL,"live-admission",0,0,0,0);
+        s_report_live_lifetime=lifetime;
+    }else if(s_report_live_lifetime)return rsx_reports_fail(&s_reports,NULL,"live-provider-changed",0,0,0,0);
+    return 1;
 }
 static int gcm_reports_dependency(void){
     if(!s_deferred_reports)return 1;
@@ -1238,7 +1291,8 @@ static int gcm_inline_image_barrier_core(void){
 }
 /* Label writes retain the existing value/byte-order semantics, but release
  * guest reuse only after the same genuine ordered GPU completion as reports. */
-static int gcm_defer_label(u32 ea,u32 value,u32 method,u32 fifo_ea){
+static int gcm_defer_label_get(u32 ea,u32 value,u32 method,u32 fifo_ea,u32 get_before_publish){
+    if(!gcm_reports_admit())return 0;
     ring_note(RSX_RING_DECODE,ea,value,0,((uint64_t)method<<32)|fifo_ea);
     rsx_deferred_report r={0};r.operation=1;r.main_memory=1;
     if(gph_enabled()){r.enqueued_ns=gph_now();s_reports.clock=gph_now;}
@@ -1246,11 +1300,17 @@ static int gcm_defer_label(u32 ea,u32 value,u32 method,u32 fifo_ea){
     r.capture=ps3_critical_capture_id();r.start_ns=ps3_critical_enabled()?ps3_critical_now_ns():0;
     u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
     if(!vm_base||(u64)ea+4u>limit){s_reports.failed=1;fprintf(stderr,"[deferred reports] invalid label destination %08X; publication stopped\n",ea);return 0;}
+    /* A threshold enqueue can synchronously publish. GET must already lead
+     * an NV406E RELEASE when a guest observes its label. */
+    if(get_before_publish)vm_write32(GCM_CONTROL_GUEST_ADDR+4,get_before_publish);
     unsigned failed=s_reports.failed;
     int ok=rsx_reports_enqueue(&s_reports,&s_report_ops,r);
     ring_note(RSX_RING_ENQUEUE,ea,value,0,((uint64_t)(ok!=0)<<63)|s_reports.count);
     if(!ok&&!failed)fprintf(stderr,"[deferred reports] label enqueue FAILED; publication stopped\n");
     return ok;
+}
+static int gcm_defer_label(u32 ea,u32 value,u32 method,u32 fifo_ea){
+    return gcm_defer_label_get(ea,value,method,fifo_ea,0);
 }
 
 /* Separate diagnostic capture only. Counts are FIFO draw-method words, not
@@ -1276,7 +1336,8 @@ static void gcm_get_report(u32 argument){
     r.main_memory=r.context!=GCM_REPORT_DMA_LOCAL;
     if(!gcm_report_destination(argument,r.context,&r.ea))goto invalid;
     {static unsigned reports;if(reports++<6)printf("[GET_REPORT] type=%u idx=%u context=%08X ea=%08X%s\n",argument>>24,r.index,r.context,r.ea,r.main_memory?"":" host-only");}
-    if(s_deferred_reports&&!rsx_live_draw_enabled()&&rsx_draw_engine_async_available()){
+    if(gcm_reports_can_defer()){
+        if(!gcm_reports_admit())goto invalid;
         unsigned failed=s_reports.failed;
         if(!rsx_reports_enqueue(&s_reports,&s_report_ops,r)&&!failed)
             fprintf(stderr,"[deferred reports] enqueue FAILED; publication stopped pending=%u\n",s_reports.count);
@@ -1943,6 +2004,7 @@ static void nv0039_copy(const u32 v[8])
     if(!snapshot) { nv0039_fail("nv0039-allocation");return; }
     /* Order prior draws before the guest resource mutation. This does not
      * materialize GPU-only render targets in guest memory. */
+    if(gcm_reports_live()&&!gcm_reports_dependency()){free(snapshot);return;}
     if(rsx_draw_engine_enabled()) rsx_draw_engine_flush();
     if(rsx_live_draw_enabled()) rsx_live_draw_flush();
     for(u32 row=0;row<rows;row++) {
@@ -2030,7 +2092,7 @@ int cellGcm_checked_reference_ready(void)
 
 int cellGcm_set_checked_completion(void* user,int (*ready)(void*),int (*flush)(void*))
 {
-    if((ready==NULL)!=(flush==NULL) || s_ref_qhead!=s_ref_qtail) return 0;
+    if((ready==NULL)!=(flush==NULL) || s_ref_qhead!=s_ref_qtail || s_reports.count) return 0;
     s_checked_completion_user=user;
     s_checked_completion_ready=ready;
     s_checked_completion_flush=flush;
@@ -2297,6 +2359,9 @@ void* cellGcm_fifo_kick_event(void)
 }
 void cellGcm_native_consumer_init(void)
 {
+    /* Explicit application startup seam on MSVC (no GNU constructor). Call
+     * before guest/consumer threads; configuration is immutable thereafter. */
+    gcm_deferred_initialize();
     AcquireSRWLockExclusive(&s_consumer_config_lock);
     if(!s_consumer_config_initialized){
         const char* flag=getenv("MAG_NATIVE_CONSUMER");
@@ -2749,6 +2814,7 @@ static void gcm_rsx_process_fifo_pass(void)
             s_nv0039.active=0; /* Control flow ends contiguous packet inference. */
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
+            if(gcm_reports_live()&&!gcm_reports_dependency())return;
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
              * this word into the FIFO instead of calling any import. Fire the
              * flip (status/count/handler) and STOP this drain so the ticker's
@@ -2948,11 +3014,8 @@ static void gcm_rsx_process_fifo_pass(void)
                         s_ft_sema_t0 = 0;
                     }
                     if (m == 0x64u)      s_sema_offset = v;
-                    else if(m==0x6cu && s_deferred_reports&&!rsx_live_draw_enabled()&&rsx_draw_engine_async_available()){
-                        if(!gcm_defer_label(la,v,m,dea)){sem_blocked=1;break;}
-                        /* The label lands after GPU completion; get leads it. */
-                        if (!gcm_get_eq_put())
-                            vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
+                    else if(m==0x6cu && gcm_reports_can_defer()){
+                        if(!gcm_defer_label_get(la,v,m,dea,gcm_get_eq_put()?0:s_fifo_getoff+4+count*4)){sem_blocked=1;break;}
                     }
                     else if (m == 0x6Cu) {
                         if(!gcm_reports_sync_barrier()){sem_blocked=1;break;}
@@ -3027,6 +3090,7 @@ static void gcm_rsx_process_fifo_pass(void)
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
                               m, vm_read32(dea)); }
                 if (subch == 7 && m == 0x0B00u) {
+                    if(gcm_reports_live()&&!gcm_reports_dependency())return;
                     extern void rsx_raise_user_cmd(u32 arg);
                     rsx_raise_user_cmd(vm_read32(dea));
                     /* A title that registered its handler with the HLE
@@ -3101,6 +3165,12 @@ static void gcm_rsx_process_fifo_pass(void)
                  * canonicalises with & 0x1FFC itself. */
                 { static int live = -1;
                   if (live < 0) live = rsx_live_draw_enabled();
+                  /* Close report work before raw dispatch can expose an
+                   * effect; the legacy handler below runs too late. */
+                  if(gcm_reports_live()&&(((subch<<13)|m)==0xE920u||
+                     ((subch<<13)|m)==0xE924u||((subch<<13)|m)==0xEB00u||
+                     ((subch<<13)|m)==0xEB04u||((subch==0u||subch==1u)&&(m==0x50u||m==0x104u)))&&
+                     !gcm_reports_dependency())return;
                   if (live) rsx_live_draw_method_at((subch << 13) | m, vm_read32(dea),dea); }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
@@ -3167,10 +3237,17 @@ static void gcm_rsx_process_fifo_pass(void)
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     if(m==0x50u && !(gcm_checked_ref_mode()?gcm_reports_dependency():gcm_reports_sync_barrier()))return;
                     if(m==0x1d6cu)s_backend_label_offset=vm_read32(dea);
-                    if((m==0x1d70u||m==0x1d74u)&&s_deferred_reports&&!rsx_live_draw_enabled()&&rsx_draw_engine_async_available()){
+                    if(m==0x1a4u)s_backend_label_dma=vm_read32(dea);
+                    if((m==0x1d70u||m==0x1d74u)&&gcm_reports_can_defer()){
                         u32 value=vm_read32(dea);
                         if(m==0x1d70u)value=(value&0xff00ff00u)|((value>>16)&0xffu)|((value&0xffu)<<16);
-                        if(!gcm_defer_label(VM_HLE_INJECT_BASE+(s_backend_label_offset&0xffffffu),value,m,dea))return;
+                        u32 label_ea=VM_HLE_INJECT_BASE+(s_backend_label_offset&0xffffffu);
+                        if(gcm_reports_live()&&s_backend_label_dma==0xFEED0001u){
+                            label_ea=gcm_io2ea(s_backend_label_offset);
+                            /* Legacy HOST_BUFFER skips an unmapped write. */
+                            if(!label_ea){if(!gcm_reports_sync_barrier())return;continue;}
+                        }
+                        if(!gcm_defer_label(label_ea,value,m,dea))return;
                         continue;
                     }
                     if((m==0x1d70u||m==0x1d74u)&&!gcm_reports_sync_barrier())return;
@@ -3555,6 +3632,7 @@ u32 cellGcm_display_buffer_count(void)
 
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
+    if(gcm_reports_live()&&!gcm_reports_dependency())return CELL_GCM_ERROR_FAILURE;
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
      * fast?" -- the question that matters when a title stops appearing on
@@ -4334,6 +4412,7 @@ u32* cellGcmGetLabelAddress(u8 index)
 /* NID: 0x8572ADE4 */
 CellGcmReportData* cellGcmGetReportDataAddress(u32 index)
 {
+    if(gcm_reports_live()&&!gcm_reports_dependency())return NULL;
     if (index >= CELL_GCM_MAX_REPORT_COUNT) {
         printf("[cellGcmSys] WARNING: GetReportDataAddress index %u out of range\n", index);
         return NULL;
@@ -4350,7 +4429,7 @@ u32 cellGcmGetReport(u32 type, u32 index)
     if(!s_deferred_reports)return cellGcmGetReport_consumer_body(type, index);
     cellGcm_rsx_consumer_begin();
     u32 result=0;
-    if(gcm_reports_progress(0,0))result=cellGcmGetReport_consumer_body(type, index);
+    if(gcm_reports_progress(gcm_reports_live(),gcm_reports_live()))result=cellGcmGetReport_consumer_body(type, index);
     else fprintf(stderr,"[deferred reports] rejected cellGcmGetReport after failure\n");
     cellGcm_rsx_consumer_end();return result;
 }
@@ -4369,7 +4448,7 @@ u64 cellGcmGetTimeStamp(u32 index)
     if(!s_deferred_reports)return cellGcmGetTimeStamp_consumer_body(index);
     cellGcm_rsx_consumer_begin();
     u64 result=0;
-    if(gcm_reports_progress(0,0))result=cellGcmGetTimeStamp_consumer_body(index);
+    if(gcm_reports_progress(gcm_reports_live(),gcm_reports_live()))result=cellGcmGetTimeStamp_consumer_body(index);
     else fprintf(stderr,"[deferred reports] rejected cellGcmGetTimeStamp after failure\n");
     cellGcm_rsx_consumer_end();return result;
 }
@@ -4558,7 +4637,7 @@ u64 cellGcmGetTimeStampLocation(u32 index, u32 location)
     if(!s_deferred_reports)return cellGcmGetTimeStampLocation_consumer_body(index, location);
     cellGcm_rsx_consumer_begin();
     u64 result=0;
-    if(gcm_reports_progress(0,0))result=cellGcmGetTimeStampLocation_consumer_body(index, location);
+    if(gcm_reports_progress(gcm_reports_live(),gcm_reports_live()))result=cellGcmGetTimeStampLocation_consumer_body(index, location);
     else fprintf(stderr,"[deferred reports] rejected cellGcmGetTimeStampLocation after failure\n");
     cellGcm_rsx_consumer_end();return result;
 }
@@ -4942,6 +5021,7 @@ void cellGcmSortRemapEaIoAddress(void)
 /* Report data with location parameter */
 CellGcmReportData* cellGcmGetReportDataAddressLocation(u32 index, u32 location)
 {
+    if(gcm_reports_live()&&!gcm_reports_dependency())return NULL;
     (void)location;  /* We only have one report area */
 
     if (index >= CELL_GCM_MAX_REPORT_COUNT) {
@@ -4958,7 +5038,7 @@ u32 cellGcmGetReportDataLocation(u32 index, u32 location)
     if(!s_deferred_reports)return cellGcmGetReportDataLocation_consumer_body(index, location);
     cellGcm_rsx_consumer_begin();
     u32 result=0;
-    if(gcm_reports_progress(0,0))result=cellGcmGetReportDataLocation_consumer_body(index, location);
+    if(gcm_reports_progress(gcm_reports_live(),gcm_reports_live()))result=cellGcmGetReportDataLocation_consumer_body(index, location);
     else fprintf(stderr,"[deferred reports] rejected cellGcmGetReportDataLocation after failure\n");
     cellGcm_rsx_consumer_end();return result;
 }

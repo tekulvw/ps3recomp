@@ -62,8 +62,12 @@ static u32 watched = 0x2000430;
 static unsigned watch_writes;
 static int expect_publication = 1;
 static unsigned draw_words;static int expect_draw;
+static void (*fixture_live_method_observer)(u32,u32,u32);
+static void (*fixture_user_observer)(u32);
+static void (*fixture_write_observer)(u32,u64,int);
 void ppu_resv_break_store(uint64_t ea) { if (ea >= watched && ea < (u64)watched + 16) { assert(locked); broken++; } }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) {
+    if(fixture_write_observer){fixture_write_observer(a,v,w);return;}
     assert(locked && (external_backend ? checked_calls : flushed && live_flushed) && w==4);
     assert(a==watched+watch_writes*4 && watch_writes<4);
     assert(vm_read32(watched+12)==0x00010000); /* Completion still pending. */
@@ -83,7 +87,7 @@ void rsx_draw_engine_flush(void) { assert(!locked); assert(vm_read32(watched+12)
 void rsx_live_draw_flush(void) { assert(!locked); assert(vm_read32(watched+12)==0x00010000); live_flushed++; }
 void rsx_state_init(rsx_state* s) { memset(s,0,sizeof(*s)); }
 int rsx_process_method(rsx_state* s,u32 m,u32 v) { (void)s; if(m==0x50)g_rsx_last_reference=v;return 0; }
-void rsx_raise_user_cmd(u32 arg) { (void)arg; }
+void rsx_raise_user_cmd(u32 arg) { if(fixture_user_observer)fixture_user_observer(arg); }
 void rsx_live_draw_set_display_buffer(u32 a,u32 b,u32 c,u32 d,u32 e,u32 f) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; }
 void rsx_draw_engine_set_display_buffer(u32 a,u32 b,u32 c,u32 d,u32 e,u32 f) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; }
 int rsx_live_draw_blit(u32 a,u32 b,u32 c,u32 d,u32 e,u32 f,u32 g,u32 h) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0; }
@@ -245,6 +249,7 @@ void rsx_draw_engine_guest_wrote(u32 a,u32 b,u32 c,u32 d,u32 e) {(void)a;(void)b
 void rsx_draw_engine_note_flip(u32 a) {(void)a;}
 
 void rsx_live_draw_method_at(u32 method,u32 arg,u32 data_ea) {
+    if(fixture_live_method_observer)fixture_live_method_observer(method,arg,data_ea);
     if(expect_live_ea){
         assert(live_ea_words<2 && data_ea==0x100004+4*live_ea_words);
         assert(method==0x7A00+4*live_ea_words);

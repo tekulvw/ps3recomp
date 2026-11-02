@@ -52,6 +52,14 @@ void rsx_live_draw_note_resolve(u32 sl, u32 sa, u32 dl, u32 da)
 void rsx_live_draw_flush(void) {}
 int rsx_live_draw_checked_ready(void) { return 0; }
 int rsx_live_draw_flush_checked(void) { return 0; }
+uint64_t rsx_live_draw_report_batch_lifetime(void) { return 0; }
+int rsx_live_draw_report_batch_admit(uint64_t l) { (void)l; return 0; }
+uint64_t rsx_live_draw_report_batch_issue(uint64_t l) { (void)l; return 0; }
+int rsx_live_draw_report_batch_status(uint64_t l,uint64_t f,int w)
+{ (void)l; (void)f; (void)w; return -1; }
+void rsx_live_draw_set_report_barrier(int (*b)(void)) { (void)b; }
+int rsx_live_draw_set_report_lease(void (*b)(void),void (*e)(void))
+{ return (b == NULL) == (e == NULL); }
 void rsx_live_draw_present(u32 b) { (void)b; }
 void rsx_live_draw_set_movie_mode(int on) { (void)on; }
 void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
@@ -1078,6 +1086,7 @@ typedef enum {
     LD_FLUSH_PIXEL_CONSTANT_RING,
     LD_FLUSH_DESCRIPTOR_RING,
     LD_FLUSH_SHUTDOWN,
+    LD_FLUSH_UPLOAD_RING,
     LD_FLUSH_REASON_COUNT
 } ld_flush_reason;
 
@@ -1848,6 +1857,60 @@ int rsx_live_draw_flush_checked(void)
     return g.ready && rsx_picture_ready();
 }
 
+/* Not reset with g: a new D3D device/fence must never validate an old ticket. */
+static u64 s_report_lifetime;
+static int (*s_report_barrier)(void);
+static void (*s_report_lease_begin)(void);
+static void (*s_report_lease_end)(void);
+
+uint64_t rsx_live_draw_report_batch_lifetime(void)
+{
+    return rsx_live_draw_checked_ready() ? s_report_lifetime : 0;
+}
+int rsx_live_draw_report_batch_admit(uint64_t lifetime)
+{
+    return lifetime && lifetime == rsx_live_draw_report_batch_lifetime() &&
+        !g.rsx.in_begin_end;
+}
+uint64_t rsx_live_draw_report_batch_issue(uint64_t lifetime)
+{
+    if (!rsx_live_draw_report_batch_admit(lifetime)) return 0;
+    const u64 previous = g.fence_value;
+    if (!rsx_live_draw_flush_checked() || g.fence_value <= previous) return 0;
+    return g.fence_value;
+}
+int rsx_live_draw_report_batch_status(uint64_t lifetime, uint64_t fence, int wait)
+{
+    (void)wait; /* Issue already performed the original synchronous checked wait. */
+    if (!lifetime || lifetime != rsx_live_draw_report_batch_lifetime() ||
+        !fence || fence > g.fence_value || !g.fence || !g.dev)
+        return -1;
+    const u64 completed = g.fence->lpVtbl->GetCompletedValue(g.fence);
+    if (completed == UINT64_MAX || completed < fence ||
+        g.dev->lpVtbl->GetDeviceRemovedReason(g.dev) != S_OK)
+        return -1;
+    return 1;
+}
+void rsx_live_draw_set_report_barrier(int (*barrier)(void))
+{ s_report_barrier = barrier; }
+int rsx_live_draw_set_report_lease(void (*begin)(void), void (*end)(void))
+{
+    if ((begin == NULL) != (end == NULL)) return 0;
+    s_report_lease_begin = begin; s_report_lease_end = end;
+    return 1;
+}
+static int ld_report_effect_begin(void)
+{
+    if (s_report_lease_begin) s_report_lease_begin();
+    if (s_report_barrier && !s_report_barrier()) {
+        if (s_report_lease_end) s_report_lease_end();
+        return 0;
+    }
+    return 1;
+}
+static void ld_report_effect_end(void)
+{ if (s_report_lease_end) s_report_lease_end(); }
+
 static int retire_texture(ID3D12Resource* tex)
 {
     if (!tex) return 1;
@@ -1976,9 +2039,36 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
 
 typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
 
+/* Reserve the complete texture before creating a resource or recording any
+ * face/mip copy. A pressure flush here is still in draw preparation, before
+ * graphics state is recorded; a flush inside the copy loop would lose state
+ * and could leave a partially uploaded resource referenced by the old list. */
+static int texture_upload_reserve(const tex_level_t* lv, u32 count)
+{
+    if (!g.upload_mapped || !g.list || !lv || !count ||
+        count > 6u * RSX_MAX_TEXTURE_LEVELS)
+        return 0;
+    u64 empty = 0, current = g.upload_used;
+    for (u32 i = 0; i < count; i++) {
+        if (!lv[i].w || !lv[i].h || !lv[i].data || !lv[i].row_bytes ||
+            !lv[i].rows || lv[i].row_bytes > UINT32_MAX - 255u)
+            return 0;
+        const u64 bytes = (u64)((lv[i].row_bytes + 255u) & ~255u) * lv[i].rows;
+        empty = ((empty + 511u) & ~(u64)511u) + bytes;
+        current = ((current + 511u) & ~(u64)511u) + bytes;
+        if (empty > UPLOAD_SIZE) return 0;
+    }
+    if (current > UPLOAD_SIZE) {
+        if (!g.ready) return 0;
+        ld_flush(LD_FLUSH_UPLOAD_RING);
+        if (!g.ready) return 0;
+    }
+    return 1;
+}
+
 static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
 {
-    if (n == 0) return NULL;
+    if (!texture_upload_reserve(lv, n)) return NULL;
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -1992,7 +2082,6 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     for (u32 m = 0; m < n; m++) {
         const u32 pitch = (lv[m].row_bytes + 255) & ~255u;
         const u32 start = (g.upload_used + 511) & ~511u;
-        if ((u64)start + (u64)pitch * lv[m].rows > UPLOAD_SIZE) break;
         for (u32 y = 0; y < lv[m].rows; y++)
             memcpy(g.upload_mapped + start + (size_t)y * pitch,
                    lv[m].data + (size_t)y * lv[m].row_bytes, lv[m].row_bytes);
@@ -2028,7 +2117,8 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
 static ID3D12Resource* create_texture_cube(
     DXGI_FORMAT fmt, const tex_level_t* lv, u32 n_mips)
 {
-    if (!n_mips) return NULL;
+    if (!n_mips || n_mips > RSX_MAX_TEXTURE_LEVELS ||
+        !texture_upload_reserve(lv, 6u * n_mips)) return NULL;
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2045,10 +2135,6 @@ static ID3D12Resource* create_texture_cube(
             const tex_level_t* level = &lv[face * n_mips + mip];
             const u32 pitch = (level->row_bytes + 255) & ~255u;
             const u32 start = (g.upload_used + 511) & ~511u;
-            if ((u64)start + (u64)pitch * level->rows > UPLOAD_SIZE) {
-                tex->lpVtbl->Release(tex);
-                return NULL;
-            }
             for (u32 y = 0; y < level->rows; y++)
                 memcpy(g.upload_mapped + start + (size_t)y * pitch,
                        level->data + (size_t)y * level->row_bytes,
@@ -2255,7 +2341,7 @@ static ID3D12Resource* decode_guest_float4(const rsx_dsp_texture* t, u64 token)
     const u32 face_stride = span / faces;
     /* Check the whole upload before recording any copy. The common uploaders
      * cannot represent a texture whose footprints exceed this ring. */
-    u64 upload = g.upload_used;
+    u64 upload = 0; /* Intrinsic size; current-list pressure is reserved later. */
     for (u32 face = 0; face < faces; face++)
         for (u32 mip = 0; mip < n_mips; mip++) {
             upload = ((upload + 511u) & ~(u64)511u) +
@@ -3381,7 +3467,7 @@ static int   s_csv_gate_open;
 
 static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h);
-int rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
+static int ld_blit_body(u32 src_loc, u32 src_abs, u32 src_pitch,
                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h)
 {
     const int r = ld_blit_gpu(src_loc, src_abs, src_pitch, dst_loc, dst_abs, dst_pitch, w, h);
@@ -3687,7 +3773,7 @@ static int ld_scaled_blit(u32 si, float sx, float sy, float sw, float sh,
     return 1;
 }
 
-int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, u32 dt,
+static int ld_resolve_blit_body(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, u32 dt,
                                u32 dst_loc, u32 dst_abs, u32 dst_pitch,
                                u32 out_x, u32 out_y, u32 out_w, u32 out_h)
 {
@@ -3783,7 +3869,7 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
     return 1;
 }
 
-void rsx_live_draw_note_resolve(u32 src_loc, u32 src_abs, u32 dst_loc, u32 dst_abs)
+static void ld_note_resolve_body(u32 src_loc, u32 src_abs, u32 dst_loc, u32 dst_abs)
 {
     if (!g.ready) return;
     for (u32 b = 0; b < 8; b++) {
@@ -7677,6 +7763,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
           }
       } }
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) {
+        if (!g.ready) return;
         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
         /* LD_PS1_BUF0=1 -- DIAGNOSTIC, not a fix. Force a 24-bit PS1 VRAM
          * bind at buffer 1 (offset 0x4003C0) to sample buffer 0 (0x400000).
@@ -7928,6 +8015,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         }
     }
 
+    if (!g.ready) return;
     const u32 vtex_mask = vertex_texture_mask();
     u32 vtex_slots[SRV_TABLE_SIZE];
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++)
@@ -7937,6 +8025,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
      * command list; doing that after SetPipelineState/root bindings silently
      * loses those bindings on the replacement list. */
     for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {
+        if (!g.ready) return;
         if (!((vtex_mask >> u) & 1u)) continue;
         rsx_dsp_vertex_texture vt;
         rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
@@ -7946,6 +8035,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         else
             g_ld_vtex_unsupported++;
     }
+    if (!g.ready) return;
     const u32 required_srv_tables = 1u + (vtex_mask != 0);
     if (g.srv_ring_used + required_srv_tables > SRV_RING_TABLES ||
         sampler_table_needs_flush(smp_slots)) {
@@ -8492,7 +8582,7 @@ static int make_depth_snapshot_pipeline(void)
     return SUCCEEDED(hr) ? 0 : -1;
 }
 
-int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+static int ld_init_body(void* hwnd, u32 width, u32 height,
                        rsx_live_guest_ptr_fn guest_fn, void* guest_user)
 {
     if (!rsx_live_draw_enabled()) return 0;
@@ -8780,6 +8870,8 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 
     g.ready = 1;
     g.enabled = 1;
+    if (s_report_lifetime == UINT64_MAX) { g.ready = 0; return -1; }
+    ++s_report_lifetime;
     return 0;
 }
 
@@ -8914,7 +9006,7 @@ void rsx_live_draw_method_at(u32 method, u32 arg,u32 data_ea)
     ld_method_core(method,arg,data_ea);
 }
 
-void rsx_live_draw_set_movie_mode(int on)
+static void ld_set_movie_mode_body(int on)
 {
     static unsigned long long suppressed_at_start = 0;
     const int composite = ld_movie_composite_ui_enabled();
@@ -9088,7 +9180,7 @@ void rsx_live_draw_dump_present_samples(void)
  * swap-chain backbuffer (both R8G8B8A8_UNORM at the swap size) and Present.
  * The frame is clamped to the backbuffer size. Call from a single thread with
  * movie mode on (so guest draws don't touch g.list). */
-void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
+static void ld_present_rgba_body(const uint8_t* rgba, u32 w, u32 h)
 {
     const int composite = ld_movie_composite_ui_enabled();
     const int serialized = composite || g_ld_debug_layer_enabled;
@@ -9376,7 +9468,7 @@ static void ld_parity_capture_surface(
 }
 #endif
 
-int rsx_live_draw_debug_dump_surface(
+static int ld_debug_dump_surface_body(
     u32 location, u32 offset, const char* path)
 {
     if (!g.ready || !path || !path[0]) return -1;
@@ -9503,7 +9595,7 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
     fflush(stderr);
 }
 
-void rsx_live_draw_present(u32 buffer_id)
+static void ld_present_body(u32 buffer_id)
 {
     if (!g.ready) return;
 
@@ -10593,7 +10685,7 @@ void rsx_live_draw_present(u32 buffer_id)
      * clear/demote a tracked zeta (sink_clear does that above). */
 }
 
-void rsx_live_draw_shutdown(void)
+static void ld_shutdown_body(void)
 {
     /* Uploads copy immutable CPU bytes; D3D resources retain GPU ownership. */
     for(u32 i=0;i<16;i++){
@@ -10858,6 +10950,60 @@ void rsx_live_draw_shutdown(void)
         dc.compact_capacity = 0;
     }
     if (dc.cuts) { free(dc.cuts); dc.cuts = NULL; dc.cap_cuts = 0; }
+}
+
+/* Keep the lease outside every existing LIVE/access lock and across all early
+ * returns in the original bodies. The callback may issue a checked batch;
+ * low-level issue/flush deliberately does not enter this wrapper again. */
+int rsx_live_draw_init(void* hwnd,u32 w,u32 h,rsx_live_guest_ptr_fn f,void* user)
+{
+    if (!ld_report_effect_begin()) return -1;
+    int result=ld_init_body(hwnd,w,h,f,user);
+    ld_report_effect_end(); return result;
+}
+int rsx_live_draw_blit(u32 sl,u32 sa,u32 sp,u32 dl,u32 da,u32 dp,u32 w,u32 h)
+{
+    if (!ld_report_effect_begin()) return 0;
+    int result=ld_blit_body(sl,sa,sp,dl,da,dp,w,h);
+    ld_report_effect_end(); return result;
+}
+int rsx_live_draw_resolve_blit(u32 sl,u32 sa,u32 sp,u32 ds,u32 dt,u32 dl,u32 da,
+    u32 dp,u32 x,u32 y,u32 w,u32 h)
+{
+    if (!ld_report_effect_begin()) return 0;
+    int result=ld_resolve_blit_body(sl,sa,sp,ds,dt,dl,da,dp,x,y,w,h);
+    ld_report_effect_end(); return result;
+}
+void rsx_live_draw_note_resolve(u32 sl,u32 sa,u32 dl,u32 da)
+{
+    if (!ld_report_effect_begin()) return;
+    ld_note_resolve_body(sl,sa,dl,da); ld_report_effect_end();
+}
+void rsx_live_draw_set_movie_mode(int on)
+{
+    if (!ld_report_effect_begin()) return;
+    ld_set_movie_mode_body(on); ld_report_effect_end();
+}
+void rsx_live_draw_present_rgba(const uint8_t* rgba,u32 w,u32 h)
+{
+    if (!ld_report_effect_begin()) return;
+    ld_present_rgba_body(rgba,w,h); ld_report_effect_end();
+}
+int rsx_live_draw_debug_dump_surface(u32 location,u32 offset,const char* path)
+{
+    if (!ld_report_effect_begin()) return -1;
+    int result=ld_debug_dump_surface_body(location,offset,path);
+    ld_report_effect_end(); return result;
+}
+void rsx_live_draw_present(u32 buffer_id)
+{
+    if (!ld_report_effect_begin()) return;
+    ld_present_body(buffer_id); ld_report_effect_end();
+}
+void rsx_live_draw_shutdown(void)
+{
+    if (!ld_report_effect_begin()) return;
+    ld_shutdown_body(); ld_report_effect_end();
 }
 
 #endif /* _WIN32 */

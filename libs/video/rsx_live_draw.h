@@ -105,6 +105,21 @@ void rsx_live_draw_flush(void);
 int rsx_live_draw_checked_ready(void);
 int rsx_live_draw_flush_checked(void);
 
+#define RSX_LIVE_HAS_REPORT_BATCH 1
+/* Consumer-owned synchronous report batching. A ticket is an actual completed
+ * fence in one physical renderer lifetime, never an asynchronous promise.
+ * Admission is checked at the original FIFO position. Status returns -1 for
+ * invalid/failed tickets and 1 for real completion; it never submits or waits. */
+uint64_t rsx_live_draw_report_batch_lifetime(void);
+int rsx_live_draw_report_batch_admit(uint64_t lifetime);
+uint64_t rsx_live_draw_report_batch_issue(uint64_t lifetime);
+int rsx_live_draw_report_batch_status(uint64_t lifetime, uint64_t fence, int wait);
+/* Startup-only registration. The lease surrounds each complete public host
+ * effect, including its barrier and existing renderer locks. NULL disables it;
+ * an unmatched begin/end pair is rejected without changing registration. */
+void rsx_live_draw_set_report_barrier(int (*barrier)(void));
+int rsx_live_draw_set_report_lease(void (*begin)(void), void (*end)(void));
+
 /* Present the given display buffer id (called from the flip path). */
 void rsx_live_draw_present(u32 buffer_id);
 
