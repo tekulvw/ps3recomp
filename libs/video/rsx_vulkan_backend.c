@@ -4093,7 +4093,7 @@ static void vulkan_borrow_end(void* user,uint64_t life){
 }
 static rsx_native_proc vulkan_owner_instance_proc(void* instance,const char* name){return (rsx_native_proc)pvkGetInstanceProcAddr((VkInstance)instance,name);}
 static rsx_native_proc vulkan_owner_device_proc(void* device,const char* name){return (rsx_native_proc)pvkGetDeviceProcAddr((VkDevice)device,name);}
-int rsx_vulkan_backend_borrow_owner(rsx_native_owner* out){
+static int vulkan_borrow_owner(rsx_native_owner* out,rsx_native_owner_v2 *extended){
     if(!out||out->abi_version!=1||out->struct_size!=sizeof(*out))return -1;
     if(!vulkan_owner_enabled())return -2;
     if(s_vulkan_owner_thread.gate||!rsx_owner_lock_try(&s_vulkan_owner.lock))return -4;
@@ -4110,7 +4110,21 @@ int rsx_vulkan_backend_borrow_owner(rsx_native_owner* out){
             .instance=(void*)s_vk.instance,.physical_device=(void*)s_vk.phys,.get_instance_proc=vulkan_owner_instance_proc,.get_device_proc=vulkan_owner_device_proc,
             .retain=vulkan_borrow_retain,.release=vulkan_borrow_release,.try_begin=vulkan_borrow_begin,.end=vulkan_borrow_end};
     }
+    if(!status && extended){
+        extended->base=*out;
+        /* These are the exact VkDeviceCreateInfo enabled fields, not a fresh
+         * physical-device query. The generation and facts share this lock. */
+        extended->known_features=RSX_NATIVE_OWNER_FEATURE_BC|RSX_NATIVE_OWNER_FEATURE_ANISOTROPY|RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS;
+        extended->enabled_features=(s_vk.bc_ok?RSX_NATIVE_OWNER_FEATURE_BC:0)|
+            (s_vk.depth_bounds_ok?RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS:0);
+    }
     rsx_owner_lock_release(&s_vulkan_owner.lock);return status;
+}
+int rsx_vulkan_backend_borrow_owner(rsx_native_owner *out){return vulkan_borrow_owner(out,NULL);}
+int rsx_vulkan_backend_borrow_owner_v2(rsx_native_owner_v2 *out){
+    if(!out||out->abi_version!=2||out->struct_size!=sizeof(*out))return -1;
+    rsx_native_owner base={.abi_version=1,.struct_size=sizeof(base)};
+    return vulkan_borrow_owner(&base,out);
 }
 int rsx_vulkan_backend_owner_shutdown_requested(uint64_t life){
     if(!vulkan_owner_enabled())return -2;

@@ -131,6 +131,7 @@ int  rsx_vulkan_backend_guest_programs(void);
 
 /* Borrow existing native ownership only; no device/queue is created. */
 int rsx_vulkan_backend_borrow_owner(rsx_native_owner *);
+int rsx_vulkan_backend_borrow_owner_v2(rsx_native_owner_v2 *);
 int rsx_vulkan_backend_owner_shutdown_requested(uint64_t lifetime);
 int rsx_vulkan_backend_owner_retry_shutdown(uint64_t lifetime);
 

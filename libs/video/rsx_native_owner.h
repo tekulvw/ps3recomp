@@ -30,6 +30,14 @@ typedef struct rsx_native_owner {
     int (*try_begin)(void *,uint64_t);
     void (*end)(void *,uint64_t);
 } rsx_native_owner;
+#define RSX_NATIVE_OWNER_FEATURE_BC UINT64_C(1)
+#define RSX_NATIVE_OWNER_FEATURE_ANISOTROPY UINT64_C(2)
+#define RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS UINT64_C(4)
+typedef struct rsx_native_owner_v2 {
+    uint32_t abi_version,struct_size;
+    rsx_native_owner base;
+    uint64_t known_features,enabled_features;
+} rsx_native_owner_v2;
 #ifdef __cplusplus
 }
 #endif

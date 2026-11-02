@@ -2,7 +2,16 @@
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+static VkPhysicalDeviceFeatures created_features;
+static VkResult capture_create_device(VkPhysicalDevice,const VkDeviceCreateInfo *,const VkAllocationCallbacks *,VkDevice *);
+#define PS3RECOMP_VK_TEST_CREATE_DEVICE capture_create_device
 #include "../rsx_vulkan_backend.c"
+static VkResult capture_create_device(VkPhysicalDevice physical,const VkDeviceCreateInfo *info,const VkAllocationCallbacks *allocator,VkDevice *device){
+    created_features=*info->pEnabledFeatures;
+    return pvkCreateDevice(physical,info,allocator,device);
+}
 #include <assert.h>
 u8* vm_base;u32 ppu_vm_size,ppu_hle_inject_base;
 u32 cellGcmResolveLocated(int local,u32 offset){(void)local;(void)offset;assert(!"fixture has no guest memory");return 0;}
@@ -35,6 +44,14 @@ int main(int argc,char** argv){
         assert(properties.deviceType==VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU||properties.deviceType==VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);}
     rsx_native_owner first={.abi_version=1,.struct_size=sizeof(first)};assert(rsx_vulkan_backend_borrow_owner(&first)==0);
     assert(first.device==(void*)s_vk.device && first.queue==(void*)s_vk.queue);
+    rsx_native_owner_v2 extended={.abi_version=2,.struct_size=sizeof(extended)};
+    assert(rsx_vulkan_backend_borrow_owner_v2(&extended)==0);
+    assert(extended.base.lifetime==first.lifetime && extended.base.device==first.device);
+    assert(extended.known_features==(RSX_NATIVE_OWNER_FEATURE_BC|RSX_NATIVE_OWNER_FEATURE_ANISOTROPY|RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS));
+    const uint64_t expected_features=(created_features.textureCompressionBC?RSX_NATIVE_OWNER_FEATURE_BC:0)|
+        (created_features.samplerAnisotropy?RSX_NATIVE_OWNER_FEATURE_ANISOTROPY:0)|
+        (created_features.depthBounds?RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS:0);
+    assert(extended.enabled_features==expected_features);
     assert(!rsx_vulkan_backend_frontend());assert(first.retain(first.userdata,first.lifetime)==0);
     assert(first.try_begin(first.userdata,first.lifetime)==-4);
     rsx_draw_engine_flush();assert(first.try_begin(first.userdata,first.lifetime)==0);first.end(first.userdata,first.lifetime);
