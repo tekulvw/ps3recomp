@@ -1,7 +1,7 @@
 # Explicit frontend compute interface
 
 `libs/video/rsx_frontend.h` provides an opt-in, versioned compute interface. The initial
-implementation uses the existing Metal backend's device and command queue. It creates no
+implementations use the existing Metal or Vulkan backend's device and command queue. They create no
 second renderer, window, device or queue and changes no original rendering defaults. Draws,
 presentation and other APIs remain unsupported by this compute slice.
 
@@ -17,9 +17,10 @@ A newly acquired context after teardown rejects all earlier value handles.
 
 ## Buffers and pipelines
 
-Buffer creation copies complete initial bytes or initializes zero bytes into a persistent shared
-Metal buffer. A full-buffer update allocates a new immutable content version; it never modifies
-or reads the previous version. Old public versions remain addressable until explicitly released.
+Buffer creation copies complete initial bytes or initializes zero bytes into a persistent native
+buffer. A full-buffer CPU update allocates a new version; it never modifies or reads the previous
+version. Explicit GPU `READ_WRITE` bindings can mutate a native version, so its post-dispatch bytes
+must not be mistaken for the CPU seed. Old public versions remain addressable until released.
 Submissions independently retain each referenced version and pipeline through GPU terminal
 completion, even if the public handle is released meanwhile. Version metadata is retired once
 no public version remains addressable. Buffers and bound slice lengths must fit `u32`, meet
@@ -28,7 +29,7 @@ their schema minimum size, and respect the manifest alignment.
 `rsx_frontend_pipeline_desc` selects MSL, HLSL or SPIR-V payload bytes explicitly. The initial
 Metal implementation accepts MSL only and rejects the other targets as unsupported. Pipeline
 creation performs actual runtime Metal library/function/pipeline compilation. Its binding schema
-must come from the same generated shader manifest: slots, access, minimum bytes, alignment,
+must come from the same generated shader manifest: slots, uniform/storage kind, access, minimum bytes, alignment,
 runtime-array stride and runtime-size index, plus declared threads per group.
 
 Initial native support restricts runtime arrays to byte offset zero, with minimum binding size
@@ -94,3 +95,51 @@ version retention across a real shared-event delay, exactly-once terminal pollin
 retirement, shutdown drain and stale context rejection. Diagnostic readback is used only after
 terminal completion. These are synthetic Metal compute results, not complete scene, D3D12,
 Vulkan, game visual or match-performance acceptance.
+
+## Vulkan route and Linux verification
+
+Set `PS3RECOMP_VK_FRONTEND=1` before the existing Vulkan backend initializes. This explicitly
+requests Vulkan1.1 for the tool's SPIR-V1.3; ordinary initialization continues to request
+Vulkan1.0 when the option is absent. Query `rsx_vulkan_backend_frontend_available()` before
+borrowing `rsx_vulkan_backend_frontend()`. Both require the existing selected graphics queue
+to support compute. No parallel device/queue or mandatory present/readback is created.
+
+The adapter accepts SPIR-V only, checks its compute entry and literal local size, and uses
+explicit uniform/storage descriptor kinds. Uniforms must be read-only. Offsets obey both
+manifest and device descriptor alignment/range limits. Initial support requires host-visible
+coherent memory and runtime arrays at byte zero; unavailable capabilities remain visible.
+Each of two ticket slots owns persistent command/descriptor pools and a fence, reused only
+after terminal polling. Submit returns BUSY while original commands are recording or present
+recording ownership cannot be acquired immediately. Queue operations use the original mutex.
+
+Normal submit/poll performs no device/queue idle wait, fence wait, frame readback or original
+present call. Poll uses native fence status. Native errors retain uncertain tickets and block
+new admission. Genuine valid terminal receipts are delivered first even if another fence
+fails; the independent fault is reported later, never alongside a consumed once-only receipt.
+Out-of-memory submit errors are definite rejection under the
+[Vulkan queue-submit guarantee](https://docs.vulkan.org/refpages/latest/refpages/source/vkQueueSubmit.html);
+other unknown/device-lost submit results retain an indeterminate ticket. Device loss does not
+become a successful terminal. Explicit teardown drains the shared device before destruction.
+
+From Linux with a C compiler, Python3, SDL2/Vulkan development headers and loader in pkg-config:
+
+```sh
+python3 tools/test_frontend_vulkan.py --contract-only
+python3 tools/test_frontend_vulkan.py --shader-root <generated-shader-root> --build-only
+python3 tools/test_frontend_vulkan.py --shader-root <generated-shader-root> \
+  --require-hardware --gpu-index <index> --vendor-id <PCI-vendor> --device-id <PCI-device> \
+  --report build/frontend-vulkan-hardware.json
+```
+
+Hardware mode matches vendor/device IDs and rejects CPU, virtual and unspecified devices.
+The no-window fixture uses one existing-owner device/queue. A host-signaled Vulkan event
+delays queue progress while two compute tickets retain released old CPU versions. It checks
+exact transform/compaction outputs, zero/oversized bounds, ordering gates, alignment/layout
+rejection, pressure, pending-read protection, new publication and exactly-once terminal polling.
+The CPU-only driver-fault test injects fence responses without creating a GPU device. Receipts
+bind SDK/shader source hashes and distinguish diagnostic-only from explicit hardware runs.
+
+The dedicated Linux workflow builds with GCC/Clang and runs lavapipe diagnostics under validation
+using pinned authored shader sources. A green software result is never hardware acceptance.
+Full scenes, original-surface interop, presentation, fault injection, D3D12 and full M2 remain
+separate obligations.

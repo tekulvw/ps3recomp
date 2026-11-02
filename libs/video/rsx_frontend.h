@@ -24,6 +24,7 @@ enum rsx_frontend_status {
     RSX_FRONTEND_DEVICE_FAILED = -6
 };
 enum rsx_frontend_access { RSX_FRONTEND_READ = 1, RSX_FRONTEND_READ_WRITE = 2 };
+enum rsx_frontend_binding_kind { RSX_FRONTEND_STORAGE = 0, RSX_FRONTEND_UNIFORM = 1 };
 enum rsx_frontend_shader_language {
     RSX_FRONTEND_MSL = 1, RSX_FRONTEND_HLSL = 2, RSX_FRONTEND_SPIRV = 3
 };
@@ -44,8 +45,10 @@ typedef struct rsx_frontend_buffer_desc {
     const void *initial_bytes; /* NULL means zero initialize */
 } rsx_frontend_buffer_desc;
 
-/* One complete immutable resource version. update publishes complete CPU bytes
- * into a new MTLBuffer; it never reads/mutates the previous in-flight version.
+/* CPU publication never overwrites a prior allocation/version. update publishes
+ * complete CPU bytes into a new native buffer without reading/mutating the prior
+ * in-flight version. Explicit READ_WRITE GPU bindings can mutate that native
+ * version; its post-dispatch bytes must not be mistaken for the CPU seed.
  * Each version remains addressable until explicitly released. Submission retains
  * its own references through GPU terminal completion even after public release. */
 int rsx_frontend_buffer_create(rsx_frontend_device *, const rsx_frontend_buffer_desc *, rsx_frontend_buffer *);
@@ -61,7 +64,7 @@ typedef struct rsx_frontend_binding_layout {
     uint64_t minimum_bytes;
     uint32_t runtime_array_stride; /* zero for fixed layouts */
     uint32_t runtime_size_index; /* dense metadata indices or NO_SIZE_INDEX */
-    uint32_t alignment_bytes, reserved; /* manifest alignment, power of two >=4 */
+    uint32_t alignment_bytes, binding_kind; /* uniform requires READ */
 } rsx_frontend_binding_layout;
 /* Initial native compute accepts runtime arrays starting at byte zero only:
  * minimum_bytes must equal runtime_array_stride. Struct headers before runtime

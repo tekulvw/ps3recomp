@@ -55,6 +55,7 @@
 #define PS3RECOMP_RSX_VULKAN_BACKEND_H
 
 #include "rsx_commands.h"
+#include "rsx_frontend.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -64,6 +65,11 @@ extern "C" {
  * the RSX backend. `title` is only logged (no window at V0).
  * Returns 0 on success, -1 on any failure (reason printed to stderr). */
 int  rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
+
+/* Requires explicit PS3RECOMP_VK_FRONTEND=1 before init (Vulkan1.1), an
+ * existing compute-capable graphics queue, and no implicit device creation. */
+int rsx_vulkan_backend_frontend_available(void);
+rsx_frontend_device *rsx_vulkan_backend_frontend(void);
 
 /* Unregister and destroy every Vulkan object, then unload the library. */
 void rsx_vulkan_backend_shutdown(void);

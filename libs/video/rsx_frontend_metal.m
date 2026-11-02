@@ -116,7 +116,8 @@ static int metal_pipeline_create(void *opaque, const rsx_frontend_pipeline_desc 
     for (uint32_t i = 0; i < desc->binding_count; ++i) {
         rsx_frontend_binding_layout b = desc->bindings[i];
         if (b.slot >= RSX_FRONTEND_MAX_BINDINGS || slots & (1u << b.slot) || !b.minimum_bytes ||
-            b.minimum_bytes % 4 || b.minimum_bytes > UINT32_MAX || b.reserved ||
+            b.minimum_bytes % 4 || b.minimum_bytes > UINT32_MAX || b.binding_kind > RSX_FRONTEND_UNIFORM ||
+            (b.binding_kind == RSX_FRONTEND_UNIFORM && (b.access != RSX_FRONTEND_READ || b.runtime_array_stride)) ||
             b.alignment_bytes < 4 || (b.alignment_bytes & (b.alignment_bytes - 1)) || b.alignment_bytes > 256 ||
             (b.access != RSX_FRONTEND_READ && b.access != RSX_FRONTEND_READ_WRITE)) return RSX_FRONTEND_INVALID;
         slots |= 1u << b.slot;

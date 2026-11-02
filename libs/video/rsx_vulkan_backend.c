@@ -44,6 +44,8 @@
 #include <vulkan/vulkan.h>
 
 #include "rsx_vulkan_backend.h"
+#include "rsx_frontend_vulkan.h"
+#include "rsx_frontend_internal.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
 #include "rsx_vp_decompiler.h"
@@ -189,6 +191,7 @@ typedef struct vk_state {
     VkCommandPool    pool;
     VkCommandBuffer  cmd;
     VkFence          fence;
+    int              frontend_enabled, frontend_recording;
 
     /* A present records and submits on its own pool, command buffer and
      * fences, so its second half can run on a host thread of its own while
@@ -237,6 +240,7 @@ typedef struct vk_state {
 } vk_state;
 
 static vk_state s_vk;
+static rsx_frontend_device *s_vk_frontend;
 
 #define VK_LOG(...)  fprintf(stderr, "[RSX vulkan] " __VA_ARGS__)
 #define VK_CHECK(call, what)                                               \
@@ -554,6 +558,7 @@ static int vk_begin(void)
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     VK_CHECK(pvkBeginCommandBuffer(s_vk.cmd, &bi), "vkBeginCommandBuffer");
+    s_vk.frontend_recording = 1;
     /* A present's copy may still be reading the surface this frame is about
      * to draw over: order everything here after it. Set only by a present,
      * which never runs alongside the walker's recording. */
@@ -568,6 +573,7 @@ static int vk_submit_and_wait(void)
                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
     VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
     VK_CHECK(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit");
+    s_vk.frontend_recording = 0;
     VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
     return 0;
 }
@@ -3500,9 +3506,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
     if (vk_load_library()) return -1;
 
+    const char *frontend = getenv("PS3RECOMP_VK_FRONTEND");
+    s_vk.frontend_enabled = frontend && !strcmp(frontend, "1");
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                               .pApplicationName = "ps3recomp", .pEngineName = "ps3recomp RSX",
-                              .apiVersion = VK_API_VERSION_1_0 };
+                              .apiVersion = s_vk.frontend_enabled ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0 };
     VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                                 .pApplicationInfo = &app };
     if (s_vk.windowed) {
@@ -3648,8 +3656,40 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
     return 0;
 }
 
+static int vk_frontend_begin(void *user)
+{
+    vk_state *state = user;
+    if (state->frontend_recording || pthread_mutex_trylock(&state->present_mu)) return 0;
+    return 1;
+}
+static void vk_frontend_end(void *user) { pthread_mutex_unlock(&((vk_state *)user)->present_mu); }
+int rsx_vulkan_backend_frontend_available(void)
+{
+    if (!s_vk.device || !s_vk.frontend_enabled) return 0;
+    VkPhysicalDeviceProperties properties; pvkGetPhysicalDeviceProperties(s_vk.phys, &properties);
+    if (properties.apiVersion < VK_API_VERSION_1_1) return 0;
+    uint32_t count = 0; pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys, &count, NULL);
+    if (s_vk.queue_family >= count || count > 64) return 0;
+    VkQueueFamilyProperties queues[64]; pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys, &count, queues);
+    return (queues[s_vk.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+}
+rsx_frontend_device *rsx_vulkan_backend_frontend(void)
+{
+    if (!rsx_vulkan_backend_frontend_available()) return NULL;
+    if (!s_vk_frontend) {
+        rsx_frontend_vulkan_owner owner = {0};
+        owner.device = s_vk.device; owner.queue = s_vk.queue; owner.queue_family = s_vk.queue_family;
+        pvkGetPhysicalDeviceProperties(s_vk.phys, &owner.properties); owner.memory = s_vk.memprops;
+        owner.get_proc = pvkGetDeviceProcAddr; owner.queue_mutex = &s_vk.queue_mu;
+        owner.begin_submit = vk_frontend_begin; owner.end_submit = vk_frontend_end; owner.user = &s_vk;
+        s_vk_frontend = rsx_frontend_vulkan_create(&owner);
+    }
+    return s_vk_frontend;
+}
+
 void rsx_vulkan_backend_shutdown(void)
 {
+    rsx_frontend_close(s_vk_frontend); s_vk_frontend = NULL;
     rsx_vulkan_backend_present_finish();   /* a host that began one and quit */
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
     if (s_vk.eng_active) { rsx_draw_engine_shutdown(); s_vk.eng_active = 0; }

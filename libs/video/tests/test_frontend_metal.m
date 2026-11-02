@@ -35,7 +35,8 @@ static rsx_frontend_pipeline pipeline(rsx_frontend_device *device, const char *d
             [entry[@"access"] isEqual:@"read"] ? RSX_FRONTEND_READ : RSX_FRONTEND_READ_WRITE,
             [entry[@"minimum_binding_bytes"] unsignedLongLongValue],
             size_index == RSX_FRONTEND_NO_SIZE_INDEX ? 0 : [entry[@"layout"][@"stride_bytes"] unsignedIntValue], size_index,
-            [entry[@"layout"][@"alignment_bytes"] unsignedIntValue], 0};
+            [entry[@"layout"][@"alignment_bytes"] unsignedIntValue],
+            [entry[@"address_space"] isEqual:@"uniform"] ? RSX_FRONTEND_UNIFORM : RSX_FRONTEND_STORAGE};
     }
     NSString *entry = manifest[@"targets"][@"msl"][@"entry_point"];
     rsx_frontend_pipeline_desc desc = {0}; desc.struct_size = sizeof(desc); desc.abi_version = 1;
