@@ -40,6 +40,7 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 #include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
 #include "../spu/spu_lifted_thread.h" /* run a thread's own image, lifted */
 #include "../spu/spu_context.h"       /* the architectural context that runs it */
+#include "../diagnostics/original_work_threads.h"
 #include "../spu/spurs_policy_service.h"
 #include "../spu/spu_workload.h"   /* the content-fingerprint registry */
 #include "sys_event.h"
@@ -694,10 +695,10 @@ static void spu_spawn_host_thread(spu_thread_handle_t* out,
     pthread_attr_init(&attr);
     int rc = EINVAL;
     if (pthread_attr_setstacksize(&attr, spu_host_stack_bytes()) == 0)
-        rc = pthread_create(out, &attr, fn, arg);
+        rc = ps3_original_pthread_create(out, &attr, fn, arg);
     pthread_attr_destroy(&attr);
     if (rc != 0)
-        pthread_create(out, NULL, fn, arg);
+        ps3_original_pthread_create(out, NULL, fn, arg);
 }
 #endif
 

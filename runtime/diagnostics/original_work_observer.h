@@ -70,6 +70,11 @@ typedef struct ps3_original_report {
   uint64_t covered_from, drained_through, lost_records;
   uint8_t manifest_sha256[32];
 } ps3_original_report;
+typedef struct ps3_original_live_report {
+  uint32_t struct_size, abi_version, faults, workers;
+  uint64_t covered_from, lost_records;
+  uint8_t manifest_sha256[32];
+} ps3_original_live_report;
 /* One immutable capture per process. Arm before ANY observed worker starts.
  * Enroll each expected worker generation before creating/starting that worker;
  * subsequent workers need explicit enrollment too. No ID/generation reuse.
@@ -98,6 +103,17 @@ int ps3_original_seal(ps3_original_report *);
  * host join/drain evidence. This API does not manufacture ObserverReceipts. */
 int ps3_original_count(uint64_t worker, uint64_t generation, uint64_t target,
                        unsigned route, uint64_t *out);
+/* Explicitly diagnostic snapshots, with NO drained-through/final receipt.
+ * Single-writer relaxed atomic counters are readable while workers execute.
+ * Neither API establishes absence, complete worker enrollment or quiescence. */
+int ps3_original_live_status(ps3_original_live_report *);
+int ps3_original_live_total(uint64_t target, unsigned route, uint64_t *out);
+/* Native factory integration: high-bit IDs are reserved for these helpers.
+ * prepare=1 means enrolled; failure never authorizes suppressing a real thread.
+ * cancel acknowledges a genuine native creation failure, never live work.
+ * The main guest worker uses explicit host enrollment of ID1/generation1. */
+int ps3_original_worker_prepare(uint64_t *worker);
+int ps3_original_worker_cancel(uint64_t worker);
 #if defined(PS3RECOMP_ORIGINAL_OBSERVER) && PS3RECOMP_ORIGINAL_OBSERVER
 #define PS3_ORIGINAL_STEP(context, pc, route)                                  \
   ps3_original_step((context), (pc), (route), __FILE__)

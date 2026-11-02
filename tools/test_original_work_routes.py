@@ -51,6 +51,7 @@ with tempfile.TemporaryDirectory(prefix='original-routes-') as temporary:
         *['-I'+str(path)for path in [ROOT/'include',SPU,ROOT/'runtime/platform',ROOT/'runtime/diagnostics',tmp]],
         str(SPU/'tests/test_original_work_routes.c'),*[str(interp if unit=='spu_interp' else SPU/(unit+'.c'))for unit in units],
         str(ROOT/'runtime/platform/win32_compat.c'),str(ROOT/'runtime/diagnostics/original_work_observer.c'),
+        str(ROOT/'runtime/diagnostics/original_work_threads.c'),
         str(ROOT/'runtime/diagnostics/job_io_recorder.c'),str(ROOT/'runtime/diagnostics/critical_trace.c'),
         *[str(tmp/name/'spu_recomp.c')for name in ['legacy','region','leaf','halt']],'-pthread','-lm','-o',str(binary)]
     compiled=subprocess.run(command,capture_output=True,text=True,timeout=90)

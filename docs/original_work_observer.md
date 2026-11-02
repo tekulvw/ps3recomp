@@ -13,6 +13,12 @@ unchanged, and the interpreter/microstep macros compile away without that flag.
 The focused runtime fixture additionally checks the normal interpreter object
 has no undefined reference to `ps3_original_step`.
 
+The SDK compile definition is private to the runtime target. Set it explicitly
+on observed generated sources and the `ppu_loader.cpp` main scaffold, together
+with the diagnostics include directory. Do not propagate diagnostic definitions
+to every unrelated generated PPU translation unit: doing so needlessly changes
+their compile commands and rebuilds the whole title.
+
 The collector uses fixed storage: at most64 sources,32 providers,64 targets and64
 worker generations. Worker counters occupy224 KiB. No worker event allocates,
 locks, writes a file, polls a trigger, or formats output. A private resolver
@@ -74,7 +80,7 @@ fault. The host must also supply real join/quiescence evidence and ensure no new
 or unregistered worker can enter afterward. A sealed snapshot alone does not
 prove that orchestration, and a later observed entry remains an integrity fault.
 
-Read counters only after sealing and reject any report with faults or lost
+Read final counters only after sealing and reject any report with faults or lost
 records. This module does not emit the public Rust `ObserverReceipt` schema.
 That schema conservatively requires all inventoried routes; a source-bound
 non-applicability record or a strict schema extension is required for a route
@@ -82,10 +88,38 @@ that does not exist. Do not convert absent instrumentation into enabled zero
 counters. Actual private range/provider qualification, worker lifecycle hookup
 and authenticated drain remain integration requirements before removal proof.
 
+The native POSIX factory adapter enrolls before actual `pthread_create`,
+registers before the original function, and retires through a pthread cleanup
+handler after normal return or `pthread_exit`. It preserves arguments, result,
+attributes and errno. A genuine creation failure cancels only the never-started
+expected generation; it cannot retire an active worker. At most the fixed worker
+capacity of small setup records can be allocated on the creation path, and each
+is freed at entry or creation failure. Instruction observations still allocate
+nothing. Normal builds macro-expand directly to the original pthread factory.
+
+The actual POSIX PPU factory, SPU group/async factories and POSIX Win32-compatible
+`CreateThread` implementation use that adapter. This includes persistent SPURS
+workers and native guest-callback threads created through the shim. Main guest
+execution has separate fixed host enrollment of ID1/generation1 before
+`ppu_run`; its real body entry registers, and return/unwind retires it. Unexpected
+worker routes still invalidate rather than auto-enroll at an instruction. Native
+Windows thread-factory enrollment remains a separate integration requirement;
+portable collector/CPU execution tests alone do not establish it.
+
+`ps3_original_live_status` and `ps3_original_live_total` are diagnostic-only APIs.
+Their report deliberately has no drained-through field. Per-worker single-writer
+counters use relaxed atomic loads/stores, without a read-modify-write operation
+on each witness. Reading while active is safe but does not form a synchronized
+frame snapshot, prove zero original execution, or establish worker quiescence.
+Persistent workers may remain active when a bounded client test ends; retain
+that incomplete state instead of manufacturing a sealed removal receipt. The
+adapter adds no new guest stop protocol.
+
 Focused commands (no game, device or window):
 
 ```
 python tools/test_original_work_observer.py
+python tools/test_original_work_threads.py
 python tools/test_original_work_routes.py
 python tools/test_ppu_original_work.py
 python tools/test_original_work_routes.py --negative-interpreter-control
