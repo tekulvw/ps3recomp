@@ -1285,7 +1285,14 @@ static int gcm_inline_image_barrier_core(void){
     uint64_t capture=ps3_critical_capture_id(),start=ps3_critical_enabled()?ps3_critical_now_ns():0;
     uint64_t pending=s_reports.count,issued=s_reports.issued,published=s_reports.published;
     int ok=gcm_reports_dependency();
-    if(ok&&rsx_live_draw_enabled())rsx_live_draw_flush();
+    if(ok&&rsx_live_draw_enabled()){
+        /* Recorded LIVE draws own their copied inputs. The dependency above
+         * still completes pending reports; only the redundant whole-work
+         * flush may be omitted, with this opt-in and a valid batch provider.
+         * Keep the old boundary for disabled batching or partial primitives. */
+        uint64_t lifetime=gcm_reports_live()?rsx_live_draw_report_batch_lifetime():0;
+        if(!lifetime||!rsx_live_draw_report_batch_admit(lifetime))rsx_live_draw_flush();
+    }
     if(start){uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};ps3_critical_emit_capture(capture,19,__LINE__,0,w,7);}
     return ok;
 }

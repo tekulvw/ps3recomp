@@ -31,6 +31,14 @@ publication after later commands. Texture staging reserves the whole
 upload before recording copies, and pressure completion must preserve
 the draw state needed after reset.
 
+With both LIVE batching options enabled, the existing
+`PS3RECOMP_GCM_INLINE_NO_GPU_WAIT=1` option also avoids the extra LIVE
+flush before an inline image update when the current renderer lifetime
+admits a completed primitive. Pending reports still complete and publish
+before the CPU write. Earlier completed draws retain their owned constant,
+vertex and index snapshots. Disabled options or unsuccessful admission keep
+the original flush boundary; this does not change texture-cache freshness.
+
 ## Synthetic validation
 
 With `PS3RECOMP_BUILD_TESTS=ON`, Windows CTest includes the CPU-only
@@ -42,6 +50,8 @@ Real D3D12 adapter, upload-pressure and ownership checks are explicit:
 ```text
 python tools/test_live_draw_report_batch.py --runtime-library <path-to-MT-ps3recomp_runtime.lib>
 python tools/test_gcm_live_report_gpu.py --runtime-library <path-to-MT-ps3recomp_runtime.lib>
+python tools/test_gcm_live_inline_gpu.py --runtime-library <path-to-MT-ps3recomp_runtime.lib>
+python tools/test_gcm_live_inline_gpu.py --runtime-library <path-to-MT-ps3recomp_runtime.lib> --fp-mode literal --scenario constants
 ```
 
 Run this from an initialized Windows native compiler environment using the
