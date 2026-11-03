@@ -109,6 +109,20 @@ typedef struct rsx_native_image_match {
     uint32_t width, height, queued_clear_planes, reserved;
 } rsx_native_image_match;
 int rsx_draw_engine_native_image(const rsx_native_image_key*, rsx_native_image_match*);
+/* Serialized consumer-scoped output preparation. Current cache/input backing is
+ * unchanged until accepted external write publication. Scope IDs never reuse.
+ * sampled_planes require existing contents. Missing attachment-only color outputs may
+ * be allocated and actually cleared only with flags=1 (explicit POC policy).
+ * Returned backing key names the real physical allocation; same-grid/pitch
+ * larger reuse follows the ordinary target allocator. Clear commands must pass
+ * a successful original native boundary before native use. End releases all
+ * unpromoted allocations; borrowed HostImages require their own real pins. */
+int rsx_draw_engine_native_images_begin(uint64_t source_observation, uint64_t* scope);
+int rsx_draw_engine_native_prepare_image(uint64_t scope, const rsx_native_image_key*,
+    uint32_t sampled_planes, uint32_t attachment_planes, uint32_t flags,
+    rsx_native_image_key* backing, rsx_native_image_match*);
+int rsx_draw_engine_native_images_end(uint64_t scope);
+
 /* Protected read for a native image provider's validate-planes callback.
  * Caller MUST first validate the retained image identity under its native owner
  * lease, which excludes original decoder mutation. This never acquires an

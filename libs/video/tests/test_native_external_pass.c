@@ -71,5 +71,65 @@ int main(void){
     engine_down();engine_up();p=pass();assert(!rsx_draw_engine_native_publish_external(&p));
     upload_programs(4);fresh_arrays();assert(!rsx_draw_engine_native_abort_external(123,19,41,-7));
     draw_triangle();assert(!stub.n_draw&&status().failure==10&&status().native_ticket==41);
+    engine_down();engine_up();
+    m(M_COLOR_TARGET,CELL_GCM_SURFACE_TARGET_0);m(M_CLEAR_BUFFERS,RSX_CLEAR_COLOR_R);
+    rsx_native_image_key output={.abi_version=1,.struct_size=sizeof(output),.kind=0,
+        .location=0,.offset=0x900000,.pitch=10240,.format=8,.width=2560,.height=720,.aa_grid=0x101};
+    rsx_native_image_key backing={0}; uint64_t scope=0;
+    assert(!rsx_draw_engine_native_images_begin(77,&scope)&&scope);
+    uint64_t overlapping=0;
+    assert(rsx_draw_engine_native_images_begin(78,&overlapping)==-4&&!overlapping);
+    assert(rsx_draw_engine_native_images_end(scope+1)==-3);
+    found=(rsx_native_image_match){.abi_version=1,.struct_size=sizeof(found)};
+    int clears=stub.n_clear_color;
+    assert(rsx_draw_engine_native_prepare_image(scope,&output,1,1,1,&backing,&found)==-1);
+    assert(stub.n_clear_color==clears); // Combined input/output cannot fabricate prior contents.
+    assert(rsx_draw_engine_native_prepare_image(scope,&output,0,1,0,&backing,&found)==-3);
+    assert(rsx_draw_engine_native_prepare_image(scope,&output,0,1,1,&backing,&found)==1);
+    assert(found.native_handle&&found.queued_clear_planes==1&&stub.n_clear_color==clears+1);
+    u32 staged=found.native_handle;
+    assert(!rsx_draw_engine_native_image_clear_planes(staged,1));
+    rsx_native_image_match absent={.abi_version=1,.struct_size=sizeof(absent)};
+    assert(!rsx_draw_engine_native_image(&output,&absent)); // Staging does not change current cache.
+    assert(rsx_draw_engine_native_prepare_image(scope,&output,0,1,1,&backing,&found)==1&&found.native_handle==staged);
+    assert(stub.n_clear_color==clears+1); // Exact repeated lookup uses one real allocation/clear.
+    writes[0]=(rsx_native_external_image_write){.key=backing,.native_handle=staged,.planes=1,
+        .source_clip_width=2560,.source_clip_height=720};
+    p=pass();p.source_observation=77;p.writes=writes;p.write_count=1;
+    assert(!rsx_draw_engine_native_publish_external(&p));
+    assert(!rsx_draw_engine_native_images_end(scope));
+    absent=(rsx_native_image_match){.abi_version=1,.struct_size=sizeof(absent)};
+    assert(rsx_draw_engine_native_image(&output,&absent)==1&&absent.native_handle==staged);
+    assert(!rsx_draw_engine_native_images_begin(78,&scope));
+    rsx_native_image_key small=output;small.width=1280;
+    assert(rsx_draw_engine_native_prepare_image(scope,&small,0,1,0,&backing,&found)==1);
+    assert(backing.width==2560&&found.native_handle==staged); // Same-pitch/grid larger reuse.
+    small.aa_grid=0x102;
+    assert(rsx_draw_engine_native_prepare_image(scope,&small,0,1,0,&backing,&found)==-3);
+    assert(rsx_draw_engine_native_prepare_image(scope,&small,0,1,1,&backing,&found)==1&&found.native_handle!=staged);
+    u32 alternate=found.native_handle;
+    writes[0]=(rsx_native_external_image_write){.key=backing,.native_handle=alternate,.planes=1,
+        .source_clip_width=1280,.source_clip_height=720};
+    writes[1]=(rsx_native_external_image_write){.key=output,.native_handle=staged,.planes=1,
+        .source_clip_width=2560,.source_clip_height=720};
+    p=pass();p.source_observation=78;p.writes=writes;p.write_count=2;
+    assert(!rsx_draw_engine_native_publish_external(&p)); // Last write restores old current layout.
+    assert(!rsx_draw_engine_native_images_end(scope)); // Unwritten output cancelled, old cache remains.
+    assert(rsx_draw_engine_native_images_end(scope)==-3);
+    assert(!rsx_draw_engine_native_images_begin(79,&scope));
+    assert(rsx_draw_engine_native_prepare_image(scope,&small,0,1,1,&backing,&found)==1);
+    writes[0]=(rsx_native_external_image_write){.key=output,.native_handle=staged,.planes=1,
+        .source_clip_width=2560,.source_clip_height=720};
+    writes[1]=(rsx_native_external_image_write){.key=backing,.native_handle=found.native_handle,.planes=1,
+        .source_clip_width=1280,.source_clip_height=720};
+    p.source_observation=79;
+    assert(!rsx_draw_engine_native_publish_external(&p)); // Reverse order promotes the new layout.
+    assert(!rsx_draw_engine_native_images_end(scope));
+    assert(rsx_draw_engine_native_image(&small,&absent)==1&&absent.native_handle==found.native_handle);
+    // Pure cancellation does not publish a third layout.
+    assert(!rsx_draw_engine_native_images_begin(80,&scope));
+    assert(rsx_draw_engine_native_prepare_image(scope,&output,0,1,1,&backing,&found)==1);
+    assert(!rsx_draw_engine_native_images_end(scope));
+    assert(!rsx_draw_engine_native_image(&output,&absent));
     engine_down();free(vm_base);puts("PASS: external native publication validates atomically and requires fresh actual programs/arrays");return 0;
 }

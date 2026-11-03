@@ -221,6 +221,26 @@ static struct {
 
     rsx_fp_constant_block fp_constants;
 } g;
+/* One synchronous FIFO consumer owns a bounded preparation scope. Staged
+ * objects own backend references independently of the live per-EA cache. */
+#define ENG_NATIVE_STAGED 64u
+#define ENG_NATIVE_STAGE_BIT 0x80000000u
+static struct {
+    u64 id, next, source;
+    const void* vm;
+    u32 count, clears;
+    struct { rsx_native_image_key key; eng_surface color; } images[ENG_NATIVE_STAGED];
+} s_native_images;
+static void eng_native_images_release(void)
+{
+    if(g.be)for(u32 i=0;i<s_native_images.count;++i) {
+        if(s_native_images.images[i].color.handle)g.be->color_target_release(g.be->user,s_native_images.images[i].color.handle);
+    }
+    if(s_native_images.clears)fprintf(stderr,"[rsx native POC scope] source=%llu explicit_neutral_color_clears=%u prior_contents_discarded=1\n",
+        (unsigned long long)s_native_images.source,s_native_images.clears);
+    s_native_images.clears=0;
+    s_native_images.id=0;s_native_images.source=0;s_native_images.vm=NULL;s_native_images.count=0;
+}
 static int (*s_report_barrier)(void);
 static void original_rsx_draw_engine_set_report_barrier(int (*barrier)(void)){s_report_barrier=barrier;}
 static int eng_report_barrier(void){return !s_report_barrier||s_report_barrier();}
@@ -4221,6 +4241,7 @@ static void original_rsx_draw_engine_shutdown(void)
 {
     if(!eng_report_barrier())return;
     draw_observer_reset();
+    eng_native_images_release();
     atomic_store(&s_checked_ready, 0);
     for(u32 i=0;i<RSX_BE_MAX_TEXTURES;++i){rsx_picture_release(s_picture_bound[i]);s_picture_bound[i]=0;s_picture_offset_pending[i]=0;}
     if (!g.be) return;
@@ -4620,6 +4641,100 @@ int rsx_draw_engine_native_image(const rsx_native_image_key* key, rsx_native_ima
     if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
     return status;
 }
+static int eng_native_key_valid(const rsx_native_image_key* k)
+{
+    return k && k->abi_version==1 && k->struct_size==sizeof(*k) && !k->reserved[0] && !k->reserved[1] &&
+        k->kind<=1 && k->location<=RSX_LOCATION_MAIN && k->width && k->height && k->pitch &&
+        k->width<=ENG_MAX_SURFACE_DIM && k->height<=ENG_MAX_SURFACE_DIM && k->format<=31 &&
+        (k->kind==0 ? (k->aa_grid==0x101 || k->aa_grid==0x102 || k->aa_grid==0x202) :
+                     (!k->aa_grid && (k->format==1 || k->format==2)));
+}
+int rsx_draw_engine_native_images_begin(uint64_t source, uint64_t* scope)
+{
+    if(!source || !scope)return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
+    int status=0;
+    if(!g.ready)status=-3;
+    else if(atomic_load(&s_checked_failed))status=-6;
+    else if(g.rsx.in_begin_end || s_native_images.id)status=-4;
+    else if(s_native_images.next==UINT64_MAX)status=-5;
+    else {s_native_images.id=++s_native_images.next;s_native_images.source=source;
+        s_native_images.vm=vm_base;*scope=s_native_images.id;}
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+    return status;
+}
+int rsx_draw_engine_native_images_end(uint64_t scope)
+{
+    if(!scope)return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
+    int status=0;
+    if(scope!=s_native_images.id)status=-3;
+    else eng_native_images_release();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+    return status;
+}
+int rsx_draw_engine_native_prepare_image(uint64_t scope,const rsx_native_image_key* k,
+    uint32_t sampled,uint32_t attachment,uint32_t flags,rsx_native_image_key* backing,rsx_native_image_match* out)
+{
+    if(!eng_native_key_valid(k) || !backing || !out || out->abi_version!=1 || out->struct_size!=sizeof(*out) ||
+       !scope || (flags&~1u) || !(sampled|attachment) || ((sampled|attachment)&~(k->kind==0?1u:(k->format==1?2u:6u))) ||
+       (flags && (sampled || !attachment)))return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
+    int status=0;u32 handle=0,planes=0,w=k->width,h=k->height;int cleared=0;
+    if(!g.ready || scope!=s_native_images.id || s_native_images.vm!=vm_base)status=-3;
+    else if(atomic_load(&s_checked_failed))status=-6;
+    else if(g.rsx.in_begin_end)status=-4;
+    /* Current input allocations have priority. Never replace or clear one. */
+    if(!status && k->kind==0)for(u32 i=0;i<g.n_surfaces;++i) {
+        const eng_surface* v=&g.surfaces[i];
+        if(v->handle && v->location==k->location && v->offset==k->offset && v->fmt==eng_surface_format(k->format) &&
+           v->pitch==k->pitch && v->aa_grid==k->aa_grid && v->w>=w && v->h>=h) {
+            handle=v->handle;planes=v->queued_clear_planes;w=v->w;h=v->h;break;}
+    }
+    if(!status && k->kind==1)for(u32 i=0;i<g.n_zdepths;++i) {
+        const eng_zdepth* v=&g.zdepths[i];
+        if(v->handle && v->location==k->location && v->offset==k->offset && v->zfmt==k->format &&
+           v->pitch==k->pitch && v->w>=w && v->h>=h) {
+            handle=v->handle;planes=v->queued_clear_planes;w=v->w;h=v->h;break;}
+    }
+    if(!status && !handle)for(u32 i=0;i<s_native_images.count;++i) {
+        if(memcmp(k,&s_native_images.images[i].key,sizeof(*k)))continue;
+        /* Staging is not prior input content, even after its diagnostic clear. */
+        if(sampled){status=-3;break;}
+        const eng_surface* c=&s_native_images.images[i].color;
+        handle=c->handle;planes=c->queued_clear_planes;break;
+    }
+    if(!status && !handle) {
+        if(sampled || !attachment || !flags || k->kind!=0)status=-3;
+        else if(s_native_images.count==ENG_NATIVE_STAGED)status=-5;
+        else if(k->kind==0 && (!g.be->color_target_create || !g.be->clear_color))status=-3;
+        else {
+            handle=g.be->color_target_create(g.be->user,eng_surface_format(k->format),w,h,NULL,0);
+            if(!handle)status=-5;
+            else {
+                u32 i=s_native_images.count++;
+                s_native_images.images[i].key=*k;
+                const float neutral[4]={0,0,0,0};g.be->clear_color(g.be->user,handle,neutral);planes=1;
+                s_native_images.images[i].color=(eng_surface){.location=k->location,.offset=k->offset,.w=w,.h=h,
+                    .pitch=k->pitch,.aa_grid=k->aa_grid,.fmt=eng_surface_format(k->format),.handle=handle,.queued_clear_planes=planes};
+                cleared=1;++s_native_images.clears;
+                static u32 logs=0;if(PS3_LOG_FIRST(logs,8))fprintf(stderr,
+                    "[rsx native POC clear] scope=%llu source=%llu kind=%u offset=%08X size=%ux%u planes=%u prior_contents_discarded=1\n",
+                    (unsigned long long)scope,(unsigned long long)s_native_images.source,k->kind,k->offset,w,h,planes);
+            }
+        }
+    }
+    if(!status) {
+        *backing=*k;backing->width=w;backing->height=h;
+        *out=(rsx_native_image_match){.abi_version=1,.struct_size=sizeof(*out),.kind=k->kind,
+            .native_handle=handle,.width=w,.height=h,.queued_clear_planes=planes};status=1;
+    }
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,cleared?0:1);
+    return status;
+}
 /* This whitelist is passive source state only. Execution, program and guest
  * vertex/index bindings deliberately require real later original methods. */
 static int eng_external_passive(u32 m)
@@ -4670,6 +4785,11 @@ static int eng_external_image_slot(const rsx_native_external_image_write* w,u32*
         if(v->handle==w->native_handle && v->location==k->location && v->offset==k->offset &&
            v->pitch==k->pitch && v->zfmt==k->format && v->w==k->width && v->h==k->height){*slot=i;++found;}
     }
+    for(u32 i=0;i<s_native_images.count;++i) {
+        const eng_surface* c=&s_native_images.images[i].color;
+        if(k->kind==0 && c->handle==w->native_handle && c->location==k->location && c->offset==k->offset &&
+             c->pitch==k->pitch && c->fmt==eng_surface_format(k->format) && c->w==k->width && c->h==k->height && c->aa_grid==k->aa_grid) {*slot=ENG_NATIVE_STAGE_BIT|i;++found;}
+    }
     return found==1?0:-3;
 }
 int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
@@ -4690,16 +4810,45 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
     else if(g.rsx.in_begin_end)status=-4;
     else if(UINT64_MAX-g.write_serial<p->write_count)status=-5;
     for(u32 i=0;!status&&i<p->write_count;++i)status=eng_external_image_slot(&p->writes[i],&slots[i]);
+    if(!status && s_native_images.id && (s_native_images.source!=p->source_observation || s_native_images.vm!=vm_base))status=-3;
+    /* Prove all promotion capacity before any serial/cache mutation. */
+    u32 new_color=0,new_depth=0;
+    for(u32 i=0;!status&&i<p->write_count;++i) {
+        const rsx_native_image_key* k=&p->writes[i].key;int seen=0;
+        for(u32 j=0;j<i;++j)if(p->writes[j].key.kind==k->kind && p->writes[j].key.location==k->location && p->writes[j].key.offset==k->offset)seen=1;
+        if(seen)continue;
+        if(k->kind==0){for(u32 j=0;j<g.n_surfaces;++j)if(g.surfaces[j].location==k->location&&g.surfaces[j].offset==k->offset)seen=1;
+            if(!seen)++new_color;
+        }else{for(u32 j=0;j<g.n_zdepths;++j)if(g.zdepths[j].location==k->location&&g.zdepths[j].offset==k->offset)seen=1;
+            if(!seen)++new_depth;}
+    }
+    if(!status && (new_color>ENG_MAX_SURFACES-g.n_surfaces || new_depth>ENG_MAX_ZDEPTHS-g.n_zdepths))status=-5;
     if(!status) {
         for(u32 i=0;i<p->write_count;++i) {
             const rsx_native_external_image_write* w=&p->writes[i];
             if(w->key.kind==0) {
-                eng_surface* v=&g.surfaces[slots[i]];v->color_serial=++g.write_serial;v->guest_dirty=1;
+                eng_surface* v=(slots[i]&ENG_NATIVE_STAGE_BIT)?&s_native_images.images[slots[i]&~ENG_NATIVE_STAGE_BIT].color:&g.surfaces[slots[i]];v->color_serial=++g.write_serial;v->guest_dirty=1;
             } else {
                 eng_zdepth* v=&g.zdepths[slots[i]];v->depth_serial=++g.write_serial;v->guest_dirty=1;
                 v->snapshot_valid=0;
                 if(w->planes&2)v->had_write=1;
                 v->used_w=w->source_clip_width;v->used_h=w->source_clip_height;
+            }
+        }
+        /* Only the last written physical layout per guest EA becomes current.
+         * Earlier native/input allocations remain alive through HostImage pins. */
+        for(u32 i=0;i<p->write_count;++i) {
+            const rsx_native_image_key* k=&p->writes[i].key;int later=0;
+            for(u32 j=i+1;j<p->write_count;++j)if(p->writes[j].key.kind==k->kind && p->writes[j].key.location==k->location && p->writes[j].key.offset==k->offset)later=1;
+            if(later || !(slots[i]&ENG_NATIVE_STAGE_BIT))continue;
+            u32 n=slots[i]&~ENG_NATIVE_STAGE_BIT;
+            if(k->kind==0) {
+                u32 j=0;for(;j<g.n_surfaces;++j)if(g.surfaces[j].location==k->location&&g.surfaces[j].offset==k->offset)break;
+                if(j==g.n_surfaces)++g.n_surfaces;
+                else {if(g.surfaces[j].feedback)g.be->texture_release(g.be->user,g.surfaces[j].feedback);
+                    if(g.surfaces[j].handle)g.be->color_target_release(g.be->user,g.surfaces[j].handle);}
+                g.surfaces[j]=s_native_images.images[n].color;s_native_images.images[n].color.handle=0;
+
             }
         }
         for(u32 i=0;i<p->register_count;++i) {
@@ -4766,6 +4915,9 @@ int rsx_draw_engine_native_image_clear_planes(uint32_t handle, uint32_t required
     }
     for (u32 i = 0; i < g.n_zdepths; ++i) if (g.zdepths[i].handle == handle) {
         ++matches; planes = g.zdepths[i].queued_clear_planes;
+    }
+    for(u32 i=0;i<s_native_images.count;++i) {
+        if(s_native_images.images[i].color.handle==handle){++matches;planes=s_native_images.images[i].color.queued_clear_planes;}
     }
     if (matches != 1) return -3;
     return (planes & required) == required ? 0 : -5;
