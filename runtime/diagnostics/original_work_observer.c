@@ -6,16 +6,38 @@
 #if defined(PS3RECOMP_ORIGINAL_OBSERVER) && PS3RECOMP_ORIGINAL_OBSERVER
 enum { UNARMED, ARMING, ARMED, DRAINING, SEALED };
 enum { EXPECTED = 1, ACTIVE, RETIRED, CANCELLED };
+/* An immutable identity outlives its reusable counter slot. Archive fields are
+ * published by RETIRED; UINT32_MAX means evidence remains pinned in the slot.
+ */
 typedef struct worker_record {
-  uint64_t id, generation, transaction;
+  uint64_t id, generation;
   _Atomic unsigned state;
-  _Atomic uint64_t count[PS3_ORIGINAL_MAX_TARGETS][PS3_ORIGINAL_ROUTES];
+  unsigned slot, archive_offset, archive_count;
 } worker_record;
+typedef struct active_record {
+  _Atomic unsigned lease;
+  uint64_t transaction;
+  _Atomic uint64_t count[PS3_ORIGINAL_MAX_TARGETS][PS3_ORIGINAL_ROUTES];
+} active_record;
+typedef struct archived_count {
+  uint64_t value;
+  unsigned cell, reserved;
+} archived_count;
+enum { HISTORY_BUCKETS = PS3_ORIGINAL_MAX_LIFETIMES * 2u };
+_Static_assert(sizeof(worker_record) == 32, "compact lifetime storage");
+_Static_assert(sizeof(archived_count) == 16, "sparse counter storage");
 static ps3_original_config config;
 static ps3_original_source sources[PS3_ORIGINAL_MAX_SOURCES];
 static ps3_original_provider providers[PS3_ORIGINAL_MAX_PROVIDERS];
 static ps3_original_target targets[PS3_ORIGINAL_MAX_TARGETS];
-static worker_record workers[PS3_ORIGINAL_MAX_WORKERS];
+static worker_record workers[PS3_ORIGINAL_MAX_LIFETIMES];
+static _Atomic unsigned history_index[HISTORY_BUCKETS];
+static active_record active[PS3_ORIGINAL_MAX_WORKERS];
+static archived_count archive[PS3_ORIGINAL_MAX_ARCHIVED_COUNTS];
+static _Atomic unsigned archived_used;
+static _Atomic uint64_t totals[PS3_ORIGINAL_MAX_TARGETS][PS3_ORIGINAL_ROUTES];
+static _Atomic unsigned total_overflow[PS3_ORIGINAL_MAX_TARGETS]
+                                      [PS3_ORIGINAL_ROUTES];
 static _Atomic unsigned phase, faults, workers_seen, worker_count;
 static _Atomic uint64_t lost_records;
 static _Atomic uint64_t next_native_worker = 1;
@@ -45,7 +67,32 @@ static int provider_index(uint64_t id) {
       return (int)i;
   return -1;
 }
-static worker_record *active_worker(void) {
+/* Only enrollment mutates this append-only hash table, under control. Bucket
+ * release publishes immutable identity fields to register/cancel/query. */
+static unsigned history_bucket(uint64_t id, uint64_t generation) {
+  uint64_t value = id ^ (generation * UINT64_C(0x9e3779b97f4a7c15));
+  value ^= value >> 30;
+  value *= UINT64_C(0xbf58476d1ce4e5b9);
+  value ^= value >> 27;
+  value *= UINT64_C(0x94d049bb133111eb);
+  value ^= value >> 31;
+  return (unsigned)value & (HISTORY_BUCKETS - 1u);
+}
+static int find_worker(uint64_t id, uint64_t generation) {
+  unsigned bucket = history_bucket(id, generation);
+  for (unsigned n = 0; n < HISTORY_BUCKETS; ++n) {
+    unsigned entry =
+        atomic_load_explicit(&history_index[bucket], memory_order_acquire);
+    if (!entry)
+      return -1;
+    if (workers[entry - 1].id == id &&
+        workers[entry - 1].generation == generation)
+      return (int)(entry - 1);
+    bucket = (bucket + 1u) & (HISTORY_BUCKETS - 1u);
+  }
+  return -1;
+}
+static active_record *active_worker(void) {
   if (resolving) {
     fault(PS3_ORIGINAL_BAD_SOURCE);
     return NULL;
@@ -55,11 +102,13 @@ static worker_record *active_worker(void) {
     return NULL;
   }
   worker_record *w = &workers[current_worker];
-  if (atomic_load_explicit(&w->state, memory_order_acquire) != ACTIVE) {
+  if (atomic_load_explicit(&w->state, memory_order_acquire) != ACTIVE ||
+      atomic_load_explicit(&active[w->slot].lease, memory_order_acquire) !=
+          (unsigned)current_worker + 1u) {
     fault(PS3_ORIGINAL_LATE_WORK);
     return NULL;
   }
-  return w;
+  return &active[w->slot];
 }
 int ps3_original_arm(const ps3_original_config *c) {
   if (!c || c->struct_size != sizeof(*c) || c->abi_version != 1 ||
@@ -137,15 +186,29 @@ int ps3_original_enroll(uint64_t id, uint64_t generation) {
     return -1;
   int result = -1;
   if (atomic_load_explicit(&phase, memory_order_acquire) == ARMED) {
-    unsigned count = atomic_load_explicit(&worker_count, memory_order_relaxed),
-             i;
-    for (i = 0; i < count; ++i)
-      if (workers[i].id == id && workers[i].generation == generation)
+    unsigned count = atomic_load_explicit(&worker_count, memory_order_relaxed);
+    unsigned slot;
+    for (slot = 0; slot < PS3_ORIGINAL_MAX_WORKERS; ++slot)
+      if (!atomic_load_explicit(&active[slot].lease, memory_order_acquire))
         break;
-    if (i == count && count < PS3_ORIGINAL_MAX_WORKERS) {
+    if (find_worker(id, generation) < 0 && count < PS3_ORIGINAL_MAX_LIFETIMES &&
+        slot < PS3_ORIGINAL_MAX_WORKERS) {
       workers[count].id = id;
       workers[count].generation = generation;
+      workers[count].slot = slot;
+      active[slot].transaction = 0;
+      for (unsigned t = 0; t < config.target_count; ++t)
+        for (unsigned r = 0; r < PS3_ORIGINAL_ROUTES; ++r)
+          atomic_store_explicit(&active[slot].count[t][r], 0,
+                                memory_order_relaxed);
+      atomic_store_explicit(&active[slot].lease, count + 1u,
+                            memory_order_release);
       atomic_store_explicit(&workers[count].state, EXPECTED,
+                            memory_order_release);
+      unsigned bucket = history_bucket(id, generation);
+      while (atomic_load_explicit(&history_index[bucket], memory_order_relaxed))
+        bucket = (bucket + 1u) & (HISTORY_BUCKETS - 1u);
+      atomic_store_explicit(&history_index[bucket], count + 1u,
                             memory_order_release);
       atomic_store_explicit(&worker_count, count + 1, memory_order_release);
       result = 0;
@@ -163,32 +226,62 @@ int ps3_original_worker_register(uint64_t id, uint64_t generation) {
     fault(state < ARMED ? PS3_ORIGINAL_LATE_ARM : PS3_ORIGINAL_MISSING_WORKER);
     return -1;
   }
-  unsigned count = atomic_load_explicit(&worker_count, memory_order_acquire);
-  for (unsigned i = 0; i < count; ++i)
-    if (workers[i].id == id && workers[i].generation == generation) {
-      unsigned expected = EXPECTED;
-      if (atomic_compare_exchange_strong_explicit(&workers[i].state, &expected,
-                                                  ACTIVE, memory_order_acq_rel,
-                                                  memory_order_acquire)) {
-        current_worker = (int)i;
-        return 0;
-      }
-      break;
+  int index = find_worker(id, generation);
+  if (index >= 0) {
+    unsigned expected = EXPECTED;
+    if (atomic_compare_exchange_strong_explicit(
+            &workers[index].state, &expected, ACTIVE, memory_order_acq_rel,
+            memory_order_acquire)) {
+      current_worker = index;
+      return 0;
     }
+  }
   fault(PS3_ORIGINAL_MISSING_WORKER);
   return -1;
 }
 int ps3_original_worker_retire(void) {
-  worker_record *w = active_worker();
+  active_record *w = active_worker();
   if (!w)
     return -1;
   if (w->transaction)
     fault(PS3_ORIGINAL_BAD_SCOPE);
-  atomic_store_explicit(&w->state, RETIRED, memory_order_release);
+  worker_record *history = &workers[current_worker];
+  unsigned needed = 0;
+  for (unsigned t = 0; t < config.target_count; ++t)
+    for (unsigned r = 0; r < PS3_ORIGINAL_ROUTES; ++r)
+      needed +=
+          atomic_load_explicit(&w->count[t][r], memory_order_relaxed) != 0;
+  unsigned offset = atomic_load_explicit(&archived_used, memory_order_relaxed);
+  for (;;) {
+    if (needed > PS3_ORIGINAL_MAX_ARCHIVED_COUNTS - offset) {
+      /* No evidence is discarded: keep this counter lease permanently pinned.
+       * A faulted sealed report can still query every recorded witness. */
+      fault(PS3_ORIGINAL_OVERFLOW);
+      history->archive_count = UINT32_MAX;
+      atomic_store_explicit(&history->state, RETIRED, memory_order_release);
+      return 0;
+    }
+    if (atomic_compare_exchange_weak_explicit(
+            &archived_used, &offset, offset + needed, memory_order_relaxed,
+            memory_order_relaxed))
+      break;
+  }
+  history->archive_offset = offset;
+  history->archive_count = needed;
+  for (unsigned t = 0; t < config.target_count; ++t)
+    for (unsigned r = 0; r < PS3_ORIGINAL_ROUTES; ++r) {
+      uint64_t value =
+          atomic_load_explicit(&w->count[t][r], memory_order_relaxed);
+      if (value)
+        archive[offset++] =
+            (archived_count){value, t * PS3_ORIGINAL_ROUTES + r, 0};
+    }
+  atomic_store_explicit(&history->state, RETIRED, memory_order_release);
+  atomic_store_explicit(&w->lease, 0, memory_order_release);
   return 0;
 }
 int ps3_original_transaction_begin(uint64_t id) {
-  worker_record *w = active_worker();
+  active_record *w = active_worker();
   if (!w)
     return -1;
   if (!id || w->transaction) {
@@ -199,7 +292,7 @@ int ps3_original_transaction_begin(uint64_t id) {
   return 0;
 }
 int ps3_original_transaction_end(uint64_t id) {
-  worker_record *w = active_worker();
+  active_record *w = active_worker();
   if (!w)
     return -1;
   if (!id || w->transaction != id) {
@@ -209,12 +302,29 @@ int ps3_original_transaction_end(uint64_t id) {
   w->transaction = 0;
   return 0;
 }
-static void increment(_Atomic uint64_t *value) {
+static int increment(_Atomic uint64_t *value) {
   uint64_t old = atomic_load_explicit(value, memory_order_relaxed);
-  if (old == config.counter_limit)
+  if (old == config.counter_limit) {
     fault(PS3_ORIGINAL_OVERFLOW);
-  else
-    atomic_store_explicit(value, old + 1, memory_order_relaxed);
+    return 0;
+  }
+  atomic_store_explicit(value, old + 1, memory_order_relaxed);
+  return 1;
+}
+static void increment_total(unsigned target, unsigned route) {
+  _Atomic uint64_t *value = &totals[target][route];
+  uint64_t old = atomic_load_explicit(value, memory_order_relaxed);
+  for (;;) {
+    if (old == UINT64_MAX) {
+      atomic_store_explicit(&total_overflow[target][route], 1,
+                            memory_order_release);
+      fault(PS3_ORIGINAL_OVERFLOW);
+      return;
+    }
+    if (atomic_compare_exchange_weak_explicit(
+            value, &old, old + 1, memory_order_relaxed, memory_order_relaxed))
+      return;
+  }
 }
 void ps3_original_step(const void *context, uint64_t pc, unsigned route,
                        const char *provider_name) {
@@ -228,7 +338,7 @@ void ps3_original_step(const void *context, uint64_t pc, unsigned route,
     fault(PS3_ORIGINAL_LATE_WORK);
     return;
   }
-  worker_record *w = active_worker();
+  active_record *w = active_worker();
   if (!w)
     return;
   if (route >= PS3_ORIGINAL_OUTSIDE) {
@@ -263,9 +373,10 @@ void ps3_original_step(const void *context, uint64_t pc, unsigned route,
         fault(PS3_ORIGINAL_BAD_ROUTE);
         continue;
       }
-      increment(&w->count[i][route]);
-      if (!w->transaction)
-        increment(&w->count[i][PS3_ORIGINAL_OUTSIDE]);
+      if (increment(&w->count[i][route]))
+        increment_total(i, route);
+      if (!w->transaction && increment(&w->count[i][PS3_ORIGINAL_OUTSIDE]))
+        increment_total(i, PS3_ORIGINAL_OUTSIDE);
     }
 }
 void ps3_original_lost(uint64_t count) {
@@ -331,15 +442,33 @@ int ps3_original_count(uint64_t id, uint64_t generation, uint64_t target,
   if (!out || route >= PS3_ORIGINAL_ROUTES ||
       atomic_load_explicit(&phase, memory_order_acquire) != SEALED)
     return -1;
-  unsigned count = atomic_load_explicit(&worker_count, memory_order_acquire);
-  for (unsigned i = 0; i < count; ++i)
-    if (workers[i].id == id && workers[i].generation == generation) {
-      for (unsigned j = 0; j < config.target_count; ++j)
-        if (targets[j].id == target) {
-          *out = atomic_load_explicit(&workers[i].count[j][route],
-                                      memory_order_relaxed);
-          return 0;
+  int index = find_worker(id, generation);
+  if (index < 0)
+    return -1;
+  worker_record *w = &workers[index];
+  unsigned state = atomic_load_explicit(&w->state, memory_order_acquire);
+  if (state != RETIRED && state != CANCELLED && state != EXPECTED)
+    return -1;
+  for (unsigned j = 0; j < config.target_count; ++j)
+    if (targets[j].id == target) {
+      if (state == EXPECTED || w->archive_count == UINT32_MAX) {
+        if (atomic_load_explicit(&active[w->slot].lease,
+                                 memory_order_acquire) != (unsigned)index + 1u)
+          return -1;
+        *out = atomic_load_explicit(&active[w->slot].count[j][route],
+                                    memory_order_relaxed);
+        return 0;
+      }
+      unsigned cell = j * PS3_ORIGINAL_ROUTES + route;
+      *out = 0;
+      for (unsigned n = 0; n < w->archive_count; ++n) {
+        const archived_count *entry = &archive[w->archive_offset + n];
+        if (entry->cell == cell) {
+          *out = entry->value;
+          break;
         }
+      }
+      return 0;
     }
   return -1;
 }
@@ -364,20 +493,12 @@ int ps3_original_live_total(uint64_t target, unsigned route, uint64_t *out) {
     return -1;
   for (unsigned t = 0; t < config.target_count; ++t)
     if (targets[t].id == target) {
-      uint64_t total = 0;
-      unsigned count =
-          atomic_load_explicit(&worker_count, memory_order_acquire);
-      for (unsigned i = 0; i < count; ++i) {
-        uint64_t n = atomic_load_explicit(&workers[i].count[t][route],
-                                          memory_order_relaxed);
-        if (n > UINT64_MAX - total) {
-          fault(PS3_ORIGINAL_OVERFLOW);
-          *out = UINT64_MAX;
-          return -1;
-        }
-        total += n;
+      *out = atomic_load_explicit(&totals[t][route], memory_order_relaxed);
+      if (atomic_load_explicit(&total_overflow[t][route],
+                               memory_order_acquire)) {
+        *out = UINT64_MAX;
+        return -1;
       }
-      *out = total;
       return 0;
     }
   return -1;
@@ -417,16 +538,17 @@ int ps3_original_worker_prepare(uint64_t *out) {
   return 1;
 }
 int ps3_original_worker_cancel(uint64_t id) {
-  unsigned count = atomic_load_explicit(&worker_count, memory_order_acquire);
-  for (unsigned i = 0; i < count; ++i)
-    if (workers[i].id == id && workers[i].generation == 1) {
-      unsigned expected = EXPECTED;
-      if (atomic_compare_exchange_strong_explicit(
-              &workers[i].state, &expected, CANCELLED, memory_order_release,
-              memory_order_relaxed))
-        return 0;
-      break;
+  int index = find_worker(id, 1);
+  if (index >= 0) {
+    unsigned expected = EXPECTED;
+    if (atomic_compare_exchange_strong_explicit(
+            &workers[index].state, &expected, CANCELLED, memory_order_acq_rel,
+            memory_order_relaxed)) {
+      atomic_store_explicit(&active[workers[index].slot].lease, 0,
+                            memory_order_release);
+      return 0;
     }
+  }
   fault(PS3_ORIGINAL_MISSING_WORKER);
   return -1;
 }

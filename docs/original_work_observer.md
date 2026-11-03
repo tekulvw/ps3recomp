@@ -19,12 +19,26 @@ with the diagnostics include directory. Do not propagate diagnostic definitions
 to every unrelated generated PPU translation unit: doing so needlessly changes
 their compile commands and rebuilds the whole title.
 
-The collector uses fixed storage: at most64 sources,32 providers,64 targets and64
-worker generations. Worker counters occupy224 KiB. No worker event allocates,
-locks, writes a file, polls a trigger, or formats output. A private resolver
-callback must obey the same bounded/no-I/O contract. Diagnostic instruction
-coverage can be expensive; it is not a performance benchmark or a normal
-rendering default.
+The collector bounds source tables to64 sources,32 providers and64 targets.
+Up to1024 EXPECTED/ACTIVE workers hold dense counter slots concurrently.
+Immutable lifetime identities are retained separately: up to1,048,576 records
+(32 MiB), with an8 MiB append-only hash index. Retirement archives only nonzero
+counter cells into a16 MiB budget, then releases the dense slot without recycling
+its lifetime identity. Active counters occupy about3.5 MiB; all storage together
+is bounded to about59.52 MiB, with cold static pages touched as needed.
+
+Sealed per-worker queries remain exact after slot reuse. Retired TLS retains its
+old lifetime identity and cannot write into another worker's counter lease.
+History or concurrent-slot exhaustion sets MISSING_WORKER. Archive exhaustion
+sets OVERFLOW and pins the remaining dense evidence instead of discarding it.
+These finite budgets require headroom checks for the declared live workload;
+they are not an unlimited-duration guarantee.
+
+No execution witness allocates, takes a lock, writes a file, polls a trigger or
+formats output. Its private resolver must obey the same bounded/no-I/O contract.
+Enrollment and retirement maintain the bounded history and sparse archive.
+Diagnostic instruction coverage can be expensive; it is not a performance
+benchmark or a normal rendering default.
 
 Before starting workers, the private controller constructs a source census and
 calls `ps3_original_arm`. The configuration includes an opaque manifest SHA256,
@@ -122,9 +136,12 @@ client's complete thread lifecycle.
 
 `ps3_original_live_status` and `ps3_original_live_total` are diagnostic-only APIs.
 Their report deliberately has no drained-through field. Per-worker single-writer
-counters use relaxed atomic loads/stores, without a read-modify-write operation
-on each witness. Reading while active is safe but does not form a synchronized
-frame snapshot, prove zero original execution, or establish worker quiescence.
+counters use relaxed atomic loads/stores. Each accepted witness also updates a
+checked aggregate using atomic compare-and-exchange; live-total queries therefore
+do not scan lifetime history. Aggregate overflow remains a sticky fault and
+returns saturated evidence with an error. Reading while active is safe but does
+not form a synchronized frame snapshot, prove zero original execution or
+establish worker quiescence.
 Persistent workers may remain active when a bounded client test ends; retain
 that incomplete state instead of manufacturing a sealed removal receipt. The
 adapter adds no new guest stop protocol.

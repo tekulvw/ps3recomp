@@ -7,11 +7,14 @@ extern "C" {
 #define PS3_ORIGINAL_MAX_SOURCES 64u
 #define PS3_ORIGINAL_MAX_PROVIDERS 32u
 #define PS3_ORIGINAL_MAX_TARGETS 64u
-/* Lifetime identities, including retired/cancelled workers. Never recycle a
- * record: sealed per-worker history and late-TLS rejection depend on it.
- * 1024 records bound counter storage to about 3.5 MiB. Exhaustion remains a
- * MISSING_WORKER fault; real-match acceptance must verify headroom. */
+/* Concurrent EXPECTED/ACTIVE workers, including pinned evidence on archive
+ * exhaustion. Only counter storage is reused; lifetime identities never are.
+ * Storage budgets are independent: 32 MiB compact history, 8 MiB hash index,
+ * 16 MiB nonzero archive and about 3.5 MiB active dense counters. Exhaustion
+ * remains a sticky fault; real-match acceptance must verify headroom. */
 #define PS3_ORIGINAL_MAX_WORKERS 1024u
+#define PS3_ORIGINAL_MAX_LIFETIMES 1048576u
+#define PS3_ORIGINAL_MAX_ARCHIVED_COUNTS 1048576u
 #define PS3_ORIGINAL_ROUTES 7u
 enum ps3_original_route {
   PS3_ORIGINAL_PPU,
