@@ -33,6 +33,7 @@ WEAK void rsx_live_draw_method_at(u32 method,u32 arg,u32 data_ea){(void)method;(
 WEAK void rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea){(void)method;(void)arg;(void)data_ea;}
 WEAK void rsx_draw_engine_mark_guest_dirty(u32 ea,u32 bytes){(void)ea;(void)bytes;}
 WEAK int rsx_draw_engine_flush_checked(void){return 0;}
+WEAK int rsx_draw_engine_checked_ready(void){return 0;}
 WEAK uint64_t ps3_critical_capture_id(void){return 0;}
 WEAK int ps3_critical_enabled(void){return 0;}
 WEAK uint64_t ps3_critical_now_ns(void){return 0;}

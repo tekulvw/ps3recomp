@@ -398,6 +398,16 @@ static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
 static _Thread_local unsigned s_consumer_depth;
 static int s_deferred_reports;
 static int s_live_report_batch;
+/* PS3RECOMP_RSX_EARLY_LABEL_RELEASE=1 applies label releases and the SDK's
+ * synthesized reports at their FIFO position instead of at GPU completion.
+ * PS3RECOMP_RSX_EARLY_FIFO_SYNC=1 (with it) also stops the FIFO-ordered
+ * SET_REFERENCE, NV406E ACQUIRE and NV0039 copy from waiting for the GPU.
+ * Both rest on two renderer facts (docs/RSX_EARLY_LABEL_RELEASE.md): every
+ * GPU input is copied out of guest memory when it is recorded, and GPU
+ * results reach guest memory only through explicit synchronous readbacks at
+ * their own stream position. Draw-engine deferred path only; default off. */
+static int s_early_release;
+static int s_early_fifo_sync;
 /* Every queued LIVE record belongs to this one physical renderer lifetime.
  * Cleared only after the entire consumer-owned queue has published. */
 static uint64_t s_report_live_lifetime;
@@ -452,6 +462,17 @@ static void gcm_deferred_initialize(void) {
     { const char *b=getenv("PS3RECOMP_RSX_DEFERRED_REPORT_BATCH");
       const long n=b?strtol(b,NULL,0):0;
       if(n>0&&n<=(long)RSX_DEFERRED_REPORT_CAPACITY)s_reports.batch=(uint32_t)n; }
+    { const char *a=getenv("PS3RECOMP_RSX_EARLY_LABEL_RELEASE"),*y=getenv("PS3RECOMP_RSX_EARLY_FIFO_SYNC");
+      const int want=a&&!strcmp(a,"1"),want_sync=y&&!strcmp(y,"1");
+      if((want||want_sync)&&(!s_deferred_reports||s_live_report_batch))
+          fprintf(stderr,"[early release] refused: requires PS3RECOMP_RSX_DEFERRED_REPORTS=1 on the draw-engine path without PS3RECOMP_GCM_LIVE_REPORT_BATCH\n");
+      else if(want_sync&&!want)
+          fprintf(stderr,"[early release] refused: PS3RECOMP_RSX_EARLY_FIFO_SYNC requires PS3RECOMP_RSX_EARLY_LABEL_RELEASE=1\n");
+      else{s_early_release=want;s_early_fifo_sync=want&&want_sync;}
+      s_reports.early_mode=(uint32_t)s_early_release;
+      if(s_early_release)
+          fprintf(stderr,"[early release] labels and synthesized reports publish at FIFO position%s; completion still verified\n",
+              s_early_fifo_sync?"; SET_REFERENCE/ACQUIRE/NV0039 do not wait for the GPU":""); }
     if (s_deferred_reports) {
         rsx_draw_engine_set_report_barrier(gcm_reports_dependency);
         if(s_live_report_batch){
@@ -1418,6 +1439,8 @@ static void gph_label_published(const rsx_deferred_report *r){
 }
 static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     (void)user;u32 ea;
+    /* A completion receipt carries no guest effect of its own. */
+    if(r->operation==2)return r->vm==(uintptr_t)vm_base;
     if(r->operation&&s_gph_on>0)gph_label_published(r);
     if(r->operation){
         u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
@@ -1499,6 +1522,7 @@ static int gcm_reports_progress(int wait,int issue){
     int ok=rsx_reports_progress(&s_reports,&s_report_ops,wait,issue);
     if(ok&&!s_reports.count)s_report_live_lifetime=0;
     if(!ok&&!was_failed)fprintf(stderr,"[deferred reports] FAILED; publication stopped pending=%u issued=%llu published=%llu\n",s_reports.count,(unsigned long long)s_reports.issued,(unsigned long long)s_reports.published);
+    if(s_reports.failed&&s_early_fifo_sync&&gcm_checked_ref_mode())gcm_checked_ref_fail("early-release-completion",s_fifo_getoff);
     return ok;
 }
 static int gcm_reports_can_defer(void){
@@ -1574,8 +1598,37 @@ static int gcm_inline_image_barrier_core(void){
     if(start){uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};ps3_critical_emit_capture(capture,19,__LINE__,0,w,7);}
     return ok;
 }
+/* Early release eligibility. A label's value comes from the command stream.
+ * A diagnostic ring-progress target keeps completion-gated publication, since
+ * its observer treats publication as a GPU receipt; later records then queue
+ * behind it in order. */
+static int gcm_early_label(u32 ea){
+    if(!s_early_release)return 0;
+    const u32 target=ring_target();
+    if(target&&target==ea){
+        static int noted;if(!noted++)fprintf(stderr,"[early release] observed progress word %08X stays completion-gated\n",ea);
+        return 0;
+    }
+    return 1;
+}
+/* gcm_report_publish writes a fixed value per type and a host timestamp: no
+ * report type carries a measured GPU result. A type that someday does must
+ * return 0 here so it publishes only after completion. */
+static int gcm_report_value_synthesized(u32 argument){(void)argument;return 1;}
+static int gcm_early_report(u32 argument){return s_early_release&&gcm_report_value_synthesized(argument);}
+/* Early SET_REFERENCE: commit the work recorded so far without waiting, and
+ * queue a receipt so its genuine completion is still verified. A later
+ * failure freezes certification (gcm_reports_progress). */
+static int gcm_early_reference_receipt(void){
+    extern u32 g_rsx_last_reference;
+    if(s_reports.failed||!gcm_checked_backend_ready())return 0;
+    rsx_deferred_report r={0};r.operation=2;r.context=0x50u;r.argument=g_rsx_last_reference;r.vm=(uintptr_t)vm_base;
+    r.capture=ps3_critical_capture_id();
+    return gcm_reports_admit()&&rsx_reports_enqueue_early(&s_reports,&s_report_ops,r)&&rsx_reports_issue(&s_reports,&s_report_ops);
+}
 /* Label writes retain the existing value/byte-order semantics, but release
- * guest reuse only after the same genuine ordered GPU completion as reports. */
+ * guest reuse only after the same genuine ordered GPU completion as reports,
+ * unless early release applies them at their stream position. */
 static int gcm_defer_label_get(u32 ea,u32 value,u32 method,u32 fifo_ea,u32 get_before_publish){
     if(!gcm_reports_admit())return 0;
     ring_note(RSX_RING_DECODE,ea,value,0,((uint64_t)method<<32)|fifo_ea);
@@ -1589,7 +1642,7 @@ static int gcm_defer_label_get(u32 ea,u32 value,u32 method,u32 fifo_ea,u32 get_b
      * an NV406E RELEASE when a guest observes its label. */
     if(get_before_publish)vm_write32(GCM_CONTROL_GUEST_ADDR+4,get_before_publish);
     unsigned failed=s_reports.failed;
-    int ok=rsx_reports_enqueue(&s_reports,&s_report_ops,r);
+    int ok=gcm_early_label(ea)?rsx_reports_enqueue_early(&s_reports,&s_report_ops,r):rsx_reports_enqueue(&s_reports,&s_report_ops,r);
     ring_note(RSX_RING_ENQUEUE,ea,value,0,((uint64_t)(ok!=0)<<63)|s_reports.count);
     if(!ok&&!failed)fprintf(stderr,"[deferred reports] label enqueue FAILED; publication stopped\n");
     return ok;
@@ -1624,7 +1677,8 @@ static void gcm_get_report(u32 argument){
     if(gcm_reports_can_defer()){
         if(!gcm_reports_admit())goto invalid;
         unsigned failed=s_reports.failed;
-        if(!rsx_reports_enqueue(&s_reports,&s_report_ops,r)&&!failed)
+        const int ok=gcm_early_report(argument)?rsx_reports_enqueue_early(&s_reports,&s_report_ops,r):rsx_reports_enqueue(&s_reports,&s_report_ops,r);
+        if(!ok&&!failed)
             fprintf(stderr,"[deferred reports] enqueue FAILED; publication stopped pending=%u\n",s_reports.count);
         return;
     }
@@ -2290,7 +2344,10 @@ static void nv0039_copy(const u32 v[8])
     /* Order prior draws before the guest resource mutation. This does not
      * materialize GPU-only render targets in guest memory. */
     if(gcm_reports_live()&&!gcm_reports_dependency()){free(snapshot);return;}
-    if(rsx_draw_engine_enabled()) rsx_draw_engine_flush();
+    /* Early FIFO sync: recorded draws already own copies of their inputs, so
+     * only unapplied reports must precede the copy. */
+    if(s_early_fifo_sync){if(!gcm_reports_dependency()){free(snapshot);return;}}
+    else if(rsx_draw_engine_enabled()) rsx_draw_engine_flush();
     if(rsx_live_draw_enabled()) rsx_live_draw_flush();
     for(u32 row=0;row<rows;row++) {
         int64_t off=(int64_t)v[0]+(int64_t)in_pitch*row;
@@ -3295,7 +3352,9 @@ static void gcm_rsx_process_fifo_pass(void)
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
                     { static int sn = 0, recdbg = -1; if (gcm_env_flag(&recdbg, "GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
-                    if(m==0x68u&&!gcm_reports_sync_barrier()){sem_blocked=1;break;}
+                    /* Early FIFO sync: every release an ACQUIRE can depend on
+                     * has already been applied, so no GPU wait is needed. */
+                    if(m==0x68u&&!(s_early_fifo_sync?gcm_reports_dependency():gcm_reports_sync_barrier())){sem_blocked=1;break;}
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
                     if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
@@ -3523,7 +3582,7 @@ static void gcm_rsx_process_fifo_pass(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    if(m==0x50u && !(gcm_checked_ref_mode()?gcm_reports_dependency():gcm_reports_sync_barrier()))return;
+                    if(m==0x50u && !((s_early_fifo_sync||gcm_checked_ref_mode())?gcm_reports_dependency():gcm_reports_sync_barrier()))return;
                     if(m==0x1d6cu)s_backend_label_offset=vm_read32(dea);
                     if(m==0x1a4u)s_backend_label_dma=vm_read32(dea);
                     if((m==0x1d70u||m==0x1d74u)&&gcm_reports_can_defer()){
@@ -3549,8 +3608,8 @@ static void gcm_rsx_process_fifo_pass(void)
                     if (m == 0x50) {
                         if(gcm_checked_ref_mode() && (count!=1 || method!=0x50)){gcm_checked_ref_fail("malformed-reference",s_fifo_getoff);continue;}
                         if (gcm_checked_ref_mode() &&
-                            !gcm_checked_backend_flush())
-                            gcm_checked_ref_fail("backend-completion", s_fifo_getoff);
+                            !(s_early_fifo_sync ? gcm_early_reference_receipt() : gcm_checked_backend_flush()))
+                            gcm_checked_ref_fail(s_early_fifo_sync ? "early-reference-receipt" : "backend-completion", s_fifo_getoff);
                         else gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
                     }
                     if (m == 0x1A8u) {
