@@ -228,7 +228,7 @@ static struct {
 static struct {
     u64 id, next, source;
     const void* vm;
-    u32 count, clears;
+    u32 count, clears, published;
     struct { rsx_native_image_key key; eng_surface color; } images[ENG_NATIVE_STAGED];
 } s_native_images;
 static void eng_native_images_release(void)
@@ -238,7 +238,7 @@ static void eng_native_images_release(void)
     }
     if(s_native_images.clears)fprintf(stderr,"[rsx native POC scope] source=%llu explicit_neutral_color_clears=%u prior_contents_discarded=1\n",
         (unsigned long long)s_native_images.source,s_native_images.clears);
-    s_native_images.clears=0;
+    s_native_images.clears=0;s_native_images.published=0;
     s_native_images.id=0;s_native_images.source=0;s_native_images.vm=NULL;s_native_images.count=0;
 }
 static int (*s_report_barrier)(void);
@@ -4684,7 +4684,7 @@ int rsx_draw_engine_native_prepare_image(uint64_t scope,const rsx_native_image_k
     const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
     if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
     int status=0;u32 handle=0,planes=0,w=k->width,h=k->height;int cleared=0;
-    if(!g.ready || scope!=s_native_images.id || s_native_images.vm!=vm_base)status=-3;
+    if(!g.ready || scope!=s_native_images.id || s_native_images.vm!=vm_base || s_native_images.published)status=-3;
     else if(atomic_load(&s_checked_failed))status=-6;
     else if(g.rsx.in_begin_end)status=-4;
     /* Current input allocations have priority. Never replace or clear one. */
@@ -4792,6 +4792,11 @@ static int eng_external_image_slot(const rsx_native_external_image_write* w,u32*
     }
     return found==1?0:-3;
 }
+static const rsx_native_external_image_write* eng_external_ordered_write(
+    const rsx_native_external_pass* p,const rsx_native_external_image_write* clears,u32 clear_count,u32 i)
+{
+    return i<clear_count?&clears[i]:&p->writes[i-clear_count];
+}
 int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
 {
     if(!p || p->abi_version!=1 || p->struct_size!=sizeof(*p) || !p->source_observation ||
@@ -4804,18 +4809,31 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
     for(u32 i=0;i<p->current_attribute_count;++i) if(p->current_attributes[i].index>=RSX_DSP_NUM_VERTEX_ATTR)return -1;
     const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
     if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
-    int status=0;u32 slots[4096];
+    int status=0;u32 slots[4096+ENG_NATIVE_STAGED];
+    rsx_native_external_image_write clears[ENG_NATIVE_STAGED];u32 clear_count=0;
     if(!g.ready)status=-3;
     else if(atomic_load(&s_checked_failed))status=-6;
     else if(g.rsx.in_begin_end)status=-4;
-    else if(UINT64_MAX-g.write_serial<p->write_count)status=-5;
-    for(u32 i=0;!status&&i<p->write_count;++i)status=eng_external_image_slot(&p->writes[i],&slots[i]);
-    if(!status && s_native_images.id && (s_native_images.source!=p->source_observation || s_native_images.vm!=vm_base))status=-3;
+    if(!status && s_native_images.id && (s_native_images.source!=p->source_observation || s_native_images.vm!=vm_base || s_native_images.published))status=-3;
+    /* These are actual earlier queued POC clear commands, not inferred draw
+     * coverage. Publish them before native writes, including clear-only outputs.
+     * Cancel/end without accepted publication never changes the live cache. */
+    for(u32 i=0;!status && i<s_native_images.count;++i) {
+        const eng_surface* v=&s_native_images.images[i].color;
+        if(!v->handle || !(v->queued_clear_planes&1))continue;
+        clears[clear_count]=(rsx_native_external_image_write){.key=s_native_images.images[i].key,
+            .native_handle=v->handle,.planes=1,.source_clip_width=v->w,.source_clip_height=v->h};
+        ++clear_count;
+    }
+    const u32 write_count=clear_count+p->write_count;
+    if(!status && UINT64_MAX-g.write_serial<write_count)status=-5;
+    for(u32 i=0;!status&&i<write_count;++i)
+        status=eng_external_image_slot(eng_external_ordered_write(p,clears,clear_count,i),&slots[i]);
     /* Prove all promotion capacity before any serial/cache mutation. */
     u32 new_color=0,new_depth=0;
-    for(u32 i=0;!status&&i<p->write_count;++i) {
-        const rsx_native_image_key* k=&p->writes[i].key;int seen=0;
-        for(u32 j=0;j<i;++j)if(p->writes[j].key.kind==k->kind && p->writes[j].key.location==k->location && p->writes[j].key.offset==k->offset)seen=1;
+    for(u32 i=0;!status&&i<write_count;++i) {
+        const rsx_native_image_key* k=&eng_external_ordered_write(p,clears,clear_count,i)->key;int seen=0;
+        for(u32 j=0;j<i;++j)if(eng_external_ordered_write(p,clears,clear_count,j)->key.kind==k->kind && eng_external_ordered_write(p,clears,clear_count,j)->key.location==k->location && eng_external_ordered_write(p,clears,clear_count,j)->key.offset==k->offset)seen=1;
         if(seen)continue;
         if(k->kind==0){for(u32 j=0;j<g.n_surfaces;++j)if(g.surfaces[j].location==k->location&&g.surfaces[j].offset==k->offset)seen=1;
             if(!seen)++new_color;
@@ -4824,8 +4842,9 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
     }
     if(!status && (new_color>ENG_MAX_SURFACES-g.n_surfaces || new_depth>ENG_MAX_ZDEPTHS-g.n_zdepths))status=-5;
     if(!status) {
-        for(u32 i=0;i<p->write_count;++i) {
-            const rsx_native_external_image_write* w=&p->writes[i];
+        if(s_native_images.id)s_native_images.published=1;
+        for(u32 i=0;i<write_count;++i) {
+            const rsx_native_external_image_write* w=eng_external_ordered_write(p,clears,clear_count,i);
             if(w->key.kind==0) {
                 eng_surface* v=(slots[i]&ENG_NATIVE_STAGE_BIT)?&s_native_images.images[slots[i]&~ENG_NATIVE_STAGE_BIT].color:&g.surfaces[slots[i]];v->color_serial=++g.write_serial;v->guest_dirty=1;
             } else {
@@ -4837,9 +4856,9 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
         }
         /* Only the last written physical layout per guest EA becomes current.
          * Earlier native/input allocations remain alive through HostImage pins. */
-        for(u32 i=0;i<p->write_count;++i) {
-            const rsx_native_image_key* k=&p->writes[i].key;int later=0;
-            for(u32 j=i+1;j<p->write_count;++j)if(p->writes[j].key.kind==k->kind && p->writes[j].key.location==k->location && p->writes[j].key.offset==k->offset)later=1;
+        for(u32 i=0;i<write_count;++i) {
+            const rsx_native_image_key* k=&eng_external_ordered_write(p,clears,clear_count,i)->key;int later=0;
+            for(u32 j=i+1;j<write_count;++j)if(eng_external_ordered_write(p,clears,clear_count,j)->key.kind==k->kind && eng_external_ordered_write(p,clears,clear_count,j)->key.location==k->location && eng_external_ordered_write(p,clears,clear_count,j)->key.offset==k->offset)later=1;
             if(later || !(slots[i]&ENG_NATIVE_STAGE_BIT))continue;
             u32 n=slots[i]&~ENG_NATIVE_STAGE_BIT;
             if(k->kind==0) {

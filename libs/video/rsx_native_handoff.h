@@ -116,7 +116,10 @@ int rsx_draw_engine_native_image(const rsx_native_image_key*, rsx_native_image_m
  * Returned backing key names the real physical allocation; same-grid/pitch
  * larger reuse follows the ordinary target allocator. Clear commands must pass
  * a successful original native boundary before native use. End releases all
- * unpromoted allocations; borrowed HostImages require their own real pins. */
+ * unpromoted allocations; borrowed HostImages require their own real pins.
+ * Accepted external publication includes actual scoped POC clears as an ordered
+ * prelude, then caller native writes: a later real writer per EA always wins.
+ * Clear-only outputs are promoted too; no source-parity/initial-content claim. */
 int rsx_draw_engine_native_images_begin(uint64_t source_observation, uint64_t* scope);
 int rsx_draw_engine_native_prepare_image(uint64_t scope, const rsx_native_image_key*,
     uint32_t sampled_planes, uint32_t attachment_planes, uint32_t flags,

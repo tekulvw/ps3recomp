@@ -96,7 +96,12 @@ int main(void){
     writes[0]=(rsx_native_external_image_write){.key=backing,.native_handle=staged,.planes=1,
         .source_clip_width=2560,.source_clip_height=720};
     p=pass();p.source_observation=77;p.writes=writes;p.write_count=1;
+    ++writes[0].native_handle;
+    assert(rsx_draw_engine_native_publish_external(&p)==-3);
+    assert(!rsx_draw_engine_native_image(&output,&absent)); // Bad native row cannot promote prelude.
+    p.writes=NULL;p.write_count=0; // Clear-only output: no native draw writes this image.
     assert(!rsx_draw_engine_native_publish_external(&p));
+    assert(rsx_draw_engine_native_publish_external(&p)==-3); // No clear prelude replay.
     assert(!rsx_draw_engine_native_images_end(scope));
     absent=(rsx_native_image_match){.abi_version=1,.struct_size=sizeof(absent)};
     assert(rsx_draw_engine_native_image(&output,&absent)==1&&absent.native_handle==staged);
@@ -112,17 +117,18 @@ int main(void){
         .source_clip_width=1280,.source_clip_height=720};
     writes[1]=(rsx_native_external_image_write){.key=output,.native_handle=staged,.planes=1,
         .source_clip_width=2560,.source_clip_height=720};
-    p=pass();p.source_observation=78;p.writes=writes;p.write_count=2;
+    p=pass();p.source_observation=78;p.writes=&writes[1];p.write_count=1; // Clear prelude then old-current native write.
     assert(!rsx_draw_engine_native_publish_external(&p)); // Last write restores old current layout.
     assert(!rsx_draw_engine_native_images_end(scope)); // Unwritten output cancelled, old cache remains.
     assert(rsx_draw_engine_native_images_end(scope)==-3);
+    assert(rsx_draw_engine_native_image(&output,&absent)==1&&absent.native_handle==staged);
     assert(!rsx_draw_engine_native_images_begin(79,&scope));
     assert(rsx_draw_engine_native_prepare_image(scope,&small,0,1,1,&backing,&found)==1);
     writes[0]=(rsx_native_external_image_write){.key=output,.native_handle=staged,.planes=1,
         .source_clip_width=2560,.source_clip_height=720};
     writes[1]=(rsx_native_external_image_write){.key=backing,.native_handle=found.native_handle,.planes=1,
         .source_clip_width=1280,.source_clip_height=720};
-    p.source_observation=79;
+    p.source_observation=79;p.writes=writes;p.write_count=2;
     assert(!rsx_draw_engine_native_publish_external(&p)); // Reverse order promotes the new layout.
     assert(!rsx_draw_engine_native_images_end(scope));
     assert(rsx_draw_engine_native_image(&small,&absent)==1&&absent.native_handle==found.native_handle);
