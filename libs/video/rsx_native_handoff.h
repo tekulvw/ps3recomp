@@ -74,6 +74,12 @@ int cellGcm_native_handoff_ring_publish(uint64_t cookie);
 /* Read-only actual dispatch decoder snapshot; caller holds consumer lease.
  * Returns 1 for a qualified existing color-A allocation; otherwise 0. */
 int rsx_draw_engine_native_source_target(rsx_native_source_target* out);
+/* Bounded original register words at a caller-qualified FIFO boundary. Caller
+ * holds serialized consumer ownership; this reports inherited earlier work,
+ * never frontend source ownership or original-work removal. No mutation,
+ * allocation or submission. Methods must be aligned in0..1FFC, count1..256.
+ * 0 success; -1 invalid (output unchanged), -3 inactive, -4 busy, -6 failed. */
+int rsx_draw_engine_native_registers(const uint32_t* methods,uint32_t* values,uint32_t count);
 /* Explicit source-key lookup, independent of current dispatch registers.
  * Width/height are exact physical image dimensions, including the source AA
  * sample grid. format is the source color-format code or depth-format code;

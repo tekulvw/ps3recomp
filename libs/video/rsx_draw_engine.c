@@ -4470,6 +4470,25 @@ int rsx_draw_engine_completion_status(u64 ticket,int wait){
     if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
     return result;
 }
+int rsx_draw_engine_native_registers(const uint32_t* methods, uint32_t* values, uint32_t count)
+{
+    if (!methods || !values || !count || count > 256) return -1;
+    for (uint32_t i = 0; i < count; ++i)
+        if ((methods[i] & 3u) || methods[i] > 0x1ffcu) return -1;
+    const rsx_original_owner_hooks* owner = atomic_load_explicit(&s_original_owner_hooks, memory_order_acquire);
+    if (owner && !owner->begin(owner->user, RSX_ORIGINAL_READ)) return -4;
+    int status = 0;
+    if (!g.ready) status = -3;
+    else if (atomic_load(&s_checked_failed)) status = -6;
+    else if (g.rsx.in_begin_end) status = -4;
+    else {
+        uint32_t snapshot[256];
+        for (uint32_t i = 0; i < count; ++i) snapshot[i] = rsx_dsp_reg(&g.rsx, methods[i]);
+        memcpy(values, snapshot, count * sizeof(*values));
+    }
+    if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
+    return status;
+}
 int rsx_draw_engine_native_image(const rsx_native_image_key* key, rsx_native_image_match* out)
 {
     if (!out || out->abi_version != 1 || out->struct_size != sizeof(*out)) return -1;
