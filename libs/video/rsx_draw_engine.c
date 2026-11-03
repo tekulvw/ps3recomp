@@ -4470,6 +4470,19 @@ int rsx_draw_engine_completion_status(u64 ticket,int wait){
     if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
     return result;
 }
+int rsx_draw_engine_native_canvas(uint32_t dimensions[2])
+{
+    if (!dimensions) return -1;
+    const rsx_original_owner_hooks* owner = atomic_load_explicit(&s_original_owner_hooks, memory_order_acquire);
+    if (owner && !owner->begin(owner->user, RSX_ORIGINAL_READ)) return -4;
+    int status = 0;
+    if (!g.ready) status = -3;
+    else if (atomic_load(&s_checked_failed)) status = -6;
+    else if (g.rsx.in_begin_end) status = -4;
+    else { dimensions[0] = g.width; dimensions[1] = g.height; }
+    if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
+    return status;
+}
 int rsx_draw_engine_native_registers(const uint32_t* methods, uint32_t* values, uint32_t count)
 {
     if (!methods || !values || !count || count > 256) return -1;

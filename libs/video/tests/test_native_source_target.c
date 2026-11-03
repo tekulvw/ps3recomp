@@ -6,6 +6,9 @@
 #include <assert.h>
 int main(void) {
     vm_base=calloc(1,GUEST_BYTES);assert(vm_base);ppu_vm_size=GUEST_BYTES;engine_up();
+    uint32_t canvas[2]={0,0};
+    assert(!rsx_draw_engine_native_canvas(canvas)&&canvas[0]==1280&&canvas[1]==720);
+    assert(rsx_draw_engine_native_canvas(NULL)==-1);
     m(M_COLOR_TARGET,CELL_GCM_SURFACE_TARGET_0);
     uint32_t methods[3]={0x1834,M_DEPTH_BOUNDS_MIN,M_DEPTH_BOUNDS_MAX};
     uint32_t values[3]={0xdeadbeef,0xdeadbeef,0xdeadbeef};
@@ -38,6 +41,7 @@ int main(void) {
     m(M_BEGIN_END,RSX_PRIMITIVE_TRIANGLES);
     assert(!rsx_draw_engine_native_source_target(&target));
     assert(rsx_draw_engine_native_registers(methods,values,3)==-4);
+    canvas[0]=123;assert(rsx_draw_engine_native_canvas(canvas)==-4&&canvas[0]==123);
     assert(rsx_draw_engine_native_image(&key,&match)==-4&&!match.native_handle);m(M_BEGIN_END,0);
     m(M_COLOR_A_OFFSET,0x80000);
     assert(!rsx_draw_engine_native_source_target(&target)&&!target.native_surface&&stub.n_color_create==1);

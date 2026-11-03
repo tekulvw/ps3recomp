@@ -80,6 +80,10 @@ int rsx_draw_engine_native_source_target(rsx_native_source_target* out);
  * allocation or submission. Methods must be aligned in0..1FFC, count1..256.
  * 0 success; -1 invalid (output unchanged), -3 inactive, -4 busy, -6 failed. */
 int rsx_draw_engine_native_registers(const uint32_t* methods,uint32_t* values,uint32_t count);
+/* Actual engine canvas used to size depth allocations; never current target
+ * or viewport dimensions. Same owner/consumer/status contract as registers.
+ * On failure output remains unchanged. No allocation or GPU operation. */
+int rsx_draw_engine_native_canvas(uint32_t dimensions[2]);
 /* Explicit source-key lookup, independent of current dispatch registers.
  * Width/height are exact physical image dimensions, including the source AA
  * sample grid. format is the source color-format code or depth-format code;
