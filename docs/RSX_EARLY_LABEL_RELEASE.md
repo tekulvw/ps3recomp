@@ -80,3 +80,40 @@ Barriers that record their own event, such as `gcm_reports_sync_barrier`,
 suppress the nested one. On a single in-order queue, any of these waits also
 waits for every command buffer queued ahead of it, including work submitted
 by an external renderer on that queue.
+
+## GPU-only depth reads (`PS3RECOMP_RSX_GPU_DEPTH_VIEW=1`)
+
+A texture fetch that reads a depth target's bytes as linear `A8R8G8B8` or
+`D8R8G8B8` normally stores the depth into guest memory as Z24S8 words first:
+the engine commits, waits for the GPU, converts and copies, and then builds
+the texture. On a single queue that wait also covers every command buffer
+queued ahead of it, so a pass that samples a depth target another renderer
+just wrote stalls the FIFO until that renderer's GPU work finishes.
+
+With this switch, which is read when the engine initializes and is
+independent of the label switches, the engine asks the backend for a
+`depth_z24_view` instead. The backend appends the conversion and a copy into
+a fresh texture to its next submission, after every draw recorded so far.
+The engine submits that asynchronously and binds the view. The texels are
+exactly those the store would have produced; `tools/test_metal_depth_z24.py`
+compares them for both formats and a spread of crossbars, and checks stream
+order. The view is reused while the depth target is unchanged.
+
+Not covered:
+
+- `Z16`, mipmapped, cube or volume fetches, a pitch other than the zeta's,
+  and rectangles larger than the written clip. These keep the store.
+- Guest memory is not written. The target stays `guest_dirty`, so any later
+  consumer that needs the bytes, such as another format or a transfer, still
+  gets the synchronous store. A guest CPU or SPU read of that memory, which
+  the engine cannot observe, no longer sees the depth the store used to leave
+  there as a side effect.
+
+**Backends.** Metal implements the view. Vulkan has neither `depth_store_z24`
+nor the view, so its depth reads keep the CPU readback path. The engine prints
+a message when the switch is set and the backend lacks the operation. A Vulkan
+implementation needs the conversion as a compute shader writing a buffer,
+then a buffer-to-image copy into an `R8G8B8A8` image whose view carries the
+same component swizzle, with both recorded into the engine's current command
+stream before later draws. The D3D12 path uses a separate engine (live draw)
+and is not affected.

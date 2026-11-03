@@ -140,6 +140,10 @@ typedef struct {
     int guest_dirty;       /* written since guest memory last got a copy     */
     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
     u32 used_w, used_h;    /* the clip that write went through              */
+    /* PS3RECOMP_RSX_GPU_DEPTH_VIEW: the last GPU-built Z24S8 colour view and
+     * what it was built from (handle, write serial, rectangle, format). */
+    u32 view, view_handle, view_w, view_h, view_remap, view_fmt;
+    u64 view_serial;
 } eng_zdepth;
 
 typedef struct {
@@ -1024,6 +1028,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
+    if (z->view) g.be->texture_release(g.be->user, z->view);
+    z->view = 0; z->view_serial = 0;
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
@@ -1061,6 +1067,54 @@ static u32 eng_zdepth_snapshot(u32 slot)
     z->snapshot = tex;
     z->snapshot_valid = 1;
     return tex;
+}
+
+/* PS3RECOMP_RSX_GPU_DEPTH_VIEW=1 (read at init; default off): a texture
+ * fetch that reads a depth target's bytes as linear A8R8G8B8 or D8R8G8B8 is
+ * served by a backend view built on the GPU, in stream order, instead of
+ * storing the depth into guest memory and waiting for the GPU to finish.
+ * The fetch then samples exactly what the store would have produced, but
+ * guest memory is left as it was: the target stays guest_dirty, so any later
+ * consumer that does need the bytes (another format, a transfer) still gets
+ * the synchronous store. A guest CPU/SPU read of that memory, which the
+ * engine cannot observe, no longer sees the depth this path used to leave
+ * there as a side effect. */
+static int s_gpu_depth_view;
+static u32 eng_zdepth_gpu_view(u32 slot, const rsx_dsp_texture* t, u32 base_fmt)
+{
+    eng_zdepth* z = &g.zdepths[slot];
+    if (!s_gpu_depth_view || !g.be->depth_z24_view || !g.be->submit_async) return 0;
+    if (!z->handle || !z->guest_dirty || z->zfmt == 1u) return 0;   /* Z16 stays */
+    const u32 w = z->used_w < z->w ? z->used_w : z->w;
+    const u32 h = z->used_h < z->h ? z->used_h : z->h;
+    if ((base_fmt != 0x85u && base_fmt != 0x9Eu) || !(t->format & RSX_TEX_FMT_LINEAR) ||
+        t->cubemap || t->dimension == 3 || t->mipmaps > 1 ||
+        (t->pitch ? t->pitch : t->width * 4u) != z->pitch ||
+        !t->width || !t->height || t->width > w || t->height > h)
+        return 0;
+    const u32 remap = t->remap & 0xFFFFu;
+    if (z->view && z->view_serial == z->depth_serial && z->view_handle == z->handle &&
+        z->view_w == t->width && z->view_h == t->height && z->view_remap == remap &&
+        z->view_fmt == t->format)
+        return z->view;
+    if (!eng_report_barrier()) return 0;
+    const u32 view = g.be->depth_z24_view(g.be->user, z->handle, t->width, t->height,
+                                          remap, t->format);
+    if (!view) return 0;
+    /* The view's conversion is encoded after the draws recorded so far; commit
+     * them now, without waiting, so the draw that samples it follows it. */
+    if (!g.be->submit_async(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE)) {
+        g.be->texture_release(g.be->user, view);
+        ENG_CHECKED_FAIL();
+        return 0;
+    }
+    if (z->view) g.be->texture_release(g.be->user, z->view);
+    z->view = view; z->view_handle = z->handle; z->view_serial = z->depth_serial;
+    z->view_w = t->width; z->view_h = t->height; z->view_remap = remap; z->view_fmt = t->format;
+    if (eng_coherence_log())
+        fprintf(stderr, "[rsx engine] depth 0x%08X %ux%u sampled through a GPU view (guest memory unchanged)\n",
+                z->offset, t->width, t->height);
+    return view;
 }
 
 /* ---- textures ------------------------------------------------------------ */
@@ -3192,6 +3246,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                 if (snap) { textures[u] = snap; continue; }
             }
+            { const u32 view = eng_zdepth_gpu_view((u32)zsrc, &t, base_fmt);
+              if (view) { textures[u] = view; continue; } }
             ENG_PH_BEGIN(ph_zd);
             const int zd_ok = eng_zdepth_to_guest((u32)zsrc);
             ENG_PH_END(ENG_PH_ZDEPTH, ph_zd);
@@ -4284,6 +4340,10 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
     g.height = height ? height : 720;
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_RSX_GPU_DEPTH_VIEW");
+      s_gpu_depth_view = e && !strcmp(e, "1");
+      if (s_gpu_depth_view && (!g.be->depth_z24_view || !g.be->submit_async))
+          fprintf(stderr, "[rsx engine] PS3RECOMP_RSX_GPU_DEPTH_VIEW: backend has no GPU depth view; depth reads keep the guest-memory store\n"); }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
@@ -4330,8 +4390,10 @@ static void original_rsx_draw_engine_shutdown(void)
         if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
     }
-    for (u32 i = 0; i < g.n_zdepths; i++)
+    for (u32 i = 0; i < g.n_zdepths; i++) {
+        if (g.zdepths[i].view) g.be->texture_release(g.be->user, g.zdepths[i].view);
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
+    }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);

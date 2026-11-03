@@ -1530,6 +1530,105 @@ static void test_depth_read_as_color(void)
     engine_down();
 }
 
+/* PS3RECOMP_RSX_GPU_DEPTH_VIEW=1: the same read is served by a GPU view,
+ * submitted without waiting, with guest memory untouched; reused while the
+ * depth is unchanged, rebuilt after a new depth write. */
+static struct { int views, asyncs; u32 w, h, remap, fmt, depth; } g_view;
+static u32 stub_depth_z24_view(void* u, u32 d, u32 w, u32 h, u32 remap, u32 fmt)
+{
+    (void)u; g_view.views++; g_view.depth = d; g_view.w = w; g_view.h = h;
+    g_view.remap = remap; g_view.fmt = fmt;
+    return stub_handle();
+}
+static u64 stub_submit_async(void* u, u32 reason) { (void)u; (void)reason; return (u64)++g_view.asyncs; }
+static void test_depth_read_as_color_gpu_view(void)
+{
+    printf("-- zeta read as A8R8G8B8 through a GPU view\n");
+    setenv("PS3RECOMP_RSX_GPU_DEPTH_VIEW", "1", 1);
+    memset(&g_view, 0, sizeof g_view);
+    g_stub_backend.depth_z24_view = stub_depth_z24_view;
+    g_stub_backend.submit_async = stub_submit_async;
+    engine_up();
+    u8* z = vm_base + GUEST_LOCAL_EA + ZETA_OFFSET;
+    memset(z, 0x5A, 16);
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, ZETA_OFFSET);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    draw_triangle();
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    m(0x1840, 256u * 4u);                      /* TEX_SIZE1 pitch = zeta pitch */
+    const int uploads = stub.n_texture_create;
+    draw_triangle();
+    CHECK(g_view.views == 1 && g_view.asyncs == 1, "one GPU view, submitted without a wait (%d, %d)",
+          g_view.views, g_view.asyncs);
+    CHECK(g_view.w == 4 && g_view.h == 4 && g_view.remap == 0xAAE4u && (g_view.fmt & 0xFFu) == 0xA5u,
+          "the view covers the fetch's rectangle, crossbar and format");
+    CHECK(stub.n_depth_readback == 0 && stub.n_texture_create == uploads,
+          "no readback and no decoded upload (%d, %d)", stub.n_depth_readback, stub.n_texture_create - uploads);
+    CHECK(z[0] == 0x5A && z[3] == 0x5A, "guest memory left as it was");
+    const u32 view = stub.bound_tex[0];
+    CHECK(view && stub.alive[view], "the unit samples the view");
+    draw_triangle();
+    CHECK(g_view.views == 1 && stub.bound_tex[0] == view, "an unchanged depth reuses the view");
+    /* A new depth write: the old view is released and a new one built. */
+    m(M_COLOR_A_OFFSET, ZETA_OFFSET);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    m(M_TEX_UNIT + 0x0C, 0u);                  /* unit off for the depth pass */
+    draw_triangle();
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    m(M_TEX_UNIT + 0x0C, 0x80000000u);
+    draw_triangle();
+    CHECK(g_view.views == 2 && !stub.alive[view] && stub.bound_tex[0] != view,
+          "rebuilt after a depth write, the stale view released");
+    /* A format the view cannot serve keeps the guest-memory store. */
+    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((0x81u | 0x20u) << 8) | (1u << 16));
+    draw_triangle();
+    CHECK(stub.n_depth_readback == 1 && z[0] == 0x80, "other formats still store through guest memory");
+    engine_down();
+    g_stub_backend.depth_z24_view = NULL;
+    g_stub_backend.submit_async = NULL;
+    unsetenv("PS3RECOMP_RSX_GPU_DEPTH_VIEW");
+    /* Flag off: the existing behaviour, even with the op present. */
+    g_stub_backend.depth_z24_view = stub_depth_z24_view;
+    g_stub_backend.submit_async = stub_submit_async;
+    memset(&g_view, 0, sizeof g_view);
+    engine_up();
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, ZETA_OFFSET);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    draw_triangle();
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    m(0x1840, 256u * 4u);
+    draw_triangle();
+    CHECK(g_view.views == 0 && stub.n_depth_readback == 1, "flag off: no view, guest-memory store");
+    engine_down();
+    g_stub_backend.depth_z24_view = NULL;
+    g_stub_backend.submit_async = NULL;
+}
+
 /* A depth map sampled pass after pass: each clear makes the next sample take
  * a new backend snapshot, and the one it replaces must be released. Leaking
  * it filled a backend's object table in a long session. */
@@ -1765,6 +1864,7 @@ int main(void)
     test_antialiased_surface();
     test_surface_reuse_antialias();
     test_depth_read_as_color();
+    test_depth_read_as_color_gpu_view();
     test_depth_snapshot_released();
     test_color_read_as_float();
     test_immediate_compositor();

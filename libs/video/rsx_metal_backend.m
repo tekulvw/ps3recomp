@@ -4995,6 +4995,78 @@ static u32 eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fm
     }
 }
 
+/* The same alias as eng_depth_z24_texture, but nothing goes through shared
+ * staging or the CPU: the conversion writes a private buffer and a blit
+ * fills the texture, both appended to the next commit after the recorded
+ * draws (s_eng_tail_encode). The engine commits asynchronously right after,
+ * so the draw that samples it is encoded after both. */
+static u32 eng_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    const u32 base = rsx_fmt & 0x9Fu;
+    if (!depth || !s_dev || !s_queue || !s_eng_helper_lib || !w || !h || w > UINT32_MAX / 4u ||
+        (base != 0x85u && base != 0x9Eu))
+        return 0;
+    id<MTLTexture> src = eng_obj(depth);
+    if (!src || s_eng_obj_retired[depth - 1u] || [src pixelFormat] != MTL_DEPTH_FORMAT ||
+        [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
+        w > [src width] || h > [src height])
+        return 0;
+    @autoreleasepool {
+        if (!s_eng_z24_pso) {
+            NSError* err = nil;
+            id<MTLFunction> fn = [s_eng_helper_lib newFunctionWithName:@"eng_depth_z24_cs"];
+            s_eng_z24_pso = fn ? [s_dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+            if (!s_eng_z24_pso) return 0;
+        }
+        id<MTLComputePipelineState> pso = s_eng_z24_pso;
+        id<MTLBuffer> words = [s_dev newBufferWithLength:(NSUInteger)w * h * 4u
+                                                 options:MTLResourceStorageModePrivate];
+        if (!words) return 0;
+        eng_site_tag(words, ENG_SITE_DEPTH_STAGING);
+        const int rotate = !rsx_texture_argb_is_rgba(), alpha_one = base == 0x9Eu;
+        u8 sel[4];
+        rsx_texture_component_remap(remap, base, sel);
+        MTLTextureDescriptor* td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                               width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        td.swizzle = MTLTextureSwizzleChannelsMake(
+            eng_z24_raw_channel(swizzle_sel(sel[1]), rotate, alpha_one),
+            eng_z24_raw_channel(swizzle_sel(sel[2]), rotate, alpha_one),
+            eng_z24_raw_channel(swizzle_sel(sel[3]), rotate, alpha_one),
+            eng_z24_raw_channel(swizzle_sel(sel[0]), rotate, alpha_one));
+        id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+        if (!t) return 0;
+        eng_site_tag(t, ENG_SITE_Z24_TEXTURE);
+        const struct { uint32_t w, h; } wh = { w, h };
+        void (^prior)(id<MTLCommandBuffer>) = s_eng_tail_encode;
+        s_eng_tail_encode = ^(id<MTLCommandBuffer> cb) {
+            if (prior) prior(cb);
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:pso];
+            [ce setTexture:src atIndex:0];
+            [ce setBuffer:words offset:0 atIndex:0];
+            [ce setBytes:&wh length:sizeof wh atIndex:1];
+            const NSUInteger tw = [pso threadExecutionWidth];
+            const NSUInteger th = [pso maxTotalThreadsPerThreadgroup] / tw;
+            [ce dispatchThreads:MTLSizeMake(wh.w, wh.h, 1)
+          threadsPerThreadgroup:MTLSizeMake(tw, th ? th : 1, 1)];
+            [ce endEncoding];
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit copyFromBuffer:words sourceOffset:0
+               sourceBytesPerRow:(NSUInteger)wh.w * 4u
+             sourceBytesPerImage:(NSUInteger)wh.w * 4u * wh.h
+                      sourceSize:MTLSizeMake(wh.w, wh.h, 1)
+                       toTexture:t destinationSlice:0 destinationLevel:0
+               destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+        };
+        return eng_obj_add(t);
+    }
+}
+
 /* Every registered original backend entry shares the host owner gate. */
 static int owner_eng_init(void* user, u32 width, u32 height){
     if(!metal_owner_begin(1)){return -1;}
@@ -5074,6 +5146,10 @@ static int owner_eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* ds
 static u32 owner_eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fmt){
     if(!metal_owner_begin(1)){return 0;}
     u32 result=eng_depth_z24_texture(user,w,h,remap,rsx_fmt);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_depth_z24_view(user,depth,w,h,remap,rsx_fmt);metal_owner_finish(0);return result;
 }
 static u32 owner_eng_color_snapshot(void* user, u32 surface){
     if(!metal_owner_begin(1)){return 0;}
@@ -5181,6 +5257,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_readback       = owner_eng_depth_readback,
     .depth_store_z24      = owner_eng_depth_store_z24,
     .depth_z24_texture    = owner_eng_depth_z24_texture,
+    .depth_z24_view       = owner_eng_depth_z24_view,
     .color_snapshot       = owner_eng_color_snapshot,
     .pipeline_create      = owner_eng_pipeline_create,
     .pipeline_release     = owner_eng_pipeline_release,

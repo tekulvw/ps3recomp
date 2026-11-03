@@ -2,12 +2,17 @@
  * depth_readback's floats: every depth bit pattern sampled (all of [0, 1]
  * with DEPTH_Z24_EXHAUSTIVE=1), the specials, rendered depth, padded rows and
  * draws recorded before the store. No window or original game data.
- * clang -fobjc-arc -I include -I libs/video
- * libs/video/tests/test_metal_depth_z24.m libs/video/rsx_texture_layout.c libs/video/rsx_shader_msl.cpp -lc++
- * -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore
- * -o /tmp/test_metal_depth_z24 */
+ * Also the GPU-only depth view against that alias, and its stream order.
+ * python3 tools/test_metal_depth_z24.py */
 #include "../rsx_metal_backend.m"
 #include <math.h>
+/* Host seams outside the backend; tools/test_metal_depth_z24.py links the
+ * shared fixture stubs and the render-ablation registry for the rest. */
+float cellAvconfExt_display_gamma(void) { return 1.0f; }
+int cellGcm_native_consumer_enabled(void) { return 0; }
+void cellGcm_fifo_kick_notify(void) {}
+void rsx_ring_progress_metal_committed(uint64_t t, uint64_t r) { (void)t; (void)r; }
+void rsx_ring_progress_metal_completed(uint64_t t, uint64_t s) { (void)t; (void)s; }
 #include <stdio.h>
 #include <stdlib.h>
 static int failures, checks;
@@ -178,6 +183,60 @@ int main(void)
             }
             CHECK(built, "alias textures built on the GPU");
             CHECK(same, "GPU alias texels equal the decoded upload's");
+            /* The GPU-only view: same texels as the stored alias, built by
+             * work appended to an asynchronous commit, with no CPU wait. */
+            int vsame = 1, vbuilt = 1;
+            for (u32 fi = 0; fi < 2; fi++) for (u32 ri = 0; ri < sizeof remaps / sizeof remaps[0]; ri++) {
+                u32 ref = eng_depth_z24_texture(NULL, AW, AH, remaps[ri], fmts[fi]);
+                u32 view = eng_depth_z24_view(NULL, big, AW, AH, remaps[ri], fmts[fi]);
+                const u64 ticket = view ? eng_submit_async(NULL, RSX_BE_FLUSH_GUEST_REFERENCE) : 0;
+                vbuilt &= ref && view && ticket;
+                if (!ref || !view || !ticket) { if (ref) eng_obj_release(NULL, ref); if (view) eng_obj_release(NULL, view); continue; }
+                id<MTLBuffer> a = [s_dev newBufferWithLength:AW * AH * 16 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> b = [s_dev newBufferWithLength:AW * AH * 16 options:MTLResourceStorageModeShared];
+                id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:rd];
+                [ce setTexture:eng_obj(ref) atIndex:0]; [ce setBuffer:a offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(AW, AH, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                [ce setTexture:eng_obj(view) atIndex:0]; [ce setBuffer:b offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(AW, AH, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                if (memcmp([a contents], [b contents], AW * AH * 16)) vsame = 0;
+                eng_obj_release(NULL, ref); eng_obj_release(NULL, view);
+            }
+            CHECK(vbuilt, "GPU depth views built and submitted asynchronously");
+            CHECK(vsame, "GPU depth view texels equal the stored alias's");
+            /* Stream order: a clear recorded before the view lands in it,
+             * one recorded after it does not. */
+            {
+                u8 tmp[8 * 4 * 4];
+                u32 o = eng_depth_target_create(NULL, 8, 4), r = eng_depth_target_create(NULL, 8, 4);
+                eng_clear_depth_stencil(NULL, o, 3, 0.25f, 0);
+                u32 v = eng_depth_z24_view(NULL, o, 8, 4, 0xAAE4u, 0xA5u);
+                CHECK(v && eng_submit_async(NULL, RSX_BE_FLUSH_GUEST_REFERENCE), "ordered view submitted");
+                eng_clear_depth_stencil(NULL, o, 3, 0.75f, 0);
+                CHECK(eng_submit_async(NULL, RSX_BE_FLUSH_GUEST_REFERENCE) != 0, "later clear submitted");
+                eng_clear_depth_stencil(NULL, r, 3, 0.25f, 0);
+                CHECK(eng_depth_store_z24(NULL, r, 8, 4, tmp, 32) == 0, "reference store");
+                u32 ref = eng_depth_z24_texture(NULL, 8, 4, 0xAAE4u, 0xA5u);
+                id<MTLBuffer> a = [s_dev newBufferWithLength:8 * 4 * 16 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> b = [s_dev newBufferWithLength:8 * 4 * 16 options:MTLResourceStorageModeShared];
+                id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:rd];
+                [ce setTexture:eng_obj(v) atIndex:0]; [ce setBuffer:a offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(8, 4, 1) threadsPerThreadgroup:MTLSizeMake(8, 4, 1)];
+                [ce setTexture:eng_obj(ref) atIndex:0]; [ce setBuffer:b offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(8, 4, 1) threadsPerThreadgroup:MTLSizeMake(8, 4, 1)];
+                [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                CHECK(ref && !memcmp([a contents], [b contents], 8 * 4 * 16),
+                      "the view holds the depth recorded before it, not the later clear");
+                eng_obj_release(NULL, v); eng_obj_release(NULL, ref);
+                eng_obj_release(NULL, o); eng_obj_release(NULL, r);
+            }
+            CHECK(eng_depth_z24_view(NULL, big, SW + 1, AH, 0xAAE4u, 0xA5u) == 0, "view wider than the depth rejected");
+            CHECK(eng_depth_z24_view(NULL, big, AW, AH, 0xAAE4u, 0x81u) == 0, "view of other formats rejected");
             CHECK(eng_depth_z24_texture(NULL, SW + 1, AH, 0xAAE4u, 0xA5u) == 0, "alias wider than the store rejected");
             CHECK(eng_depth_z24_texture(NULL, AW, AH, 0xAAE4u, 0x81u) == 0, "other formats rejected");
             float fl1; CHECK(eng_depth_readback(NULL, big, 0, 0, 1, 1, &fl1, 4) == 0, "float readback reuses staging");
