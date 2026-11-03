@@ -37,11 +37,15 @@ static int gcm_checked_backend_ready(void) {
     return s_checked_completion_ready ?
         s_checked_completion_ready(s_checked_completion_user)==1 : rsx_draw_engine_checked_ready();
 }
+static u32 s_engine_barrier_reason;
+#define GCM_BARRIER_REFERENCE 0x10050u
 static int gcm_checked_backend_flush(void) {
     if(s_checked_completion_ready)
         return s_checked_completion_ready(s_checked_completion_user)==1 &&
                s_checked_completion_flush(s_checked_completion_user)==1;
-    return rsx_draw_engine_enabled() && rsx_draw_engine_flush_checked()==1;
+    if(!rsx_draw_engine_enabled())return 0;
+    const u32 outer=s_engine_barrier_reason;s_engine_barrier_reason=GCM_BARRIER_REFERENCE;
+    const int ok=rsx_draw_engine_flush_checked()==1;s_engine_barrier_reason=outer;return ok;
 }
 #include <stdio.h>
 #include <string.h>
@@ -416,6 +420,7 @@ static rsx_deferred_report_queue s_reports = {.generation=1};
 static u32 s_backend_label_offset;
 static u32 s_backend_label_dma;
 static int gcm_reports_dependency(void);
+static int gcm_engine_report_barrier(void);
 static int gcm_reports_progress(int wait,int issue);
 static int gcm_reports_live(void) { return s_live_report_batch && rsx_live_draw_enabled(); }
 static int gcm_reports_sync_barrier_at(u32 reason);
@@ -474,7 +479,7 @@ static void gcm_deferred_initialize(void) {
           fprintf(stderr,"[early release] labels and synthesized reports publish at FIFO position%s; completion still verified\n",
               s_early_fifo_sync?"; SET_REFERENCE/ACQUIRE/NV0039 do not wait for the GPU":""); }
     if (s_deferred_reports) {
-        rsx_draw_engine_set_report_barrier(gcm_reports_dependency);
+        rsx_draw_engine_set_report_barrier(gcm_engine_report_barrier);
         if(s_live_report_batch){
             if(!rsx_live_draw_set_report_lease(cellGcm_rsx_consumer_begin,cellGcm_rsx_consumer_end))s_reports.failed=1;
             rsx_live_draw_set_report_barrier(gcm_reports_dependency);
@@ -1546,6 +1551,22 @@ static int gcm_reports_dependency(void){
     cellGcm_rsx_consumer_begin();int ok=gcm_reports_progress(1,1);
     cellGcm_rsx_consumer_end();return ok;
 }
+/* Draw-engine waits (surface/depth readback into guest memory, synchronous
+ * flushes) pass this barrier first. A critical trace records it as kind 19
+ * with a reason outside the source-line range, so the synchronous commit
+ * that follows can be attributed. Diagnostic only; same dependency. */
+#define GCM_BARRIER_ENGINE 0x10000u
+#define GCM_BARRIER_NV0039 0x10039u
+#define GCM_BARRIER_QUIET 0xffffffffu /* caller records its own event */
+static int gcm_engine_report_barrier(void){
+    if(!ps3_critical_enabled()||s_engine_barrier_reason==GCM_BARRIER_QUIET)return gcm_reports_dependency();
+    uint64_t capture=ps3_critical_capture_id(),start=ps3_critical_now_ns();
+    uint64_t pending=s_reports.count,issued=s_reports.issued,published=s_reports.published;
+    int ok=gcm_reports_dependency();
+    uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};
+    ps3_critical_emit_capture(capture,19,s_engine_barrier_reason?s_engine_barrier_reason:GCM_BARRIER_ENGINE,0,w,7);
+    return ok;
+}
 static int gcm_reports_sync_barrier_core(u32 reason);
 static int gcm_reports_sync_barrier_at(u32 reason){
     if(!gph_enabled())return gcm_reports_sync_barrier_core(reason);
@@ -1558,7 +1579,10 @@ static int gcm_reports_sync_barrier_core(u32 reason){
     uint64_t pending=s_reports.count,issued=s_reports.issued,published=s_reports.published;
     int ok=gcm_reports_dependency();
     if(ok&&rsx_live_draw_enabled())rsx_live_draw_flush();
-    if(ok&&rsx_draw_engine_async_available())ok=rsx_draw_engine_flush_checked()==1;
+    if(ok&&rsx_draw_engine_async_available()){
+        const u32 outer=s_engine_barrier_reason;s_engine_barrier_reason=GCM_BARRIER_QUIET;
+        ok=rsx_draw_engine_flush_checked()==1;s_engine_barrier_reason=outer;
+    }
     if(start){uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};ps3_critical_emit_capture(capture,19,reason,0,w,7);}
     return ok;
 }
@@ -2347,7 +2371,7 @@ static void nv0039_copy(const u32 v[8])
     /* Early FIFO sync: recorded draws already own copies of their inputs, so
      * only unapplied reports must precede the copy. */
     if(s_early_fifo_sync){if(!gcm_reports_dependency()){free(snapshot);return;}}
-    else if(rsx_draw_engine_enabled()) rsx_draw_engine_flush();
+    else if(rsx_draw_engine_enabled()){s_engine_barrier_reason=GCM_BARRIER_NV0039;rsx_draw_engine_flush();s_engine_barrier_reason=0;}
     if(rsx_live_draw_enabled()) rsx_live_draw_flush();
     for(u32 row=0;row<rows;row++) {
         int64_t off=(int64_t)v[0]+(int64_t)in_pitch*row;

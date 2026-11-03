@@ -55,6 +55,13 @@ void rsx_draw_engine_set_report_barrier(int(*barrier)(void)){(void)barrier;}
 int rsx_draw_engine_checked_ready(void) { return !gpu_error; }
 int rsx_draw_engine_flush_checked(void) { checked_flushes++; completed=issued; return gpu_error?0:1; }
 
+/* Critical-trace seam for barrier attribution. */
+static int trace_on;static u64 trace_owner[8];static unsigned trace_n;
+int ps3_critical_enabled(void){return trace_on;}
+uint64_t ps3_critical_now_ns(void){return 1;}
+void ps3_critical_emit_capture(uint64_t c,uint32_t k,uint64_t o,uint64_t sub,const uint64_t*w,uint32_t n){
+    (void)c;(void)sub;(void)w;(void)n;if(k==19&&trace_n<8)trace_owner[trace_n++]=o;
+}
 static void raw32(u32 ea,u32 v) { v=ps3_bswap32(v);memcpy(vm_base+ea,&v,4); }
 static void fifo(const u32* w,u32 n) {
     for(u32 i=0;i<n;i++)raw32(0x100000+i*4,w[i]);
@@ -157,7 +164,15 @@ int main(void) {
       cellGcm_rsx_process_fifo(); }
     assert(vm_read32(label)==0x31&&s_ref_qtail==0);
     unsetenv("PS3RECOMP_GCM_CHECKED_REF");
+    /* 9. Engine-initiated barriers are attributed in a critical trace; a
+     * caller that records its own event suppresses the nested one. */
+    reset(0,0);trace_on=1;trace_n=0;
+    assert(gcm_engine_report_barrier()&&trace_n==1&&trace_owner[0]==GCM_BARRIER_ENGINE);
+    s_engine_barrier_reason=GCM_BARRIER_NV0039;assert(gcm_engine_report_barrier());s_engine_barrier_reason=0;
+    assert(trace_n==2&&trace_owner[1]==GCM_BARRIER_NV0039);
+    s_engine_barrier_reason=GCM_BARRIER_QUIET;assert(gcm_engine_report_barrier());s_engine_barrier_reason=0;
+    assert(trace_n==2);trace_on=0;
     s_deferred_reports=0;s_early_release=s_early_fifo_sync=0;
     munmap(vm_base,0x100000000ULL);
-    puts("PASS early label release: FIFO-position labels/reports, ordering, checked reference, acquire, sticky failure");
+    puts("PASS early label release: FIFO-position labels/reports, ordering, checked reference, acquire, sticky failure, barrier attribution");
 }

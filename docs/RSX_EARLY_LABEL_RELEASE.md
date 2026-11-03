@@ -61,3 +61,22 @@ work because both are submitted in order on the same queue.
   checks every release form, the report record, ordering behind an observed
   word, checked `SET_REFERENCE` with and without early FIFO sync, the acquire
   barrier, and a failure after early publication.
+
+## Attributing the remaining FIFO waits
+
+The draw engine's own waits pass the report barrier before they commit and
+wait: surface or depth readback into guest memory, and synchronous flushes.
+While a critical trace is active, that barrier records a kind-19 event. Its
+reason is outside the source-line range, so it reads as a cause rather than a
+line:
+
+| Reason | Wait that follows |
+| --- | --- |
+| `0x10000` | An engine-initiated readback or flush |
+| `0x10039` | The pre-copy flush of an `NV0039` copy |
+| `0x10050` | A checked backend completion (`SET_REFERENCE`, non-deferred report) |
+
+Barriers that record their own event, such as `gcm_reports_sync_barrier`,
+suppress the nested one. On a single in-order queue, any of these waits also
+waits for every command buffer queued ahead of it, including work submitted
+by an external renderer on that queue.
