@@ -145,6 +145,14 @@ int main(void){
     absent=(rsx_native_image_match){.abi_version=1,.struct_size=sizeof(absent)};
     assert(rsx_draw_engine_native_image(&output,&absent)==1&&absent.native_handle==staged);
     assert(!rsx_draw_engine_native_images_begin(78,&scope));
+    // The original target allocator reuses an EXACT physical layout even when
+    // source AA differs (role0 2W/AA0 versus role1 W/AA3). Preserve actual
+    // backing metadata and contents; do not create or clear another image.
+    rsx_native_image_key exact_other_grid=output;exact_other_grid.aa_grid=0x102;
+    clears=stub.n_clear_color;
+    assert(rsx_draw_engine_native_prepare_image(scope,&exact_other_grid,1,0,0,&backing,&found)==1);
+    assert(found.native_handle==staged&&backing.aa_grid==output.aa_grid&&stub.n_clear_color==clears);
+    assert(backing.width==2560&&backing.height==720&&backing.pitch==output.pitch);
     rsx_native_image_key small=output;small.width=1280;
     assert(rsx_draw_engine_native_prepare_image(scope,&small,0,1,0,&backing,&found)==1);
     assert(backing.width==2560&&found.native_handle==staged); // Same-pitch/grid larger reuse.

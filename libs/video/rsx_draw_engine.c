@@ -4758,16 +4758,21 @@ int rsx_draw_engine_native_prepare_image(uint64_t scope,const rsx_native_image_k
        (flags && (sampled || !attachment)))return -1;
     const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
     if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
-    int status=0;u32 handle=0,planes=0,w=k->width,h=k->height;int cleared=0;
+    int status=0;u32 handle=0,planes=0,w=k->width,h=k->height,backing_aa=k->aa_grid;int cleared=0;
     if(!g.ready || scope!=s_native_images.id || s_native_images.vm!=vm_base || s_native_images.published)status=-3;
     else if(atomic_load(&s_checked_failed))status=-6;
     else if(g.rsx.in_begin_end)status=-4;
     /* Current input allocations have priority. Never replace or clear one. */
     if(!status && k->kind==0)for(u32 i=0;i<g.n_surfaces;++i) {
         const eng_surface* v=&g.surfaces[i];
+        /* Match the original eng_surface_get rule for the SAME physical
+         * layout. AA describes source viewport/sample-grid interpretation;
+         * exact physical extent/format/pitch is already the same allocation.
+         * Larger-backing reuse still requires the actual cached AA grid. */
         if(v->handle && v->location==k->location && v->offset==k->offset && v->fmt==eng_surface_format(k->format) &&
-           v->pitch==k->pitch && v->aa_grid==k->aa_grid && v->w>=w && v->h>=h) {
-            handle=v->handle;planes=v->queued_clear_planes;w=v->w;h=v->h;break;}
+           v->pitch==k->pitch && ((v->w==w && v->h==h) ||
+           (v->aa_grid==k->aa_grid && v->w>=w && v->h>=h))) {
+            handle=v->handle;planes=v->queued_clear_planes;w=v->w;h=v->h;backing_aa=v->aa_grid;break;}
     }
     if(!status && k->kind==1)for(u32 i=0;i<g.n_zdepths;++i) {
         const eng_zdepth* v=&g.zdepths[i];
@@ -4803,7 +4808,7 @@ int rsx_draw_engine_native_prepare_image(uint64_t scope,const rsx_native_image_k
         }
     }
     if(!status) {
-        *backing=*k;backing->width=w;backing->height=h;
+        *backing=*k;backing->width=w;backing->height=h;backing->aa_grid=backing_aa;
         *out=(rsx_native_image_match){.abi_version=1,.struct_size=sizeof(*out),.kind=k->kind,
             .native_handle=handle,.width=w,.height=h,.queued_clear_planes=planes};status=1;
     }
