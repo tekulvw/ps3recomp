@@ -235,6 +235,50 @@ int main(void)
                 eng_obj_release(NULL, v); eng_obj_release(NULL, ref);
                 eng_obj_release(NULL, o); eng_obj_release(NULL, r);
             }
+            /* Pooling: a released view's pair is reused only after the GPU is
+             * done with it, and still converts the current depth. */
+            {
+                const uint64_t made0 = s_eng_view_made, reused0 = s_eng_view_reused;
+                u32 v1 = eng_depth_z24_view(NULL, big, AW, AH, 0xAAE4u, 0xA5u);
+                CHECK(v1 && eng_submit_async(NULL, RSX_BE_FLUSH_GUEST_REFERENCE), "pooled view submitted");
+                u32 v2 = eng_depth_z24_view(NULL, big, AW, AH, 0xAAE4u, 0xA5u);
+                CHECK(v2 && s_eng_view_reused == reused0, "a view still held is not reused");
+                eng_submit_async(NULL, RSX_BE_FLUSH_GUEST_REFERENCE);
+                eng_obj_release(NULL, v1);
+                eng_submit_and_wait(NULL, RSX_BE_FLUSH_GUEST_REFERENCE);   /* retire and complete */
+                u32 v3 = eng_depth_z24_view(NULL, big, AW, AH, 0xAAE4u, 0xA5u);
+                CHECK(v3 && s_eng_view_reused == reused0 + 1 && s_eng_view_made == made0 + 2,
+                      "a released, completed view is reused");
+                eng_submit_async(NULL, RSX_BE_FLUSH_GUEST_REFERENCE);
+                CHECK(eng_depth_store_z24(NULL, big, SW, AH + 2, words, SW * 4) == 0, "reference store of the same depth");
+                u32 ref = eng_depth_z24_texture(NULL, AW, AH, 0xAAE4u, 0xA5u);
+                id<MTLBuffer> a = [s_dev newBufferWithLength:AW * AH * 16 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> b = [s_dev newBufferWithLength:AW * AH * 16 options:MTLResourceStorageModeShared];
+                id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:rd];
+                [ce setTexture:eng_obj(v3) atIndex:0]; [ce setBuffer:a offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(AW, AH, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                [ce setTexture:eng_obj(ref) atIndex:0]; [ce setBuffer:b offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(AW, AH, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                CHECK(ref && !memcmp([a contents], [b contents], AW * AH * 16), "a reused view holds the current depth");
+                eng_obj_release(NULL, v2); eng_obj_release(NULL, v3); eng_obj_release(NULL, ref);
+            }
+            /* More than 64 outstanding asynchronous commits wait for the oldest
+             * instead of failing. */
+            for (u32 i = 0; i < 200; i++) { eng_clear_depth_stencil(NULL, big, 3, 0.5f, 0); eng_submit_async(NULL, RSX_BE_FLUSH_GUEST_REFERENCE); }
+            CHECK(!atomic_load(&s_eng_checked_failed), "many outstanding commits stay healthy");
+            /* Staging handed to unfinished buffers beyond the byte bound waits. */
+            {
+                const uint64_t limit = s_eng_stage_limit, waits = s_eng_bound_waits;
+                s_eng_stage_limit = 1;
+                static u8 junk[1 << 16]; u32 off;
+                for (u32 i = 0; i < 8; i++) { eng_stage_copy(junk, sizeof junk, &off); eng_submit_async(NULL, RSX_BE_FLUSH_GUEST_REFERENCE); }
+                CHECK(s_eng_bound_waits > waits && !atomic_load(&s_eng_checked_failed), "staging byte bound waits, stays healthy");
+                s_eng_stage_limit = limit;
+            }
+            eng_completion_status(NULL, s_eng_fence_next, 1);
             CHECK(eng_depth_z24_view(NULL, big, SW + 1, AH, 0xAAE4u, 0xA5u) == 0, "view wider than the depth rejected");
             CHECK(eng_depth_z24_view(NULL, big, AW, AH, 0xAAE4u, 0x81u) == 0, "view of other formats rejected");
             CHECK(eng_depth_z24_texture(NULL, SW + 1, AH, 0xAAE4u, 0xA5u) == 0, "alias wider than the store rejected");

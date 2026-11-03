@@ -164,6 +164,20 @@ int main(void) {
       cellGcm_rsx_process_fifo(); }
     assert(vm_read32(label)==0x31&&s_ref_qtail==0);
     unsetenv("PS3RECOMP_GCM_CHECKED_REF");
+    /* 10. Frames ahead of GPU completion are bounded at FIFO flips: each flip
+     * commits its frame without waiting; the third flip waits for the first
+     * frame's genuine completion when the bound is two. */
+    reset(1,1);s_frames_ahead=2;s_frame_count=s_frame_waits=0;
+    for(int i=0;i<4;i++){ const u32 w[]={GCM_FLIP_MARKER}; fifo(w,1); }
+    assert(s_frame_count==4&&issued>=4);
+    assert(s_frame_waits==2&&blocking_waits==2);
+    /* Unbounded when set to zero; off entirely without early release. */
+    reset(1,1);s_frames_ahead=0;s_frame_count=s_frame_waits=0;
+    for(int i=0;i<4;i++){ const u32 w[]={GCM_FLIP_MARKER}; fifo(w,1); }
+    assert(!s_frame_count&&!blocking_waits);
+    reset(0,0);s_frames_ahead=2;
+    for(int i=0;i<4;i++){ const u32 w[]={GCM_FLIP_MARKER}; fifo(w,1); }
+    assert(!s_frame_count&&!blocking_waits);
     /* 9. Engine-initiated barriers are attributed in a critical trace; a
      * caller that records its own event suppresses the nested one. */
     reset(0,0);trace_on=1;trace_n=0;
@@ -174,5 +188,5 @@ int main(void) {
     assert(trace_n==2);trace_on=0;
     s_deferred_reports=0;s_early_release=s_early_fifo_sync=0;
     munmap(vm_base,0x100000000ULL);
-    puts("PASS early label release: FIFO-position labels/reports, ordering, checked reference, acquire, sticky failure, barrier attribution");
+    puts("PASS early label release: FIFO-position labels/reports, ordering, checked reference, acquire, sticky failure, barrier attribution, frame bound");
 }

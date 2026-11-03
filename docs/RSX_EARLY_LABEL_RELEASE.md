@@ -117,3 +117,29 @@ then a buffer-to-image copy into an `R8G8B8A8` image whose view carries the
 same component swizzle, with both recorded into the engine's current command
 stream before later draws. The D3D12 path uses a separate engine (live draw)
 and is not affected.
+
+## Bounded work in flight
+
+Without the GPU waits that used to pace it, the FIFO consumer could get
+arbitrarily far ahead of the GPU. Three bounds keep that finite.
+
+| Bound | Default | Behavior |
+| --- | --- | --- |
+| `PS3RECOMP_RSX_MAX_FRAMES_AHEAD` | `3` | Applies with early label release. At each FIFO flip, the frame's recorded work is committed without waiting and its ticket is kept. The flip waits until the frame that many flips back has genuinely completed. `0` means unbounded; at most 15. |
+| `PS3RECOMP_METAL_MAX_INFLIGHT_STAGE_MB` | `512` | An asynchronous commit first waits for the oldest tracked buffer while staging handed to unfinished buffers exceeds the limit. `0` disables the byte bound. |
+| Tracked buffers | 64 | A 65th outstanding buffer now waits for the oldest instead of latching a checked failure. |
+
+GPU depth views come from a pool of four pairs (words buffer and texture). A
+pair is reused once the engine has released its view and every commit up to
+the one that retired it has completed.
+
+`PS3RECOMP_RSX_INFLIGHT_LOG=1` prints, every two seconds:
+
+```
+[rsx inflight gcm] frames=… bound=3 waits=… wait_ms=… max_wait_ms=… reports_pending=… gated=… max_pending=… applied_early=…
+[rsx inflight metal] commits=… done=… tracked=… fences=… stage_inflight=…MB peak=…MB limit=512MB stage_waits=… wait_ms=… cap_waits=… views=… reused=… metal_allocated=…MB
+```
+
+Either line is also printed, at most every two seconds, whenever its bound
+actually waits. `metal_allocated` is the device's `currentAllocatedSize`. If
+it stays flat while the process grows, the growth is not GPU resources.

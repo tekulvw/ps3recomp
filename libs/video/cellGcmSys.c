@@ -412,6 +412,11 @@ static int s_live_report_batch;
  * their own stream position. Draw-engine deferred path only; default off. */
 static int s_early_release;
 static int s_early_fifo_sync;
+#define GCM_FRAME_RING 16u
+static u64 s_frame_ticket[GCM_FRAME_RING];
+static u64 s_frame_count,s_frame_waits,s_frame_wait_ns,s_frame_wait_max_ns;
+static u32 s_frames_ahead=3;
+static int s_frame_log;
 /* Every queued LIVE record belongs to this one physical renderer lifetime.
  * Cleared only after the entire consumer-owned queue has published. */
 static uint64_t s_report_live_lifetime;
@@ -475,9 +480,12 @@ static void gcm_deferred_initialize(void) {
           fprintf(stderr,"[early release] refused: PS3RECOMP_RSX_EARLY_FIFO_SYNC requires PS3RECOMP_RSX_EARLY_LABEL_RELEASE=1\n");
       else{s_early_release=want;s_early_fifo_sync=want&&want_sync;}
       s_reports.early_mode=(uint32_t)s_early_release;
+      { const char *f=getenv("PS3RECOMP_RSX_MAX_FRAMES_AHEAD"),*l=getenv("PS3RECOMP_RSX_INFLIGHT_LOG");
+        if(f){const long n=strtol(f,NULL,0);s_frames_ahead=n<0?0u:n>(long)GCM_FRAME_RING-1?GCM_FRAME_RING-1u:(u32)n;}
+        s_frame_log=l&&!strcmp(l,"1"); }
       if(s_early_release)
-          fprintf(stderr,"[early release] labels and synthesized reports publish at FIFO position%s; completion still verified\n",
-              s_early_fifo_sync?"; SET_REFERENCE/ACQUIRE/NV0039 do not wait for the GPU":""); }
+          fprintf(stderr,"[early release] labels and synthesized reports publish at FIFO position%s; completion still verified; frames ahead of GPU completion bounded to %u%s\n",
+              s_early_fifo_sync?"; SET_REFERENCE/ACQUIRE/NV0039 do not wait for the GPU":"",s_frames_ahead,s_frames_ahead?"":" (unbounded)"); }
     if (s_deferred_reports) {
         rsx_draw_engine_set_report_barrier(gcm_engine_report_barrier);
         if(s_live_report_batch){
@@ -1640,6 +1648,38 @@ static int gcm_early_label(u32 ea){
  * return 0 here so it publishes only after completion. */
 static int gcm_report_value_synthesized(u32 argument){(void)argument;return 1;}
 static int gcm_early_report(u32 argument){return s_early_release&&gcm_report_value_synthesized(argument);}
+/* Early release removes the GPU waits that used to pace the FIFO, so bound
+ * how far it may run ahead instead: at each FIFO flip, commit the frame's
+ * recorded work asynchronously and keep its ticket; before the next frame
+ * proceeds, wait until the frame PS3RECOMP_RSX_MAX_FRAMES_AHEAD (default 3,
+ * 0 = unbounded) flips back has genuinely completed. One in-order queue, so
+ * that also covers any other renderer's work queued before it. */
+static uint64_t gcm_bound_now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;}
+static void gcm_frame_bound(void){
+    if(!s_early_release||!s_frames_ahead||s_reports.failed||!rsx_draw_engine_async_available())return;
+    const u64 ticket=rsx_draw_engine_submit_async();
+    if(!ticket)return; /* mid-primitive or failed: the failure path reports itself */
+    s_frame_ticket[s_frame_count%GCM_FRAME_RING]=ticket;++s_frame_count;
+    int waited=0;
+    if(s_frame_count>s_frames_ahead){
+        const u64 old=s_frame_ticket[(s_frame_count-1u-s_frames_ahead)%GCM_FRAME_RING];
+        int ready=rsx_draw_engine_completion_status(old,0);
+        if(ready==0){
+            const uint64_t t0=gcm_bound_now();
+            ready=rsx_draw_engine_completion_status(old,1);
+            const uint64_t dt=gcm_bound_now()-t0;
+            ++s_frame_waits;s_frame_wait_ns+=dt;if(dt>s_frame_wait_max_ns)s_frame_wait_max_ns=dt;waited=1;
+        }
+        if(ready<0)s_reports.failed=1;
+    }
+    static uint64_t last;const uint64_t now=gcm_bound_now();
+    if((s_frame_log||waited)&&(!last||now-last>=2000000000ull)){
+        last=now;
+        fprintf(stderr,"[rsx inflight gcm] frames=%llu bound=%u waits=%llu wait_ms=%.1f max_wait_ms=%.2f reports_pending=%u gated=%u max_pending=%u applied_early=%llu\n",
+            (unsigned long long)s_frame_count,s_frames_ahead,(unsigned long long)s_frame_waits,s_frame_wait_ns/1e6,s_frame_wait_max_ns/1e6,
+            s_reports.count,s_reports.gated,s_reports.max_pending,(unsigned long long)s_reports.applied_early);
+    }
+}
 /* Early SET_REFERENCE: commit the work recorded so far without waiting, and
  * queue a receipt so its genuine completion is still verified. A later
  * failure freezes certification (gcm_reports_progress). */
@@ -3216,6 +3256,7 @@ static void gcm_rsx_process_fifo_pass(void)
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
+            gcm_frame_bound();
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
              * behind it is a deadlock, because the title's ring can only be

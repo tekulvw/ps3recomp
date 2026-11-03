@@ -2636,6 +2636,47 @@ static int eng_completion_status(void *user,u64 ticket,int wait){
 
 #define PS3RECOMP_METAL_TRACKED_COMPLETION 1
 static NSMutableArray<id<MTLCommandBuffer>>* s_eng_submitted;
+/* Bounded work in flight. Every commit gets a sequence number and a
+ * completion handler that only advances s_eng_commit_done; handed-off
+ * staging arenas are counted until the GPU releases them. Commits wait for
+ * the oldest tracked buffer when more than 64 are outstanding (formerly a
+ * checked failure) or when in-flight staging exceeds
+ * PS3RECOMP_METAL_MAX_INFLIGHT_STAGE_MB (default 512, 0 = no byte bound).
+ * PS3RECOMP_RSX_INFLIGHT_LOG=1 prints the counters every two seconds; a
+ * line is also printed (at most every two seconds) whenever a bound waits. */
+/* Pooled GPU depth views (eng_depth_z24_view). */
+enum { ENG_VIEW_POOL = 4 };
+typedef struct { id<MTLBuffer> words; id<MTLTexture> tex; u32 handle, w, h, remap, fmt; uint64_t retired_seq; } EngViewEntry;
+static EngViewEntry s_eng_view_pool[ENG_VIEW_POOL];
+static uint64_t s_eng_commit_seq;
+static _Atomic(uint64_t) s_eng_commit_done;
+static _Atomic(uint64_t) s_eng_stage_inflight, s_eng_stage_inflight_peak;
+static uint64_t s_eng_bound_waits, s_eng_bound_wait_ns, s_eng_cap_waits;
+static uint64_t s_eng_view_made, s_eng_view_reused;
+static int s_eng_bound_log = -1;
+static uint64_t s_eng_stage_limit = UINT64_MAX;
+static uint64_t eng_now_ns(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;}
+static void eng_bound_config(void){
+    if(s_eng_bound_log>=0)return;
+    const char* l=getenv("PS3RECOMP_RSX_INFLIGHT_LOG");s_eng_bound_log=l&&!strcmp(l,"1");
+    const char* m=getenv("PS3RECOMP_METAL_MAX_INFLIGHT_STAGE_MB");
+    const long mb=m?strtol(m,NULL,0):512;
+    s_eng_stage_limit=mb>0?(uint64_t)mb<<20:UINT64_MAX;
+}
+static void eng_bound_report(int waited){
+    static uint64_t last;const uint64_t now=eng_now_ns();
+    if(!s_eng_bound_log&&!waited)return;
+    if(last&&now-last<2000000000ull)return;
+    last=now;
+    fprintf(stderr,"[rsx inflight metal] commits=%llu done=%llu tracked=%lu fences=%lu stage_inflight=%lluMB peak=%lluMB limit=%lldMB stage_waits=%llu wait_ms=%.1f cap_waits=%llu views=%llu reused=%llu metal_allocated=%lluMB\n",
+        (unsigned long long)s_eng_commit_seq,(unsigned long long)atomic_load(&s_eng_commit_done),
+        (unsigned long)[s_eng_submitted count],(unsigned long)[s_eng_fence_cbs count],
+        (unsigned long long)(atomic_load(&s_eng_stage_inflight)>>20),(unsigned long long)(atomic_load(&s_eng_stage_inflight_peak)>>20),
+        s_eng_stage_limit==UINT64_MAX?-1ll:(long long)(s_eng_stage_limit>>20),
+        (unsigned long long)s_eng_bound_waits,s_eng_bound_wait_ns/1e6,(unsigned long long)s_eng_cap_waits,
+        (unsigned long long)s_eng_view_made,(unsigned long long)s_eng_view_reused,
+        (unsigned long long)(s_dev?[s_dev currentAllocatedSize]>>20:0));
+}
 /* Consumer-owned receipts: GPU status is checked directly, without relying
  * on asynchronous completion-handler delivery ordering. */
 static void eng_check_submissions(int barrier_complete)
@@ -2667,7 +2708,12 @@ static void eng_track_submission(id<MTLCommandBuffer> cb)
 {
     eng_check_submissions(0);
     if(!s_eng_submitted)s_eng_submitted=[NSMutableArray new];
-    if(!cb || !s_eng_submitted || [s_eng_submitted count]>=64){eng_checked_fail();return;}
+    while(cb && s_eng_submitted && [s_eng_submitted count]>=64){
+        /* Oldest first: one in-order queue completes them in order. */
+        [s_eng_submitted[0] waitUntilCompleted];++s_eng_cap_waits;
+        eng_check_submissions(0);eng_bound_report(1);
+    }
+    if(!cb || !s_eng_submitted){eng_checked_fail();return;}
     [s_eng_submitted addObject:cb];
     eng_wake_consumer_on_completion(cb);
 }
@@ -3132,6 +3178,7 @@ static void eng_shutdown(void* user)
     s_eng_checked_completed=0;
     s_eng_submitted=nil;
     s_eng_fence_cbs=nil;s_eng_fence_next=s_eng_fence_completed=0;
+    for(u32 i=0;i<ENG_VIEW_POOL;i++){s_eng_view_pool[i].words=nil;s_eng_view_pool[i].tex=nil;s_eng_view_pool[i].handle=0;}
     s_eng_stage_buf = nil; s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
     s_eng_depth_staging = nil;
@@ -4444,7 +4491,10 @@ static void eng_stage_hand_off(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 {
     if (!stage) return;
     atomic_fetch_add(&s_eng_pool_handoff, 1ull);
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> unused) { (void)unused; atomic_fetch_add(&s_eng_pool_handler, 1ull); eng_stage_buffer_release(stage); }];
+    const uint64_t bytes=[stage length];
+    const uint64_t now_inflight=atomic_fetch_add(&s_eng_stage_inflight,bytes)+bytes;
+    if(now_inflight>atomic_load(&s_eng_stage_inflight_peak))atomic_store(&s_eng_stage_inflight_peak,now_inflight);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> unused) { (void)unused; atomic_fetch_add(&s_eng_pool_handler, 1ull); atomic_fetch_sub(&s_eng_stage_inflight,bytes); eng_stage_buffer_release(stage); }];
     s_eng_stage_buf = nil; s_eng_stage = NULL; s_eng_stage_cap = 0;
 }
 static id<MTLCommandBuffer> s_capture_present_cb;
@@ -4495,6 +4545,13 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
         id<MTLBuffer> stage = s_eng_stage_used ? s_eng_stage_buf : nil;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         eng_site_tag_bytes(cb, ENG_SITE_COMMAND_BUFFER, 0);
+        if (cb) {
+            const uint64_t seq = ++s_eng_commit_seq;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                (void)done;uint64_t prev=atomic_load(&s_eng_commit_done);
+                while(prev<seq&&!atomic_compare_exchange_weak(&s_eng_commit_done,&prev,seq)){}
+            }];
+        }
         if(!cb || (s_eng_stage_used && !stage)) {
             eng_checked_fail();fps_note_submission_failure();
             if(windowed_present)dispatch_semaphore_signal(s_inflight);
@@ -4601,6 +4658,16 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
 
 static u64 eng_submit_async(void *user,u32 reason){
  (void)user;(void)reason;if(atomic_load(&s_eng_checked_failed))return 0;
+ eng_bound_config();
+ /* Staging handed to buffers the GPU has not finished: wait for the oldest
+  * before handing off more. Only asynchronous commits can accumulate it. */
+ if(atomic_load(&s_eng_stage_inflight)>s_eng_stage_limit){
+  const uint64_t t0=eng_now_ns();
+  while(atomic_load(&s_eng_stage_inflight)>s_eng_stage_limit&&[s_eng_submitted count]){
+   [s_eng_submitted[0] waitUntilCompleted];eng_check_submissions(0);
+  }
+  ++s_eng_bound_waits;s_eng_bound_wait_ns+=eng_now_ns()-t0;eng_bound_report(1);
+ } else eng_bound_report(0);
  if([s_eng_fence_cbs count]>=64&&eng_completion_status(NULL,s_eng_fence_completed+1,1)!=1)return 0;
  u64 ticket=0;eng_encode_and_commit_mode(nil,1,&ticket);
  return atomic_load(&s_eng_checked_failed)?0:ticket;
@@ -5000,6 +5067,26 @@ static u32 eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fm
  * fills the texture, both appended to the next commit after the recorded
  * draws (s_eng_tail_encode). The engine commits asynchronously right after,
  * so the draw that samples it is encoded after both. */
+static void eng_z24_view_encode(id<MTLCommandBuffer> cb, id<MTLComputePipelineState> pso,
+                                id<MTLTexture> src, id<MTLBuffer> words, id<MTLTexture> t,
+                                uint32_t w, uint32_t h)
+{
+    const struct { uint32_t w, h; } wh = { w, h };
+    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce setComputePipelineState:pso];
+    [ce setTexture:src atIndex:0];
+    [ce setBuffer:words offset:0 atIndex:0];
+    [ce setBytes:&wh length:sizeof wh atIndex:1];
+    const NSUInteger tw = [pso threadExecutionWidth];
+    const NSUInteger th = [pso maxTotalThreadsPerThreadgroup] / tw;
+    [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(tw, th ? th : 1, 1)];
+    [ce endEncoding];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromBuffer:words sourceOffset:0 sourceBytesPerRow:(NSUInteger)w * 4u
+     sourceBytesPerImage:(NSUInteger)w * 4u * h sourceSize:MTLSizeMake(w, h, 1)
+               toTexture:t destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+}
 static u32 eng_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt)
 {
     (void)user;
@@ -5020,6 +5107,30 @@ static u32 eng_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u3
             if (!s_eng_z24_pso) return 0;
         }
         id<MTLComputePipelineState> pso = s_eng_z24_pso;
+        /* A pooled pair is reused once the engine has released its handle and
+         * every commit up to the one that retired it has completed. */
+        EngViewEntry* slot = NULL;
+        for (u32 i = 0; i < ENG_VIEW_POOL; i++) {
+            EngViewEntry* e = &s_eng_view_pool[i];
+            if (!e->tex) { if (!slot) slot = e; continue; }
+            if (e->handle && eng_obj(e->handle) == e->tex) continue;          /* still bound */
+            if (e->handle) { e->handle = 0; e->retired_seq = s_eng_commit_seq; }
+            if (atomic_load(&s_eng_commit_done) < e->retired_seq) continue;    /* GPU may still read */
+            if (e->w == w && e->h == h && e->remap == remap && e->fmt == rsx_fmt) {
+                const u32 handle = eng_obj_add(e->tex);
+                if (!handle) return 0;
+                e->handle = handle; ++s_eng_view_reused;
+                id<MTLBuffer> words = e->words; id<MTLTexture> t = e->tex;
+                const struct { uint32_t w, h; } wh = { w, h };
+                void (^prior)(id<MTLCommandBuffer>) = s_eng_tail_encode;
+                s_eng_tail_encode = ^(id<MTLCommandBuffer> cb) {
+                    if (prior) prior(cb);
+                    eng_z24_view_encode(cb, pso, src, words, t, wh.w, wh.h);
+                };
+                return handle;
+            }
+            if (!slot || slot->tex) slot = e;                                  /* evict an idle one */
+        }
         id<MTLBuffer> words = [s_dev newBufferWithLength:(NSUInteger)w * h * 4u
                                                  options:MTLResourceStorageModePrivate];
         if (!words) return 0;
@@ -5044,26 +5155,15 @@ static u32 eng_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u3
         void (^prior)(id<MTLCommandBuffer>) = s_eng_tail_encode;
         s_eng_tail_encode = ^(id<MTLCommandBuffer> cb) {
             if (prior) prior(cb);
-            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-            [ce setComputePipelineState:pso];
-            [ce setTexture:src atIndex:0];
-            [ce setBuffer:words offset:0 atIndex:0];
-            [ce setBytes:&wh length:sizeof wh atIndex:1];
-            const NSUInteger tw = [pso threadExecutionWidth];
-            const NSUInteger th = [pso maxTotalThreadsPerThreadgroup] / tw;
-            [ce dispatchThreads:MTLSizeMake(wh.w, wh.h, 1)
-          threadsPerThreadgroup:MTLSizeMake(tw, th ? th : 1, 1)];
-            [ce endEncoding];
-            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-            [blit copyFromBuffer:words sourceOffset:0
-               sourceBytesPerRow:(NSUInteger)wh.w * 4u
-             sourceBytesPerImage:(NSUInteger)wh.w * 4u * wh.h
-                      sourceSize:MTLSizeMake(wh.w, wh.h, 1)
-                       toTexture:t destinationSlice:0 destinationLevel:0
-               destinationOrigin:MTLOriginMake(0, 0, 0)];
-            [blit endEncoding];
+            eng_z24_view_encode(cb, pso, src, words, t, wh.w, wh.h);
         };
-        return eng_obj_add(t);
+        const u32 handle = eng_obj_add(t);
+        ++s_eng_view_made;
+        if (handle && slot) {
+            *slot = (EngViewEntry){ .words = words, .tex = t, .handle = handle,
+                                    .w = w, .h = h, .remap = remap, .fmt = rsx_fmt };
+        }
+        return handle;
     }
 }
 
