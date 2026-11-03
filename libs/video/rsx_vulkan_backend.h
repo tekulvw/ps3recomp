@@ -143,6 +143,9 @@ int rsx_vulkan_backend_validate_image_planes(void *,uint64_t,uint64_t,uint64_t,u
  * holds serialized FIFO consumption. No new submit, GPU wait or minted ticket;
  * 0 reports a real successful fence watermark, -4 pending/no checkpoint. */
 int rsx_vulkan_backend_native_boundary(uint64_t *original_ticket);
+/* Reserved queue order for native submissions (rsx_native_owner.h); -2 when
+ * the native owner is not enabled. */
+int rsx_vulkan_backend_queue_order(rsx_native_queue_order *out);
 
 #ifdef __cplusplus
 }

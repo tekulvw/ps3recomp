@@ -224,6 +224,48 @@ with synchronization validation:
 
 It needs glslang, because the engine translates its HLSL.
 
+**Reserved queue order for native work.** On Metal, the native renderer can
+fix its submission's place in the queue at the native boundary: it enqueues
+an empty command buffer, then encodes and commits it later from its worker.
+The FIFO consumer goes on in the meantime, and its later commits queue behind
+that buffer.
+
+A Vulkan queue has no such slot. A timeline semaphore that later original
+submissions wait on cannot stand in for one either: the native signal would be
+submitted after those waits on the same queue. Mesa, for one, processes a
+queue's submissions in order, so a wait whose signal has not been submitted
+yet blocks every later submission, and that deadlocks.
+
+`rsx_vulkan_backend_queue_order` (`rsx_native_owner.h`) keeps the order on the
+CPU instead.
+
+- `reserve`, called under the native lease, starts a hold. From then on, every
+  original queue submission is recorded in order, with its fence, instead of
+  reaching the queue: engine batches, tickets, presents, depth views.
+- `submit`, called once from the native worker without the lease, submits the
+  native batch, then the held submissions in order, and ends the hold.
+  `submit` with no batch abandons the reservation and releases the held work
+  the same way.
+- While a hold is active:
+  - a wait on a held fence first waits for the release, and a status read of
+    one reports it as pending;
+  - swapchain presents and device-idle waits also wait for the release;
+  - the native lease reports -4, so no other native submission can overtake
+    held work.
+- In effect, an original operation that has to wait for the GPU waits for the
+  native worker's encode as well. With batched recording, only CPU reads and
+  explicit waits do; recording itself continues.
+
+The native Vulkan backend uses it behind `MAG_RENDER_VULKAN_RESERVED_COMMIT=1`.
+
+`tools/check_native_owner_vulkan.py` checks it in both recording modes:
+
+- a clear recorded after a reservation lands after a native clear submitted
+  150 ms later from another thread;
+- the readback waited for that native submission;
+- an abandoned reservation releases the held clear;
+- the native lease is refused while the hold is active.
+
 `PS3RECOMP_RSX_INFLIGHT_LOG=1` also prints:
 
 ```

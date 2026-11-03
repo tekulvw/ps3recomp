@@ -86,7 +86,7 @@ def main():
             print(result.stdout, end="")
             print(result.stderr, end="")
             result.check_returncode()
-            if "VUID-" in result.stdout + result.stderr:
+            if "VUID-" in result.stdout + result.stderr or "THREADING ERROR" in result.stdout + result.stderr:
                 raise SystemExit("Vulkan validation rejected the fixture")
             if "Validation Error" in result.stdout + result.stderr:
                 raise SystemExit("Vulkan validation reported an error")

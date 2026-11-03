@@ -73,7 +73,7 @@ def main():
             print("\n".join(line for line in result.stderr.splitlines() if not line.startswith("[RSX vulkan] device")))
             result.check_returncode()
             text = result.stdout + result.stderr
-            if "VUID-" in text or "SYNC-HAZARD" in text or "Validation Error" in text:
+            if "VUID-" in text or "SYNC-HAZARD" in text or "Validation Error" in text or "THREADING ERROR" in text:
                 raise SystemExit(f"Vulkan validation rejected the {mode} run")
             outputs[mode] = out.read_bytes()
         if args.timing:

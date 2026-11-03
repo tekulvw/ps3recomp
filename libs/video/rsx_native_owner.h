@@ -38,6 +38,22 @@ typedef struct rsx_native_owner_v2 {
     rsx_native_owner base;
     uint64_t known_features,enabled_features;
 } rsx_native_owner_v2;
+/* Optional reserved queue order (Vulkan: rsx_vulkan_backend_queue_order).
+ * reserve, called under the native lease at the native boundary, fixes the
+ * next native submission's place: original submissions made after it reach
+ * the queue only after that submission. submit, called once per reservation
+ * from any thread without the lease, submits `submit_info` (a VkSubmitInfo,
+ * with `fence`) and then the original work held behind it; NULL abandons the
+ * reservation with the same release. Returns the native submit's VkResult,
+ * or a negative owner status. */
+#define RSX_NATIVE_QUEUE_ORDER_ABI 1u
+typedef struct rsx_native_queue_order {
+    uint32_t abi_version,struct_size;
+    uint64_t lifetime;
+    void *userdata;
+    int (*reserve)(void *userdata,uint64_t lifetime,uint64_t *token);
+    int (*submit)(void *userdata,uint64_t lifetime,uint64_t token,const void *submit_info,void *fence);
+} rsx_native_queue_order;
 #ifdef __cplusplus
 }
 #endif

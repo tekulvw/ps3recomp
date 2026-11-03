@@ -13,6 +13,8 @@ static VkResult capture_create_device(VkPhysicalDevice physical,const VkDeviceCr
     return pvkCreateDevice(physical,info,allocator,device);
 }
 #include <assert.h>
+#include <pthread.h>
+#include <time.h>
 u8* vm_base;u32 ppu_vm_size,ppu_hle_inject_base;
 u32 cellGcmResolveLocated(int local,u32 offset){(void)local;(void)offset;assert(!"fixture has no guest memory");return 0;}
 u32 cellGcmResolveIO(u32 offset){(void)offset;assert(!"fixture has no guest IO");return 0;}
@@ -31,6 +33,71 @@ static void require_validation(void){
     VkLayerProperties* layers=calloc(count,sizeof(*layers));assert(layers);assert(enumerate(&count,layers)==VK_SUCCESS);
     int found=0;for(uint32_t i=0;i<count;++i)found|=!strcmp(layers[i].layerName,"VK_LAYER_KHRONOS_validation");
     free(layers);dlclose(library);assert(found);
+}
+
+/* A stand-in native worker: after a delay, clears the image green on the
+ * shared queue through the reservation's submit(). */
+typedef struct { rsx_native_queue_order order; uint64_t token; VkImage image; VkCommandPool pool; VkCommandBuffer cb; VkFence fence; int status, abandon; } native_job;
+static void* native_worker(void* arg){
+    native_job* j=(native_job*)arg;
+    struct timespec d={0,150*1000*1000};nanosleep(&d,NULL);
+    if(j->abandon){j->status=j->order.submit(j->order.userdata,j->order.lifetime,j->token,NULL,NULL);return NULL;}
+    VkCommandBufferBeginInfo bi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    assert(pvkBeginCommandBuffer(j->cb,&bi)==VK_SUCCESS);
+    vk_cmd_after_everything(j->cb);
+    VkClearColorValue green={.float32={0,1,0,1}};VkImageSubresourceRange r={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+    pvkCmdClearColorImage(j->cb,j->image,VK_IMAGE_LAYOUT_GENERAL,&green,1,&r);
+    vk_cmd_after_everything(j->cb);
+    assert(pvkEndCommandBuffer(j->cb)==VK_SUCCESS);
+    VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&j->cb};
+    j->status=j->order.submit(j->order.userdata,j->order.lifetime,j->token,&si,(void*)j->fence);
+    return NULL;
+}
+static double ms_now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
+/* Original work recorded after a reservation runs after the native batch that
+ * fills it, though that batch is submitted later from another thread; an
+ * abandoned reservation releases the same way. */
+static void check_queue_order(rsx_native_owner* first){
+    const rsx_draw_backend* be=&s_vk_engine_backend;
+    native_job j={.order={.abi_version=RSX_NATIVE_QUEUE_ORDER_ABI,.struct_size=sizeof(j.order)}};
+    assert(rsx_vulkan_backend_queue_order(&j.order)==0&&j.order.lifetime==first->lifetime);
+    uint64_t token=0;assert(j.order.reserve(j.order.userdata,j.order.lifetime,&token)==-4&&!token); /* lease required */
+    uint32_t image=be->color_target_create(NULL,RSX_BE_FMT_R8G8B8A8,16,16,NULL,0);assert(image);
+    rsx_draw_engine_flush();
+    j.image=s_eobj[image].im.img;
+    VkCommandPoolCreateInfo pci={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=s_vk.queue_family};
+    assert(pvkCreateCommandPool(s_vk.device,&pci,NULL,&j.pool)==VK_SUCCESS);
+    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=j.pool,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    assert(pvkAllocateCommandBuffers(s_vk.device,&cai,&j.cb)==VK_SUCCESS);
+    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};assert(pvkCreateFence(s_vk.device,&fci,NULL,&j.fence)==VK_SUCCESS);
+    assert(first->try_begin(first->userdata,first->lifetime)==0);
+    assert(j.order.reserve(j.order.userdata,j.order.lifetime,&j.token)==0&&j.token);
+    assert(j.order.reserve(j.order.userdata,j.order.lifetime,&token)==-4);                   /* one at a time */
+    first->end(first->userdata,first->lifetime);
+    assert(first->try_begin(first->userdata,first->lifetime)==-4);                          /* nothing overtakes */
+    pthread_t worker;assert(pthread_create(&worker,NULL,native_worker,&j)==0);
+    const double t0=ms_now();
+    const float red[4]={1,0,0,1};be->clear_color(NULL,image,red);                       /* recorded after the reservation */
+    uint32_t pixel=0;be->readback(NULL,image,8,8,1,1,&pixel,4);
+    const double waited=ms_now()-t0;
+    pthread_join(worker,NULL);
+    assert(j.status==VK_SUCCESS&&pvkWaitForFences(s_vk.device,1,&j.fence,VK_TRUE,UINT64_MAX)==VK_SUCCESS);
+    printf("reserved order: original clear after a native batch submitted %.0f ms later reads %08x (bytes R,G,B,A = ff,00,00,ff: the original red, after the native green)\n",waited,pixel);
+    assert(pixel==0xff0000ffu);                         /* R,G,B,A bytes: red, so the native green ran first */
+    assert(waited>=100.0);                              /* the readback waited for the native submission */
+    assert(j.order.submit(j.order.userdata,j.order.lifetime,j.token,NULL,NULL)==-3);    /* consumed */
+    /* Abandoned from the worker: the held clear reaches the queue at release. */
+    assert(first->try_begin(first->userdata,first->lifetime)==0);
+    assert(j.order.reserve(j.order.userdata,j.order.lifetime,&j.token)==0&&j.token);
+    first->end(first->userdata,first->lifetime);
+    j.abandon=1;assert(pthread_create(&worker,NULL,native_worker,&j)==0);
+    const float blue[4]={0,0,1,1};be->clear_color(NULL,image,blue);
+    be->readback(NULL,image,8,8,1,1,&pixel,4);
+    pthread_join(worker,NULL);
+    assert(j.status==VK_SUCCESS&&pixel==0xffff0000u);
+    rsx_draw_engine_flush();assert(first->try_begin(first->userdata,first->lifetime)==0);first->end(first->userdata,first->lifetime);
+    pvkDestroyFence(s_vk.device,j.fence,NULL);pvkDestroyCommandPool(s_vk.device,j.pool,NULL);
+    be->color_target_release(NULL,image);rsx_draw_engine_flush();
 }
 int main(int argc,char** argv){
     if(argc!=4){fprintf(stderr,"usage: owner_fixture REQUIRE_HARDWARE VENDOR_ID DEVICE_ID\n");return 2;}
@@ -75,6 +142,7 @@ int main(int argc,char** argv){
         be->texture_release(NULL,view);be->depth_target_release(NULL,depth);
         printf("async boundary accepted (ticket pending at boundary: %d)\n",was_pending);
     }
+    check_queue_order(&first);
     void* original=first.device;rsx_vulkan_backend_shutdown();assert((void*)s_vk.device==original);
     assert(rsx_vulkan_backend_owner_shutdown_requested(first.lifetime)==1);
     assert(rsx_vulkan_backend_owner_retry_shutdown(first.lifetime)==-4);

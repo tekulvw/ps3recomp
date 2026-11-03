@@ -673,10 +673,128 @@ static void vk_invalidate(vk_buffer* b)
  * The queue is shared with the present (see present_mu in vk_state), so every
  * operation on it goes through these.
  * -------------------------------------------------------------------------*/
+/* ---- Reserved queue order (rsx_vulkan_backend_queue_order) ----------------
+ *
+ * Metal fixes a native submission's place in the queue by enqueueing its
+ * command buffer at the native boundary and committing it later. A Vulkan
+ * queue has no such slot, and a timeline semaphore that later original
+ * submissions wait on cannot stand in for one: the native signal would be
+ * submitted after those waits on the same queue, and implementations process
+ * a queue's submissions in order (Mesa's queue thread holds every later
+ * submission behind a wait-before-signal), so it deadlocks.
+ *
+ * Instead the order is kept on the CPU. reserve(), called under the native
+ * lease at the boundary, starts a hold: every original queue submission from
+ * then on (engine batches and tickets, presents, depth views) is recorded
+ * here, in order, with its fence, instead of reaching the queue. The owner
+ * bookkeeping still runs as if it had been submitted. submit(), called once
+ * from the native worker without the lease, submits the native batch, then
+ * every held one in order, and ends the hold; submit() with no batch abandons
+ * the reservation the same way. While a hold is active:
+ *   - waiting on a held fence blocks until submit() runs (the GPU cannot run
+ *     that work before the native batch either, which is Metal's behaviour);
+ *   - a swapchain present and a device-wide idle wait first wait for the hold
+ *     to end, since they depend on held submissions reaching the queue;
+ *   - the native lease (try_begin) reports -4, so no other native submission
+ *     can overtake held original work.
+ * Every submit() entry also ends a hold whose submissions failed: the failure
+ * latches like any other, and nothing is left held. */
+typedef struct {
+    VkFence fence;
+    uint32_t nwait, ncb, nsig;
+    VkSemaphore* wait; VkPipelineStageFlags* stage; VkCommandBuffer* cb; VkSemaphore* sig;
+} vk_held_submit;
+static struct {
+    int active;
+    uint64_t token, next_token;
+    vk_held_submit* q; uint32_t n, cap;
+    uint64_t reservations, held, abandoned, failures;
+} s_hold;
+static pthread_cond_t s_hold_cv = PTHREAD_COND_INITIALIZER;
+
+/* queue_mu held. */
+static VkResult vk_hold_push(const VkSubmitInfo* si, VkFence fence)
+{
+    if (si->pNext) return VK_ERROR_FEATURE_NOT_PRESENT;        /* nothing here chains one */
+    if (s_hold.n == s_hold.cap) {
+        const uint32_t cap = s_hold.cap ? s_hold.cap * 2u : 64u;
+        vk_held_submit* n = (vk_held_submit*)realloc(s_hold.q, (size_t)cap * sizeof *n);
+        if (!n) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        s_hold.q = n; s_hold.cap = cap;
+    }
+    vk_held_submit h = { fence, si->waitSemaphoreCount, si->commandBufferCount, si->signalSemaphoreCount, 0, 0, 0, 0 };
+    h.wait = h.nwait ? (VkSemaphore*)malloc(h.nwait * sizeof *h.wait) : NULL;
+    h.stage = h.nwait ? (VkPipelineStageFlags*)malloc(h.nwait * sizeof *h.stage) : NULL;
+    h.cb = h.ncb ? (VkCommandBuffer*)malloc(h.ncb * sizeof *h.cb) : NULL;
+    h.sig = h.nsig ? (VkSemaphore*)malloc(h.nsig * sizeof *h.sig) : NULL;
+    if ((h.nwait && (!h.wait || !h.stage)) || (h.ncb && !h.cb) || (h.nsig && !h.sig)) {
+        free(h.wait); free(h.stage); free(h.cb); free(h.sig); return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (h.nwait) { memcpy(h.wait, si->pWaitSemaphores, h.nwait * sizeof *h.wait);
+                   memcpy(h.stage, si->pWaitDstStageMask, h.nwait * sizeof *h.stage); }
+    if (h.ncb) memcpy(h.cb, si->pCommandBuffers, h.ncb * sizeof *h.cb);
+    if (h.nsig) memcpy(h.sig, si->pSignalSemaphores, h.nsig * sizeof *h.sig);
+    s_hold.q[s_hold.n++] = h;
+    s_hold.held++;
+    return VK_SUCCESS;
+}
+
+/* queue_mu held: every held submission onto the queue, in order; ends the hold. */
+static void vk_hold_release_locked(void)
+{
+    for (uint32_t i = 0; i < s_hold.n; i++) {
+        vk_held_submit* h = &s_hold.q[i];
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                            .waitSemaphoreCount = h->nwait, .pWaitSemaphores = h->wait, .pWaitDstStageMask = h->stage,
+                            .commandBufferCount = h->ncb, .pCommandBuffers = h->cb,
+                            .signalSemaphoreCount = h->nsig, .pSignalSemaphores = h->sig };
+        if (pvkQueueSubmit(s_vk.queue, 1, &si, h->fence) != VK_SUCCESS) {
+            atomic_store(&s_vk_eng_failed, 1);
+            s_vulkan_owner.failed = 1;
+            s_hold.failures++;
+        }
+        free(h->wait); free(h->stage); free(h->cb); free(h->sig);
+    }
+    s_hold.n = 0;
+    s_hold.active = 0; s_hold.token = 0;
+    pthread_cond_broadcast(&s_hold_cv);
+}
+
+/* queue_mu held: until no reservation holds original submissions. */
+static void vk_hold_wait_locked(void)
+{
+    while (s_hold.active) pthread_cond_wait(&s_hold_cv, &s_vk.queue_mu);
+}
+
+/* A fence of a held submission is not on the queue yet, and the releasing
+ * thread will pass it to vkQueueSubmit, which needs it externally
+ * synchronised: read its status as pending, and wait for the release before
+ * waiting on it. */
+static int vk_hold_has_locked(VkFence f)
+{
+    if (!s_hold.active || !f) return 0;
+    for (uint32_t i = 0; i < s_hold.n; i++) if (s_hold.q[i].fence == f) return 1;
+    return 0;
+}
+static VkResult vk_fence_status(VkFence f)
+{
+    pthread_mutex_lock(&s_vk.queue_mu);
+    const int held = vk_hold_has_locked(f);
+    pthread_mutex_unlock(&s_vk.queue_mu);
+    return held ? VK_NOT_READY : pvkGetFenceStatus(s_vk.device, f);
+}
+static VkResult vk_fence_wait(VkFence f)
+{
+    pthread_mutex_lock(&s_vk.queue_mu);
+    while (vk_hold_has_locked(f)) pthread_cond_wait(&s_hold_cv, &s_vk.queue_mu);
+    pthread_mutex_unlock(&s_vk.queue_mu);
+    return pvkWaitForFences(s_vk.device, 1, &f, VK_TRUE, UINT64_MAX);
+}
+
 static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
 {
     pthread_mutex_lock(&s_vk.queue_mu);
-    const VkResult r = pvkQueueSubmit(s_vk.queue, 1, si, fence);
+    const VkResult r = s_hold.active ? vk_hold_push(si, fence) : pvkQueueSubmit(s_vk.queue, 1, si, fence);
     vulkan_owner_submitted(r);
     if(vulkan_owner_enabled()&&r==VK_SUCCESS&&s_vulkan_owner_thread.original_depth&&!s_vulkan_owner.failed){
         s_vulkan_boundary_fence=fence;
@@ -690,6 +808,7 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
 static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
 {
     pthread_mutex_lock(&s_vk.queue_mu);
+    vk_hold_wait_locked();               /* it waits on a semaphore a held submission signals */
     const VkResult r = pvkQueuePresentKHR(s_vk.queue, pi);
     pthread_mutex_unlock(&s_vk.queue_mu);
     return r;
@@ -699,6 +818,7 @@ static void vk_device_idle(void)
 {
     if (!s_vk.device || !pvkDeviceWaitIdle) return;
     pthread_mutex_lock(&s_vk.queue_mu);
+    vk_hold_wait_locked();               /* held work is not on the queue yet */
     VkResult status=pvkDeviceWaitIdle(s_vk.device);
     if(status!=VK_SUCCESS)vulkan_owner_fault();
     pthread_mutex_unlock(&s_vk.queue_mu);
@@ -752,7 +872,7 @@ static int vk_submit_and_wait_core(void)
     VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
     VK_CHECK(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit");
     s_vk.frontend_recording = 0;
-    VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    VK_CHECK(vk_fence_wait(s_vk.fence), "vkWaitForFences");
     return 0;
 }
 
@@ -2085,7 +2205,7 @@ static void vk_present_window(void)
     if (vk_queue_submit(&si, s_vk.window_fence) != VK_SUCCESS) {
         VK_LOG("vkQueueSubmit (window) failed\n"); return;
     }
-    pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence, VK_TRUE, UINT64_MAX);
+    vk_fence_wait(s_vk.window_fence);
 
     VkPresentInfoKHR pi = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -2131,14 +2251,14 @@ static void vk_dump_ppm(const unsigned char* rgba)
 static void vk_present_wait_gpu(void)
 {
     if (__atomic_load_n(&s_vk.present_inflight, __ATOMIC_ACQUIRE) && s_vk.present_fence)
-        pvkWaitForFences(s_vk.device, 1, &s_vk.present_fence, VK_TRUE, UINT64_MAX);
+        vk_fence_wait(s_vk.present_fence);
 }
 
 /* present_mu held. */
 static void vk_present_complete_locked(void)
 {
     if (!s_vk.present_inflight) return;
-    pvkWaitForFences(s_vk.device, 1, &s_vk.present_fence, VK_TRUE, UINT64_MAX);
+    vk_fence_wait(s_vk.present_fence);
     __atomic_store_n(&s_vk.present_inflight, 0, __ATOMIC_RELEASE);
 
     vk_invalidate(&s_vk.readback);
@@ -3854,10 +3974,10 @@ static int vk_e5_reap(u64 until, int wait)
 {
     while (s_e5.count) {
         vk_e5_slot* sl = &s_e5.slot[s_e5.head];
-        VkResult r = pvkGetFenceStatus(s_vk.device, sl->fence);
+        VkResult r = vk_fence_status(sl->fence);
         if (r == VK_NOT_READY && wait && sl->ticket <= until) {
-            r = pvkWaitForFences(s_vk.device, 1, &sl->fence, VK_TRUE, UINT64_MAX);
-            if (r == VK_SUCCESS) r = pvkGetFenceStatus(s_vk.device, sl->fence);
+            r = vk_fence_wait(sl->fence);
+            if (r == VK_SUCCESS) r = vk_fence_status(sl->fence);
         }
         if (r == VK_NOT_READY) break;
         if (r != VK_SUCCESS) { vk_e5_fail("completion fence"); return -1; }
@@ -5212,6 +5332,8 @@ static int vulkan_borrow_begin(void* user,uint64_t life){
         s_vulkan_owner.failed=1;rsx_owner_native_end(&s_vulkan_owner,&s_vulkan_owner_thread);return -6;}
     if(s_vulkan_partial_primitives||s_vk.frontend_recording||pthread_mutex_trylock(&s_vk.present_mu)){rsx_owner_native_end(&s_vulkan_owner,&s_vulkan_owner_thread);return -4;}
     if(pthread_mutex_trylock(&s_vk.queue_mu)){pthread_mutex_unlock(&s_vk.present_mu);rsx_owner_native_end(&s_vulkan_owner,&s_vulkan_owner_thread);return -4;}
+    /* A reservation holds original work: nothing native may overtake it. */
+    if(s_hold.active){pthread_mutex_unlock(&s_vk.queue_mu);pthread_mutex_unlock(&s_vk.present_mu);rsx_owner_native_end(&s_vulkan_owner,&s_vulkan_owner_thread);return -4;}
     return 0;
 }
 static void vulkan_borrow_end(void* user,uint64_t life){
@@ -5276,7 +5398,7 @@ int rsx_vulkan_backend_native_boundary(uint64_t *ticket){
                 else if(!s_vulkan_boundary_commit||!s_vulkan_boundary_fence)status=-4;
                 else if(s_vulkan_boundary_generation!=s_vulkan_owner.generation)status=-3;
                 else{
-                    VkResult result=pvkGetFenceStatus(s_vk.device,s_vulkan_boundary_fence);
+                    VkResult result=vk_hold_has_locked(s_vulkan_boundary_fence)?VK_NOT_READY:pvkGetFenceStatus(s_vk.device,s_vulkan_boundary_fence);
                     /* An asynchronous completion ticket (E5) is an ordered,
                      * submitted boundary even before it signals, as Metal's
                      * async boundary is: native work queued after it runs
@@ -5413,5 +5535,45 @@ int rsx_vulkan_backend_borrow_image(uint64_t life,uint32_t handle,rsx_native_ima
         }
     }
     vulkan_owner_finish(1);return status;
+}
+/* Reserved queue order, see vk_queue_submit. reserve: under the native lease
+ * only (try_begin held on this thread). submit: any thread, without it. */
+static int vulkan_order_reserve(void* user, uint64_t life, uint64_t* token)
+{
+    if (!token) return -1;
+    *token = 0;
+    if (user != &s_vulkan_owner || !life || life != s_vulkan_owner.generation) return -3;
+    /* The lease holds queue_mu on this thread: hold state is ours to change. */
+    if (s_vulkan_owner_thread.gate != &s_vulkan_owner || !s_vulkan_owner_thread.native) return -4;
+    if (s_vulkan_owner.failed || atomic_load(&s_vk_eng_failed)) return -6;
+    if (s_hold.active) return -4;
+    if (s_hold.next_token == UINT64_MAX) return -6;
+    s_hold.active = 1; s_hold.token = ++s_hold.next_token; s_hold.reservations++;
+    *token = s_hold.token;
+    return 0;
+}
+static int vulkan_order_submit(void* user, uint64_t life, uint64_t token, const void* submit_info, void* fence)
+{
+    if (user != &s_vulkan_owner || !life || life != s_vulkan_owner.generation) return -3;
+    pthread_mutex_lock(&s_vk.queue_mu);
+    if (!s_hold.active || !token || token != s_hold.token) { pthread_mutex_unlock(&s_vk.queue_mu); return -3; }
+    VkResult r = VK_SUCCESS;
+    if (submit_info) {
+        r = pvkQueueSubmit(s_vk.queue, 1, (const VkSubmitInfo*)submit_info, (VkFence)fence);
+        if (r != VK_SUCCESS) s_hold.failures++;
+    } else s_hold.abandoned++;
+    vk_hold_release_locked();            /* after the native batch, whatever its result */
+    pthread_mutex_unlock(&s_vk.queue_mu);
+    return (int)r;
+}
+int rsx_vulkan_backend_queue_order(rsx_native_queue_order* out)
+{
+    if (!out || out->abi_version != RSX_NATIVE_QUEUE_ORDER_ABI || out->struct_size != sizeof(*out)) return -1;
+    if (!vulkan_owner_enabled()) return -2;
+    if (!s_vk.device || !s_vk.queue || !s_vulkan_owner.generation || s_vulkan_owner.closing) return -3;
+    *out = (rsx_native_queue_order){ .abi_version = RSX_NATIVE_QUEUE_ORDER_ABI, .struct_size = sizeof(*out),
+        .lifetime = s_vulkan_owner.generation, .userdata = &s_vulkan_owner,
+        .reserve = vulkan_order_reserve, .submit = vulkan_order_submit };
+    return 0;
 }
 #endif /* !_WIN32 */

@@ -39,7 +39,7 @@ def main():
         for batched in ('0','1'):
             result=subprocess.run([str(binary),str(int(args.require_hardware)),args.vendor_id,args.device_id],env=dict(environment,PS3RECOMP_VK_BATCHED_ENGINE=batched),capture_output=True,text=True,timeout=20)
             print(result.stdout,end='');print(result.stderr,end='');result.check_returncode()
-            if 'VUID-'in result.stdout+result.stderr:raise RuntimeError('Vulkan validation rejected the fixture')
+            if any(m in result.stdout+result.stderr for m in('VUID-','THREADING ERROR')):raise RuntimeError('Vulkan validation rejected the fixture')
         if args.report:
             tracked=sources+['libs/video/rsx_vulkan_backend.c','libs/video/rsx_vulkan_backend.h','libs/video/rsx_native_owner.h','libs/video/rsx_native_owner_gate.h','libs/video/rsx_original_owner.h','tools/check_native_owner_vulkan.py']
             record={'status':'passed','evidence':'actual provider lifecycle and queue boundaries; no frontend shader/game acceptance','hardware_required':args.require_hardware,
