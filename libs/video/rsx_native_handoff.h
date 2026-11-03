@@ -116,6 +116,53 @@ int rsx_draw_engine_native_image(const rsx_native_image_key*, rsx_native_image_m
  * 0 = known clears cover requested planes; -3 = absent/ambiguous allocation;
  * -5 = missing initialization; -1 invalid; -6 decoder failed. No GPU wait. */
 int rsx_draw_engine_native_image_clear_planes(uint32_t handle, uint32_t required_planes);
+/* Explicit external native-pass continuation. Caller holds the serialized FIFO
+ * consumer lease and genuine retained HostImage identities through this call.
+ * The native generation/ticket name an accepted queued submission, never GPU
+ * completion. All rows are validated before any decoder mutation. Ordered
+ * repeated image keys retain the last producer's AA-expanded logical clip;
+ * physical allocation/canvas dimensions cannot substitute for that clip.
+ * Potential writes dirty caches but do not initialize any uncleared plane.
+ * Passive words exclude programs/array pointers/execution methods. Constants
+ * and current attributes contain only source-known actual writes; other rows
+ * remain unchanged. Subsequent original draws must bind fresh VP instructions,
+ * FP address/control and any consumed array addresses/formats/base state.
+ * Status0 success; -1 invalid, -3 stale identity, -4 busy, -5 budget, -6 failed.
+ */
+typedef struct rsx_native_external_image_write {
+    rsx_native_image_key key;
+    uint32_t native_handle, planes, source_clip_width, source_clip_height;
+} rsx_native_external_image_write;
+typedef struct rsx_native_register_write { uint32_t method, value; } rsx_native_register_write;
+typedef struct rsx_native_vector_write { uint32_t index, words[4]; } rsx_native_vector_write;
+typedef struct rsx_native_external_pass {
+    uint32_t abi_version, struct_size;
+    uint64_t source_observation, native_generation, native_ticket;
+    const rsx_native_external_image_write* writes;
+    uint32_t write_count, reserved;
+    const rsx_native_register_write* registers;
+    uint32_t register_count, reserved1;
+    const rsx_native_vector_write* constants;
+    uint32_t constant_count, reserved2;
+    const rsx_native_vector_write* current_attributes;
+    uint32_t current_attribute_count, reserved3;
+} rsx_native_external_pass;
+int rsx_draw_engine_native_publish_external(const rsx_native_external_pass*);
+/* A candidate-only guard failure names the native publication and missing
+ * original bind. failure:1 VP start,2 VP words,3 FP address,4 FP control,
+ * 5 array format,6 array offset,7 array base,8 missing resident program,
+ * 9 indexed address/type,10 candidate late failure. detail is the missing method/word/array index. */
+typedef struct rsx_native_external_status {
+    uint32_t abi_version, struct_size, active, failure;
+    uint64_t source_observation, native_generation, native_ticket;
+    uint32_t vp_start, detail;
+} rsx_native_external_status;
+int rsx_draw_engine_native_external_status(rsx_native_external_status*);
+/* Candidate failure only: prevent later original draws until owned lifecycle
+ * stop. Does not publish guest completion, mutate passive state, or wait for
+ * GPU work. Zero native identities explicitly mean no queued witness known. */
+int rsx_draw_engine_native_abort_external(uint64_t source_observation,
+    uint64_t native_generation,uint64_t native_ticket,int32_t reason);
 #ifdef __cplusplus
 }
 #endif

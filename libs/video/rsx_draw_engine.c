@@ -12,6 +12,7 @@
  */
 #include <stdatomic.h>
 #include "rsx_draw_engine.h"
+#include "rsx_native_handoff.h"
 static _Atomic(const rsx_original_owner_hooks*) s_original_owner_hooks;
 void rsx_draw_engine_set_owner_hooks(const rsx_original_owner_hooks* hooks){
     atomic_store_explicit(&s_original_owner_hooks,hooks,memory_order_release);
@@ -236,6 +237,42 @@ static atomic_int s_checked_ready, s_checked_failed;
 static atomic_int s_checked_fail_line;
 static void eng_checked_fail_at(int line);
 #define ENG_CHECKED_FAIL() eng_checked_fail_at(__LINE__)
+/* Activated only by the explicit external-pass publication API. Word/array
+ * coverage describes actual subsequent guest method writes, not upload hints. */
+static struct {
+    rsx_native_external_status status;
+    u8 vp_words[RSX_DSP_VP_WORDS];
+    u16 array_formats, array_offsets;
+    u8 vp_start, fp_address, fp_control, bases, indices, frequency;
+} s_external;
+static int eng_external_fail(u32 reason, u32 detail)
+{
+    if (!s_external.status.failure) {
+        s_external.status.failure=reason;s_external.status.detail=detail;
+        s_external.status.vp_start=rsx_dsp_vp_start(&g.rsx);
+        fprintf(stderr,"[rsx external continuation] publication=%llu native_generation=%llu native_ticket=%llu reason=%u detail=%u vp_start=%u\n",
+                (unsigned long long)s_external.status.source_observation,
+                (unsigned long long)s_external.status.native_generation,
+                (unsigned long long)s_external.status.native_ticket,reason,detail,s_external.status.vp_start);
+    }
+    ENG_CHECKED_FAIL();return 0;
+}
+static int eng_external_programs_fresh(void)
+{
+    if (!s_external.status.active) return 1;
+    if (s_external.status.failure) return 0;
+    if (!s_external.vp_start) return eng_external_fail(1,0x1EA0);
+    const u32 start=rsx_dsp_vp_start(&g.rsx);
+    if (start>=RSX_DSP_VP_INSTR) return eng_external_fail(2,start*4);
+    const u32 count=rsx_vp_program_size_instrs((const u8*)(g.rsx.vp+start*4),
+                                              (RSX_DSP_VP_INSTR-start)*16u);
+    for (u32 i=start*4;i<(count?(start+count)*4:RSX_DSP_VP_WORDS);++i)
+        if (!s_external.vp_words[i]) return eng_external_fail(2,i);
+    if (!count) return eng_external_fail(2,RSX_DSP_VP_WORDS);
+    if (!s_external.fp_address) return eng_external_fail(3,0x08E4);
+    if (!s_external.fp_control) return eng_external_fail(4,0x1D60);
+    return 1;
+}
 static atomic_uint_fast64_t s_dirty_generation;
 static char s_vs_hlsl[256 * 1024];
 static char s_ps_hlsl[256 * 1024];
@@ -3754,8 +3791,23 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
         if (topology == RSX_TOPOLOGY_UNSUPPORTED) {ENG_CHECKED_FAIL();return;}
     }
 
+    if (!eng_external_programs_fresh()) return;
+    if (s_external.status.active && !eng_guest_programs(NULL,NULL,NULL,NULL)) {
+        (void)eng_external_fail(8,0x08E4);return;
+    }
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
+    if (s_external.status.active && !dc.n_immediate) {
+        for (u32 i=0;i<RSX_DSP_NUM_VERTEX_ATTR;++i) if (layout.mask&(1u<<i)) {
+            if (!(s_external.array_formats&(1u<<i))) { (void)eng_external_fail(5,i);return; }
+            rsx_dsp_vertex_attr attr;rsx_dsp_get_vertex_attr(&g.rsx,i,&attr);
+            if (!attr.size || dc.inl_bytes) continue;
+            if (!(s_external.array_offsets&(1u<<i))) { (void)eng_external_fail(6,i);return; }
+            if (s_external.bases!=3) { (void)eng_external_fail(7,s_external.bases!=1?0x1738:0x173C);return; }
+            if (attr.frequency>1 && !s_external.frequency) { (void)eng_external_fail(7,0x1FEC);return; }
+        }
+        if (dc.n_idx && s_external.indices!=3) { (void)eng_external_fail(9,s_external.indices!=1?0x181C:0x1820);return; }
+    }
     DRAW_OBSERVER_STAGE("fetch");
     dc_fetch(&layout, rebuild);
     if (!dc.n_verts || !dc.fetch_ok) {ENG_CHECKED_FAIL();return;}
@@ -4155,6 +4207,7 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
+    memset(&s_external,0,sizeof(s_external));
     atomic_store(&s_checked_failed, 0);
     atomic_store(&s_checked_ready, g.be->submit_and_wait_checked != NULL);
     /* Display buffers the title registered before the backend came up. */
@@ -4223,6 +4276,21 @@ static void eng_method_core(u32 method, u32 arg)
         }
         rsx_picture_release(s_picture_bound[unit]);s_picture_bound[unit]=0;
         s_picture_offset_ea[unit]=s_picture_command_ea;s_picture_offset_pending[unit]=1;
+    }
+    if (s_external.status.active) {
+        if (m>=0x0B80 && m<0x0C00) {
+            const u64 pos=(u64)rsx_dsp_reg(&g.rsx,0x1E9C)*4+(((m-0x0B80)>>2)&3);
+            if (pos<RSX_DSP_VP_WORDS) s_external.vp_words[pos]=1;
+        } else if (m==0x1EA0) s_external.vp_start=1;
+        else if (m==0x08E4) s_external.fp_address=1;
+        else if (m==0x1D60) s_external.fp_control=1;
+        else if (m>=0x1740 && m<0x1780) s_external.array_formats|=(u16)(1u<<((m-0x1740)/4));
+        else if (m>=0x1680 && m<0x16C0) s_external.array_offsets|=(u16)(1u<<((m-0x1680)/4));
+        else if (m==0x1738) s_external.bases|=1;
+        else if (m==0x173C) s_external.bases|=2;
+        else if (m==0x181C) s_external.indices|=1;
+        else if (m==0x1820) s_external.indices|=2;
+        else if (m==0x1FEC) s_external.frequency=1;
     }
     rsx_dispatch_method(&g.rsx, m, arg);
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
@@ -4551,6 +4619,140 @@ int rsx_draw_engine_native_image(const rsx_native_image_key* key, rsx_native_ima
     }
     if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
     return status;
+}
+/* This whitelist is passive source state only. Execution, program and guest
+ * vertex/index bindings deliberately require real later original methods. */
+static int eng_external_passive(u32 m)
+{
+    if (m&3u) return 0;
+    switch(m) {
+    case 0x018C:case 0x0194:case 0x0198:case 0x01B4:case 0x01B8:
+    case 0x0200:case 0x0204:case 0x0208:case 0x020C:case 0x0210:case 0x0214:
+    case 0x0218:case 0x021C:case 0x022C:case 0x0280:case 0x0284:case 0x0288:
+    case 0x028C:case 0x02B8:case 0x1D88:case 0x1D7C:
+    case 0x0300:case 0x0304:case 0x0308:case 0x030C:case 0x0310:case 0x0314:
+    case 0x0318:case 0x031C:case 0x0320:case 0x0324:case 0x0328:case 0x032C:
+    case 0x0330:case 0x0334:case 0x0338:case 0x033C:case 0x0340:case 0x0344:
+    case 0x0348:case 0x034C:case 0x0350:case 0x0354:case 0x0358:case 0x035C:
+    case 0x0360:case 0x0364:case 0x0368:case 0x036C:case 0x0370:case 0x0374:
+    case 0x0378:case 0x037C:case 0x0380:case 0x0384:case 0x0388:case 0x038C:
+    case 0x0390:case 0x0394:case 0x0398:case 0x039C:case 0x03A0:
+    case 0x08C0:case 0x08C4:case 0x08CC:case 0x08D0:
+    case 0x0A00:case 0x0A04:case 0x0A20:case 0x0A24:case 0x0A28:case 0x0A2C:
+    case 0x0A30:case 0x0A34:case 0x0A38:case 0x0A3C:
+    case 0x0A60:case 0x0A64:case 0x0A68:case 0x0A6C:case 0x0A70:case 0x0A74:case 0x0A78:case 0x0A7C:
+    case 0x1830:case 0x1834:case 0x1838:case 0x183C:case 0x1FEC:case 0x1D78:case 0x1D90:
+    case 0x1D98:case 0x1D9C:case 0x1DA0:case 0x1DA4:case 0x1DAC:case 0x1DB0:
+    case 0x1FC0:case 0x1FF0:case 0x1FF4:return 1;
+    default:return (m>=0x1A00 && m<0x1C00) || (m>=0x1840 && m<0x1880) ||
+                   (m>=0x0B40 && m<0x0B68) || (m>=0x0B00 && m<0x0B40) ||
+                   (m>=0x1D00 && m<0x1D40);
+    }
+}
+static int eng_external_image_slot(const rsx_native_external_image_write* w,u32* slot)
+{
+    const rsx_native_image_key* k=&w->key;
+    if(k->abi_version!=1 || k->struct_size!=sizeof(*k) || k->reserved[0] || k->reserved[1] ||
+       k->kind>1 || k->location>RSX_LOCATION_MAIN || !k->width || !k->height ||
+       k->width>ENG_MAX_SURFACE_DIM || k->height>ENG_MAX_SURFACE_DIM || k->format>31 ||
+       !w->native_handle || !w->planes || !w->source_clip_width || !w->source_clip_height ||
+       w->source_clip_width>k->width || w->source_clip_height>k->height ||
+       (k->kind==0 ? (w->planes!=1 || (k->aa_grid!=0x101 && k->aa_grid!=0x102 && k->aa_grid!=0x202)) :
+                    ((w->planes&~6u) || k->aa_grid || (k->format==1 && (w->planes&4))))) return -1;
+    u32 found=0;
+    if(k->kind==0) for(u32 i=0;i<g.n_surfaces;++i) {
+        const eng_surface* v=&g.surfaces[i];
+        if(v->handle==w->native_handle && v->location==k->location && v->offset==k->offset &&
+           v->pitch==k->pitch && v->fmt==eng_surface_format(k->format) && v->w==k->width &&
+           v->h==k->height && v->aa_grid==k->aa_grid){*slot=i;++found;}
+    } else for(u32 i=0;i<g.n_zdepths;++i) {
+        const eng_zdepth* v=&g.zdepths[i];
+        if(v->handle==w->native_handle && v->location==k->location && v->offset==k->offset &&
+           v->pitch==k->pitch && v->zfmt==k->format && v->w==k->width && v->h==k->height){*slot=i;++found;}
+    }
+    return found==1?0:-3;
+}
+int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
+{
+    if(!p || p->abi_version!=1 || p->struct_size!=sizeof(*p) || !p->source_observation ||
+       !p->native_generation || !p->native_ticket || p->reserved || p->reserved1 || p->reserved2 || p->reserved3 ||
+       (p->write_count&&!p->writes) || (p->register_count&&!p->registers) ||
+       (p->constant_count&&!p->constants) || (p->current_attribute_count&&!p->current_attributes)) return -1;
+    if(p->write_count>4096 || p->register_count>256 || p->constant_count>512 || p->current_attribute_count>16) return -5;
+    for(u32 i=0;i<p->register_count;++i) if(!eng_external_passive(p->registers[i].method))return -1;
+    for(u32 i=0;i<p->constant_count;++i) if(p->constants[i].index>=RSX_DSP_NUM_CONSTANTS)return -1;
+    for(u32 i=0;i<p->current_attribute_count;++i) if(p->current_attributes[i].index>=RSX_DSP_NUM_VERTEX_ATTR)return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
+    int status=0;u32 slots[4096];
+    if(!g.ready)status=-3;
+    else if(atomic_load(&s_checked_failed))status=-6;
+    else if(g.rsx.in_begin_end)status=-4;
+    else if(UINT64_MAX-g.write_serial<p->write_count)status=-5;
+    for(u32 i=0;!status&&i<p->write_count;++i)status=eng_external_image_slot(&p->writes[i],&slots[i]);
+    if(!status) {
+        for(u32 i=0;i<p->write_count;++i) {
+            const rsx_native_external_image_write* w=&p->writes[i];
+            if(w->key.kind==0) {
+                eng_surface* v=&g.surfaces[slots[i]];v->color_serial=++g.write_serial;v->guest_dirty=1;
+            } else {
+                eng_zdepth* v=&g.zdepths[slots[i]];v->depth_serial=++g.write_serial;v->guest_dirty=1;
+                v->snapshot_valid=0;
+                if(w->planes&2)v->had_write=1;
+                v->used_w=w->source_clip_width;v->used_h=w->source_clip_height;
+            }
+        }
+        for(u32 i=0;i<p->register_count;++i) {
+            const rsx_native_register_write* r=&p->registers[i];
+            g.rsx.regs[r->method>>2]=r->value;
+            if(r->method>=0x1A00 && r->method<0x1C00 && ((r->method&31u)==0 || (r->method&31u)==4)) {
+                const u32 unit=(r->method-0x1A00)/32;
+                rsx_picture_release(s_picture_bound[unit]);s_picture_bound[unit]=0;
+                s_picture_offset_pending[unit]=0;s_picture_offset_ea[unit]=0;
+            }
+        }
+        for(u32 i=0;i<p->constant_count;++i)memcpy(g.rsx.constants[p->constants[i].index],p->constants[i].words,16);
+        for(u32 i=0;i<p->current_attribute_count;++i) {
+            const rsx_native_vector_write* v=&p->current_attributes[i];
+            for(u32 j=0;j<4;++j){const u32 idx=(0x1C00+v->index*16+j*4)>>2;
+                g.rsx.regs[idx]=v->words[j];g.rsx.seen[idx]=1;}
+        }
+        memset(&s_external,0,sizeof(s_external));
+        s_external.status=(rsx_native_external_status){.abi_version=1,.struct_size=sizeof(rsx_native_external_status),.active=1,
+            .source_observation=p->source_observation,.native_generation=p->native_generation,.native_ticket=p->native_ticket};
+    }
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+    return status;
+}
+int rsx_draw_engine_native_abort_external(uint64_t source,uint64_t generation,uint64_t ticket,int32_t reason)
+{
+    if(!source || !reason)return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
+    int result=0;
+    if(!g.ready)result=-3;
+    else {
+        if(!s_external.status.failure) {
+            s_external.status=(rsx_native_external_status){.abi_version=1,.struct_size=sizeof(rsx_native_external_status),
+                .active=1,.failure=10,.source_observation=source,.native_generation=generation,.native_ticket=ticket,
+                .detail=(uint32_t)reason,.vp_start=rsx_dsp_vp_start(&g.rsx)};
+        } else if(s_external.status.source_observation==source) {
+            if(generation)s_external.status.native_generation=generation;
+            if(ticket)s_external.status.native_ticket=ticket;
+        }
+        ENG_CHECKED_FAIL();
+    }
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+    return result;
+}
+int rsx_draw_engine_native_external_status(rsx_native_external_status* out)
+{
+    if(!out || out->abi_version!=1 || out->struct_size!=sizeof(*out))return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_READ))return -4;
+    *out=s_external.status;out->abi_version=1;out->struct_size=sizeof(*out);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
+    return 0;
 }
 int rsx_draw_engine_native_image_clear_planes(uint32_t handle, uint32_t required)
 {
