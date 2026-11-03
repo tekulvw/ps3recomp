@@ -48,6 +48,29 @@ typedef struct rsx_native_handoff_arm {
 int cellGcm_native_handoff_arm(const rsx_native_handoff_arm*, uint64_t* cookie);
 int cellGcm_native_handoff_publish(uint64_t cookie);
 int cellGcm_native_handoff_cancel(uint64_t cookie);
+/* A distinct producer-owned Main-style ring writer. The caller owns the real
+ * state record and ring span; this API does not turn a guessed address into a
+ * writer lease. Arm before writing/releasing its first packet. Publish checks
+ * the unchanged four-word writer state and exact packet bytes BEFORE PUT can
+ * expose them. It does not use or advance a PPE GCM context. The source owner
+ * must retain the actual VM/allocation/publication identity through consume or
+ * cancel. All ordinary handoff cancellation/lifetime rules apply. */
+typedef struct rsx_native_handoff_ring_event {
+    uint32_t abi_version, struct_size;
+    rsx_native_handoff_event source;
+    uint32_t writer_state_ea, ring_begin_ea, ring_bytes, reserved;
+} rsx_native_handoff_ring_event;
+typedef void (*rsx_native_handoff_ring_fn)(void*, const rsx_native_handoff_ring_event*);
+typedef struct rsx_native_handoff_ring_arm {
+    uint32_t abi_version, struct_size;
+    uint64_t vm_identity, source_observation;
+    uint32_t writer_state_ea, ring_begin_ea, ring_bytes, header_ea;
+    uint32_t expected_header, expected_argument;
+    void* userdata;
+    rsx_native_handoff_ring_fn consume;
+} rsx_native_handoff_ring_arm;
+int cellGcm_native_handoff_ring_arm(const rsx_native_handoff_ring_arm*, uint64_t* cookie);
+int cellGcm_native_handoff_ring_publish(uint64_t cookie);
 /* Read-only actual dispatch decoder snapshot; caller holds consumer lease.
  * Returns 1 for a qualified existing color-A allocation; otherwise 0. */
 int rsx_draw_engine_native_source_target(rsx_native_source_target* out);
@@ -61,6 +84,11 @@ int rsx_draw_engine_native_source_target(rsx_native_source_target* out);
  * then govern retention and validation. This does not certify GPU completion.
  * Returns 1 for one exact existing allocation, 0 for absent/ambiguous, negative
  * for invalid/busy/stale/failed. The result is unretained metadata only. */
+/* queued_clear_planes bits: color1, depth2, stencil4. These record actual
+ * full-allocation clear commands since allocation, not arbitrary draw writes,
+ * GPU completion or scene/content identity. They become usable initialization
+ * evidence only with a successful original native boundary and the exact
+ * source association under the same serialized consumer/owner lease. */
 enum rsx_native_image_kind { RSX_NATIVE_COLOR_IMAGE=0, RSX_NATIVE_DEPTH_IMAGE=1 };
 typedef struct rsx_native_image_key {
     uint32_t abi_version, struct_size, kind, location;
@@ -68,9 +96,16 @@ typedef struct rsx_native_image_key {
 } rsx_native_image_key;
 typedef struct rsx_native_image_match {
     uint32_t abi_version, struct_size, kind, native_handle;
-    uint32_t width, height, reserved[2];
+    uint32_t width, height, queued_clear_planes, reserved;
 } rsx_native_image_match;
 int rsx_draw_engine_native_image(const rsx_native_image_key*, rsx_native_image_match*);
+/* Protected read for a native image provider's validate-planes callback.
+ * Caller MUST first validate the retained image identity under its native owner
+ * lease, which excludes original decoder mutation. This never acquires an
+ * original-owner gate recursively. required_planes must be nonzero/subset7.
+ * 0 = known clears cover requested planes; -3 = absent/ambiguous allocation;
+ * -5 = missing initialization; -1 invalid; -6 decoder failed. No GPU wait. */
+int rsx_draw_engine_native_image_clear_planes(uint32_t handle, uint32_t required_planes);
 #ifdef __cplusplus
 }
 #endif

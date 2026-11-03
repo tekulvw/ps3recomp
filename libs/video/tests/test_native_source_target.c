@@ -21,6 +21,7 @@ int main(void) {
         .height=target.native_height,.aa_grid=0x101};
     rsx_native_image_match match={.abi_version=1,.struct_size=sizeof(match)};
     assert(rsx_draw_engine_native_image(&key,&match)==1&&match.native_handle==target.native_surface);
+    assert(match.queued_clear_planes==1);
     const uint32_t original_handle=match.native_handle;
     m(0x0a38,0x3f000000);m(0x0a28,0x3f000000);
     assert(rsx_draw_engine_native_source_target(&target));
@@ -46,13 +47,27 @@ int main(void) {
     m(M_SURFACE_FORMAT,8u|(2u<<5));
     m(M_ZETA_OFFSET,ZETA_OFFSET);m(M_ZETA_PITCH,256u*4u);
     m(M_COLOR_A_OFFSET,ZETA_OFFSET);m(M_COLOR_MASK,0);
-    m(M_DEPTH_TEST,1);m(M_DEPTH_WRITE,1);draw_triangle();
+    m(M_DEPTH_TEST,1);m(M_DEPTH_WRITE,1);
+    m(M_CLEAR_BUFFERS,RSX_CLEAR_DEPTH);draw_triangle();
     key.offset=ZETA_OFFSET;key.pitch=256u*4u;key.format=2;
     /* The real decoder allocates depth to at least the 1280x720 canvas. */
     assert(!rsx_draw_engine_native_image(&key,&match));
     key.width=1280;key.height=720;
     assert(rsx_draw_engine_native_image(&key,&match)==1);
     assert(match.kind==RSX_NATIVE_DEPTH_IMAGE&&match.native_handle&&match.width==1280&&match.height==720);
+    assert(match.queued_clear_planes==2); // A draw does not initialize uncleared stencil.
+    assert(!rsx_draw_engine_native_image_clear_planes(match.native_handle,2));
+    assert(rsx_draw_engine_native_image_clear_planes(match.native_handle,4)==-5);
+    assert(rsx_draw_engine_native_image_clear_planes(match.native_handle,0)==-1);
+    assert(rsx_draw_engine_native_image_clear_planes(UINT32_MAX,2)==-3);
+    m(M_CLEAR_BUFFERS,RSX_CLEAR_DEPTH);
+    assert(rsx_draw_engine_native_image(&key,&match)==1&&match.queued_clear_planes==2);
+    m(M_CLEAR_BUFFERS,RSX_CLEAR_STENCIL);
+    assert(rsx_draw_engine_native_image(&key,&match)==1&&match.queued_clear_planes==6);
+    /* A new source depth allocation must not inherit another one's clears. */
+    key.offset=ZETA_OFFSET+0x200000;
+    m(M_ZETA_OFFSET,key.offset);m(M_CLEAR_BUFFERS,RSX_CLEAR_STENCIL);draw_triangle();
+    assert(rsx_draw_engine_native_image(&key,&match)==1&&match.queued_clear_planes==4);
     key.reserved[0]=1;
     assert(rsx_draw_engine_native_image(&key,&match)==-1&&!match.native_handle);
     engine_down();free(vm_base);puts("PASS: actual dispatch target snapshot refuses missing/stale/partial targets without allocation");return 0;

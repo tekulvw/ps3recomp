@@ -5702,6 +5702,12 @@ static int metal_image_validate(void *user,uint64_t life,uint64_t id,uint64_t ge
  if(s_metal_owner.failed||fps_backend_failed())return -6;
  return metal_image_identity(life,id,generation,0);
 }
+int rsx_metal_backend_validate_image_planes(void *user,uint64_t life,uint64_t id,uint64_t generation,uint32_t required){
+ if(!required||(required&~7u)||id>UINT32_MAX)return -1;
+ int status=metal_image_validate(user,life,id,generation);
+ if(status)return status;
+ return rsx_draw_engine_native_image_clear_planes((uint32_t)id,required);
+}
 /* Report actual allocation format, not the guest's source format code. */
 static uint32_t metal_native_image_format(MTLPixelFormat format){
  switch(format){

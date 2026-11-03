@@ -122,6 +122,7 @@ typedef struct {
     u32 handle;
     u32 feedback;          /* last immutable own-target copy, engine-owned */
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
+    u32 queued_clear_planes; /* actual full-allocation clear commands only */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
 } eng_surface;
 
@@ -131,6 +132,7 @@ typedef struct {
     u32 handle;
     u32 snapshot;          /* sampleable copy, or 0                        */
     int cleared;
+    u32 queued_clear_planes; /* depth2/stencil4, not arbitrary draw writes */
     int had_write;
     int snapshot_valid;
     u64 depth_serial;      /* g.write_serial of the last depth write or clear */
@@ -690,6 +692,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
     s->handle = handle;
     s->color_serial = 0;
+    s->queued_clear_planes = 0;
     s->guest_dirty = 0;
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 16))
@@ -969,6 +972,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->handle = handle;
     z->snapshot = 0;
     z->cleared = 0;
+    z->queued_clear_planes = 0;
     z->had_write = 0;
     z->snapshot_valid = 0;
     z->depth_serial = 0;
@@ -3880,6 +3884,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
                                   RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL,
                                   1.0f, 0);
         g.zdepths[zslot].cleared = 1;
+        g.zdepths[zslot].queued_clear_planes |= 6u;
         g.zdepths[zslot].had_write = 0;
     }
 
@@ -3986,8 +3991,10 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         /* Every target the set names, not only A: a deferred pass clears its
          * whole G-buffer in one CLEAR_SURFACE, and B, C and D would otherwise
          * keep whatever the last frame left in them. */
-        for (u32 i = 0; i < n_targets; i++)
+        for (u32 i = 0; i < n_targets; i++) {
             g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
+            g.surfaces[targets[i]].queued_clear_planes |= 1u;
+        }
         eng_surfaces_wrote(targets, n_targets);
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
@@ -4013,6 +4020,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
                                   depth, z16 ? 0 : (u8)(zs & 0xFFu));
         g.zdepths[zslot].cleared = 1;
+        if (mask & RSX_CLEAR_DEPTH) g.zdepths[zslot].queued_clear_planes |= 2u;
+        if (mask & RSX_CLEAR_STENCIL) g.zdepths[zslot].queued_clear_planes |= 4u;
         if (mask & RSX_CLEAR_DEPTH) {
             /* A clear invalidates the older published depth image; the next
              * texture consumer resolves the newly written pass exactly once. */
@@ -4476,7 +4485,7 @@ int rsx_draw_engine_native_image(const rsx_native_image_key* key, rsx_native_ima
     const rsx_original_owner_hooks* owner = atomic_load_explicit(&s_original_owner_hooks, memory_order_acquire);
     if (owner && !owner->begin(owner->user, RSX_ORIGINAL_READ)) return -4;
     int status = 0;
-    uint32_t handle = 0;
+    uint32_t handle = 0, clear_planes = 0;
     if (!g.ready) status = -3;
     else if (atomic_load(&s_checked_failed)) status = -6;
     else if (g.rsx.in_begin_end) status = -4;
@@ -4489,7 +4498,7 @@ int rsx_draw_engine_native_image(const rsx_native_image_key* key, rsx_native_ima
                 surface->w != key->width || surface->h != key->height ||
                 surface->aa_grid != key->aa_grid) continue;
             if (handle) { handle = 0; break; }
-            handle = surface->handle;
+            handle = surface->handle; clear_planes = surface->queued_clear_planes;
         }
     } else {
         for (u32 i = 0; i < g.n_zdepths; ++i) {
@@ -4499,16 +4508,33 @@ int rsx_draw_engine_native_image(const rsx_native_image_key* key, rsx_native_ima
                 surface->zfmt != key->format || surface->w != key->width ||
                 surface->h != key->height) continue;
             if (handle) { handle = 0; break; }
-            handle = surface->handle;
+            handle = surface->handle; clear_planes = surface->queued_clear_planes;
         }
     }
     if (handle) {
         out->kind = key->kind; out->native_handle = handle;
         out->width = key->width; out->height = key->height;
+        out->queued_clear_planes = clear_planes;
         status = 1;
     }
     if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
     return status;
+}
+int rsx_draw_engine_native_image_clear_planes(uint32_t handle, uint32_t required)
+{
+    if (!handle || !required || (required & ~7u)) return -1;
+    if (!g.ready) return -3;
+    if (atomic_load(&s_checked_failed)) return -6;
+    unsigned matches = 0;
+    uint32_t planes = 0;
+    for (u32 i = 0; i < g.n_surfaces; ++i) if (g.surfaces[i].handle == handle) {
+        ++matches; planes = g.surfaces[i].queued_clear_planes;
+    }
+    for (u32 i = 0; i < g.n_zdepths; ++i) if (g.zdepths[i].handle == handle) {
+        ++matches; planes = g.zdepths[i].queued_clear_planes;
+    }
+    if (matches != 1) return -3;
+    return (planes & required) == required ? 0 : -5;
 }
 int rsx_draw_engine_native_source_target(rsx_native_source_target* out)
 {

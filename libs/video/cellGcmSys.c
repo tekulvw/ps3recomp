@@ -62,6 +62,9 @@ static struct {
     uintptr_t vm_base_identity;
     unsigned phase; /* 1 armed, 2 published, 3 callback active */
     rsx_native_handoff_arm source;
+    unsigned ring_writer;
+    rsx_native_handoff_ring_arm ring;
+    uint32_t writer_state[4];
 } s_native_handoffs[GCM_NATIVE_HANDOFF_CAPACITY];
 static void gcm_native_handoff_remove(unsigned i)
 {
@@ -106,6 +109,81 @@ int cellGcm_native_handoff_arm(const rsx_native_handoff_arm* source, uint64_t* c
     ReleaseSRWLockExclusive(&s_native_handoff_lock);
     return result;
 }
+int cellGcm_native_handoff_ring_arm(const rsx_native_handoff_ring_arm* source, uint64_t* cookie)
+{
+    if (cookie) *cookie = 0;
+    const uint64_t limit = ppu_vm_size ? (uint64_t)ppu_vm_size : UINT64_C(0x100000000);
+    if (!source || !cookie || source->abi_version != RSX_NATIVE_HANDOFF_ABI ||
+        source->struct_size != sizeof(*source) || !source->consume || !source->source_observation ||
+        !source->vm_identity || !vm_base || !source->writer_state_ea ||
+        (source->writer_state_ea & 3u) || (uint64_t)source->writer_state_ea + 16u > limit ||
+        !source->ring_begin_ea || (source->ring_begin_ea & 3u) || source->ring_bytes < 8u ||
+        (source->ring_bytes & 3u) || (uint64_t)source->ring_begin_ea + source->ring_bytes > limit ||
+        (source->header_ea & 3u) || source->header_ea < source->ring_begin_ea ||
+        (uint64_t)source->header_ea + 8u > (uint64_t)source->ring_begin_ea + source->ring_bytes ||
+        (source->expected_header & 0xFFFF0003u) != 0x00040000u)
+        return -1;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    uint32_t state[4];
+    for (unsigned n = 0; n < 4; ++n) state[n] = vm_read32(source->writer_state_ea + 4u * n);
+    int result = -4;
+    if (state[2] != source->header_ea || state[0] < source->ring_begin_ea ||
+        state[0] > source->header_ea || state[1] < source->header_ea + 8u ||
+        (uint64_t)state[1] > (uint64_t)source->ring_begin_ea + source->ring_bytes) {
+        result = -3;
+    } else if (s_native_handoff_next != 0) {
+        unsigned free_slot = GCM_NATIVE_HANDOFF_CAPACITY;
+        int duplicate = 0;
+        for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+            if (!s_native_handoffs[i].phase) free_slot = i;
+            else if (s_native_handoffs[i].source.vm_identity == source->vm_identity &&
+                     s_native_handoffs[i].source.header_ea == source->header_ea) duplicate = 1;
+        }
+        if (!duplicate && free_slot < GCM_NATIVE_HANDOFF_CAPACITY) {
+            rsx_native_handoff_arm* common = &s_native_handoffs[free_slot].source;
+            common->abi_version = RSX_NATIVE_HANDOFF_ABI; common->struct_size = sizeof(*common);
+            common->vm_identity = source->vm_identity; common->source_observation = source->source_observation;
+            common->context_ea = 0; common->consume = NULL;
+            common->header_ea = source->header_ea; common->expected_header = source->expected_header;
+            common->expected_argument = source->expected_argument; common->userdata = source->userdata;
+            s_native_handoffs[free_slot].ring_writer = 1;
+            s_native_handoffs[free_slot].ring = *source;
+            memcpy(s_native_handoffs[free_slot].writer_state, state, sizeof(state));
+            s_native_handoffs[free_slot].vm_base_identity = (uintptr_t)vm_base;
+            s_native_handoffs[free_slot].cookie = s_native_handoff_next++;
+            s_native_handoffs[free_slot].phase = 1;
+            *cookie = s_native_handoffs[free_slot].cookie;
+            atomic_fetch_add_explicit(&s_native_handoff_count, 1, memory_order_release);
+            result = 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    return result;
+}
+int cellGcm_native_handoff_ring_publish(uint64_t cookie)
+{
+    if (!cookie) return -3;
+    int result = -3;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+        if (s_native_handoffs[i].cookie != cookie) continue;
+        const rsx_native_handoff_ring_arm* a = &s_native_handoffs[i].ring;
+        if (s_native_handoffs[i].ring_writer && s_native_handoffs[i].phase == 1 &&
+            s_native_handoffs[i].vm_base_identity == (uintptr_t)vm_base) {
+            int same = 1;
+            for (unsigned n = 0; n < 4; ++n)
+                if (vm_read32(a->writer_state_ea + 4u * n) != s_native_handoffs[i].writer_state[n]) same = 0;
+            if (same && vm_read32(a->header_ea) == a->expected_header &&
+                vm_read32(a->header_ea + 4u) == a->expected_argument) {
+                s_native_handoffs[i].phase = 2;
+                result = 0;
+            }
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    return result;
+}
 int cellGcm_native_handoff_publish(uint64_t cookie)
 {
     if (!cookie) return -3;
@@ -114,7 +192,7 @@ int cellGcm_native_handoff_publish(uint64_t cookie)
     for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
         if (s_native_handoffs[i].cookie != cookie) continue;
         const rsx_native_handoff_arm* a = &s_native_handoffs[i].source;
-        if (s_native_handoffs[i].phase == 1 && s_native_handoffs[i].vm_base_identity == (uintptr_t)vm_base &&
+        if (!s_native_handoffs[i].ring_writer && s_native_handoffs[i].phase == 1 && s_native_handoffs[i].vm_base_identity == (uintptr_t)vm_base &&
             vm_read32(a->context_ea + 8) == a->header_ea + 8u &&
             vm_read32(a->header_ea) == a->expected_header &&
             vm_read32(a->header_ea + 4) == a->expected_argument) {
@@ -145,6 +223,8 @@ static int gcm_native_handoff_consume(u32 ea, u32 get, u32 put)
 {
     if (!atomic_load_explicit(&s_native_handoff_count, memory_order_acquire)) return 0;
     rsx_native_handoff_arm source;
+    rsx_native_handoff_ring_arm ring = {0};
+    unsigned ring_writer = 0;
     uint64_t cookie = 0;
     unsigned slot = GCM_NATIVE_HANDOFF_CAPACITY;
     int waiting = 0;
@@ -152,6 +232,8 @@ static int gcm_native_handoff_consume(u32 ea, u32 get, u32 put)
     for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
         if (!s_native_handoffs[i].phase || s_native_handoffs[i].source.header_ea != ea) continue;
         source = s_native_handoffs[i].source;
+        ring_writer = s_native_handoffs[i].ring_writer;
+        if (ring_writer) ring = s_native_handoffs[i].ring;
         if (s_native_handoffs[i].vm_base_identity != (uintptr_t)vm_base) {
             gcm_native_handoff_remove(i);
         } else if (s_native_handoffs[i].phase == 1) {
@@ -183,7 +265,13 @@ static int gcm_native_handoff_consume(u32 ea, u32 get, u32 put)
         event.fifo_get = get;
         event.fifo_put = put;
         rsx_draw_engine_native_source_target(&event.target);
-        source.consume(source.userdata, &event);
+        if (ring_writer) {
+            rsx_native_handoff_ring_event owned = {0};
+            owned.abi_version = RSX_NATIVE_HANDOFF_ABI; owned.struct_size = sizeof(owned);
+            owned.source = event; owned.writer_state_ea = ring.writer_state_ea;
+            owned.ring_begin_ea = ring.ring_begin_ea; owned.ring_bytes = ring.ring_bytes;
+            ring.consume(ring.userdata, &owned);
+        } else source.consume(source.userdata, &event);
         AcquireSRWLockExclusive(&s_native_handoff_lock);
         gcm_native_handoff_remove(slot);
         ReleaseSRWLockExclusive(&s_native_handoff_lock);

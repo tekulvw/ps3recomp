@@ -1,7 +1,15 @@
 /* CPU-only format contract; never creates a Metal device or submits work. */
 #include "../rsx_metal_backend.m"
 #include <assert.h>
+static unsigned plane_queries;
+int rsx_draw_engine_native_image_clear_planes(uint32_t handle,uint32_t required) {
+    (void)handle;(void)required;++plane_queries;return -5;
+}
 int main(void) {
+    assert(rsx_metal_backend_validate_image_planes(&s_metal_owner,1,1,1,0)==-1);
+    assert(rsx_metal_backend_validate_image_planes(&s_metal_owner,1,1,1,2)==-4);
+    assert(!plane_queries); // Missing native lease must reject before decoder access.
+
     assert(metal_native_image_format(MTLPixelFormatRGBA8Unorm)==RSX_NATIVE_IMAGE_RGBA8);
     assert(metal_native_image_format(MTLPixelFormatBGRA8Unorm)==RSX_NATIVE_IMAGE_BGRA8);
     assert(metal_native_image_format(MTLPixelFormatDepth32Float)==RSX_NATIVE_IMAGE_D32F);

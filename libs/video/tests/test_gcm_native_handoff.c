@@ -1,4 +1,4 @@
-/* A missing pre-header barrier would execute UI state before publication;
+/* A missing pre-header barrier would execute retained state before publication;
  * replay, stale cookies or cross-VM delivery would submit the wrong source. */
 #define main checked_fixture_main
 #include "test_gcm_checked_reference.c"
@@ -19,6 +19,58 @@ static void consume(void* user,const rsx_native_handoff_event* e) {
     assert(e->target.color_a_offset==0x4000&&e->target.native_surface==23);
     assert(cellGcm_native_handoff_cancel(e->cookie)==-4); /* callback runs outside registry lock */
     last_cookie=e->cookie;callbacks++;
+}
+static unsigned ring_callbacks;
+static void consume_ring(void* user,const rsx_native_handoff_ring_event* e) {
+    assert(user==&ring_callbacks&&e->abi_version==1&&e->struct_size==sizeof(*e));
+    assert(e->source.context_ea==0); /* no synthetic PPE GCM context */
+    assert(e->source.vm_identity==17&&e->source.source_observation==92);
+    assert(e->source.header_ea==0x110000&&e->source.fifo_get==0x10000&&s_fifo_getoff==0x10000);
+    assert(e->writer_state_ea==0x210000&&e->ring_begin_ea==0x110000&&e->ring_bytes==0x4000);
+    assert(e->source.header==0x00041d6c&&e->source.argument==0x480);
+    assert(cellGcm_native_handoff_cancel(e->source.cookie)==-4);
+    ring_callbacks++;
+}
+static void ring_writer_checks(void) {
+    raw32(0x210000,0x110000);raw32(0x210004,0x112000);
+    raw32(0x210008,0x110000);raw32(0x21000c,0xffffffff);
+    raw32(0x110000,0);raw32(0x110004,0);
+    _Static_assert(sizeof(rsx_native_handoff_ring_arm)==64,"ring arm ABI");
+    rsx_native_handoff_ring_arm a={1,sizeof(a),17,92,0x210000,0x110000,0x4000,0x110000,0x00041d6c,0x480,&ring_callbacks,consume_ring};
+    uint64_t cookie=0;
+    assert(cellGcm_native_handoff_ring_arm(&a,&cookie)==0&&cookie);
+    uint64_t duplicate=1;assert(cellGcm_native_handoff_ring_arm(&a,&duplicate)==-4&&duplicate==0);
+    cellGcm_syscall_set_fifo(0x10008,0x10000);cellGcm_rsx_process_fifo();
+    assert(s_fifo_getoff==0x10000&&ring_callbacks==0);
+    assert(cellGcm_native_handoff_publish(cookie)==-3); /* wrong writer mode */
+    assert(cellGcm_native_handoff_ring_publish(cookie)==-3); /* words unwritten */
+    raw32(0x110004,0x480);raw32(0x110000,0x00041d6c);
+    raw32(0x210008,0x110008); /* old UI rule must not qualify a ring writer */
+    assert(cellGcm_native_handoff_ring_publish(cookie)==-3);
+    raw32(0x210008,0x110000);raw32(0x21000c,0);
+    assert(cellGcm_native_handoff_ring_publish(cookie)==-3); /* actual writer state changed; no allocation-generation inference */
+    raw32(0x21000c,0xffffffff);
+    assert(cellGcm_native_handoff_ring_publish(cookie)==0);
+    /* Real final writer state can advance after publication, before GET. */
+    raw32(0x210008,0x110080);
+    cellGcm_rsx_process_fifo();assert(ring_callbacks==1&&s_fifo_getoff==0x10008);
+    assert(cellGcm_native_handoff_cancel(cookie)==-3);
+    cellGcm_syscall_set_fifo(0x10008,0x10000);cellGcm_rsx_process_fifo();assert(ring_callbacks==1);
+    raw32(0x210008,0x110000);a.header_ea=0x114000;
+    assert(cellGcm_native_handoff_ring_arm(&a,&cookie)==-1&&cookie==0); /* outside source ring */
+    a.header_ea=0x110000;a.ring_bytes=7;
+    assert(cellGcm_native_handoff_ring_arm(&a,&cookie)==-1&&cookie==0);
+    a.ring_bytes=0x4000;raw32(0x210004,0x110004);
+    assert(cellGcm_native_handoff_ring_arm(&a,&cookie)==-3&&cookie==0);
+    raw32(0x210004,0x112000);
+    assert(cellGcm_native_handoff_ring_arm(&a,&cookie)==0);
+    uint8_t* real_vm=vm_base;vm_base+=4;
+    assert(cellGcm_native_handoff_ring_publish(cookie)==-3);vm_base=real_vm;
+    assert(cellGcm_native_handoff_cancel(cookie)==0);
+    assert(cellGcm_native_handoff_ring_arm(&a,&cookie)==0);
+    assert(cellGcm_native_handoff_ring_publish(cookie)==0);
+    raw32(0x110004,0x490);cellGcm_syscall_set_fifo(0x10008,0x10000);cellGcm_rsx_process_fifo();
+    assert(ring_callbacks==1&&cellGcm_native_handoff_cancel(cookie)==-3); /* changed before GET */
 }
 int main(void) {
     vm_base=mmap(NULL,0x100000000ULL,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
@@ -66,5 +118,6 @@ int main(void) {
     for(unsigned i=0;i<64;i++)assert(cellGcm_native_handoff_cancel(cookies[i])==0);
     assert(cellGcm_native_handoff_arm(&a,&cookie)==0&&cookie>cookies[63]);
     assert(cellGcm_native_handoff_cancel(cookie)==0);
+    ring_writer_checks();
     puts("PASS: exact FIFO source publication, pre-header barrier, replay/mutation/VM rejection, bounded capacity and cancellation");return 0;
 }
