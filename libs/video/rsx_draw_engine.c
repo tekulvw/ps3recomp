@@ -2691,6 +2691,75 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
     return ENG_INVALID;
 }
 
+/* Private inventory-only correlation, not allocation readiness or coverage proof.
+ * The backend HostImage receipt owns resource_generation; native_generation below
+ * is the actual submitted owner generation. Never borrow a backend image here:
+ * the original engine owner is already held. */
+typedef struct {
+    u32 offset, expected_handle, published_handle, sampled;
+    u64 source, generation, ticket, serial;
+} eng_native_color_attestation;
+static eng_native_color_attestation s_native_color_attest[2];
+static u64 s_native_color_attest_source;
+static int eng_native_color_attest_enabled(void)
+{
+    const char* inventory = getenv("PS3_RENDER_SHADER_INVENTORY_DIR");
+    return inventory && inventory[0] == '/';
+}
+static void eng_native_color_attest_publish(const rsx_native_external_pass* p)
+{
+    if (!eng_native_color_attest_enabled()) return;
+    if (s_native_color_attest_source && s_native_color_attest_source != p->source_observation) return;
+    const u32 offsets[2] = {0x00030000u, 0x007c0000u};
+    for (u32 n = 0; n < 2; ++n) {
+        if (s_native_color_attest[n].source) continue;
+        const rsx_native_external_image_write* last = NULL;
+        for (u32 i = 0; i < p->write_count; ++i) {
+            const rsx_native_external_image_write* w = &p->writes[i];
+            if (w->key.kind == RSX_NATIVE_COLOR_IMAGE && w->key.location == RSX_LOCATION_LOCAL &&
+                w->key.offset == offsets[n] && (w->planes & 1u)) last = w;
+        }
+        if (!last) continue;
+        s_native_color_attest_source = p->source_observation;
+        eng_native_color_attestation* a = &s_native_color_attest[n];
+        *a = (eng_native_color_attestation){.offset=offsets[n],.expected_handle=last->native_handle,
+            .source=p->source_observation,.generation=p->native_generation,.ticket=p->native_ticket};
+        const eng_surface* surface = NULL;
+        for (u32 i = 0; i < g.n_surfaces; ++i)
+            if (g.surfaces[i].location == RSX_LOCATION_LOCAL && g.surfaces[i].offset == offsets[n]) {
+                surface = &g.surfaces[i]; break;
+            }
+        if (surface) {a->published_handle=surface->handle;a->serial=surface->color_serial;}
+        fprintf(stderr, "[rsx native color attestation] stage=publish source=%llu native_generation=%llu ticket=%llu "
+            "loc=0 offset=%08X expected_handle=%u cache_handle=%u size=%ux%u pitch=%u format=%u aa_grid=%X "
+            "color_serial=%llu resource_generation=backend_receipt_only\n",
+            (unsigned long long)a->source,(unsigned long long)a->generation,(unsigned long long)a->ticket,
+            a->offset,a->expected_handle,a->published_handle,surface?surface->w:0,surface?surface->h:0,
+            surface?surface->pitch:0,surface?(u32)surface->fmt:0,surface?surface->aa_grid:0,
+            (unsigned long long)a->serial);
+    }
+}
+static void eng_native_color_attest_sample(u32 unit, const rsx_dsp_texture* t,
+    u32 handle, const char* source, const eng_surface* surface)
+{
+    if (!s_native_color_attest_source || !surface || t->location != RSX_LOCATION_LOCAL) return;
+    for (u32 n = 0; n < 2; ++n) {
+        eng_native_color_attestation* a = &s_native_color_attest[n];
+        if (!a->source || a->sampled || a->offset != t->offset) continue;
+        a->sampled = 1;
+        fprintf(stderr, "[rsx native color attestation] stage=first-retained-sample source=%llu "
+            "native_generation=%llu ticket=%llu frame=%u guest_draw=%u unit=%u binding=%s loc=%u offset=%08X "
+            "published_handle=%u expected_handle=%u cache_handle=%u view_handle=%u cache_matches_publication=%u "
+            "cache_size=%ux%u cache_pitch=%u cache_format=%u aa_grid=%X color_serial=%llu published_serial=%llu "
+            "texture_size=%ux%u texture_pitch=%u texture_format=%X remap=%08X filter=%08X control0=%08X wrap=%08X\n",
+            (unsigned long long)a->source,(unsigned long long)a->generation,(unsigned long long)a->ticket,
+            g.frames,g.guest_draws,unit,source,t->location,t->offset,a->published_handle,a->expected_handle,
+            surface->handle,handle,surface->handle==a->published_handle,surface->w,surface->h,surface->pitch,
+            (u32)surface->fmt,surface->aa_grid,(unsigned long long)surface->color_serial,
+            (unsigned long long)a->serial,t->width,t->height,t->pitch,t->format,t->remap,t->filter,t->control0,t->wrap);
+    }
+}
+
 /* Bounded opt-in evidence. A trigger file permits arming after a menu opens;
  * only metadata is logged, once per distinct descriptor and binding source. */
 static const char* s_capture_binding_source[RSX_BE_MAX_TEXTURES];
@@ -2699,6 +2768,7 @@ static void eng_texture_descriptor_log(u32 unit, const rsx_dsp_texture* t,
                                        const eng_surface* surface)
 {
     s_capture_binding_source[unit] = source;
+    eng_native_color_attest_sample(unit, t, handle, source, surface);
     enum { MAX_DESCRIPTORS = 512 };
     static int configured, enabled, armed;
     static u32 start_frame, limit = 128, count, checked_frame = UINT32_MAX;
@@ -2904,7 +2974,7 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
 {
     enum { MAX_CAPTURE = 8, MAX_IMAGE_BYTES = 8u << 20,
            MAX_TOTAL_BYTES = 64u << 20, MAX_GEOMETRY_BYTES = 1u << 20 };
-    static int configured, enabled, armed;
+    static int configured, enabled, armed, after_native;
     static rsx_binding_capture_filter consumers[RSX_BINDING_CAPTURE_MAX];
     static u32 offsets[MAX_CAPTURE], count, done[MAX_CAPTURE], location;
     static u32 start_frame, start_draw, draw, checked_frame = UINT32_MAX;
@@ -2942,10 +3012,15 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
         if (frame) { unsigned long value=strtoul(frame,&end,10); if (*end || value>UINT32_MAX) return; start_frame=(u32)value; }
         if (first) { unsigned long value=strtoul(first,&end,10); if (*end || value>UINT32_MAX) return; start_draw=(u32)value; }
         trigger=getenv("PS3RECOMP_RSX_BINDING_CAPTURE_TRIGGER");
+        const char* after=getenv("PS3RECOMP_RSX_BINDING_CAPTURE_AFTER_NATIVE");
+        after_native=after && !strcmp(after,"1");
         armed=!trigger || !*trigger;
         enabled=1;
     }
     if (!enabled || g.frames<start_frame || draw<start_draw) return;
+    /* Explicit inventory capture mode: navigation/menu consumers cannot spend
+     * the once-only offset budget before an owned native Main publication. */
+    if (after_native && !s_native_color_attest_source) return;
     if (!armed && checked_frame!=g.frames) {
         checked_frame=g.frames;
         FILE* f=fopen(trigger,"rb"); if (f) { fclose(f); armed=1; }
@@ -4880,6 +4955,7 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
 
             }
         }
+        eng_native_color_attest_publish(p);
         for(u32 i=0;i<p->register_count;++i) {
             const rsx_native_register_write* r=&p->registers[i];
             g.rsx.regs[r->method>>2]=r->value;

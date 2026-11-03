@@ -17,6 +17,11 @@ with tempfile.TemporaryDirectory(prefix='gcm-native-handoff-') as temp:
         ('external', ['libs/video/tests/test_native_external_pass.c'] + ['libs/video/'+x+'.c' for x in (
             'rsx_draw_engine','rsx_dispatch','rsx_texture_layout','rsx_vertex_compact','rsx_vertex_fetch','rsx_vp_decompiler','rsx_fp_decompiler')] +
                    ['runtime/diagnostics/critical_trace.c','runtime/diagnostics/render_ablation.c']),
+        # This fixture includes the production engine to inspect the bounded
+        # diagnostic state directly; do not link a second engine translation.
+        ('color-attestation', ['libs/video/tests/test_native_color_attestation.c'] + ['libs/video/'+x+'.c' for x in (
+            'rsx_dispatch','rsx_texture_layout','rsx_vertex_compact','rsx_vertex_fetch','rsx_vp_decompiler','rsx_fp_decompiler')] +
+                   ['runtime/diagnostics/critical_trace.c','runtime/diagnostics/render_ablation.c']),
         ('target', ['libs/video/tests/test_native_source_target.c'] + ['libs/video/'+x+'.c' for x in (
             'rsx_draw_engine','rsx_dispatch','rsx_texture_layout','rsx_vertex_compact','rsx_vertex_fetch','rsx_vp_decompiler','rsx_fp_decompiler')] +
                    ['runtime/diagnostics/critical_trace.c','runtime/diagnostics/render_ablation.c']),

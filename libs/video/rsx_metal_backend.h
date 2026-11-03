@@ -89,6 +89,29 @@ int rsx_metal_backend_borrow_image(uint64_t owner_lifetime,uint32_t backend_surf
 /* Existing HostImage identity/lifetime; call only under its native owner lease.
  * Checks actual queued full clears after the ordered original boundary. */
 int rsx_metal_backend_validate_image_planes(void*,uint64_t,uint64_t,uint64_t,uint32_t);
+/* Opt-in host diagnostic only. Caller holds a genuine native owner lease and
+ * a retained exact HostImage. Same-queue blit waits at most five seconds; no
+ * original recording/cache epochs are changed. Native byte order is reported.
+ * Zero status proves this diagnostic copy completed, never presentation. */
+typedef struct rsx_metal_native_readback {
+    uint32_t abi_version,struct_size,width,height;
+    uint64_t pixel_format;
+    uint32_t storage_mode,row_bytes,padded_row_bytes,reserved;
+    uint64_t bytes_written;
+    uint32_t gpu_status,gpu_completed;
+} rsx_metal_native_readback;
+#define RSX_METAL_NATIVE_READBACK_MAX_BYTES UINT64_C(8388608)
+static inline int rsx_metal_native_readback_layout(uint32_t width,uint32_t height,
+    uint32_t *row_bytes,uint32_t *padded_row_bytes,uint64_t *bytes) {
+    if(!width||!height||!row_bytes||!padded_row_bytes||!bytes||
+       width>RSX_METAL_NATIVE_READBACK_MAX_BYTES/4u)return -1;
+    const uint64_t row=(uint64_t)width*4u,padded=(row+255u)&~UINT64_C(255);
+    if(padded>RSX_METAL_NATIVE_READBACK_MAX_BYTES/height)return -1;
+    *row_bytes=(uint32_t)row;*padded_row_bytes=(uint32_t)padded;*bytes=row*height;
+    return 0;
+}
+int rsx_metal_backend_read_native_image(void*,uint64_t,uint64_t,uint64_t,
+    uint32_t,uint32_t,void*,uint64_t,rsx_metal_native_readback*);
 int rsx_metal_backend_reserve_frame(const rsx_native_image *,const rsx_native_frame_source *,rsx_native_frame *);
 int rsx_metal_backend_cancel_frame(uint64_t owner_lifetime,uint64_t reservation);
 int rsx_metal_backend_poll_frames(rsx_native_frame_event *,uint32_t capacity,uint32_t *count);

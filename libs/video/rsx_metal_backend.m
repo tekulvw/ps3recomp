@@ -5708,6 +5708,46 @@ int rsx_metal_backend_validate_image_planes(void *user,uint64_t life,uint64_t id
  if(status)return status;
  return rsx_draw_engine_native_image_clear_planes((uint32_t)id,required);
 }
+int rsx_metal_backend_read_native_image(void *user,uint64_t life,uint64_t resource_id,
+ uint64_t generation,uint32_t width,uint32_t height,void *bytes,uint64_t capacity,
+ rsx_metal_native_readback *out){
+ if(!out||out->abi_version!=1||out->struct_size!=sizeof(*out))return -1;
+ *out=(rsx_metal_native_readback){.abi_version=1,.struct_size=sizeof(*out)};
+ uint32_t row=0,padded=0;uint64_t length=0;
+ if(!bytes||rsx_metal_native_readback_layout(width,height,&row,&padded,&length)||capacity<length)return -1;
+ int status=metal_image_validate(user,life,resource_id,generation);if(status)return status;
+ @autoreleasepool {
+  id<MTLTexture> image=eng_obj((u32)resource_id);
+  if(!s_queue||!image||image.device!=s_dev||image.width!=width||image.height!=height||
+     image.textureType!=MTLTextureType2D||image.sampleCount!=1||image.mipmapLevelCount!=1||image.arrayLength!=1)return -3;
+  out->width=width;out->height=height;out->pixel_format=(uint64_t)image.pixelFormat;
+  out->storage_mode=(uint32_t)image.storageMode;out->row_bytes=row;out->padded_row_bytes=padded;
+  if(image.pixelFormat!=MTLPixelFormatRGBA8Unorm&&image.pixelFormat!=MTLPixelFormatBGRA8Unorm)return -2;
+  id<MTLBuffer> copy=[s_dev newBufferWithLength:(NSUInteger)padded*height options:MTLResourceStorageModeShared];
+  id<MTLCommandBuffer> command=[s_queue commandBuffer];
+  if(!copy||!command)return -5;
+  id<MTLBlitCommandEncoder> blit=[command blitCommandEncoder];if(!blit)return -6;
+  [blit copyFromTexture:image sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+   sourceSize:MTLSizeMake(width,height,1) toBuffer:copy destinationOffset:0
+   destinationBytesPerRow:padded destinationBytesPerImage:(NSUInteger)padded*height];
+  [blit endEncoding];
+  dispatch_semaphore_t done=dispatch_semaphore_create(0);if(!done)return -5;
+  [command addCompletedHandler:^(id<MTLCommandBuffer> completed){(void)completed;dispatch_semaphore_signal(done);}];
+  /* Native diagnostic submission on the borrowed queue, not an original
+   * recorder submission. Calling metal_owner_committed here would falsely
+   * classify a native lease as an unscoped original commit. */
+  [command commit];
+  const long timeout=dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC));
+  out->gpu_status=(uint32_t)command.status;
+  if(timeout)return -4;
+  if(command.status!=MTLCommandBufferStatusCompleted)return -6;
+  out->gpu_completed=1;
+  const uint8_t *source=copy.contents;if(!source)return -6;
+  for(uint32_t y=0;y<height;++y)memcpy((uint8_t*)bytes+(size_t)y*row,source+(size_t)y*padded,row);
+  out->bytes_written=length;
+  return 0;
+ }
+}
 /* Report actual allocation format, not the guest's source format code. */
 static uint32_t metal_native_image_format(MTLPixelFormat format){
  switch(format){

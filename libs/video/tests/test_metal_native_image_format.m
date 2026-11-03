@@ -6,6 +6,13 @@ int rsx_draw_engine_native_image_clear_planes(uint32_t handle,uint32_t required)
     (void)handle;(void)required;++plane_queries;return -5;
 }
 int main(void) {
+    uint8_t pixels[4]={9,9,9,9};
+    rsx_metal_native_readback readback={.abi_version=1,.struct_size=sizeof(readback)};
+    assert(rsx_metal_backend_read_native_image(&s_metal_owner,1,1,1,1,1,pixels,sizeof pixels,&readback)==-4);
+    assert(!readback.gpu_completed&&!readback.bytes_written&&pixels[0]==9);
+    assert(rsx_metal_backend_read_native_image(&s_metal_owner,1,1,1,0,1,pixels,sizeof pixels,&readback)==-1);
+    assert(rsx_metal_backend_read_native_image(&s_metal_owner,1,1,1,1,1,pixels,3,&readback)==-1);
+    assert(!readback.gpu_completed&&!readback.bytes_written&&pixels[3]==9);
     assert(rsx_metal_backend_validate_image_planes(&s_metal_owner,1,1,1,0)==-1);
     assert(rsx_metal_backend_validate_image_planes(&s_metal_owner,1,1,1,2)==-4);
     assert(!plane_queries); // Missing native lease must reject before decoder access.
