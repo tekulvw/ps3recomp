@@ -109,14 +109,10 @@ Not covered:
   the engine cannot observe, no longer sees the depth the store used to leave
   there as a side effect.
 
-**Backends.** Metal implements the view. Vulkan has neither `depth_store_z24`
-nor the view, so its depth reads keep the CPU readback path. The engine prints
-a message when the switch is set and the backend lacks the operation. A Vulkan
-implementation needs the conversion as a compute shader writing a buffer,
-then a buffer-to-image copy into an `R8G8B8A8` image whose view carries the
-same component swizzle, with both recorded into the engine's current command
-stream before later draws. The D3D12 path uses a separate engine (live draw)
-and is not affected.
+**Backends.** Metal and Vulkan implement the view (Vulkan: see below). The
+engine prints a message when the switch is set and the backend lacks the
+operation, and keeps the store. The D3D12 path uses a separate engine (live
+draw) and is not affected.
 
 ## Bounded work in flight
 
@@ -143,3 +139,74 @@ the one that retired it has completed.
 Either line is also printed, at most every two seconds, whenever its bound
 actually waits. `metal_allocated` is the device's `currentAllocatedSize`. If
 it stays flat while the process grows, the growth is not GPU resources.
+
+## Vulkan
+
+The register-file engine's Vulkan backend (`rsx_vulkan_backend.c`, stage E5)
+provides what the switches above need. Before E5 it had no completion tickets
+and no checked flush, so deferred reports never deferred on Vulkan, checked
+`SET_REFERENCE` could not certify, and both early switches had nothing to act
+on.
+
+| Operation | Vulkan |
+| --- | --- |
+| `submit_async` / `completion_status` | A ticket is a fence submitted, with no command buffer, after everything so far. Every drawing operation is still one submission the CPU waits for, so no recorded work is left unsubmitted. `vkQueueSubmit` signals the fence only after all earlier work on the queue has completed, so it covers this backend, the native renderer and the present alike. Tickets come from a ring of 64 fences retired strictly in order; a full ring waits for its oldest. |
+| `submit_and_wait_checked` | A ticket, waited for. Any failed submission, fence wait or recording call latches: from then on tickets report -1 and the checked flush 0. |
+| `depth_store_z24` + `depth_z24_texture` | Behind `PS3RECOMP_VK_GPU_Z24=1` (default off; the engine keeps `depth_readback` plus its CPU conversion). Depth aspect to a buffer as floats, `libs/video/vulkan/rsx_vk_depth_z24.comp` to D24S8 words in place (integer-exact rounding, the CPU path's clamp and NaN rule), a copy to a cached host buffer, then the rows into guest memory. The alias texture is filled from the device-side words. |
+| `depth_z24_view` | The same conversion and a buffer-to-image copy into a fresh `R8G8B8A8` image, recorded into a command buffer of its own and submitted without a wait as a ticket. The image view's component mapping composes the A8R8G8B8/D8R8G8B8 decode's channel rotation with the unit's crossbar. |
+
+Depth formats other than `D32_SFLOAT` and `D32_SFLOAT_S8_UINT` are refused
+with one message, and the engine takes its fallback.
+
+**Audit against the two facts above, for Vulkan.**
+
+- **Inputs are copied when recorded.** The engine path's draw copies its vertex
+  and index bytes into backend buffers and waits for the draw; uploads go
+  through staging; textures are decoded at bind time. Nothing imports guest
+  memory: no `VK_EXT_external_memory_host`, no mapped guest pointers. Guest
+  memory is read only by the legacy vtable path, which also decodes at bind.
+- **Outputs reach guest memory only through synchronous readbacks** (`readback`,
+  `depth_readback`, `depth_store_z24`), each waiting for its own fence.
+  Retiring a ticket advances counters, frees backend-private buffers and
+  destroys released images; it writes no guest memory. The backend has no
+  completion callbacks.
+- **Resources stay alive until completion.** Synchronous work is waited for
+  before anything it used is released. A view's words buffer is retired with
+  its ticket. A released view, or the depth target an unfinished view still
+  reads, goes on a retire list until its ticket completes.
+- **One queue, explicit dependencies.** Engine, present and native work are
+  all submitted on the same `VkQueue` under one mutex. Engine operations
+  start with barriers that order them after every earlier submission. Each E5
+  command buffer starts and ends with a full memory dependency, so ordering
+  never depends on what other submissions record themselves. Native passes
+  order their imported images against all earlier queue work.
+- **Native boundary.** A pending ticket is accepted as the ordered boundary
+  before native work, as Metal's asynchronous boundary is. Before E5 the
+  latest submission was always a completed synchronous one.
+
+**What this does not change.** Drawing on Vulkan stays synchronous: every
+draw, clear and upload waits for its fence, and so for everything queued
+before it, native Main included. With the switches on, labels, reports and
+references stop waiting. The FIFO consumer still waits at the next engine
+draw after native work has been queued, so the Metal gains do not carry over
+until the backend batches its command buffers.
+
+`PS3RECOMP_RSX_INFLIGHT_LOG=1` also prints:
+
+```
+[rsx inflight vulkan] tickets=… completed=… outstanding=… cap_waits=… views=… view_buffers_reused=… stores=… deferred_destroys=… pending_destroys=… failed=…
+```
+
+Device test: `python3 tools/test_vulkan_depth_z24.py [--require-hardware
+--vendor-id … --device-id …] [--exhaustive]`. It runs headless under the
+Khronos validation layer, and any VUID fails it. It covers:
+
+- the conversion against the CPU conversion, bit for bit;
+- the store against `depth_readback` plus the CPU conversion;
+- alias and view texels against the decoded upload, for both formats and
+  eight crossbars;
+- the view's stream order;
+- the ticket ring, the checked flush, and deferred destruction;
+- with the switch unset, the store and alias declining.
+
+CI runs it on lavapipe in `frontend-vulkan.yml`.

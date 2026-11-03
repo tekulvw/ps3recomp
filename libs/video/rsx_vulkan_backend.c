@@ -17,13 +17,17 @@
  *   draw engine backend    rsx_draw_backend: targets, clears, present and
  *                          readback (E1), pipelines and draws (E2), textures,
  *                          surface views and samplers (E3), depth snapshots
- *                          (E4) -- the stage names in the commit history
+ *                          (E4), completion tickets and the GPU Z24S8 depth
+                          store/alias/view (E5) -- the stage names in the
+                          commit history
  *   public entry points    init picks the path, shutdown undoes everything
  *
  * Deliberately synchronous: every clear, draw and present is one one-shot
  * command buffer, submitted and waited on. Slow and trivially correct; it is
  * what lets the engine's submit_and_wait and staging reuse cost nothing, and
- * batching is the first thing to change once correctness is settled.
+ * batching is the first thing to change once correctness is settled. The
+ * exceptions are E5's completion tickets and GPU depth views, which are
+ * submitted without a wait and retired in queue order (see there).
  *
  * Images stay in VK_IMAGE_LAYOUT_GENERAL for their whole life: legal for
  * transfers, sampling and as attachments, so there is no layout bookkeeping.
@@ -57,6 +61,7 @@
 #include "rsx_draw_engine.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
+#include "vulkan/rsx_vk_depth_z24_comp.spv.h"
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
  * opens the optional window. Same include style as those two. */
@@ -70,6 +75,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---------------------------------------------------------------------------
  * Run-time loaded entry points (Vulkan 1.0 core only)
@@ -106,7 +112,8 @@
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
     X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
-    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
+    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) \
+    X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCmdCopyBuffer)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
@@ -260,6 +267,10 @@ static uint64_t s_vulkan_boundary_commit,s_vulkan_boundary_generation;
 static int s_vulkan_shutdown_pending;
 static unsigned s_vulkan_partial_primitives;
 static atomic_int s_vulkan_unscoped_submit;
+/* Sticky engine failure: a submission, fence wait or recording call that did
+ * not succeed. submit_and_wait_checked and completion tickets report it, the
+ * same certificate Metal's command-buffer errors give. Cleared at engine init. */
+static atomic_int s_vk_eng_failed;
 static int vulkan_owner_enabled(void){
     static atomic_int setting=-1;int value=atomic_load_explicit(&setting,memory_order_relaxed);
     if(value<0){const char* text=getenv("PS3RECOMP_RSX_NATIVE_OWNER");value=text&&!strcmp(text,"1");int expected=-1;
@@ -644,7 +655,14 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
+static int vk_begin_core(void);
 static int vk_begin(void)
+{
+    const int rc = vk_begin_core();
+    if (rc && s_vk.eng_active) atomic_store(&s_vk_eng_failed, 1);
+    return rc;
+}
+static int vk_begin_core(void)
 {
     VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -658,7 +676,14 @@ static int vk_begin(void)
     return 0;
 }
 
+static int vk_submit_and_wait_core(void);
 static int vk_submit_and_wait(void)
+{
+    const int rc = vk_submit_and_wait_core();
+    if (rc && s_vk.eng_active) atomic_store(&s_vk_eng_failed, 1);
+    return rc;
+}
+static int vk_submit_and_wait_core(void)
 {
     VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -2159,6 +2184,11 @@ static uint64_t s_eobj_generation[VK_ENG_MAX_OBJ],s_eobj_next_generation;
 static uint32_t s_eobj_native_pins[VK_ENG_MAX_OBJ];
 static uint8_t s_eobj_retired[VK_ENG_MAX_OBJ];
 static rsx_native_vulkan_image s_eobj_native_image[VK_ENG_MAX_OBJ];
+/* The last asynchronous ticket that reads or writes each engine image (E5);
+ * 0 when none can still be pending. */
+static u64 s_e5_obj_ticket[VK_ENG_MAX_OBJ];
+static int vk_e5_defer_destroy(u32 handle);
+static void vk_e5_shutdown(void);
 
 /* Defined with the E2 pipeline state further down. */
 static void vk_eng_drop_framebuffers(void);
@@ -2214,6 +2244,7 @@ static u32 vk_eng_alloc(void)
             }
             memset(&s_eobj_native_image[i],0,sizeof s_eobj_native_image[i]);
             s_eobj_retired[i]=0;
+            s_e5_obj_ticket[i]=0;
             return i;
         }
     VK_LOG("engine: object table full (%d)\n", VK_ENG_MAX_OBJ);
@@ -2312,6 +2343,8 @@ static int vk_eng_init(void* user, u32 width, u32 height)
     memset(s_eobj_retired,0,sizeof s_eobj_retired);
     memset(s_eobj_native_image,0,sizeof s_eobj_native_image);
     memset(&s_eng_bound, 0, sizeof s_eng_bound);
+    memset(s_e5_obj_ticket, 0, sizeof s_e5_obj_ticket);
+    atomic_store(&s_vk_eng_failed, 0);
     return s_vk.device ? 0 : -1;
 }
 
@@ -2348,7 +2381,9 @@ static void vk_eng_release(void* user, u32 handle)
         memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
         return;
     }
-    vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
+    /* Idle once every submission that used it is waited on; an image an
+     * asynchronous ticket still reads or writes is destroyed when it retires. */
+    if (!vk_e5_defer_destroy(handle)) vk_destroy_image(&s_eobj[handle].im);
     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
 }
 
@@ -2359,6 +2394,7 @@ static void vk_eng_shutdown(void* user)
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
     vk_eng_snapshot_pool_drain();
+    vk_e5_shutdown();
 }
 
 static void vk_eng_submit_and_wait(void* user, u32 reason)
@@ -3559,6 +3595,569 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     vk_submit_and_wait();
 }
 
+/* ---- E5: completion tickets, checked flushes and GPU depth conversion -----
+ *
+ * What the engine's deferred reports, checked SET_REFERENCE, early label
+ * release and frames-ahead bound need from a backend, and the Z24S8 depth
+ * paths (depth_store_z24, depth_z24_texture, depth_z24_view).
+ *
+ * Tickets. Every engine operation above is still one submission the CPU
+ * waits for, so by the time the engine asks for a ticket there is no
+ * recorded-but-unsubmitted work. A ticket is therefore a fence submitted on
+ * the queue after everything so far: vkQueueSubmit signals it only once every
+ * earlier submission on the queue has completed -- this backend's, the
+ * native renderer's and the present's -- so a signalled ticket is a genuine
+ * completion of all of it. Tickets live in a ring of VK_E5_SLOTS fences,
+ * retired strictly in submission order; a full ring waits for its oldest
+ * entry instead of failing. Nothing is retired from a callback, and nothing
+ * here ever writes guest memory: completion only advances counters, frees
+ * backend-private buffers and destroys released images.
+ *
+ * A failed submission, fence wait or recording call (s_vk_eng_failed) is
+ * sticky: completion_status answers -1 and submit_and_wait_checked 0 from
+ * then on, which is what freezes checked REF and deferred publication.
+ *
+ * Depth conversion. The depth aspect of a D32_SFLOAT(_S8_UINT) target is
+ * copied into a buffer as floats; rsx_vk_depth_z24.comp turns each float into
+ * the D24S8 word guest memory holds, in place. The store (synchronous, as the
+ * engine expects) then copies the words to a cached host buffer; the view
+ * (asynchronous) copies them into a fresh RGBA8 image whose component mapping
+ * composes the A8R8G8B8 decode's channel rotation with the unit's crossbar,
+ * so sampling it equals sampling the decoded upload of the stored bytes.
+ * Every recording starts with a full dependency on all earlier queue work and
+ * ends with one before all later work, so ordering against draws, clears and
+ * the native renderer never depends on what those record themselves.
+ *
+ * PS3RECOMP_VK_GPU_Z24=1 enables the store and its alias texture (default
+ * off: the engine keeps depth_readback plus its CPU conversion). The view is
+ * used only under the engine's PS3RECOMP_RSX_GPU_DEPTH_VIEW=1. Other depth
+ * formats are refused with one message; the engine then takes its fallback.
+ * -------------------------------------------------------------------------*/
+#define VK_E5_SLOTS 64u
+#define VK_E5_SPARES 4u
+#define VK_E5_RETIRE 64u
+
+typedef struct {
+    VkFence         fence;
+    VkCommandBuffer cb;
+    VkDescriptorSet set;
+    vk_buffer       words;      /* view: device-local words, retired with the slot */
+    u64             ticket;
+} vk_e5_slot;
+
+static struct {
+    int             ready;      /* pool and fences exist */
+    VkCommandPool   pool;
+    vk_e5_slot      slot[VK_E5_SLOTS];
+    u32             head, count;            /* busy slots, oldest at head */
+    u64             issued, completed;      /* tickets, in queue order */
+    /* conversion pipeline */
+    VkDescriptorSetLayout set_layout;
+    VkPipelineLayout layout;
+    VkShaderModule  module;
+    VkPipeline      pipe;
+    VkDescriptorPool dpool;
+    VkDescriptorSet sync_set;
+    int             pipe_failed;
+    /* the last successful store: device-local words and their host copy */
+    vk_buffer       store_dev, store_host;
+    u32             store_w, store_h;
+    int             store_valid;
+    vk_buffer       spare[VK_E5_SPARES];    /* device-local word buffers to reuse */
+    u32             nspare;
+    struct { vk_image im; u64 ticket; } retire[VK_E5_RETIRE];
+    u32             nretire;
+    /* counters for PS3RECOMP_RSX_INFLIGHT_LOG=1 */
+    u64             cap_waits, views_made, view_buffers_reused, stores, deferred_destroys;
+    int             log;
+} s_e5;
+
+static int vk_e5_failed(void) { return atomic_load(&s_vk_eng_failed); }
+static void vk_e5_fail(const char* what)
+{
+    if (!atomic_exchange(&s_vk_eng_failed, 1)) VK_LOG("engine: %s failed; completion tickets now report failure\n", what);
+    vulkan_owner_fault();
+}
+
+static int vk_e5_gpu_z24(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_GPU_Z24"); on = e && !strcmp(e, "1"); }
+    return on;
+}
+
+static int vk_e5_init(void)
+{
+    if (s_e5.ready) return 0;
+    if (!s_vk.device) return -1;
+    { const char* e = getenv("PS3RECOMP_RSX_INFLIGHT_LOG"); s_e5.log = e && !strcmp(e, "1"); }
+    VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                                    .queueFamilyIndex = s_vk.queue_family };
+    if (pvkCreateCommandPool(s_vk.device, &pci, NULL, &s_e5.pool) != VK_SUCCESS) return -1;
+    VkCommandBuffer cbs[VK_E5_SLOTS];
+    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                        .commandPool = s_e5.pool,
+                                        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                        .commandBufferCount = VK_E5_SLOTS };
+    if (pvkAllocateCommandBuffers(s_vk.device, &cai, cbs) != VK_SUCCESS) {
+        pvkDestroyCommandPool(s_vk.device, s_e5.pool, NULL); s_e5.pool = VK_NULL_HANDLE; return -1;
+    }
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    for (u32 i = 0; i < VK_E5_SLOTS; i++) {
+        s_e5.slot[i].cb = cbs[i];
+        if (pvkCreateFence(s_vk.device, &fci, NULL, &s_e5.slot[i].fence) != VK_SUCCESS) {
+            for (u32 j = 0; j < i; j++) pvkDestroyFence(s_vk.device, s_e5.slot[j].fence, NULL);
+            pvkDestroyCommandPool(s_vk.device, s_e5.pool, NULL);
+            memset(&s_e5, 0, sizeof s_e5);
+            return -1;
+        }
+    }
+    s_e5.ready = 1;
+    return 0;
+}
+
+static void vk_e5_destroy_spare_or_keep(vk_buffer* b)
+{
+    if (!b->buf) return;
+    if (s_e5.nspare < VK_E5_SPARES) { s_e5.spare[s_e5.nspare++] = *b; memset(b, 0, sizeof *b); }
+    else vk_destroy_buffer(b);
+}
+
+/* Retire every slot whose fence has signalled, oldest first; with `wait`,
+ * block until `until` is retired. 0 on success, -1 on a failed fence. */
+static int vk_e5_reap(u64 until, int wait)
+{
+    while (s_e5.count) {
+        vk_e5_slot* sl = &s_e5.slot[s_e5.head];
+        VkResult r = pvkGetFenceStatus(s_vk.device, sl->fence);
+        if (r == VK_NOT_READY && wait && sl->ticket <= until) {
+            r = pvkWaitForFences(s_vk.device, 1, &sl->fence, VK_TRUE, UINT64_MAX);
+            if (r == VK_SUCCESS) r = pvkGetFenceStatus(s_vk.device, sl->fence);
+        }
+        if (r == VK_NOT_READY) break;
+        if (r != VK_SUCCESS) { vk_e5_fail("completion fence"); return -1; }
+        s_e5.completed = sl->ticket;
+        vk_e5_destroy_spare_or_keep(&sl->words);
+        s_e5.head = (s_e5.head + 1u) % VK_E5_SLOTS;
+        s_e5.count--;
+    }
+    /* Images released while their writer was in flight. */
+    for (u32 i = 0; i < s_e5.nretire; ) {
+        if (s_e5.retire[i].ticket <= s_e5.completed) {
+            vk_destroy_image(&s_e5.retire[i].im);
+            s_e5.retire[i] = s_e5.retire[--s_e5.nretire];
+        } else i++;
+    }
+    return 0;
+}
+
+/* The next free slot, its fence reset and its command buffer ready to record
+ * (begun, after a full dependency on everything earlier) when `record`. */
+static vk_e5_slot* vk_e5_acquire(int record)
+{
+    if (vk_e5_failed() || vk_e5_init()) return NULL;
+    if (vk_e5_reap(0, 0)) return NULL;
+    if (s_e5.count == VK_E5_SLOTS) {
+        s_e5.cap_waits++;
+        if (vk_e5_reap(s_e5.slot[s_e5.head].ticket, 1)) return NULL;
+    }
+    if (s_e5.issued == UINT64_MAX) { vk_e5_fail("ticket counter"); return NULL; }
+    vk_e5_slot* sl = &s_e5.slot[(s_e5.head + s_e5.count) % VK_E5_SLOTS];
+    if (pvkResetFences(s_vk.device, 1, &sl->fence) != VK_SUCCESS) { vk_e5_fail("vkResetFences"); return NULL; }
+    if (record) {
+        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        if (pvkResetCommandBuffer(sl->cb, 0) != VK_SUCCESS || pvkBeginCommandBuffer(sl->cb, &bi) != VK_SUCCESS) {
+            vk_e5_fail("async command buffer"); return NULL;
+        }
+        vk_cmd_after_everything(sl->cb);
+    }
+    return sl;
+}
+
+/* Submit an acquired slot (with its recording, or none) and return its
+ * ticket; 0 on failure. */
+static u64 vk_e5_submit(vk_e5_slot* sl, int recorded)
+{
+    if (recorded) {
+        vk_cmd_after_everything(sl->cb);     /* before every later submission */
+        if (pvkEndCommandBuffer(sl->cb) != VK_SUCCESS) { vk_e5_fail("vkEndCommandBuffer (async)"); return 0; }
+    }
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = recorded ? 1u : 0u,
+                        .pCommandBuffers = recorded ? &sl->cb : NULL };
+    if (vk_queue_submit(&si, sl->fence) != VK_SUCCESS) { vk_e5_fail("vkQueueSubmit (async)"); return 0; }
+    sl->ticket = ++s_e5.issued;
+    s_e5.count++;
+    return sl->ticket;
+}
+
+static int vk_e5_is_ticket_fence(VkFence f)
+{
+    if (!f || !s_e5.ready) return 0;
+    for (u32 i = 0; i < s_e5.count; i++)
+        if (s_e5.slot[(s_e5.head + i) % VK_E5_SLOTS].fence == f) return 1;
+    return 0;
+}
+
+static void vk_e5_log(void)
+{
+    if (!s_e5.log) return;
+    static struct timespec last;
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    if (last.tv_sec && now.tv_sec - last.tv_sec < 2) return;
+    last = now;
+    fprintf(stderr, "[rsx inflight vulkan] tickets=%llu completed=%llu outstanding=%u cap_waits=%llu "
+            "views=%llu view_buffers_reused=%llu stores=%llu deferred_destroys=%llu pending_destroys=%u failed=%d\n",
+            (unsigned long long)s_e5.issued, (unsigned long long)s_e5.completed, s_e5.count,
+            (unsigned long long)s_e5.cap_waits, (unsigned long long)s_e5.views_made,
+            (unsigned long long)s_e5.view_buffers_reused, (unsigned long long)s_e5.stores,
+            (unsigned long long)s_e5.deferred_destroys, s_e5.nretire, vk_e5_failed());
+}
+
+static u64 vk_eng_submit_async(void* user, u32 reason)
+{
+    (void)user; (void)reason;
+    vk_e5_slot* sl = vk_e5_acquire(0);
+    const u64 ticket = sl ? vk_e5_submit(sl, 0) : 0;
+    vk_e5_log();
+    return vk_e5_failed() ? 0 : ticket;
+}
+
+static int vk_eng_completion_status(void* user, u64 ticket, int wait)
+{
+    (void)user;
+    if (!ticket || ticket > s_e5.issued || vk_e5_failed()) return -1;
+    if (vk_e5_reap(ticket, wait)) return -1;
+    return ticket <= s_e5.completed ? 1 : 0;
+}
+
+static int vk_eng_submit_and_wait_checked(void* user, u32 reason)
+{
+    const u64 ticket = vk_eng_submit_async(user, reason);
+    return ticket && vk_eng_completion_status(user, ticket, 1) == 1;
+}
+
+/* An engine image that the GPU may still be writing goes on the retire list
+ * instead of being destroyed. Returns 1 when it took the image. */
+static int vk_e5_defer_destroy(u32 handle)
+{
+    const u64 t = s_e5_obj_ticket[handle];
+    s_e5_obj_ticket[handle] = 0;
+    if (!t || !s_e5.ready) return 0;
+    if (vk_e5_reap(0, 0) || t <= s_e5.completed) return 0;
+    if (s_e5.nretire == VK_E5_RETIRE && vk_e5_reap(s_e5.retire[0].ticket, 1)) return 0;
+    if (s_e5.nretire == VK_E5_RETIRE) return 0;      /* reaped above; cannot happen */
+    s_e5.retire[s_e5.nretire].im = s_eobj[handle].im;
+    s_e5.retire[s_e5.nretire].ticket = t;
+    s_e5.nretire++;
+    s_e5.deferred_destroys++;
+    memset(&s_eobj[handle].im, 0, sizeof s_eobj[handle].im);
+    return 1;
+}
+
+static void vk_e5_shutdown(void)
+{
+    if (!s_vk.device) { memset(&s_e5, 0, sizeof s_e5); return; }
+    if (s_e5.ready || s_e5.nretire || s_e5.pipe) vk_device_idle();
+    for (u32 i = 0; i < s_e5.nretire; i++) vk_destroy_image(&s_e5.retire[i].im);
+    for (u32 i = 0; i < VK_E5_SLOTS; i++) {
+        vk_destroy_buffer(&s_e5.slot[i].words);
+        if (s_e5.slot[i].fence) pvkDestroyFence(s_vk.device, s_e5.slot[i].fence, NULL);
+    }
+    for (u32 i = 0; i < s_e5.nspare; i++) vk_destroy_buffer(&s_e5.spare[i]);
+    vk_destroy_buffer(&s_e5.store_dev);
+    vk_destroy_buffer(&s_e5.store_host);
+    if (s_e5.pool) pvkDestroyCommandPool(s_vk.device, s_e5.pool, NULL);
+    if (s_e5.pipe) pvkDestroyPipeline(s_vk.device, s_e5.pipe, NULL);
+    if (s_e5.module) pvkDestroyShaderModule(s_vk.device, s_e5.module, NULL);
+    if (s_e5.layout) pvkDestroyPipelineLayout(s_vk.device, s_e5.layout, NULL);
+    if (s_e5.dpool) pvkDestroyDescriptorPool(s_vk.device, s_e5.dpool, NULL);
+    if (s_e5.set_layout) pvkDestroyDescriptorSetLayout(s_vk.device, s_e5.set_layout, NULL);
+    memset(&s_e5, 0, sizeof s_e5);
+    memset(s_e5_obj_ticket, 0, sizeof s_e5_obj_ticket);
+}
+
+/* A device-local buffer the conversion can copy into, run on and copy out of. */
+static int vk_e5_device_buffer(vk_buffer* b, VkDeviceSize size)
+{
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                               .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    memset(b, 0, sizeof *b);
+    if (pvkCreateBuffer(s_vk.device, &bci, NULL, &b->buf) != VK_SUCCESS) return -1;
+    VkMemoryRequirements req;
+    pvkGetBufferMemoryRequirements(s_vk.device, b->buf, &req);
+    u32 type;
+    if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type) &&
+        vk_find_memory_type(req.memoryTypeBits, 0, &type)) { vk_destroy_buffer(b); return -1; }
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = req.size, .memoryTypeIndex = type };
+    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &b->mem) != VK_SUCCESS ||
+        pvkBindBufferMemory(s_vk.device, b->buf, b->mem, 0) != VK_SUCCESS) { vk_destroy_buffer(b); return -1; }
+    b->size = size;
+    return 0;
+}
+
+static int vk_e5_pipeline(void)
+{
+    if (s_e5.pipe) return 0;
+    if (s_e5.pipe_failed) return -1;
+    s_e5.pipe_failed = 1;
+    if (vk_e5_init()) return -1;
+    VkDescriptorSetLayoutBinding b = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                       .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
+    VkDescriptorSetLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                            .bindingCount = 1, .pBindings = &b };
+    if (pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_e5.set_layout) != VK_SUCCESS) return -1;
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 8 };
+    VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                        .setLayoutCount = 1, .pSetLayouts = &s_e5.set_layout,
+                                        .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+    if (pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_e5.layout) != VK_SUCCESS) return -1;
+    if (vk_create_shader(rsx_vk_depth_z24_comp_spv, sizeof rsx_vk_depth_z24_comp_spv, &s_e5.module)) return -1;
+    VkComputePipelineCreateInfo cci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = s_e5.module, .pName = "main" },
+        .layout = s_e5.layout };
+    if (pvkCreateComputePipelines(s_vk.device, VK_NULL_HANDLE, 1, &cci, NULL, &s_e5.pipe) != VK_SUCCESS) {
+        s_e5.pipe = VK_NULL_HANDLE; return -1;
+    }
+    /* One set per ticket slot, so an in-flight view's set is never rewritten,
+     * and one for the synchronous store. */
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_E5_SLOTS + 1u };
+    VkDescriptorPoolCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                       .maxSets = VK_E5_SLOTS + 1u, .poolSizeCount = 1, .pPoolSizes = &ps };
+    if (pvkCreateDescriptorPool(s_vk.device, &dci, NULL, &s_e5.dpool) != VK_SUCCESS) return -1;
+    VkDescriptorSetLayout layouts[VK_E5_SLOTS + 1u];
+    VkDescriptorSet sets[VK_E5_SLOTS + 1u];
+    for (u32 i = 0; i <= VK_E5_SLOTS; i++) layouts[i] = s_e5.set_layout;
+    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                        .descriptorPool = s_e5.dpool, .descriptorSetCount = VK_E5_SLOTS + 1u,
+                                        .pSetLayouts = layouts };
+    if (pvkAllocateDescriptorSets(s_vk.device, &dai, sets) != VK_SUCCESS) return -1;
+    for (u32 i = 0; i < VK_E5_SLOTS; i++) s_e5.slot[i].set = sets[i];
+    s_e5.sync_set = sets[VK_E5_SLOTS];
+    s_e5.pipe_failed = 0;
+    return 0;
+}
+
+/* Which depth targets the conversion reads: those whose depth aspect copies
+ * out as 32-bit floats. Says once when the device's depth format is not one. */
+static vk_eng_obj* vk_e5_depth(u32 depth, u32 w, u32 h)
+{
+    vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
+    if (!z || !w || !h || w > z->w || h > z->h || (u64)w * h > UINT32_MAX / 4u) return NULL;
+    if (s_vk.depth_format != VK_FORMAT_D32_SFLOAT && s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        static int warned;
+        if (!warned) { VK_LOG("engine: GPU z24 conversion needs D32_SFLOAT, this device uses %d; depth reads keep the CPU path\n",
+                              (int)s_vk.depth_format); warned = 1; }
+        return NULL;
+    }
+    return z;
+}
+
+/* Record: the float bits in `buf` (just written by a transfer) -> D24S8
+ * words in place, then the words available to `next_stage`/`next_access`.
+ * `set` must not be in use by pending work. */
+static void vk_e5_record_words(VkCommandBuffer cb, VkDescriptorSet set, VkBuffer buf, u32 w, u32 h,
+                               VkPipelineStageFlags next_stage, VkAccessFlags next_access)
+{
+    VkBufferMemoryBarrier toc = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buf, .offset = 0, .size = VK_WHOLE_SIZE };
+    pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0, 0, NULL, 1, &toc, 0, NULL);
+    VkDescriptorBufferInfo bi = { buf, 0, (VkDeviceSize)w * h * 4u };
+    VkWriteDescriptorSet wr = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+                                .dstBinding = 0, .descriptorCount = 1,
+                                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi };
+    pvkUpdateDescriptorSets(s_vk.device, 1, &wr, 0, NULL);
+    pvkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s_e5.pipe);
+    pvkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s_e5.layout, 0, 1, &set, 0, NULL);
+    const u32 extent[2] = { w, h };
+    pvkCmdPushConstants(cb, s_e5.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof extent, extent);
+    pvkCmdDispatch(cb, (w + 7u) / 8u, (h + 7u) / 8u, 1);
+    VkBufferMemoryBarrier fromc = toc;
+    fromc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    fromc.dstAccessMask = next_access;
+    pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, next_stage, 0, 0, NULL, 1, &fromc, 0, NULL);
+}
+
+/* Record: the top-left w x h of depth -> `buf` as floats -> D24S8 words. */
+static void vk_e5_record_convert(VkCommandBuffer cb, VkDescriptorSet set, const vk_eng_obj* z,
+                                 VkBuffer buf, u32 w, u32 h,
+                                 VkPipelineStageFlags next_stage, VkAccessFlags next_access)
+{
+    VkBufferImageCopy out = { .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+                              .imageExtent = { w, h, 1 } };
+    pvkCmdCopyImageToBuffer(cb, z->im.img, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &out);
+    vk_e5_record_words(cb, set, buf, w, h, next_stage, next_access);
+}
+
+/* The A8R8G8B8 decode puts guest bytes A,R,G,B into host R,G,B,A by rotating
+ * (unless TEX_RGBA), and D8R8G8B8 reads its alpha as one. The raw image holds
+ * the guest bytes in components 0..3; this is the component each decoded
+ * channel comes from. */
+static VkComponentSwizzle vk_e5_raw(VkComponentSwizzle decoded, int rotate, int alpha_one)
+{
+    switch (decoded) {
+    case VK_COMPONENT_SWIZZLE_R: return rotate ? VK_COMPONENT_SWIZZLE_G : VK_COMPONENT_SWIZZLE_R;
+    case VK_COMPONENT_SWIZZLE_G: return rotate ? VK_COMPONENT_SWIZZLE_B : VK_COMPONENT_SWIZZLE_G;
+    case VK_COMPONENT_SWIZZLE_B: return rotate ? VK_COMPONENT_SWIZZLE_A : VK_COMPONENT_SWIZZLE_B;
+    case VK_COMPONENT_SWIZZLE_A: return alpha_one ? VK_COMPONENT_SWIZZLE_ONE
+                                       : rotate ? VK_COMPONENT_SWIZZLE_R : VK_COMPONENT_SWIZZLE_A;
+    default:                     return decoded;
+    }
+}
+
+/* A sampled RGBA8 engine texture that reads raw D24S8 words as the A8R8G8B8 /
+ * D8R8G8B8 decode plus crossbar would. Image in UNDEFINED; caller fills it. */
+static u32 vk_e5_alias_texture(u32 w, u32 h, u32 remap, u32 rsx_fmt)
+{
+    const u32 base = rsx_fmt & 0x9Fu;
+    if (!w || !h || w > vk_max_dim() || h > vk_max_dim() || (base != 0x85u && base != 0x9Eu)) return 0;
+    const int rotate = !rsx_texture_argb_is_rgba(), alpha_one = base == 0x9Eu;
+    const VkComponentMapping dec = vk_remap(remap, base);
+    const VkComponentMapping map = { vk_e5_raw(dec.r, rotate, alpha_one), vk_e5_raw(dec.g, rotate, alpha_one),
+                                     vk_e5_raw(dec.b, rotate, alpha_one), vk_e5_raw(dec.a, rotate, alpha_one) };
+    const u32 hd = vk_eng_alloc();
+    if (!hd) return 0;
+    vk_eng_obj* o = &s_eobj[hd];
+    if (vk_create_image(&o->im, VK_FORMAT_R8G8B8A8_UNORM, w, h,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) {
+        vk_destroy_image(&o->im); memset(o, 0, sizeof *o); return 0;
+    }
+    pvkDestroyImageView(s_vk.device, o->im.view, NULL);
+    o->im.view = VK_NULL_HANDLE;
+    if (vk_eng_make_view(o->im.img, VK_FORMAT_R8G8B8A8_UNORM, 1, map, 0, &o->im.view)) {
+        vk_destroy_image(&o->im); memset(o, 0, sizeof *o); return 0;
+    }
+    o->kind = VK_ENG_TEXTURE; o->fmt = VK_FORMAT_R8G8B8A8_UNORM; o->bpp = 4; o->w = w; o->h = h;
+    return hd;
+}
+
+/* Record: `words` (row length `row` texels) -> the w x h alias image, then
+ * the image readable by any later work. */
+static void vk_e5_record_fill(VkCommandBuffer cb, VkBuffer words, u32 row, VkImage img, u32 w, u32 h)
+{
+    VkImageMemoryBarrier to = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          0, 0, NULL, 0, NULL, 1, &to);
+    VkBufferImageCopy in = { .bufferRowLength = row, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                             .imageExtent = { w, h, 1 } };
+    pvkCmdCopyBufferToImage(cb, words, img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+    VkImageMemoryBarrier rd = to;
+    rd.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    rd.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;
+    rd.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          0, 0, NULL, 0, NULL, 1, &rd);
+}
+
+static int vk_eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32 dst_pitch)
+{
+    (void)user;
+    if (!vk_e5_gpu_z24() || vk_e5_failed() || !dst || dst_pitch < w * 4u) return -1;
+    const vk_eng_obj* z = vk_e5_depth(depth, w, h);
+    if (!z || vk_e5_pipeline()) return -1;
+    const VkDeviceSize bytes = (VkDeviceSize)w * h * 4u;
+    s_e5.store_valid = 0;
+    if (s_e5.store_dev.size < bytes) {
+        vk_destroy_buffer(&s_e5.store_dev);
+        if (vk_e5_device_buffer(&s_e5.store_dev, bytes)) return -1;
+    }
+    if (s_e5.store_host.size < bytes) {
+        vk_destroy_buffer(&s_e5.store_host);
+        if (vk_create_host_buffer(&s_e5.store_host, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+            vk_destroy_buffer(&s_e5.store_host); return -1;
+        }
+    }
+    if (vk_begin()) return -1;
+    vk_cmd_after_everything(s_vk.cmd);
+    vk_e5_record_convert(s_vk.cmd, s_e5.sync_set, z, s_e5.store_dev.buf, w, h,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkBufferCopy c = { 0, 0, bytes };
+    pvkCmdCopyBuffer(s_vk.cmd, s_e5.store_dev.buf, s_e5.store_host.buf, 1, &c);
+    VkBufferMemoryBarrier hb = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = s_e5.store_host.buf, .offset = 0, .size = VK_WHOLE_SIZE };
+    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                          0, 0, NULL, 1, &hb, 0, NULL);
+    if (vk_submit_and_wait()) return -1;
+    vk_invalidate(&s_e5.store_host);
+    const u8* src = (const u8*)s_e5.store_host.ptr;
+    if (dst_pitch == w * 4u) memcpy(dst, src, (size_t)bytes);
+    else for (u32 y = 0; y < h; y++) memcpy(dst + (size_t)y * dst_pitch, src + (size_t)y * w * 4u, (size_t)w * 4u);
+    s_e5.store_w = w; s_e5.store_h = h; s_e5.store_valid = 1;
+    s_e5.stores++;
+    return 0;
+}
+
+static u32 vk_eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    if (!vk_e5_gpu_z24() || vk_e5_failed() || !s_e5.store_valid || !w || !h ||
+        w > s_e5.store_w || h > s_e5.store_h)
+        return 0;
+    const u32 hd = vk_e5_alias_texture(w, h, remap, rsx_fmt);
+    if (!hd) return 0;
+    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    vk_cmd_after_everything(s_vk.cmd);
+    vk_e5_record_fill(s_vk.cmd, s_e5.store_dev.buf, s_e5.store_w, s_eobj[hd].im.img, w, h);
+    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    return hd;
+}
+
+static u32 vk_eng_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    const u32 base = rsx_fmt & 0x9Fu;
+    if (vk_e5_failed() || (base != 0x85u && base != 0x9Eu)) return 0;
+    const vk_eng_obj* z = vk_e5_depth(depth, w, h);
+    if (!z || vk_e5_pipeline()) return 0;
+    const VkDeviceSize bytes = (VkDeviceSize)w * h * 4u;
+    vk_buffer words = {0};
+    for (u32 i = 0; i < s_e5.nspare; i++)
+        if (s_e5.spare[i].size >= bytes && s_e5.spare[i].size <= bytes * 2u) {
+            words = s_e5.spare[i]; s_e5.spare[i] = s_e5.spare[--s_e5.nspare];
+            s_e5.view_buffers_reused++;
+            break;
+        }
+    if (!words.buf && vk_e5_device_buffer(&words, bytes)) return 0;
+    const u32 hd = vk_e5_alias_texture(w, h, remap, rsx_fmt);
+    vk_e5_slot* sl = hd ? vk_e5_acquire(1) : NULL;
+    if (!sl) {
+        if (hd) vk_eng_release(user, hd);
+        vk_e5_destroy_spare_or_keep(&words);
+        return 0;
+    }
+    vk_e5_record_convert(sl->cb, sl->set, z, words.buf, w, h,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    vk_e5_record_fill(sl->cb, words.buf, w, s_eobj[hd].im.img, w, h);
+    sl->words = words;           /* freed (or kept as a spare) when the slot retires */
+    const u64 ticket = vk_e5_submit(sl, 1);
+    if (!ticket) {
+        /* Never submitted: nothing on the GPU references either. */
+        vk_destroy_buffer(&sl->words);
+        vk_eng_release(user, hd);
+        return 0;
+    }
+    s_e5_obj_ticket[hd] = ticket;
+    s_e5_obj_ticket[depth] = ticket;     /* its copy reads the depth target */
+    s_e5.views_made++;
+    return hd;
+}
+
 /* Every registered original backend entry shares the host owner gate. */
 static int owner_vk_eng_init(void* user, u32 width, u32 height){
     if(!vulkan_owner_begin(1)){return -1;}uint64_t before=s_vulkan_commits;
@@ -3693,6 +4292,31 @@ static void owner_vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 
     vk_eng_color_target_write(user,surface,x,y,w,h,rows,row_bytes);vulkan_owner_finish(vulkan_owner_boundary(before));
 }
 
+static u64 owner_vk_eng_submit_async(void* user, u32 reason){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u64 result=vk_eng_submit_async(user,reason);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static int owner_vk_eng_completion_status(void* user, u64 ticket, int wait){
+    if(!vulkan_owner_begin(0)){return -1;}
+    int result=vk_eng_completion_status(user,ticket,wait);vulkan_owner_finish(1);return result;
+}
+static int owner_vk_eng_submit_and_wait_checked(void* user, u32 reason){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    int result=vk_eng_submit_and_wait_checked(user,reason);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static int owner_vk_eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32 dst_pitch){
+    if(!vulkan_owner_begin(1)){return -1;}uint64_t before=s_vulkan_commits;
+    int result=vk_eng_depth_store_z24(user,depth,w,h,dst,dst_pitch);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static u32 owner_vk_eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fmt){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u32 result=vk_eng_depth_z24_texture(user,w,h,remap,rsx_fmt);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static u32 owner_vk_eng_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u32 result=vk_eng_depth_z24_view(user,depth,w,h,remap,rsx_fmt);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+
 static const rsx_draw_backend s_vk_engine_backend = {
     .user                 = NULL,
     .init                 = owner_vk_eng_init,
@@ -3727,6 +4351,12 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .readback             = owner_vk_eng_readback,
     .depth_readback       = owner_vk_eng_depth_readback,
     .color_target_write   = owner_vk_eng_color_target_write,
+    .depth_store_z24      = owner_vk_eng_depth_store_z24,
+    .depth_z24_texture    = owner_vk_eng_depth_z24_texture,
+    .depth_z24_view       = owner_vk_eng_depth_z24_view,
+    .submit_and_wait_checked = owner_vk_eng_submit_and_wait_checked,
+    .submit_async         = owner_vk_eng_submit_async,
+    .completion_status    = owner_vk_eng_completion_status,
 };
 
 /* Every registered original backend entry shares the host owner gate. */
@@ -3995,6 +4625,7 @@ static void vulkan_original_shutdown(void)
         vk_device_idle();
         if(vulkan_owner_enabled()&&s_vulkan_owner.failed)return;
         vk_guest_shutdown();
+        vk_e5_shutdown();
         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);
         if (s_vk.pipe_layout) pvkDestroyPipelineLayout(s_vk.device, s_vk.pipe_layout, NULL);
@@ -4189,13 +4820,19 @@ int rsx_vulkan_backend_native_boundary(uint64_t *ticket){
                 else if(s_vulkan_boundary_generation!=s_vulkan_owner.generation)status=-3;
                 else{
                     VkResult result=pvkGetFenceStatus(s_vk.device,s_vulkan_boundary_fence);
+                    /* An asynchronous completion ticket (E5) is an ordered,
+                     * submitted boundary even before it signals, as Metal's
+                     * async boundary is: native work queued after it runs
+                     * after it, and native passes order their imported
+                     * images against all earlier queue work themselves. */
+                    if(result==VK_NOT_READY&&vk_e5_is_ticket_fence(s_vulkan_boundary_fence))result=VK_SUCCESS;
                     if(result==VK_NOT_READY)status=-4;
                     else if(result!=VK_SUCCESS){vulkan_owner_fault();status=-6;}
                     else{
                         *ticket=s_vulkan_boundary_commit;
-                        /* All original encoding is synchronous today. The exact
-                         * latest submitted fence plus common quiescence proves
-                         * a completed original boundary, without a callback wait. */
+                        /* Original drawing is synchronous; the exact latest
+                         * submitted fence (complete, or a pending E5 ticket)
+                         * plus common quiescence is the ordered boundary. */
                         rsx_owner_submitted(&s_vulkan_owner,&s_vulkan_owner_thread,1);
                     }
                 }

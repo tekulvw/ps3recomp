@@ -1,0 +1,51 @@
+#version 450
+// Depth values to the D24S8 words guest memory holds, in place.
+//
+// Input: one 32-bit IEEE float per texel, the depth aspect of a D32_SFLOAT or
+// D32_SFLOAT_S8_UINT target copied tightly into the buffer. Output, over the
+// same element: the four bytes depth[23:16], depth[15:8], depth[7:0], 0 in
+// memory order, i.e. the big-endian word (z24 << 8) | stencil 0.
+//
+// The 24-bit value is what the engine's CPU conversion computes,
+// (u32)((double)clamp(d, 0, 1) * 16777215 + 0.5), but derived from the float's
+// bits with integer arithmetic only, so the result does not depend on the
+// GPU's float rounding or NaN handling:
+//   negative (sign set, -0 and negative NaN included) or positive NaN -> 0
+//   1.0 and above (+inf included)                                   -> 0xFFFFFF
+//   otherwise d = m * 2^-k with m the 24-bit significand, and the value is
+//   (m * 16777215 + 2^(k-1)) >> k, a 48-bit product held in two words.
+//
+// Regenerate the header (from this directory) with
+//   glslangValidator -V --vn rsx_vk_depth_z24_comp_spv -o rsx_vk_depth_z24_comp.spv.h rsx_vk_depth_z24.comp
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(std430, set = 0, binding = 0) buffer Words { uint word[]; };
+layout(push_constant) uniform Extent { uint width; uint height; } pc;
+
+uint z24_of_bits(uint b)
+{
+    if ((b & 0x80000000u) != 0u || b > 0x7F800000u) return 0u;
+    if (b >= 0x3F800000u) return 0xFFFFFFu;
+    const uint e = b >> 23;
+    const uint m = (b & 0x7FFFFFu) | (e != 0u ? 0x800000u : 0u);
+    const uint k = e != 0u ? 150u - e : 149u;    // k >= 24 here
+    if (k > 48u) return 0u;                      // m * 16777215 < 2^48 <= 2^(k-1)
+    uint hi, lo;
+    umulExtended(m, 0xFFFFFFu, hi, lo);
+    // + 2^(k-1), carried into the high word.
+    const uint r = k - 1u;
+    const uint add_lo = r < 32u ? (1u << r) : 0u;
+    const uint add_hi = r < 32u ? 0u : (1u << (r - 32u));
+    const uint sum_lo = lo + add_lo;
+    hi += add_hi + (sum_lo < lo ? 1u : 0u);
+    // >> k, k in [24, 48].
+    return k < 32u ? ((sum_lo >> k) | (hi << (32u - k))) : (hi >> (k - 32u));
+}
+
+void main()
+{
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height) return;
+    const uint i = p.y * pc.width + p.x;
+    const uint v = z24_of_bits(word[i]);
+    word[i] = (v >> 16) | (((v >> 8) & 0xFFu) << 8) | ((v & 0xFFu) << 16);
+}

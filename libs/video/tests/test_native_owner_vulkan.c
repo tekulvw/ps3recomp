@@ -61,6 +61,20 @@ int main(int argc,char** argv){
     assert(first.try_begin(first.userdata,first.lifetime)==-4); /* direct backend flush cannot bypass CPU BEGIN */
     rsx_draw_engine_method(NV4097_SET_BEGIN_END,0);rsx_draw_engine_flush();
     assert(first.try_begin(first.userdata,first.lifetime)==0);first.end(first.userdata,first.lifetime);
+    /* E5: an asynchronous ticket, even one still pending behind GPU work, is
+     * an ordered native boundary; it certifies once it completes. */
+    {
+        const rsx_draw_backend* be=&s_vk_engine_backend;
+        uint32_t depth=be->depth_target_create(NULL,4096,4096);assert(depth);
+        uint32_t view=be->depth_z24_view(NULL,depth,4096,4096,0xAAE4u,0xA5u);assert(view);
+        const uint64_t pending=be->submit_async(NULL,RSX_BE_FLUSH_GUEST_REFERENCE);assert(pending);
+        const int was_pending=be->completion_status(NULL,pending,0)==0;
+        uint64_t boundary=0;assert(rsx_vulkan_backend_native_boundary(&boundary)==0&&boundary);
+        assert(first.try_begin(first.userdata,first.lifetime)==0);first.end(first.userdata,first.lifetime);
+        assert(be->completion_status(NULL,pending,1)==1&&be->submit_and_wait_checked(NULL,RSX_BE_FLUSH_GUEST_REFERENCE)==1);
+        be->texture_release(NULL,view);be->depth_target_release(NULL,depth);
+        printf("async boundary accepted (ticket pending at boundary: %d)\n",was_pending);
+    }
     void* original=first.device;rsx_vulkan_backend_shutdown();assert((void*)s_vk.device==original);
     assert(rsx_vulkan_backend_owner_shutdown_requested(first.lifetime)==1);
     assert(rsx_vulkan_backend_owner_retry_shutdown(first.lifetime)==-4);
