@@ -1,12 +1,20 @@
 /* Deliberately incorrect, launch-selected rendering diagnostics. These gates
  * never own submission/completion and are not renderer capability profiles. */
 #include "render_ablation.h"
+#ifdef _WIN32
+#include "../platform/win32_compat.h"
+#else
 #include <pthread.h>
+#endif
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+static INIT_ONCE s_once=INIT_ONCE_STATIC_INIT;
+#else
 static pthread_once_t s_once=PTHREAD_ONCE_INIT;
+#endif
 static unsigned s_configured;
 static int s_status;
 static atomic_uint s_active, s_metrics;
@@ -31,8 +39,19 @@ static void configure(void) {
     atomic_store_explicit(&s_metrics,metrics || s_configured!=0,memory_order_relaxed);
     if(s_configured || metrics)fprintf(stderr,"[rsx ablation] configured=%u active=0 metrics=1; explicit after-HUD arm required\n",s_configured);
 }
+#ifdef _WIN32
+static BOOL CALLBACK configure_once(PINIT_ONCE once,PVOID parameter,PVOID *context) {
+    (void)once;(void)parameter;(void)context;
+    configure();
+    return TRUE;
+}
+#endif
 int rsx_render_ablation_init(void) {
+#ifdef _WIN32
+    if(!InitOnceExecuteOnce(&s_once,configure_once,NULL,NULL))return -1;
+#else
     pthread_once(&s_once,configure);
+#endif
     return s_status;
 }
 int rsx_render_ablation_arm(void) {
