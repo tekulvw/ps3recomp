@@ -3824,7 +3824,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
             if (!attr.size || dc.inl_bytes) continue;
             if (!(s_external.array_offsets&(1u<<i))) { (void)eng_external_fail(6,i);return; }
             if (s_external.bases!=3) { (void)eng_external_fail(7,s_external.bases!=1?0x1738:0x173C);return; }
-            if (attr.frequency>1 && !s_external.frequency) { (void)eng_external_fail(7,0x1FEC);return; }
+            if (attr.frequency>1 && !s_external.frequency) { (void)eng_external_fail(7,0x1FC0);return; }
         }
         if (dc.n_idx && s_external.indices!=3) { (void)eng_external_fail(9,s_external.indices!=1?0x181C:0x1820);return; }
     }
@@ -4311,7 +4311,7 @@ static void eng_method_core(u32 method, u32 arg)
         else if (m==0x173C) s_external.bases|=2;
         else if (m==0x181C) s_external.indices|=1;
         else if (m==0x1820) s_external.indices|=2;
-        else if (m==0x1FEC) s_external.frequency=1;
+        else if (m==0x1FC0) s_external.frequency=1;
     }
     rsx_dispatch_method(&g.rsx, m, arg);
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
@@ -4736,7 +4736,9 @@ int rsx_draw_engine_native_prepare_image(uint64_t scope,const rsx_native_image_k
     return status;
 }
 /* This whitelist is passive source state only. Execution, program and guest
- * vertex/index bindings deliberately require real later original methods. */
+ * vertex/index bindings deliberately require real later original methods.
+ * Base registers are certificates of unchanged inherited state, checked under
+ * the owner gate before mutation; they cannot restore a stale guest base. */
 static int eng_external_passive(u32 m)
 {
     if (m&3u) return 0;
@@ -4756,6 +4758,7 @@ static int eng_external_passive(u32 m)
     case 0x0A00:case 0x0A04:case 0x0A20:case 0x0A24:case 0x0A28:case 0x0A2C:
     case 0x0A30:case 0x0A34:case 0x0A38:case 0x0A3C:
     case 0x0A60:case 0x0A64:case 0x0A68:case 0x0A6C:case 0x0A70:case 0x0A74:case 0x0A78:case 0x0A7C:
+    case 0x1738:case 0x173C:
     case 0x1830:case 0x1834:case 0x1838:case 0x183C:case 0x1FEC:case 0x1D78:case 0x1D90:
     case 0x1D98:case 0x1D9C:case 0x1DA0:case 0x1DA4:case 0x1DAC:case 0x1DB0:
     case 0x1FC0:case 0x1FF0:case 0x1FF4:return 1;
@@ -4814,6 +4817,13 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
     if(!g.ready)status=-3;
     else if(atomic_load(&s_checked_failed))status=-6;
     else if(g.rsx.in_begin_end)status=-4;
+    /* Native Main does not write either guest array base. An explicit carried
+     * word may certify that unchanged value, never overwrite newer state. */
+    for(u32 i=0;!status && i<p->register_count;++i) {
+        const rsx_native_register_write* r=&p->registers[i];
+        if((r->method==0x1738 || r->method==0x173C) &&
+           r->value!=rsx_dsp_reg(&g.rsx,r->method))status=-3;
+    }
     if(!status && s_native_images.id && (s_native_images.source!=p->source_observation || s_native_images.vm!=vm_base || s_native_images.published))status=-3;
     /* These are actual earlier queued POC clear commands, not inferred draw
      * coverage. Publish them before native writes, including clear-only outputs.
@@ -4886,6 +4896,15 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
                 g.rsx.regs[idx]=v->words[j];g.rsx.seen[idx]=1;}
         }
         memset(&s_external,0,sizeof(s_external));
+        // Only explicit validated continuation words certify these retained
+        // inputs. Programs, guest array addresses/formats and indices remain
+        // invalid until their real subsequent guest methods arrive.
+        for(u32 i=0;i<p->register_count;++i) {
+            const u32 m=p->registers[i].method;
+            if(m==0x1738)s_external.bases|=1;
+            else if(m==0x173C)s_external.bases|=2;
+            else if(m==0x1FC0)s_external.frequency=1;
+        }
         s_external.status=(rsx_native_external_status){.abi_version=1,.struct_size=sizeof(rsx_native_external_status),.active=1,
             .source_observation=p->source_observation,.native_generation=p->native_generation,.native_ticket=p->native_ticket};
     }

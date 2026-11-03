@@ -143,7 +143,12 @@ int rsx_draw_engine_native_image_clear_planes(uint32_t handle, uint32_t required
  * Passive words exclude programs/array pointers/execution methods. Constants
  * and current attributes contain only source-known actual writes; other rows
  * remain unchanged. Subsequent original draws must bind fresh VP instructions,
- * FP address/control and any consumed array addresses/formats/base state.
+ * FP address/control and any consumed array addresses/formats/index state.
+ * Explicit 0x1738/0x173C words certify unchanged inherited vertex bases: each must
+ * equal the live decoder value under the owner gate or the whole publication
+ * returns -3 without mutation. Missing certificates require later real base
+ * writes. An explicit source-known 0x1FC0 word certifies the frequency-divider mode; absent
+ * frequency state likewise requires its later real method.
  * Status0 success; -1 invalid, -3 stale identity, -4 busy, -5 budget, -6 failed.
  */
 typedef struct rsx_native_external_image_write {

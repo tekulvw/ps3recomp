@@ -43,6 +43,45 @@ int main(void){
     engine_down();engine_up();p=pass();assert(!rsx_draw_engine_native_publish_external(&p));
     upload_programs(4);fresh_arrays();draw_triangle();assert(stub.n_draw==1&&!status().failure);
     engine_down();engine_up();
+    // Source Main leaves these inherited base registers unchanged. Certify the
+    // exact observed values, not a guessed zero or a restored stale snapshot.
+    rsx_native_register_write bases[3]={{0x0324,0x12345678},{0x1738,16},{0x173C,0}};
+    p=pass();p.registers=bases;p.register_count=3;
+    assert(rsx_draw_engine_native_publish_external(&p)==-3&&!status().active);
+    method=0x0324;value=0;assert(!rsx_draw_engine_native_registers(&method,&value,1)&&value!=bases[0].value);
+    bases[1].value=0;p.registers=bases+1;p.register_count=2;
+    assert(!rsx_draw_engine_native_publish_external(&p));
+    // The certificates do not certify any program, format or array address.
+    draw_triangle();assert(!stub.n_draw&&status().failure==1);
+    engine_down();engine_up();p=pass();p.registers=bases+1;p.register_count=1;
+    assert(!rsx_draw_engine_native_publish_external(&p));
+    upload_programs(4);m(M_VTXFMT,2u|(4u<<4)|(16u<<8));m(M_VTXBUF_OFFSET,0x80000000u|VTX_OFFSET);
+    draw_triangle();assert(!stub.n_draw&&status().failure==7&&status().detail==0x173C);
+    engine_down();engine_up();p=pass();
+    assert(!rsx_draw_engine_native_publish_external(&p));
+    upload_programs(4);m(M_VTXFMT,2u|(4u<<4)|(16u<<8));m(M_VTXBUF_OFFSET,0x80000000u|VTX_OFFSET);
+    draw_triangle();assert(!stub.n_draw&&status().failure==7&&status().detail==0x1738);
+    engine_down();engine_up();p=pass();p.registers=bases+1;p.register_count=2;
+    assert(!rsx_draw_engine_native_publish_external(&p));
+    upload_programs(4);m(M_VTXFMT,2u|(4u<<4)|(16u<<8));m(M_VTXBUF_OFFSET,0x80000000u|VTX_OFFSET);
+    draw_triangle();assert(stub.n_draw==1&&!status().failure);
+    engine_down();engine_up();p=pass();p.registers=bases+1;p.register_count=2;
+    assert(!rsx_draw_engine_native_publish_external(&p));
+    upload_programs(4);m(M_VTXFMT,2u|(4u<<4)|(16u<<8)|(2u<<16));m(M_VTXBUF_OFFSET,0x80000000u|VTX_OFFSET);
+    draw_triangle();assert(!stub.n_draw&&status().failure==7&&status().detail==0x1FC0);
+    engine_down();engine_up();
+    rsx_native_register_write with_frequency[3]={{0x1738,0},{0x173C,0},{0x1FEC,0}};
+    p=pass();p.registers=with_frequency;p.register_count=3;
+    assert(!rsx_draw_engine_native_publish_external(&p));
+    upload_programs(4);m(M_VTXFMT,2u|(4u<<4)|(16u<<8)|(2u<<16));m(M_VTXBUF_OFFSET,0x80000000u|VTX_OFFSET);
+    // SHADER_PACKER/sRGB 1FEC is unrelated to the fetch divider mask 1FC0.
+    draw_triangle();assert(!stub.n_draw&&status().failure==7&&status().detail==0x1FC0);
+    engine_down();engine_up();with_frequency[2].method=0x1FC0;
+    p=pass();p.registers=with_frequency;p.register_count=3;
+    assert(!rsx_draw_engine_native_publish_external(&p));
+    upload_programs(4);m(M_VTXFMT,2u|(4u<<4)|(16u<<8)|(2u<<16));m(M_VTXBUF_OFFSET,0x80000000u|VTX_OFFSET);
+    draw_triangle();assert(stub.n_draw==1&&!status().failure);
+    engine_down();engine_up();
     m(M_CONTEXT_DMA_ZETA,DMA_LOCAL);m(M_SURFACE_FORMAT,8u|(2u<<5));
     m(M_ZETA_OFFSET,ZETA_OFFSET);m(M_ZETA_PITCH,256u*4);m(M_COLOR_A_OFFSET,0x90000);
     m(M_COLOR_MASK,0);m(M_DEPTH_TEST,1);m(M_DEPTH_WRITE,1);
