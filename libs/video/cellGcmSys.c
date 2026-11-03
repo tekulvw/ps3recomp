@@ -144,9 +144,18 @@ int cellGcm_native_handoff_ring_arm(const rsx_native_handoff_ring_arm* source, u
     for (unsigned n = 0; n < 4; ++n) state[n] = vm_read32(source->writer_state_ea + 4u * n);
     int result = -4;
     const char* reason = "cookie-exhausted";
-    if (state[2] != source->header_ea || state[0] < source->ring_begin_ea ||
-        state[0] > source->header_ea || state[1] < source->header_ea + 8u ||
-        (uint64_t)state[1] > (uint64_t)source->ring_begin_ea + source->ring_bytes) {
+    const uint64_t ring_end=(uint64_t)source->ring_begin_ea+source->ring_bytes;
+    const int in_block=state[0]>=source->ring_begin_ea && state[0]<=source->header_ea &&
+        state[1]>=source->header_ea+8u && (uint64_t)state[1]<=ring_end;
+    /* Main's PPE allocator D12318/D128B4/D129E8 can wrap ONLY current to
+     * the head, retaining begin/end/callback. Admit the observed final
+     * 8192-byte tail shape; other out-of-block currents remain unsupported.
+     * Publish still requires all four captured words to remain unchanged. */
+    const int wrapped_tail=source->header_ea==source->ring_begin_ea &&
+        source->ring_bytes>=0x4000u && state[0]>=source->ring_begin_ea &&
+        (uint64_t)state[0]+0x2000u==ring_end &&
+        (uint64_t)state[1]==(uint64_t)state[0]+0x1FECu;
+    if (state[2] != source->header_ea || (!in_block && !wrapped_tail)) {
         result = -3;
         reason = "writer-state-bounds";
     } else if (s_native_handoff_next != 0) {

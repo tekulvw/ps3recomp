@@ -31,6 +31,31 @@ static void consume_ring(void* user,const rsx_native_handoff_ring_event* e) {
     assert(cellGcm_native_handoff_cancel(e->source.cookie)==-4);
     ring_callbacks++;
 }
+static void wrapped_ring_writer_checks(void) {
+    // Same source shape as Run32: a wrapped current at the ring head, while
+    // begin/end still describe the last 8192-byte block (8172-byte payload).
+    const u32 begin=0x110000,bytes=0xA3000,tail=begin+bytes-0x2000;
+    rsx_native_handoff_ring_arm a={1,sizeof(a),17,93,0x210000,begin,bytes,begin,
+        0x00041d6c,0x480,&ring_callbacks,consume_ring};
+    raw32(a.writer_state_ea,tail);raw32(a.writer_state_ea+4,tail+0x1FEC);
+    raw32(a.writer_state_ea+8,begin);raw32(a.writer_state_ea+12,0x01B17A70);
+    raw32(begin,a.expected_header);raw32(begin+4,a.expected_argument);
+    uint64_t cookie=0;
+    assert(cellGcm_native_handoff_ring_arm(&a,&cookie)==0&&cookie);
+    raw32(a.writer_state_ea+12,0); // Wrap never waives publication identity.
+    assert(cellGcm_native_handoff_ring_publish(cookie)==-3);
+    raw32(a.writer_state_ea+12,0x01B17A70);
+    assert(cellGcm_native_handoff_ring_publish(cookie)==0);
+    assert(cellGcm_native_handoff_cancel(cookie)==0);
+    raw32(a.writer_state_ea+4,tail+0x1FF0);
+    assert(cellGcm_native_handoff_ring_arm(&a,&cookie)==-3&&!cookie);
+    raw32(a.writer_state_ea+4,tail+0x1FEC);
+    raw32(a.writer_state_ea,tail-128);
+    assert(cellGcm_native_handoff_ring_arm(&a,&cookie)==-3&&!cookie);
+    raw32(a.writer_state_ea,tail);
+    a.header_ea=begin+128;raw32(a.writer_state_ea+8,a.header_ea);
+    assert(cellGcm_native_handoff_ring_arm(&a,&cookie)==-3&&!cookie);
+}
 static void ring_writer_checks(void) {
     raw32(0x210000,0x110000);raw32(0x210004,0x112000);
     raw32(0x210008,0x110000);raw32(0x21000c,0xffffffff);
@@ -119,5 +144,6 @@ int main(void) {
     assert(cellGcm_native_handoff_arm(&a,&cookie)==0&&cookie>cookies[63]);
     assert(cellGcm_native_handoff_cancel(cookie)==0);
     ring_writer_checks();
+    wrapped_ring_writer_checks();
     puts("PASS: exact FIFO source publication, pre-header barrier, replay/mutation/VM rejection, bounded capacity and cancellation");return 0;
 }
