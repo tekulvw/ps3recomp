@@ -57,6 +57,7 @@
 #include "rsx_commands.h"
 #include "rsx_frontend.h"
 #include "rsx_native_owner.h"
+#include "rsx_native_vulkan_image.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -134,6 +135,14 @@ int rsx_vulkan_backend_borrow_owner(rsx_native_owner *);
 int rsx_vulkan_backend_borrow_owner_v2(rsx_native_owner_v2 *);
 int rsx_vulkan_backend_owner_shutdown_requested(uint64_t lifetime);
 int rsx_vulkan_backend_owner_retry_shutdown(uint64_t lifetime);
+/* Existing allocation only. image points to rsx_native_vulkan_image payload;
+ * retain before dereference. Same-device/queue GENERAL acquisition+handback. */
+int rsx_vulkan_backend_borrow_image(uint64_t owner_lifetime,uint32_t backend_surface,rsx_native_image *);
+int rsx_vulkan_backend_validate_image_planes(void *,uint64_t,uint64_t,uint64_t,uint32_t);
+/* Nonblocking checkpoint of the latest actual original queue fence. Caller
+ * holds serialized FIFO consumption. No new submit, GPU wait or minted ticket;
+ * 0 reports a real successful fence watermark, -4 pending/no checkpoint. */
+int rsx_vulkan_backend_native_boundary(uint64_t *original_ticket);
 
 #ifdef __cplusplus
 }

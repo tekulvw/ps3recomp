@@ -90,7 +90,7 @@
     X(vkInvalidateMappedMemoryRanges) \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) \
     X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) \
-    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) \
+    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkGetFenceStatus) X(vkResetFences) X(vkQueueSubmit) \
     X(vkCreateRenderPass) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) \
@@ -145,6 +145,10 @@ typedef struct vk_image {
     VkImage        img;
     VkDeviceMemory mem;
     VkImageView    view;
+    VkFormat format;
+    VkImageUsageFlags usage;
+    VkImageAspectFlags aspect;
+    u32 levels,layers,samples;
 } vk_image;
 
 #define VK_SAMPLER_CACHE 32
@@ -251,6 +255,8 @@ static rsx_native_owner_gate s_vulkan_owner=RSX_NATIVE_OWNER_GATE_INIT;
 static _Thread_local rsx_native_owner_thread s_vulkan_owner_thread;
 static _Thread_local int s_vulkan_consumer;
 static uint64_t s_vulkan_lifetime,s_vulkan_commits;
+static VkFence s_vulkan_boundary_fence;
+static uint64_t s_vulkan_boundary_commit,s_vulkan_boundary_generation;
 static int s_vulkan_shutdown_pending;
 static unsigned s_vulkan_partial_primitives;
 static atomic_int s_vulkan_unscoped_submit;
@@ -312,7 +318,9 @@ static int vulkan_owner_boundary(uint64_t before){
 static int vulkan_owner_activate(void){
     if(s_vulkan_lifetime==UINT64_MAX)return -1;
     if(rsx_owner_generation(&s_vulkan_owner,&s_vulkan_owner_thread,++s_vulkan_lifetime))return -1;
-    s_vulkan_shutdown_pending=0;atomic_store(&s_vulkan_unscoped_submit,0);return 0;
+    s_vulkan_shutdown_pending=0;s_vulkan_boundary_fence=VK_NULL_HANDLE;
+    s_vulkan_boundary_commit=s_vulkan_boundary_generation=0;
+    atomic_store(&s_vulkan_unscoped_submit,0);return 0;
 }
 
 
@@ -514,6 +522,8 @@ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 
         .subresourceRange = { aspect, 0, levels, 0, 1 },
     };
     VK_CHECK(pvkCreateImageView(s_vk.device, &vci, NULL, &im->view), "vkCreateImageView");
+    im->format=fmt;im->usage=usage;im->aspect=aspect;
+    im->levels=levels;im->layers=1;im->samples=VK_SAMPLE_COUNT_1_BIT;
     return 0;
 }
 
@@ -597,6 +607,11 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
     pthread_mutex_lock(&s_vk.queue_mu);
     const VkResult r = pvkQueueSubmit(s_vk.queue, 1, si, fence);
     vulkan_owner_submitted(r);
+    if(vulkan_owner_enabled()&&r==VK_SUCCESS&&s_vulkan_owner_thread.original_depth&&!s_vulkan_owner.failed){
+        s_vulkan_boundary_fence=fence;
+        s_vulkan_boundary_commit=s_vulkan_commits;
+        s_vulkan_boundary_generation=s_vulkan_owner.generation;
+    }
     pthread_mutex_unlock(&s_vk.queue_mu);
     return r;
 }
@@ -2140,6 +2155,10 @@ typedef struct vk_eng_obj {
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
+static uint64_t s_eobj_generation[VK_ENG_MAX_OBJ],s_eobj_next_generation;
+static uint32_t s_eobj_native_pins[VK_ENG_MAX_OBJ];
+static uint8_t s_eobj_retired[VK_ENG_MAX_OBJ];
+static rsx_native_vulkan_image s_eobj_native_image[VK_ENG_MAX_OBJ];
 
 /* Defined with the E2 pipeline state further down. */
 static void vk_eng_drop_framebuffers(void);
@@ -2188,14 +2207,22 @@ static u32 vk_max_dim(void) { return s_vk.max_dim ? s_vk.max_dim : 4096u; }
 static u32 vk_eng_alloc(void)
 {
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
-        if (s_eobj[i].kind == VK_ENG_FREE) return i;
+        if (s_eobj[i].kind == VK_ENG_FREE && !s_eobj_native_pins[i]) {
+            if(vulkan_owner_enabled()) {
+                if(s_eobj_next_generation==UINT64_MAX){vulkan_owner_fault();return 0;}
+                s_eobj_generation[i]=++s_eobj_next_generation;
+            }
+            memset(&s_eobj_native_image[i],0,sizeof s_eobj_native_image[i]);
+            s_eobj_retired[i]=0;
+            return i;
+        }
     VK_LOG("engine: object table full (%d)\n", VK_ENG_MAX_OBJ);
     return 0;
 }
 
 static vk_eng_obj* vk_eng_get(u32 handle, int kind)
 {
-    if (!handle || handle >= VK_ENG_MAX_OBJ) return NULL;
+    if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj_retired[handle]) return NULL;
     vk_eng_obj* o = &s_eobj[handle];
     return (o->kind == kind) ? o : NULL;
 }
@@ -2278,7 +2305,12 @@ static int vk_eng_make_view(VkImage img, VkFormat fmt, u32 levels, VkComponentMa
 static int vk_eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
+    if(vulkan_owner_enabled()&&s_vulkan_owner.retained)return -1;
     memset(s_eobj, 0, sizeof s_eobj);
+    memset(s_eobj_generation,0,sizeof s_eobj_generation);
+    memset(s_eobj_native_pins,0,sizeof s_eobj_native_pins);
+    memset(s_eobj_retired,0,sizeof s_eobj_retired);
+    memset(s_eobj_native_image,0,sizeof s_eobj_native_image);
     memset(&s_eng_bound, 0, sizeof s_eng_bound);
     return s_vk.device ? 0 : -1;
 }
@@ -2288,7 +2320,7 @@ static void vk_eng_snapshot_recycle(vk_eng_obj* o);
 static void vk_eng_release(void* user, u32 handle)
 {
     (void)user;
-    if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE) return;
+    if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE || s_eobj_retired[handle]) return;
     if (s_eobj[handle].kind == VK_ENG_COLOR)
         for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
             if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
@@ -2300,6 +2332,15 @@ static void vk_eng_release(void* user, u32 handle)
         s_eobj[handle].surface = 0;
         if (vk_eng_get(snap, VK_ENG_TEXTURE)) vk_eng_release(user, snap);
     }
+    if ((s_eobj[handle].kind == VK_ENG_COLOR && !s_eobj[handle].snapshot) || s_eobj[handle].kind == VK_ENG_DEPTH)
+        vk_eng_drop_framebuffers();
+    if(s_eobj_native_pins[handle]) {
+        /* Match the original release's presentation drain now. Native pins
+         * outlive genuine native fences; their final callback must not wait. */
+        vk_present_wait_gpu();
+        s_eobj_retired[handle]=1;
+        return;
+    }
     if (s_eobj[handle].kind == VK_ENG_COLOR && s_eobj[handle].snapshot) {
         /* Never an attachment, so no framebuffer names it; the image goes
          * back to the pool for the next feedback draw. */
@@ -2307,8 +2348,6 @@ static void vk_eng_release(void* user, u32 handle)
         memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
         return;
     }
-    if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
-        vk_eng_drop_framebuffers();
     vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
 }
@@ -2369,10 +2408,13 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
-    if (vk_create_image(&o->im, s_vk.depth_format, w, h,
-                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                        s_vk.depth_aspect)) {
+    VkImageUsageFlags usage=VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if(vulkan_owner_enabled()) {
+        VkFormatProperties properties;pvkGetPhysicalDeviceFormatProperties(s_vk.phys,s_vk.depth_format,&properties);
+        if(properties.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)usage|=VK_IMAGE_USAGE_SAMPLED_BIT;
+    }
+    if (vk_create_image(&o->im, s_vk.depth_format, w, h,usage,s_vk.depth_aspect)) {
         vk_destroy_image(&o->im); return 0;
     }
     o->kind = VK_ENG_DEPTH; o->fmt = s_vk.depth_format; o->w = w; o->h = h;
@@ -3971,6 +4013,7 @@ static void vulkan_original_shutdown(void)
         vk_destroy_image(&s_vk.color);
         vk_destroy_buffer(&s_vk.vertices);
         vk_destroy_buffer(&s_vk.readback);
+        s_vulkan_boundary_fence=VK_NULL_HANDLE;s_vulkan_boundary_commit=s_vulkan_boundary_generation=0;
         if (s_vk.fence) pvkDestroyFence(s_vk.device, s_vk.fence, NULL);
         if (s_vk.pool)  pvkDestroyCommandPool(s_vk.device, s_vk.pool, NULL);
         if (s_vk.present_fence) pvkDestroyFence(s_vk.device, s_vk.present_fence, NULL);
@@ -4121,6 +4164,49 @@ static int vulkan_borrow_owner(rsx_native_owner* out,rsx_native_owner_v2 *extend
     rsx_owner_lock_release(&s_vulkan_owner.lock);return status;
 }
 int rsx_vulkan_backend_borrow_owner(rsx_native_owner *out){return vulkan_borrow_owner(out,NULL);}
+int rsx_vulkan_backend_native_boundary(uint64_t *ticket){
+    if(!ticket)return -1;
+    *ticket=0;
+    if(!vulkan_owner_enabled())return -2;
+    if(!vulkan_owner_begin(0))return -4;
+    int status=0;
+    if(!s_vk.device||!s_vk.queue||!s_vulkan_owner.generation||s_vulkan_owner.closing)status=-3;
+    else if(!s_vk.eng_active)status=-2;
+    else if(s_vulkan_owner.failed||atomic_load(&s_vulkan_unscoped_submit))status=-6;
+    else if(s_vulkan_partial_primitives||s_vk.frontend_recording)status=-4;
+    /* Reuse the real common-engine ready/checked-failure/partial-BEGIN guard.
+     * The outer owner/consumer scope stays held after its nested READ ends. */
+    if(!status){uint32_t method=NV4097_SET_BEGIN_END,value=0;status=rsx_draw_engine_native_registers(&method,&value,1);}
+    if(!status){
+        if(pthread_mutex_trylock(&s_vk.present_mu))status=-4;
+        else{
+            if(pthread_mutex_trylock(&s_vk.queue_mu))status=-4;
+            else{
+                if(s_vulkan_owner.failed||atomic_load(&s_vulkan_unscoped_submit))status=-6;
+                else if(s_vulkan_owner.closing)status=-3;
+                else if(s_vulkan_partial_primitives||s_vk.frontend_recording)status=-4;
+                else if(!s_vulkan_boundary_commit||!s_vulkan_boundary_fence)status=-4;
+                else if(s_vulkan_boundary_generation!=s_vulkan_owner.generation)status=-3;
+                else{
+                    VkResult result=pvkGetFenceStatus(s_vk.device,s_vulkan_boundary_fence);
+                    if(result==VK_NOT_READY)status=-4;
+                    else if(result!=VK_SUCCESS){vulkan_owner_fault();status=-6;}
+                    else{
+                        *ticket=s_vulkan_boundary_commit;
+                        /* All original encoding is synchronous today. The exact
+                         * latest submitted fence plus common quiescence proves
+                         * a completed original boundary, without a callback wait. */
+                        rsx_owner_submitted(&s_vulkan_owner,&s_vulkan_owner_thread,1);
+                    }
+                }
+                pthread_mutex_unlock(&s_vk.queue_mu);
+            }
+            pthread_mutex_unlock(&s_vk.present_mu);
+        }
+    }
+    if(status==-6)vulkan_owner_fault();
+    vulkan_owner_finish(1);return status;
+}
 int rsx_vulkan_backend_borrow_owner_v2(rsx_native_owner_v2 *out){
     if(!out||out->abi_version!=2||out->struct_size!=sizeof(*out))return -1;
     rsx_native_owner base={.abi_version=1,.struct_size=sizeof(base)};
@@ -4141,5 +4227,97 @@ int rsx_vulkan_backend_owner_retry_shutdown(uint64_t life){
     else if(s_vulkan_owner.failed)status=-6;
     else{vulkan_original_shutdown();status=s_vk.device?-6:1;if(status==1)s_vulkan_shutdown_pending=0;}
     vulkan_owner_finish(status==1?0:1);return status;
+}
+static int vulkan_image_identity(uint64_t life,uint64_t id,uint64_t generation,int retired_ok){
+    if(!life||life!=s_vulkan_owner.generation||!id||id>=VK_ENG_MAX_OBJ||!generation||
+       s_eobj_generation[id]!=generation||!s_eobj[id].im.img||
+       (s_eobj[id].kind!=VK_ENG_COLOR&&s_eobj[id].kind!=VK_ENG_DEPTH)||
+       (!retired_ok&&s_eobj_retired[id]))return -3;
+    return 0;
+}
+static int vulkan_image_retain(void *user,uint64_t life,uint64_t id,uint64_t generation){
+    if(user!=&s_vulkan_owner)return -3;
+    if(s_vulkan_owner_thread.gate||!rsx_owner_lock_try(&s_vulkan_owner.lock))return -4;
+    int status=vulkan_image_identity(life,id,generation,0);
+    if(!status&&s_vulkan_owner.closing)status=-3;
+    if(!status&&(s_vulkan_owner.failed||atomic_load(&s_vulkan_unscoped_submit)))status=-6;
+    if(!status&&(s_vulkan_owner.retained==UINT_MAX||s_eobj_native_pins[id]==UINT_MAX))status=-4;
+    if(!status){++s_vulkan_owner.retained;++s_eobj_native_pins[id];}
+    rsx_owner_lock_release(&s_vulkan_owner.lock);return status;
+}
+static void vulkan_image_release(void *user,uint64_t life,uint64_t id,uint64_t generation){
+    if(user!=&s_vulkan_owner||s_vulkan_owner_thread.gate)return;
+    rsx_owner_lock_acquire(&s_vulkan_owner.lock);
+    if(!vulkan_image_identity(life,id,generation,1)&&s_eobj_native_pins[id]&&s_vulkan_owner.retained){
+        --s_eobj_native_pins[id];--s_vulkan_owner.retained;
+        if(!s_eobj_native_pins[id]&&s_eobj_retired[id]){
+            /* Original release already drained original presentation users;
+             * the final native pin is released after genuine native fences.
+             * Never call vk_destroy_image here: it can wait for presentation. */
+            vk_image *image=&s_eobj[id].im;
+            if(image->view)pvkDestroyImageView(s_vk.device,image->view,NULL);
+            if(image->img)pvkDestroyImage(s_vk.device,image->img,NULL);
+            if(image->mem)pvkFreeMemory(s_vk.device,image->mem,NULL);
+            memset(&s_eobj[id],0,sizeof s_eobj[id]);
+            memset(&s_eobj_native_image[id],0,sizeof s_eobj_native_image[id]);
+            s_eobj_retired[id]=0;
+        }
+    }
+    rsx_owner_lock_release(&s_vulkan_owner.lock);
+}
+static int vulkan_image_validate(void *user,uint64_t life,uint64_t id,uint64_t generation){
+    if(user!=&s_vulkan_owner)return -3;
+    if(s_vulkan_owner_thread.gate!=&s_vulkan_owner||!s_vulkan_owner_thread.native)return -4;
+    if(s_vulkan_owner.closing)return -3;
+    if(s_vulkan_owner.failed||atomic_load(&s_vulkan_unscoped_submit))return -6;
+    return vulkan_image_identity(life,id,generation,0);
+}
+int rsx_vulkan_backend_validate_image_planes(void *user,uint64_t life,uint64_t id,uint64_t generation,uint32_t required){
+    if(!required||(required&~7u)||id>UINT32_MAX)return -1;
+    int status=vulkan_image_validate(user,life,id,generation);if(status)return status;
+    return rsx_draw_engine_native_image_clear_planes((uint32_t)id,required);
+}
+static uint32_t vulkan_native_image_format(VkFormat format){
+    switch(format){
+        case VK_FORMAT_R8G8B8A8_UNORM:return RSX_NATIVE_IMAGE_RGBA8;
+        case VK_FORMAT_B8G8R8A8_UNORM:return RSX_NATIVE_IMAGE_BGRA8;
+        case VK_FORMAT_R16G16B16A16_SFLOAT:return RSX_NATIVE_IMAGE_RGBA16F;
+        case VK_FORMAT_R32G32B32A32_SFLOAT:return RSX_NATIVE_IMAGE_RGBA32F;
+        case VK_FORMAT_R32_SFLOAT:return RSX_NATIVE_IMAGE_R32F;
+        case VK_FORMAT_D32_SFLOAT:return RSX_NATIVE_IMAGE_D32F;
+        case VK_FORMAT_D24_UNORM_S8_UINT:return RSX_NATIVE_IMAGE_D24S8;
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:return RSX_NATIVE_IMAGE_D32S8;
+        default:return 0;
+    }
+}
+int rsx_vulkan_backend_borrow_image(uint64_t life,uint32_t handle,rsx_native_image *out){
+    if(!out||out->abi_version!=RSX_NATIVE_IMAGE_ABI||out->struct_size!=sizeof(*out))return -1;
+    if(!vulkan_owner_enabled())return -2;
+    if(!vulkan_owner_begin(0))return -4;
+    int status=0;
+    if(!s_vk.device||s_vulkan_owner.closing||!handle||handle>=VK_ENG_MAX_OBJ||
+       vulkan_image_identity(life,handle,s_eobj_generation[handle],0))status=-3;
+    else if(s_vulkan_owner.failed||atomic_load(&s_vulkan_unscoped_submit))status=-6;
+    else {
+        vk_eng_obj *object=&s_eobj[handle];vk_image *image=&object->im;
+        uint32_t format=vulkan_native_image_format(image->format);
+        if(!format||image->format!=object->fmt||image->levels!=1||image->layers!=1||
+           image->samples!=VK_SAMPLE_COUNT_1_BIT)status=-2;
+        if(!status){
+            rsx_native_vulkan_image *payload=&s_eobj_native_image[handle];
+            if(!payload->abi_version){
+                *payload=(rsx_native_vulkan_image){.abi_version=RSX_NATIVE_VULKAN_IMAGE_ABI,.struct_size=sizeof(*payload),
+                    .format=image->format,.usage=image->usage,.aspect=image->aspect,.mip_count=image->levels,
+                    .layers=image->layers,.samples=image->samples,.queue_family=s_vk.queue_family,.layout=VK_IMAGE_LAYOUT_GENERAL};
+                _Static_assert(sizeof(image->img)<=sizeof(payload->image_bits),"Vulkan opaque handle transport");
+                memcpy(&payload->image_bits,&image->img,sizeof(image->img));
+            }
+            *out=(rsx_native_image){.abi_version=RSX_NATIVE_IMAGE_ABI,.struct_size=sizeof(*out),
+                .backend=RSX_NATIVE_OWNER_VULKAN,.format=format,.width=object->w,.height=object->h,
+                .owner_lifetime=life,.resource_id=handle,.resource_generation=s_eobj_generation[handle],
+                .image=payload,.userdata=&s_vulkan_owner,.retain=vulkan_image_retain,.release=vulkan_image_release,.validate=vulkan_image_validate};
+        }
+    }
+    vulkan_owner_finish(1);return status;
 }
 #endif /* !_WIN32 */
