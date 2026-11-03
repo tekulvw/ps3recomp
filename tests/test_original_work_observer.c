@@ -17,6 +17,8 @@
 #endif
 static ps3_original_identity identity = {11, 2, 13};
 static int rogue;
+static uint64_t current_test_worker = 8;
+static int witness_after_retirement;
 static int racing;
 static atomic_int race_start;
 static int resolve(const void *context, uint64_t pc, unsigned route,
@@ -38,10 +40,11 @@ static void new_worker_body(void) {
     return;
   }
   if (!rogue)
-    assert(ps3_original_worker_register(8, 1) == 0);
+    assert(ps3_original_worker_register(current_test_worker, 1) == 0);
   PS3_ORIGINAL_STEP(&identity, 24, PS3_ORIGINAL_MICROSTEP);
   if (!rogue)
     assert(ps3_original_worker_retire() == 0);
+  if(witness_after_retirement)PS3_ORIGINAL_STEP(&identity,24,PS3_ORIGINAL_MICROSTEP);
 }
 #ifdef _WIN32
 static DWORD WINAPI new_worker(void *arg) {
@@ -93,6 +96,36 @@ static void arm_racing_worker(const ps3_original_config *config) {
     assert(armed == -1);
   puts("original observer concurrent arm/register/drain is never eligible");
 }
+static void lifetime_capacity(void) {
+  const unsigned actual_workers=129;
+  for(unsigned i=0;i<actual_workers;++i) {
+    current_test_worker=100+i;
+    assert(!ps3_original_enroll(current_test_worker,1));
+    run_new_worker();
+  }
+  ps3_original_live_report live={.struct_size=sizeof(live),.abi_version=1};
+  assert(!ps3_original_live_status(&live)&&live.workers==actual_workers&&!live.faults);
+  uint64_t total=0;
+  assert(!ps3_original_live_total(31,PS3_ORIGINAL_MICROSTEP,&total)&&total==actual_workers);
+  /* Retired identities remain queryable: never recycle an old TLS slot into a
+   * different worker. A witness after genuine retirement still fails. */
+  witness_after_retirement=1;current_test_worker=100+actual_workers;
+  assert(!ps3_original_enroll(current_test_worker,1));run_new_worker();
+  for(unsigned i=actual_workers+1;i<PS3_ORIGINAL_MAX_WORKERS;++i) {
+    const uint64_t id=100+i;
+    assert(!ps3_original_enroll(id,1));assert(!ps3_original_worker_cancel(id));
+  }
+  assert(ps3_original_enroll(100+PS3_ORIGINAL_MAX_WORKERS,1)==-1);
+  assert(!ps3_original_begin_drain(150));
+  ps3_original_report report={.struct_size=sizeof(report),.abi_version=1};
+  assert(!ps3_original_seal(&report));
+  assert(report.workers==PS3_ORIGINAL_MAX_WORKERS);
+  assert(report.faults==(PS3_ORIGINAL_MISSING_WORKER|PS3_ORIGINAL_LATE_WORK));
+  assert(!ps3_original_count(100,1,31,PS3_ORIGINAL_MICROSTEP,&total)&&total==1);
+  assert(!ps3_original_count(100+actual_workers,1,31,PS3_ORIGINAL_MICROSTEP,&total)&&total==1);
+  assert(!ps3_original_live_total(31,PS3_ORIGINAL_MICROSTEP,&total)&&total==actual_workers+1);
+  puts("original observer 130 real lifetime workers preserve history; stale retirement and explicit capacity exhaustion remain faults");
+}
 int main(int argc, char **argv) {
   const char *mode = argc > 1 ? argv[1] : "good";
   ps3_original_source source = {
@@ -126,6 +159,7 @@ int main(int argc, char **argv) {
   if (!strcmp(mode, "overflow"))
     config.counter_limit = 2;
   assert(ps3_original_arm(&config) == 0);
+  if(!strcmp(mode,"lifetime_capacity")){lifetime_capacity();return 0;}
   /* Caller mutation cannot change a copied manifest. */
   source.generation = 99;
   target.low = 1000;

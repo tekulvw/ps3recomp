@@ -52,7 +52,7 @@ try:
     else:
         run([compiler,'-std=c17','-Wall','-Wextra','-Werror','-DPS3RECOMP_ORIGINAL_OBSERVER=1',
              '-I'+str(ROOT/'runtime/diagnostics'),*sources,'-pthread','-o',binary],60,'compile/link')
-    for mode in ['good','wrong_source','missing_worker','overflow','loss','route','unregistered','after_retire','late_arm']+['arm_race']*8:
+    for mode in ['lifetime_capacity','good','wrong_source','missing_worker','overflow','loss','route','unregistered','after_retire','late_arm']+['arm_race']*8:
         run([binary,mode],10,'execute '+mode)
 finally:
     try:shutil.rmtree(tmp)
