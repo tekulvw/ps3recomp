@@ -18,8 +18,8 @@
  *                          readback (E1), pipelines and draws (E2), textures,
  *                          surface views and samplers (E3), depth snapshots
  *                          (E4), completion tickets and the GPU Z24S8 depth
-                          store/alias/view (E5) -- the stage names in the
-                          commit history
+                          store/alias/view (E5), opt-in batched recording
+                          (E6) -- the stage names in the commit history
  *   public entry points    init picks the path, shutdown undoes everything
  *
  * Deliberately synchronous: every clear, draw and present is one one-shot
@@ -27,7 +27,9 @@
  * what lets the engine's submit_and_wait and staging reuse cost nothing, and
  * batching is the first thing to change once correctness is settled. The
  * exceptions are E5's completion tickets and GPU depth views, which are
- * submitted without a wait and retired in queue order (see there).
+ * submitted without a wait and retired in queue order, and E6's opt-in
+ * batched recording (PS3RECOMP_VK_BATCHED_ENGINE=1), which records engine
+ * operations and submits them only where something needs it (see there).
  *
  * Images stay in VK_IMAGE_LAYOUT_GENERAL for their whole life: legal for
  * transfers, sampling and as attachments, so there is no layout bookkeeping.
@@ -113,7 +115,7 @@
     X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) \
-    X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCmdCopyBuffer)
+    X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCmdCopyBuffer) X(vkResetDescriptorPool)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
@@ -271,6 +273,48 @@ static atomic_int s_vulkan_unscoped_submit;
  * not succeed. submit_and_wait_checked and completion tickets report it, the
  * same certificate Metal's command-buffer errors give. Cleared at engine init. */
 static atomic_int s_vk_eng_failed;
+/* Batched engine recording (E6, PS3RECOMP_VK_BATCHED_ENGINE=1); defined below. */
+static int s_bat_on;
+enum { VK_RET_IMAGE = 1, VK_RET_BUFFER, VK_RET_SPARE, VK_RET_FRAMEBUFFER, VK_RET_PIPELINE };
+static int vk_bat_begin_op(void);
+static int vk_bat_end_op(void);
+static int vk_bat_flush(int wait);
+static int vk_bat_retire(int kind, const void* object);
+static void vk_bat_reap(void);
+static int vk_sync(void);
+static void vk_e5_fail(const char* what);
+static int vk_bat_reserve(VkDeviceSize bytes, u32 sets);
+static void* vk_bat_alloc(VkDeviceSize bytes, VkBuffer* buf, VkDeviceSize* off);
+static VkDescriptorSet vk_bat_set(VkDescriptorSetLayout layout);
+static int vk_bat_init(void);
+static void vk_bat_shutdown(void);
+#define VK_BAT_MAX_SLOTS 32u
+typedef struct {
+    int kind;
+    u64 ticket;                 /* 0: the open batch's, set when it is submitted */
+    union { vk_image im; vk_buffer buf; VkFramebuffer fb; VkPipeline pipe; } u;
+} vk_bat_retired;
+typedef struct {
+    VkCommandPool    pool;
+    VkCommandBuffer  cb;
+    VkDescriptorPool dpool;
+    u32              sets_left;
+    vk_buffer        arena;
+    VkDeviceSize     used;
+    u64              ticket;    /* the submission that last used this slot */
+} vk_bat_slot;
+static struct {
+    u32 nslots, cur, max_ops, ops;
+    int open;
+    VkCommandBuffer legacy_cmd;
+    VkDeviceSize align;
+    vk_bat_slot s[VK_BAT_MAX_SLOTS];
+    vk_bat_retired* ret; u32 nret, cap;
+    u8 *vsc, *psc; u32 vsc_cap, psc_cap;
+    /* PS3RECOMP_RSX_INFLIGHT_LOG=1 counters */
+    u64 batches, batch_ops, slot_waits, waits_for_cpu, retired, arena_grows;
+} s_bat;
+
 static int vulkan_owner_enabled(void){
     static atomic_int setting=-1;int value=atomic_load_explicit(&setting,memory_order_relaxed);
     if(value<0){const char* text=getenv("PS3RECOMP_RSX_NATIVE_OWNER");value=text&&!strcmp(text,"1");int expected=-1;
@@ -546,7 +590,7 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
 
 static void vk_present_wait_gpu(void);
 
-static void vk_destroy_image(vk_image* im)
+static void vk_destroy_image_now(vk_image* im)
 {
     /* Never under a present's copy that may still read it. */
     if (im->img) vk_present_wait_gpu();
@@ -554,6 +598,22 @@ static void vk_destroy_image(vk_image* im)
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
     if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
     memset(im, 0, sizeof *im);
+}
+
+/* Released objects: destroyed at once, or -- batched -- when every batch
+ * that may still use them has completed. */
+static void vk_destroy_image(vk_image* im)
+{
+    if (!im->img && !im->view && !im->mem) return;
+    if (vk_bat_retire(VK_RET_IMAGE, im)) { memset(im, 0, sizeof *im); return; }
+    vk_destroy_image_now(im);
+}
+static void vk_destroy_buffer_now(vk_buffer* b);
+static void vk_destroy_buffer(vk_buffer* b)
+{
+    if (!b->buf && !b->mem) return;
+    if (vk_bat_retire(VK_RET_BUFFER, b)) { memset(b, 0, sizeof *b); return; }
+    vk_destroy_buffer_now(b);
 }
 
 static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageFlags usage)
@@ -588,7 +648,7 @@ static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageF
     return 0;
 }
 
-static void vk_destroy_buffer(vk_buffer* b)
+static void vk_destroy_buffer_now(vk_buffer* b)
 {
     if (b->ptr) pvkUnmapMemory(s_vk.device, b->mem);
     if (b->buf) pvkDestroyBuffer(s_vk.device, b->buf, NULL);
@@ -658,7 +718,7 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
 static int vk_begin_core(void);
 static int vk_begin(void)
 {
-    const int rc = vk_begin_core();
+    const int rc = s_bat_on ? vk_bat_begin_op() : vk_begin_core();
     if (rc && s_vk.eng_active) atomic_store(&s_vk_eng_failed, 1);
     return rc;
 }
@@ -679,7 +739,8 @@ static int vk_begin_core(void)
 static int vk_submit_and_wait_core(void);
 static int vk_submit_and_wait(void)
 {
-    const int rc = vk_submit_and_wait_core();
+    /* Batched: the operation stays recorded; vk_sync() is the waiting end. */
+    const int rc = s_bat_on ? vk_bat_end_op() : vk_submit_and_wait_core();
     if (rc && s_vk.eng_active) atomic_store(&s_vk_eng_failed, 1);
     return rc;
 }
@@ -2345,7 +2406,13 @@ static int vk_eng_init(void* user, u32 width, u32 height)
     memset(&s_eng_bound, 0, sizeof s_eng_bound);
     memset(s_e5_obj_ticket, 0, sizeof s_e5_obj_ticket);
     atomic_store(&s_vk_eng_failed, 0);
-    return s_vk.device ? 0 : -1;
+    if (!s_vk.device) return -1;
+    if (!s_bat_on && vk_bat_init()) {
+        VK_LOG("engine: batched recording could not start; every operation stays one waited submission\n");
+        vk_bat_shutdown();
+        s_bat_on = 0;
+    }
+    return 0;
 }
 
 static void vk_eng_snapshot_recycle(vk_eng_obj* o);
@@ -2368,6 +2435,10 @@ static void vk_eng_release(void* user, u32 handle)
     if ((s_eobj[handle].kind == VK_ENG_COLOR && !s_eobj[handle].snapshot) || s_eobj[handle].kind == VK_ENG_DEPTH)
         vk_eng_drop_framebuffers();
     if(s_eobj_native_pins[handle]) {
+        /* Batched: the native side destroys it after its own fences, which
+         * do not cover original work recorded after its boundary; finish
+         * that first. */
+        if (s_bat_on) (void)vk_bat_flush(1);
         /* Match the original release's presentation drain now. Native pins
          * outlive genuine native fences; their final callback must not wait. */
         vk_present_wait_gpu();
@@ -2391,15 +2462,21 @@ static void vk_eng_snapshot_pool_drain(void);
 
 static void vk_eng_shutdown(void* user)
 {
+    if (s_bat_on) (void)vk_bat_flush(1);
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
     vk_eng_snapshot_pool_drain();
+    vk_bat_shutdown();
     vk_e5_shutdown();
 }
 
 static void vk_eng_submit_and_wait(void* user, u32 reason)
 {
     (void)user; (void)reason;      /* default path submissions already completed */
+    /* Batched: submit (an empty batch if nothing is open, so the owner sees
+     * a real submitted boundary, as the per-operation path makes one) and wait;
+     * the engine reuses its staging the moment this returns. */
+    if (s_bat_on) { if (vk_bat_begin_op() || vk_bat_flush(1)) vulkan_owner_fault(); return; }
     if(vulkan_owner_enabled() && (vk_begin() || vk_submit_and_wait()))vulkan_owner_fault();
 }
 
@@ -2514,6 +2591,8 @@ static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
     if (!s_vk.device) return;
+    /* Batched: what the frame recorded goes on the queue ahead of the blit. */
+    if (s_bat_on) (void)vk_bat_flush(0);
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     pthread_mutex_lock(&s_vk.present_mu);
     VkCommandBuffer cb = vk_present_record_begin();
@@ -2577,7 +2656,7 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
         };
         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                               0, 0, NULL, 1, &hb, 0, NULL);
-        if (!vk_submit_and_wait()) {
+        if (!vk_sync()) {
             vk_invalidate(&st);
             for (u32 row = 0; row < h; row++)
                 memcpy((u8*)out + (size_t)row * out_pitch, (const u8*)st.ptr + (size_t)row * tight, tight);
@@ -2857,7 +2936,7 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
         };
         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                               0, 0, NULL, 1, &hb, 0, NULL);
-        rc = vk_submit_and_wait();
+        rc = vk_sync();
         if (!rc) {
             vk_invalidate(&st);
             for (u32 row = 0; row < h; row++)
@@ -2937,7 +3016,8 @@ static u32 s_esamp_count;
 static void vk_eng_drop_framebuffers(void)
 {
     for (u32 i = 0; i < s_e2.fb_count; i++)
-        if (s_e2.fb[i].fb) pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
+        if (s_e2.fb[i].fb && !vk_bat_retire(VK_RET_FRAMEBUFFER, &s_e2.fb[i].fb))
+            pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
     s_e2.fb_count = 0;
 }
 
@@ -3148,7 +3228,8 @@ static void vk_eng_pipeline_release(void* user, u32 pipeline)
     if (!pipeline || pipeline > VK_ENG_MAX_PIPE || !s_epipe[pipeline - 1].used) return;
     vk_eng_pipe* P = &s_epipe[pipeline - 1];
     for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
-        if (P->variant[t]) pvkDestroyPipeline(s_vk.device, P->variant[t], NULL);
+        if (P->variant[t] && !vk_bat_retire(VK_RET_PIPELINE, &P->variant[t]))
+            pvkDestroyPipeline(s_vk.device, P->variant[t], NULL);
     if (P->vs) pvkDestroyShaderModule(s_vk.device, P->vs, NULL);
     if (P->fs) pvkDestroyShaderModule(s_vk.device, P->fs, NULL);
     memset(P, 0, sizeof *P);
@@ -3283,14 +3364,28 @@ static void vk_eng2_shutdown(void* user)
 }
 
 /* Constants go straight into the shared UBO: vertex at 0, pixel at ps_off.
- * Every operation is waited on, so overwriting per draw is safe. */
+ * Every operation is waited on, so overwriting per draw is safe. Batched,
+ * they go to a CPU shadow that each draw copies into its batch's arena. */
+static u8 s_bat_shadow_fail[16];
+static u8* vk_bat_shadow(int ps, u32 cap)
+{
+    u8** p = ps ? &s_bat.psc : &s_bat.vsc;
+    u32* c = ps ? &s_bat.psc_cap : &s_bat.vsc_cap;
+    if (*c < cap) {
+        u8* n = (u8*)realloc(*p, cap);
+        if (!n) { vk_e5_fail("constant shadow"); return s_bat_shadow_fail; }
+        *p = n; *c = cap;
+    }
+    return *p;
+}
 static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
     if (!s_g.on || !data) { s_e2.vs_bytes = 0; return; }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
-    memcpy(s_g.ubo.ptr, data, bytes);
+    /* Batched: a shadow the draw copies into its batch's arena. */
+    memcpy(s_bat_on ? (void*)vk_bat_shadow(0, cap) : s_g.ubo.ptr, data, bytes);
     s_e2.vs_bytes = bytes;
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
@@ -3299,7 +3394,7 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
     if (!s_g.on || !data) { s_e2.ps_bytes = 0; return; }
     const u32 cap = (u32)(s_g.ubo.size - s_g.ps_off);
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 4u)) { VK_LOG("engine: PS constants truncated\n"); s_e2.warned |= 4u; } }
-    memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, data, bytes);
+    memcpy(s_bat_on ? (void*)vk_bat_shadow(1, cap) : (void*)((u8*)s_g.ubo.ptr + s_g.ps_off), data, bytes);
     s_e2.ps_bytes = bytes;
 }
 static void vk_eng_bind_textures(void* user, const u32* textures,
@@ -3461,10 +3556,11 @@ static VkImageView vk_eng_dummy_cube_view(void)
 /* Fill the set the bound pipeline uses: the shared one (sixteen textures in
  * one binding), or for a pipeline with cube units the split one (one binding
  * per unit). Returns the set, or VK_NULL_HANDLE. */
-static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P)
+static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P, VkDescriptorSet set,
+                                                const VkDescriptorBufferInfo* constants)
 {
     const int split = P->cube_mask != 0;
-    const VkDescriptorSet set = split ? s_e2.split_set : s_g.set;
+    if (!set) set = split ? s_e2.split_set : s_g.set;
     if (!set) return VK_NULL_HANDLE;
     const VkImageView dummy_cube = split ? vk_eng_dummy_cube_view() : VK_NULL_HANDLE;
     if (split && !dummy_cube) return VK_NULL_HANDLE;
@@ -3472,6 +3568,7 @@ static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P)
         { s_g.ubo.buf, 0, s_e2.vs_bytes ? s_e2.vs_bytes : 16u },
         { s_g.ubo.buf, s_g.ps_off, s_e2.ps_bytes ? s_e2.ps_bytes : 16u },
     };
+    if (constants) { bi[0] = constants[0]; bi[1] = constants[1]; }
     VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
         const int cube = (P->cube_mask >> u) & 1u;
@@ -3543,13 +3640,41 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     if (!pipe || !rp || !fb) return;
 
     const VkDeviceSize vbytes = (VkDeviceSize)vertex_count * stride;
-    if (vk_ensure_vertex_buffer(vbytes)) return;
-    memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
-    if (indices && index_count) {
-        if (vk_eng_ensure_indices((VkDeviceSize)index_count * 4u)) return;
-        memcpy(s_e2.indices.ptr, indices, (size_t)index_count * 4u);
+    VkBuffer vbuf = s_vk.vertices.buf, ibuf = s_e2.indices.buf;
+    VkDeviceSize voff = 0, ioff = 0;
+    VkDescriptorSet set;
+    if (s_bat_on) {
+        /* Everything the GPU reads from host memory, in this batch's arena;
+         * a set of its own. The dummy cube is made before the reservation. */
+        if (P->cube_mask && !vk_eng_dummy_cube_view()) return;
+        const VkDeviceSize ibytes = indices && index_count ? (VkDeviceSize)index_count * 4u : 0;
+        const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
+        if (vk_bat_reserve(vbytes + ibytes + vsb + psb, 1)) return;
+        VkDescriptorBufferInfo cb[2];
+        void* vp = vk_bat_alloc(vbytes, &vbuf, &voff);
+        void* ip = ibytes ? vk_bat_alloc(ibytes, &ibuf, &ioff) : NULL;
+        void* vc = vk_bat_alloc(vsb, &cb[0].buffer, &cb[0].offset);
+        void* pc = vk_bat_alloc(psb, &cb[1].buffer, &cb[1].offset);
+        if (!vp || (ibytes && !ip) || !vc || !pc) return;
+        memcpy(vp, vertices, (size_t)vbytes);
+        if (ip) memcpy(ip, indices, (size_t)ibytes);
+        memset(vc, 0, vsb); memset(pc, 0, psb);
+        if (s_e2.vs_bytes && s_bat.vsc) memcpy(vc, s_bat.vsc, s_e2.vs_bytes);
+        if (s_e2.ps_bytes && s_bat.psc) memcpy(pc, s_bat.psc, s_e2.ps_bytes);
+        cb[0].range = vsb; cb[1].range = psb;
+        const VkDescriptorSet fresh = vk_bat_set(P->cube_mask ? s_e2.split_layout : s_g.set_layout);
+        if (!fresh) return;
+        set = vk_eng_write_descriptors(P, fresh, cb);
+    } else {
+        if (vk_ensure_vertex_buffer(vbytes)) return;
+        memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
+        if (indices && index_count) {
+            if (vk_eng_ensure_indices((VkDeviceSize)index_count * 4u)) return;
+            memcpy(s_e2.indices.ptr, indices, (size_t)index_count * 4u);
+        }
+        vbuf = s_vk.vertices.buf; ibuf = s_e2.indices.buf;   /* after any growth */
+        set = vk_eng_write_descriptors(P, VK_NULL_HANDLE, NULL);
     }
-    const VkDescriptorSet set = vk_eng_write_descriptors(P);
     if (!set) return;
 
     if (vk_begin()) return;
@@ -3583,10 +3708,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                              P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout,
                              0, 1, &set, 0, NULL);
-    VkDeviceSize off = 0;
-    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &s_vk.vertices.buf, &off);
+    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &voff);
     if (indices && index_count) {
-        pvkCmdBindIndexBuffer(s_vk.cmd, s_e2.indices.buf, 0, VK_INDEX_TYPE_UINT32);
+        pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
         pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
@@ -3742,6 +3866,7 @@ static int vk_e5_reap(u64 until, int wait)
         s_e5.head = (s_e5.head + 1u) % VK_E5_SLOTS;
         s_e5.count--;
     }
+    if (s_bat_on) vk_bat_reap();
     /* Images released while their writer was in flight. */
     for (u32 i = 0; i < s_e5.nretire; ) {
         if (s_e5.retire[i].ticket <= s_e5.completed) {
@@ -3793,6 +3918,310 @@ static u64 vk_e5_submit(vk_e5_slot* sl, int recorded)
     return sl->ticket;
 }
 
+/* ---- E6: batched engine recording (PS3RECOMP_VK_BATCHED_ENGINE=1) ----------
+ *
+ * Default off. Read at engine init. Without it every operation above is one
+ * submission the CPU waits for, and so is every wait behind native work.
+ * With it, operations are recorded into one command buffer per batch, and a
+ * batch is submitted only at a point that needs it:
+ *   - a completion ticket (submit_async), the checked flush, submit_and_wait;
+ *   - a read the CPU needs (readback, depth readback, the z24 store), which
+ *     also waits;
+ *   - the native boundary and every present (submitted, not waited);
+ *   - a batch that has grown to PS3RECOMP_VK_BATCH_MAX_OPS operations
+ *     (default 2048), or whose arena or descriptor pool is full.
+ * A submitted batch is an E5 ticket, so it is retired in queue order with the
+ * rest and certifies everything before it.
+ *
+ * What makes recording instead of waiting safe:
+ *   - Order. Each operation begins with a full memory dependency on
+ *     everything recorded or submitted before it, exactly as the separate
+ *     submissions were ordered, so overwriting a target, a snapshot image or a
+ *     store buffer that earlier recorded work still reads is ordered by the
+ *     queue.
+ *   - CPU-written bytes. Vertices, indices, constants and upload rows are
+ *     copied into the batch's own host-visible arena, never into a buffer an
+ *     unfinished batch may read. A batch slot, and its arena (4 MiB, grown
+ *     on demand) and descriptor pool (1024 sets), are reused only after its
+ *     ticket has completed: PS3RECOMP_VK_BATCH_SLOTS batches in flight
+ *     (default 16, at most 32), a full ring waits for the oldest. Every
+ *     ticket submits the open batch, so the ring is what bounds how far the
+ *     consumer runs ahead of work queued behind native passes.
+ *   - Descriptors. Every draw gets a fresh set from the batch's pool.
+ *   - Lifetime. Images, buffers, framebuffers and pipelines released while
+ *     any batch may still use them are destroyed when the last ticket that
+ *     could reference them retires.
+ * Nothing about guest memory changes: inputs are still copied when recorded,
+ * and every result the CPU reads is still waited for at its stream position.
+ * -------------------------------------------------------------------------*/
+#define VK_BAT_SETS 1024u
+static int vk_bat_slot_init(vk_bat_slot* sl)
+{
+    VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                                    .queueFamilyIndex = s_vk.queue_family };
+    if (pvkCreateCommandPool(s_vk.device, &pci, NULL, &sl->pool) != VK_SUCCESS) return -1;
+    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                        .commandPool = sl->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                        .commandBufferCount = 1 };
+    if (pvkAllocateCommandBuffers(s_vk.device, &cai, &sl->cb) != VK_SUCCESS) return -1;
+    /* A draw's set: two constant buffers, 16 samplers and 16 images (shared
+     * or split layout); a GPU depth view's: one storage buffer. */
+    VkDescriptorPoolSize ps[4] = {
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2u * VK_BAT_SETS },
+        { VK_DESCRIPTOR_TYPE_SAMPLER, 16u * VK_BAT_SETS },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16u * VK_BAT_SETS },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_BAT_SETS } };
+    VkDescriptorPoolCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                       .maxSets = VK_BAT_SETS, .poolSizeCount = 4, .pPoolSizes = ps };
+    if (pvkCreateDescriptorPool(s_vk.device, &dci, NULL, &sl->dpool) != VK_SUCCESS) return -1;
+    sl->sets_left = VK_BAT_SETS;
+    return 0;
+}
+
+static void vk_bat_destroy_now(vk_bat_retired* r)
+{
+    switch (r->kind) {
+    case VK_RET_IMAGE:       vk_destroy_image_now(&r->u.im); break;
+    case VK_RET_BUFFER:      vk_destroy_buffer_now(&r->u.buf); break;
+    case VK_RET_SPARE:       vk_e5_destroy_spare_or_keep(&r->u.buf); break;
+    case VK_RET_FRAMEBUFFER: pvkDestroyFramebuffer(s_vk.device, r->u.fb, NULL); break;
+    case VK_RET_PIPELINE:    pvkDestroyPipeline(s_vk.device, r->u.pipe, NULL); break;
+    default: break;
+    }
+}
+
+/* Destroy whatever no unfinished ticket can still reference. */
+static void vk_bat_reap(void)
+{
+    for (u32 i = 0; i < s_bat.nret; ) {
+        if (s_bat.ret[i].ticket && s_bat.ret[i].ticket <= s_e5.completed) {
+            vk_bat_retired r = s_bat.ret[i];
+            s_bat.ret[i] = s_bat.ret[--s_bat.nret];
+            vk_bat_destroy_now(&r);
+            s_bat.retired++;
+        } else i++;
+    }
+}
+
+/* Take `object` (of `kind`) for destruction once every batch that may use it
+ * has completed. 1 when taken; 0 means nothing can be using it: destroy now. */
+static int vk_bat_retire(int kind, const void* object)
+{
+    if (!s_bat_on) return 0;
+    if (s_e5.ready && vk_e5_reap(0, 0)) return 0;
+    const u64 ticket = s_bat.open ? 0 : (s_e5.issued > s_e5.completed ? s_e5.issued : UINT64_MAX);
+    if (ticket == UINT64_MAX) return 0;
+    if (s_bat.nret == s_bat.cap) {
+        const u32 cap = s_bat.cap ? s_bat.cap * 2u : 256u;
+        vk_bat_retired* n = (vk_bat_retired*)realloc(s_bat.ret, (size_t)cap * sizeof *n);
+        if (!n) { vk_e5_fail("retire list"); return 0; }   /* destroy now: fail closed */
+        s_bat.ret = n; s_bat.cap = cap;
+    }
+    vk_bat_retired* r = &s_bat.ret[s_bat.nret++];
+    memset(r, 0, sizeof *r);
+    r->kind = kind; r->ticket = ticket;
+    switch (kind) {
+    case VK_RET_IMAGE:       r->u.im = *(const vk_image*)object; break;
+    case VK_RET_BUFFER:
+    case VK_RET_SPARE:       r->u.buf = *(const vk_buffer*)object; break;
+    case VK_RET_FRAMEBUFFER: r->u.fb = *(const VkFramebuffer*)object; break;
+    case VK_RET_PIPELINE:    r->u.pipe = *(const VkPipeline*)object; break;
+    default: break;
+    }
+    return 1;
+}
+
+/* Open the current slot for recording: wait until its last batch completed,
+ * then reset its command buffer, pool and arena. */
+static int vk_bat_open(void)
+{
+    if (s_bat.open) return 0;
+    if (vk_e5_failed() || vk_e5_init()) return -1;
+    vk_bat_slot* sl = &s_bat.s[s_bat.cur];
+    if (sl->ticket && sl->ticket > s_e5.completed) {
+        s_bat.slot_waits++;
+        if (vk_e5_reap(sl->ticket, 1)) return -1;
+    }
+    vk_bat_reap();
+    if (pvkResetCommandBuffer(sl->cb, 0) != VK_SUCCESS || pvkResetDescriptorPool(s_vk.device, sl->dpool, 0) != VK_SUCCESS) {
+        vk_e5_fail("batch reset"); return -1;
+    }
+    sl->sets_left = VK_BAT_SETS; sl->used = 0;
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (pvkBeginCommandBuffer(sl->cb, &bi) != VK_SUCCESS) { vk_e5_fail("batch begin"); return -1; }
+    s_vk.cmd = sl->cb;
+    s_vk.frontend_recording = 1;
+    s_vk.present_order = 0;           /* every operation orders after everything anyway */
+    s_bat.open = 1; s_bat.ops = 0;
+    return 0;
+}
+
+static int vk_bat_begin_op(void)
+{
+    if (vk_bat_open()) return -1;
+    vk_cmd_after_everything(s_vk.cmd);
+    return 0;
+}
+
+/* Submit the open batch (if any) as a ticket; with `wait`, wait for it.
+ * Returns 0, or -1 after a failure (latched). */
+static u64 s_bat_last_ticket;
+static int vk_bat_flush(int wait)
+{
+    if (!s_bat.open) {
+        if (wait && s_e5.issued && vk_e5_reap(s_e5.issued, 1)) return -1;
+        return vk_e5_failed() ? -1 : 0;
+    }
+    vk_bat_slot* bs = &s_bat.s[s_bat.cur];
+    vk_cmd_after_everything(bs->cb);
+    s_bat.open = 0;
+    s_vk.frontend_recording = 0;
+    s_vk.cmd = s_bat.legacy_cmd;
+    if (pvkEndCommandBuffer(bs->cb) != VK_SUCCESS) { vk_e5_fail("batch end"); return -1; }
+    vk_e5_slot* sl = vk_e5_acquire(0);
+    if (!sl) return -1;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &bs->cb };
+    if (vk_queue_submit(&si, sl->fence) != VK_SUCCESS) { vk_e5_fail("vkQueueSubmit (batch)"); return -1; }
+    sl->ticket = ++s_e5.issued;
+    s_e5.count++;
+    bs->ticket = sl->ticket;
+    s_bat_last_ticket = sl->ticket;
+    for (u32 i = 0; i < s_bat.nret; i++) if (!s_bat.ret[i].ticket) s_bat.ret[i].ticket = sl->ticket;
+    s_bat.batches++; s_bat.batch_ops += s_bat.ops;
+    s_bat.cur = (s_bat.cur + 1u) % s_bat.nslots;
+    if (wait) { s_bat.waits_for_cpu++; if (vk_e5_reap(sl->ticket, 1)) return -1; }
+    return vk_e5_failed() ? -1 : 0;
+}
+
+static int vk_bat_end_op(void)
+{
+    if (!s_bat.open) return -1;
+    if (++s_bat.ops >= s_bat.max_ops) return vk_bat_flush(0);
+    return 0;
+}
+
+/* Make room in the open batch for `bytes` of arena and `sets` descriptor
+ * sets, submitting it first when it is full, so one operation's allocations
+ * never span two batches. */
+static int vk_bat_reserve(VkDeviceSize bytes, u32 sets)
+{
+    if (vk_bat_open()) return -1;
+    const VkDeviceSize need = bytes + 4u * s_bat.align;     /* slack for alignment */
+    vk_bat_slot* sl = &s_bat.s[s_bat.cur];
+    if ((sl->arena.size - sl->used < need || sl->sets_left < sets) && s_bat.ops) {
+        if (vk_bat_flush(0) || vk_bat_open()) return -1;
+        sl = &s_bat.s[s_bat.cur];
+    }
+    if (sl->arena.size - sl->used < need) {
+        if (sl->used) { vk_e5_fail("batch arena"); return -1; }   /* fresh slot: cannot happen */
+        VkDeviceSize size = sl->arena.size ? sl->arena.size : 4u << 20;
+        while (size < need) size *= 2u;
+        /* The slot is idle (just opened), but other batches may be pending. */
+        if (sl->arena.buf) vk_destroy_buffer(&sl->arena);
+        if (vk_create_host_buffer(&sl->arena, size,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+            !sl->arena.coherent) {
+            vk_destroy_buffer_now(&sl->arena); vk_e5_fail("batch arena allocation"); return -1;
+        }
+        s_bat.arena_grows++;
+    }
+    if (sl->sets_left < sets) { vk_e5_fail("batch descriptor pool"); return -1; }
+    return 0;
+}
+
+/* `bytes` of the open batch's arena (after vk_bat_reserve), aligned for any
+ * use: its CPU pointer and its offset in s_bat arena buffer. */
+static void* vk_bat_alloc(VkDeviceSize bytes, VkBuffer* buf, VkDeviceSize* off)
+{
+    vk_bat_slot* sl = &s_bat.s[s_bat.cur];
+    const VkDeviceSize o = (sl->used + s_bat.align - 1u) / s_bat.align * s_bat.align;
+    if (o + bytes > sl->arena.size) { vk_e5_fail("batch arena overrun"); return NULL; }
+    sl->used = o + bytes;
+    *buf = sl->arena.buf; *off = o;
+    return (u8*)sl->arena.ptr + o;
+}
+
+static VkDescriptorSet vk_bat_set(VkDescriptorSetLayout layout)
+{
+    vk_bat_slot* sl = &s_bat.s[s_bat.cur];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                        .descriptorPool = sl->dpool, .descriptorSetCount = 1, .pSetLayouts = &layout };
+    if (!sl->sets_left || pvkAllocateDescriptorSets(s_vk.device, &dai, &set) != VK_SUCCESS) {
+        vk_e5_fail("batch descriptor set"); return VK_NULL_HANDLE;
+    }
+    sl->sets_left--;
+    return set;
+}
+
+/* The end of an operation whose result the CPU reads next. */
+static int vk_sync(void)
+{
+    if (!s_bat_on) return vk_submit_and_wait();
+    if (vk_bat_end_op()) return -1;
+    return vk_bat_flush(1);
+}
+
+static void vk_bat_log(void)
+{
+    if (!s_bat_on || !s_e5.log) return;
+    static struct timespec last;
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    if (last.tv_sec && now.tv_sec - last.tv_sec < 2) return;
+    last = now;
+    fprintf(stderr, "[rsx inflight vulkan batch] batches=%llu ops=%llu ops_per_batch=%.1f slot_waits=%llu cpu_waits=%llu "
+            "retired=%llu pending_retire=%u arena_grows=%llu\n",
+            (unsigned long long)s_bat.batches, (unsigned long long)s_bat.batch_ops,
+            s_bat.batches ? (double)s_bat.batch_ops / (double)s_bat.batches : 0.0,
+            (unsigned long long)s_bat.slot_waits, (unsigned long long)s_bat.waits_for_cpu,
+            (unsigned long long)s_bat.retired, s_bat.nret, (unsigned long long)s_bat.arena_grows);
+}
+
+static int vk_bat_init(void)
+{
+    const char* e = getenv("PS3RECOMP_VK_BATCHED_ENGINE");
+    if (!e || strcmp(e, "1")) return 0;
+    memset(&s_bat, 0, sizeof s_bat);
+    { const char* n = getenv("PS3RECOMP_VK_BATCH_SLOTS"); long v = n ? strtol(n, NULL, 0) : 16;
+      s_bat.nslots = v < 2 ? 2u : v > (long)VK_BAT_MAX_SLOTS ? VK_BAT_MAX_SLOTS : (u32)v; }
+    { const char* n = getenv("PS3RECOMP_VK_BATCH_MAX_OPS"); long v = n ? strtol(n, NULL, 0) : 2048;
+      s_bat.max_ops = v < 1 ? 1u : v > 65536 ? 65536u : (u32)v; }
+    VkPhysicalDeviceProperties p; pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+    s_bat.align = 256u;
+    if (p.limits.minUniformBufferOffsetAlignment > s_bat.align) s_bat.align = p.limits.minUniformBufferOffsetAlignment;
+    if (p.limits.minStorageBufferOffsetAlignment > s_bat.align) s_bat.align = p.limits.minStorageBufferOffsetAlignment;
+    if (vk_e5_init()) return -1;
+    for (u32 i = 0; i < s_bat.nslots; i++) if (vk_bat_slot_init(&s_bat.s[i])) return -1;
+    s_bat.legacy_cmd = s_vk.cmd;
+    s_bat_on = 1;
+    VK_LOG("engine: batched recording on (%u batches in flight, at most %u operations each)\n", s_bat.nslots, s_bat.max_ops);
+    return 0;
+}
+
+/* Submit and wait for everything, destroy every retired object, then leave
+ * batched mode. */
+static void vk_bat_shutdown(void)
+{
+    if (!s_bat_on && !s_bat.nslots) return;
+    if (s_bat_on) (void)vk_bat_flush(1);
+    vk_device_idle();
+    s_bat_on = 0;
+    for (u32 i = 0; i < s_bat.nret; i++) vk_bat_destroy_now(&s_bat.ret[i]);
+    free(s_bat.ret);
+    for (u32 i = 0; i < s_bat.nslots; i++) {
+        vk_destroy_buffer_now(&s_bat.s[i].arena);
+        if (s_bat.s[i].dpool) pvkDestroyDescriptorPool(s_vk.device, s_bat.s[i].dpool, NULL);
+        if (s_bat.s[i].pool) pvkDestroyCommandPool(s_vk.device, s_bat.s[i].pool, NULL);
+    }
+    free(s_bat.vsc); free(s_bat.psc);
+    if (s_bat.legacy_cmd) s_vk.cmd = s_bat.legacy_cmd;
+    s_vk.frontend_recording = 0;
+    memset(&s_bat, 0, sizeof s_bat);
+}
+
 static int vk_e5_is_ticket_fence(VkFence f)
 {
     if (!f || !s_e5.ready) return 0;
@@ -3819,6 +4248,12 @@ static void vk_e5_log(void)
 static u64 vk_eng_submit_async(void* user, u32 reason)
 {
     (void)user; (void)reason;
+    /* Batched: the recorded work is the ticket. */
+    if (s_bat_on && s_bat.open) {
+        const int rc = vk_bat_flush(0);
+        vk_e5_log(); vk_bat_log();
+        return rc || vk_e5_failed() ? 0 : s_bat_last_ticket;
+    }
     vk_e5_slot* sl = vk_e5_acquire(0);
     const u64 ticket = sl ? vk_e5_submit(sl, 0) : 0;
     vk_e5_log();
@@ -4093,7 +4528,7 @@ static int vk_eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, 
         .buffer = s_e5.store_host.buf, .offset = 0, .size = VK_WHOLE_SIZE };
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           0, 0, NULL, 1, &hb, 0, NULL);
-    if (vk_submit_and_wait()) return -1;
+    if (vk_sync()) return -1;
     vk_invalidate(&s_e5.store_host);
     const u8* src = (const u8*)s_e5.store_host.ptr;
     if (dst_pitch == w * 4u) memcpy(dst, src, (size_t)bytes);
@@ -4135,6 +4570,23 @@ static u32 vk_eng_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap,
         }
     if (!words.buf && vk_e5_device_buffer(&words, bytes)) return 0;
     const u32 hd = vk_e5_alias_texture(w, h, remap, rsx_fmt);
+    if (s_bat_on) {
+        /* Batched: recorded after the draws so far in the open batch, which
+         * the engine's submit_async right after submits as the ticket. */
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (!hd || vk_bat_reserve(0, 1) || !(set = vk_bat_set(s_e5.set_layout)) || vk_begin()) {
+            if (hd) vk_eng_release(user, hd);
+            vk_destroy_buffer(&words);
+            return 0;
+        }
+        vk_e5_record_convert(s_vk.cmd, set, z, words.buf, w, h,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        vk_e5_record_fill(s_vk.cmd, words.buf, w, s_eobj[hd].im.img, w, h);
+        (void)vk_submit_and_wait();                       /* ends the recorded operation */
+        if (!vk_bat_retire(VK_RET_SPARE, &words)) vk_e5_destroy_spare_or_keep(&words);
+        s_e5.views_made++;
+        return hd;
+    }
     vk_e5_slot* sl = hd ? vk_e5_acquire(1) : NULL;
     if (!sl) {
         if (hd) vk_eng_release(user, hd);
@@ -4625,6 +5077,7 @@ static void vulkan_original_shutdown(void)
         vk_device_idle();
         if(vulkan_owner_enabled()&&s_vulkan_owner.failed)return;
         vk_guest_shutdown();
+        vk_bat_shutdown();
         vk_e5_shutdown();
         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);
@@ -4804,7 +5257,11 @@ int rsx_vulkan_backend_native_boundary(uint64_t *ticket){
     if(!s_vk.device||!s_vk.queue||!s_vulkan_owner.generation||s_vulkan_owner.closing)status=-3;
     else if(!s_vk.eng_active)status=-2;
     else if(s_vulkan_owner.failed||atomic_load(&s_vulkan_unscoped_submit))status=-6;
-    else if(s_vulkan_partial_primitives||s_vk.frontend_recording)status=-4;
+    else if(s_vulkan_partial_primitives)status=-4;
+    /* Batched: what was recorded so far is submitted (not waited for) and
+     * becomes the boundary native work queues behind. */
+    else if(s_bat_on&&vk_bat_flush(0))status=-6;
+    else if(s_vk.frontend_recording)status=-4;
     /* Reuse the real common-engine ready/checked-failure/partial-BEGIN guard.
      * The outer owner/consumer scope stays held after its nested READ ends. */
     if(!status){uint32_t method=NV4097_SET_BEGIN_END,value=0;status=rsx_draw_engine_native_registers(&method,&value,1);}

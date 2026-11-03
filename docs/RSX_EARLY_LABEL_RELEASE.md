@@ -184,17 +184,51 @@ with one message, and the engine takes its fallback.
   before native work, as Metal's asynchronous boundary is. Before E5 the
   latest submission was always a completed synchronous one.
 
-**What this does not change.** Drawing on Vulkan stays synchronous: every
-draw, clear and upload waits for its fence, and so for everything queued
-before it, native Main included. With the switches on, labels, reports and
-references stop waiting. The FIFO consumer still waits at the next engine
-draw after native work has been queued, so the Metal gains do not carry over
-until the backend batches its command buffers.
+**Per-operation waits, and batched recording.** By default, Vulkan drawing
+stays synchronous: every draw, clear and upload waits for its fence, and so
+for everything queued before it, native Main included. With the switches on,
+labels, reports and references stop waiting, but the FIFO consumer still
+waits at the next engine draw after native work has been queued.
+
+`PS3RECOMP_VK_BATCHED_ENGINE=1` (stage E6, default off, read at engine init)
+removes that wait.
+
+- **Recording.** Operations are recorded into one command buffer per batch.
+  Each operation starts with a full dependency on everything before it, so
+  GPU order is exactly the per-operation order.
+- **When a batch is submitted.**
+  - At a ticket, the checked flush, or `submit_and_wait`.
+  - At a CPU read (readback, depth readback, the z24 store). These also wait.
+  - At the native boundary and at every present. These do not wait.
+  - When the batch reaches `PS3RECOMP_VK_BATCH_MAX_OPS` operations (default
+    2048), or its arena or descriptor pool is full.
+- **Memory.** Vertices, indices, constants and descriptor sets come from the
+  batch's own host-visible arena and descriptor pool.
+  `PS3RECOMP_VK_BATCH_SLOTS` batches can be in flight (default 16, at most 32).
+  A slot is reused only after its ticket completes, and a full ring waits for
+  its oldest batch.
+- **Lifetime.** Images, buffers, framebuffers and pipelines that are released
+  while a batch may still use them are destroyed when the last ticket that
+  could reference them retires.
+- **Guest memory.** Unchanged. Inputs are copied when recorded, and every
+  result the CPU reads is still waited for at its stream position.
+
+`python3 tools/test_vulkan_batched_engine.py [--timing]` checks it. It runs one
+synthetic operation stream twice, per operation and batched, under validation
+with synchronization validation:
+
+- the two runs must read back identical bytes;
+- behind about 300 ms of foreign GPU work on the queue, 64 batched draws and a
+  ticket must return while that work is still running, where the
+  per-operation path waits for it.
+
+It needs glslang, because the engine translates its HLSL.
 
 `PS3RECOMP_RSX_INFLIGHT_LOG=1` also prints:
 
 ```
 [rsx inflight vulkan] tickets=… completed=… outstanding=… cap_waits=… views=… view_buffers_reused=… stores=… deferred_destroys=… pending_destroys=… failed=…
+[rsx inflight vulkan batch] batches=… ops=… ops_per_batch=… slot_waits=… cpu_waits=… retired=… pending_retire=… arena_grows=…
 ```
 
 Device test: `python3 tools/test_vulkan_depth_z24.py [--require-hardware

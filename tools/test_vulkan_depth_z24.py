@@ -78,9 +78,11 @@ def main():
             environment["DEPTH_Z24_EXHAUSTIVE"] = "1"
         loader = subprocess.check_output(["pkg-config", "--variable=libdir", "vulkan"], text=True).strip()
         environment["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None, [loader, environment.get("LD_LIBRARY_PATH", "")]))
-        for mode in ("on", "off"):
+        for mode, batched in (("on", "0"), ("off", "0"), ("on", "1"), ("off", "1")):
+            run_environment = dict(environment, PS3RECOMP_VK_BATCHED_ENGINE=batched)
+            print(f"--- PS3RECOMP_VK_GPU_Z24 {mode}, PS3RECOMP_VK_BATCHED_ENGINE={batched}")
             result = subprocess.run([str(binary), mode, str(int(args.require_hardware)), args.vendor_id, args.device_id],
-                                    env=environment, capture_output=True, text=True, timeout=1800)
+                                    env=run_environment, capture_output=True, text=True, timeout=1800)
             print(result.stdout, end="")
             print(result.stderr, end="")
             result.check_returncode()

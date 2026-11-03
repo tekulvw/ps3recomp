@@ -35,9 +35,11 @@ def main():
         environment=dict(os.environ,PS3RECOMP_VK_DEVICE=args.gpu_index,VK_INSTANCE_LAYERS='VK_LAYER_KHRONOS_validation')
         loader=subprocess.check_output(['pkg-config','--variable=libdir','vulkan'],text=True).strip()
         environment['LD_LIBRARY_PATH']=os.pathsep.join(filter(None,[loader,environment.get('LD_LIBRARY_PATH','')]))
-        result=subprocess.run([str(binary),str(int(args.require_hardware)),args.vendor_id,args.device_id],env=environment,capture_output=True,text=True,timeout=20)
-        print(result.stdout,end='');print(result.stderr,end='');result.check_returncode()
-        if 'VUID-'in result.stdout+result.stderr:raise RuntimeError('Vulkan validation rejected the fixture')
+        # Per-operation submissions, then batched recording (PS3RECOMP_VK_BATCHED_ENGINE=1).
+        for batched in ('0','1'):
+            result=subprocess.run([str(binary),str(int(args.require_hardware)),args.vendor_id,args.device_id],env=dict(environment,PS3RECOMP_VK_BATCHED_ENGINE=batched),capture_output=True,text=True,timeout=20)
+            print(result.stdout,end='');print(result.stderr,end='');result.check_returncode()
+            if 'VUID-'in result.stdout+result.stderr:raise RuntimeError('Vulkan validation rejected the fixture')
         if args.report:
             tracked=sources+['libs/video/rsx_vulkan_backend.c','libs/video/rsx_vulkan_backend.h','libs/video/rsx_native_owner.h','libs/video/rsx_native_owner_gate.h','libs/video/rsx_original_owner.h','tools/check_native_owner_vulkan.py']
             record={'status':'passed','evidence':'actual provider lifecycle and queue boundaries; no frontend shader/game acceptance','hardware_required':args.require_hardware,

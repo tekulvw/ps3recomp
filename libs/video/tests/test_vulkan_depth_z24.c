@@ -9,6 +9,8 @@
  *  - a view holds the depth recorded before it, not a later clear;
  *  - completion tickets: order, a full ring waiting instead of failing, the
  *    checked flush, deferred destruction of a released in-flight view.
+ * Runs with per-operation submissions and with PS3RECOMP_VK_BATCHED_ENGINE=1
+ * (the runner sets it), where every helper below waits through vk_sync().
  * No window, no guest memory and no game data.
  * python3 tools/test_vulkan_depth_z24.py [--require-hardware ...] */
 #ifdef NDEBUG
@@ -52,7 +54,7 @@ static void put_bits(vk_buffer* dev, const uint32_t* bits, u32 n)
     assert(vk_begin() == 0);
     VkBufferCopy c = { 0, 0, (VkDeviceSize)n * 4u };
     pvkCmdCopyBuffer(s_vk.cmd, st.buf, dev->buf, 1, &c);
-    assert(vk_submit_and_wait() == 0);
+    assert(vk_sync() == 0);
     vk_destroy_buffer(&st);
 }
 /* The conversion alone, over arbitrary bits (a depth copy may clamp them). */
@@ -68,7 +70,7 @@ static void convert_bits(vk_buffer* dev, const uint32_t* bits, u8* got, u32 w, u
     VkMemoryBarrier hb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
                            .dstAccessMask = VK_ACCESS_HOST_READ_BIT };
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
-    assert(vk_submit_and_wait() == 0);
+    assert(vk_sync() == 0);
     vk_invalidate(&out);
     memcpy(got, out.ptr, (size_t)w * h * 4u);
     vk_destroy_buffer(&out);
@@ -84,7 +86,7 @@ static void fill_depth(u32 depth, const float* v, u32 w, u32 h)
     VkBufferImageCopy r = { .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, .imageExtent = { w, h, 1 } };
     pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, s_eobj[depth].im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     vk_cmd_after_everything(s_vk.cmd);
-    assert(vk_submit_and_wait() == 0);
+    assert(vk_sync() == 0);
     vk_destroy_buffer(&st);
 }
 
@@ -153,7 +155,7 @@ static void fetch(u32 handle, u32 w, u32 h, float* out)
     VkMemoryBarrier hb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
                            .dstAccessMask = VK_ACCESS_HOST_READ_BIT };
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
-    assert(vk_submit_and_wait() == 0);
+    assert(vk_sync() == 0);
     vk_invalidate(&ob);
     memcpy(out, ob.ptr, (size_t)w * h * 16u);
     vk_destroy_buffer(&ob);
@@ -371,8 +373,8 @@ int main(int argc, char** argv)
             vk_eng_release(NULL, zz);
             const u64 deferred = s_e5.deferred_destroys - d0;
             CHECK(okv, "large views built");
-            CHECK(vk_eng_submit_and_wait_checked(NULL, RSX_BE_FLUSH_GUEST_REFERENCE) == 1 && s_e5.nretire == 0,
-                  "deferred destroys drain at completion");
+            CHECK(vk_eng_submit_and_wait_checked(NULL, RSX_BE_FLUSH_GUEST_REFERENCE) == 1 && s_e5.nretire == 0 &&
+                  (!s_bat_on || s_bat.nret == 0), "deferred destroys drain at completion");
             u32 again = vk_eng_depth_target_create(NULL, 64, 64);
             u32 v2 = vk_eng_depth_z24_view(NULL, again, 64, 64, 0xAAE4u, 0xA5u);
             u32 v3 = vk_eng_depth_z24_view(NULL, again, 64, 64, 0xAAE4u, 0xA5u);
