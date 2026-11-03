@@ -31,6 +31,13 @@
 int rsx_live_draw_borrow_owner(rsx_live_draw_owner* owner) { (void)owner; return -2; }
 int rsx_live_draw_owner_shutdown_requested(uint64_t lifetime) { (void)lifetime;return -2; }
 int rsx_live_draw_owner_retry_shutdown(uint64_t lifetime) { (void)lifetime;return -2; }
+int rsx_live_draw_native_image(const rsx_native_image_key* k,rsx_native_image_match* o){(void)k;(void)o;return -2;}
+int rsx_live_draw_borrow_image(uint64_t l,uint32_t h,rsx_native_image* o){(void)l;(void)h;(void)o;return -2;}
+int rsx_live_draw_validate_image_planes(void* u,uint64_t l,uint64_t i,uint64_t g,uint32_t p){(void)u;(void)l;(void)i;(void)g;(void)p;return -2;}
+int rsx_live_draw_native_registers(const uint32_t* m,uint32_t* v,uint32_t n){(void)m;(void)v;(void)n;return -2;}
+int rsx_live_draw_native_canvas(uint32_t d[2]){(void)d;return -2;}
+int rsx_live_draw_native_boundary(uint64_t* t){if(!t)return -1;*t=0;return -2;}
+
 int  rsx_live_draw_enabled(void) { return 0; }
 int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
 { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
@@ -226,6 +233,8 @@ typedef struct {
     u32 w, h;
     DXGI_FORMAT fmt;
     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
+    uint64_t native_generation;
+    uint32_t native_state,native_state_known,native_clear_planes,native_aa_grid,native_source_format;
     u32 pitch;                /* guest row pitch of colour target 0 (bytes), 0 = unknown */
     /* Top-left windows of the surface for smaller aliasing textures (see surface_window). */
     struct { ID3D12Resource* tex; ID3D12Resource* src; u32 w, h, wgen, used; } swin[LD_SWIN_PER];
@@ -258,6 +267,8 @@ typedef struct {
     u32 w, h;
     u32 snapshot_w, snapshot_h;
     D3D12_RESOURCE_STATES snapshot_state;
+    uint64_t native_generation;
+    uint32_t native_state,native_state_known,native_clear_planes,native_pitch,native_source_format;
     int cleared;
     int had_write;
     int snapshot_valid;
@@ -1325,6 +1336,8 @@ static void ld_owner_original_finish(int preserve_boundary) {
 static void ld_owner_failed_boundary(void) {
     if(ld_native_owner_enabled())rsx_owner_submitted(&s_native_owner,&s_native_thread,0);
 }
+#include "rsx_live_draw_native_image.inc"
+
 
 
 static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
@@ -2184,7 +2197,7 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     return tex;
 }
 
@@ -2243,7 +2256,7 @@ static ID3D12Resource* create_texture_cube(
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     return tex;
 }
 
@@ -3090,7 +3103,7 @@ static ID3D12Resource* decode_vertex_texture(
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+        ld_native_resource_barriers(1, &b);
         if (out_hash) *out_hash = hash;
     }
     return tex;
@@ -3274,6 +3287,9 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     for (u32 j = 0; j < LD_SWIN_PER; j++)   /* windows are sized and typed for the old resource */
         if (s->swin[j].tex) { retire_texture(s->swin[j].tex); s->swin[j].tex = NULL; }
     s->tex = replacement;
+    s->native_generation=ld_native_new_generation();s->native_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
+    s->native_state_known=1;s->native_clear_planes=0;s->native_aa_grid=0;
+    ld_native_image_gc();
     s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
     s->fmt = want_fmt;
 #if !defined(YZ_PERF_CLEAN)
@@ -3400,7 +3416,7 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
         b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+        ld_native_resource_barriers(2, b);
         D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
         dst.pResource = s->swin[k].tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         src.pResource = s->tex;         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3410,7 +3426,7 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
         b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+        ld_native_resource_barriers(2, b);
         s->swin[k].wgen = s->swin_wgen;
         if ((++g_ld_swin_copies & 0x3FFFu) == 1u)
             fprintf(stderr, "[swin] copies=%llu frame=%u\n", (unsigned long long)g_ld_swin_copies, g_ld_frames);
@@ -3497,13 +3513,13 @@ static u32 surface_feedback_srv(u32 slot)
     b[1].Transition.pResource = s->fb_tex;
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g.list->lpVtbl->ResourceBarrier(g.list, fresh ? 1 : 2, b);
+    ld_native_resource_barriers(fresh ? 1 : 2, b);
     g.list->lpVtbl->CopyResource(g.list, s->fb_tex, s->tex);
     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_native_resource_barriers(2, b);
     return SRV_FEEDBACK_BASE + slot;
 }
 
@@ -3683,7 +3699,7 @@ static int ld_downsample(u32 si, u32 sx, u32 sy, u32 k,
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + di);
     g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
@@ -3701,7 +3717,7 @@ static int ld_downsample(u32 si, u32 sx, u32 sy, u32 k,
     g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     return 1;
 }
 
@@ -3820,7 +3836,7 @@ static int ld_scaled_blit(u32 si, float sx, float sy, float sw, float sh,
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + di);
     g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
@@ -3841,7 +3857,7 @@ static int ld_scaled_blit(u32 si, float sx, float sy, float sw, float sh,
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     ld_surface_note_write(di, LD_SURFACE_WRITE_COPY);
     { static int n = 0; if (n++ < 4)
         fprintf(stderr, "[scaled-blit] surf %u (%.0f,%.0f %.0fx%.0f) -> surf %u (%u,%u %ux%u)\n",
@@ -3925,7 +3941,7 @@ static int ld_resolve_blit_body(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds,
     }
     b[0].Transition.pResource = s;        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[1].Transition.pResource = dst->tex; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_native_resource_barriers(2, b);
     D3D12_TEXTURE_COPY_LOCATION sl = {0}, dl = {0};
     sl.pResource = s;        sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dl.pResource = dst->tex; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3935,7 +3951,7 @@ static int ld_resolve_blit_body(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds,
         b[q].Transition.StateBefore = b[q].Transition.StateAfter;
         b[q].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_native_resource_barriers(2, b);
     ld_surface_note_write(slot, LD_SURFACE_WRITE_COPY);
     if (s_csv_file && s_csv_gate_open) {
         fprintf(s_csv_file, "#resolve,%u,%u:0x%X,%u:0x%X,%u,%u,%ux%u\n", g_ld_frames,
@@ -3993,7 +4009,7 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
     }
     b[0].Transition.pResource = src; b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[1].Transition.pResource = dst; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_native_resource_barriers(2, b);
     D3D12_TEXTURE_COPY_LOCATION s = {0}, d = {0};
     s.pResource = src; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     d.pResource = dst; d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -4003,7 +4019,7 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
         b[k].Transition.StateBefore = b[k].Transition.StateAfter;
         b[k].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_native_resource_barriers(2, b);
     ld_surface_note_write((u32)di, LD_SURFACE_WRITE_COPY);
     return 1;
 }
@@ -4015,7 +4031,8 @@ static u32 current_surface(void)
     const u32 slot = surface_get(sf.color_location[0], sf.color_offset[0],
                                  sf.clip_w, sf.clip_h,
                                  ld_color_format(sf.color_format));
-    if (slot != LD_INVALID_SURFACE) g.surfaces[slot].pitch = sf.color_pitch[0];
+    if (slot != LD_INVALID_SURFACE) {g.surfaces[slot].pitch = sf.color_pitch[0];
+        g.surfaces[slot].native_aa_grid=sf.aa_sx|(sf.aa_sy<<8);g.surfaces[slot].native_source_format=sf.color_format;}
     return slot;
 }
 
@@ -4095,7 +4112,7 @@ static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
 }
 
 /* Returns DSV slot 1+i. Slot 0 is the legacy shared depth fallback. */
-static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h,u32 pitch,u32 source_format)
 {
     if (!honor_zeta_track()) return 0;
     /* The DSV must cover the complete live framebuffer/viewport it is bound
@@ -4110,6 +4127,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         zdepth_t* z = &g.zdepths[i];
         if (z->location == location && z->offset == offset) {
             if (z->w >= want_w && z->h >= want_h) {
+                z->native_pitch=pitch;z->native_source_format=source_format;
                 zdepth_grow_snapshot(i, rt_w, rt_h);
                 return 1 + i;
             }
@@ -4172,6 +4190,9 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         z->tex = NULL;
         return 0;
     }
+    z->native_generation=ld_native_new_generation();z->native_state=D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    z->native_state_known=1;z->native_clear_planes=0;z->native_pitch=pitch;z->native_source_format=source_format;
+    ld_native_image_gc();
     z->location = location;
     z->offset = offset;
     z->w = want_w;
@@ -4222,6 +4243,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         g.list, dsv_handle(1 + slot),
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
         1.0f, 0, 0, NULL);
+    z->native_clear_planes|=6u;
     z->cleared = 1;
     fprintf(stderr,
             "[zetatrack] live new #%u %u:0x%X backing=%ux%u "
@@ -4275,7 +4297,7 @@ static int zdepth_snapshot(u32 slot)
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         nbar++;
     }
-    g.list->lpVtbl->ResourceBarrier(g.list, nbar, bars);
+    ld_native_resource_barriers(nbar, bars);
 
     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
@@ -4293,7 +4315,7 @@ static int zdepth_snapshot(u32 slot)
     D3D12_RESOURCE_BARRIER uav_done = {0};
     uav_done.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     uav_done.UAV.pResource = z->snapshot;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &uav_done);
+    ld_native_resource_barriers(1, &uav_done);
 
     D3D12_RESOURCE_BARRIER done[2] = {0};
     done[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -4311,7 +4333,7 @@ static int zdepth_snapshot(u32 slot)
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     done[1].Transition.StateAfter =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, done);
+    ld_native_resource_barriers(2, done);
     z->snapshot_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     z->snapshot_valid = 1;
     z->had_write = 0;
@@ -6582,7 +6604,7 @@ static void ld_movie_capture_overlay(void)
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
     src.pResource = rt;
@@ -6598,7 +6620,7 @@ static void ld_movie_capture_overlay(void)
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     ld_flush(LD_FLUSH_MOVIE);
 
     const SIZE_T rb_size = (SIZE_T)g.movie_overlay_pitch * g.height;
@@ -7771,6 +7793,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                                       msf.clip_w, msf.clip_h,
                                       ld_color_format(msf.color_format));
             if (s == LD_INVALID_SURFACE || s == target) break;
+            g.surfaces[s].pitch=msf.color_pitch[r];
+            g.surfaces[s].native_aa_grid=msf.aa_sx|(msf.aa_sy<<8);g.surfaces[s].native_source_format=msf.color_format;
             mrt[n_mrt++] = s;
         }
     }
@@ -7784,7 +7808,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     rsx_dsp_get_surface(&g.rsx, &sf);
     rsx_dsp_get_viewport(&g.rsx, &vp);
     const u32 current_zslot = g.depth
-        ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h)
+        ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h,sf.zeta_pitch,sf.depth_format)
         : 0;
     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
@@ -8132,7 +8156,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         bar.Transition.pResource = g.surfaces[surf_used[k]].tex;
         bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
+        ld_native_resource_barriers(1, &bar);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
     D3D12_CPU_DESCRIPTOR_HANDLE dsv; int have_dsv = 0;
@@ -8146,6 +8170,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                     g.list, dsv,
                     D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                     1.0f, 0, 0, NULL);
+                z->native_clear_planes|=6u;
                 z->cleared = 1;
                 z->had_write = 0;
                 g_ld_stats.implicit_depth_clears++;
@@ -8335,7 +8360,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         bar.Transition.pResource = g.surfaces[surf_used[k]].tex;
         bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         bar.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
+        ld_native_resource_barriers(1, &bar);
     }
     /* A guest-side failure can occur before the next flip even though useful
      * orphanage draws have already reached internal world targets.  Preserve
@@ -8444,13 +8469,14 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
           if (ct < 0) ct = getenv("LD_CLEAR_TEST") ? 1 : 0;
           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
         g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, 0, NULL);
+        g.surfaces[target].native_clear_planes|=1u;
         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
     }
     if ((mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
         rsx_dsp_surface sf;
         rsx_dsp_get_surface(&g.rsx, &sf);
         const u32 zslot = zdepth_get(sf.zeta_location, sf.zeta_offset,
-                                     sf.clip_w, sf.clip_h);
+                                     sf.clip_w, sf.clip_h,sf.zeta_pitch,sf.depth_format);
         D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_handle(zslot);
         D3D12_CLEAR_FLAGS clear_flags = (D3D12_CLEAR_FLAGS)0;
         if (mask & RSX_CLEAR_DEPTH)
@@ -8474,6 +8500,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
                 clear_flags, cd, z16 ? (UINT8)0 : (UINT8)(zs & 0xFFu), 0, NULL);
         }
         if (zslot) {
+            g.zdepths[zslot - 1].native_clear_planes|=((mask&RSX_CLEAR_DEPTH)?2u:0u)|((mask&RSX_CLEAR_STENCIL)?4u:0u);
             g.zdepths[zslot - 1].cleared = 1;
             if (mask & RSX_CLEAR_DEPTH) {
                 g.zdepths[zslot - 1].had_write = 0;
@@ -9331,7 +9358,7 @@ static void ld_present_rgba_body(const uint8_t* rgba, u32 w, u32 h)
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
     dst.pResource = bb; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
@@ -9347,7 +9374,7 @@ static void ld_present_rgba_body(const uint8_t* rgba, u32 w, u32 h)
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     ld_flush(LD_FLUSH_MOVIE_PRESENT);
     {
@@ -9432,7 +9459,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
     src.pResource = rt; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
@@ -9446,7 +9473,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     ld_flush(LD_FLUSH_READBACK);                   /* copy completes on the GPU */
 
@@ -9888,7 +9915,7 @@ static void ld_present_body(u32 buffer_id)
     bar[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+    ld_native_resource_barriers(2, bar);
 
     g.list->lpVtbl->CopyResource(g.list, bb, srcimg);
 
@@ -9896,7 +9923,7 @@ static void ld_present_body(u32 buffer_id)
     bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+    ld_native_resource_barriers(2, bar);
 
     ld_flush(LD_FLUSH_PRESENT);
     {
@@ -10983,6 +11010,7 @@ static void ld_shutdown_body(void)
     shader_blob_cache_release(&g.ps_blobs);
     for (u32 i = 0; i < g.n_textures; i++) if (g.textures[i].tex) g.textures[i].tex->lpVtbl->Release(g.textures[i].tex);
     for (u32 i = 0; i < g.n_vtex; i++) if (g.vtex[i].tex) g.vtex[i].tex->lpVtbl->Release(g.vtex[i].tex);
+    ld_native_image_records_clear();
     for (u32 i = 0; i < g.n_surfaces; i++) if (g.surfaces[i].tex) g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
     for (u32 i = 0; i < g.n_zdepths; i++) {
         if (g.zdepths[i].tex)

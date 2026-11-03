@@ -1,6 +1,8 @@
 #ifndef PS3RECOMP_RSX_LIVE_DRAW_OWNER_H
 #define PS3RECOMP_RSX_LIVE_DRAW_OWNER_H
 #include <stdint.h>
+#include "rsx_native_d3d12_image.h"
+#include "rsx_native_handoff.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -35,6 +37,20 @@ int rsx_live_draw_borrow_owner(rsx_live_draw_owner *);
  * A normal frontend drop never requests or performs host teardown. */
 int rsx_live_draw_owner_shutdown_requested(uint64_t lifetime);
 int rsx_live_draw_owner_retry_shutdown(uint64_t lifetime);
+/* Existing live allocations only; no common-engine handle is inferred. Color
+ * handles are1+slot, depth handles1+MAX_SURFACES+slot (opaque to consumers).
+ * Key lookup returns1 exact match,0 absent/ambiguous,negative invalid/busy.
+ * Plane validation requires the genuine owner native lease. Metadata is
+ * unretained. Release reuses a held same-owner scope or acquires the gate;
+ * it never waits for GPU work or retries host shutdown. */
+int rsx_live_draw_native_image(const rsx_native_image_key*,rsx_native_image_match*);
+int rsx_live_draw_borrow_image(uint64_t,uint32_t,rsx_native_image*);
+int rsx_live_draw_validate_image_planes(void*,uint64_t,uint64_t,uint64_t,uint32_t);
+int rsx_live_draw_native_registers(const uint32_t*,uint32_t*,uint32_t);
+int rsx_live_draw_native_canvas(uint32_t dimensions[2]);
+/* Nonblocking observation of an existing successful original checked flush.
+ * Dirty/partial/pending remains Busy. Never submits or waits to make it ready. */
+int rsx_live_draw_native_boundary(uint64_t*);
 /* Existing report callback registration belongs to owner configuration before
  * concurrent ingress. The enabled owner gate snapshots a coherent begin/end
  * pair; default-off operation retains the existing registration contract. */
