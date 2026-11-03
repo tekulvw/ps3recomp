@@ -66,6 +66,22 @@ static struct {
     rsx_native_handoff_ring_arm ring;
     uint32_t writer_state[4];
 } s_native_handoffs[GCM_NATIVE_HANDOFF_CAPACITY];
+/* Error-only bounded context for the source-owned ring seam. These values
+ * are copies of words already read by its checks, never fresh guest probes. */
+static void gcm_native_ring_refusal(const char* stage,int status,const char* reason,
+    uint64_t cookie,const rsx_native_handoff_ring_arm* a,const uint32_t expected[4],
+    const uint32_t actual[4],unsigned phase,int header_checked,uint32_t header,uint32_t argument)
+{
+    static atomic_uint reported;
+    unsigned n=atomic_load_explicit(&reported,memory_order_relaxed);
+    while(n<8 && !atomic_compare_exchange_weak_explicit(&reported,&n,n+1,memory_order_relaxed,memory_order_relaxed)){}
+    if(n>=8)return;
+    fprintf(stderr,"[gcm native ring refusal] stage=%s status=%d reason=%s cookie=%llu source=%llu vm=%llu writer=%08x ring=%08x+%08x header_ea=%08x phase=%u expected_state=%08x,%08x,%08x,%08x actual_state=%08x,%08x,%08x,%08x header_checked=%d expected_words=%08x,%08x actual_words=%08x,%08x\n",
+        stage,status,reason,(unsigned long long)cookie,(unsigned long long)a->source_observation,
+        (unsigned long long)a->vm_identity,a->writer_state_ea,a->ring_begin_ea,a->ring_bytes,a->header_ea,phase,
+        expected[0],expected[1],expected[2],expected[3],actual[0],actual[1],actual[2],actual[3],
+        header_checked,a->expected_header,a->expected_argument,header,argument);
+}
 static void gcm_native_handoff_remove(unsigned i)
 {
     memset(&s_native_handoffs[i], 0, sizeof(s_native_handoffs[i]));
@@ -127,10 +143,12 @@ int cellGcm_native_handoff_ring_arm(const rsx_native_handoff_ring_arm* source, u
     uint32_t state[4];
     for (unsigned n = 0; n < 4; ++n) state[n] = vm_read32(source->writer_state_ea + 4u * n);
     int result = -4;
+    const char* reason = "cookie-exhausted";
     if (state[2] != source->header_ea || state[0] < source->ring_begin_ea ||
         state[0] > source->header_ea || state[1] < source->header_ea + 8u ||
         (uint64_t)state[1] > (uint64_t)source->ring_begin_ea + source->ring_bytes) {
         result = -3;
+        reason = "writer-state-bounds";
     } else if (s_native_handoff_next != 0) {
         unsigned free_slot = GCM_NATIVE_HANDOFF_CAPACITY;
         int duplicate = 0;
@@ -139,6 +157,7 @@ int cellGcm_native_handoff_ring_arm(const rsx_native_handoff_ring_arm* source, u
             else if (s_native_handoffs[i].source.vm_identity == source->vm_identity &&
                      s_native_handoffs[i].source.header_ea == source->header_ea) duplicate = 1;
         }
+        reason = duplicate ? "duplicate-header" : "registry-capacity";
         if (!duplicate && free_slot < GCM_NATIVE_HANDOFF_CAPACITY) {
             rsx_native_handoff_arm* common = &s_native_handoffs[free_slot].source;
             common->abi_version = RSX_NATIVE_HANDOFF_ABI; common->struct_size = sizeof(*common);
@@ -158,23 +177,40 @@ int cellGcm_native_handoff_ring_arm(const rsx_native_handoff_ring_arm* source, u
         }
     }
     ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    if(result) { const uint32_t expected[4]={0};
+        gcm_native_ring_refusal("arm",result,reason,0,source,expected,state,0,0,0,0); }
     return result;
 }
 int cellGcm_native_handoff_ring_publish(uint64_t cookie)
 {
     if (!cookie) return -3;
     int result = -3;
+    const char* reason = "cookie-not-found";
+    rsx_native_handoff_ring_arm source={0};
+    uint32_t expected[4]={0},actual[4]={0},header=0,argument=0;
+    unsigned phase=0;int header_checked=0;
     AcquireSRWLockExclusive(&s_native_handoff_lock);
     for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
         if (s_native_handoffs[i].cookie != cookie) continue;
         const rsx_native_handoff_ring_arm* a = &s_native_handoffs[i].ring;
+        source=*a;phase=s_native_handoffs[i].phase;
+        memcpy(expected,s_native_handoffs[i].writer_state,sizeof(expected));
+        reason=!s_native_handoffs[i].ring_writer ? "not-ring" : phase!=1 ? "phase" : "vm-base";
         if (s_native_handoffs[i].ring_writer && s_native_handoffs[i].phase == 1 &&
             s_native_handoffs[i].vm_base_identity == (uintptr_t)vm_base) {
             int same = 1;
-            for (unsigned n = 0; n < 4; ++n)
-                if (vm_read32(a->writer_state_ea + 4u * n) != s_native_handoffs[i].writer_state[n]) same = 0;
-            if (same && vm_read32(a->header_ea) == a->expected_header &&
-                vm_read32(a->header_ea + 4u) == a->expected_argument) {
+            for (unsigned n = 0; n < 4; ++n) {
+                actual[n]=vm_read32(a->writer_state_ea + 4u * n);
+                if(actual[n]!=expected[n])same=0;
+            }
+            reason="writer-state-changed";
+            if(same) {
+                header=vm_read32(a->header_ea);header_checked=1;reason="header-word";
+                if(header==a->expected_header) {
+                    argument=vm_read32(a->header_ea+4u);header_checked=2;reason="argument-word";
+                }
+            }
+            if (same && header_checked==2 && argument==a->expected_argument) {
                 s_native_handoffs[i].phase = 2;
                 result = 0;
             }
@@ -182,6 +218,7 @@ int cellGcm_native_handoff_ring_publish(uint64_t cookie)
         break;
     }
     ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    if(result)gcm_native_ring_refusal("publish",result,reason,cookie,&source,expected,actual,phase,header_checked,header,argument);
     return result;
 }
 int cellGcm_native_handoff_publish(uint64_t cookie)
