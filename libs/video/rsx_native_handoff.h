@@ -51,6 +51,26 @@ int cellGcm_native_handoff_cancel(uint64_t cookie);
 /* Read-only actual dispatch decoder snapshot; caller holds consumer lease.
  * Returns 1 for a qualified existing color-A allocation; otherwise 0. */
 int rsx_draw_engine_native_source_target(rsx_native_source_target* out);
+/* Explicit source-key lookup, independent of current dispatch registers.
+ * Width/height are exact physical image dimensions, including the source AA
+ * sample grid. format is the source color-format code or depth-format code;
+ * aa_grid is x|(y<<8) for color, and zero for depth. No allocation, snapshot,
+ * copy, current-target fallback or content-readiness inference is performed.
+ * The caller holds the serialized consumer lease through lookup and borrowing
+ * the returned backend handle. The host image's lifetime/generation callbacks
+ * then govern retention and validation. This does not certify GPU completion.
+ * Returns 1 for one exact existing allocation, 0 for absent/ambiguous, negative
+ * for invalid/busy/stale/failed. The result is unretained metadata only. */
+enum rsx_native_image_kind { RSX_NATIVE_COLOR_IMAGE=0, RSX_NATIVE_DEPTH_IMAGE=1 };
+typedef struct rsx_native_image_key {
+    uint32_t abi_version, struct_size, kind, location;
+    uint32_t offset, pitch, format, width, height, aa_grid, reserved[2];
+} rsx_native_image_key;
+typedef struct rsx_native_image_match {
+    uint32_t abi_version, struct_size, kind, native_handle;
+    uint32_t width, height, reserved[2];
+} rsx_native_image_match;
+int rsx_draw_engine_native_image(const rsx_native_image_key*, rsx_native_image_match*);
 #ifdef __cplusplus
 }
 #endif

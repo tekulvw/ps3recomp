@@ -14,6 +14,12 @@ extern "C" {
 #define RSX_NATIVE_IMAGE_ABI 1u
 #define RSX_NATIVE_IMAGE_RGBA8 1u
 #define RSX_NATIVE_IMAGE_BGRA8 3u
+#define RSX_NATIVE_IMAGE_D32F 2u
+#define RSX_NATIVE_IMAGE_RGBA16F 11u
+#define RSX_NATIVE_IMAGE_RGBA32F 12u
+#define RSX_NATIVE_IMAGE_R32F 13u
+#define RSX_NATIVE_IMAGE_D24S8 15u
+#define RSX_NATIVE_IMAGE_D32S8 16u
 typedef struct rsx_native_image {
  uint32_t abi_version,struct_size,backend,format,width,height,reserved,reserved1;
  uint64_t owner_lifetime,resource_id,resource_generation;

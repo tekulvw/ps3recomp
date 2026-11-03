@@ -4461,6 +4461,55 @@ int rsx_draw_engine_completion_status(u64 ticket,int wait){
     if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
     return result;
 }
+int rsx_draw_engine_native_image(const rsx_native_image_key* key, rsx_native_image_match* out)
+{
+    if (!out || out->abi_version != 1 || out->struct_size != sizeof(*out)) return -1;
+    memset(out, 0, sizeof(*out));
+    out->abi_version = 1; out->struct_size = sizeof(*out);
+    if (!key || key->abi_version != 1 || key->struct_size != sizeof(*key) ||
+        key->reserved[0] || key->reserved[1] || key->kind > RSX_NATIVE_DEPTH_IMAGE ||
+        key->location > RSX_LOCATION_MAIN || !key->width || !key->height ||
+        key->width > ENG_MAX_SURFACE_DIM || key->height > ENG_MAX_SURFACE_DIM ||
+        key->format > 31 ||
+        (key->kind == RSX_NATIVE_DEPTH_IMAGE ? key->aa_grid != 0 :
+         (key->aa_grid != 0x101 && key->aa_grid != 0x102 && key->aa_grid != 0x202))) return -1;
+    const rsx_original_owner_hooks* owner = atomic_load_explicit(&s_original_owner_hooks, memory_order_acquire);
+    if (owner && !owner->begin(owner->user, RSX_ORIGINAL_READ)) return -4;
+    int status = 0;
+    uint32_t handle = 0;
+    if (!g.ready) status = -3;
+    else if (atomic_load(&s_checked_failed)) status = -6;
+    else if (g.rsx.in_begin_end) status = -4;
+    else if (key->kind == RSX_NATIVE_COLOR_IMAGE) {
+        for (u32 i = 0; i < g.n_surfaces; ++i) {
+            const eng_surface* surface = &g.surfaces[i];
+            if (!surface->handle || surface->location != key->location ||
+                surface->offset != key->offset || surface->pitch != key->pitch ||
+                surface->fmt != eng_surface_format(key->format) ||
+                surface->w != key->width || surface->h != key->height ||
+                surface->aa_grid != key->aa_grid) continue;
+            if (handle) { handle = 0; break; }
+            handle = surface->handle;
+        }
+    } else {
+        for (u32 i = 0; i < g.n_zdepths; ++i) {
+            const eng_zdepth* surface = &g.zdepths[i];
+            if (!surface->handle || surface->location != key->location ||
+                surface->offset != key->offset || surface->pitch != key->pitch ||
+                surface->zfmt != key->format || surface->w != key->width ||
+                surface->h != key->height) continue;
+            if (handle) { handle = 0; break; }
+            handle = surface->handle;
+        }
+    }
+    if (handle) {
+        out->kind = key->kind; out->native_handle = handle;
+        out->width = key->width; out->height = key->height;
+        status = 1;
+    }
+    if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
+    return status;
+}
 int rsx_draw_engine_native_source_target(rsx_native_source_target* out)
 {
     if (!out) return 0;

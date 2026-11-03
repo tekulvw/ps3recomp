@@ -5702,6 +5702,20 @@ static int metal_image_validate(void *user,uint64_t life,uint64_t id,uint64_t ge
  if(s_metal_owner.failed||fps_backend_failed())return -6;
  return metal_image_identity(life,id,generation,0);
 }
+/* Report actual allocation format, not the guest's source format code. */
+static uint32_t metal_native_image_format(MTLPixelFormat format){
+ switch(format){
+  case MTLPixelFormatRGBA8Unorm:return RSX_NATIVE_IMAGE_RGBA8;
+  case MTLPixelFormatBGRA8Unorm:return RSX_NATIVE_IMAGE_BGRA8;
+  case MTLPixelFormatDepth32Float:return RSX_NATIVE_IMAGE_D32F;
+  case MTLPixelFormatRGBA16Float:return RSX_NATIVE_IMAGE_RGBA16F;
+  case MTLPixelFormatRGBA32Float:return RSX_NATIVE_IMAGE_RGBA32F;
+  case MTLPixelFormatR32Float:return RSX_NATIVE_IMAGE_R32F;
+  case MTLPixelFormatDepth24Unorm_Stencil8:return RSX_NATIVE_IMAGE_D24S8;
+  case MTLPixelFormatDepth32Float_Stencil8:return RSX_NATIVE_IMAGE_D32S8;
+  default:return 0;
+ }
+}
 int rsx_metal_backend_borrow_image(uint64_t life,uint32_t handle,rsx_native_image *out){
  if(!out||out->abi_version!=RSX_NATIVE_IMAGE_ABI||out->struct_size!=sizeof(*out))return -1;
  if(!metal_owner_enabled())return -2;
@@ -5709,10 +5723,9 @@ int rsx_metal_backend_borrow_image(uint64_t life,uint32_t handle,rsx_native_imag
  int status=0;
  if(!s_ready||s_metal_owner.closing||life!=s_metal_owner.generation||!handle||handle>s_eng_obj_count||s_eng_obj_retired[handle-1]||!s_eng_obj[handle-1]||!s_eng_obj_generation[handle-1])status=-3;
  else if(s_metal_owner.failed||fps_backend_failed())status=-6;
- else{ id<MTLTexture> image=s_eng_obj[handle-1];uint32_t format=0;
-  if(image.pixelFormat==MTLPixelFormatRGBA8Unorm)format=RSX_NATIVE_IMAGE_RGBA8;
-  else if(image.pixelFormat==MTLPixelFormatBGRA8Unorm)format=RSX_NATIVE_IMAGE_BGRA8;
-  else status=-2;
+ else{ id<MTLTexture> image=s_eng_obj[handle-1];
+  uint32_t format=metal_native_image_format(image.pixelFormat);
+  if(!format||image.textureType!=MTLTextureType2D||image.sampleCount!=1||image.mipmapLevelCount!=1||image.arrayLength!=1)status=-2;
   if(!status)*out=(rsx_native_image){.abi_version=RSX_NATIVE_IMAGE_ABI,.struct_size=sizeof(*out),.backend=RSX_NATIVE_OWNER_METAL,.format=format,.width=(uint32_t)image.width,.height=(uint32_t)image.height,.owner_lifetime=life,.resource_id=handle,.resource_generation=s_eng_obj_generation[handle-1],.image=(__bridge void*)image,.userdata=&s_metal_owner,.retain=metal_image_retain,.release=metal_image_release,.validate=metal_image_validate};
  }
  metal_owner_finish(1);return status;

@@ -21,3 +21,15 @@ with tempfile.TemporaryDirectory(prefix='gcm-native-handoff-') as temp:
         output = Path(temp) / name
         subprocess.run(common + sources + linker + ['-o', str(output)], cwd=ROOT, check=True, timeout=60)
         subprocess.run([str(output)], check=True, timeout=10)
+
+    if sys.platform == 'darwin':
+        output = Path(temp) / 'metal-image-format'
+        subprocess.run([os.environ.get('CC', 'clang'), '-fobjc-arc',
+                        '-DPS3RECOMP_DISABLE_NATIVE_OSK', '-Iinclude', '-Ilibs/video',
+                        'libs/video/tests/test_metal_native_image_format.m',
+                        'libs/video/rsx_texture_layout.c',
+                        'runtime/diagnostics/critical_trace.c', 'libs/input/pad_macos.m',
+                        '-Wl,-dead_strip', '-framework', 'Metal', '-framework', 'Cocoa',
+                        '-framework', 'QuartzCore', '-o', str(output)],
+                       cwd=ROOT, check=True, timeout=60)
+        subprocess.run([str(output)], check=True, timeout=10)
