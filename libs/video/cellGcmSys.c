@@ -3968,6 +3968,12 @@ static void gcm_rsx_process_fifo_pass(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
+    if (s_lag_ea && s_lag_ea != 1u && s_lag_sampler) {
+        static unsigned ln;
+        if (ln++ < 60000u)
+            fprintf(stderr, "[label-lag] t=%llu pass why=%s start=0x%08X end=0x%08X put=0x%08X\n",
+                    (unsigned long long)ps3_critical_now_ns(), why, start_off, s_fifo_getoff, put);
+    }
     if (gcm_drain_debug()) {
         static int n2 = 0;
         if (n2++ % s_drain_every == 0)
