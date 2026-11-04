@@ -2133,6 +2133,14 @@ static void spurs_diag_line(const char* fmt, ...)
  * block word (+0xD6C), with the committing context's image, pc, link and the lifted
  * streamed-job image whose code it was executing. */
 static u32 s_diag_flag[MAX_SPURS_INST];
+/* The kernel resets a delivered flag with a host store that no commit reports,
+ * so each kernel pass re-reads the fields; a later commit is then compared with
+ * what is in memory, not with the last commit. */
+static u32 spurs_diag_flag_key(u32 ea)
+{
+    return spurs_flag_be32(ea + 0x6C) ^ (u32)vm_base[ea + 0x77] << 8 ^ (u32)vm_base[ea + 0x74] << 16 ^
+           spurs_flag_be32(ea + 0xB0) * 0x9E3779B1u ^ spurs_flag_be32(ea + 0xD6C) * 0x85EBCA77u;
+}
 static void spurs_diag_line_commit(struct SpursInst* si, u32 ea)
 {
     if (!spurs_diag_active()) return;
@@ -2140,7 +2148,7 @@ static void spurs_diag_line_commit(struct SpursInst* si, u32 ea)
     const u32 flag = spurs_flag_be32(ea + 0x6C);
     const u32 recv = vm_base[ea + 0x77], ctl = vm_base[ea + 0x74];
     const u32 mask = spurs_flag_be32(ea + 0xB0), block = spurs_flag_be32(ea + 0xD6C);
-    const u32 key = flag ^ (recv << 8) ^ (ctl << 16) ^ mask * 0x9E3779B1u ^ block * 0x85EBCA77u;
+    const u32 key = spurs_diag_flag_key(ea);
     if (key == s_diag_flag[inst]) return;
     s_diag_flag[inst] = key;
     extern int spu_commit_ctx_describe(uint32_t*, uint32_t*, uint32_t*, uint32_t*, int*);
@@ -2155,6 +2163,7 @@ static void spurs_diag_line_commit(struct SpursInst* si, u32 ea)
 static void spurs_diag_scan(struct SpursInst* si, u32 ea, u32 enabled, int target_mode)
 {
     const int inst = (int)(si - s_inst);
+    s_diag_flag[inst] = spurs_diag_flag_key(ea);
     for (u32 wid = 0; wid < CELL_SPURS_MAX_WORKLOAD; wid++) {
         if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
         const u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
