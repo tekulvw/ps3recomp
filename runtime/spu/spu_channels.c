@@ -111,6 +111,24 @@ void spu_decrementer_observer_set(spu_decrementer_observer_fn observer)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* The context whose atomic is being reported to g_spu_line_commit_hook, for the
+ * hook's opt-in diagnostics only (cellSpurs PS3RECOMP_SPURS_DISPATCH_DIAG). */
+static SPU_THREAD_LOCAL const spu_context* t_commit_ctx;
+int spu_commit_ctx_describe(uint32_t* image, uint32_t* pc, uint32_t* lr, uint32_t* spu, int* code_image)
+{
+    const spu_context* c = t_commit_ctx;
+    if (!c) return 0;
+    *image = (uint32_t)c->image_id; *pc = c->pc & SPU_LS_MASK;
+    *lr = c->gpr[0]._u32[0] & SPU_LS_MASK; *spu = c->spu_id;
+    *code_image = 0;
+    for (unsigned i = 0; i < 4; ++i)
+        if (c->resident_code[i].image_id && *pc >= c->resident_code[i].lsa &&
+            *pc - c->resident_code[i].lsa < c->resident_code[i].size) {
+            *code_image = c->resident_code[i].image_id;
+            break;
+        }
+    return 1;
+}
 /* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
 void spu_taskset_line_committed(uint32_t line);
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
@@ -1051,7 +1069,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             ctx->atomic_stat ? SPU_DMA_ATOMIC_PUTLLC_FAILURE : SPU_DMA_ATOMIC_PUTLLC_SUCCESS);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
-            if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+            if (g_spu_line_commit_hook) {
+                t_commit_ctx = ctx; g_spu_line_commit_hook(ea & ~127u); t_commit_ctx = NULL;
+            }
         }
         if(observing)spu_atomic_observe_end(ctx->atomic_stat);
         return 1;
@@ -1073,7 +1093,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
-        if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+        if (g_spu_line_commit_hook) {
+            t_commit_ctx = ctx; g_spu_line_commit_hook(ea & ~127u); t_commit_ctx = NULL;
+        }
         if(observing)spu_atomic_observe_end(ctx->atomic_stat);
         return 1;
 

@@ -476,12 +476,15 @@ static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
  * committed write to that line; one that raised nothing only costs a pass. The
  * kick flag covers a commit that lands while the coordinator is mid-pass. Called
  * with no lock-line lock held. */
+static int s_diag_on;
+static void spurs_diag_line_commit(struct SpursInst* si, u32 ea);
 static void spurs_line_committed(uint32_t line)
 {
     for (int i = 0; i < MAX_SPURS_INST; i++) {
         struct SpursInst* si = &s_inst[i];
         const u32 ea = __atomic_load_n(&si->ea, __ATOMIC_ACQUIRE);
         if (!ea || (ea & ~127u) != line || !__atomic_load_n(&si->kernel_live, __ATOMIC_ACQUIRE)) continue;
+        if (s_diag_on > 0) spurs_diag_line_commit(si, ea);
         __atomic_store_n(&si->kick, 1, __ATOMIC_RELEASE);
         WakeAllConditionVariable(&si->wake);
     }
@@ -2094,13 +2097,14 @@ static WklPm* spurs_resolve_pm(u32 wid)
  * Reading the guest bytes has no side effects; nothing here alters dispatch. */
 static int spurs_ready_requests(u32 ea, u32 wid, u32 ready, u32 active, int target_mode);
 enum { SPURS_DIAG_CAP = 400000 };
-static int s_diag_on = -1;
+static int s_diag_read;
 static uint64_t s_diag_t0, s_diag_from, s_diag_to;
 static unsigned s_diag_lines;
 static u32 s_diag_last[MAX_SPURS_INST][CELL_SPURS_MAX_WORKLOAD];
 static int spurs_diag_active(void)
 {
-    if (s_diag_on < 0) {
+    if (!s_diag_read) {
+        s_diag_read = 1;
         const char* e = getenv("PS3RECOMP_SPURS_DISPATCH_DIAG");
         double start = 0, secs = 0;
         s_diag_on = e && sscanf(e, "%lf:%lf", &start, &secs) == 2 && secs > 0;
@@ -2121,6 +2125,25 @@ static void spurs_diag_line(const char* fmt, ...)
 {
     if (__atomic_fetch_add(&s_diag_lines, 1u, __ATOMIC_RELAXED) >= SPURS_DIAG_CAP) return;
     va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+}
+/* A committed SPU atomic on the instance's first line: report each change of the
+ * receiver flag word (+0x6C: 0 = pending for the receiver at +0x77) and the
+ * ready counts, with the committing context's image, pc, link and the lifted
+ * streamed-job image whose code it was executing. */
+static u32 s_diag_flag[MAX_SPURS_INST];
+static void spurs_diag_line_commit(struct SpursInst* si, u32 ea)
+{
+    if (!spurs_diag_active()) return;
+    const int inst = (int)(si - s_inst);
+    const u32 flag = (u32)vm_base[ea + 0x6C] << 24 | (u32)vm_base[ea + 0x6D] << 16 |
+                     (u32)vm_base[ea + 0x6E] << 8 | vm_base[ea + 0x6F];
+    if (flag == s_diag_flag[inst]) return;
+    s_diag_flag[inst] = flag;
+    extern int spu_commit_ctx_describe(uint32_t*, uint32_t*, uint32_t*, uint32_t*, int*);
+    uint32_t image = 0, pc = 0, lr = 0, spu = 0; int code_image = 0;
+    spu_commit_ctx_describe(&image, &pc, &lr, &spu, &code_image);
+    spurs_diag_line("[spurs-diag] t=%llu inst=%d flagword=0x%08X receiver=%u by_image=%u pc=0x%05X lr=0x%05X spu=%u job_image=%d\n",
+                    (unsigned long long)ps3_ft_now(), inst, flag, vm_base[ea + 0x77], image, pc, lr, spu, code_image);
 }
 /* Reasons: 1 disabled, 2 not in state 2, 3 not this instance's or a taskset,
  * 4 contention full (maxcont 0 or active >= maxcont), 5 policy module
@@ -2147,8 +2170,8 @@ static void spurs_diag_scan(struct SpursInst* si, u32 ea, u32 enabled, int targe
                         (u32)si->idle[wid] << 18 | (u32)why << 24 | 1u << 31;
         if (s_diag_last[inst][wid] == key) continue;
         s_diag_last[inst][wid] = key;
-        spurs_diag_line("[spurs-diag] t=%llu pass=%u wid=%u ready=%u signal=%u flag=%u active=%u maxcont=%u idle=%u why=%d\n",
-                        (unsigned long long)ps3_ft_now(), si->pass_no, wid, ready, signal, flag,
+        spurs_diag_line("[spurs-diag] t=%llu inst=%d pass=%u wid=%u ready=%u signal=%u flag=%u active=%u maxcont=%u idle=%u why=%d\n",
+                        (unsigned long long)ps3_ft_now(), inst, si->pass_no, wid, ready, signal, flag,
                         active, maxcont, si->idle[wid], why);
     }
 }
@@ -2195,8 +2218,8 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         else if (si->idle[wid] < 4) si->idle[wid]++;
         if (diag_t0 && spurs_diag_active()) {
             extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited;
-            spurs_diag_line("[spurs-diag] t=%llu return wid=%u spu=%u image=%d rc=%d polls=%u exited=%u run_us=%llu ready=%u active=%u idle=%u\n",
-                            (unsigned long long)ps3_ft_now(), wid, slot->spu_num, slot->image_id, pm_rc, polls,
+            spurs_diag_line("[spurs-diag] t=%llu inst=%d return wid=%u spu=%u image=%d rc=%d polls=%u exited=%u run_us=%llu ready=%u active=%u idle=%u\n",
+                            (unsigned long long)ps3_ft_now(), (int)(si - s_inst), wid, slot->spu_num, slot->image_id, pm_rc, polls,
                             g_spurs_pm_exited, (unsigned long long)((ps3_ft_now() - diag_t0) / 1000u),
                             vm_read8(slot->ea + SPURS_WKL_READY1 + wid), si->active[wid], si->idle[wid]);
         }
@@ -2307,8 +2330,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 ef_line_end(ea);
                 slot->busy = 1;
                 if (spurs_diag_active())
-                    spurs_diag_line("[spurs-diag] t=%llu pass=%u dispatch wid=%u spu=%u ready=%u signal=%u active=%u\n",
-                                    (unsigned long long)ps3_ft_now(), si->pass_no, wid, sn, ready,
+                    spurs_diag_line("[spurs-diag] t=%llu inst=%d pass=%u dispatch wid=%u spu=%u ready=%u signal=%u active=%u\n",
+                                    (unsigned long long)ps3_ft_now(), (int)(si - s_inst), si->pass_no, wid, sn, ready,
                                     (signal >> (15 - wid)) & 1u, si->active[wid]);
                 WakeAllConditionVariable(&si->wake);
                 break;
