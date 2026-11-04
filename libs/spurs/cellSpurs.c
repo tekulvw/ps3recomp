@@ -19,6 +19,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE policy-module run spans */
 #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -2083,6 +2084,75 @@ static WklPm* spurs_resolve_pm(u32 wid)
     return r->fn ? r : NULL;
 }
 
+/* PS3RECOMP_SPURS_DISPATCH_DIAG=<start s>:<seconds> (opt-in, off by default):
+ * numbers-only record of why the kernel does or does not dispatch each
+ * registered workload, and how each policy-module run ends, for <seconds>
+ * starting <start s> after the first kernel pass. Per-workload state lines are
+ * printed only when the observed tuple or the reason changes, and the whole
+ * window is capped, so a busy kernel cannot flood the log. Timestamps are the
+ * ftrace / critical-trace clock (ps3_ft_now) so the lines align with both.
+ * Reading the guest bytes has no side effects; nothing here alters dispatch. */
+static int spurs_ready_requests(u32 ea, u32 wid, u32 ready, u32 active, int target_mode);
+enum { SPURS_DIAG_CAP = 400000 };
+static int s_diag_on = -1;
+static uint64_t s_diag_t0, s_diag_from, s_diag_to;
+static unsigned s_diag_lines;
+static u32 s_diag_last[MAX_SPURS_INST][CELL_SPURS_MAX_WORKLOAD];
+static int spurs_diag_active(void)
+{
+    if (s_diag_on < 0) {
+        const char* e = getenv("PS3RECOMP_SPURS_DISPATCH_DIAG");
+        double start = 0, secs = 0;
+        s_diag_on = e && sscanf(e, "%lf:%lf", &start, &secs) == 2 && secs > 0;
+        if (s_diag_on) {
+            s_diag_t0 = ps3_ft_now();
+            s_diag_from = s_diag_t0 + (uint64_t)(start * 1e9);
+            s_diag_to = s_diag_from + (uint64_t)(secs * 1e9);
+            fprintf(stderr, "[spurs-diag] window start_ns=%llu end_ns=%llu\n",
+                    (unsigned long long)s_diag_from, (unsigned long long)s_diag_to);
+        }
+    }
+    if (!s_diag_on) return 0;
+    const uint64_t now = ps3_ft_now();
+    return now >= s_diag_from && now < s_diag_to &&
+           __atomic_load_n(&s_diag_lines, __ATOMIC_RELAXED) < SPURS_DIAG_CAP;
+}
+static void spurs_diag_line(const char* fmt, ...)
+{
+    if (__atomic_fetch_add(&s_diag_lines, 1u, __ATOMIC_RELAXED) >= SPURS_DIAG_CAP) return;
+    va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+}
+/* Reasons: 1 disabled, 2 not in state 2, 3 not this instance's or a taskset,
+ * 4 contention full (maxcont 0 or active >= maxcont), 5 policy module
+ * unresolved, 6 no request (ready/signal/flag), 7 requested. */
+static void spurs_diag_scan(struct SpursInst* si, u32 ea, u32 enabled, int target_mode)
+{
+    const int inst = (int)(si - s_inst);
+    for (u32 wid = 0; wid < CELL_SPURS_MAX_WORKLOAD; wid++) {
+        if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
+        const u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+        const u32 signal = (vm_read16(ea + SPURS_WKL_SIGNAL1) >> (15 - wid)) & 1u;
+        const u32 flag = spurs_flag_status(ea, wid, 0) ? 1u : 0u;
+        const u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
+        const u32 active = si->active[wid];
+        int why;
+        if (!(enabled & (0x80000000u >> wid))) why = 1;
+        else if (vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2) why = 2;
+        else if (s_workloads[wid].is_taskset) why = 3;
+        else if (!maxcont || active >= maxcont) why = 4;
+        else if (s_wkl_pm[wid].resolved < 0) why = 5;
+        else if (!spurs_ready_requests(ea, wid, ready, active, target_mode) && !signal && !flag) why = 6;
+        else why = 7;
+        const u32 key = ready | signal << 8 | flag << 9 | (active & 15u) << 10 | (maxcont & 15u) << 14 |
+                        (u32)si->idle[wid] << 18 | (u32)why << 24 | 1u << 31;
+        if (s_diag_last[inst][wid] == key) continue;
+        s_diag_last[inst][wid] = key;
+        spurs_diag_line("[spurs-diag] t=%llu pass=%u wid=%u ready=%u signal=%u flag=%u active=%u maxcont=%u idle=%u why=%d\n",
+                        (unsigned long long)ps3_ft_now(), si->pass_no, wid, ready, signal, flag,
+                        active, maxcont, si->idle[wid], why);
+    }
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -2105,7 +2175,8 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         if (si->stopping && !slot->busy) break;
         ReleaseSRWLockExclusive(&si->lock);
         const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-        spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
+        const uint64_t diag_t0 = s_diag_on > 0 ? ps3_ft_now() : 0;
+        const int pm_rc = spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
         if (ft_t0) {
             extern void spu_ft_job_end(void);
@@ -2122,6 +2193,13 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         ef_line_end(slot->ea);
         if (polls) si->idle[wid] = 0;
         else if (si->idle[wid] < 4) si->idle[wid]++;
+        if (diag_t0 && spurs_diag_active()) {
+            extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited;
+            spurs_diag_line("[spurs-diag] t=%llu return wid=%u spu=%u image=%d rc=%d polls=%u exited=%u run_us=%llu ready=%u active=%u idle=%u\n",
+                            (unsigned long long)ps3_ft_now(), wid, slot->spu_num, slot->image_id, pm_rc, polls,
+                            g_spurs_pm_exited, (unsigned long long)((ps3_ft_now() - diag_t0) / 1000u),
+                            vm_read8(slot->ea + SPURS_WKL_READY1 + wid), si->active[wid], si->idle[wid]);
+        }
         slot->busy = 0;
         WakeAllConditionVariable(&si->wake);
     }
@@ -2174,6 +2252,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         AcquireSRWLockExclusive(&s_workload_registry_lock);
         si->pass_no++;
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+        if (spurs_diag_active()) spurs_diag_scan(si, ea, enabled, target_mode);
         for (u32 sn = 0; sn < si->nspus; sn++) {
             struct SpursPmSlot* slot = &si->slots[sn];
             if (slot->busy) continue;
@@ -2227,6 +2306,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
                 ef_line_end(ea);
                 slot->busy = 1;
+                if (spurs_diag_active())
+                    spurs_diag_line("[spurs-diag] t=%llu pass=%u dispatch wid=%u spu=%u ready=%u signal=%u active=%u\n",
+                                    (unsigned long long)ps3_ft_now(), si->pass_no, wid, sn, ready,
+                                    (signal >> (15 - wid)) & 1u, si->active[wid]);
                 WakeAllConditionVariable(&si->wake);
                 break;
             }
