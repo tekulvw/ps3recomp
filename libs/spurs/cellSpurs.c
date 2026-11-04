@@ -2123,6 +2123,99 @@ static int spurs_diag_active(void)
     return now >= s_diag_from && now < s_diag_to &&
            __atomic_load_n(&s_diag_lines, __ATOMIC_RELAXED) < SPURS_DIAG_CAP;
 }
+/* PS3RECOMP_SPURS_FLAG_GUARD=1 with the diagnostic window (Linux x86-64 only):
+ * for the window, write-protect the host page holding instance 0's receiver
+ * flag word, let each write through by single-stepping it, and report every
+ * write that turns a non-zero flag word into zero: host instruction offset in
+ * the executable (resolve offline), thread name and id. Most faults on that page
+ * are the ready-count traffic; they are counted, not printed. */
+#if defined(__linux__) && defined(__x86_64__)
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
+extern char __executable_start;
+enum { FG_REG_RIP = 16, FG_REG_EFL = 17 };   /* glibc x86-64 gregs indices */
+static uintptr_t s_fg_page;
+static const volatile uint8_t* s_fg_word;
+static int s_fg_state;                          /* 0 off, 1 armed, 2 finished */
+static struct sigaction s_fg_prev_segv, s_fg_prev_trap;
+static __thread uint32_t t_fg_pre;
+static __thread uintptr_t t_fg_rip;
+static __thread int t_fg_step;
+static unsigned s_fg_faults, s_fg_zeroes;
+static uint32_t fg_word(void)
+{
+    return (uint32_t)s_fg_word[0] << 24 | (uint32_t)s_fg_word[1] << 16 | (uint32_t)s_fg_word[2] << 8 | s_fg_word[3];
+}
+static void fg_chain(struct sigaction* prev, int sig, siginfo_t* si, void* uc)
+{
+    if (prev->sa_flags & SA_SIGINFO) { if (prev->sa_sigaction) prev->sa_sigaction(sig, si, uc); return; }
+    if (prev->sa_handler == SIG_DFL || prev->sa_handler == SIG_IGN) { signal(sig, SIG_DFL); raise(sig); return; }
+    prev->sa_handler(sig);
+}
+static void fg_segv(int sig, siginfo_t* si, void* ucv)
+{
+    const uintptr_t a = (uintptr_t)si->si_addr;
+    if (s_fg_page && a >= s_fg_page && a < s_fg_page + 4096u) {
+        ucontext_t* uc = (ucontext_t*)ucv;
+        __atomic_fetch_add(&s_fg_faults, 1u, __ATOMIC_RELAXED);
+        t_fg_pre = fg_word();
+        t_fg_rip = (uintptr_t)uc->uc_mcontext.gregs[FG_REG_RIP];
+        t_fg_step = 1;
+        mprotect((void*)s_fg_page, 4096u, PROT_READ | PROT_WRITE);
+        uc->uc_mcontext.gregs[FG_REG_EFL] |= 0x100;
+        return;
+    }
+    fg_chain(&s_fg_prev_segv, sig, si, ucv);
+}
+static void fg_trap(int sig, siginfo_t* si, void* ucv)
+{
+    if (!t_fg_step) { fg_chain(&s_fg_prev_trap, sig, si, ucv); return; }
+    ucontext_t* uc = (ucontext_t*)ucv;
+    t_fg_step = 0;
+    uc->uc_mcontext.gregs[FG_REG_EFL] &= ~0x100;
+    const uint32_t now = fg_word();
+    if (t_fg_pre && !now && __atomic_fetch_add(&s_fg_zeroes, 1u, __ATOMIC_RELAXED) < 256u) {
+        char name[17] = {0}, line[256];
+        prctl(PR_GET_NAME, name, 0, 0, 0);
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        const int n = snprintf(line, sizeof line,
+            "[spurs-diag] t=%llu guard zeroed flag word pre=0x%08X rip_off=0x%llX thread=%s tid=%ld\n",
+            (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec, t_fg_pre,
+            (unsigned long long)(t_fg_rip - (uintptr_t)&__executable_start), name, (long)syscall(SYS_gettid));
+        if (n > 0) { ssize_t w = write(2, line, (size_t)n); (void)w; }
+    }
+    if (__atomic_load_n(&s_fg_state, __ATOMIC_ACQUIRE) == 1)
+        mprotect((void*)s_fg_page, 4096u, PROT_READ);
+}
+static void spurs_diag_guard_tick(struct SpursInst* si, u32 ea, int active)
+{
+    if (si != &s_inst[0] || s_fg_state == 2) return;
+    if (s_fg_state == 0 && active) {
+        const char* e = getenv("PS3RECOMP_SPURS_FLAG_GUARD");
+        if (!e || strcmp(e, "1")) { s_fg_state = 2; return; }
+        s_fg_word = vm_base + ea + 0x6C;
+        s_fg_page = (uintptr_t)s_fg_word & ~(uintptr_t)4095u;
+        struct sigaction sa; memset(&sa, 0, sizeof sa);
+        sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
+        sa.sa_sigaction = fg_segv; sigaction(SIGSEGV, &sa, &s_fg_prev_segv);
+        sa.sa_sigaction = fg_trap; sigaction(SIGTRAP, &sa, &s_fg_prev_trap);
+        __atomic_store_n(&s_fg_state, 1, __ATOMIC_RELEASE);
+        mprotect((void*)s_fg_page, 4096u, PROT_READ);
+        fprintf(stderr, "[spurs-diag] guard armed on 0x%08X\n", ea + 0x6C);
+    } else if (s_fg_state == 1 && !active) {
+        __atomic_store_n(&s_fg_state, 2, __ATOMIC_RELEASE);
+        mprotect((void*)s_fg_page, 4096u, PROT_READ | PROT_WRITE);
+        fprintf(stderr, "[spurs-diag] guard disarmed faults=%u zeroes=%u\n",
+                __atomic_load_n(&s_fg_faults, __ATOMIC_RELAXED), __atomic_load_n(&s_fg_zeroes, __ATOMIC_RELAXED));
+    }
+}
+#else
+static void spurs_diag_guard_tick(struct SpursInst* si, u32 ea, int active) { (void)si; (void)ea; (void)active; }
+#endif
 static void spurs_diag_line(const char* fmt, ...)
 {
     if (__atomic_fetch_add(&s_diag_lines, 1u, __ATOMIC_RELAXED) >= SPURS_DIAG_CAP) return;
@@ -2289,7 +2382,11 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         AcquireSRWLockExclusive(&s_workload_registry_lock);
         si->pass_no++;
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
-        if (spurs_diag_active()) spurs_diag_scan(si, ea, enabled, target_mode);
+        if (s_diag_on > 0 || !s_diag_read) {
+            const int diag_active = spurs_diag_active();
+            if (diag_active) spurs_diag_scan(si, ea, enabled, target_mode);
+            if (s_diag_on > 0) spurs_diag_guard_tick(si, ea, diag_active);
+        }
         for (u32 sn = 0; sn < si->nspus; sn++) {
             struct SpursPmSlot* slot = &si->slots[sn];
             if (slot->busy) continue;
