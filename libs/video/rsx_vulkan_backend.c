@@ -2576,8 +2576,14 @@ static u32 vk_max_dim(void) { return s_vk.max_dim ? s_vk.max_dim : 4096u; }
 
 static u32 vk_eng_alloc(void)
 {
-    for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
+    /* Hand out slots round-robin rather than lowest-first, so a handle the
+     * engine releases is not immediately reused: a late or duplicated release
+     * of an old handle then finds a free slot instead of a live object. */
+    static u32 cursor;
+    for (u32 step = 0; step < VK_ENG_MAX_OBJ - 1; step++) {
+        const u32 i = 1 + (cursor + step) % (VK_ENG_MAX_OBJ - 1);
         if (s_eobj[i].kind == VK_ENG_FREE && !s_eobj_native_pins[i]) {
+            cursor = i % (VK_ENG_MAX_OBJ - 1);
             if(vulkan_owner_enabled()) {
                 if(s_eobj_next_generation==UINT64_MAX){vulkan_owner_fault();return 0;}
                 s_eobj_generation[i]=++s_eobj_next_generation;
@@ -2587,6 +2593,7 @@ static u32 vk_eng_alloc(void)
             s_e5_obj_ticket[i]=0;
             return i;
         }
+    }
     VK_LOG("engine: object table full (%d)\n", VK_ENG_MAX_OBJ);
     return 0;
 }
@@ -4933,6 +4940,36 @@ static void owner_vk_eng_release(void* user, u32 handle){
     if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
     vk_eng_release(user,handle);vulkan_owner_finish(vulkan_owner_boundary(before));
 }
+/* The engine releases each object through the call for its kind. Handles are
+ * slots that get reused, so a release naming an object of another kind is a
+ * stale handle: freeing it would destroy a live object that now owns the
+ * slot (a colour target the next feedback draw snapshots). It is refused and
+ * reported instead. */
+static int vk_eng_release_kind_ok(u32 handle, int want_color, int want_depth)
+{
+    if (!handle || handle >= VK_ENG_MAX_OBJ) return 1;
+    const vk_eng_obj* o = &s_eobj[handle];
+    if (o->kind == VK_ENG_FREE || s_eobj_retired[handle]) return 1;   /* vk_eng_release ignores these */
+    const int color = o->kind == VK_ENG_COLOR && !o->snapshot, depth = o->kind == VK_ENG_DEPTH;
+    const int ok = want_color ? color : want_depth ? depth : (!color && !depth);
+    if (!ok) {
+        static u32 logs;
+        if (logs++ < 16)
+            VK_LOG("engine: stale %s release of object %u (kind %d%s, %ux%u) refused\n",
+                   want_color ? "colour target" : want_depth ? "depth target" : "texture", handle,
+                   (int)o->kind, o->snapshot ? " snapshot" : "", o->w, o->h);
+    }
+    return ok;
+}
+static void owner_vk_eng_texture_release(void* user, u32 handle){
+    if(vk_eng_release_kind_ok(handle,0,0))owner_vk_eng_release(user,handle);
+}
+static void owner_vk_eng_color_target_release(void* user, u32 handle){
+    if(vk_eng_release_kind_ok(handle,1,0))owner_vk_eng_release(user,handle);
+}
+static void owner_vk_eng_depth_target_release(void* user, u32 handle){
+    if(vk_eng_release_kind_ok(handle,0,1))owner_vk_eng_release(user,handle);
+}
 static u32 owner_vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                                       const void* seed, u32 seed_row_bytes){
     if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
@@ -5072,12 +5109,12 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .submit_and_wait      = owner_vk_eng_submit_and_wait,
     .texture_create       = owner_vk_eng_texture_create,
     .texture_upload       = owner_vk_eng_texture_upload,
-    .texture_release      = owner_vk_eng_release,
+    .texture_release      = owner_vk_eng_texture_release,
     .color_target_create  = owner_vk_eng_color_target_create,
-    .color_target_release = owner_vk_eng_release,
+    .color_target_release = owner_vk_eng_color_target_release,
     .surface_view         = owner_vk_eng_surface_view,
     .depth_target_create  = owner_vk_eng_depth_target_create,
-    .depth_target_release = owner_vk_eng_release,
+    .depth_target_release = owner_vk_eng_depth_target_release,
     .depth_snapshot       = owner_vk_eng_depth_snapshot,
     .color_snapshot       = owner_vk_eng_color_snapshot,
     .pipeline_create      = owner_vk_eng_pipeline_create,
