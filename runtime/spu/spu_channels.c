@@ -132,6 +132,33 @@ int spu_commit_ctx_describe(uint32_t* image, uint32_t* pc, uint32_t* lr, uint32_
         }
     return 1;
 }
+/* PS3RECOMP_SPU_LINE_WATCH=<hex EA> (opt-in diagnostic, numbers only): every
+ * committed SPU atomic (PUTLLC success, PUTLLUC) on the 128-byte line holding
+ * that word, with a monotonic timestamp, SPU, image, SPURS workload (LS 0x1DC),
+ * pc, link, the streamed job image being run and the word's value after the
+ * commit. Capped. */
+static uint32_t s_line_watch = 1u;   /* 1: not read yet */
+static void spu_line_watch_commit(const spu_context* c, uint32_t ea)
+{
+    if (s_line_watch == 1u) {
+        const char* e = getenv("PS3RECOMP_SPU_LINE_WATCH");
+        s_line_watch = e && *e ? (uint32_t)strtoul(e, 0, 16) & ~3u : 0u;
+    }
+    if (!s_line_watch || (ea & ~127u) != (s_line_watch & ~127u)) return;
+    static unsigned n;
+    if (__atomic_fetch_add(&n, 1u, __ATOMIC_RELAXED) >= 200000u) return;
+    const uint32_t pc = c->pc & SPU_LS_MASK;
+    int job = 0;
+    for (unsigned i = 0; i < 4; ++i)
+        if (c->resident_code[i].image_id && pc >= c->resident_code[i].lsa &&
+            pc - c->resident_code[i].lsa < c->resident_code[i].size) { job = c->resident_code[i].image_id; break; }
+    const uint8_t* w = vm_base + s_line_watch;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(stderr, "[spu-line-watch] t=%llu spu=%u image=%d wid=%u pc=0x%05X lr=0x%05X job=%d word=0x%08X\n",
+            (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec, c->spu_id, c->image_id,
+            spu_ls_read32(c, 0x1DC), pc, c->gpr[0]._u32[0] & SPU_LS_MASK, job,
+            (uint32_t)w[0] << 24 | (uint32_t)w[1] << 16 | (uint32_t)w[2] << 8 | w[3]);
+}
 /* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
 void spu_taskset_line_committed(uint32_t line);
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
@@ -1072,6 +1099,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             ctx->atomic_stat ? SPU_DMA_ATOMIC_PUTLLC_FAILURE : SPU_DMA_ATOMIC_PUTLLC_SUCCESS);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
+            if (s_line_watch) spu_line_watch_commit(ctx, (uint32_t)ea);
             if (g_spu_line_commit_hook) {
                 t_commit_ctx = ctx; g_spu_line_commit_hook(ea & ~127u); t_commit_ctx = NULL;
             }
@@ -1096,6 +1124,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
+        if (s_line_watch) spu_line_watch_commit(ctx, (uint32_t)ea);
         if (g_spu_line_commit_hook) {
             t_commit_ctx = ctx; g_spu_line_commit_hook(ea & ~127u); t_commit_ctx = NULL;
         }
