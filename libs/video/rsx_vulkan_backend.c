@@ -3072,10 +3072,18 @@ static void vk_eng_snapshot_pool_drain(void)
 static u32 vk_eng_color_snapshot(void* user, u32 surface)
 {
     (void)user;
+    static u32 logs;
+#define VK_SNAP_FAIL(why) do { if (logs++ < 8) VK_LOG("engine: colour snapshot of %u failed: %s\n", surface, why); } while (0)
     const vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
-    if (!t || t->snapshot) return 0;
+    if (!t || t->snapshot) {
+        if (logs < 8 && surface < VK_ENG_MAX_OBJ)
+            VK_LOG("engine: colour snapshot of %u: kind %d retired %d native pin %d snapshot %d %ux%u\n", surface,
+                   (int)s_eobj[surface].kind, (int)s_eobj_retired[surface], (int)s_eobj_native_pins[surface],
+                   (int)s_eobj[surface].snapshot, s_eobj[surface].w, s_eobj[surface].h);
+        VK_SNAP_FAIL(!t ? "no colour target" : "target is a snapshot"); return 0;
+    }
     const u32 hd = vk_eng_alloc();
-    if (!hd) return 0;
+    if (!hd) { VK_SNAP_FAIL("no object slot"); return 0; }
     vk_eng_obj* o = &s_eobj[hd];
     int reused = 0;
     for (u32 i = 0; i < s_snap_pool_n; i++)
@@ -3090,11 +3098,12 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
                                    VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&o->im);
         memset(o, 0, sizeof *o);
+        VK_SNAP_FAIL("image creation");
         return 0;
     }
     o->kind = VK_ENG_COLOR; o->snapshot = 1;
     o->fmt = t->fmt; o->bpp = t->bpp; o->w = t->w; o->h = t->h;
-    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    if (vk_begin()) { vk_eng_release(user, hd); VK_SNAP_FAIL("command begin"); return 0; }
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
                      reused ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED);
     vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -3107,8 +3116,9 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
                     o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     /* The copy, made visible to whatever samples it next. */
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    if (vk_submit_and_wait()) { vk_eng_release(user, hd); VK_SNAP_FAIL("submission"); return 0; }
     return hd;
+#undef VK_SNAP_FAIL
 }
 
 /* ---- E4: depth snapshots --------------------------------------------------
@@ -4941,7 +4951,7 @@ static u32 owner_vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h){
     u32 result=vk_eng_depth_snapshot(user,depth,w,h);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
 }
 static u32 owner_vk_eng_color_snapshot(void* user, u32 surface){
-    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    if(!vulkan_owner_begin(1)){static u32 logs;if(logs++<8)VK_LOG("engine: colour snapshot of %u refused by the native owner gate\n",surface);return 0;}uint64_t before=s_vulkan_commits;
     u32 result=vk_eng_color_snapshot(user,surface);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
 }
 static u32 owner_vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
