@@ -132,7 +132,7 @@ int spu_commit_ctx_describe(uint32_t* image, uint32_t* pc, uint32_t* lr, uint32_
         }
     return 1;
 }
-/* PS3RECOMP_SPU_LINE_WATCH=<hex EA> (opt-in diagnostic, numbers only): every
+/* PS3RECOMP_SPU_LINE_WATCH=<hex EA>[:<start s>:<seconds>] (opt-in diagnostic, numbers only): every
  * committed SPU atomic (PUTLLC success, PUTLLUC) on the 128-byte line holding
  * that word, with a monotonic timestamp, SPU, image, SPURS workload (LS 0x1DC),
  * pc, link, the streamed job image being run and the word's value after the
@@ -140,22 +140,30 @@ int spu_commit_ctx_describe(uint32_t* image, uint32_t* pc, uint32_t* lr, uint32_
 static uint32_t s_line_watch = 1u;   /* 1: not read yet */
 static void spu_line_watch_commit(const spu_context* c, uint32_t ea)
 {
+    static uint64_t from_ns, to_ns;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
     if (s_line_watch == 1u) {
+        /* <hex EA>[:<start s>:<seconds>], the window counted from this first call. */
         const char* e = getenv("PS3RECOMP_SPU_LINE_WATCH");
+        double start = 0, secs = 0;
+        const char* colon = e ? strchr(e, ':') : NULL;
+        if (colon && sscanf(colon + 1, "%lf:%lf", &start, &secs) == 2 && secs > 0) {
+            from_ns = now + (uint64_t)(start * 1e9); to_ns = from_ns + (uint64_t)(secs * 1e9);
+        } else { from_ns = 0; to_ns = UINT64_MAX; }
         s_line_watch = e && *e ? (uint32_t)strtoul(e, 0, 16) & ~3u : 0u;
     }
-    if (!s_line_watch || (ea & ~127u) != (s_line_watch & ~127u)) return;
+    if (!s_line_watch || (ea & ~127u) != (s_line_watch & ~127u) || now < from_ns || now >= to_ns) return;
     static unsigned n;
-    if (__atomic_fetch_add(&n, 1u, __ATOMIC_RELAXED) >= 200000u) return;
+    if (__atomic_fetch_add(&n, 1u, __ATOMIC_RELAXED) >= 400000u) return;
     const uint32_t pc = c->pc & SPU_LS_MASK;
     int job = 0;
     for (unsigned i = 0; i < 4; ++i)
         if (c->resident_code[i].image_id && pc >= c->resident_code[i].lsa &&
             pc - c->resident_code[i].lsa < c->resident_code[i].size) { job = c->resident_code[i].image_id; break; }
     const uint8_t* w = vm_base + s_line_watch;
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     fprintf(stderr, "[spu-line-watch] t=%llu spu=%u image=%d wid=%u pc=0x%05X lr=0x%05X job=%d word=0x%08X\n",
-            (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec, c->spu_id, c->image_id,
+            (unsigned long long)now, c->spu_id, c->image_id,
             spu_ls_read32(c, 0x1DC), pc, c->gpr[0]._u32[0] & SPU_LS_MASK, job,
             (uint32_t)w[0] << 24 | (uint32_t)w[1] << 16 | (uint32_t)w[2] << 8 | w[3]);
 }
