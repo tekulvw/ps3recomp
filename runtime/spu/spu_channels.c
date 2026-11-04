@@ -111,6 +111,9 @@ void spu_decrementer_observer_set(spu_decrementer_observer_fn observer)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* Called by host-side writers of guest memory (an RSX label publication) that
+ * opt in to waking line watchers; cellSpurs sets it to its line-commit wake. */
+void (*g_host_line_write_hook)(uint32_t line) = 0;
 /* The context whose atomic is being reported to g_spu_line_commit_hook, for the
  * hook's opt-in diagnostics only (cellSpurs PS3RECOMP_SPURS_DISPATCH_DIAG). */
 static SPU_THREAD_LOCAL const spu_context* t_commit_ctx;

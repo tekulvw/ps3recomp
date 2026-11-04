@@ -1595,6 +1595,15 @@ static void gph_label_published(const rsx_deferred_report *r){
     static const uint64_t edge[7]={100000,250000,500000,1000000,2000000,4000000,8000000};
     u32 b=0;while(b<7&&total>=edge[b])b++;s_gph.lab_hist[b]++;
 }
+/* PS3RECOMP_RSX_REPORT_SPURS_KICK=1: a published label wakes whoever watches
+ * its line (the SPURS coordinator, when a title signals a workload flag or
+ * ready count from the command stream) at once, as an SPU commit to that line
+ * does, instead of on the coordinator's next timed pass. Off by default. */
+static int gcm_report_spurs_kick(void){
+    static int on=-1;
+    if(on<0){const char *e=getenv("PS3RECOMP_RSX_REPORT_SPURS_KICK");on=e&&!strcmp(e,"1");}
+    return on;
+}
 static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     (void)user;u32 ea;
     /* A completion receipt carries no guest effect of its own. */
@@ -1604,6 +1613,7 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
         u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
         if(!vm_base||r->vm!=(uintptr_t)vm_base||(u64)r->ea+4u>limit)return 0;
         vm_write32(r->ea,r->argument);
+        if(gcm_report_spurs_kick()){extern void (*g_host_line_write_hook)(uint32_t);if(g_host_line_write_hook)g_host_line_write_hook(r->ea&~127u);}
         ring_note(RSX_RING_VM_PUBLISH,r->ea,r->argument,r->ticket,r->context);
         if(r->start_ns){uint64_t w[5]={r->start_ns,r->ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,20,r->ea,0,w,5);}
         return 1;
