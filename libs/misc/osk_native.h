@@ -2,7 +2,9 @@
 #ifndef PS3RECOMP_OSK_NATIVE_H
 #define PS3RECOMP_OSK_NATIVE_H
 #include <stdint.h>
-#if ((defined(__APPLE__) || (defined(_WIN32) && defined(PS3RECOMP_NATIVE_OSK_WINDOWS))) && !defined(PS3RECOMP_DISABLE_NATIVE_OSK)) || defined(PS3RECOMP_TEST_NATIVE_OSK)
+#if ((defined(__APPLE__) || (defined(_WIN32) && defined(PS3RECOMP_NATIVE_OSK_WINDOWS)) || \
+      (!defined(_WIN32) && !defined(__APPLE__) && defined(PS3RECOMP_NATIVE_OSK_HEADLESS))) && \
+     !defined(PS3RECOMP_DISABLE_NATIVE_OSK)) || defined(PS3RECOMP_TEST_NATIVE_OSK)
 #define PS3RECOMP_NATIVE_OSK 1
 #endif
 #ifdef __cplusplus
