@@ -2730,18 +2730,18 @@ static int eng_color_feedback_compatible(const eng_surface* s,
 }
 
 static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
-                                       const rsx_dsp_texture* t)
+                                       const rsx_dsp_texture* t, const char* why)
 {
     static u32 logs;
     ENG_CHECKED_FAIL();
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
     if (PS3_LOG_FIRST(logs, 8))
-        fprintf(stderr, "[rsx engine] rejected colour feedback unit %u: "
+        fprintf(stderr, "[rsx engine] rejected colour feedback unit %u (%s): "
                 "target %ux%u fmt%u pitch%u, texture %ux%u fmt%02X pitch%u "
-                "dim%u levels%u cube%u color%u raster%u\n", unit, s->w, s->h, (u32)s->fmt,
+                "dim%u levels%u cube%u color%u raster%u remap%04X\n", unit, why, s->w, s->h, (u32)s->fmt,
                 s->pitch, t->width, t->height, t->format, t->pitch,
-                t->dimension, t->mipmaps, t->cubemap, sf.color_format, sf.raster_type);
+                t->dimension, t->mipmaps, t->cubemap, sf.color_format, sf.raster_type, t->remap & 0xffffu);
     return ENG_INVALID;
 }
 
@@ -3266,24 +3266,24 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             rsx_dsp_surface sf;
             rsx_dsp_get_surface(&g.rsx, &sf);
             if (!eng_color_feedback_compatible(s, &t, &sf))
-                return eng_color_feedback_failure(u, s, &t);
+                return eng_color_feedback_failure(u, s, &t, "incompatible layout");
             u32 k = 0;
             while (k < n_targets && target_slots[k] != (u32)surface_at) k++;
-            if (k == n_targets) return eng_color_feedback_failure(u, s, &t);
+            if (k == n_targets) return eng_color_feedback_failure(u, s, &t, "not a bound target");
             if (!feedback[k]) {
                 const u32 copy = g.be->color_snapshot(g.be->user, s->handle);
-                if (!copy) return eng_color_feedback_failure(u, s, &t);
+                if (!copy) return eng_color_feedback_failure(u, s, &t, "backend snapshot failed");
                 if (s->feedback) g.be->texture_release(g.be->user, s->feedback);
                 s->feedback = feedback[k] = copy;
             }
             if (g.be->surface_view) {
                 textures[u] = g.be->surface_view(g.be->user, feedback[k],
                                                t.remap & 0xffffu, t.format);
-                if (!textures[u]) return eng_color_feedback_failure(u, s, &t);
+                if (!textures[u]) return eng_color_feedback_failure(u, s, &t, "backend view failed");
             } else if ((t.remap & 0xffffu) == 0xaae4u) {
                 textures[u] = feedback[k];
             } else {
-                return eng_color_feedback_failure(u, s, &t);
+                return eng_color_feedback_failure(u, s, &t, "remap without views");
             }
             eng_texture_descriptor_log(u, &t, textures[u], "feedback", s);
             continue;
