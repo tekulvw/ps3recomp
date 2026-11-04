@@ -97,6 +97,120 @@ static void ring_writer_checks(void) {
     raw32(0x110004,0x490);cellGcm_syscall_set_fifo(0x10008,0x10000);cellGcm_rsx_process_fifo();
     assert(ring_callbacks==1&&cellGcm_native_handoff_cancel(cookie)==-3); /* changed before GET */
 }
+
+/* Ring watch: a writer we do not control writes the header; it is judged when
+ * GET arrives, every outcome is reported exactly once, and GET never waits. */
+static unsigned watch_calls;
+static int32_t watch_status;
+static u32 watch_get_at_callback;
+static rsx_native_handoff_ring_event watch_event;
+static void consume_watch(void* user,const rsx_native_handoff_ring_event* e,int32_t status) {
+    assert(user==&watch_calls&&e->abi_version==1&&e->struct_size==sizeof(*e));
+    assert(e->source.vm_identity==17&&e->source.source_observation==94);
+    assert(e->writer_state_ea==0x220000&&e->ring_begin_ea==0x120000&&e->ring_bytes==0x4000);
+    assert(cellGcm_native_handoff_cancel(e->source.cookie)==-4); /* outside the lock, held */
+    watch_event=*e;watch_status=status;watch_get_at_callback=s_fifo_getoff;watch_calls++;
+}
+static rsx_native_handoff_ring_watch watch_at(u32 header_ea) {
+    rsx_native_handoff_ring_watch w={1,sizeof(w),17,94,0x220000,0x120000,0x4000,header_ea,
+        0x00041d6c,0x480,{0,0},{0,0},0,0,&watch_calls,consume_watch};
+    return w;
+}
+static void clear_ring(void) { for(u32 a=0x11f000;a<0x124000;a+=4)raw32(a,0); }
+static void ring_watch_checks(void) {
+    _Static_assert(sizeof(rsx_native_handoff_ring_watch)==88,"ring watch ABI");
+    uint64_t cookie=7;
+    rsx_native_handoff_ring_watch w=watch_at(0x120000);
+    /* Invalid input. */
+    w.abi_version=2;assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==-1&&cookie==0);w.abi_version=1;
+    w.header_ea=0x124000;assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==-1);
+    w.header_ea=0x123ff8;w.tail_mask[0]=1;assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==-1);
+    w.tail_mask[0]=0;w.reserved=1;assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==-1);
+    w=watch_at(0x120000);w.consume=NULL;assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==-1);
+    w=watch_at(0x120000);w.expected_header=0x20000000u;assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==-1);
+
+    /* ARRIVED: nothing read at arm; the words appear later; callback runs
+     * before the header is decoded and GET then continues. */
+    clear_ring();w=watch_at(0x120000);
+    assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0&&cookie);
+    uint64_t dup=1;assert(cellGcm_native_handoff_ring_watch(&w,&dup)==-4&&dup==0);
+    assert(cellGcm_native_handoff_ring_publish(cookie)==-3); /* not a publishing writer */
+    raw32(0x120000,0x00041d6c);raw32(0x120004,0x480);
+    watch_calls=0;cellGcm_syscall_set_fifo(0x20008,0x20000);cellGcm_rsx_process_fifo();
+    assert(watch_calls==1&&watch_status==RSX_NATIVE_WATCH_ARRIVED);
+    assert(watch_get_at_callback==0x20000&&s_fifo_getoff==0x20008);
+    assert(watch_event.source.header==0x00041d6c&&watch_event.source.argument==0x480);
+    assert(watch_event.source.header_ea==0x120000&&watch_event.source.target.native_surface==23);
+    assert(watch_event.source.cookie==cookie&&cellGcm_native_handoff_cancel(cookie)==-3);
+    cellGcm_syscall_set_fifo(0x20008,0x20000);cellGcm_rsx_process_fifo();assert(watch_calls==1); /* one-shot */
+
+    /* MISMATCH: GET arrives before the writer; reported, and GET never waits. */
+    clear_ring();assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0);
+    watch_calls=0;cellGcm_syscall_set_fifo(0x20008,0x20000);cellGcm_rsx_process_fifo();
+    assert(watch_calls==1&&watch_status==RSX_NATIVE_WATCH_MISMATCH&&s_fifo_getoff==0x20008);
+    assert(watch_event.source.header==0&&watch_event.source.target.native_surface==0);
+
+    /* Masked tail words: the writer's epoch bits must match too. */
+    clear_ring();raw32(0x120000,0x00041d6c);raw32(0x120004,0x480);
+    raw32(0x120008,0x00041d74);raw32(0x12000c,0x80000ec0u);
+    w.expected_tail[0]=0x00041d74;w.tail_mask[0]=0xffffffffu;
+    w.expected_tail[1]=0x40000000u;w.tail_mask[1]=0xc0000000u;
+    assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0);
+    watch_calls=0;cellGcm_syscall_set_fifo(0x20008,0x20000);cellGcm_rsx_process_fifo();
+    assert(watch_calls==1&&watch_status==RSX_NATIVE_WATCH_MISMATCH);
+    raw32(0x12000c,0x40000ec0u);assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0);
+    watch_calls=0;cellGcm_syscall_set_fifo(0x20008,0x20000);cellGcm_rsx_process_fifo();
+    assert(watch_calls==1&&watch_status==RSX_NATIVE_WATCH_ARRIVED);
+
+    /* SKIPPED: a forward JUMP over the header. */
+    clear_ring();w=watch_at(0x120010);
+    assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0);
+    raw32(0x120000,0x20000000u|0x20020u);
+    watch_calls=0;cellGcm_syscall_set_fifo(0x20024,0x20000);cellGcm_rsx_process_fifo();
+    assert(watch_calls==1&&watch_status==RSX_NATIVE_WATCH_SKIPPED&&s_fifo_getoff==0x20024);
+    /* SKIPPED: a JUMP back out of the span before reaching the header. */
+    clear_ring();assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0);
+    raw32(0x120004,0x20000000u|0x1f000u);
+    watch_calls=0;cellGcm_syscall_set_fifo(0x1f004,0x20004);cellGcm_rsx_process_fifo();
+    assert(watch_calls==1&&watch_status==RSX_NATIVE_WATCH_SKIPPED);
+    /* A JUMP that stays short of the header is not a skip. */
+    clear_ring();w=watch_at(0x120020);
+    assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0);
+    raw32(0x120000,0x20000000u|0x20010u);
+    watch_calls=0;cellGcm_syscall_set_fifo(0x20014,0x20000);cellGcm_rsx_process_fifo();
+    assert(watch_calls==0&&s_fifo_getoff==0x20014);
+    /* Cancel before arrival: no callback can begin. */
+    assert(cellGcm_native_handoff_cancel(cookie)==0);
+    raw32(0x120020,0x00041d6c);raw32(0x120024,0x480);
+    cellGcm_syscall_set_fifo(0x20028,0x20020);cellGcm_rsx_process_fifo();assert(watch_calls==0);
+
+    /* SKIPPED by a consumer resynchronisation. */
+    clear_ring();assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0);
+    {u32 get=0x20000;watch_calls=0;gcm_fifo_resync_why("watch-test",&get,0x20030);}
+    assert(watch_calls==1&&watch_status==RSX_NATIVE_WATCH_SKIPPED);
+
+    /* EXPIRED after max_flips FIFO flips. */
+    clear_ring();w.max_flips=2;assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0);
+    watch_calls=0;gcm_native_watch_sweep(2,0,0,0,0);assert(watch_calls==0);
+    gcm_native_watch_sweep(2,0,0,0,0);
+    assert(watch_calls==1&&watch_status==RSX_NATIVE_WATCH_EXPIRED);
+    w.max_flips=0;assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0);
+    for(int i=0;i<8;i++)gcm_native_watch_sweep(2,0,0,0,0);
+    assert(watch_calls==1); /* no expiry requested */
+    assert(cellGcm_native_handoff_cancel(cookie)==0);
+
+    /* VM_RETIRED: the base changed before arrival. */
+    assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==0);
+    uint8_t* real_vm=vm_base;vm_base+=4;watch_calls=0;
+    gcm_native_watch_sweep(2,0,0,0,0);vm_base=real_vm;
+    assert(watch_calls==1&&watch_status==RSX_NATIVE_WATCH_VM_RETIRED);
+
+    /* Capacity is shared with the other handoff kinds. */
+    uint64_t cookies[64];
+    for(unsigned i=0;i<64;i++){w=watch_at(0x120000+8*i);assert(cellGcm_native_handoff_ring_watch(&w,&cookies[i])==0);}
+    w=watch_at(0x120200);assert(cellGcm_native_handoff_ring_watch(&w,&cookie)==-4&&cookie==0);
+    for(unsigned i=0;i<64;i++)assert(cellGcm_native_handoff_cancel(cookies[i])==0);
+}
 int main(void) {
     vm_base=mmap(NULL,0x100000000ULL,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
     assert(vm_base!=MAP_FAILED);ppu_vm_size=0x4000000;ppu_hle_inject_base=0x3000000;
@@ -145,5 +259,6 @@ int main(void) {
     assert(cellGcm_native_handoff_cancel(cookie)==0);
     ring_writer_checks();
     wrapped_ring_writer_checks();
-    puts("PASS: exact FIFO source publication, pre-header barrier, replay/mutation/VM rejection, bounded capacity and cancellation");return 0;
+    ring_watch_checks();
+    puts("PASS: exact FIFO source publication, pre-header barrier, replay/mutation/VM rejection, bounded capacity and cancellation; ring watch reports arrival, mismatch, skip, expiry and VM retirement once");return 0;
 }

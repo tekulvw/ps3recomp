@@ -71,6 +71,49 @@ typedef struct rsx_native_handoff_ring_arm {
 } rsx_native_handoff_ring_arm;
 int cellGcm_native_handoff_ring_arm(const rsx_native_handoff_ring_arm*, uint64_t* cookie);
 int cellGcm_native_handoff_ring_publish(uint64_t cookie);
+/* Watch for a ring header written by a writer the caller does not control
+ * (for example an SPU job that writes its own command segment). Unlike
+ * ring_arm/publish, nothing is read at arm time and there is no publish step:
+ * the expected words are checked when the serialized FIFO consumer reaches
+ * header_ea, and the FIFO never waits for the watch.
+ *
+ * Arm before the writer can run. Every watch reports exactly once through
+ * consume, outside the registry mutex, with the ordinary callback rules
+ * (no throw, no recursive drain, no GPU wait, any host thread), then retires:
+ *   RSX_NATIVE_WATCH_ARRIVED     GET reached header_ea and the words matched;
+ *                                runs BEFORE the header is decoded, with the
+ *                                actual dispatch target snapshot.
+ *   RSX_NATIVE_WATCH_MISMATCH    GET reached header_ea but a word differed
+ *                                (another writer, stale or reused span).
+ *   RSX_NATIVE_WATCH_SKIPPED     GET left the ring span before header_ea by a
+ *                                JUMP, or the consumer resynchronised.
+ *   RSX_NATIVE_WATCH_EXPIRED     max_flips FIFO flips passed first (0: never).
+ *   RSX_NATIVE_WATCH_VM_RETIRED  the VM base changed before arrival.
+ * On failure the event carries the words actually read (zero when none were)
+ * and an empty target; the FIFO always continues with the real words. The
+ * caller must then not commit work bound to this header. expected_tail[n] is
+ * compared under tail_mask[n] at header_ea+8+4n; a zero mask ignores it.
+ * A JUMP into the ring from outside it is not judged; max_flips bounds that.
+ * Arm status: 0 armed, -1 invalid, -4 duplicate header or registry capacity
+ * (shared with the other handoff kinds). cancel returns -4 while the callback
+ * runs; after a successful cancel no callback can begin. */
+#define RSX_NATIVE_WATCH_ARRIVED 0
+#define RSX_NATIVE_WATCH_MISMATCH (-3)
+#define RSX_NATIVE_WATCH_SKIPPED (-4)
+#define RSX_NATIVE_WATCH_EXPIRED (-6)
+#define RSX_NATIVE_WATCH_VM_RETIRED (-7)
+typedef void (*rsx_native_handoff_watch_fn)(void*, const rsx_native_handoff_ring_event*, int32_t status);
+typedef struct rsx_native_handoff_ring_watch {
+    uint32_t abi_version, struct_size;
+    uint64_t vm_identity, source_observation;
+    uint32_t writer_state_ea, ring_begin_ea, ring_bytes, header_ea;
+    uint32_t expected_header, expected_argument;
+    uint32_t expected_tail[2], tail_mask[2];
+    uint32_t max_flips, reserved;
+    void* userdata;
+    rsx_native_handoff_watch_fn consume;
+} rsx_native_handoff_ring_watch;
+int cellGcm_native_handoff_ring_watch(const rsx_native_handoff_ring_watch*, uint64_t* cookie);
 /* Read-only actual dispatch decoder snapshot; caller holds consumer lease.
  * Returns 1 for a qualified existing color-A allocation; otherwise 0. */
 int rsx_draw_engine_native_source_target(rsx_native_source_target* out);

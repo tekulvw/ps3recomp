@@ -69,6 +69,9 @@ static struct {
     unsigned ring_writer;
     rsx_native_handoff_ring_arm ring;
     uint32_t writer_state[4];
+    unsigned ring_watch; /* published at arm; judged at FIFO arrival */
+    rsx_native_handoff_ring_watch watch;
+    uint32_t flips_left;
 } s_native_handoffs[GCM_NATIVE_HANDOFF_CAPACITY];
 /* Error-only bounded context for the source-owned ring seam. These values
  * are copies of words already read by its checks, never fresh guest probes. */
@@ -254,6 +257,118 @@ int cellGcm_native_handoff_publish(uint64_t cookie)
     ReleaseSRWLockExclusive(&s_native_handoff_lock);
     return result;
 }
+int cellGcm_native_handoff_ring_watch(const rsx_native_handoff_ring_watch* w, uint64_t* cookie)
+{
+    if (cookie) *cookie = 0;
+    const uint64_t limit = ppu_vm_size ? (uint64_t)ppu_vm_size : UINT64_C(0x100000000);
+    const uint64_t words = (w && (w->tail_mask[0] || w->tail_mask[1])) ? 16u : 8u;
+    if (!w || !cookie || w->abi_version != RSX_NATIVE_HANDOFF_ABI ||
+        w->struct_size != sizeof(*w) || !w->consume || !w->source_observation ||
+        !w->vm_identity || !vm_base || !w->writer_state_ea ||
+        (w->writer_state_ea & 3u) || (uint64_t)w->writer_state_ea + 16u > limit ||
+        !w->ring_begin_ea || (w->ring_begin_ea & 3u) || w->ring_bytes < 8u ||
+        (w->ring_bytes & 3u) || (uint64_t)w->ring_begin_ea + w->ring_bytes > limit ||
+        (w->header_ea & 3u) || w->header_ea < w->ring_begin_ea ||
+        (uint64_t)w->header_ea + words > (uint64_t)w->ring_begin_ea + w->ring_bytes ||
+        (w->expected_header & 0xFFFF0003u) != 0x00040000u || w->reserved)
+        return -1;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    int result = -4;
+    if (s_native_handoff_next != 0) {
+        unsigned free_slot = GCM_NATIVE_HANDOFF_CAPACITY;
+        int duplicate = 0;
+        for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+            if (!s_native_handoffs[i].phase) free_slot = i;
+            else if (s_native_handoffs[i].source.vm_identity == w->vm_identity &&
+                     s_native_handoffs[i].source.header_ea == w->header_ea) duplicate = 1;
+        }
+        if (!duplicate && free_slot < GCM_NATIVE_HANDOFF_CAPACITY) {
+            rsx_native_handoff_arm* common = &s_native_handoffs[free_slot].source;
+            common->abi_version = RSX_NATIVE_HANDOFF_ABI; common->struct_size = sizeof(*common);
+            common->vm_identity = w->vm_identity; common->source_observation = w->source_observation;
+            common->context_ea = 0; common->consume = NULL; common->header_ea = w->header_ea;
+            common->expected_header = w->expected_header;
+            common->expected_argument = w->expected_argument; common->userdata = w->userdata;
+            s_native_handoffs[free_slot].ring_watch = 1;
+            s_native_handoffs[free_slot].watch = *w;
+            s_native_handoffs[free_slot].flips_left = w->max_flips;
+            s_native_handoffs[free_slot].vm_base_identity = (uintptr_t)vm_base;
+            s_native_handoffs[free_slot].cookie = s_native_handoff_next++;
+            s_native_handoffs[free_slot].phase = 2; /* nothing to publish */
+            *cookie = s_native_handoffs[free_slot].cookie;
+            atomic_fetch_add_explicit(&s_native_handoff_count, 1, memory_order_release);
+            result = 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    return result;
+}
+/* One watch outcome, copied under the registry lock with its entry held in
+ * phase 3, and reported outside it. */
+typedef struct gcm_native_watch_report {
+    uint64_t cookie;
+    unsigned slot;
+    int32_t status;
+    rsx_native_handoff_ring_watch watch;
+    uint32_t header, argument;
+} gcm_native_watch_report;
+static void gcm_native_watch_take(unsigned i, int32_t status, uint32_t header,
+    uint32_t argument, gcm_native_watch_report* out)
+{
+    s_native_handoffs[i].phase = 3;
+    out->cookie = s_native_handoffs[i].cookie; out->slot = i; out->status = status;
+    out->watch = s_native_handoffs[i].watch; out->header = header; out->argument = argument;
+}
+static void gcm_native_watch_report_one(const gcm_native_watch_report* r, u32 get, u32 put)
+{
+    rsx_native_handoff_ring_event owned = {0};
+    owned.abi_version = RSX_NATIVE_HANDOFF_ABI; owned.struct_size = sizeof(owned);
+    rsx_native_handoff_event* e = &owned.source;
+    e->abi_version = RSX_NATIVE_HANDOFF_ABI; e->struct_size = sizeof(*e);
+    e->cookie = r->cookie; e->vm_identity = r->watch.vm_identity;
+    e->vm_base_identity = (uint64_t)(uintptr_t)vm_base;
+    e->source_observation = r->watch.source_observation;
+    e->header_ea = r->watch.header_ea; e->header = r->header; e->argument = r->argument;
+    e->fifo_get = get; e->fifo_put = put;
+    if (r->status == RSX_NATIVE_WATCH_ARRIVED) rsx_draw_engine_native_source_target(&e->target);
+    owned.writer_state_ea = r->watch.writer_state_ea;
+    owned.ring_begin_ea = r->watch.ring_begin_ea; owned.ring_bytes = r->watch.ring_bytes;
+    r->watch.consume(r->watch.userdata, &owned, r->status);
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    if (s_native_handoffs[r->slot].cookie == r->cookie) gcm_native_handoff_remove(r->slot);
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+}
+/* Judge pending watches at a consumer event, then report the retired ones
+ * outside the lock. kind 0: a JUMP from_ea -> to_ea leaves the ring span
+ * before a header; kind 1: resynchronisation skips every header; kind 2: a
+ * FIFO flip counts down max_flips. A changed VM base retires any watch. */
+static void gcm_native_watch_sweep(int kind, u32 from_ea, u32 to_ea, u32 get, u32 put)
+{
+    if (!atomic_load_explicit(&s_native_handoff_count, memory_order_acquire)) return;
+    gcm_native_watch_report reports[GCM_NATIVE_HANDOFF_CAPACITY];
+    unsigned n = 0;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+        if (!s_native_handoffs[i].ring_watch || s_native_handoffs[i].phase != 2) continue;
+        const rsx_native_handoff_ring_watch* w = &s_native_handoffs[i].watch;
+        int32_t status = 1;
+        if (s_native_handoffs[i].vm_base_identity != (uintptr_t)vm_base) {
+            status = RSX_NATIVE_WATCH_VM_RETIRED;
+        } else if (kind == 0) { /* JUMP from_ea -> to_ea */
+            const uint64_t end = (uint64_t)w->ring_begin_ea + w->ring_bytes;
+            if (from_ea >= w->ring_begin_ea && from_ea < w->header_ea &&
+                (to_ea <= from_ea || to_ea > w->header_ea || (uint64_t)to_ea >= end))
+                status = RSX_NATIVE_WATCH_SKIPPED;
+        } else if (kind == 1) { /* resynchronisation */
+            status = RSX_NATIVE_WATCH_SKIPPED;
+        } else if (kind == 2 && s_native_handoffs[i].flips_left) { /* flip */
+            if (--s_native_handoffs[i].flips_left == 0) status = RSX_NATIVE_WATCH_EXPIRED;
+        }
+        if (status <= 0) gcm_native_watch_take(i, status, 0, 0, &reports[n++]);
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned k = 0; k < n; ++k) gcm_native_watch_report_one(&reports[k], get, put);
+}
 int cellGcm_native_handoff_cancel(uint64_t cookie)
 {
     if (!cookie) return -3;
@@ -278,9 +393,29 @@ static int gcm_native_handoff_consume(u32 ea, u32 get, u32 put)
     uint64_t cookie = 0;
     unsigned slot = GCM_NATIVE_HANDOFF_CAPACITY;
     int waiting = 0;
+    gcm_native_watch_report watched;
+    int watch_due = 0;
     AcquireSRWLockExclusive(&s_native_handoff_lock);
     for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
         if (!s_native_handoffs[i].phase || s_native_handoffs[i].source.header_ea != ea) continue;
+        if (s_native_handoffs[i].ring_watch) {
+            if (s_native_handoffs[i].phase != 2) break; /* already reporting */
+            const rsx_native_handoff_ring_watch* w = &s_native_handoffs[i].watch;
+            if (s_native_handoffs[i].vm_base_identity != (uintptr_t)vm_base) {
+                gcm_native_watch_take(i, RSX_NATIVE_WATCH_VM_RETIRED, 0, 0, &watched);
+            } else {
+                const uint32_t header = vm_read32(ea), argument = vm_read32(ea + 4);
+                int same = header == w->expected_header && argument == w->expected_argument;
+                for (unsigned n = 0; n < 2; ++n)
+                    if (w->tail_mask[n] &&
+                        ((vm_read32(ea + 8u + 4u * n) ^ w->expected_tail[n]) & w->tail_mask[n]))
+                        same = 0;
+                gcm_native_watch_take(i, same ? RSX_NATIVE_WATCH_ARRIVED : RSX_NATIVE_WATCH_MISMATCH,
+                                      header, argument, &watched);
+            }
+            watch_due = 1;
+            break;
+        }
         source = s_native_handoffs[i].source;
         ring_writer = s_native_handoffs[i].ring_writer;
         if (ring_writer) ring = s_native_handoffs[i].ring;
@@ -300,6 +435,7 @@ static int gcm_native_handoff_consume(u32 ea, u32 get, u32 put)
         break;
     }
     ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    if (watch_due) gcm_native_watch_report_one(&watched, get, put);
     if (cookie) {
         rsx_native_handoff_event event = {0};
         event.abi_version = RSX_NATIVE_HANDOFF_ABI;
@@ -2608,6 +2744,7 @@ static u32 gcm_spu_block_for_put(u32 put)
  * is not, it deadlocks the title. Sweep the skipped range first. */
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
+    gcm_native_watch_sweep(1, 0, 0, *getoff, put); /* a resync may skip any header */
     if (gcm_checked_ref_mode()) { gcm_checked_ref_fail(why, *getoff); return; }
     static int n = 0;
     if (PS3_LOG_FIRST(n, 8))
@@ -3179,6 +3316,7 @@ static void gcm_rsx_process_fifo_pass(void)
                             s_fifo_getoff, put);
             }
             if (gcm_checked_ref_mode()) { gcm_checked_ref_fail("no-io-mapping", s_fifo_getoff); break; }
+            gcm_native_watch_sweep(1, 0, 0, s_fifo_getoff, put);
             s_fifo_getoff = put;
             /* Whatever the walker had not reached is gone, and so are the flips
              * queued in it: none of them will ever be executed, so do not let a
@@ -3267,6 +3405,7 @@ static void gcm_rsx_process_fifo_pass(void)
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
             gcm_frame_bound();
+            gcm_native_watch_sweep(2, 0, 0, s_fifo_getoff, put);
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
              * behind it is a deadlock, because the title's ring can only be
@@ -3341,6 +3480,7 @@ static void gcm_rsx_process_fifo_pass(void)
                   break;
               }
               gcm_observer_branch(s_fifo_getoff,"jump",tgt);
+              gcm_native_watch_sweep(0, ea, gcm_io2ea(tgt), s_fifo_getoff, put);
               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
               s_fifo_getoff = tgt;
               /* get is the RSX's fetch pointer: a title polling it sees the
