@@ -2420,6 +2420,7 @@ static void vk_present_record_end(VkCommandBuffer cb)
         s_vk.present_order = 1;
         s_vk.presented++;
         s_vk.present_direct++;
+        if (s_vk.fps_on) metal_frame_rate_guest(&s_vk.fps);
         if (window) {
             VkPresentInfoKHR pi = {
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -2427,9 +2428,12 @@ static void vk_present_record_end(VkCommandBuffer cb)
                 .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
             };
             VkResult r = vk_queue_present(&pi);
+            if (s_vk.fps_on && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR))
+                metal_frame_rate_presented(&s_vk.fps, vk_now_seconds());
             if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
             else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
         }
+        if (s_vk.fps_on) vk_fps_report();
         return;
     }
     vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
