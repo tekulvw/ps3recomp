@@ -58,7 +58,7 @@ jobs:
           set -e
           for t in tools/test_*.py; do
             # Explicit shader-bound native fixtures have dedicated workflows.
-            case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py) continue ;; esac
+            case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py|tools/test_vulkan_present_cost.py) continue ;; esac
             echo "--- $t"
             python "$t"
           done

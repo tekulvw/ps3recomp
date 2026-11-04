@@ -1416,6 +1416,11 @@ int main(int argc, char** argv)
         return 0;
     }
 
+#if defined(PS3RECOMP_RSX_VULKAN) && !defined(__APPLE__)
+    /* --split-present checks the centre pixel a present read back, which a
+     * Vulkan engine present keeps only on request. */
+    if (do_draw == 13) setenv("PS3RECOMP_VK_PRESENT_READBACK", "1", 1);
+#endif
     vm_base = host_vm_alloc();
     if (!vm_base) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }
 

@@ -80,9 +80,17 @@ void rsx_vulkan_backend_shutdown(void);
  * window has been closed or Esc pressed. */
 int  rsx_vulkan_backend_pump_messages(void);
 
-/* Read the frame back to host memory (and to PS3RECOMP_VK_DUMP if set), and
- * show it in the window if there is one. Same as _present_begin() followed
- * by _present_finish(). */
+/* Show the flipped frame in the window if there is one. Same as
+ * _present_begin() followed by _present_finish().
+ *
+ * On the draw engine path a present is direct: the blit into the window is
+ * submitted with the GPU waiting for the swapchain image, and the CPU waits
+ * for nothing (a short ring of presents stays in flight). The frame is read
+ * back to host memory -- the centre pixel for
+ * rsx_vulkan_backend_presented_center() and the PS3RECOMP_VK_DUMP file --
+ * only for the presents PS3RECOMP_VK_DUMP writes, for every present under
+ * PS3RECOMP_VK_PRESENT_READBACK=1, and always on the fixed-function path;
+ * such a present waits for the copy. */
 void rsx_vulkan_backend_present(void);
 
 /* The same present in two halves, for a host that presents on a thread of its
@@ -91,10 +99,12 @@ void rsx_vulkan_backend_present(void);
  * _present_begin() reads the flipped surface: it must not run while the
  * walker is draining (call it under the same lock as
  * cellGcm_rsx_process_fifo). On the draw engine path it only records and
- * submits the copy out of that surface, and returns at once.
+ * submits the copy out of that surface (a direct present: the window blit
+ * too), and returns at once.
  *
- * _present_finish() waits for that copy, reads the frame back, writes the
- * dump and presents to the window. It may run while the walker drains the
+ * _present_finish() waits for a read-back present's copy, reads the frame
+ * back, writes the dump and presents to the window; after a direct present
+ * it has nothing left to do. It may run while the walker drains the
  * next frame: the next frame's commands are ordered after the copy, so they
  * never reach the presented image. On the fixed-function path, where the
  * walker draws into the presented image itself, _present_begin() does all of
