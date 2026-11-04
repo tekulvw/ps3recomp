@@ -757,6 +757,8 @@ static int gcm_flip_executed_take(void)
     if (s_flip_direct_pending) { s_flip_direct_pending = 0; return 1; }
     return 0;
 }
+static int s_flip_pacing = -1;              /* PS3RECOMP_GCM_FLIP_PACING: -1 unread, 0 fixed, 1 adaptive */
+static void gcm_flip_adaptive_poll(void);   /* below */
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -1319,8 +1321,10 @@ void cellGcmSetWaitFlip(void)
 #ifdef _WIN32
     __declspec(dllimport) void __stdcall Sleep(unsigned long);
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++) {
+        if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
         Sleep(1);
+    }
     /* A flip still WAITING after the bound is left to the tick. Forcing DONE
      * here skipped its completion: the tick only completes WAITING flips, so
      * the flip handler never ran for it, and inFAMOUS 2, whose handler writes
@@ -1359,6 +1363,7 @@ u32 cellGcmGetFlipStatus(void)
       if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
+    if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
     return s_flip_status;
 }
 
@@ -1392,6 +1397,58 @@ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
 
+/* PS3RECOMP_GCM_FLIP_PACING=adaptive (opt-in; unset keeps the fixed beat).
+ *
+ * By default a flip the drain has executed completes on the next 60 Hz beat
+ * (cellGcmTickFlip), so a frame that misses a beat waits for the one after,
+ * and everything the title orders behind its flip waits with it. Adaptive
+ * pacing completes an executed flip as soon as one display period has passed
+ * since the previous completion: at max(execution, last completion + 1/60 s).
+ * It still completes only flips the drain has executed, through the same
+ * pending-completion and delivery path as the beat (status, handler, the
+ * late-delivery and newer-request rules in ppu_gcm_pump), and never more than
+ * one per period. The vblank count, vblank interrupt and handler stay on the
+ * ticker. Completions are polled wherever one may have become possible: after
+ * each drain, on the beat, and while the guest waits on or polls the status. */
+#define GCM_FLIP_PERIOD_NS 16666667ull
+static int s_flip_done_any;
+static uint64_t s_flip_done_ns;
+static unsigned long long s_flip_adaptive_completions;
+static uint64_t gcm_flip_clock_now(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+#endif
+}
+static uint64_t (*s_flip_clock)(void) = gcm_flip_clock_now;   /* tests substitute it */
+static int gcm_flip_adaptive(void)
+{
+    if (s_flip_pacing < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_FLIP_PACING");
+        s_flip_pacing = e && !strcmp(e, "adaptive");
+        if (s_flip_pacing) fprintf(stderr, "[flip pacing] adaptive: an executed flip completes one period after the last\n");
+    }
+    return s_flip_pacing;
+}
+static void gcm_flip_adaptive_poll(void)
+{
+    if (!gcm_flip_adaptive()) return;
+    const uint64_t now = s_flip_clock();
+    FLIP_LOCK();
+    const int due = !s_flip_done_any || now - s_flip_done_ns >= GCM_FLIP_PERIOD_NS;
+    const int waiting = due && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
+    if (waiting) { s_flip_tick_seq = s_flip_req_seq; s_flip_done_ns = now; s_flip_done_any = 1; }
+    FLIP_UNLOCK();
+    if (!waiting) return;
+    GCM_PENDING_SET(2);
+    if (++s_flip_adaptive_completions % 600ull == 0)
+        fprintf(stderr, "[flip pacing] adaptive completions=%llu\n", s_flip_adaptive_completions);
+}
+
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
 static u32 s_fifo_getoff;   /* tentative: defined below */
@@ -1399,6 +1456,7 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
 void cellGcm_request_tick(void)
 {
     s_vblank_count++;
+    if (gcm_flip_adaptive()) { GCM_PENDING_SET(1); gcm_flip_adaptive_poll(); return; }
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
      * actually consumed up to `put`.
      *
@@ -1502,6 +1560,7 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
+    if (gcm_flip_adaptive()) { gcm_flip_adaptive_poll(); return; }
     /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
      * not happened yet. */
     FLIP_LOCK();
@@ -3165,6 +3224,7 @@ void cellGcm_rsx_process_fifo(void)
         if (t1 - ft_t0 >= ps3_ft_min_ns())
             ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
     }
+    if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
 }
 
 /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
