@@ -483,8 +483,10 @@ static void spurs_line_committed(uint32_t line)
     for (int i = 0; i < MAX_SPURS_INST; i++) {
         struct SpursInst* si = &s_inst[i];
         const u32 ea = __atomic_load_n(&si->ea, __ATOMIC_ACQUIRE);
+        if (s_diag_on > 0 && ea && __atomic_load_n(&si->kernel_live, __ATOMIC_ACQUIRE) &&
+            ((ea & ~127u) == line || ((ea + 0x80u) & ~127u) == line || ((ea + 0xD6Cu) & ~127u) == line))
+            spurs_diag_line_commit(si, ea);
         if (!ea || (ea & ~127u) != line || !__atomic_load_n(&si->kernel_live, __ATOMIC_ACQUIRE)) continue;
-        if (s_diag_on > 0) spurs_diag_line_commit(si, ea);
         __atomic_store_n(&si->kick, 1, __ATOMIC_RELEASE);
         WakeAllConditionVariable(&si->wake);
     }
@@ -2126,24 +2128,26 @@ static void spurs_diag_line(const char* fmt, ...)
     if (__atomic_fetch_add(&s_diag_lines, 1u, __ATOMIC_RELAXED) >= SPURS_DIAG_CAP) return;
     va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
 }
-/* A committed SPU atomic on the instance's first line: report each change of the
- * receiver flag word (+0x6C: 0 = pending for the receiver at +0x77) and the
- * ready counts, with the committing context's image, pc, link and the lifted
+/* A committed SPU atomic on a line holding the receiver-flag fields: report each change of the
+ * flag word (+0x6C: 0 = pending), receiver (+0x77), control (+0x74), eligible mask (+0xB0) and
+ * block word (+0xD6C), with the committing context's image, pc, link and the lifted
  * streamed-job image whose code it was executing. */
 static u32 s_diag_flag[MAX_SPURS_INST];
 static void spurs_diag_line_commit(struct SpursInst* si, u32 ea)
 {
     if (!spurs_diag_active()) return;
     const int inst = (int)(si - s_inst);
-    const u32 flag = (u32)vm_base[ea + 0x6C] << 24 | (u32)vm_base[ea + 0x6D] << 16 |
-                     (u32)vm_base[ea + 0x6E] << 8 | vm_base[ea + 0x6F];
-    if (flag == s_diag_flag[inst]) return;
-    s_diag_flag[inst] = flag;
+    const u32 flag = spurs_flag_be32(ea + 0x6C);
+    const u32 recv = vm_base[ea + 0x77], ctl = vm_base[ea + 0x74];
+    const u32 mask = spurs_flag_be32(ea + 0xB0), block = spurs_flag_be32(ea + 0xD6C);
+    const u32 key = flag ^ (recv << 8) ^ (ctl << 16) ^ mask * 0x9E3779B1u ^ block * 0x85EBCA77u;
+    if (key == s_diag_flag[inst]) return;
+    s_diag_flag[inst] = key;
     extern int spu_commit_ctx_describe(uint32_t*, uint32_t*, uint32_t*, uint32_t*, int*);
     uint32_t image = 0, pc = 0, lr = 0, spu = 0; int code_image = 0;
     spu_commit_ctx_describe(&image, &pc, &lr, &spu, &code_image);
-    spurs_diag_line("[spurs-diag] t=%llu inst=%d flagword=0x%08X receiver=%u by_image=%u pc=0x%05X lr=0x%05X spu=%u job_image=%d\n",
-                    (unsigned long long)ps3_ft_now(), inst, flag, vm_base[ea + 0x77], image, pc, lr, spu, code_image);
+    spurs_diag_line("[spurs-diag] t=%llu inst=%d flagword=0x%08X receiver=%u ctl=0x%02X mask=0x%08X block=0x%08X by_image=%u pc=0x%05X lr=0x%05X spu=%u job_image=%d\n",
+                    (unsigned long long)ps3_ft_now(), inst, flag, recv, ctl, mask, block, image, pc, lr, spu, code_image);
 }
 /* Reasons: 1 disabled, 2 not in state 2, 3 not this instance's or a taskset,
  * 4 contention full (maxcont 0 or active >= maxcont), 5 policy module
@@ -2170,9 +2174,10 @@ static void spurs_diag_scan(struct SpursInst* si, u32 ea, u32 enabled, int targe
                         (u32)si->idle[wid] << 18 | (u32)why << 24 | 1u << 31;
         if (s_diag_last[inst][wid] == key) continue;
         s_diag_last[inst][wid] = key;
-        spurs_diag_line("[spurs-diag] t=%llu inst=%d pass=%u wid=%u ready=%u signal=%u flag=%u active=%u maxcont=%u idle=%u why=%d\n",
+        spurs_diag_line("[spurs-diag] t=%llu inst=%d pass=%u wid=%u ready=%u signal=%u flag=%u active=%u maxcont=%u idle=%u why=%d fw=0x%08X recv=%u ctl=0x%02X blk=0x%08X\n",
                         (unsigned long long)ps3_ft_now(), inst, si->pass_no, wid, ready, signal, flag,
-                        active, maxcont, si->idle[wid], why);
+                        active, maxcont, si->idle[wid], why, spurs_flag_be32(ea + 0x6C), vm_base[ea + 0x77],
+                        vm_base[ea + 0x74], spurs_flag_be32(ea + 0xD6C));
     }
 }
 
