@@ -472,6 +472,15 @@ static void gcm_deferred_initialize(void) {
     { const char *b=getenv("PS3RECOMP_RSX_DEFERRED_REPORT_BATCH");
       const long n=b?strtol(b,NULL,0):0;
       if(n>0&&n<=(long)RSX_DEFERRED_REPORT_CAPACITY)s_reports.batch=(uint32_t)n; }
+    /* PS3RECOMP_RSX_DEFERRED_REPORT_CAPACITY=<n> (default 1024, up to 8192):
+     * how many records may be queued before a push waits for completion. In
+     * early mode applied records stay queued only to verify their completion,
+     * so a larger bound lets the consumer run on while the GPU is behind; the
+     * frames-ahead bound still limits how far. */
+    { const char *c=getenv("PS3RECOMP_RSX_DEFERRED_REPORT_CAPACITY");
+      const long n=c?strtol(c,NULL,0):0;
+      if(n>=(long)RSX_DEFERRED_REPORT_CAPACITY&&n<=(long)RSX_DEFERRED_REPORT_STORAGE)s_reports.capacity=(uint32_t)n;
+      else if(c)fprintf(stderr,"[deferred reports] ignored PS3RECOMP_RSX_DEFERRED_REPORT_CAPACITY=%s (allowed %u..%u)\n",c,RSX_DEFERRED_REPORT_CAPACITY,RSX_DEFERRED_REPORT_STORAGE); }
     { const char *a=getenv("PS3RECOMP_RSX_EARLY_LABEL_RELEASE"),*y=getenv("PS3RECOMP_RSX_EARLY_FIFO_SYNC");
       const int want=a&&!strcmp(a,"1"),want_sync=y&&!strcmp(y,"1");
       if((want||want_sync)&&(!s_deferred_reports||s_live_report_batch))
@@ -495,7 +504,7 @@ static void gcm_deferred_initialize(void) {
         ps3_vm_release_guard.begin=gcm_report_vm_begin;
         ps3_vm_release_guard.end=cellGcm_rsx_consumer_end;
         fprintf(stderr,"[deferred reports] enabled batch=%u capacity=%u consumer-owned genuine completion\n",
-            s_reports.batch?s_reports.batch:RSX_DEFERRED_REPORT_BATCH,RSX_DEFERRED_REPORT_CAPACITY);
+            s_reports.batch?s_reports.batch:RSX_DEFERRED_REPORT_BATCH,rsx_reports_capacity(&s_reports));
     }
     s_deferred_initialized=1;
     ReleaseSRWLockExclusive(&s_deferred_init_lock);
@@ -1489,7 +1498,7 @@ static uint64_t gcm_report_issue(void *user){
     }
     if(!target)return rsx_draw_engine_submit_async();
     if(target)for(uint32_t i=0;i<s_reports.count;i++){
-        const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_CAPACITY];
+        const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_STORAGE];
         if(r->operation&&r->ea==target&&!r->ticket){selected=target;value=r->argument;break;}
     }
     atomic_store_explicit(&s_ring_issue_value,value,memory_order_relaxed);
@@ -1497,7 +1506,7 @@ static uint64_t gcm_report_issue(void *user){
     uint64_t ticket=rsx_draw_engine_submit_async();
     atomic_store_explicit(&s_ring_issue_ea,0,memory_order_release);
     if(selected&&ticket)for(uint32_t i=0;i<s_reports.count;i++){
-        const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_CAPACITY];
+        const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_STORAGE];
         if(r->operation&&r->ea==selected&&!r->ticket){
             ring_track(r->ea,r->argument,ticket);
             ring_note(RSX_RING_TICKET_BIND,r->ea,r->argument,ticket,s_reports.generation);
@@ -1524,7 +1533,7 @@ static int gcm_reports_progress(int wait,int issue){
     if(target&&atomic_load_explicit(&s_ring_snapshot_target,memory_order_acquire)!=target){
         atomic_store_explicit(&s_ring_snapshot_target,target,memory_order_release);
         for(uint32_t i=0;i<s_reports.count;i++){
-            const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_CAPACITY];
+            const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_STORAGE];
             if(r->operation&&r->ea==target){
                 ring_track(r->ea,r->argument,r->ticket);
                 ring_note(RSX_RING_PENDING_SNAPSHOT,r->ea,r->argument,r->ticket,s_reports.generation);
@@ -1675,9 +1684,10 @@ static void gcm_frame_bound(void){
     static uint64_t last;const uint64_t now=gcm_bound_now();
     if((s_frame_log||waited)&&(!last||now-last>=2000000000ull)){
         last=now;
-        fprintf(stderr,"[rsx inflight gcm] frames=%llu bound=%u waits=%llu wait_ms=%.1f max_wait_ms=%.2f reports_pending=%u gated=%u max_pending=%u applied_early=%llu\n",
+        fprintf(stderr,"[rsx inflight gcm] frames=%llu bound=%u waits=%llu wait_ms=%.1f max_wait_ms=%.2f reports_pending=%u gated=%u max_pending=%u applied_early=%llu capacity=%u capacity_waits=%llu\n",
             (unsigned long long)s_frame_count,s_frames_ahead,(unsigned long long)s_frame_waits,s_frame_wait_ns/1e6,s_frame_wait_max_ns/1e6,
-            s_reports.count,s_reports.gated,s_reports.max_pending,(unsigned long long)s_reports.applied_early);
+            s_reports.count,s_reports.gated,s_reports.max_pending,(unsigned long long)s_reports.applied_early,
+            rsx_reports_capacity(&s_reports),(unsigned long long)s_reports.capacity_waits);
     }
 }
 /* Early SET_REFERENCE: commit the work recorded so far without waiting, and

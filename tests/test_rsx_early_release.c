@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 static uint64_t issued,complete;
-static unsigned applied[4096],napplied,blocking,polls;
+static unsigned applied[16384],napplied,blocking,polls;
 static int failed;
 static uint64_t issue(void *p){(void)p;return ++issued;}
 static int status(void *p,uint64_t ticket,int wait){
@@ -16,7 +16,7 @@ static int status(void *p,uint64_t ticket,int wait){
 /* Records carry a sequence number; publication order must equal stream order
  * and each record is applied exactly once. */
 static int publish(void *p,const rsx_deferred_report *r){
- (void)p;assert(napplied<4096);
+ (void)p;assert(napplied<16384);
  if(napplied)assert(r->argument==applied[napplied-1]+1);
  applied[napplied++]=r->argument;return 1;
 }
@@ -73,5 +73,28 @@ int main(void){
  failed=1;assert(!rsx_reports_progress(&q,&ops,RSX_REPORTS_NO_WAIT,0));
  assert(q.failed&&q.count==1);
  assert(!rsx_reports_enqueue_early(&q,&ops,rec(before+1))&&napplied==before+1);
+ /* A raised bound (PS3RECOMP_RSX_DEFERRED_REPORT_CAPACITY): applied records
+  * queue up to it with no completion wait, and the bound still holds. */
+ { failed=0;napplied=0;blocking=0;issued=complete=0;
+   static rsx_deferred_report_queue big;memset(&big,0,sizeof big);
+   big.generation=1;big.early_mode=1;big.capacity=4096;
+   assert(rsx_reports_capacity(&big)==4096);
+   for(unsigned i=0;i<4096;i++)assert(rsx_reports_enqueue_early(&big,&ops,rec(i)));
+   assert(blocking==0&&big.count==4096&&big.capacity_waits==0&&napplied==4096);
+   /* Tickets cover every record, oldest first, across many issues. */
+   for(unsigned i=0;i<big.count;i++)assert(big.records[(big.head+i)%RSX_DEFERRED_REPORT_STORAGE].ticket==0||
+     big.records[(big.head+i)%RSX_DEFERRED_REPORT_STORAGE].ticket==1+i/RSX_DEFERRED_REPORT_BATCH);
+   assert(rsx_reports_enqueue_early(&big,&ops,rec(4096)));
+   assert(blocking>0&&big.capacity_waits==1&&big.count<=4096&&napplied==4097);
+   /* Completion retires the ring in order across the wrap of the storage. */
+   for(unsigned round=0;round<3;round++){
+     for(unsigned i=0;i<3000;i++)assert(rsx_reports_enqueue_early(&big,&ops,rec(napplied)));
+     complete=issued;assert(rsx_reports_progress(&big,&ops,RSX_REPORTS_NO_WAIT,1));
+     complete=issued;assert(rsx_reports_progress(&big,&ops,RSX_REPORTS_NO_WAIT,0));
+     assert(big.count==0);
+   }
+   /* An out-of-range bound falls back to the default. */
+   big.capacity=RSX_DEFERRED_REPORT_STORAGE+1;assert(rsx_reports_capacity(&big)==RSX_DEFERRED_REPORT_CAPACITY); }
+ puts("PASS early-release queue: raised capacity bound;");
  puts("PASS early-release queue: stream-order application, no double publication, gated ordering, capacity, receipts, sticky failure");
 }

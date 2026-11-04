@@ -50,7 +50,15 @@ work because both are submitted in order on the same queue.
   completion. It is never applied twice. If the backend fails, publication
   latches off and checked references freeze, as before. Values that were
   already published cannot be withdrawn; the failure is reported on stderr.
-- **Capacity.** A full queue still waits for every record.
+- **Capacity.** A full queue still waits for every record. The bound is 1024
+  records. Because applied records stay queued until their completion is
+  verified, a title that releases about a thousand labels per frame fills the
+  queue while the GPU is still working on the previous frame, and the FIFO then
+  waits for that completion on every frame.
+  `PS3RECOMP_RSX_DEFERRED_REPORT_CAPACITY=<n>` (1024 to 8192, default 1024)
+  raises the bound. Nothing guest-visible changes: records are still applied in
+  stream order, and completion is still verified. `PS3RECOMP_RSX_INFLIGHT_LOG=1`
+  reports `capacity=` and `capacity_waits=`.
 
 ## Tests
 

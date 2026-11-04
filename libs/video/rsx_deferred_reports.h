@@ -12,7 +12,12 @@
 #define RSX_DEFERRED_REPORTS_H
 #include <stdint.h>
 #include <stdio.h>
+/* Default bound on queued records. Early mode keeps applied records queued
+ * until their genuine completion, so a title that releases many labels per
+ * frame reaches this bound while the GPU is still behind, and every push then
+ * waits for completion. A queue may raise its bound up to the storage size. */
 #define RSX_DEFERRED_REPORT_CAPACITY 1024u
+#define RSX_DEFERRED_REPORT_STORAGE 8192u
 #define RSX_DEFERRED_REPORT_BATCH 32u
 typedef struct rsx_deferred_report {
  uint64_t ticket,generation,vm,capture,start_ns;
@@ -21,7 +26,7 @@ typedef struct rsx_deferred_report {
  uint32_t early; /* guest effect already applied at its stream position */
 } rsx_deferred_report;
 typedef struct rsx_deferred_report_queue {
- rsx_deferred_report records[RSX_DEFERRED_REPORT_CAPACITY];
+ rsx_deferred_report records[RSX_DEFERRED_REPORT_STORAGE];
  uint32_t head,count,unissued,failed,max_pending;
  uint64_t generation,issued,published;
  uint64_t (*clock)(void); /* diagnostic: stamps issue times when set */
@@ -29,7 +34,12 @@ typedef struct rsx_deferred_report_queue {
  uint32_t early_mode;      /* 1: waits cover only records whose effect is not applied */
  uint32_t gated;           /* queued records whose guest effect still awaits completion */
  uint64_t applied_early;   /* records applied at their stream position (diagnostic) */
+ uint32_t capacity;        /* queued-record bound; 0 = RSX_DEFERRED_REPORT_CAPACITY */
+ uint64_t capacity_waits;  /* pushes that waited for completion at the bound (diagnostic) */
 } rsx_deferred_report_queue;
+static uint32_t rsx_reports_capacity(const rsx_deferred_report_queue *q){
+ return q->capacity&&q->capacity<=RSX_DEFERRED_REPORT_STORAGE?q->capacity:RSX_DEFERRED_REPORT_CAPACITY;
+}
 #define RSX_REPORTS_NO_WAIT 0
 #define RSX_REPORTS_WAIT 1     /* every record, or in early mode every unapplied one */
 #define RSX_REPORTS_WAIT_ALL 2 /* every record, applied or not */
@@ -56,7 +66,8 @@ static int rsx_reports_fail(rsx_deferred_report_queue *q,const rsx_deferred_repo
 static int rsx_reports_issue(rsx_deferred_report_queue *q,const rsx_deferred_report_ops *o){
  if(q->failed)return 0;if(!q->unissued)return 1;
  uint64_t ticket=o->issue(o->user);if(!ticket)return rsx_reports_fail(q,q->count?&q->records[q->head]:NULL,"issue-zero",0,0,0,0);
- for(uint32_t i=0;i<q->count;i++){rsx_deferred_report *r=&q->records[(q->head+i)%RSX_DEFERRED_REPORT_CAPACITY];if(!r->ticket){r->ticket=ticket;r->issued_ns=q->clock?q->clock():0;}}
+ /* Only the newest `unissued` records lack a ticket: every issue tickets all. */
+ for(uint32_t i=q->count-q->unissued;i<q->count;i++){rsx_deferred_report *r=&q->records[(q->head+i)%RSX_DEFERRED_REPORT_STORAGE];if(!r->ticket){r->ticket=ticket;r->issued_ns=q->clock?q->clock():0;}}
  q->unissued=0;q->issued++;return 1;
 }
 static int rsx_reports_progress(rsx_deferred_report_queue *q,const rsx_deferred_report_ops *o,int wait,int issue){
@@ -69,21 +80,21 @@ static int rsx_reports_progress(rsx_deferred_report_queue *q,const rsx_deferred_
   if(r->generation!=q->generation)return rsx_reports_fail(q,r,"generation-mismatch",r->ticket,ready,block,1);
   if(!r->early&&!o->publish(o->user,r))return rsx_reports_fail(q,r,"publish-validation",r->ticket,ready,block,1);
   if(!r->early&&q->gated)q->gated--;
-  q->head=(q->head+1)%RSX_DEFERRED_REPORT_CAPACITY;q->count--;q->published++;
+  q->head=(q->head+1)%RSX_DEFERRED_REPORT_STORAGE;q->count--;q->published++;
  }
  return 1;
 }
 static int rsx_reports_push(rsx_deferred_report_queue *q,const rsx_deferred_report_ops *o,rsx_deferred_report r,int may_apply){
  if(q->failed)return 0;
- if(q->count==RSX_DEFERRED_REPORT_CAPACITY&&!rsx_reports_progress(q,o,RSX_REPORTS_WAIT_ALL,1))return 0;
- if(q->count==RSX_DEFERRED_REPORT_CAPACITY)return rsx_reports_fail(q,&q->records[q->head],"capacity-after-blocking-progress",q->records[q->head].ticket,0,1,0);
+ if(q->count>=rsx_reports_capacity(q)){q->capacity_waits++;if(!rsx_reports_progress(q,o,RSX_REPORTS_WAIT_ALL,1))return 0;}
+ if(q->count>=rsx_reports_capacity(q))return rsx_reports_fail(q,&q->records[q->head],"capacity-after-blocking-progress",q->records[q->head].ticket,0,1,0);
  r.ticket=0;r.generation=q->generation;r.early=0;
  /* Apply now only behind already-applied records: stream order is kept. */
  if(may_apply&&q->early_mode&&!q->gated){
   if(!o->publish(o->user,&r))return rsx_reports_fail(q,&r,"early-publish-validation",0,0,0,0);
   r.early=1;q->applied_early++;
  }
- q->records[(q->head+q->count)%RSX_DEFERRED_REPORT_CAPACITY]=r;
+ q->records[(q->head+q->count)%RSX_DEFERRED_REPORT_STORAGE]=r;
  q->count++;q->unissued++;if(!r.early)q->gated++;if(q->count>q->max_pending)q->max_pending=q->count;
  if(q->unissued>=(q->batch?q->batch:RSX_DEFERRED_REPORT_BATCH)&&!rsx_reports_issue(q,o))return 0;
  return rsx_reports_progress(q,o,0,0);
@@ -99,7 +110,8 @@ static int rsx_reports_enqueue_early(rsx_deferred_report_queue *q,const rsx_defe
 /* Only effects still to be applied can touch guest memory later. */
 static int rsx_reports_overlap(const rsx_deferred_report_queue *q,uint64_t ea,uint64_t bytes){
  if(!bytes||ea>UINT32_MAX||bytes>UINT64_C(0x100000000)-ea)return 0;
- for(uint32_t i=0;i<q->count;i++){const rsx_deferred_report *r=&q->records[(q->head+i)%RSX_DEFERRED_REPORT_CAPACITY];if(r->main_memory&&!r->early&&ea<(uint64_t)r->ea+(r->operation?4u:16u)&&(uint64_t)r->ea<ea+bytes)return 1;}
+ if(!q->gated)return 0; /* gated counts exactly the queued unapplied records */
+ for(uint32_t i=0;i<q->count;i++){const rsx_deferred_report *r=&q->records[(q->head+i)%RSX_DEFERRED_REPORT_STORAGE];if(r->main_memory&&!r->early&&ea<(uint64_t)r->ea+(r->operation?4u:16u)&&(uint64_t)r->ea<ea+bytes)return 1;}
  return 0;
 }
 #endif
