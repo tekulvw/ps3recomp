@@ -2131,7 +2131,9 @@ static int spurs_diag_active(void)
  * flag word, let each write through by single-stepping it, and report every
  * write that turns a non-zero flag word into zero: host instruction offset in
  * the executable (resolve offline), thread name and id. Most faults on that page
- * are the ready-count traffic; they are counted, not printed. */
+ * are the ready-count traffic; they are counted, not printed.
+ * PS3RECOMP_SPURS_GUARD_EA=<hex EA> (with the window) guards that 128-byte region
+ * instead and reports every word it changes: offset, old and new value, writer. */
 #if defined(__linux__) && defined(__x86_64__)
 #include <signal.h>
 #include <sys/mman.h>
@@ -2146,6 +2148,10 @@ static const volatile uint8_t* s_fg_word;
 static int s_fg_state;                          /* 0 off, 1 armed, 2 finished */
 static struct sigaction s_fg_prev_segv, s_fg_prev_trap;
 static __thread uint32_t t_fg_pre;
+static const volatile uint8_t* s_fg_region;   /* PS3RECOMP_SPURS_GUARD_EA: 128-byte region, else NULL */
+static __thread uint8_t t_fg_snap[128];
+static __thread int t_fg_in_region;
+static unsigned s_fg_region_lines;
 static __thread uintptr_t t_fg_rip;
 static __thread int t_fg_step;
 static unsigned s_fg_faults, s_fg_zeroes;
@@ -2166,6 +2172,8 @@ static void fg_segv(int sig, siginfo_t* si, void* ucv)
         ucontext_t* uc = (ucontext_t*)ucv;
         __atomic_fetch_add(&s_fg_faults, 1u, __ATOMIC_RELAXED);
         t_fg_pre = fg_word();
+        t_fg_in_region = s_fg_region && a >= (uintptr_t)s_fg_region && a < (uintptr_t)s_fg_region + 128u;
+        if (t_fg_in_region) memcpy(t_fg_snap, (const void*)s_fg_region, 128u);
         t_fg_rip = (uintptr_t)uc->uc_mcontext.gregs[FG_REG_RIP];
         t_fg_step = 1;
         mprotect((void*)s_fg_page, 4096u, PROT_READ | PROT_WRITE);
@@ -2180,6 +2188,26 @@ static void fg_trap(int sig, siginfo_t* si, void* ucv)
     ucontext_t* uc = (ucontext_t*)ucv;
     t_fg_step = 0;
     uc->uc_mcontext.gregs[FG_REG_EFL] &= ~0x100;
+    if (s_fg_region) {
+        if (t_fg_in_region) {
+            char name[17] = {0}; prctl(PR_GET_NAME, name, 0, 0, 0);
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            for (unsigned o = 0; o < 128u; o += 4u) {
+                const volatile uint8_t* q = s_fg_region + o;
+                const uint32_t was = (uint32_t)t_fg_snap[o] << 24 | (uint32_t)t_fg_snap[o + 1] << 16 | (uint32_t)t_fg_snap[o + 2] << 8 | t_fg_snap[o + 3];
+                const uint32_t is = (uint32_t)q[0] << 24 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 8 | q[3];
+                if (was == is || __atomic_fetch_add(&s_fg_region_lines, 1u, __ATOMIC_RELAXED) >= 100000u) continue;
+                char line[256];
+                const int n = snprintf(line, sizeof line,
+                    "[spurs-diag] t=%llu guard write off=0x%02X old=0x%08X new=0x%08X rip_off=0x%llX thread=%s tid=%ld\n",
+                    (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec, o, was, is,
+                    (unsigned long long)(t_fg_rip - (uintptr_t)&__executable_start), name, (long)syscall(SYS_gettid));
+                if (n > 0) { ssize_t w = write(2, line, (size_t)n); (void)w; }
+            }
+        }
+        if (__atomic_load_n(&s_fg_state, __ATOMIC_ACQUIRE) == 1) mprotect((void*)s_fg_page, 4096u, PROT_READ);
+        return;
+    }
     const uint32_t now = fg_word();
     if (t_fg_pre && !now && __atomic_fetch_add(&s_fg_zeroes, 1u, __ATOMIC_RELAXED) < 256u) {
         char name[17] = {0}, line[256];
@@ -2199,16 +2227,19 @@ static void spurs_diag_guard_tick(struct SpursInst* si, u32 ea, int active)
     if (si != &s_inst[0] || s_fg_state == 2) return;
     if (s_fg_state == 0 && active) {
         const char* e = getenv("PS3RECOMP_SPURS_FLAG_GUARD");
-        if (!e || strcmp(e, "1")) { s_fg_state = 2; return; }
+        const char* r = getenv("PS3RECOMP_SPURS_GUARD_EA");
+        const u32 region = r && *r ? (u32)strtoul(r, 0, 16) & ~127u : 0u;
+        if (!region && (!e || strcmp(e, "1"))) { s_fg_state = 2; return; }
         s_fg_word = vm_base + ea + 0x6C;
-        s_fg_page = (uintptr_t)s_fg_word & ~(uintptr_t)4095u;
+        if (region) s_fg_region = vm_base + region;
+        s_fg_page = (uintptr_t)(region ? s_fg_region : s_fg_word) & ~(uintptr_t)4095u;
         struct sigaction sa; memset(&sa, 0, sizeof sa);
         sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
         sa.sa_sigaction = fg_segv; sigaction(SIGSEGV, &sa, &s_fg_prev_segv);
         sa.sa_sigaction = fg_trap; sigaction(SIGTRAP, &sa, &s_fg_prev_trap);
         __atomic_store_n(&s_fg_state, 1, __ATOMIC_RELEASE);
         mprotect((void*)s_fg_page, 4096u, PROT_READ);
-        fprintf(stderr, "[spurs-diag] guard armed on 0x%08X\n", ea + 0x6C);
+        fprintf(stderr, "[spurs-diag] guard armed on 0x%08X\n", region ? region : ea + 0x6C);
     } else if (s_fg_state == 1 && !active) {
         __atomic_store_n(&s_fg_state, 2, __ATOMIC_RELEASE);
         mprotect((void*)s_fg_page, 4096u, PROT_READ | PROT_WRITE);
