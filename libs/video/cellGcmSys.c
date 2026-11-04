@@ -1604,6 +1604,7 @@ static int gcm_report_spurs_kick(void){
     if(on<0){const char *e=getenv("PS3RECOMP_RSX_REPORT_SPURS_KICK");on=e&&!strcmp(e,"1");}
     return on;
 }
+static u32 s_lag_ea;   /* PS3RECOMP_RSX_LABEL_LAG target, defined below */
 static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     (void)user;u32 ea;
     /* A completion receipt carries no guest effect of its own. */
@@ -1614,6 +1615,7 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
         if(!vm_base||r->vm!=(uintptr_t)vm_base||(u64)r->ea+4u>limit)return 0;
         vm_write32(r->ea,r->argument);
         if(gcm_report_spurs_kick()){extern void (*g_host_line_write_hook)(uint32_t);if(g_host_line_write_hook)g_host_line_write_hook(r->ea&~127u);}
+        if(s_lag_ea&&r->ea==s_lag_ea){static unsigned pn;if(pn++<20000u)fprintf(stderr,"[label-lag] t=%llu publish ea=0x%08X method=0x%04X value=0x%08X early=%u\n",(unsigned long long)ps3_critical_now_ns(),r->ea,r->context,r->argument,(unsigned)r->early);}
         ring_note(RSX_RING_VM_PUBLISH,r->ea,r->argument,r->ticket,r->context);
         if(r->start_ns){uint64_t w[5]={r->start_ns,r->ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,20,r->ea,0,w,5);}
         return 1;
@@ -1846,29 +1848,8 @@ static int gcm_early_reference_receipt(void){
     r.capture=ps3_critical_capture_id();
     return gcm_reports_admit()&&rsx_reports_enqueue_early(&s_reports,&s_report_ops,r)&&rsx_reports_issue(&s_reports,&s_report_ops);
 }
-/* Label writes retain the existing value/byte-order semantics, but release
- * guest reuse only after the same genuine ordered GPU completion as reports,
- * unless early release applies them at their stream position. */
-static int gcm_defer_label_get(u32 ea,u32 value,u32 method,u32 fifo_ea,u32 get_before_publish){
-    if(!gcm_reports_admit())return 0;
-    ring_note(RSX_RING_DECODE,ea,value,0,((uint64_t)method<<32)|fifo_ea);
-    rsx_deferred_report r={0};r.operation=1;r.main_memory=1;
-    if(gph_enabled()){r.enqueued_ns=gph_now();s_reports.clock=gph_now;}
-    r.ea=ea;r.argument=value;r.context=method;r.vm=(uintptr_t)vm_base;
-    r.capture=ps3_critical_capture_id();r.start_ns=ps3_critical_enabled()?ps3_critical_now_ns():0;
-    u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
-    if(!vm_base||(u64)ea+4u>limit){s_reports.failed=1;fprintf(stderr,"[deferred reports] invalid label destination %08X; publication stopped\n",ea);return 0;}
-    /* A threshold enqueue can synchronously publish. GET must already lead
-     * an NV406E RELEASE when a guest observes its label. */
-    if(get_before_publish)vm_write32(GCM_CONTROL_GUEST_ADDR+4,get_before_publish);
-    unsigned failed=s_reports.failed;
-    int ok=gcm_early_label(ea)?rsx_reports_enqueue_early(&s_reports,&s_report_ops,r):rsx_reports_enqueue(&s_reports,&s_report_ops,r);
-    ring_note(RSX_RING_ENQUEUE,ea,value,0,((uint64_t)(ok!=0)<<63)|s_reports.count);
-    if(!ok&&!failed)fprintf(stderr,"[deferred reports] label enqueue FAILED; publication stopped\n");
-    return ok;
-}
-/* PS3RECOMP_RSX_LABEL_LAG=<hex EA> (opt-in diagnostic, numbers only): for back-end
- * semaphore releases whose label lands on that guest word, print when the FIFO
+/* PS3RECOMP_RSX_LABEL_LAG=<hex EA> (opt-in diagnostic, numbers only): for label
+ * writes (semaphore releases of either class) that land on that guest word, print when the FIFO
  * consumes each one (critical-trace clock) and the command's get offset; from
  * the first such release, a sampler prints every change of the guest put
  * pointer for 40 s, so the time put passed each release can be found offline. */
@@ -1895,6 +1876,28 @@ static void gcm_label_lag_note(u32 ea,u32 method,u32 value){
     static unsigned n;
     if(n++<20000u)fprintf(stderr,"[label-lag] t=%llu consume ea=0x%08X method=0x%04X value=0x%08X get=0x%08X\n",
         (unsigned long long)ps3_critical_now_ns(),ea,method,value,s_fifo_getoff);
+}
+/* Label writes retain the existing value/byte-order semantics, but release
+ * guest reuse only after the same genuine ordered GPU completion as reports,
+ * unless early release applies them at their stream position. */
+static int gcm_defer_label_get(u32 ea,u32 value,u32 method,u32 fifo_ea,u32 get_before_publish){
+    if(s_lag_ea)gcm_label_lag_note(ea,method,value);
+    if(!gcm_reports_admit())return 0;
+    ring_note(RSX_RING_DECODE,ea,value,0,((uint64_t)method<<32)|fifo_ea);
+    rsx_deferred_report r={0};r.operation=1;r.main_memory=1;
+    if(gph_enabled()){r.enqueued_ns=gph_now();s_reports.clock=gph_now;}
+    r.ea=ea;r.argument=value;r.context=method;r.vm=(uintptr_t)vm_base;
+    r.capture=ps3_critical_capture_id();r.start_ns=ps3_critical_enabled()?ps3_critical_now_ns():0;
+    u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
+    if(!vm_base||(u64)ea+4u>limit){s_reports.failed=1;fprintf(stderr,"[deferred reports] invalid label destination %08X; publication stopped\n",ea);return 0;}
+    /* A threshold enqueue can synchronously publish. GET must already lead
+     * an NV406E RELEASE when a guest observes its label. */
+    if(get_before_publish)vm_write32(GCM_CONTROL_GUEST_ADDR+4,get_before_publish);
+    unsigned failed=s_reports.failed;
+    int ok=gcm_early_label(ea)?rsx_reports_enqueue_early(&s_reports,&s_report_ops,r):rsx_reports_enqueue(&s_reports,&s_report_ops,r);
+    ring_note(RSX_RING_ENQUEUE,ea,value,0,((uint64_t)(ok!=0)<<63)|s_reports.count);
+    if(!ok&&!failed)fprintf(stderr,"[deferred reports] label enqueue FAILED; publication stopped\n");
+    return ok;
 }
 static int gcm_defer_label(u32 ea,u32 value,u32 method,u32 fifo_ea){
     return gcm_defer_label_get(ea,value,method,fifo_ea,0);
@@ -3848,7 +3851,6 @@ static void gcm_rsx_process_fifo_pass(void)
                             /* Legacy HOST_BUFFER skips an unmapped write. */
                             if(!label_ea){if(!gcm_reports_sync_barrier())return;continue;}
                         }
-                        if(s_lag_ea)gcm_label_lag_note(label_ea,m,value);
                         if(!gcm_defer_label(label_ea,value,m,dea))return;
                         continue;
                     }
