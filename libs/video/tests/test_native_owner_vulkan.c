@@ -142,6 +142,24 @@ int main(int argc,char** argv){
         be->texture_release(NULL,view);be->depth_target_release(NULL,depth);
         printf("async boundary accepted (ticket pending at boundary: %d)\n",was_pending);
     }
+    /* A direct present still running on the GPU is an ordered boundary too:
+     * it is already on the queue, so native work queued after it runs after
+     * it. Queued behind a large GPU job so that it is still pending. */
+    {
+        const rsx_draw_backend* be=&s_vk_engine_backend;
+        uint32_t depth=be->depth_target_create(NULL,4096,4096);assert(depth);
+        uint32_t view=be->depth_z24_view(NULL,depth,4096,4096,0xAAE4u,0xA5u);assert(view);
+        uint32_t color=be->color_target_create(NULL,RSX_BE_FMT_R8G8B8A8,8,8,NULL,0);assert(color);
+        assert(be->submit_async(NULL,RSX_BE_FLUSH_GUEST_REFERENCE));
+        const uint64_t direct=s_vk.present_direct;
+        be->present(NULL,color);
+        assert(s_vk.present_direct==direct+1);       /* not read back */
+        const int was_pending=pvkGetFenceStatus(s_vk.device,s_vk.present_fence)==VK_NOT_READY;
+        uint64_t boundary=0;assert(rsx_vulkan_backend_native_boundary(&boundary)==0&&boundary);
+        assert(be->submit_and_wait_checked(NULL,RSX_BE_FLUSH_GUEST_REFERENCE)==1);
+        be->texture_release(NULL,view);be->depth_target_release(NULL,depth);be->color_target_release(NULL,color);
+        printf("direct present boundary accepted (present pending at boundary: %d)\n",was_pending);
+    }
     check_queue_order(&first);
     void* original=first.device;rsx_vulkan_backend_shutdown();assert((void*)s_vk.device==original);
     assert(rsx_vulkan_backend_owner_shutdown_requested(first.lifetime)==1);

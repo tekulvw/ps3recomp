@@ -721,6 +721,10 @@ static struct {
     uint64_t reservations, held, abandoned, failures;
 } s_hold;
 static pthread_cond_t s_hold_cv = PTHREAD_COND_INITIALIZER;
+/* The native boundary's bounded wait for a held original submission. */
+#define VK_BOUNDARY_HOLD_WAIT_MS 50
+static uint64_t s_boundary_hold_waits, s_boundary_hold_refusals;
+static int vk_present_is_fence(VkFence f);
 
 /* queue_mu held. */
 static VkResult vk_hold_push(const VkSubmitInfo* si, VkFence fence)
@@ -2248,6 +2252,13 @@ static void vk_dump_ppm(const unsigned char* rgba)
  * image on the GPU and signals its present, and nothing waits on the CPU. A
  * ring of VK_PRESENT_SLOTS command buffers and fences keeps frames in flight;
  * a slot is reused only once its fence signalled. */
+/* A fence of the direct-present ring (see rsx_vulkan_backend_native_boundary). */
+static int vk_present_is_fence(VkFence f)
+{
+    if (!f) return 0;
+    for (u32 i = 0; i < VK_PRESENT_SLOTS; i++) if (s_vk.present_fences[i] == f) return 1;
+    return 0;
+}
 static int vk_present_readback_wanted(void)
 {
     static int forced = -1;
@@ -5521,13 +5532,32 @@ int rsx_vulkan_backend_native_boundary(uint64_t *ticket){
                 else if(!s_vulkan_boundary_commit||!s_vulkan_boundary_fence)status=-4;
                 else if(s_vulkan_boundary_generation!=s_vulkan_owner.generation)status=-3;
                 else{
+                    /* Original work held behind a reservation reaches the
+                     * queue as soon as the reserved native batch is
+                     * submitted, which needs no owner lease: wait for that a
+                     * bounded time rather than refuse at once. */
+                    if(vk_hold_has_locked(s_vulkan_boundary_fence)){
+                        struct timespec until;clock_gettime(CLOCK_REALTIME,&until);
+                        until.tv_nsec+=VK_BOUNDARY_HOLD_WAIT_MS*1000000L;
+                        until.tv_sec+=until.tv_nsec/1000000000L;until.tv_nsec%=1000000000L;
+                        s_boundary_hold_waits++;
+                        while(vk_hold_has_locked(s_vulkan_boundary_fence)&&
+                              pthread_cond_timedwait(&s_hold_cv,&s_vk.queue_mu,&until)==0){}
+                    }
                     VkResult result=vk_hold_has_locked(s_vulkan_boundary_fence)?VK_NOT_READY:pvkGetFenceStatus(s_vk.device,s_vulkan_boundary_fence);
+                    if(result==VK_NOT_READY&&vk_hold_has_locked(s_vulkan_boundary_fence)&&
+                       (++s_boundary_hold_refusals<=8||s_boundary_hold_refusals%256==0))
+                        VK_LOG("native boundary: original work still held behind a reservation after %d ms (refusals=%llu waits=%llu)\n",
+                               VK_BOUNDARY_HOLD_WAIT_MS,(unsigned long long)s_boundary_hold_refusals,(unsigned long long)s_boundary_hold_waits);
                     /* An asynchronous completion ticket (E5) is an ordered,
                      * submitted boundary even before it signals, as Metal's
                      * async boundary is: native work queued after it runs
                      * after it, and native passes order their imported
                      * images against all earlier queue work themselves. */
                     if(result==VK_NOT_READY&&vk_e5_is_ticket_fence(s_vulkan_boundary_fence))result=VK_SUCCESS;
+                    /* So is a direct present still running: it is on the queue
+                     * (never held here) and reads only the offscreen target. */
+                    if(result==VK_NOT_READY&&vk_present_is_fence(s_vulkan_boundary_fence))result=VK_SUCCESS;
                     if(result==VK_NOT_READY)status=-4;
                     else if(result!=VK_SUCCESS){vulkan_owner_fault();status=-6;}
                     else{
