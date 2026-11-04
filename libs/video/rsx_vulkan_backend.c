@@ -242,6 +242,7 @@ typedef struct vk_state {
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
     int              depth_bounds_ok; /* depthBounds enabled                */
+    int              anisotropy_ok;   /* samplerAnisotropy enabled          */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
     SDL_Window*      window;
@@ -5146,6 +5147,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * Vulkan; without it the test stays off, as before. */
     want.depthBounds = have.depthBounds;
     s_vk.depth_bounds_ok = have.depthBounds ? 1 : 0;
+    /* Anisotropic filtering, for a native frontend's samplers on this device
+     * (the owner reports it enabled). The engine's own samplers never ask
+     * for it, so enabling it changes nothing for them. */
+    want.samplerAnisotropy = have.samplerAnisotropy;
+    s_vk.anisotropy_ok = have.samplerAnisotropy ? 1 : 0;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
@@ -5481,6 +5487,7 @@ static int vulkan_borrow_owner(rsx_native_owner* out,rsx_native_owner_v2 *extend
          * physical-device query. The generation and facts share this lock. */
         extended->known_features=RSX_NATIVE_OWNER_FEATURE_BC|RSX_NATIVE_OWNER_FEATURE_ANISOTROPY|RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS;
         extended->enabled_features=(s_vk.bc_ok?RSX_NATIVE_OWNER_FEATURE_BC:0)|
+            (s_vk.anisotropy_ok?RSX_NATIVE_OWNER_FEATURE_ANISOTROPY:0)|
             (s_vk.depth_bounds_ok?RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS:0);
     }
     rsx_owner_lock_release(&s_vulkan_owner.lock);return status;
