@@ -1634,6 +1634,7 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
             if(g_resv_store_active>0)ppu_resv_break_store(address);
         }
         spu_coh_notify_write(ea);spu_lockline_unlock();
+        if(s_lag_ea&&ea<=s_lag_ea&&s_lag_ea-ea<16u){static unsigned rn;if(rn++<20000u)fprintf(stderr,"[label-lag] t=%llu publish ea=0x%08X method=0x1800 value=0x%08X early=%u\n",(unsigned long long)ps3_critical_now_ns(),s_lag_ea,r->argument,(unsigned)r->early);}
     }
     if(r->start_ns){uint64_t w[5]={r->start_ns,ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,PS3_CRITICAL_REPORT,ea,r->index,w,5);}
     return 1;
@@ -1925,6 +1926,7 @@ static void gcm_get_report(u32 argument){
     r.start_ns=ps3_critical_enabled()?ps3_critical_now_ns():0;
     r.main_memory=r.context!=GCM_REPORT_DMA_LOCAL;
     if(!gcm_report_destination(argument,r.context,&r.ea))goto invalid;
+    if(s_lag_ea&&r.main_memory&&r.ea<=s_lag_ea&&s_lag_ea-r.ea<16u)gcm_label_lag_note(s_lag_ea,0x1800u,argument);
     {static unsigned reports;if(reports++<6)printf("[GET_REPORT] type=%u idx=%u context=%08X ea=%08X%s\n",argument>>24,r.index,r.context,r.ea,r.main_memory?"":" host-only");}
     if(gcm_reports_can_defer()){
         if(!gcm_reports_admit())goto invalid;
