@@ -1867,6 +1867,35 @@ static int gcm_defer_label_get(u32 ea,u32 value,u32 method,u32 fifo_ea,u32 get_b
     if(!ok&&!failed)fprintf(stderr,"[deferred reports] label enqueue FAILED; publication stopped\n");
     return ok;
 }
+/* PS3RECOMP_RSX_LABEL_LAG=<hex EA> (opt-in diagnostic, numbers only): for back-end
+ * semaphore releases whose label lands on that guest word, print when the FIFO
+ * consumes each one (critical-trace clock) and the command's get offset; from
+ * the first such release, a sampler prints every change of the guest put
+ * pointer for 40 s, so the time put passed each release can be found offline. */
+static u32 s_lag_ea=1u;
+static int s_lag_sampler;
+static DWORD WINAPI gcm_lag_sampler(LPVOID unused){
+    (void)unused;u32 last=0xFFFFFFFFu;unsigned lines=0;
+    const uint64_t end=ps3_critical_now_ns()+40ull*1000000000ull;
+    while(ps3_critical_now_ns()<end&&lines<400000u){
+        const u32 put=vm_read32(GCM_CONTROL_GUEST_ADDR+0);
+        if(put!=last){last=put;lines++;fprintf(stderr,"[label-lag] t=%llu put=0x%08X\n",(unsigned long long)ps3_critical_now_ns(),put);}
+#ifdef _WIN32
+        Sleep(0);
+#else
+        {const struct timespec ts={0,20000};nanosleep(&ts,NULL);}
+#endif
+    }
+    return 0;
+}
+static void gcm_label_lag_note(u32 ea,u32 method,u32 value){
+    if(s_lag_ea==1u){const char *e=getenv("PS3RECOMP_RSX_LABEL_LAG");s_lag_ea=e&&*e?(u32)strtoul(e,0,16):0u;}
+    if(!s_lag_ea||ea!=s_lag_ea)return;
+    if(!s_lag_sampler){s_lag_sampler=1;HANDLE h=CreateThread(NULL,0,gcm_lag_sampler,NULL,0,NULL);if(h)CloseHandle(h);}
+    static unsigned n;
+    if(n++<20000u)fprintf(stderr,"[label-lag] t=%llu consume ea=0x%08X method=0x%04X value=0x%08X get=0x%08X\n",
+        (unsigned long long)ps3_critical_now_ns(),ea,method,value,s_fifo_getoff);
+}
 static int gcm_defer_label(u32 ea,u32 value,u32 method,u32 fifo_ea){
     return gcm_defer_label_get(ea,value,method,fifo_ea,0);
 }
@@ -3819,6 +3848,7 @@ static void gcm_rsx_process_fifo_pass(void)
                             /* Legacy HOST_BUFFER skips an unmapped write. */
                             if(!label_ea){if(!gcm_reports_sync_barrier())return;continue;}
                         }
+                        if(s_lag_ea)gcm_label_lag_note(label_ea,m,value);
                         if(!gcm_defer_label(label_ea,value,m,dea))return;
                         continue;
                     }
