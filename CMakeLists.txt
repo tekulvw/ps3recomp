@@ -342,6 +342,15 @@ if(WIN32)
         target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_WINDOWS=1)
     endif()
 endif()
+if(NOT WIN32 AND NOT APPLE)
+    # No toolkit dialog here. The headless host keeps the retail OSK lifecycle
+    # (no artificial Init, real sysutil events) and is confirmed only through
+    # OSK_NATIVE_CONTROL_FILE; see libs/misc/osk_headless.c.
+    option(PS3RECOMP_NATIVE_OSK_HEADLESS "Build the headless native OSK host (mailbox-confirmed)" OFF)
+    if(PS3RECOMP_NATIVE_OSK_HEADLESS)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_HEADLESS=1)
+    endif()
+endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
         -Wall -Wextra -Wno-unused-parameter
