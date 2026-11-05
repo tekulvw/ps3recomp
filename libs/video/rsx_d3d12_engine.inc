@@ -81,7 +81,7 @@ typedef struct {
     u8  attrs[RSX_DSP_NUM_VERTEX_ATTR];
 } e12_obj;
 
-typedef struct { IUnknown* res; u64 fence; } e12_retire;
+typedef struct { IUnknown* res; u64 fence; } e12_retiree;
 
 static struct {
     int active, ready, recording, failed;
@@ -96,7 +96,7 @@ static struct {
     u8  rtv_used[ENG12_RTV_HEAP], dsv_used[ENG12_DSV_HEAP], srv_used[ENG12_SRV_CPU_HEAP];
     u32 srv_gpu_next, samp_gpu_next;
     ID3D12Resource* upload; u8* upload_ptr; u64 upload_next;
-    e12_retire* retire; u32 retire_n, retire_cap;
+    e12_retiree* retire; u32 retire_n, retire_cap;
     u32 null_srv2d, null_srvcube;    /* CPU SRV slots + 1 */
     /* present blit */
     ID3D12RootSignature* blit_root; ID3D12PipelineState* blit_pso;
@@ -163,7 +163,7 @@ static void e12_retire(IUnknown* r)
     if (!r) return;
     if (s_e12.retire_n == s_e12.retire_cap) {
         u32 cap = s_e12.retire_cap ? s_e12.retire_cap * 2 : 256;
-        e12_retire* n = (e12_retire*)realloc(s_e12.retire, cap * sizeof *n);
+        e12_retiree* n = (e12_retiree*)realloc(s_e12.retire, cap * sizeof *n);
         if (!n) { e12_count(E12_X_DEVICE); return; }   /* leak rather than free in use */
         s_e12.retire = n; s_e12.retire_cap = cap;
     }
