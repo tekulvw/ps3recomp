@@ -818,7 +818,14 @@ static u32 e12_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
     ID3DBlob* vs = e12_compile(vs_hlsl, "vs_5_0", E12_X_COMPILE_VS);
     if (!vs) return 0;
-    ID3DBlob* ps = e12_compile(ps_hlsl, "ps_5_0", E12_X_COMPILE_PS);
+    /* PS3RECOMP_D3D12_ENGINE_FORCE_COLOR=1: every pixel program writes opaque
+     * magenta to all targets. Diagnostic: tells geometry from shading. */
+    static int force = -1;
+    if (force < 0) { const char* e = getenv("PS3RECOMP_D3D12_ENGINE_FORCE_COLOR"); force = e && *e == '1'; }
+    static const char forced[] =
+        "struct PSOutput { float4 c0:SV_Target0; float4 c1:SV_Target1; float4 c2:SV_Target2; float4 c3:SV_Target3; };\n"
+        "PSOutput main(float4 p : SV_Position) { PSOutput o; o.c0 = o.c1 = o.c2 = o.c3 = float4(1, 0, 1, 1); return o; }\n";
+    ID3DBlob* ps = e12_compile(force ? forced : ps_hlsl, "ps_5_0", E12_X_COMPILE_PS);
     if (!ps) { vs->lpVtbl->Release(vs); return 0; }
     EnterCriticalSection(&s_e12.lock);
     const u32 hd = e12_alloc();
