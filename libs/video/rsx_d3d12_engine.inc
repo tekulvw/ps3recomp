@@ -103,7 +103,10 @@ static struct {
     /* bound state */
     u32 rt[RSX_BE_MAX_COLOR_TARGETS], nrt, depth, pipeline;
     u32 scratch_depth;
-    u8  vsc[512 * 16], psc[512 * 16]; u32 vs_bytes, ps_bytes;
+    /* VPConst: 512 transform constants plus the viewport epilogue (two more
+     * vec4s); PSConstants: the buffered fragment constants plus fp_alpha. Both
+     * up to the 64 KiB a constant buffer view can address. */
+    u8  vsc[65536], psc[65536]; u32 vs_bytes, ps_bytes;
     u32 tex[RSX_BE_MAX_TEXTURES], vtex[ENG12_VTEX]; u32 tex_mask, vtex_mask;
     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES], vsamp[ENG12_VTEX];
     float vp[4]; int have_vp; u32 sc[4]; int have_sc; u32 stencil_ref; float dbounds[2];
@@ -442,7 +445,10 @@ static int e12_root_signature(void)
     D3D12_DESCRIPTOR_RANGE r[4]; memset(r, 0, sizeof r);
     r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;     r[0].NumDescriptors = RSX_BE_MAX_TEXTURES;
     r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER; r[1].NumDescriptors = RSX_BE_MAX_TEXTURES;
+    /* The vertex program declares its texture units at t16..t19 (rsx_vp_decompiler.c),
+     * so the fragment units' t0..t15 and the vertex units never alias in one layout. */
     r[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;     r[2].NumDescriptors = ENG12_VTEX;
+    r[2].BaseShaderRegister = RSX_BE_MAX_TEXTURES;
     r[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER; r[3].NumDescriptors = ENG12_VTEX;
     D3D12_ROOT_PARAMETER p[6]; memset(p, 0, sizeof p);
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0;
@@ -934,14 +940,14 @@ static void e12_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e12.pipe
 static void e12_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
-    if (bytes > sizeof s_e12.vsc) bytes = sizeof s_e12.vsc;
+    if (bytes > sizeof s_e12.vsc) { e12_count(E12_X_UPLOAD_TOO_LARGE); bytes = sizeof s_e12.vsc; }
     if (data && bytes) memcpy(s_e12.vsc, data, bytes);
     s_e12.vs_bytes = data ? bytes : 0;
 }
 static void e12_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
-    if (bytes > sizeof s_e12.psc) bytes = sizeof s_e12.psc;
+    if (bytes > sizeof s_e12.psc) { e12_count(E12_X_UPLOAD_TOO_LARGE); bytes = sizeof s_e12.psc; }
     if (data && bytes) memcpy(s_e12.psc, data, bytes);
     s_e12.ps_bytes = data ? bytes : 0;
 }

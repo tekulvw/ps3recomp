@@ -47,8 +47,10 @@ static int failures, checks;
 static const char VS[] =
     "struct VSInput { float4 a0:ATTR0; float4 a8:ATTR8; };\n"
     "struct VSOutput { float4 pos:SV_Position; float4 col0:COLOR0; float4 tc0:TEXCOORD0; };\n"
-    "cbuffer VPConst : register(b0) { float4 vp_c[4]; };\n"
-    "VSOutput main(VSInput input) { VSOutput o; o.pos = input.a0; o.col0 = vp_c[1];\n"
+    "cbuffer VPConst : register(b0) { float4 vp_c[512]; float4 vp_posscale; float4 vp_posoffset; };\n"
+    "VSOutput main(VSInput input) { VSOutput o;\n"
+    "  o.pos = float4(input.a0.xyz * vp_posscale.xyz + input.a0.w * vp_posoffset.xyz, input.a0.w);\n"
+    "  o.col0 = vp_c[1];\n"
     "  o.tc0 = input.a8; return o; }\n";
 static const char PS[] =
     "struct PSInput { float4 pos:SV_Position; float4 col0:COLOR0; float4 tc0:TEXCOORD0; };\n"
@@ -144,8 +146,11 @@ int main(void)
     rsx_be_render_state rs = plain_state();
     rsx_vertex_layout_plan lay = layout2();
     const u32 pipe = b->pipeline_create(b->user, VS, PS, &rs, &lay, sizeof(vtx), RSX_BE_FMT_R8G8B8A8, 1);
-    CHECK(pipe != 0, "pipeline from decompiler-shaped HLSL");
-    float vc[16] = { 0 }, fc[8] = { 0 };
+    CHECK(pipe != 0, "pipeline from decompiler-shaped HLSL (VPConst with the viewport epilogue)");
+    /* The engine's block: 512 transform constants, then the viewport epilogue
+     * (scale, offset) the decompiled program's tail applies. */
+    static float vc[514 * 4]; float fc[8] = { 0 };
+    vc[512 * 4 + 0] = vc[512 * 4 + 1] = vc[512 * 4 + 2] = 1.0f;   /* vp_posscale; vp_posoffset stays 0 */
     vc[4] = 0.0f; vc[5] = 1.0f; vc[6] = 0.5f; vc[7] = 1.0f;      /* vp_c[1] */
     fc[0] = 1.0f; fc[1] = 1.0f; fc[2] = 1.0f; fc[3] = 1.0f;      /* fp_c[0] */
     b->bind_vs_constants(b->user, vc, sizeof vc);
