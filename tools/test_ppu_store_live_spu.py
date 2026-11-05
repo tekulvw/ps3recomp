@@ -44,6 +44,7 @@ extern "C" void cellGcm_ref_on_poll(void) {std::abort();}
 extern "C" { uint32_t g_gcm_consumer_put_wake_ea=0; void cellGcm_fifo_kick_notify(void) {std::abort();} }
 extern "C" void ppu_resv_register(ppu_context*);
 extern "C" unsigned long g_spu_coh_live_skips;
+extern "C" unsigned long g_spu_coh_shard_idle_stores;
 static unsigned char arena[0x40000];
 static bool eq(const ppu_context& c){return (c.cr&0x20000000u)!=0;}
 static uint64_t ll(ppu_context& c,uint32_t ea){c.gpr[4]=ea;func_00001000(&c);return c.gpr[3];}
@@ -75,6 +76,7 @@ static int shard_path(uint32_t ea){int s=spu_coh_ppu_store_lock(ea);if(s)spu_coh
 
 int main(int argc,char** argv){
   const bool live=spu_coh_live_spu_enabled()>0;
+  const bool shard=spu_coh_shard_idle_enabled()>0;
   const int rounds=argc>1?atoi(argv[1]):200000;
   vm_base=arena;ppu_vm_size=sizeof(arena);
   g_active_ctx=&g_c;
@@ -83,19 +85,27 @@ int main(int argc,char** argv){
   // A line reserved once walks the holders on every write when off, only while counted when on.
   const uint32_t A=0x10000;
   getllar(&g_spu,A,ls);put_be32(ls,1);assert(putllc(&g_spu,A,ls));
-  assert(!shard_path(A));                                  // the lock-line lock stays, on and off
-  { unsigned long k0=g_spu_coh_live_skips;vm_write32(A+0x40,1);assert(g_spu_coh_live_skips==k0+(live?1:0)); }
+  assert(shard_path(A)==(shard?1:0));                      // idle: the shard path only with SHARD_IDLE
+  { unsigned long k0=g_spu_coh_live_skips,s0=g_spu_coh_shard_idle_stores;vm_write32(A+0x40,1);
+    assert(g_spu_coh_live_skips-k0==(live&&!shard?1u:0u)&&g_spu_coh_shard_idle_stores-s0==(shard?1u:0u)); }
   // A counted holder is told, on and off.
-  getllar(&g_spu2,A,ls);
+  getllar(&g_spu2,A,ls);assert(!shard_path(A));             // counted: the lock-line lock
   { unsigned long k0=g_spu_coh_live_skips;__atomic_store_n(&g_spu2.event_status,0,__ATOMIC_RELAXED);
     vm_write32(A+0x44,1);assert(g_spu_coh_live_skips==k0);
     assert(!g_spu2.resv_valid&&(g_spu2.event_status&SPU_EVENT_LR)&&"holder must lose its reservation"); }
   getllar(&g_spu2,A+0x80,ls);                               // the count moves with the next GETLLAR
-  { unsigned long k0=g_spu_coh_live_skips;vm_write32(A+0x48,1);assert(g_spu_coh_live_skips==k0+(live?1:0)); }
+  { unsigned long k0=g_spu_coh_live_skips,s0=g_spu_coh_shard_idle_stores;vm_write32(A+0x48,1);
+    assert(g_spu_coh_live_skips-k0==(live&&!shard?1u:0u)&&g_spu_coh_shard_idle_stores-s0==(shard?1u:0u)); }
   putllc(&g_spu2,A+0x80,ls);
   // A context-less interest (a watch, an HLE line) is never skipped.
   { const uint32_t W=0x11000;spu_lockline_lock();spu_coh_reserve(NULL,W);spu_lockline_unlock();
-    unsigned long k0=g_spu_coh_live_skips;vm_write32(W,1);assert(g_spu_coh_live_skips==k0); }
+    unsigned long k0=g_spu_coh_live_skips;vm_write32(W,1);assert(g_spu_coh_live_skips==k0);assert(!shard_path(W)); }
+  // A line host code read-modify-writes keeps the lock-line lock from then on.
+  { const uint32_t H=0x12000;getllar(&g_spu,H,ls);putllc(&g_spu,H,ls);
+    assert(shard_path(H)==(shard?1:0));
+    spu_lockline_lock();spu_coh_host_rmw_mark(H+4,4);spu_lockline_unlock();
+    assert(!shard_path(H)&&!shard_path(H+0x7C)&&"the whole line is marked");
+  }
   // An overlapping PPU store fails the PUTLLC, the same bytes written back included.
   getllar(&g_spu,A,ls);vm_write32(A+0x40,7);put_be32(ls,2);assert(!putllc(&g_spu,A,ls));
   getllar(&g_spu,A,ls);{uint32_t v=vm_read32(A+0x40);vm_write32(A+0x40,v+1);vm_write32(A+0x40,v);}
@@ -104,6 +114,16 @@ int main(int argc,char** argv){
   getllar(&g_spu,A,ls);ll(g_c,A+0x48);assert(sc(g_c,A+0x48,5));put_be32(ls,4);assert(!putllc(&g_spu,A,ls));
   // A store-conditional fails after an SPU commit to its line, idle line or not.
   ll(g_c,A+0x48);getllar(&g_spu2,A,ls);put_be32(ls+4,9);assert(putllc(&g_spu2,A,ls));assert(!sc(g_c,A+0x48,6));
+  // Host read-modify-writes under the lock against PPU stores to the same line: none is lost.
+  { const uint32_t C=0x14000;getllar(&g_spu,C,ls);putllc(&g_spu,C,ls);memset(vm_base+C,0,128);
+    std::atomic<bool> hdone{false};
+    std::thread h([&]{for(int k=0;k<rounds/4;k++){spu_lockline_lock();spu_coh_host_rmw_mark(C,8);
+        uint32_t v=be32(vm_base+C);put_be32(vm_base+C,v+1);
+        if(spu_coh_is_reserved(C))spu_coh_notify_write(C);spu_lockline_unlock();}hdone=true;});
+    g_active_ctx=&g_y;uint32_t k=0;while(!hdone.load()){++k;vm_write32(C+4,k);vm_write32(C+0x40,k);}
+    h.join();g_active_ctx=&g_c;
+    assert(vm_read32(C)==(uint32_t)(rounds/4)&&"host increments survive");
+    assert(vm_read32(C+4)==k&&vm_read32(C+0x40)==k&&"PPU stores survive"); }
   // Stress: SPU increments word 0 in bursts, one PPU thread stores word 2, another ll/sc-increments word 4.
   const uint32_t B=0x20000;
   getllar(&g_spu,B,ls);putllc(&g_spu,B,ls);                // SPU-marked, idle
@@ -122,8 +142,8 @@ int main(int argc,char** argv){
   g_active_ctx=&g_y;
   for(uint32_t k=1;k<=(uint32_t)rounds;++k)vm_write32(B+8,k);
   pdone=true;u.join();w.join();g_active_ctx=&g_c;
-  printf("live=%d: %d stores, %lu PUTLLC commits, %lu store-conditional commits, backwards=%lu\n",
-         live,rounds,spu_commits,sccommits.load(),back);
+  printf("live=%d shard=%d: %d stores, %lu PUTLLC commits, %lu store-conditional commits, backwards=%lu, shard-path stores=%lu\n",
+         live,shard,rounds,spu_commits,sccommits.load(),back,g_spu_coh_shard_idle_stores);
   assert(spu_commits>0&&sccommits>0);assert(back==0);
   assert(vm_read32(B+8)==(uint32_t)rounds);assert(vm_read32(B)==spu_commits);assert(vm_read64(B+16)==sccommits.load());
   spu_coh_unregister(&g_spu);spu_coh_unregister(&g_spu2);
@@ -146,13 +166,14 @@ with tempfile.TemporaryDirectory(prefix='ppu-store-live-spu-') as tmp:
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-UNDEBUG', *common, '-I'+str(root/'runtime/ppu'), '-I'+str(p), '-I'+str(root/'include'), '-I'+str(root/'runtime/spu'), '-I'+str(root/'runtime/platform'), str(root/'runtime/ppu/ppu_loader.cpp'), str(p/'driver.cpp'), str(p/'lifted.cpp'), str(p/'coh.o'), str(p/'compat.o'), '-pthread', ('-Wl,-dead_strip' if sys.platform == 'darwin' else '-Wl,--gc-sections'), '-o', str(p/'test')], check=True)
     rounds = os.environ.get('PPU_STORE_LIVE_SPU_ROUNDS', '200000')
     digests = []
-    for mode in ('0', '1'):
+    for mode in ('0', '1', 'shard'):
         env = dict(os.environ)
-        if mode == '1': env['PS3RECOMP_PPU_STORE_LIVE_SPU'] = '1'
-        else: env.pop('PS3RECOMP_PPU_STORE_LIVE_SPU', None)
+        env.pop('PS3RECOMP_PPU_STORE_LIVE_SPU', None); env.pop('PS3RECOMP_PPU_STORE_SHARD_IDLE', None)
+        if mode != '0': env['PS3RECOMP_PPU_STORE_LIVE_SPU'] = '1'
+        if mode == 'shard': env['PS3RECOMP_PPU_STORE_SHARD_IDLE'] = '1'
         r = subprocess.run([str(p/'test'), rounds], timeout=600, env=env, capture_output=True, text=True)
         sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
         assert r.returncode == 0, f'live={mode} failed'
         digests.append([x for x in r.stdout.splitlines() if x.startswith('deterministic')])
-    assert digests[0] == digests[1], 'final memory differs between the switch off and on'
-    print('PASS PPU stores with live SPU reservation tracking, switch off and on')
+    assert digests[0] == digests[1] == digests[2], 'final memory differs between the switches'
+    print('PASS PPU stores with live SPU reservation tracking and the idle-line shard path, switches off and on')

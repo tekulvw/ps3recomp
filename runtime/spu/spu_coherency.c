@@ -377,6 +377,59 @@ static inline int spu_coh_line_spu_idle(uint32_t ea)
     if (spu_coh_live_spu_enabled() <= 0 || spu_coh_line_watched(ea)) return 0;
     return __atomic_load_n(spu_coh_live_slot(ea), __ATOMIC_SEQ_CST) == 0;
 }
+/* PS3RECOMP_PPU_STORE_SHARD_IDLE=1 (opt-in, needs PS3RECOMP_PPU_STORE_LIVE_SPU):
+ * a plain PPU store to a line an SPU once reserved takes the line's shard
+ * instead of the lock-line lock while the line is idle -- no SPU counts a
+ * reservation on it and it carries no sticky mark.
+ *
+ * The lock-line lock is what made such stores safe against two other writers:
+ *  - an SPU PUTLLC, which compares and then copies the whole line under the
+ *    lock: it commits only while its context counts the line, and the count
+ *    is raised under the line's shard, so a store that holds the shard and
+ *    finds the count at zero cannot overlap a commit;
+ *  - host code that read-modify-writes a line under the lock (the SPURS HLE
+ *    kernel's counters and event flags, the taskset bits, cellSync queues):
+ *    every such section marks its lines sticky with spu_coh_host_rmw_mark
+ *    before it reads them, under each line's shard, so a store to them keeps
+ *    the lock from then on. Context-less interest (watches, the SPURS lines
+ *    marked with spu_coh_reserve(NULL)) is sticky too.
+ * Writers that only write (MFC puts, report publication, plain host stores)
+ * may overlap a shard-path store on one line as they already may on PPU-only
+ * lines: both write bytes and bump the epoch atomically. Store-conditionals
+ * keep the lock-line lock: a shard-only one would not exclude an MFC put to
+ * the other words of its line. */
+static int s_shard_idle_on = -1;
+int spu_coh_shard_idle_enabled(void)
+{
+    int on = __atomic_load_n(&s_shard_idle_on, __ATOMIC_RELAXED);
+    if (__builtin_expect(on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_PPU_STORE_SHARD_IDLE");
+        on = e && !strcmp(e, "1") && spu_coh_live_spu_enabled() > 0;
+        __atomic_store_n(&s_shard_idle_on, on, __ATOMIC_RELAXED);
+        if (on) { fprintf(stderr, "[spu-coh] idle SPU lines take the shard path\n"); fflush(stderr); }
+        else if (e && !strcmp(e, "1"))
+            fprintf(stderr, "[spu-coh] PS3RECOMP_PPU_STORE_SHARD_IDLE needs PS3RECOMP_PPU_STORE_LIVE_SPU=1: off\n");
+    }
+    return on;
+}
+/* Caller holds the lock-line lock and is about to read-modify-write
+ * [ea, ea+len): stores to those lines keep the lock-line lock from now on. */
+void spu_coh_host_rmw_mark(uint32_t ea, uint32_t len)
+{
+    if (!len || spu_coh_shard_idle_enabled() <= 0) return;
+    const uint32_t last = (ea + len - 1u) & ~127u;
+    for (uint32_t line = ea & ~127u;; line += 128u) {
+        const uint32_t l = line >> SPU_COH_LINE_SHIFT;
+        if (!((__atomic_load_n(&s_watch_bitmap[l >> 3], __ATOMIC_ACQUIRE) >> (l & 7)) & 1u)) {
+            spu_coh_line_shard_lock(line);   /* no shard-path store is mid-flight */
+            __atomic_fetch_or(&s_watch_bitmap[l >> 3], (unsigned char)(1u << (l & 7)), __ATOMIC_RELEASE);
+            spu_coh_line_shard_unlock(line);
+        }
+        if (line == last) break;
+    }
+}
+unsigned long g_spu_coh_shard_idle_stores;   /* plain stores that took the shard path on an idle SPU line */
+
 void spu_coh_live_untrack(spu_context* c)
 {
     if (!c || !c->coh_live_counted) return;
@@ -707,9 +760,23 @@ void spu_coh_ppu_live_drop(uint32_t ea)
 
 int spu_coh_ppu_store_lock(uint32_t ea)
 {
-    if (spu_coh_line_spu(ea)) return 0;
+    if (spu_coh_line_spu(ea)) {
+        /* An idle SPU line (PS3RECOMP_PPU_STORE_SHARD_IDLE): recheck under the shard. */
+        if (spu_coh_shard_idle_enabled() <= 0 || !spu_coh_line_spu_idle(ea)) return 0;
+        spu_coh_line_shard_lock(ea);
+        if (spu_coh_line_spu_idle(ea)) {
+            __atomic_fetch_add(&g_spu_coh_shard_idle_stores, 1ul, __ATOMIC_RELAXED);
+            return 1;
+        }
+        spu_coh_line_shard_unlock(ea);
+        return 0;
+    }
     spu_coh_line_shard_lock(ea);
     if (!spu_coh_line_spu(ea)) return 1;
+    if (spu_coh_shard_idle_enabled() > 0 && spu_coh_line_spu_idle(ea)) {
+        __atomic_fetch_add(&g_spu_coh_shard_idle_stores, 1ul, __ATOMIC_RELAXED);
+        return 1;
+    }
     spu_coh_line_shard_unlock(ea);
     return 0;
 }

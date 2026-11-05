@@ -282,6 +282,8 @@ extern void spu_lockline_lock(void);
 extern void spu_lockline_unlock(void);
 extern int  spu_coh_is_reserved(uint32_t);
 extern void spu_coh_notify_write(uint32_t);
+/* Read-modify-writes below mark their lines first (PS3RECOMP_PPU_STORE_SHARD_IDLE). */
+extern void spu_coh_host_rmw_mark(uint32_t, uint32_t);
 static inline u16 ef_r16(uint32_t a) { const uint8_t* p = vm_base + a; return (u16)((p[0] << 8) | p[1]); }
 static inline void ef_w16(uint32_t a, u16 v) { uint8_t* p = vm_base + a; p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static inline void ef_line_end(uint32_t ea)
@@ -293,6 +295,7 @@ static inline void ef_line_end(uint32_t ea)
 static void spurs_ef_set_locked(uint32_t ea, u16 bits)
 {
     spu_lockline_lock();
+    spu_coh_host_rmw_mark(ea, 0x80);
     u16 events        = ef_r16(ea + EF_EVENTS);
     u16 used          = (u16)(ef_r16(ea + EF_SPU_USED_SLOTS) &
                               ~ef_r16(ea + EF_SPU_PENDING_RECV));
@@ -1758,6 +1761,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             spurs_scheduler_forget(i);
             si->idle[i] = 0;
             spu_lockline_lock();
+            spu_coh_host_rmw_mark(spurs_ea, 0x80);
             vm_base[spurs_ea + SPURS_WKL_READY1 + i] = 0;
             vm_base[spurs_ea + SPURS_WKL_CURCONT + i] = 0;
             ef_w16(spurs_ea + SPURS_WKL_SIGNAL1,
@@ -2453,6 +2457,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                  * to GetWorkloadInfo and can send callers into obsolete waits. */
                 if (!kicked) continue;
                 spu_lockline_lock();
+                spu_coh_host_rmw_mark(ea, 0x80);
                 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
                 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
                 /* Recheck all request sources in the consumption transaction;
@@ -2600,6 +2605,7 @@ static s32 spurs_ready_exchange(CellSpurs* spurs, CellSpursWorkloadId wid,
         spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
     }
     spu_lockline_lock();
+    spu_coh_host_rmw_mark(si->ea, 0x80);
     u8 previous = vm_read8(si->ea + SPURS_WKL_READY1 + wid);
     if (!conditional || previous == compare) {
         vm_base[si->ea + SPURS_WKL_READY1 + wid] = (u8)value;
@@ -2845,6 +2851,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
         /* Clear from the CURRENT word: bits an SPU set since `current` was
          * read must survive. */
         spu_lockline_lock();
+        spu_coh_host_rmw_mark(ea, 0x80);
         ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
         ef_line_end(ea);
     }
@@ -2889,6 +2896,7 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
                                                        : (u16)(current & pattern);
     if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
         spu_lockline_lock();
+        spu_coh_host_rmw_mark(ea, 0x80);
         ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
         ef_line_end(ea);
     }
@@ -2909,6 +2917,7 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
 
     ef_lock(sync);
     spu_lockline_lock();
+    spu_coh_host_rmw_mark(ea, 0x80);
     ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~bits));
     ef_line_end(ea);
     ef_unlock(sync);

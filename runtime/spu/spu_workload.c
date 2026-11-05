@@ -595,6 +595,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     size_t start_sz[128];
     int n_start = 0;
     spu_lockline_lock();
+    { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(taskset_ea, 0x80); }   /* the task bit arrays below */
     if (done_task < 128) {
         uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
         ts[0x10 + done_task / 8] &= (uint8_t)~m;
@@ -1377,6 +1378,7 @@ static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
     const uint32_t mask = (1u << 31) >> (taskId % 32u);
     uint8_t* p = vm_base + word;
     spu_lockline_lock();
+    spu_coh_host_rmw_mark(word, 4);
     uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
     v = set ? (v | mask) : (v & ~mask);
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;

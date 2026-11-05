@@ -90,6 +90,10 @@ int spu_coh_is_reserved(uint32_t addr);
 void spu_coh_live_track(spu_context* ctx, uint32_t ea);
 void spu_coh_live_untrack(spu_context* ctx);
 int  spu_coh_live_spu_enabled(void);
+/* PS3RECOMP_PPU_STORE_SHARD_IDLE (spu_coherency.c): host code that
+ * read-modify-writes guest lines under the lock-line lock marks them first. */
+void spu_coh_host_rmw_mark(uint32_t ea, uint32_t len);
+int  spu_coh_shard_idle_enabled(void);
 
 /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
  * whose live reservation covers it, drop that reservation, and wake the host

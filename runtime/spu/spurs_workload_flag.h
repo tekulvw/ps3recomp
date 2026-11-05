@@ -47,6 +47,7 @@ static inline uint32_t spurs_flag_status(uint32_t ea, uint32_t wid, int consume)
     if (wid >= 16 || !spurs_flag_range(ea)) return 0;
     uint32_t status = 0;
     spu_lockline_lock();
+    { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(ea, 0x80); }
     if (!(vm_base[ea + 0x74] & 0x40) &&
         (spurs_flag_be32(ea + 0xB0) & (0x80000000u >> wid)) &&
         vm_base[ea + 0x80 + wid] == 2 && !spurs_flag_be32(ea + 0xD6C) &&

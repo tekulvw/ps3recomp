@@ -45,6 +45,7 @@ void spurs_taskset_bitset_update(uint32_t bitset_ea, uint32_t taskId, int set)
     uint8_t* p = vm_base + bitset_ea + taskId / 8;
     const uint8_t m = (uint8_t)(0x80u >> (taskId % 8));
     spu_lockline_lock();
+    { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(bitset_ea + taskId / 8, 1); }
     if (set) *p |= m; else *p &= (uint8_t)~m;
     spu_coh_notify_write(bitset_ea);
     spu_lockline_unlock();
@@ -61,6 +62,7 @@ uint32_t spurs_taskset_take_slot(uint32_t taskset_ea, uint32_t max_tasks)
     uint8_t* en = vm_base + taskset_ea + CSTS_ENABLED;
     uint32_t slot = max_tasks;
     spu_lockline_lock();
+    { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(taskset_ea + CSTS_ENABLED, (max_tasks + 7) / 8); }
     for (uint32_t t = 0; t < max_tasks; t++) {
         const uint8_t m = (uint8_t)(0x80u >> (t % 8));
         if (!(en[t / 8] & m)) { en[t / 8] |= m; slot = t; break; }
