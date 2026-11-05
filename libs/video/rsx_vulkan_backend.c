@@ -2349,10 +2349,14 @@ static void vk_dump_ppm(const unsigned char* rgba)
  * One show is pending at most: a later capture supersedes it (the offscreen
  * target then holds the newer frame), and so does an ordinary present. The
  * show uses its own ring of command buffers, fences and acquire semaphores.
+ * A read-back present (a frame dump) is split the same way where the host
+ * splits it: its completion -- the dump and the window present -- is left to
+ * the pump instead of present_finish while the reservation is held.
  * Off, nothing here runs and presents are unchanged. */
 #define VK_SHOW_SLOTS 3
 static struct {
     int pending;                          /* present_mu */
+    int readback_pending;                 /* a read-back present left to complete */
     u32 slot;
     VkCommandBuffer cmds[VK_SHOW_SLOTS];
     VkFence fences[VK_SHOW_SLOTS];
@@ -2604,6 +2608,13 @@ static void vk_present_record_end(VkCommandBuffer cb)
  * reach), 0 when it is still held or nothing was pending. */
 static int vk_show_service_locked(void)
 {
+    if (s_show.readback_pending && !vk_hold_active()) {
+        s_show.readback_pending = 0;
+        if (!s_vk.present_inflight) return 0;    /* the next present completed it already */
+        vk_present_complete_locked();            /* the dump and the window present */
+        s_show.served++;
+        return 1;
+    }
     if (!s_show.pending || vk_hold_active()) return 0;
     s_show.pending = 0;
     if (!(s_vk.windowed && s_vk.swapchain)) { s_show.served++; return 1; }
@@ -2672,7 +2683,8 @@ static int vk_show_service_locked(void)
 static void vk_show_pump(void)
 {
     if (!vk_defer_held_present() || !s_vk.device) return;
-    if (!__atomic_load_n(&s_show.pending, __ATOMIC_ACQUIRE)) return;
+    if (!__atomic_load_n(&s_show.pending, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&s_show.readback_pending, __ATOMIC_ACQUIRE)) return;
     if (!vulkan_owner_begin(1)) return;
     const uint64_t before = s_vulkan_commits;
     pthread_mutex_lock(&s_vk.present_mu);
@@ -5811,7 +5823,12 @@ static void vulkan_original_present_finish(void)
 {
     if (!s_vk.device) return;
     pthread_mutex_lock(&s_vk.present_mu);
-    vk_present_complete_locked();
+    if (vk_defer_held_present() && s_vk.present_inflight && vk_hold_active()) {
+        if (!s_show.readback_pending) { s_show.readback_pending = 1; s_show.deferred++; vk_show_report(); }
+    } else {
+        s_show.readback_pending = 0;
+        vk_present_complete_locked();
+    }
     pthread_mutex_unlock(&s_vk.present_mu);
 }
 

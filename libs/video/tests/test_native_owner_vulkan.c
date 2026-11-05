@@ -15,6 +15,7 @@ static VkResult capture_create_device(VkPhysicalDevice physical,const VkDeviceCr
 #include <assert.h>
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
 u8* vm_base;u32 ppu_vm_size,ppu_hle_inject_base;
 u32 cellGcmResolveLocated(int local,u32 offset){(void)local;(void)offset;assert(!"fixture has no guest memory");return 0;}
 u32 cellGcmResolveIO(u32 offset){(void)offset;assert(!"fixture has no guest IO");return 0;}
@@ -212,8 +213,44 @@ static void check_deferred_present(rsx_native_owner* first){
     fflush(stdout);printf("deferred held present (%s): present returned in %.1f ms during a 150 ms hold; offscreen target %08x after the native green (R,G,B,A = 00,ff,00,ff); deferred=%llu served=%llu superseded=%llu\n",
            on?"on":"off",presented,pixel,s_show.deferred,s_show.served,s_show.superseded);fflush(stdout);
     assert(pixel==0xff00ff00u);                                    /* captured after the native batch */
+    /* A read-back present (a frame dump), split as the host splits it: with the
+     * option its completion -- the dump -- waits for the pump after the hold
+     * instead of blocking present_finish; without it, present_finish waits. */
+    {
+        char dump[256];snprintf(dump,sizeof dump,"%s/owner-fixture-%d.ppm",getenv("TMPDIR")?getenv("TMPDIR"):"/tmp",(int)getpid());
+        const float blue[4]={0,0,1,1};be->clear_color(NULL,image,blue);
+        assert(be->submit_and_wait_checked(NULL,RSX_BE_FLUSH_GUEST_REFERENCE)==1);rsx_draw_engine_flush();
+        assert(first->try_begin(first->userdata,first->lifetime)==0);
+        assert(j.order.reserve(j.order.userdata,j.order.lifetime,&j.token)==0&&j.token);
+        first->end(first->userdata,first->lifetime);
+        assert(pvkAllocateCommandBuffers(s_vk.device,&cai,&j.cb)==VK_SUCCESS&&pvkResetFences(s_vk.device,1,&j.fence)==VK_SUCCESS);  /* fresh job */
+        assert(pthread_create(&worker,NULL,native_worker,&j)==0);                 /* green again, 150 ms later */
+        s_vk.dump_path=dump;s_vk.dump_every=1;
+        const unsigned long long readbacks=s_vk.present_readback_count,served2=s_show.served;
+        const double t1=ms_now();
+        s_vk.present_split=1;be->present(NULL,image);s_vk.present_split=0;      /* the host's present_begin */
+        vulkan_original_present_finish();
+        const double finished=ms_now()-t1;
+        if(on){
+            assert(finished<100.0&&s_show.readback_pending&&s_vk.present_inflight&&s_vk.present_readback_count==readbacks);
+            vk_show_pump();assert(s_show.readback_pending&&s_vk.present_readback_count==readbacks);   /* still held */
+        }else{
+            assert(finished>=100.0&&!s_show.readback_pending&&s_vk.present_readback_count==readbacks+1); /* waited */
+        }
+        pthread_join(worker,NULL);
+        assert(j.status==VK_SUCCESS&&pvkWaitForFences(s_vk.device,1,&j.fence,VK_TRUE,UINT64_MAX)==VK_SUCCESS);
+        vk_show_pump();
+        assert(!s_show.readback_pending&&!s_vk.present_inflight&&s_vk.present_readback_count==readbacks+1);
+        assert(s_show.served==served2+(on?1:0));
+        const uint32_t center=rsx_vulkan_backend_presented_center();
+        printf("deferred read-back present (%s): present_finish returned in %.1f ms; dumped centre %08x (0xAARRGGBB: the native green)\n",on?"on":"off",finished,center);fflush(stdout);
+        assert(center==0xff00ff00u);
+        FILE* f=fopen(dump,"rb");assert(f);fclose(f);remove(dump);
+        s_vk.dump_path=NULL;s_vk.dump_every=0;
+    }
     /* An ordinary present (no hold) with nothing pending changes nothing. */
-    be->present(NULL,image);assert(!s_show.pending&&s_show.served==(on?served+1:0));
+    {const unsigned long long before=s_show.served,deferred_before=s_show.deferred;
+     be->present(NULL,image);assert(!s_show.pending&&s_show.served==before&&s_show.deferred==deferred_before);}
     uint64_t boundary=0;assert(rsx_vulkan_backend_native_boundary(&boundary)==0&&boundary);
     assert(first->try_begin(first->userdata,first->lifetime)==0);first->end(first->userdata,first->lifetime);
     assert(be->submit_and_wait_checked(NULL,RSX_BE_FLUSH_GUEST_REFERENCE)==1);
