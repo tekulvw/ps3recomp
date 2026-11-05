@@ -27,6 +27,7 @@ void ps3_ms(const char* key){(void)key;}
 unsigned long long ps3_ms_now(void){return 0;}
 void cellGcm_replay_display_buffers_to_engine(void){}
 u32 cellGcm_flip_request_count(void){return 0;}
+void cellGcm_fifo_kick_notify(void){}
 rsx_frontend_device* rsx_frontend_vulkan_create(const rsx_frontend_vulkan_owner* owner){(void)owner;assert(!"legacy frontend must not be created");return NULL;}
 void rsx_frontend_close(rsx_frontend_device* device){assert(!device);}
 

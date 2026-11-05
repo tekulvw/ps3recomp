@@ -806,6 +806,7 @@ static VkResult vk_hold_push(const VkSubmitInfo* si, VkFence fence)
 }
 
 /* queue_mu held: every held submission onto the queue, in order; ends the hold. */
+static void vk_show_kick(void);
 static void vk_hold_release_locked(void)
 {
     for (uint32_t i = 0; i < s_hold.n; i++) {
@@ -824,6 +825,7 @@ static void vk_hold_release_locked(void)
     s_hold.n = 0;
     s_hold.active = 0; s_hold.token = 0;
     pthread_cond_broadcast(&s_hold_cv);
+    vk_show_kick();
 }
 
 /* queue_mu held: until no reservation holds original submissions. */
@@ -2343,9 +2345,14 @@ static void vk_dump_ppm(const unsigned char* rgba)
  *    recorded and submitted at once; vk_queue_submit queues it behind the held
  *    work, so it still shows exactly the frame that was flipped;
  *  - the show (acquire, blit into the swapchain image, vkQueuePresentKHR), which
- *    cannot go to the queue before the held work does, is left pending and
- *    made by vk_show_pump() from the host's message pump, on the same thread,
- *    once no reservation is held.
+ *    cannot go to the queue before the capture does, is left pending and made
+ *    by vk_show_pump() from the host's message pump, on the same thread, as
+ *    soon as the capture has left the hold. The end of a hold wakes the host
+ *    thread (cellGcm_fifo_kick_notify) when a show is pending. The show reads
+ *    only the offscreen target and writes only a swapchain image -- nothing a
+ *    native batch or held original work touches -- so it is submitted and
+ *    presented directly even if a newer reservation holds other work by then;
+ *    it orders after its capture by queue order.
  * One show is pending at most: a later capture supersedes it (the offscreen
  * target then holds the newer frame), and so does an ordinary present. The
  * show uses its own ring of command buffers, fences and acquire semaphores.
@@ -2357,6 +2364,7 @@ static void vk_dump_ppm(const unsigned char* rgba)
 static struct {
     int pending;                          /* present_mu */
     int readback_pending;                 /* a read-back present left to complete */
+    VkFence capture;                      /* the pending show's capture submission */
     u32 slot;
     VkCommandBuffer cmds[VK_SHOW_SLOTS];
     VkFence fences[VK_SHOW_SLOTS];
@@ -2376,6 +2384,43 @@ static int vk_hold_active(void)
     const int active = s_hold.active;
     pthread_mutex_unlock(&s_vk.queue_mu);
     return active;
+}
+static void vk_show_kick(void)
+{
+    extern void cellGcm_fifo_kick_notify(void);
+    if (__atomic_load_n(&s_show.pending, __ATOMIC_ACQUIRE)) cellGcm_fifo_kick_notify();
+}
+/* Whether the pending show's capture has reached the queue. */
+static int vk_show_capture_queued(void)
+{
+    pthread_mutex_lock(&s_vk.queue_mu);
+    const int held = vk_hold_has_locked(s_show.capture);
+    pthread_mutex_unlock(&s_vk.queue_mu);
+    return !held;
+}
+/* A submission that orders only after work already on the queue: never held.
+ * It is an original submission for the owner's accounting; while a
+ * reservation holds other work it does not become the native boundary. */
+static VkResult vk_queue_submit_unheld(const VkSubmitInfo* si, VkFence fence)
+{
+    pthread_mutex_lock(&s_vk.queue_mu);
+    const VkResult r = pvkQueueSubmit(s_vk.queue, 1, si, fence);
+    vulkan_owner_submitted(r);
+    if(vulkan_owner_enabled()&&r==VK_SUCCESS&&!s_hold.active&&s_vulkan_owner_thread.original_depth&&!s_vulkan_owner.failed){
+        s_vulkan_boundary_fence=fence;
+        s_vulkan_boundary_commit=s_vulkan_commits;
+        s_vulkan_boundary_generation=s_vulkan_owner.generation;
+    }
+    pthread_mutex_unlock(&s_vk.queue_mu);
+    return r;
+}
+/* Its semaphore's signal is already on the queue: no hold wait. */
+static VkResult vk_queue_present_unheld(const VkPresentInfoKHR* pi)
+{
+    pthread_mutex_lock(&s_vk.queue_mu);
+    const VkResult r = pvkQueuePresentKHR(s_vk.queue, pi);
+    pthread_mutex_unlock(&s_vk.queue_mu);
+    return r;
 }
 static void vk_show_report(void)
 {
@@ -2554,7 +2599,8 @@ static void vk_present_record_end(VkCommandBuffer cb)
         if (s_vk.fps_on) metal_frame_rate_guest(&s_vk.fps);
         if (defer) {
             if (s_show.pending) s_show.superseded++;
-            s_show.pending = 1;
+            s_show.capture = s_vk.present_fence;
+            __atomic_store_n(&s_show.pending, 1, __ATOMIC_RELEASE);
             s_show.deferred++;
             vk_show_report();
         }
@@ -2615,7 +2661,7 @@ static int vk_show_service_locked(void)
         s_show.served++;
         return 1;
     }
-    if (!s_show.pending || vk_hold_active()) return 0;
+    if (!s_show.pending || !vk_show_capture_queued()) return 0;
     s_show.pending = 0;
     if (!(s_vk.windowed && s_vk.swapchain)) { s_show.served++; return 1; }
     const u32 slot = (s_show.slot + 1u) % VK_SHOW_SLOTS;
@@ -2660,7 +2706,7 @@ static int vk_show_service_locked(void)
                         .commandBufferCount = 1, .pCommandBuffers = &cb,
                         .signalSemaphoreCount = 1, .pSignalSemaphores = &s_vk.sc_done[idx] };
     pvkResetFences(s_vk.device, 1, &s_show.fences[slot]);
-    if (vk_queue_submit(&si, s_show.fences[slot]) != VK_SUCCESS) {
+    if (vk_queue_submit_unheld(&si, s_show.fences[slot]) != VK_SUCCESS) {
         VK_LOG("vkQueueSubmit (deferred show) failed\n"); s_show.failed++; return 0;
     }
     __atomic_store_n(&s_show.busy[slot], 1, __ATOMIC_RELEASE);
@@ -2669,7 +2715,7 @@ static int vk_show_service_locked(void)
         .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
-    r = vk_queue_present(&pi);
+    r = vk_queue_present_unheld(&pi);
     if (s_vk.fps_on && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR))
         metal_frame_rate_presented(&s_vk.fps, vk_now_seconds());
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();

@@ -25,6 +25,8 @@ void ps3_ms(const char* key){(void)key;assert(!"fixture issues no guest draws/fl
 unsigned long long ps3_ms_now(void){assert(!"fixture has no guest notification clock");return 0;}
 void cellGcm_replay_display_buffers_to_engine(void){}
 u32 cellGcm_flip_request_count(void){return 0;}
+static int s_kicks;
+void cellGcm_fifo_kick_notify(void){s_kicks++;}   /* the host thread's wake */
 /* The legacy SDK compute implementation is deliberately absent here. */
 rsx_frontend_device* rsx_frontend_vulkan_create(const rsx_frontend_vulkan_owner* owner){(void)owner;assert(!"legacy frontend must not be created");return NULL;}
 void rsx_frontend_close(rsx_frontend_device* device){assert(!device);}
@@ -204,8 +206,10 @@ static void check_deferred_present(rsx_native_owner* first){
     }else{
         assert(!s_show.pending&&!s_show.deferred&&!s_show.served&&!s_show.superseded);
     }
+    const int kicks=s_kicks;
     pthread_join(worker,NULL);
     assert(j.status==VK_SUCCESS&&pvkWaitForFences(s_vk.device,1,&j.fence,VK_TRUE,UINT64_MAX)==VK_SUCCESS);
+    assert(s_kicks==kicks+(on?1:0));                                /* the hold's end woke the host thread */
     if(on){vk_show_pump();assert(!s_show.pending&&s_show.served==served+1);}  /* shown once the hold ended */
     else{vk_show_pump();assert(!s_show.pending&&!s_show.served);}
     vk_fence_wait(s_vk.present_fence);
