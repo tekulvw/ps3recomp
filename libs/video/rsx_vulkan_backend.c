@@ -295,6 +295,8 @@ enum { VK_RET_IMAGE = 1, VK_RET_BUFFER, VK_RET_SPARE, VK_RET_FRAMEBUFFER, VK_RET
 static int vk_bat_begin_op(void);
 static int vk_bat_end_op(void);
 static int vk_bat_flush(int wait);
+static int vk_bat_open(void);
+static u64 s_bat_last_ticket;
 static int vk_bat_retire(int kind, const void* object);
 static void vk_bat_reap(void);
 static int vk_sync(void);
@@ -2524,6 +2526,48 @@ static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
 static uint64_t s_eobj_generation[VK_ENG_MAX_OBJ],s_eobj_next_generation;
 static uint32_t s_eobj_native_pins[VK_ENG_MAX_OBJ];
 static uint8_t s_eobj_retired[VK_ENG_MAX_OBJ];
+/* PS3RECOMP_VK_PIN_RELEASE_NOWAIT=1 (opt-in): the original release of an
+ * image the native side still pins neither flushes-and-waits nor waits for
+ * presentation. It submits the open batch without waiting, ending in a full
+ * dependency on everything submitted before it, and keeps that batch's ticket
+ * with the image. When the last native pin goes (after the native side's own
+ * fences), the image is destroyed at once if that ticket has completed, or
+ * parked on a bounded list that the completion reap destroys later. With no
+ * room left on the list, the release waits as before. */
+#define VK_PIN_RETIRE 64u
+typedef struct { vk_image im; u64 ticket; } vk_pin_retired;
+static vk_pin_retired s_pin_retire[VK_PIN_RETIRE];
+static u32 s_pin_retire_n, s_pin_retire_reserved;
+static pthread_mutex_t s_pin_retire_mu = PTHREAD_MUTEX_INITIALIZER;
+static u64 s_eobj_pin_ticket[VK_ENG_MAX_OBJ];
+static unsigned long long s_pin_nowait, s_pin_fallback, s_pin_immediate, s_pin_deferred, s_pin_destroyed;
+static int vk_pin_release_nowait(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_PIN_RELEASE_NOWAIT"); on = e && !strcmp(e, "1"); }
+    return on;
+}
+/* Destroy without the presentation wait: the caller has established that no
+ * GPU work may still use the image. */
+static void vk_image_destroy_unused(vk_image* im)
+{
+    if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
+    if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
+    if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
+    memset(im, 0, sizeof *im);
+}
+static void vk_pin_retire_reap(u64 completed, int all)
+{
+    pthread_mutex_lock(&s_pin_retire_mu);
+    for (u32 i = 0; i < s_pin_retire_n; ) {
+        if (all || s_pin_retire[i].ticket <= completed) {
+            vk_image_destroy_unused(&s_pin_retire[i].im);
+            s_pin_retire[i] = s_pin_retire[--s_pin_retire_n];
+            s_pin_destroyed++;
+        } else i++;
+    }
+    pthread_mutex_unlock(&s_pin_retire_mu);
+}
 static rsx_native_vulkan_image s_eobj_native_image[VK_ENG_MAX_OBJ];
 /* The last asynchronous ticket that reads or writes each engine image (E5);
  * 0 when none can still be pending. */
@@ -2741,6 +2785,32 @@ static void vk_eng_release(void* user, u32 handle)
         static int churn = -1;
         if (churn < 0) { const char* e = getenv("PS3RECOMP_RSX_TARGET_CHURN"); churn = e && !strcmp(e, "1"); }
         const double t0 = churn ? vk_now_seconds() : 0.0;
+        if (vk_pin_release_nowait() && s_bat_on) {
+            pthread_mutex_lock(&s_pin_retire_mu);
+            const int room = s_pin_retire_n + s_pin_retire_reserved < VK_PIN_RETIRE;
+            if (room) s_pin_retire_reserved++;
+            pthread_mutex_unlock(&s_pin_retire_mu);
+            /* An empty batch still ends in the full dependency, so its ticket
+             * covers every earlier submission, presents included. */
+            if (room && !vk_bat_open() && !vk_bat_flush(0) && s_bat_last_ticket) {
+                s_eobj_pin_ticket[handle] = s_bat_last_ticket;
+                s_eobj_retired[handle] = 1;
+                s_pin_nowait++;
+                if (churn) {
+                    static double last; const double t1 = vk_now_seconds();
+                    if (!last) last = t1;
+                    if (t1 - last >= 2.0) {
+                        fprintf(stderr, "[target churn] pinned releases without waiting: %llu, waited fallbacks %llu, "
+                                "destroyed at last pin %llu, parked %llu, destroyed by reap %llu, parked now %u\n",
+                                s_pin_nowait, s_pin_fallback, s_pin_immediate, s_pin_deferred, s_pin_destroyed, s_pin_retire_n);
+                        last = t1;
+                    }
+                }
+                return;
+            }
+            if (room) { pthread_mutex_lock(&s_pin_retire_mu); s_pin_retire_reserved--; pthread_mutex_unlock(&s_pin_retire_mu); }
+            s_pin_fallback++;
+        }
         /* Batched: the native side destroys it after its own fences, which
          * do not cover original work recorded after its boundary; finish
          * that first. */
@@ -4200,6 +4270,7 @@ static int vk_e5_reap(u64 until, int wait)
         s_e5.count--;
     }
     if (s_bat_on) vk_bat_reap();
+    if (s_pin_retire_n) vk_pin_retire_reap(s_e5.completed, 0);
     /* Images released while their writer was in flight. */
     for (u32 i = 0; i < s_e5.nretire; ) {
         if (s_e5.retire[i].ticket <= s_e5.completed) {
@@ -4628,7 +4699,8 @@ static int vk_e5_defer_destroy(u32 handle)
 static void vk_e5_shutdown(void)
 {
     if (!s_vk.device) { memset(&s_e5, 0, sizeof s_e5); return; }
-    if (s_e5.ready || s_e5.nretire || s_e5.pipe) vk_device_idle();
+    if (s_e5.ready || s_e5.nretire || s_e5.pipe || s_pin_retire_n) vk_device_idle();
+    vk_pin_retire_reap(0, 1);
     for (u32 i = 0; i < s_e5.nretire; i++) vk_destroy_image(&s_e5.retire[i].im);
     for (u32 i = 0; i < VK_E5_SLOTS; i++) {
         vk_destroy_buffer(&s_e5.slot[i].words);
@@ -5752,6 +5824,16 @@ static void vulkan_image_release(void *user,uint64_t life,uint64_t id,uint64_t g
              * the final native pin is released after genuine native fences.
              * Never call vk_destroy_image here: it can wait for presentation. */
             vk_image *image=&s_eobj[id].im;
+            const u64 ticket=s_eobj_pin_ticket[id];s_eobj_pin_ticket[id]=0;
+            if(ticket){
+                /* Released without waiting: the room was reserved then. */
+                pthread_mutex_lock(&s_pin_retire_mu);s_pin_retire_reserved--;
+                if(ticket>__atomic_load_n(&s_e5.completed,__ATOMIC_ACQUIRE)){
+                    s_pin_retire[s_pin_retire_n].im=*image;s_pin_retire[s_pin_retire_n].ticket=ticket;
+                    s_pin_retire_n++;s_pin_deferred++;memset(image,0,sizeof *image);
+                }else s_pin_immediate++;
+                pthread_mutex_unlock(&s_pin_retire_mu);
+            }
             if(image->view)pvkDestroyImageView(s_vk.device,image->view,NULL);
             if(image->img)pvkDestroyImage(s_vk.device,image->img,NULL);
             if(image->mem)pvkFreeMemory(s_vk.device,image->mem,NULL);
