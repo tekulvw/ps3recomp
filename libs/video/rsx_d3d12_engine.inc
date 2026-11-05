@@ -1161,17 +1161,29 @@ static void e12_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, vo
 /* PS3RECOMP_D3D12_ENGINE_DUMP=N: every Nth presented surface (at most 16) is
  * read back and written to d3d12_engine_<present>.bmp in the working directory.
  * Diagnostic only; off by default. */
+static void e12_dump_one(u32 surface, const e12_obj* o, int all);
 static void e12_dump(u32 surface, const e12_obj* o)
 {
-    static long every = -1; static int written = 0;
+    static long every = -1; static int written = 0, all = -1;
     if (every < 0) { const char* e = getenv("PS3RECOMP_D3D12_ENGINE_DUMP"); every = e ? atol(e) : 0; }
-    if (every <= 0 || written >= 16 || s_e12.presents % (u64)every || o->fmt != DXGI_FORMAT_R8G8B8A8_UNORM) return;
+    if (all < 0) { const char* e = getenv("PS3RECOMP_D3D12_ENGINE_DUMP_ALL"); all = e && *e == '1'; }
+    if (every <= 0 || written >= 16 || s_e12.presents % (u64)every) return;
+    written++;
+    if (!all) { e12_dump_one(surface, o, 0); return; }
+    for (u32 i = 1; i < ENG12_MAX_OBJ; i++)   /* every live colour target, named by handle */
+        if (s_e12o[i].kind == E12_COLOR) e12_dump_one(i, &s_e12o[i], 1);
+}
+static void e12_dump_one(u32 surface, const e12_obj* o, int all)
+{
+    if (o->fmt != DXGI_FORMAT_R8G8B8A8_UNORM) return;
     const u32 w = o->w, h = o->h, pad = (w * 3u + 3u) & ~3u;
     u8* px = (u8*)malloc((size_t)w * h * 4u);
     u8* row = (u8*)calloc(1, pad);
     if (!px || !row) { free(px); free(row); return; }
     e12_readback(NULL, surface, 0, 0, w, h, px, w * 4u);
-    char name[64]; snprintf(name, sizeof name, "d3d12_engine_%06llu.bmp", (unsigned long long)s_e12.presents);
+    char name[64];
+    if (all) snprintf(name, sizeof name, "d3d12_engine_%06llu_h%u.bmp", (unsigned long long)s_e12.presents, surface);
+    else snprintf(name, sizeof name, "d3d12_engine_%06llu.bmp", (unsigned long long)s_e12.presents);
     FILE* f = fopen(name, "wb");
     if (f) {
         u8 hdr[54] = { 'B', 'M' }; const u32 size = 54u + pad * h;
@@ -1184,7 +1196,7 @@ static void e12_dump(u32 surface, const e12_obj* o)
             }
             fwrite(row, 1, pad, f);
         }
-        fclose(f); written++;
+        fclose(f);
     }
     free(px); free(row);
 }
