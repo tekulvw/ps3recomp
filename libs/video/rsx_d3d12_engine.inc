@@ -1281,8 +1281,29 @@ static void e12_clear_depth_stencil(void* user, u32 depth, u32 flags, float dept
 }
 
 /* ---- backend: present and readback --------------------------------------------- */
+/* PS3RECOMP_D3D12_ENGINE_RATE_SECONDS=N: every N seconds of wall time, one
+ * line of per-second rates over that window (presents are the frames the
+ * engine put on screen). Off by default. */
+static void e12_print_rates(void)
+{
+    static double every = -1; static LARGE_INTEGER freq, t0; static u64 p0, d0, s0, a0, f0;
+    if (every < 0) {
+        const char* e = getenv("PS3RECOMP_D3D12_ENGINE_RATE_SECONDS"); every = e ? atof(e) : 0;
+        QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0);
+    }
+    if (every <= 0) return;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const double dt = (double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
+    if (dt < every) return;
+    printf("[D3D12 engine] rate seconds=%.1f presents/s=%.1f draws/s=%.0f submits/s=%.0f async/s=%.0f waits/s=%.0f\n", dt,
+           (double)(s_e12.presents - p0) / dt, (double)(s_e12.draws - d0) / dt, (double)(s_e12.submits - s0) / dt,
+           (double)(s_e12.async_submits - a0) / dt, (double)(s_e12.flushes - f0) / dt);
+    fflush(stdout);
+    t0 = now; p0 = s_e12.presents; d0 = s_e12.draws; s0 = s_e12.submits; a0 = s_e12.async_submits; f0 = s_e12.flushes;
+}
 static void e12_print_stats(void)
 {
+    e12_print_rates();
     static long every = -1;
     if (every < 0) { const char* e = getenv("PS3RECOMP_D3D12_ENGINE_STATS_EVERY"); every = e ? atol(e) : 600; }
     if (every <= 0 || s_e12.presents % (u64)every) return;
