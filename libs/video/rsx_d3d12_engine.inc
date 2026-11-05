@@ -822,6 +822,18 @@ static u32 e12_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     if (cf == DXGI_FORMAT_UNKNOWN || block) { e12_count(E12_X_FORMAT); return 0; }
     if (!rt_count) rt_count = 1;
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
+    { /* PS3RECOMP_D3D12_ENGINE_HLSL_DIR=<existing dir>: keep each pipeline's program
+       * pair for offline inspection (diagnostic; the files are the guest's programs). */
+      static const char* dir = (const char*)1;
+      if (dir == (const char*)1) dir = getenv("PS3RECOMP_D3D12_ENGINE_HLSL_DIR");
+      static u32 n = 0;
+      if (dir && *dir && n < 64) {
+          char path[1024]; FILE* f;
+          snprintf(path, sizeof path, "%s/p%03u.vs.hlsl", dir, n);
+          if ((f = fopen(path, "wb"))) { fputs(vs_hlsl, f); fclose(f); }
+          snprintf(path, sizeof path, "%s/p%03u.ps.hlsl", dir, n++);
+          if ((f = fopen(path, "wb"))) { fputs(ps_hlsl, f); fclose(f); }
+      } }
     ID3DBlob* vs = e12_compile(vs_hlsl, "vs_5_0", E12_X_COMPILE_VS);
     if (!vs) return 0;
     /* PS3RECOMP_D3D12_ENGINE_FORCE_COLOR=1: every pixel program writes opaque
