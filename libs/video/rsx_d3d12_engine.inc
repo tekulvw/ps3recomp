@@ -904,7 +904,9 @@ static ID3D12PipelineState* e12_pso(e12_obj* P, int type)
                                : (rs->cull_face == 0x0404u || rs->cull_face == 0x0408u) ? D3D12_CULL_MODE_FRONT
                                                                                         : D3D12_CULL_MODE_BACK;
     d.RasterizerState.FrontCounterClockwise = rs->front_face == 0x0901u ? TRUE : FALSE;
-    d.RasterizerState.DepthClipEnable = TRUE;
+    { static int noclip = -1;   /* PS3RECOMP_D3D12_ENGINE_NO_DEPTH_CLIP=1: diagnostic */
+      if (noclip < 0) { const char* e = getenv("PS3RECOMP_D3D12_ENGINE_NO_DEPTH_CLIP"); noclip = e && *e == '1'; }
+      d.RasterizerState.DepthClipEnable = noclip ? FALSE : TRUE; }
     d.DepthStencilState.DepthEnable = rs->depth_test ? TRUE : FALSE;
     d.DepthStencilState.DepthWriteMask = (rs->depth_test && rs->depth_write) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     d.DepthStencilState.DepthFunc = e12_compare(rs->depth_func);
