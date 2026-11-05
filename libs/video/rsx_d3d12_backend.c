@@ -6869,6 +6869,25 @@ void rsx_d3d12_backend_present(void)
       if (gfb) has_display = 1; }
     if (s_composite_src) has_display = 1;
     if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
+    /* The same accounting as d3d12_present: this ticker is the present most
+     * titles reach (MAG's flips land here, rendering only to offscreen
+     * surfaces, so every flip was skipped with nothing logged). */
+    s_d3d12_stats.flips++;
+    {
+        const CellGcmDisplayInfo* di = cellGcmGetDisplayBufferByFlipIndex(cellGcmGetCurrentDisplayBufferId());
+        s_d3d12_stats.last_display_offset = di ? di->offset : 0;
+    }
+    if (s_d3d.initialized && has_display) s_d3d12_stats.flips_rendered++;
+    else if (s_d3d.initialized && s_d3d.draw_count) {
+        s_d3d12_stats.flips_deferred++;
+        for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
+            if (!s_d3d.draws[_i].is_clear && s_d3d12_stats.last_display_offset &&
+                s_d3d.draws[_i].rt_off == s_d3d12_stats.last_display_offset) {
+                s_d3d12_stats.deferred_with_display_draw++;
+                break;
+            }
+    }
+    d3d12_print_stats();
 
     /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
      * records all target an OFFSCREEN rt (rt_off != 0) presents without ever
