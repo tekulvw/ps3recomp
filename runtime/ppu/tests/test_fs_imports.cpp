@@ -14,6 +14,7 @@
  * Driven by tools/test_ppu_fs_imports.py (writes the stub ppu_recomp.h).
  */
 #include "ppu_fs.cpp"
+#include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
 #include <vector>
 
 /* ---- link stubs: nothing on the paths this test drives calls them ---- */

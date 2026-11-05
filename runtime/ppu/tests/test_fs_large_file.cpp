@@ -13,6 +13,7 @@
  *                                 the system temp directory)
  */
 #include "ppu_fs.cpp"
+#include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
 #ifdef _WIN32
 #  include <windows.h>
 #  include <winioctl.h>
