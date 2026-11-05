@@ -24,6 +24,7 @@
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
 #include "cellGcmSys.h"   /* cellGcmGetDisplayBufferByFlipIndex: the flipped buffer, for the drop counters */
+#include "rsx_draw_engine.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -6699,6 +6700,8 @@ static rsx_backend s_d3d12_backend = {0};
  * Public API
  * -----------------------------------------------------------------------*/
 
+#include "rsx_d3d12_engine.inc"
+
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
     memset(&s_d3d, 0, sizeof(s_d3d));
@@ -6758,7 +6761,10 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     s_d3d12_backend.draw_indexed      = d3d12_draw_indexed;
     s_d3d12_backend.bind_texture      = d3d12_bind_texture;
 
-    rsx_set_backend(&s_d3d12_backend);
+    /* One path at a time (the Vulkan and Metal rule): the FIFO walker feeds
+     * both the vtable and the register-file engine, so only one is registered. */
+    if (!e12_activate(width, height))
+        rsx_set_backend(&s_d3d12_backend);
 
     s_d3d.initialized = 1;
     s_d3d.last_fps_time = GetTickCount64();
@@ -6777,6 +6783,11 @@ void rsx_d3d12_backend_shutdown(void)
 #endif
     if (!s_d3d.initialized) return;
 
+    if (s_e12.active) {   /* the engine shuts its backend down */
+        rsx_draw_engine_shutdown();
+        rsx_draw_engine_set_backend(NULL);
+        s_e12.active = 0;
+    }
     wait_for_gpu();
 
     /* Release D3D12 resources */
@@ -6837,6 +6848,10 @@ int rsx_d3d12_backend_pump_messages(void)
 
 void rsx_d3d12_backend_present(void)
 {
+    if (s_e12.active) {   /* the engine presents the flipped display buffer itself */
+        rsx_draw_engine_present();
+        return;
+    }
     if (blink_dbg())
         printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u\n",
                s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);
