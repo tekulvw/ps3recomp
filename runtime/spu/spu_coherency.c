@@ -480,6 +480,11 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
     spu_lockline_unlock();
 }
 
+/* Read-only views for ppu_loader.cpp's PS3RECOMP_VM_FAST_ACCESSORS store path,
+ * which repeats spu_coh_is_reserved's unlocked bitmap test inline. */
+const unsigned char* const g_spu_coh_bitmap = s_coh_bitmap;
+const int* const g_spu_coh_armed = &s_coh_armed;
+
 int spu_coh_is_reserved(uint32_t addr)
 {
     if (!s_coh_armed) return 0;

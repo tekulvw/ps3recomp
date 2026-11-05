@@ -1744,6 +1744,100 @@ static struct VmInlineInit {
     }
 } s_vm_inline_init;
 
+/* PS3RECOMP_VM_FAST_ACCESSORS (CMake option, default OFF): the out-of-line
+ * guest accessors below start with a fast path that does the plain big-endian
+ * load or store and returns, when the access provably needs none of the work
+ * after it. The pinned lifts call these out of line for every load and store,
+ * and their bodies (range checks, a dozen getenv-guarded probes, per-access
+ * TLS writes, a spin detector) cost about 4 ns per access against 2 ns for
+ * the fast path. Off, none of this is compiled.
+ *
+ * A read takes the fast path when vm_inline_ok (no read diagnostic armed, the
+ * same gate as ppu_recomp.h's inline loads) and the address is in
+ * [0x10000, 0xE0000000) -- not the null page, not the raw SPU problem-state
+ * window whose loads pop mailboxes -- is not the GCM ref-poll word, and is
+ * inside ppu_vm_size. What it skips is diagnostic only:
+ *  - the [HOTREAD*] spin detectors print a line after 200000 consecutive reads
+ *    of one address (and, on Windows with PPU_SPINBT, a backtrace); they never
+ *    yield, sleep, wait or kick anything. PPU_HOTREAD disables the fast path.
+ *  - g_last_rd_addr/g_last_rd_val are read only by the Windows PT truncation
+ *    detector (itself PT-gated); PPU_WVAL does not consume them.
+ * A store takes the fast path when s_vm_fast_store (no store diagnostic in
+ * the environment: PPU_WVAL, PPU_WWATCH, PPU_WWATCH_DYNAMIC, PT), no sync-line
+ * probe is armed, no null-page sweep is being contained, the address is in
+ * the same window and range, is not the GCM PUT wake word, is outside the
+ * critical-write watch, and neither its first nor its last byte is on a line
+ * the coherency bitmap marks. A marked line (an SPU reservation or watch, or a
+ * PPU load-reserve) keeps the full VM_WRITE_COH path: shard or lock-line,
+ * notify, epoch. The bitmap is read without a lock exactly as
+ * spu_coh_is_reserved reads it today. */
+#if defined(PS3RECOMP_VM_FAST_ACCESSORS) && PS3RECOMP_VM_FAST_ACCESSORS && !defined(VM_SAMPLE_READS)
+#define VM_FAST_ACCESSORS 1
+extern "C" const unsigned char* const g_spu_coh_bitmap;
+extern "C" const int* const g_spu_coh_armed;
+extern "C" uint32_t g_barrier_sync_watch;
+extern "C" uint32_t g_gcm_consumer_put_wake_ea;
+static int s_vm_fast_store = 0;
+static struct VmFastStoreInit {
+    VmFastStoreInit() {
+        static const char* const vars[] = { "PPU_WVAL", "PPU_WWATCH", "PPU_WWATCH_DYNAMIC", "PT", 0 };
+        int d = 0;
+        for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
+        s_vm_fast_store = !d;
+        fprintf(stderr, "[vm] fast accessors: reads %s, stores %s\n",
+                vm_inline_ok ? "on" : "off (read diagnostic armed)",
+                s_vm_fast_store ? "on" : "off (store diagnostic armed)");
+    }
+} s_vm_fast_store_init;
+static inline int vm_fast_window(uint32_t ea, uint32_t n)
+{
+    return ea >= 0x10000u && ea < 0xE0000000u &&
+           (ppu_vm_size == 0 || (uint64_t)ea + n <= ppu_vm_size);
+}
+static inline int vm_fast_read(uint32_t ea, uint32_t n)
+{
+    return __builtin_expect(vm_inline_ok, 1) && vm_fast_window(ea, n) &&
+           ea != VM_HLE_INJECT_BASE + 0x2008u;
+}
+static inline int vm_coh_marked(uint32_t ea)
+{
+    const uint32_t l = ea >> 7;
+    return (g_spu_coh_bitmap[l >> 3] >> (l & 7)) & 1u;
+}
+static inline int vm_fast_store(uint32_t ea, uint32_t n)
+{
+    if (!__builtin_expect(s_vm_fast_store, 1) || g_barrier_sync_watch || g_null_sweep_hi) return 0;
+    if (!vm_fast_window(ea, n) || ea == g_gcm_consumer_put_wake_ea) return 0;
+    if (ps3_critical_write_watched(ea, n)) return 0;
+    if (*g_spu_coh_armed && (vm_coh_marked(ea) || vm_coh_marked(ea + n - 1))) return 0;
+    return 1;
+}
+static inline uint8_t vm_swap8(uint8_t v) { return v; }
+/* The accessors below are compiled under _slow names and wrapped: a fast path
+ * placed inside their bodies still paid the full frame (callee saves and, with
+ * a hardened toolchain, the stack-protector canary for their diagnostic
+ * buffers) on every call. The wrappers are small enough to have no frame and
+ * tail-call the original body when the fast path does not apply. */
+#define vm_read8  vm_read8_slow
+#define vm_read16 vm_read16_slow
+#define vm_read32 vm_read32_slow
+#define vm_read64 vm_read64_slow
+#define vm_write8  vm_write8_slow
+#define vm_write16 vm_write16_slow
+#define vm_write32 vm_write32_slow
+#define vm_write64 vm_write64_slow
+extern "C" {
+__attribute__((noinline)) uint8_t  vm_read8_slow (uint64_t a);
+__attribute__((noinline)) uint16_t vm_read16_slow(uint64_t a);
+__attribute__((noinline)) uint32_t vm_read32_slow(uint64_t a);
+__attribute__((noinline)) uint64_t vm_read64_slow(uint64_t a);
+__attribute__((noinline)) void vm_write8_slow (uint64_t a, uint8_t  v);
+__attribute__((noinline)) void vm_write16_slow(uint64_t a, uint16_t v);
+__attribute__((noinline)) void vm_write32_slow(uint64_t a, uint32_t v);
+__attribute__((noinline)) void vm_write64_slow(uint64_t a, uint64_t v);
+}
+#endif
+
 uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
 #ifdef VM_SAMPLE_READS
@@ -2156,6 +2250,30 @@ void vm_write64(uint64_t a, uint64_t v) {
     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
     if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
     v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
+#ifdef VM_FAST_ACCESSORS
+#undef vm_read8
+#undef vm_read16
+#undef vm_read32
+#undef vm_read64
+#undef vm_write8
+#undef vm_write16
+#undef vm_write32
+#undef vm_write64
+#define VM_FAST_LOAD_FN(T, name, swap, n) T name(uint64_t a) { const uint32_t ea = (uint32_t)a; \
+    if (__builtin_expect(vm_fast_read(ea, n), 1)) { T v; memcpy(&v, vm_base + ea, n); return swap(v); } \
+    return name##_slow(a); }
+#define VM_FAST_STORE_FN(T, name, swap, n) void name(uint64_t a, T v) { const uint32_t ea = (uint32_t)a; \
+    if (__builtin_expect(vm_fast_store(ea, n), 1)) { const T w = swap(v); memcpy(vm_base + ea, &w, n); return; } \
+    name##_slow(a, v); }
+VM_FAST_LOAD_FN(uint8_t,  vm_read8,  vm_swap8, 1)
+VM_FAST_LOAD_FN(uint16_t, vm_read16, __builtin_bswap16, 2)
+VM_FAST_LOAD_FN(uint32_t, vm_read32, __builtin_bswap32, 4)
+VM_FAST_LOAD_FN(uint64_t, vm_read64, __builtin_bswap64, 8)
+VM_FAST_STORE_FN(uint8_t,  vm_write8,  vm_swap8, 1)
+VM_FAST_STORE_FN(uint16_t, vm_write16, __builtin_bswap16, 2)
+VM_FAST_STORE_FN(uint32_t, vm_write32, __builtin_bswap32, 4)
+VM_FAST_STORE_FN(uint64_t, vm_write64, __builtin_bswap64, 8)
+#endif
 }
 
 /* ---- malloc allocation tracker (PS3_ALLOCTAG) -------------------------------

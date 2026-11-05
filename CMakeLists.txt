@@ -21,6 +21,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 option(PS3RECOMP_ORIGINAL_OBSERVER "Compile diagnostic source-qualified original execution witnesses" OFF)
+option(PS3RECOMP_VM_FAST_ACCESSORS "Give the out-of-line PPU guest accessors a fast path for accesses that need no probe, coherency or MMIO handling" OFF)
 option(PS3RECOMP_SPU_DECODE_CACHE_HEAP "Allocate the SPU interpreter decode cache per thread on first use instead of in static TLS" OFF)
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,11 @@ if(PS3RECOMP_ORIGINAL_OBSERVER)
     target_include_directories(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/diagnostics")
 endif()
 
+if(PS3RECOMP_VM_FAST_ACCESSORS)
+    # PUBLIC: the accessors live in runtime/ppu/ppu_loader.cpp, which the game
+    # target compiles, not this library.
+    target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_VM_FAST_ACCESSORS=1)
+endif()
 if(PS3RECOMP_SPU_DECODE_CACHE_HEAP)
     target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_SPU_DECODE_CACHE_HEAP=1)
 endif()
