@@ -17,6 +17,7 @@
 #include "spurs_workload_flag.h"
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+#include "../../runtime/memory/vm_watch_hooks.h"   /* pin pages the flag guard protects */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE policy-module run spans */
 #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
 #include <stdarg.h>
@@ -2233,6 +2234,10 @@ static void spurs_diag_guard_tick(struct SpursInst* si, u32 ea, int active)
         s_fg_word = vm_base + ea + 0x6C;
         if (region) s_fg_region = vm_base + region;
         s_fg_page = (uintptr_t)(region ? s_fg_region : s_fg_word) & ~(uintptr_t)4095u;
+        /* The guard owns this page's protection from here on: pin it out of
+         * the guest write watch so the watch never restores write access the
+         * guard removed. A no-op while the watch is off. */
+        vm_watch_forget_host((const void*)s_fg_page, 4096u, 0);
         struct sigaction sa; memset(&sa, 0, sizeof sa);
         sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
         sa.sa_sigaction = fg_segv; sigaction(SIGSEGV, &sa, &s_fg_prev_segv);
