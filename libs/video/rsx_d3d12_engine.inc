@@ -170,6 +170,29 @@ static void e12_retire(IUnknown* r)
     s_e12.retire[s_e12.retire_n].res = r;
     s_e12.retire[s_e12.retire_n++].fence = s_e12.fence_value + 1;   /* the next signal */
 }
+/* D3D12_DBG=1 (debug layer) + D3D12_IQ=1: print what the debug layer stored,
+ * after each submission; capped. Off by default. */
+static void e12_drain_info_queue(void)
+{
+    static int on = -1, printed = 0;
+    if (on < 0) on = getenv("D3D12_IQ") ? 1 : 0;
+    if (!on || printed > 200) return;
+    ID3D12InfoQueue* iq = NULL;
+    if (FAILED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device, &IID_ID3D12InfoQueue, (void**)&iq)) || !iq) return;
+    const UINT64 n = iq->lpVtbl->GetNumStoredMessages(iq);
+    for (UINT64 i = 0; i < n && printed <= 200; i++) {
+        SIZE_T len = 0;
+        iq->lpVtbl->GetMessage(iq, i, NULL, &len);
+        D3D12_MESSAGE* m = (D3D12_MESSAGE*)malloc(len);
+        if (m && SUCCEEDED(iq->lpVtbl->GetMessage(iq, i, m, &len)) && m->Severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+            printf("[D3D12 engine iq] sev=%d id=%d %s\n", (int)m->Severity, (int)m->ID, m->pDescription);
+            printed++;
+        }
+        free(m);
+    }
+    iq->lpVtbl->ClearStoredMessages(iq);
+    iq->lpVtbl->Release(iq);
+}
 /* Execute what is recorded and wait for it: the engine's synchronous contract.
  * After the wait every ring restarts and every retirement is due. */
 static int e12_submit_wait(void)
@@ -196,6 +219,7 @@ static int e12_submit_wait(void)
         }
     }
     e12_retire_now(v);
+    e12_drain_info_queue();
     s_e12.upload_next = 0;
     s_e12.srv_gpu_next = 0;
     s_e12.flushes++;
