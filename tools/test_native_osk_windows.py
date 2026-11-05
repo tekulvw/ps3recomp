@@ -32,7 +32,7 @@ def main():
         try:
             startup=subprocess.STARTUPINFO();startup.lpDesktop=work.name
             environment={k:v for k,v in os.environ.items() if not k.startswith(('PAD_','PS3RECOMP_OSK_','OSK_NATIVE_'))}
-            for mode in ('normal','prefill','unicode','control','legacy-pump','background'):
+            for mode in ('normal','prefill','unicode','control','legacy-pump'):
                 run_environment=environment.copy()
                 if mode=='prefill':run_environment['PS3RECOMP_OSK_INITIAL_TEXT']='PlayerRetail'
                 if mode=='unicode':run_environment['PS3RECOMP_OSK_INITIAL_TEXT']='AΩ🚀'
