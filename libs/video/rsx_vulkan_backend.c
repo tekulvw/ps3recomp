@@ -2736,6 +2736,11 @@ static void vk_eng_release(void* user, u32 handle)
     if ((s_eobj[handle].kind == VK_ENG_COLOR && !s_eobj[handle].snapshot) || s_eobj[handle].kind == VK_ENG_DEPTH)
         vk_eng_drop_framebuffers();
     if(s_eobj_native_pins[handle]) {
+        /* PS3RECOMP_RSX_TARGET_CHURN=1: count these waited releases and their
+         * wall time (diagnostic). */
+        static int churn = -1;
+        if (churn < 0) { const char* e = getenv("PS3RECOMP_RSX_TARGET_CHURN"); churn = e && !strcmp(e, "1"); }
+        const double t0 = churn ? vk_now_seconds() : 0.0;
         /* Batched: the native side destroys it after its own fences, which
          * do not cover original work recorded after its boundary; finish
          * that first. */
@@ -2744,6 +2749,16 @@ static void vk_eng_release(void* user, u32 handle)
          * outlive genuine native fences; their final callback must not wait. */
         vk_present_wait_gpu();
         s_eobj_retired[handle]=1;
+        if (churn) {
+            static unsigned long long n; static double ms, last;
+            const double t1 = vk_now_seconds(); n++; ms += (t1 - t0) * 1e3;
+            if (!last) last = t1;
+            if (t1 - last >= 2.0) {
+                fprintf(stderr, "[target churn] vulkan pinned releases: %llu in %.1f s, waited %.1f ms total (%.2f ms each)\n",
+                        n, t1 - last, ms, n ? ms / (double)n : 0.0);
+                n = 0; ms = 0; last = t1;
+            }
+        }
         return;
     }
     if (s_eobj[handle].kind == VK_ENG_COLOR && s_eobj[handle].snapshot) {
