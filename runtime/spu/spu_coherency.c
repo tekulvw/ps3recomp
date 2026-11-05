@@ -648,8 +648,10 @@ void spu_coh_ppu_store_unlock(uint32_t ea)
  * from where, and how often a holder was actually there to be told. Called
  * under the lock-line lock, so the table needs no atomics. Every two seconds
  * the busiest lines are printed with the last caller (an address in this
- * process; subtract the printed slide to symbolize). */
-#if defined(__APPLE__)
+ * process; subtract the printed slide to symbolize -- elsewhere than macOS the
+ * anchor is this function's runtime address, to compare with its symbol). */
+void spu_coh_notify_write(uint32_t ea);
+#if !defined(_WIN32)
 static int s_clh_on = -1;
 static struct { uint32_t line; unsigned long long n, held; uintptr_t site; } s_clh[4096];
 static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held)
@@ -661,7 +663,12 @@ static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held)
         break;
     }
     static uint64_t next;
+#if defined(__APPLE__)
     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
     if (now < next) return;
     next = now + 2000000000ull;
     unsigned top[12] = {0}; int nt = 0;
@@ -674,7 +681,11 @@ static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held)
             unsigned t = top[pos]; top[pos] = top[pos - 1]; top[pos - 1] = t;
         }
     }
+#if defined(__APPLE__)
     fprintf(stderr, "[coh-line] slide=0x%lx\n", (unsigned long)_dyld_get_image_vmaddr_slide(0));
+#else
+    fprintf(stderr, "[coh-line] anchor spu_coh_notify_write=0x%lx\n", (unsigned long)(uintptr_t)&spu_coh_notify_write);
+#endif
     for (int j = 0; j < nt; ++j)
         fprintf(stderr, "[coh-line] line=0x%08X n=%llu held=%llu site=0x%lx\n", s_clh[top[j]].line,
                 s_clh[top[j]].n, s_clh[top[j]].held, (unsigned long)s_clh[top[j]].site);
@@ -688,7 +699,7 @@ void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
     if (__builtin_expect(s_clh_on != 0, 0)) {
-#if defined(__APPLE__)
+#if !defined(_WIN32)
         if (s_clh_on < 0) s_clh_on = getenv("SPU_COH_LINE_HIST") ? 1 : 0;
 #endif
         if (s_clh_on) {
