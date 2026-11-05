@@ -782,6 +782,9 @@ extern "C" int  spu_coh_ppu_store_lock(uint32_t addr);
 extern "C" void spu_coh_ppu_store_unlock(uint32_t addr);
 extern "C" void spu_coh_line_shard_lock(uint32_t addr);
 extern "C" void spu_coh_line_shard_unlock(uint32_t addr);
+extern "C" int  spu_coh_ppu_live_tracking(void);
+extern "C" void spu_coh_ppu_live_add(uint32_t addr);
+extern "C" void spu_coh_ppu_live_drop(uint32_t addr);
 
 /* The architectural reservation belongs to the executing host thread. No
  * pointers are registered in coherence, so short-lived guest contexts cannot
@@ -797,14 +800,36 @@ static PPU_THREAD_LOCAL struct {
  * have no token; keep their existing ABI/behavior until regenerated. */
 static PPU_THREAD_LOCAL ppu_context* g_line_sc_ctx;
 
+/* PS3RECOMP_PPU_STORE_FASTPATH=1: the line this thread's newest
+ * load-reserve counted live (see spu_coh_ppu_live_add). Dropped when the
+ * store-conditional finishes or the next load-reserve replaces it. */
+static PPU_THREAD_LOCAL uint32_t g_live_line;
+static PPU_THREAD_LOCAL bool g_live_held;
+static inline void ppu_live_release(void)
+{
+    if (g_live_held) { g_live_held = false; spu_coh_ppu_live_drop(g_live_line); }
+}
+/* Caller holds the lock-line lock. Returns whether the shard was taken. */
+static inline bool ppu_live_begin(uint32_t addr)
+{
+    if (!spu_coh_ppu_live_tracking()) return false;
+    ppu_live_release();
+    spu_coh_line_shard_lock(addr);
+    spu_coh_ppu_live_add(addr);
+    g_live_line = addr; g_live_held = true;
+    return true;
+}
+
 extern "C" uint32_t ppu_load_reserve32(ppu_context* ctx, uint64_t ea)
 {
     uint32_t addr = (uint32_t)ea;
     spu_lockline_lock();
+    const bool live = ppu_live_begin(addr);
     uint64_t epoch = spu_coh_line_epoch(addr);
     uint32_t value = vm_read32(addr);
     ctx->reserve_addr = addr; ctx->reserve_value = value; ctx->reserve_valid = 1;
     g_line_reservation = {ctx, addr, epoch, true};
+    if (live) spu_coh_line_shard_unlock(addr);
     spu_lockline_unlock();
     return value;
 }
@@ -812,10 +837,12 @@ extern "C" uint64_t ppu_load_reserve64(ppu_context* ctx, uint64_t ea)
 {
     uint32_t addr = (uint32_t)ea;
     spu_lockline_lock();
+    const bool live = ppu_live_begin(addr);
     uint64_t epoch = spu_coh_line_epoch(addr);
     uint64_t value = vm_read64(addr);
     ctx->reserve_addr = addr; ctx->reserve_value = value; ctx->reserve_valid = 1;
     g_line_reservation = {ctx, addr, epoch, true};
+    if (live) spu_coh_line_shard_unlock(addr);
     spu_lockline_unlock();
     return value;
 }
@@ -1166,6 +1193,7 @@ extern "C" int ppu_store_conditional32(ppu_context* ctx, uint64_t ea, uint32_t v
     g_line_sc_ctx = saved;
     g_line_reservation.valid = false;
     ctx->reserve_valid = 0; ctx->reserve_addr = PPU_RESV_INVALID;
+    ppu_live_release();
     return ok;
 }
 extern "C" int ppu_store_conditional64(ppu_context* ctx, uint64_t ea, uint64_t val)
@@ -1179,6 +1207,7 @@ extern "C" int ppu_store_conditional64(ppu_context* ctx, uint64_t ea, uint64_t v
     g_line_sc_ctx = saved;
     g_line_reservation.valid = false;
     ctx->reserve_valid = 0; ctx->reserve_addr = PPU_RESV_INVALID;
+    ppu_live_release();
     return ok;
 }
 
