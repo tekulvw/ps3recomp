@@ -1144,13 +1144,15 @@ static void e12_draw(void* user, rsx_topology topology, const void* vertices, u3
           const float* v0 = (const float*)vertices;
           printf("[D3D12 engine draw] #%llu topo=%d verts=%u idx=%u stride=%u rt=%u(%ux%u) n=%u depth=%u vp=%.1f,%.1f %.1fx%.1f "
                  "sc=%ld,%ld-%ld,%ld z(test=%u write=%u func=%X) cull=%u/%X mask=%08X blend=%u v0=(%.3f %.3f %.3f %.3f) "
-                 "vsb=%u psb=%u c0=(%.3f %.3f %.3f %.3f)\n",
+                 "vsb=%u psb=%u c0=(%.3f %.3f %.3f %.3f) xf=(%.4f %.4f %.4f | %.4f %.4f %.4f)\n",
                  (unsigned long long)s_e12.draws, (int)topology, vertex_count, index_count, stride, s_e12.rt[0], w, h,
                  s_e12.nrt, s_e12.depth, vpt.TopLeftX, vpt.TopLeftY, vpt.Width, vpt.Height,
                  (long)sc.left, (long)sc.top, (long)sc.right, (long)sc.bottom, P->rs.depth_test, P->rs.depth_write,
                  P->rs.depth_func, P->rs.cull_enable, P->rs.cull_face, P->rs.color_mask, P->rs.blend_enable,
                  v0[0], v0[1], v0[2], v0[3], s_e12.vs_bytes, s_e12.ps_bytes,
-                 ((const float*)s_e12.vsc)[0], ((const float*)s_e12.vsc)[1], ((const float*)s_e12.vsc)[2], ((const float*)s_e12.vsc)[3]);
+                 ((const float*)s_e12.vsc)[0], ((const float*)s_e12.vsc)[1], ((const float*)s_e12.vsc)[2], ((const float*)s_e12.vsc)[3],
+                 ((const float*)s_e12.vsc)[2048], ((const float*)s_e12.vsc)[2049], ((const float*)s_e12.vsc)[2050],
+                 ((const float*)s_e12.vsc)[2052], ((const float*)s_e12.vsc)[2053], ((const float*)s_e12.vsc)[2054]);
       } }
     cl->lpVtbl->RSSetViewports(cl, 1, &vpt);
     cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
