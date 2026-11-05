@@ -54,6 +54,17 @@ static void opened(void){
     CHECK(osk_native_win32_input_active());
 }
 static void click(int id){HWND button=GetDlgItem(dialog(),id);CHECK(button!=NULL);SendMessageW(button,BM_CLICK,0,0);}
+/* Another thread's window holds the foreground, as when the game runs behind
+ * another application: the dialog is shown without activation. */
+static HWND other;static HANDLE other_ready;
+static DWORD WINAPI other_foreground(void* unused){
+    (void)unused;WNDCLASSW cls={0};cls.lpfnWndProc=parent_proc;cls.hInstance=GetModuleHandleW(NULL);cls.lpszClassName=L"OskOtherForeground";
+    RegisterClassW(&cls);
+    other=CreateWindowExW(0,cls.lpszClassName,L"Other application",WS_OVERLAPPEDWINDOW|WS_VISIBLE,700,0,320,240,NULL,NULL,cls.hInstance,NULL);
+    if(other){SetForegroundWindow(other);SetActiveWindow(other);SetFocus(other);}
+    SetEvent(other_ready);MSG m;while(GetMessageW(&m,NULL,0,0)>0){TranslateMessage(&m);DispatchMessageW(&m);}
+    return 0;
+}
 #endif
 int main(int argc,char**argv){
     legacy_pump=argc>1 && !strcmp(argv[1],"legacy-pump");
@@ -119,7 +130,14 @@ int main(int argc,char**argv){
     OskNativeRequest stale={0};stale.token=1;
     osk_native_open(&stale);pump_host();CHECK(!dialog() && !osk_native_win32_input_active());
     CHECK(!call(0x7FCFC915,UINT64_MAX,0x1000,0x1200));
+    HANDLE other_thread=NULL;
+    if(argc>1 && !strcmp(argv[1],"background")){
+        ShowWindow(parent,SW_SHOW);
+        other_ready=CreateEventW(NULL,TRUE,FALSE,NULL);other_thread=CreateThread(NULL,0,other_foreground,NULL,0,NULL);
+        CHECK(other_thread!=NULL && WaitForSingleObject(other_ready,2000)==WAIT_OBJECT_0 && other!=NULL);
+    }
     osk_native_open(&stale);opened();
+    if(other_thread)CHECK(GetForegroundWindow()!=dialog() && GetActiveWindow()!=dialog());
     if(argc>2 && !strcmp(argv[1],"control")){
         command_file(argv[2],1);pump_guest();CHECK(dialog()!=NULL);
         CHECK(GetFileAttributesA(argv[2])==INVALID_FILE_ATTRIBUTES);
@@ -127,6 +145,8 @@ int main(int argc,char**argv){
     }else osk_native_confirm(loaded_generation);
     osk_native_confirm(1);pump_host();
     CHECK(!dialog());pump_guest();CHECK(statuses[events-1]==0x503);unload(0,4);
+    if(other_thread){PostMessageW(other,WM_CLOSE,0,0);PostThreadMessageW(GetThreadId(other_thread),WM_QUIT,0,0);
+        WaitForSingleObject(other_thread,2000);CloseHandle(other_thread);}
     /* A guest worker returns before the owner thread creates the real UI. */
     vm_write32(0x1208,16);HANDLE worker=CreateThread(NULL,0,worker_load,NULL,0,NULL);CHECK(worker!=NULL);
     CHECK(WaitForSingleObject(worker,2000)==WAIT_OBJECT_0);DWORD worker_result=1;CHECK(GetExitCodeThread(worker,&worker_result));CloseHandle(worker);
