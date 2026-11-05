@@ -235,7 +235,10 @@ uint64_t vm_watch(uint32_t ea, uint32_t len)
     size_t first, last;
     if (!vm_watch_active() || !span(ea, len, &first, &last)) return 0;
     for (size_t p = first; p <= last; ++p)
-        if (LOAD8(&s_state[p]) & PINNED) return 0;
+        if (LOAD8(&s_state[p]) & PINNED) {
+            COUNT(refused, 1);
+            return 0;
+        }
     /* The epoch precedes the protection: a write after it is a later epoch. */
     const uint64_t epoch = BUMP();
     size_t run = 0, protected_pages = 0;
@@ -334,9 +337,9 @@ static void forget(uint32_t addr, uint32_t size, int writable)
             if (!writable) next |= PINNED;
         } while (!CAS8(&s_state[p], &st, next));
         if (st & WATCHED) {
-            /* Our read-only protection must not outlive the watch, whatever
-             * the runtime's own call does to an already committed page. */
-            if (writable) protect(p, 1, 1);
+            /* Our read-only protection must not outlive the watch: undo it,
+             * and let the caller's own protection change follow. */
+            protect(p, 1, 1);
             __atomic_store_n(&s_epoch[p], BUMP(), __ATOMIC_RELEASE);
             ++forgotten;
         }
@@ -367,4 +370,5 @@ void vm_watch_stats(vm_watch_stats_t* out)
     out->faults = __atomic_load_n(&s_stats.faults, __ATOMIC_RELAXED);
     out->notes = __atomic_load_n(&s_stats.notes, __ATOMIC_RELAXED);
     out->forgotten = __atomic_load_n(&s_stats.forgotten, __ATOMIC_RELAXED);
+    out->refused = __atomic_load_n(&s_stats.refused, __ATOMIC_RELAXED);
 }

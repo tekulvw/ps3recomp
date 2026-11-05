@@ -37,6 +37,15 @@
  * The watch works in host pages (16 KB on Apple Silicon, 4 KB elsewhere):
  * a write anywhere in a host page dirties the whole page. Pages the runtime
  * itself made non-writable (vm_protect) are never watched.
+ *
+ * Rule for SDK code that changes the protection of guest pages itself (for
+ * example a diagnostic write guard that mprotects a page and single-steps
+ * writes through it): call vm_watch_forget_host(page, size, 0) (or
+ * vm_watch_forget(ea, size, 0)) from vm_watch_hooks.h before its first
+ * protection change. That pins the pages: the watch releases them if it held
+ * them and refuses to arm them from then on (counted in `refused`), so the
+ * two never fight over one page's protection. A pin lasts until the runtime
+ * makes the pages writable again through vm_commit or vm_protect.
  */
 #ifndef VM_WATCH_H
 #define VM_WATCH_H
@@ -81,6 +90,8 @@ typedef struct {
     uint64_t faults;      /* writes caught on watched pages */
     uint64_t notes;       /* pages released by vm_note_write */
     uint64_t forgotten;   /* pages released by runtime protection changes */
+    uint64_t refused;     /* vm_watch calls refused: a page under an SDK-owned
+                           * protection (pinned) */
 } vm_watch_stats_t;
 void vm_watch_stats(vm_watch_stats_t* out);
 

@@ -1,7 +1,9 @@
 /* Optional guest write-watch hook (runtime/memory/vm_watch.h). A protection
- * change the runtime makes itself (vm_commit, vm_protect) takes the affected
- * pages out of the write watch first, so the watch never restores or keeps a
- * protection the runtime did not ask for. Inert until the watch is enabled. */
+ * change the runtime makes itself (vm_commit, vm_protect, or any SDK code that
+ * mprotects/VirtualProtects a guest page directly) takes the affected pages
+ * out of the write watch first, so the watch never restores or keeps a
+ * protection the runtime did not ask for. `writable == 0` pins the pages:
+ * never watched until made writable again. Inert until the watch is enabled. */
 #ifndef PS3_VM_WATCH_HOOKS_H
 #define PS3_VM_WATCH_HOOKS_H
 #include <stddef.h>

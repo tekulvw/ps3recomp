@@ -205,7 +205,15 @@ int main(int argc, char** argv)
     vm_base[c] = 3;
     assert(stats().faults == faults && stats().forgotten >= 1);
     assert(vm_protect_unleased(c, 16, 1, 0, 0) == CELL_OK);
+    const uint64_t refused = stats().refused;
     assert(vm_watch(c, 16) == 0);
+    assert(stats().refused == refused + 1);
+    /* An SDK component protecting a page itself pins it the same way. */
+    const uint32_t g = (uint32_t)(0x100000 + 20 * page);
+    assert(vm_watch(g, 16));
+    vm_watch_forget_host(vm_base + g, 16, 0);
+    assert(vm_watch(g, 16) == 0 && stats().refused == refused + 2);
+    vm_base[g] = 4; /* released (writable) when pinned */
     assert(vm_commit(c, 16) == CELL_OK);
     assert(vm_watch(c, 16) != 0);
 
