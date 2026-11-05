@@ -85,6 +85,7 @@ int SDL_QueueAudio(SDL_AudioDeviceID d,const void* pcm,Uint32 bytes) {
 }
 Uint32 SDL_GetQueuedAudioSize(SDL_AudioDeviceID d){assert(d==1);queue_queries++;return frames*2*sizeof(float);}
 const char* SDL_GetError(void){return "synthetic rejection";}
+const char* SDL_GetCurrentAudioDriver(void){return mode==9?"dummy":"fixture";}
 void SDL_Delay(Uint32 ms){(void)ms;}
 uint32_t sys_event_find_queue_by_key(uint64_t key){assert(key==42);return 7;}
 uint32_t sys_event_queue_create_direct(uint64_t k,int32_t n){(void)k;(void)n;return 7;}
@@ -119,7 +120,10 @@ int main(int argc,char** argv) {
     for(unsigned i=0;i<8;i++)fill_slot(i);
     s_notify_queues[0].in_use=1;s_notify_queues[0].key=42;
     s_sdl_audio_dev=mode==1?0:1;
-    if(mode==2 || mode==3)frames=1024;
+    if(mode==2 || mode==3 || mode==9)frames=1024;
+    /* 9: SDL's dummy driver with PS3RECOMP_AUDIO_DUMMY_CLOCK=1 paces on the clock even
+     * though its queue never drains, and nothing is queued to it. */
+    if(mode==9)setenv("PS3RECOMP_AUDIO_DUMMY_CLOCK","1",1);
     s_mix_thread_running=1;audio_mix_thread_func(NULL);
     printf("mode=%d elapsed_ns=%llu blocks=%u cursor=%llu submit=%llu peak_queue=%u max_batch=%u sleeps=%u queries=%u\n",mode,(unsigned long long)(now_ns-start_ns),notifications,(unsigned long long)p->read_index,(unsigned long long)submit_count,peak_queue,max_batch,sleeps,queue_queries);
     assert(sleeps>0 && sleeps<(mode==7?11000:1100));
@@ -129,6 +133,7 @@ int main(int argc,char** argv) {
     else if(mode==7){assert(notifications>=1874 && notifications<=1880);}
     else {assert(notifications>=186 && notifications<=193);}
     if(mode==1){assert(!submit_count && max_batch==1);}
+    if(mode==9){assert(!submit_count);}
     if(mode==8)assert(submit_count+30<notifications);
     if(mode==5){assert(stopped && restarted && p->read_index+17<notifications && p->read_index+21>notifications);}
     else assert(p->read_index==notifications);

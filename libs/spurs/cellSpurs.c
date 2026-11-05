@@ -19,6 +19,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE policy-module run spans */
 #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -138,13 +139,16 @@ static EventFlagSync* ef_sync_find(uint32_t ea)
 }
 
 static void spurs_commit_hook(uint32_t line);
+static void spurs_line_committed(uint32_t line);
 static EventFlagSync* ef_sync_alloc(uint32_t ea)
 {
     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
         if (!s_ef_sync[i].initialized) {
             s_ef_sync[i].ea = ea;
             { extern void (*g_spu_line_commit_hook)(uint32_t);
-              g_spu_line_commit_hook = spurs_commit_hook; }
+              g_spu_line_commit_hook = spurs_commit_hook;
+      extern void (*g_host_line_write_hook)(uint32_t);
+      g_host_line_write_hook = spurs_line_committed; }
 #ifdef _WIN32
             InitializeCriticalSection(&s_ef_sync[i].cs);
             InitializeConditionVariable(&s_ef_sync[i].cv);
@@ -475,11 +479,16 @@ static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
  * committed write to that line; one that raised nothing only costs a pass. The
  * kick flag covers a commit that lands while the coordinator is mid-pass. Called
  * with no lock-line lock held. */
+static int s_diag_on;
+static void spurs_diag_line_commit(struct SpursInst* si, u32 ea);
 static void spurs_line_committed(uint32_t line)
 {
     for (int i = 0; i < MAX_SPURS_INST; i++) {
         struct SpursInst* si = &s_inst[i];
         const u32 ea = __atomic_load_n(&si->ea, __ATOMIC_ACQUIRE);
+        if (s_diag_on > 0 && ea && __atomic_load_n(&si->kernel_live, __ATOMIC_ACQUIRE) &&
+            ((ea & ~127u) == line || ((ea + 0x80u) & ~127u) == line || ((ea + 0xD6Cu) & ~127u) == line))
+            spurs_diag_line_commit(si, ea);
         if (!ea || (ea & ~127u) != line || !__atomic_load_n(&si->kernel_live, __ATOMIC_ACQUIRE)) continue;
         __atomic_store_n(&si->kick, 1, __ATOMIC_RELEASE);
         WakeAllConditionVariable(&si->wake);
@@ -2083,6 +2092,231 @@ static WklPm* spurs_resolve_pm(u32 wid)
     return r->fn ? r : NULL;
 }
 
+/* PS3RECOMP_SPURS_DISPATCH_DIAG=<start s>:<seconds> (opt-in, off by default):
+ * numbers-only record of why the kernel does or does not dispatch each
+ * registered workload, and how each policy-module run ends, for <seconds>
+ * starting <start s> after the first kernel pass. Per-workload state lines are
+ * printed only when the observed tuple or the reason changes, and the whole
+ * window is capped, so a busy kernel cannot flood the log. Timestamps are the
+ * ftrace / critical-trace clock (ps3_ft_now) so the lines align with both.
+ * Reading the guest bytes has no side effects; nothing here alters dispatch. */
+static int spurs_ready_requests(u32 ea, u32 wid, u32 ready, u32 active, int target_mode);
+enum { SPURS_DIAG_CAP = 400000 };
+static int s_diag_read;
+static uint64_t s_diag_t0, s_diag_from, s_diag_to;
+static unsigned s_diag_lines;
+static u32 s_diag_last[MAX_SPURS_INST][CELL_SPURS_MAX_WORKLOAD];
+static int spurs_diag_active(void)
+{
+    if (!s_diag_read) {
+        s_diag_read = 1;
+        const char* e = getenv("PS3RECOMP_SPURS_DISPATCH_DIAG");
+        double start = 0, secs = 0;
+        s_diag_on = e && sscanf(e, "%lf:%lf", &start, &secs) == 2 && secs > 0;
+        if (s_diag_on) {
+            s_diag_t0 = ps3_ft_now();
+            s_diag_from = s_diag_t0 + (uint64_t)(start * 1e9);
+            s_diag_to = s_diag_from + (uint64_t)(secs * 1e9);
+            fprintf(stderr, "[spurs-diag] window start_ns=%llu end_ns=%llu\n",
+                    (unsigned long long)s_diag_from, (unsigned long long)s_diag_to);
+        }
+    }
+    if (!s_diag_on) return 0;
+    const uint64_t now = ps3_ft_now();
+    return now >= s_diag_from && now < s_diag_to &&
+           __atomic_load_n(&s_diag_lines, __ATOMIC_RELAXED) < SPURS_DIAG_CAP;
+}
+/* PS3RECOMP_SPURS_FLAG_GUARD=1 with the diagnostic window (Linux x86-64 only):
+ * for the window, write-protect the host page holding instance 0's receiver
+ * flag word, let each write through by single-stepping it, and report every
+ * write that turns a non-zero flag word into zero: host instruction offset in
+ * the executable (resolve offline), thread name and id. Most faults on that page
+ * are the ready-count traffic; they are counted, not printed.
+ * PS3RECOMP_SPURS_GUARD_EA=<hex EA> (with the window) guards that 128-byte region
+ * instead and reports every word it changes: offset, old and new value, writer. */
+#if defined(__linux__) && defined(__x86_64__)
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
+extern char __executable_start;
+enum { FG_REG_RIP = 16, FG_REG_EFL = 17 };   /* glibc x86-64 gregs indices */
+static uintptr_t s_fg_page;
+static const volatile uint8_t* s_fg_word;
+static int s_fg_state;                          /* 0 off, 1 armed, 2 finished */
+static struct sigaction s_fg_prev_segv, s_fg_prev_trap;
+static __thread uint32_t t_fg_pre;
+static const volatile uint8_t* s_fg_region;   /* PS3RECOMP_SPURS_GUARD_EA: 128-byte region, else NULL */
+static __thread uint8_t t_fg_snap[128];
+static __thread int t_fg_in_region;
+static unsigned s_fg_region_lines;
+static __thread uintptr_t t_fg_rip;
+static __thread int t_fg_step;
+static unsigned s_fg_faults, s_fg_zeroes;
+static uint32_t fg_word(void)
+{
+    return (uint32_t)s_fg_word[0] << 24 | (uint32_t)s_fg_word[1] << 16 | (uint32_t)s_fg_word[2] << 8 | s_fg_word[3];
+}
+static void fg_chain(struct sigaction* prev, int sig, siginfo_t* si, void* uc)
+{
+    if (prev->sa_flags & SA_SIGINFO) { if (prev->sa_sigaction) prev->sa_sigaction(sig, si, uc); return; }
+    if (prev->sa_handler == SIG_DFL || prev->sa_handler == SIG_IGN) { signal(sig, SIG_DFL); raise(sig); return; }
+    prev->sa_handler(sig);
+}
+static void fg_segv(int sig, siginfo_t* si, void* ucv)
+{
+    const uintptr_t a = (uintptr_t)si->si_addr;
+    if (s_fg_page && a >= s_fg_page && a < s_fg_page + 4096u) {
+        ucontext_t* uc = (ucontext_t*)ucv;
+        __atomic_fetch_add(&s_fg_faults, 1u, __ATOMIC_RELAXED);
+        t_fg_pre = fg_word();
+        t_fg_in_region = s_fg_region && a >= (uintptr_t)s_fg_region && a < (uintptr_t)s_fg_region + 128u;
+        if (t_fg_in_region) memcpy(t_fg_snap, (const void*)s_fg_region, 128u);
+        t_fg_rip = (uintptr_t)uc->uc_mcontext.gregs[FG_REG_RIP];
+        t_fg_step = 1;
+        mprotect((void*)s_fg_page, 4096u, PROT_READ | PROT_WRITE);
+        uc->uc_mcontext.gregs[FG_REG_EFL] |= 0x100;
+        return;
+    }
+    fg_chain(&s_fg_prev_segv, sig, si, ucv);
+}
+static void fg_trap(int sig, siginfo_t* si, void* ucv)
+{
+    if (!t_fg_step) { fg_chain(&s_fg_prev_trap, sig, si, ucv); return; }
+    ucontext_t* uc = (ucontext_t*)ucv;
+    t_fg_step = 0;
+    uc->uc_mcontext.gregs[FG_REG_EFL] &= ~0x100;
+    if (s_fg_region) {
+        if (t_fg_in_region) {
+            char name[17] = {0}; prctl(PR_GET_NAME, name, 0, 0, 0);
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            for (unsigned o = 0; o < 128u; o += 4u) {
+                const volatile uint8_t* q = s_fg_region + o;
+                const uint32_t was = (uint32_t)t_fg_snap[o] << 24 | (uint32_t)t_fg_snap[o + 1] << 16 | (uint32_t)t_fg_snap[o + 2] << 8 | t_fg_snap[o + 3];
+                const uint32_t is = (uint32_t)q[0] << 24 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 8 | q[3];
+                if (was == is || __atomic_fetch_add(&s_fg_region_lines, 1u, __ATOMIC_RELAXED) >= 100000u) continue;
+                char line[256];
+                const int n = snprintf(line, sizeof line,
+                    "[spurs-diag] t=%llu guard write off=0x%02X old=0x%08X new=0x%08X rip_off=0x%llX thread=%s tid=%ld\n",
+                    (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec, o, was, is,
+                    (unsigned long long)(t_fg_rip - (uintptr_t)&__executable_start), name, (long)syscall(SYS_gettid));
+                if (n > 0) { ssize_t w = write(2, line, (size_t)n); (void)w; }
+            }
+        }
+        if (__atomic_load_n(&s_fg_state, __ATOMIC_ACQUIRE) == 1) mprotect((void*)s_fg_page, 4096u, PROT_READ);
+        return;
+    }
+    const uint32_t now = fg_word();
+    if (t_fg_pre && !now && __atomic_fetch_add(&s_fg_zeroes, 1u, __ATOMIC_RELAXED) < 256u) {
+        char name[17] = {0}, line[256];
+        prctl(PR_GET_NAME, name, 0, 0, 0);
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        const int n = snprintf(line, sizeof line,
+            "[spurs-diag] t=%llu guard zeroed flag word pre=0x%08X rip_off=0x%llX thread=%s tid=%ld\n",
+            (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec, t_fg_pre,
+            (unsigned long long)(t_fg_rip - (uintptr_t)&__executable_start), name, (long)syscall(SYS_gettid));
+        if (n > 0) { ssize_t w = write(2, line, (size_t)n); (void)w; }
+    }
+    if (__atomic_load_n(&s_fg_state, __ATOMIC_ACQUIRE) == 1)
+        mprotect((void*)s_fg_page, 4096u, PROT_READ);
+}
+static void spurs_diag_guard_tick(struct SpursInst* si, u32 ea, int active)
+{
+    if (si != &s_inst[0] || s_fg_state == 2) return;
+    if (s_fg_state == 0 && active) {
+        const char* e = getenv("PS3RECOMP_SPURS_FLAG_GUARD");
+        const char* r = getenv("PS3RECOMP_SPURS_GUARD_EA");
+        const u32 region = r && *r ? (u32)strtoul(r, 0, 16) & ~127u : 0u;
+        if (!region && (!e || strcmp(e, "1"))) { s_fg_state = 2; return; }
+        s_fg_word = vm_base + ea + 0x6C;
+        if (region) s_fg_region = vm_base + region;
+        s_fg_page = (uintptr_t)(region ? s_fg_region : s_fg_word) & ~(uintptr_t)4095u;
+        struct sigaction sa; memset(&sa, 0, sizeof sa);
+        sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
+        sa.sa_sigaction = fg_segv; sigaction(SIGSEGV, &sa, &s_fg_prev_segv);
+        sa.sa_sigaction = fg_trap; sigaction(SIGTRAP, &sa, &s_fg_prev_trap);
+        __atomic_store_n(&s_fg_state, 1, __ATOMIC_RELEASE);
+        mprotect((void*)s_fg_page, 4096u, PROT_READ);
+        fprintf(stderr, "[spurs-diag] guard armed on 0x%08X\n", region ? region : ea + 0x6C);
+    } else if (s_fg_state == 1 && !active) {
+        __atomic_store_n(&s_fg_state, 2, __ATOMIC_RELEASE);
+        mprotect((void*)s_fg_page, 4096u, PROT_READ | PROT_WRITE);
+        fprintf(stderr, "[spurs-diag] guard disarmed faults=%u zeroes=%u\n",
+                __atomic_load_n(&s_fg_faults, __ATOMIC_RELAXED), __atomic_load_n(&s_fg_zeroes, __ATOMIC_RELAXED));
+    }
+}
+#else
+static void spurs_diag_guard_tick(struct SpursInst* si, u32 ea, int active) { (void)si; (void)ea; (void)active; }
+#endif
+static void spurs_diag_line(const char* fmt, ...)
+{
+    if (__atomic_fetch_add(&s_diag_lines, 1u, __ATOMIC_RELAXED) >= SPURS_DIAG_CAP) return;
+    va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+}
+/* A committed SPU atomic on a line holding the receiver-flag fields: report each change of the
+ * flag word (+0x6C: 0 = pending), receiver (+0x77), control (+0x74), eligible mask (+0xB0) and
+ * block word (+0xD6C), with the committing context's image, pc, link and the lifted
+ * streamed-job image whose code it was executing. */
+static u32 s_diag_flag[MAX_SPURS_INST];
+/* The kernel resets a delivered flag with a host store that no commit reports,
+ * so each kernel pass re-reads the fields; a later commit is then compared with
+ * what is in memory, not with the last commit. */
+static u32 spurs_diag_flag_key(u32 ea)
+{
+    return spurs_flag_be32(ea + 0x6C) ^ (u32)vm_base[ea + 0x77] << 8 ^ (u32)vm_base[ea + 0x74] << 16 ^
+           spurs_flag_be32(ea + 0xB0) * 0x9E3779B1u ^ spurs_flag_be32(ea + 0xD6C) * 0x85EBCA77u;
+}
+static void spurs_diag_line_commit(struct SpursInst* si, u32 ea)
+{
+    if (!spurs_diag_active()) return;
+    const int inst = (int)(si - s_inst);
+    const u32 flag = spurs_flag_be32(ea + 0x6C);
+    const u32 recv = vm_base[ea + 0x77], ctl = vm_base[ea + 0x74];
+    const u32 mask = spurs_flag_be32(ea + 0xB0), block = spurs_flag_be32(ea + 0xD6C);
+    const u32 key = spurs_diag_flag_key(ea);
+    if (key == s_diag_flag[inst]) return;
+    s_diag_flag[inst] = key;
+    extern int spu_commit_ctx_describe(uint32_t*, uint32_t*, uint32_t*, uint32_t*, int*);
+    uint32_t image = 0, pc = 0, lr = 0, spu = 0; int code_image = 0;
+    spu_commit_ctx_describe(&image, &pc, &lr, &spu, &code_image);
+    spurs_diag_line("[spurs-diag] t=%llu inst=%d flagword=0x%08X receiver=%u ctl=0x%02X mask=0x%08X block=0x%08X by_image=%u pc=0x%05X lr=0x%05X spu=%u job_image=%d\n",
+                    (unsigned long long)ps3_ft_now(), inst, flag, recv, ctl, mask, block, image, pc, lr, spu, code_image);
+}
+/* Reasons: 1 disabled, 2 not in state 2, 3 not this instance's or a taskset,
+ * 4 contention full (maxcont 0 or active >= maxcont), 5 policy module
+ * unresolved, 6 no request (ready/signal/flag), 7 requested. */
+static void spurs_diag_scan(struct SpursInst* si, u32 ea, u32 enabled, int target_mode)
+{
+    const int inst = (int)(si - s_inst);
+    s_diag_flag[inst] = spurs_diag_flag_key(ea);
+    for (u32 wid = 0; wid < CELL_SPURS_MAX_WORKLOAD; wid++) {
+        if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
+        const u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+        const u32 signal = (vm_read16(ea + SPURS_WKL_SIGNAL1) >> (15 - wid)) & 1u;
+        const u32 flag = spurs_flag_status(ea, wid, 0) ? 1u : 0u;
+        const u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
+        const u32 active = si->active[wid];
+        int why;
+        if (!(enabled & (0x80000000u >> wid))) why = 1;
+        else if (vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2) why = 2;
+        else if (s_workloads[wid].is_taskset) why = 3;
+        else if (!maxcont || active >= maxcont) why = 4;
+        else if (s_wkl_pm[wid].resolved < 0) why = 5;
+        else if (!spurs_ready_requests(ea, wid, ready, active, target_mode) && !signal && !flag) why = 6;
+        else why = 7;
+        const u32 key = ready | signal << 8 | flag << 9 | (active & 15u) << 10 | (maxcont & 15u) << 14 |
+                        (u32)si->idle[wid] << 18 | (u32)why << 24 | 1u << 31;
+        if (s_diag_last[inst][wid] == key) continue;
+        s_diag_last[inst][wid] = key;
+        spurs_diag_line("[spurs-diag] t=%llu inst=%d pass=%u wid=%u ready=%u signal=%u flag=%u active=%u maxcont=%u idle=%u why=%d fw=0x%08X recv=%u ctl=0x%02X blk=0x%08X\n",
+                        (unsigned long long)ps3_ft_now(), inst, si->pass_no, wid, ready, signal, flag,
+                        active, maxcont, si->idle[wid], why, spurs_flag_be32(ea + 0x6C), vm_base[ea + 0x77],
+                        vm_base[ea + 0x74], spurs_flag_be32(ea + 0xD6C));
+    }
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -2105,7 +2339,8 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         if (si->stopping && !slot->busy) break;
         ReleaseSRWLockExclusive(&si->lock);
         const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-        spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
+        const uint64_t diag_t0 = s_diag_on > 0 ? ps3_ft_now() : 0;
+        const int pm_rc = spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
         if (ft_t0) {
             extern void spu_ft_job_end(void);
@@ -2122,6 +2357,13 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         ef_line_end(slot->ea);
         if (polls) si->idle[wid] = 0;
         else if (si->idle[wid] < 4) si->idle[wid]++;
+        if (diag_t0 && spurs_diag_active()) {
+            extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited;
+            spurs_diag_line("[spurs-diag] t=%llu inst=%d return wid=%u spu=%u image=%d rc=%d polls=%u exited=%u run_us=%llu ready=%u active=%u idle=%u\n",
+                            (unsigned long long)ps3_ft_now(), (int)(si - s_inst), wid, slot->spu_num, slot->image_id, pm_rc, polls,
+                            g_spurs_pm_exited, (unsigned long long)((ps3_ft_now() - diag_t0) / 1000u),
+                            vm_read8(slot->ea + SPURS_WKL_READY1 + wid), si->active[wid], si->idle[wid]);
+        }
         slot->busy = 0;
         WakeAllConditionVariable(&si->wake);
     }
@@ -2174,6 +2416,11 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         AcquireSRWLockExclusive(&s_workload_registry_lock);
         si->pass_no++;
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+        if (s_diag_on > 0 || !s_diag_read) {
+            const int diag_active = spurs_diag_active();
+            if (diag_active) spurs_diag_scan(si, ea, enabled, target_mode);
+            if (s_diag_on > 0) spurs_diag_guard_tick(si, ea, diag_active);
+        }
         for (u32 sn = 0; sn < si->nspus; sn++) {
             struct SpursPmSlot* slot = &si->slots[sn];
             if (slot->busy) continue;
@@ -2227,6 +2474,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
                 ef_line_end(ea);
                 slot->busy = 1;
+                if (spurs_diag_active())
+                    spurs_diag_line("[spurs-diag] t=%llu inst=%d pass=%u dispatch wid=%u spu=%u ready=%u signal=%u active=%u\n",
+                                    (unsigned long long)ps3_ft_now(), (int)(si - s_inst), si->pass_no, wid, sn, ready,
+                                    (signal >> (15 - wid)) & 1u, si->active[wid]);
                 WakeAllConditionVariable(&si->wake);
                 break;
             }
@@ -2241,7 +2492,9 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
 {
     si->stopping = 0; si->cursor = si->pass_no = 0;
     { extern void (*g_spu_line_commit_hook)(uint32_t);
-      g_spu_line_commit_hook = spurs_commit_hook; }
+      g_spu_line_commit_hook = spurs_commit_hook;
+              extern void (*g_host_line_write_hook)(uint32_t);
+              g_host_line_write_hook = spurs_line_committed; }
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
     for (u32 sn = 0; sn < si->nspus; sn++) {

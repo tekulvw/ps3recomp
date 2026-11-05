@@ -703,6 +703,57 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
  * sample resolution, so the same memory declared without antialiasing is a
  * different layout, and drawing it into the larger target would squeeze the
  * frame into its left part. */
+/* PS3RECOMP_RSX_TARGET_CHURN=1 (diagnostic, off by default): count colour and
+ * depth target creations per guest address, aggregated by transition
+ * (kind, location, offset, old format/size -> new format/size), and print the
+ * busiest transitions plus per-flip totals every two seconds. Numbers only. */
+typedef struct { u32 kind, location, offset, ofmt, ow, oh, nfmt, nw, nh; unsigned long long n; } eng_churn_row;
+static int s_churn_on = -1;
+static eng_churn_row s_churn[256];
+static unsigned long long s_churn_creates, s_churn_releases, s_churn_flips, s_churn_t0;
+static int eng_churn_enabled(void)
+{
+    if (s_churn_on < 0) { const char* e = getenv("PS3RECOMP_RSX_TARGET_CHURN"); s_churn_on = e && !strcmp(e, "1"); }
+    return s_churn_on;
+}
+static void eng_churn_flip(void);
+static void eng_churn_note(u32 kind, u32 location, u32 offset, u32 ofmt, u32 ow, u32 oh,
+                           u32 nfmt, u32 nw, u32 nh, int released)
+{
+    if (!eng_churn_enabled()) return;
+    eng_churn_flip();   /* reports on time, whether or not flips reach this sink */
+    s_churn_creates++; s_churn_releases += released ? 1u : 0u;
+    for (u32 i = 0; i < 256; i++) {
+        eng_churn_row* r = &s_churn[i];
+        if (!r->n) { *r = (eng_churn_row){kind, location, offset, ofmt, ow, oh, nfmt, nw, nh, 0}; }
+        if (r->kind == kind && r->location == location && r->offset == offset && r->ofmt == ofmt &&
+            r->ow == ow && r->oh == oh && r->nfmt == nfmt && r->nw == nw && r->nh == nh) { r->n++; return; }
+    }
+}
+static void eng_churn_flip(void)
+{
+    if (!eng_churn_enabled()) return;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const unsigned long long now = (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+    if (!s_churn_t0) s_churn_t0 = now;
+    if (now - s_churn_t0 < 2000000000ull) return;
+    const double secs = (double)(now - s_churn_t0) / 1e9;
+    fprintf(stderr, "[target churn] %.1f s: engine flips=%llu creates=%.1f/s releases=%.1f/s\n", secs, s_churn_flips,
+            (double)s_churn_creates / secs, (double)s_churn_releases / secs);
+    for (int k = 0; k < 12; k++) {
+        int best = -1;
+        for (int i = 0; i < 256; i++) if (s_churn[i].n && (best < 0 || s_churn[i].n > s_churn[best].n)) best = i;
+        if (best < 0) break;
+        const eng_churn_row* r = &s_churn[best];
+        fprintf(stderr, "[target churn]   %s %u:0x%08X fmt %u %ux%u -> fmt %u %ux%u: %.1f/s\n",
+                r->kind == 2 ? "native-publish" : r->kind ? "depth" : "color", r->location, r->offset, r->ofmt, r->ow, r->oh, r->nfmt, r->nw, r->nh,
+                (double)r->n / secs);
+        s_churn[best].n = 0;
+    }
+    memset(s_churn, 0, sizeof s_churn);
+    s_churn_creates = s_churn_releases = s_churn_flips = 0; s_churn_t0 = now;
+}
+
 static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                           rsx_be_format want_fmt, u32 pitch, u32 aa_grid)
 {
@@ -747,6 +798,10 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;}
 
     eng_surface* s = &g.surfaces[slot];
+    if (slot < g.n_surfaces)
+        eng_churn_note(0, location, offset, (u32)s->fmt, s->w, s->h, (u32)want_fmt, want_w, want_h, s->handle != 0);
+    else
+        eng_churn_note(0, location, offset, ~0u, 0, 0, (u32)want_fmt, want_w, want_h, 0);
     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
@@ -1026,6 +1081,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;}
 
     eng_zdepth* z = &g.zdepths[slot];
+    if (slot < g.n_zdepths) eng_churn_note(1, location, offset, 0, z->w, z->h, 0, want_w, want_h, z->handle != 0);
+    else eng_churn_note(1, location, offset, ~0u, 0, 0, 0, want_w, want_h, 0);
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
     if (z->view) g.be->texture_release(g.be->user, z->view);
@@ -2730,18 +2787,18 @@ static int eng_color_feedback_compatible(const eng_surface* s,
 }
 
 static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
-                                       const rsx_dsp_texture* t)
+                                       const rsx_dsp_texture* t, const char* why)
 {
     static u32 logs;
     ENG_CHECKED_FAIL();
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
     if (PS3_LOG_FIRST(logs, 8))
-        fprintf(stderr, "[rsx engine] rejected colour feedback unit %u: "
+        fprintf(stderr, "[rsx engine] rejected colour feedback unit %u (%s): "
                 "target %ux%u fmt%u pitch%u, texture %ux%u fmt%02X pitch%u "
-                "dim%u levels%u cube%u color%u raster%u\n", unit, s->w, s->h, (u32)s->fmt,
+                "dim%u levels%u cube%u color%u raster%u remap%04X\n", unit, why, s->w, s->h, (u32)s->fmt,
                 s->pitch, t->width, t->height, t->format, t->pitch,
-                t->dimension, t->mipmaps, t->cubemap, sf.color_format, sf.raster_type);
+                t->dimension, t->mipmaps, t->cubemap, sf.color_format, sf.raster_type, t->remap & 0xffffu);
     return ENG_INVALID;
 }
 
@@ -3266,24 +3323,24 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             rsx_dsp_surface sf;
             rsx_dsp_get_surface(&g.rsx, &sf);
             if (!eng_color_feedback_compatible(s, &t, &sf))
-                return eng_color_feedback_failure(u, s, &t);
+                return eng_color_feedback_failure(u, s, &t, "incompatible layout");
             u32 k = 0;
             while (k < n_targets && target_slots[k] != (u32)surface_at) k++;
-            if (k == n_targets) return eng_color_feedback_failure(u, s, &t);
+            if (k == n_targets) return eng_color_feedback_failure(u, s, &t, "not a bound target");
             if (!feedback[k]) {
                 const u32 copy = g.be->color_snapshot(g.be->user, s->handle);
-                if (!copy) return eng_color_feedback_failure(u, s, &t);
+                if (!copy) return eng_color_feedback_failure(u, s, &t, "backend snapshot failed");
                 if (s->feedback) g.be->texture_release(g.be->user, s->feedback);
                 s->feedback = feedback[k] = copy;
             }
             if (g.be->surface_view) {
                 textures[u] = g.be->surface_view(g.be->user, feedback[k],
                                                t.remap & 0xffffu, t.format);
-                if (!textures[u]) return eng_color_feedback_failure(u, s, &t);
+                if (!textures[u]) return eng_color_feedback_failure(u, s, &t, "backend view failed");
             } else if ((t.remap & 0xffffu) == 0xaae4u) {
                 textures[u] = feedback[k];
             } else {
-                return eng_color_feedback_failure(u, s, &t);
+                return eng_color_feedback_failure(u, s, &t, "remap without views");
             }
             eng_texture_descriptor_log(u, &t, textures[u], "feedback", s);
             continue;
@@ -4283,10 +4340,29 @@ static void eng_present_core(u32 buffer_id)
     g.guest_draws = 0;
 }
 
+/* PS3RECOMP_RSX_SINGLE_PRESENT=1 (opt-in): one presenter per flip. The engine
+ * presents a flip when the FIFO reaches its flip method (sink_flip, the lowest
+ * latency); a host frame clock that then presents the same flip again through
+ * rsx_draw_engine_present only blitted and presented the same image twice, and
+ * with a blocking present held its thread an extra refresh. With the switch, a
+ * host present that follows an engine flip-time present with no newer flip in
+ * between is skipped and counted. Unset, both presents happen as before. */
+static int s_single_present = -1;
+static int s_flip_presented;
+static unsigned long long s_single_present_skipped;
+static int eng_single_present(void)
+{
+    if (s_single_present < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_SINGLE_PRESENT");
+        s_single_present = e && !strcmp(e, "1");
+    }
+    return s_single_present;
+}
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
     g.last_flip_buffer = arg & 7u;
+    if (eng_churn_enabled()) { s_churn_flips++; eng_churn_flip(); }
     /* RSX_ENG_COUNTS=1: engine resource slots every 600 flips, to see a
      * long session approach a capacity limit. */
     { static int on = -1; static u32 flips;
@@ -4296,6 +4372,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
                   (unsigned)g.n_surfaces, (unsigned)ENG_MAX_SURFACES,
                   (unsigned)g.n_zdepths, (unsigned)ENG_MAX_ZDEPTHS); }
     eng_present(g.last_flip_buffer);
+    if (eng_single_present()) s_flip_presented = 1;
 }
 
 /* ---- public API ---------------------------------------------------------- */
@@ -4549,6 +4626,12 @@ static void original_rsx_draw_engine_present(void)
      * re-present a double-buffered title's OTHER scanout. Presenting twice is
      * harmless either way -- the engine never clears the surface, so a second
      * present just blits the same image again. */
+    if (eng_single_present() && s_flip_presented) {
+        s_flip_presented = 0;
+        if (++s_single_present_skipped % 600ull == 0)
+            fprintf(stderr, "[rsx engine] single present: %llu host re-presents skipped\n", s_single_present_skipped);
+        return;
+    }
     eng_present(g.last_flip_buffer);
 }
 
@@ -5017,6 +5100,8 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
                 u32 j=0;for(;j<g.n_surfaces;++j)if(g.surfaces[j].location==k->location&&g.surfaces[j].offset==k->offset)break;
                 if(j==g.n_surfaces)++g.n_surfaces;
                 else {if(g.surfaces[j].feedback)g.be->texture_release(g.be->user,g.surfaces[j].feedback);
+                    eng_churn_note(2,k->location,k->offset,(u32)g.surfaces[j].fmt,g.surfaces[j].w,g.surfaces[j].h,
+                        (u32)s_native_images.images[n].color.fmt,s_native_images.images[n].color.w,s_native_images.images[n].color.h,g.surfaces[j].handle!=0);
                     if(g.surfaces[j].handle)g.be->color_target_release(g.be->user,g.surfaces[j].handle);}
                 g.surfaces[j]=s_native_images.images[n].color;s_native_images.images[n].color.handle=0;
 

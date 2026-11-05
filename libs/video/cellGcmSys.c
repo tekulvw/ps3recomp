@@ -757,6 +757,8 @@ static int gcm_flip_executed_take(void)
     if (s_flip_direct_pending) { s_flip_direct_pending = 0; return 1; }
     return 0;
 }
+static int s_flip_pacing = -1;              /* PS3RECOMP_GCM_FLIP_PACING: -1 unread, 0 fixed, 1 adaptive */
+static void gcm_flip_adaptive_poll(void);   /* below */
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -1319,8 +1321,10 @@ void cellGcmSetWaitFlip(void)
 #ifdef _WIN32
     __declspec(dllimport) void __stdcall Sleep(unsigned long);
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++) {
+        if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
         Sleep(1);
+    }
     /* A flip still WAITING after the bound is left to the tick. Forcing DONE
      * here skipped its completion: the tick only completes WAITING flips, so
      * the flip handler never ran for it, and inFAMOUS 2, whose handler writes
@@ -1359,6 +1363,7 @@ u32 cellGcmGetFlipStatus(void)
       if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
+    if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
     return s_flip_status;
 }
 
@@ -1392,6 +1397,58 @@ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
 
+/* PS3RECOMP_GCM_FLIP_PACING=adaptive (opt-in; unset keeps the fixed beat).
+ *
+ * By default a flip the drain has executed completes on the next 60 Hz beat
+ * (cellGcmTickFlip), so a frame that misses a beat waits for the one after,
+ * and everything the title orders behind its flip waits with it. Adaptive
+ * pacing completes an executed flip as soon as one display period has passed
+ * since the previous completion: at max(execution, last completion + 1/60 s).
+ * It still completes only flips the drain has executed, through the same
+ * pending-completion and delivery path as the beat (status, handler, the
+ * late-delivery and newer-request rules in ppu_gcm_pump), and never more than
+ * one per period. The vblank count, vblank interrupt and handler stay on the
+ * ticker. Completions are polled wherever one may have become possible: after
+ * each drain, on the beat, and while the guest waits on or polls the status. */
+#define GCM_FLIP_PERIOD_NS 16666667ull
+static int s_flip_done_any;
+static uint64_t s_flip_done_ns;
+static unsigned long long s_flip_adaptive_completions;
+static uint64_t gcm_flip_clock_now(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+#endif
+}
+static uint64_t (*s_flip_clock)(void) = gcm_flip_clock_now;   /* tests substitute it */
+static int gcm_flip_adaptive(void)
+{
+    if (s_flip_pacing < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_FLIP_PACING");
+        s_flip_pacing = e && !strcmp(e, "adaptive");
+        if (s_flip_pacing) fprintf(stderr, "[flip pacing] adaptive: an executed flip completes one period after the last\n");
+    }
+    return s_flip_pacing;
+}
+static void gcm_flip_adaptive_poll(void)
+{
+    if (!gcm_flip_adaptive()) return;
+    const uint64_t now = s_flip_clock();
+    FLIP_LOCK();
+    const int due = !s_flip_done_any || now - s_flip_done_ns >= GCM_FLIP_PERIOD_NS;
+    const int waiting = due && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
+    if (waiting) { s_flip_tick_seq = s_flip_req_seq; s_flip_done_ns = now; s_flip_done_any = 1; }
+    FLIP_UNLOCK();
+    if (!waiting) return;
+    GCM_PENDING_SET(2);
+    if (++s_flip_adaptive_completions % 600ull == 0)
+        fprintf(stderr, "[flip pacing] adaptive completions=%llu\n", s_flip_adaptive_completions);
+}
+
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
 static u32 s_fifo_getoff;   /* tentative: defined below */
@@ -1399,6 +1456,7 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
 void cellGcm_request_tick(void)
 {
     s_vblank_count++;
+    if (gcm_flip_adaptive()) { GCM_PENDING_SET(1); gcm_flip_adaptive_poll(); return; }
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
      * actually consumed up to `put`.
      *
@@ -1502,6 +1560,7 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
+    if (gcm_flip_adaptive()) { gcm_flip_adaptive_poll(); return; }
     /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
      * not happened yet. */
     FLIP_LOCK();
@@ -1595,6 +1654,16 @@ static void gph_label_published(const rsx_deferred_report *r){
     static const uint64_t edge[7]={100000,250000,500000,1000000,2000000,4000000,8000000};
     u32 b=0;while(b<7&&total>=edge[b])b++;s_gph.lab_hist[b]++;
 }
+/* PS3RECOMP_RSX_REPORT_SPURS_KICK=1: a published label wakes whoever watches
+ * its line (the SPURS coordinator, when a title signals a workload flag or
+ * ready count from the command stream) at once, as an SPU commit to that line
+ * does, instead of on the coordinator's next timed pass. Off by default. */
+static int gcm_report_spurs_kick(void){
+    static int on=-1;
+    if(on<0){const char *e=getenv("PS3RECOMP_RSX_REPORT_SPURS_KICK");on=e&&!strcmp(e,"1");}
+    return on;
+}
+static u32 s_lag_ea;   /* PS3RECOMP_RSX_LABEL_LAG target, defined below */
 static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     (void)user;u32 ea;
     /* A completion receipt carries no guest effect of its own. */
@@ -1604,6 +1673,8 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
         u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
         if(!vm_base||r->vm!=(uintptr_t)vm_base||(u64)r->ea+4u>limit)return 0;
         vm_write32(r->ea,r->argument);
+        if(gcm_report_spurs_kick()){extern void (*g_host_line_write_hook)(uint32_t);if(g_host_line_write_hook)g_host_line_write_hook(r->ea&~127u);}
+        if(s_lag_ea&&r->ea==s_lag_ea){static unsigned pn;if(pn++<20000u)fprintf(stderr,"[label-lag] t=%llu publish ea=0x%08X method=0x%04X value=0x%08X early=%u\n",(unsigned long long)ps3_critical_now_ns(),r->ea,r->context,r->argument,(unsigned)r->early);}
         ring_note(RSX_RING_VM_PUBLISH,r->ea,r->argument,r->ticket,r->context);
         if(r->start_ns){uint64_t w[5]={r->start_ns,r->ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,20,r->ea,0,w,5);}
         return 1;
@@ -1622,6 +1693,7 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
             if(g_resv_store_active>0)ppu_resv_break_store(address);
         }
         spu_coh_notify_write(ea);spu_lockline_unlock();
+        if(s_lag_ea&&ea<=s_lag_ea&&s_lag_ea-ea<16u){static unsigned rn;if(rn++<20000u)fprintf(stderr,"[label-lag] t=%llu publish ea=0x%08X method=0x1800 value=0x%08X early=%u\n",(unsigned long long)ps3_critical_now_ns(),s_lag_ea,r->argument,(unsigned)r->early);}
     }
     if(r->start_ns){uint64_t w[5]={r->start_ns,ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,PS3_CRITICAL_REPORT,ea,r->index,w,5);}
     return 1;
@@ -1836,10 +1908,40 @@ static int gcm_early_reference_receipt(void){
     r.capture=ps3_critical_capture_id();
     return gcm_reports_admit()&&rsx_reports_enqueue_early(&s_reports,&s_report_ops,r)&&rsx_reports_issue(&s_reports,&s_report_ops);
 }
+/* PS3RECOMP_RSX_LABEL_LAG=<hex EA> (opt-in diagnostic, numbers only): for label
+ * writes (semaphore releases of either class) that land on that guest word, print when the FIFO
+ * consumes each one (critical-trace clock) and the command's get offset; from
+ * the first such release, a sampler prints every change of the guest put
+ * pointer for 40 s, so the time put passed each release can be found offline. */
+static u32 s_lag_ea=1u;
+static int s_lag_sampler;
+static DWORD WINAPI gcm_lag_sampler(LPVOID unused){
+    (void)unused;u32 last=0xFFFFFFFFu;unsigned lines=0;
+    const uint64_t end=ps3_critical_now_ns()+40ull*1000000000ull;
+    while(ps3_critical_now_ns()<end&&lines<400000u){
+        const u32 put=vm_read32(GCM_CONTROL_GUEST_ADDR+0);
+        if(put!=last){last=put;lines++;fprintf(stderr,"[label-lag] t=%llu put=0x%08X\n",(unsigned long long)ps3_critical_now_ns(),put);}
+#ifdef _WIN32
+        Sleep(0);
+#else
+        {const struct timespec ts={0,20000};nanosleep(&ts,NULL);}
+#endif
+    }
+    return 0;
+}
+static void gcm_label_lag_note(u32 ea,u32 method,u32 value){
+    if(s_lag_ea==1u){const char *e=getenv("PS3RECOMP_RSX_LABEL_LAG");s_lag_ea=e&&*e?(u32)strtoul(e,0,16):0u;}
+    if(!s_lag_ea||ea!=s_lag_ea)return;
+    if(!s_lag_sampler){s_lag_sampler=1;HANDLE h=CreateThread(NULL,0,gcm_lag_sampler,NULL,0,NULL);if(h)CloseHandle(h);}
+    static unsigned n;
+    if(n++<20000u)fprintf(stderr,"[label-lag] t=%llu consume ea=0x%08X method=0x%04X value=0x%08X get=0x%08X\n",
+        (unsigned long long)ps3_critical_now_ns(),ea,method,value,s_fifo_getoff);
+}
 /* Label writes retain the existing value/byte-order semantics, but release
  * guest reuse only after the same genuine ordered GPU completion as reports,
  * unless early release applies them at their stream position. */
 static int gcm_defer_label_get(u32 ea,u32 value,u32 method,u32 fifo_ea,u32 get_before_publish){
+    if(s_lag_ea)gcm_label_lag_note(ea,method,value);
     if(!gcm_reports_admit())return 0;
     ring_note(RSX_RING_DECODE,ea,value,0,((uint64_t)method<<32)|fifo_ea);
     rsx_deferred_report r={0};r.operation=1;r.main_memory=1;
@@ -1883,6 +1985,7 @@ static void gcm_get_report(u32 argument){
     r.start_ns=ps3_critical_enabled()?ps3_critical_now_ns():0;
     r.main_memory=r.context!=GCM_REPORT_DMA_LOCAL;
     if(!gcm_report_destination(argument,r.context,&r.ea))goto invalid;
+    if(s_lag_ea&&r.main_memory&&r.ea<=s_lag_ea&&s_lag_ea-r.ea<16u)gcm_label_lag_note(s_lag_ea,0x1800u,argument);
     {static unsigned reports;if(reports++<6)printf("[GET_REPORT] type=%u idx=%u context=%08X ea=%08X%s\n",argument>>24,r.index,r.context,r.ea,r.main_memory?"":" host-only");}
     if(gcm_reports_can_defer()){
         if(!gcm_reports_admit())goto invalid;
@@ -3121,6 +3224,7 @@ void cellGcm_rsx_process_fifo(void)
         if (t1 - ft_t0 >= ps3_ft_min_ns())
             ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
     }
+    if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
 }
 
 /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
@@ -3924,6 +4028,12 @@ static void gcm_rsx_process_fifo_pass(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
+    if (s_lag_ea && s_lag_ea != 1u && s_lag_sampler) {
+        static unsigned ln;
+        if (ln++ < 60000u)
+            fprintf(stderr, "[label-lag] t=%llu pass why=%s start=0x%08X end=0x%08X put=0x%08X\n",
+                    (unsigned long long)ps3_critical_now_ns(), why, start_off, s_fifo_getoff, put);
+    }
     if (gcm_drain_debug()) {
         static int n2 = 0;
         if (n2++ % s_drain_every == 0)

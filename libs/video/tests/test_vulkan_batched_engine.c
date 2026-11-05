@@ -26,6 +26,7 @@ void vm_write32(uint32_t a,uint32_t v){(void)a;(void)v;assert(!"fixture cannot p
 void ps3_ms(const char* key){(void)key;}
 unsigned long long ps3_ms_now(void){return 0;}
 void cellGcm_replay_display_buffers_to_engine(void){}
+u32 cellGcm_flip_request_count(void){return 0;}
 rsx_frontend_device* rsx_frontend_vulkan_create(const rsx_frontend_vulkan_owner* owner){(void)owner;assert(!"legacy frontend must not be created");return NULL;}
 void rsx_frontend_close(rsx_frontend_device* device){assert(!device);}
 
@@ -49,7 +50,7 @@ static const char* PS =
 
 enum { TW = 96, TH = 64 };
 
-static u32 pipeline(int blend, int depth)
+static u32 pipeline_for(int blend, int depth, rsx_be_format format)
 {
     rsx_be_render_state rs; memset(&rs, 0, sizeof rs);
     rs.color_mask = 0xFFFFFFFFu;
@@ -58,8 +59,9 @@ static u32 pipeline(int blend, int depth)
     rs.depth_test = (u32)depth; rs.depth_write = (u32)depth; rs.depth_func = 0x0203;  /* LEQUAL */
     rsx_vertex_layout_plan lp; memset(&lp, 0, sizeof lp);
     lp.mask = 3; lp.stride = 32; lp.count = 2;
-    return vk_eng_pipeline_create(NULL, VS, PS, &rs, &lp, 32, RSX_BE_FMT_R8G8B8A8, 1);
+    return vk_eng_pipeline_create(NULL, VS, PS, &rs, &lp, 32, format, 1);
 }
+static u32 pipeline(int blend, int depth) { return pipeline_for(blend, depth, RSX_BE_FMT_R8G8B8A8); }
 
 static void quad(float* v, float x0, float y0, float x1, float y1, const float c[4])
 {
@@ -158,6 +160,18 @@ int main(int argc, char** argv)
     u32 z = vk_eng_depth_target_create(NULL, TW, TH);
     u32 p_blend = pipeline(1, 0), p_depth = pipeline(0, 1);
     CHECK(rt && rt2 && z && p_blend && p_depth, "targets and pipelines");
+    /* Float colour targets a title reduces into (1x1 RGBA32F and R32F). */
+    {
+        const rsx_be_format floats[2] = { RSX_BE_FMT_R32G32B32A32F, RSX_BE_FMT_R32F };
+        for (int k = 0; k < 2; k++) {
+            u32 bpp = 0;
+            const u32 ft = vk_eng_color_target_create(NULL, floats[k], 1, 1, NULL, 0);
+            const u32 fp = pipeline_for(1, 0, floats[k]);
+            CHECK(ft && fp, "float colour target and blended pipeline");
+            CHECK(vk_eng_render_pass(vk_eng_format(floats[k], &bpp), 1) != VK_NULL_HANDLE, "float render pass");
+            if (ft) vk_eng_release(NULL, ft);
+        }
+    }
     u8 tex[16 * 16 * 4]; texels(tex, 16, 16, 1);
     u32 t0 = vk_eng_texture_create(NULL, RSX_BE_FMT_R8G8B8A8, 16, 16, 1, 1, 0xAAE4u, 0x85u);
     vk_eng_texture_upload(NULL, t0, 0, 0, 16, 16, tex, 16 * 4, 16);

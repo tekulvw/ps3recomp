@@ -21,6 +21,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 option(PS3RECOMP_ORIGINAL_OBSERVER "Compile diagnostic source-qualified original execution witnesses" OFF)
+option(PS3RECOMP_VM_FAST_ACCESSORS "Give the out-of-line PPU guest accessors a fast path for accesses that need no probe, coherency or MMIO handling" OFF)
+option(PS3RECOMP_SPU_DECODE_CACHE_HEAP "Allocate the SPU interpreter decode cache per thread on first use instead of in static TLS" OFF)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -114,6 +116,15 @@ add_library(ps3recomp_runtime STATIC
 if(PS3RECOMP_ORIGINAL_OBSERVER)
     target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_ORIGINAL_OBSERVER=1)
     target_include_directories(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/diagnostics")
+endif()
+
+if(PS3RECOMP_VM_FAST_ACCESSORS)
+    # PUBLIC: the accessors live in runtime/ppu/ppu_loader.cpp, which the game
+    # target compiles, not this library.
+    target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_VM_FAST_ACCESSORS=1)
+endif()
+if(PS3RECOMP_SPU_DECODE_CACHE_HEAP)
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_SPU_DECODE_CACHE_HEAP=1)
 endif()
 
 target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_CRITICAL_WRITE_AVAILABLE=1)
@@ -342,6 +353,15 @@ if(WIN32)
         target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_WINDOWS=1)
     endif()
 endif()
+if(NOT WIN32 AND NOT APPLE)
+    # No toolkit dialog here. The headless host keeps the retail OSK lifecycle
+    # (no artificial Init, real sysutil events) and is confirmed only through
+    # OSK_NATIVE_CONTROL_FILE; see libs/misc/osk_headless.c.
+    option(PS3RECOMP_NATIVE_OSK_HEADLESS "Build the headless native OSK host (mailbox-confirmed)" OFF)
+    if(PS3RECOMP_NATIVE_OSK_HEADLESS)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_HEADLESS=1)
+    endif()
+endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
         -Wall -Wextra -Wno-unused-parameter
@@ -455,6 +475,20 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_spu_float_exact PRIVATE m)
         add_test(NAME spu_float_exact COMMAND test_spu_float_exact)
         set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
+        # The vector forms against the scalar per-lane forms, directly.
+        add_executable(test_spu_float_vector_scalar
+            runtime/spu/tests/test_spu_float_vector_scalar.c)
+        target_include_directories(test_spu_float_vector_scalar PRIVATE include runtime/spu)
+        target_compile_options(test_spu_float_vector_scalar PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_float_vector_scalar PRIVATE m)
+        add_test(NAME spu_float_vector_scalar COMMAND test_spu_float_vector_scalar 4)
+        set_tests_properties(spu_float_vector_scalar PROPERTIES TIMEOUT 300)
+        # On x86 both take the ISA the runtime and lifted code are built for, so the SSE4.1
+        # vector form is the one under test; no contraction, as in the runtime.
+        if(PS3RECOMP_HAS_MSSE41)
+            target_compile_options(test_spu_float_exact PRIVATE -msse4.1 -ffp-contract=off)
+            target_compile_options(test_spu_float_vector_scalar PRIVATE -msse4.1 -ffp-contract=off)
+        endif()
     endif()
     # Current colors are explicit shader inputs even when they equal the
     # hardware default; exercise both compact fetch entry points without a GPU.

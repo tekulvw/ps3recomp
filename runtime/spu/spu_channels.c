@@ -111,6 +111,80 @@ void spu_decrementer_observer_set(spu_decrementer_observer_fn observer)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* Called by host-side writers of guest memory (an RSX label publication) that
+ * opt in to waking line watchers; cellSpurs sets it to its line-commit wake. */
+void (*g_host_line_write_hook)(uint32_t line) = 0;
+/* The context whose atomic is being reported to g_spu_line_commit_hook, for the
+ * hook's opt-in diagnostics only (cellSpurs PS3RECOMP_SPURS_DISPATCH_DIAG). */
+static SPU_THREAD_LOCAL const spu_context* t_commit_ctx;
+int spu_commit_ctx_describe(uint32_t* image, uint32_t* pc, uint32_t* lr, uint32_t* spu, int* code_image)
+{
+    const spu_context* c = t_commit_ctx;
+    if (!c) return 0;
+    *image = (uint32_t)c->image_id; *pc = c->pc & SPU_LS_MASK;
+    *lr = c->gpr[0]._u32[0] & SPU_LS_MASK; *spu = c->spu_id;
+    *code_image = 0;
+    for (unsigned i = 0; i < 4; ++i)
+        if (c->resident_code[i].image_id && *pc >= c->resident_code[i].lsa &&
+            *pc - c->resident_code[i].lsa < c->resident_code[i].size) {
+            *code_image = c->resident_code[i].image_id;
+            break;
+        }
+    return 1;
+}
+/* PS3RECOMP_SPU_LINE_WATCH=<hex EA>[,<hex EA>...][:<start s>:<seconds>] (opt-in diagnostic, numbers only): every
+ * committed SPU atomic (PUTLLC success, PUTLLUC) on the 128-byte line holding
+ * that word, with a monotonic timestamp, SPU, image, SPURS workload (LS 0x1DC),
+ * pc, link, the streamed job image being run and the word's value after the
+ * commit. Capped. */
+static uint32_t s_line_watch = 1u;   /* 1: not read yet; else the first watched EA, 0 off */
+static uint32_t s_line_watch_eas[4];
+static unsigned s_line_watch_n;
+static void spu_line_watch_commit(const spu_context* c, uint32_t ea)
+{
+    static uint64_t from_ns, to_ns;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    if (s_line_watch == 1u) {
+        /* <hex EA>[,<hex EA>...up to 4][:<start s>:<seconds>], the window counted from this first call. */
+        const char* e = getenv("PS3RECOMP_SPU_LINE_WATCH");
+        s_line_watch = 0u;
+        if (e && *e) {
+            const char* p = e;
+            while (s_line_watch_n < 4) {
+                char* end = NULL;
+                const unsigned long v = strtoul(p, &end, 16);
+                if (end == p) break;
+                s_line_watch_eas[s_line_watch_n++] = (uint32_t)v & ~3u;
+                p = end;
+                if (*p != ',') break;
+                p++;
+            }
+            if (s_line_watch_n) s_line_watch = s_line_watch_eas[0] ? s_line_watch_eas[0] : 4u;
+        }
+        double start = 0, secs = 0;
+        const char* colon = e ? strchr(e, ':') : NULL;
+        if (colon && sscanf(colon + 1, "%lf:%lf", &start, &secs) == 2 && secs > 0) {
+            from_ns = now + (uint64_t)(start * 1e9); to_ns = from_ns + (uint64_t)(secs * 1e9);
+        } else { from_ns = 0; to_ns = UINT64_MAX; }
+    }
+    if (!s_line_watch || now < from_ns || now >= to_ns) return;
+    unsigned hit = 4u;
+    for (unsigned i = 0; i < s_line_watch_n; i++) if ((ea & ~127u) == (s_line_watch_eas[i] & ~127u)) { hit = i; break; }
+    if (hit == 4u) return;
+    static unsigned n;
+    if (__atomic_fetch_add(&n, 1u, __ATOMIC_RELAXED) >= 400000u) return;
+    const uint32_t pc = c->pc & SPU_LS_MASK;
+    int job = 0;
+    for (unsigned i = 0; i < 4; ++i)
+        if (c->resident_code[i].image_id && pc >= c->resident_code[i].lsa &&
+            pc - c->resident_code[i].lsa < c->resident_code[i].size) { job = c->resident_code[i].image_id; break; }
+    const uint8_t* w = vm_base + s_line_watch_eas[hit];
+    fprintf(stderr, "[spu-line-watch] t=%llu line=0x%08X spu=%u image=%d wid=%u pc=0x%05X lr=0x%05X job=%d word=0x%08X\n",
+            (unsigned long long)now, ea & ~127u, c->spu_id, c->image_id,
+            spu_ls_read32(c, 0x1DC), pc, c->gpr[0]._u32[0] & SPU_LS_MASK, job,
+            (uint32_t)w[0] << 24 | (uint32_t)w[1] << 16 | (uint32_t)w[2] << 8 | w[3]);
+}
 /* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
 void spu_taskset_line_committed(uint32_t line);
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
@@ -1051,7 +1125,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             ctx->atomic_stat ? SPU_DMA_ATOMIC_PUTLLC_FAILURE : SPU_DMA_ATOMIC_PUTLLC_SUCCESS);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
-            if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+            if (s_line_watch) spu_line_watch_commit(ctx, (uint32_t)ea);
+            if (g_spu_line_commit_hook) {
+                t_commit_ctx = ctx; g_spu_line_commit_hook(ea & ~127u); t_commit_ctx = NULL;
+            }
         }
         if(observing)spu_atomic_observe_end(ctx->atomic_stat);
         return 1;
@@ -1073,7 +1150,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
-        if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+        if (s_line_watch) spu_line_watch_commit(ctx, (uint32_t)ea);
+        if (g_spu_line_commit_hook) {
+            t_commit_ctx = ctx; g_spu_line_commit_hook(ea & ~127u); t_commit_ctx = NULL;
+        }
         if(observing)spu_atomic_observe_end(ctx->atomic_stat);
         return 1;
 

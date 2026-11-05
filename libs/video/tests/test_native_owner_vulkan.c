@@ -23,6 +23,7 @@ void vm_write32(uint32_t a,uint32_t v){(void)a;(void)v;assert(!"fixture cannot p
 void ps3_ms(const char* key){(void)key;assert(!"fixture issues no guest draws/flips");}
 unsigned long long ps3_ms_now(void){assert(!"fixture has no guest notification clock");return 0;}
 void cellGcm_replay_display_buffers_to_engine(void){}
+u32 cellGcm_flip_request_count(void){return 0;}
 /* The legacy SDK compute implementation is deliberately absent here. */
 rsx_frontend_device* rsx_frontend_vulkan_create(const rsx_frontend_vulkan_owner* owner){(void)owner;assert(!"legacy frontend must not be created");return NULL;}
 void rsx_frontend_close(rsx_frontend_device* device){assert(!device);}
@@ -99,6 +100,56 @@ static void check_queue_order(rsx_native_owner* first){
     pvkDestroyFence(s_vk.device,j.fence,NULL);pvkDestroyCommandPool(s_vk.device,j.pool,NULL);
     be->color_target_release(NULL,image);rsx_draw_engine_flush();
 }
+/* PS3RECOMP_VK_PIN_RELEASE_NOWAIT=1: the original release of a natively
+ * pinned colour target returns without waiting for the GPU or presentation;
+ * the image survives until both its last native pin and the GPU work recorded
+ * before the release are done; bounded parking falls back to waiting. Use
+ * after release (destroying an image a submission still uses) is caught by
+ * the required validation layer. */
+static void check_pin_release_nowait(rsx_native_owner* owner){
+    if(!vk_pin_release_nowait())return;
+    const rsx_draw_backend* be=&s_vk_engine_backend;
+    if(!s_bat_on){printf("pin release without waiting: not batched, release waits as before\n");return;}
+    /* Keep the GPU busy so that work recorded before the release is pending. */
+    uint32_t busy=be->depth_target_create(NULL,4096,4096);assert(busy);
+    uint32_t busy_view=be->depth_z24_view(NULL,busy,4096,4096,0xAAE4u,0xA5u);assert(busy_view);
+    uint32_t color=be->color_target_create(NULL,RSX_BE_FMT_R8G8B8A8,64,64,NULL,0);assert(color);
+    rsx_native_image image={.abi_version=RSX_NATIVE_IMAGE_ABI,.struct_size=sizeof(image)};
+    assert(rsx_vulkan_backend_borrow_image(owner->lifetime,color,&image)==0);
+    assert(image.retain(image.userdata,image.owner_lifetime,image.resource_id,image.resource_generation)==0);
+    const float green[4]={0,1,0,1};be->clear_color(NULL,color,green);          /* recorded, still in the batch */
+    const unsigned long long nowait=s_pin_nowait,fallback=s_pin_fallback;
+    const double t0=ms_now();be->color_target_release(NULL,color);const double released=ms_now()-t0;
+    assert(s_pin_nowait==nowait+1&&s_pin_fallback==fallback);
+    assert(s_eobj_retired[color]&&s_eobj_pin_ticket[color]);
+    const u64 ticket=s_eobj_pin_ticket[color];
+    /* The last native pin: destroyed now only if the release's ticket is done. */
+    const unsigned long long parked=s_pin_deferred,immediate=s_pin_immediate;
+    image.release(image.userdata,image.owner_lifetime,image.resource_id,image.resource_generation);
+    assert(s_pin_deferred+s_pin_immediate==parked+immediate+1);
+    assert(!s_eobj[color].im.img&&!s_eobj_retired[color]&&!s_eobj_pin_ticket[color]);
+    assert(be->submit_and_wait_checked(NULL,RSX_BE_FLUSH_GUEST_REFERENCE)==1);
+    assert(s_e5.completed>=ticket&&s_pin_retire_n==0);                        /* reaped once complete */
+    printf("pinned release without waiting: %.2f ms, then %s at the last pin\n",released,
+           s_pin_deferred>parked?"parked until its ticket completed":"destroyed at once");
+    /* Bounds: more pinned releases than parking room. */
+    enum{N=VK_PIN_RETIRE+8};rsx_native_image held[N];uint32_t handles[N];
+    const unsigned long long fallback0=s_pin_fallback;
+    for(int i=0;i<N;i++){
+        handles[i]=be->color_target_create(NULL,RSX_BE_FMT_R8G8B8A8,16,16,NULL,0);assert(handles[i]);
+        held[i]=(rsx_native_image){.abi_version=RSX_NATIVE_IMAGE_ABI,.struct_size=sizeof(held[i])};
+        assert(rsx_vulkan_backend_borrow_image(owner->lifetime,handles[i],&held[i])==0);
+        assert(held[i].retain(held[i].userdata,held[i].owner_lifetime,held[i].resource_id,held[i].resource_generation)==0);
+        be->clear_color(NULL,handles[i],green);be->color_target_release(NULL,handles[i]);
+        assert(s_pin_retire_n+s_pin_retire_reserved<=VK_PIN_RETIRE);
+    }
+    assert(s_pin_fallback==fallback0+(N-VK_PIN_RETIRE));                      /* the rest waited */
+    for(int i=0;i<N;i++)held[i].release(held[i].userdata,held[i].owner_lifetime,held[i].resource_id,held[i].resource_generation);
+    assert(s_pin_retire_reserved==0);
+    assert(be->submit_and_wait_checked(NULL,RSX_BE_FLUSH_GUEST_REFERENCE)==1&&s_pin_retire_n==0);
+    be->texture_release(NULL,busy_view);be->depth_target_release(NULL,busy);
+    printf("pin release bounds: %d releases, %llu waited when the parking was full, all destroyed\n",N,s_pin_fallback-fallback0);
+}
 int main(int argc,char** argv){
     if(argc!=4){fprintf(stderr,"usage: owner_fixture REQUIRE_HARDWARE VENDOR_ID DEVICE_ID\n");return 2;}
     int hardware=atoi(argv[1]);uint32_t vendor=(uint32_t)strtoul(argv[2],NULL,0),device=(uint32_t)strtoul(argv[3],NULL,0);
@@ -160,6 +211,7 @@ int main(int argc,char** argv){
         be->texture_release(NULL,view);be->depth_target_release(NULL,depth);be->color_target_release(NULL,color);
         printf("direct present boundary accepted (present pending at boundary: %d)\n",was_pending);
     }
+    check_pin_release_nowait(&first);
     check_queue_order(&first);
     void* original=first.device;rsx_vulkan_backend_shutdown();assert((void*)s_vk.device==original);
     assert(rsx_vulkan_backend_owner_shutdown_requested(first.lifetime)==1);

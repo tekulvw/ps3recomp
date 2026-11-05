@@ -480,6 +480,11 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
     spu_lockline_unlock();
 }
 
+/* Read-only views for ppu_loader.cpp's PS3RECOMP_VM_FAST_ACCESSORS store path,
+ * which repeats spu_coh_is_reserved's unlocked bitmap test inline. */
+const unsigned char* const g_spu_coh_bitmap = s_coh_bitmap;
+const int* const g_spu_coh_armed = &s_coh_armed;
+
 int spu_coh_is_reserved(uint32_t addr)
 {
     if (!s_coh_armed) return 0;
@@ -561,6 +566,63 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     }
 }
 
+/* PS3RECOMP_PPU_STORE_FASTPATH=1: a plain PPU store to a PPU-only line skips
+ * the reservation break and the epoch bump when no PPU reservation is live on
+ * the line. Off (the default), every shard-path store does both, as before.
+ *
+ * Why it is safe. The only reservations the shard path's notify serves are PPU
+ * load-reserves (ppu_load_reserve32/64): a line with an SPU holder or a watch
+ * never takes the shard path (spu_coh_ppu_store_lock re-checks that under the
+ * shard). With tracking on, a load-reserve, while holding the lock-line lock
+ * AND the line's shard,
+ *   1. counts itself in s_ppu_live (spu_coh_ppu_live_add), then
+ *   2. reads the line's epoch and the reserved value,
+ * and the count stays up until that thread's store-conditional has finished or
+ * it load-reserves again (spu_coh_ppu_live_drop). A shard-path store writes
+ * guest memory and reads the count inside one shard critical section. The two
+ * critical sections exclude each other, so either
+ *   - the load-reserve ran first: the store sees the count and breaks and bumps
+ *     exactly as before, and the store-conditional, which checks the epoch and
+ *     compares-and-swaps under the same shard, fails; or
+ *   - the store ran first: the load-reserve's value read sees the store, so
+ *     the reservation already includes it and there is nothing to break.
+ * No fences are needed beyond the shard's acquire/release, and a store can
+ * never land inside a store-conditional's check-and-swap window because both
+ * still hold the shard. A count that is too high (a slot shared by two lines,
+ * a load-reserve whose thread never issued the store-conditional) only keeps
+ * the slow path; a drop happens after its reservation is already unusable
+ * (the thread's token is consumed or replaced), so a stale low count cannot
+ * expose a live reservation. The slot index is the line number modulo a
+ * multiple of SPU_COH_PPU_SHARDS, so every line sharing a slot also shares
+ * that slot's shard. */
+#define SPU_COH_PPU_LIVE_SLOTS 65536u
+static uint32_t s_ppu_live[SPU_COH_PPU_LIVE_SLOTS];
+static int s_ppu_live_on = -1;
+static inline uint32_t* spu_coh_ppu_live_slot(uint32_t ea)
+{
+    return &s_ppu_live[(ea >> SPU_COH_LINE_SHIFT) & (SPU_COH_PPU_LIVE_SLOTS - 1u)];
+}
+int spu_coh_ppu_live_tracking(void)
+{
+    int on = __atomic_load_n(&s_ppu_live_on, __ATOMIC_RELAXED);
+    if (__builtin_expect(on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_PPU_STORE_FASTPATH");
+        on = e && !strcmp(e, "1");
+        __atomic_store_n(&s_ppu_live_on, on, __ATOMIC_RELAXED);
+        if (on) { fprintf(stderr, "[spu-coh] PPU store fast path on\n"); fflush(stderr); }
+    }
+    return on;
+}
+/* Caller holds ea's shard (and the lock-line lock). */
+void spu_coh_ppu_live_add(uint32_t ea)
+{
+    __atomic_fetch_add(spu_coh_ppu_live_slot(ea), 1u, __ATOMIC_RELAXED);
+}
+void spu_coh_ppu_live_drop(uint32_t ea)
+{
+    __atomic_fetch_sub(spu_coh_ppu_live_slot(ea), 1u, __ATOMIC_RELEASE);
+}
+
 int spu_coh_ppu_store_lock(uint32_t ea)
 {
     if (spu_coh_line_spu(ea)) return 0;
@@ -571,6 +633,12 @@ int spu_coh_ppu_store_lock(uint32_t ea)
 }
 void spu_coh_ppu_store_unlock(uint32_t ea)
 {
+    /* Still inside the shard critical section that wrote the line. */
+    if (spu_coh_ppu_live_tracking() &&
+        !__atomic_load_n(spu_coh_ppu_live_slot(ea), __ATOMIC_RELAXED)) {
+        spu_coh_line_shard_unlock(ea);
+        return;
+    }
     ppu_resv_break_line(ea);
     epoch_written(ea & ~127u);
     spu_coh_line_shard_unlock(ea);

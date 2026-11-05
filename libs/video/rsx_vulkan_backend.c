@@ -61,6 +61,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "metal_frame_rate.h"   /* portable bounded present-rate statistics */
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 #include "vulkan/rsx_vk_depth_z24_comp.spv.h"
@@ -263,6 +264,11 @@ typedef struct vk_state {
     u32              presented;
     const char*      dump_path;
     u32              dump_every;       /* write every nth presented frame */
+    /* PS3RECOMP_VK_FPS=1: once a second, guest presents and window present
+     * calls. Window times are host clock readings when vkQueuePresentKHR
+     * returns, not compositor presentation timestamps. present_mu held. */
+    int              fps_on;
+    MetalFrameRate   fps;
 } vk_state;
 
 static vk_state s_vk;
@@ -289,6 +295,8 @@ enum { VK_RET_IMAGE = 1, VK_RET_BUFFER, VK_RET_SPARE, VK_RET_FRAMEBUFFER, VK_RET
 static int vk_bat_begin_op(void);
 static int vk_bat_end_op(void);
 static int vk_bat_flush(int wait);
+static int vk_bat_open(void);
+static u64 s_bat_last_ticket;
 static int vk_bat_retire(int kind, const void* object);
 static void vk_bat_reap(void);
 static int vk_sync(void);
@@ -599,6 +607,7 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
 }
 
 static void vk_present_wait_gpu(void);
+static double vk_now_seconds(void);
 
 static void vk_destroy_image_now(vk_image* im)
 {
@@ -2204,8 +2213,37 @@ static void vk_present_window(void)
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
     r = vk_queue_present(&pi);
+    if (s_vk.fps_on && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR))
+        metal_frame_rate_presented(&s_vk.fps, vk_now_seconds());
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
+}
+
+static double vk_now_seconds(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+/* present_mu held. Same line shape as the Metal backend's, plus the clock. */
+/* display/guest count host presents (every vkQueuePresentKHR, so a frame shown
+ * twice counts twice); guest_flips is the guest's own flip requests per second
+ * over the same interval (cellGcm_flip_request_count): the frame rate the title
+ * actually produced. */
+u32 cellGcm_flip_request_count(void);
+static void vk_fps_report(void)
+{
+    static u32 last_requests;
+    static double last_requests_at;
+    const double now = vk_now_seconds();
+    if (now - s_vk.fps.epoch < 1.0) return;
+    MetalFrameRateSample r = metal_frame_rate_sample(&s_vk.fps, now);
+    const u32 requests = cellGcm_flip_request_count();
+    const double flips = last_requests_at > 0.0 && now > last_requests_at
+        ? (double)(u32)(requests - last_requests) / (now - last_requests_at) : 0.0;
+    last_requests = requests; last_requests_at = now;
+    fprintf(stderr, "[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f clock=host_present_call window=%d guest_flips=%.2f\n",
+            r.display_fps, r.guest_fps, r.average_ms, r.p95_ms, r.worst_ms, r.age_seconds, s_vk.windowed && s_vk.swapchain ? 1 : 0, flips);
 }
 
 static void vk_dump_ppm(const unsigned char* rgba)
@@ -2293,7 +2331,9 @@ static void vk_present_complete_locked(void)
     s_vk.presented++;
     s_vk.present_readback_count++;
     if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
+    if (s_vk.fps_on) metal_frame_rate_guest(&s_vk.fps);
     vk_present_window();
+    if (s_vk.fps_on) vk_fps_report();
 }
 
 /* present_mu held: a previous read-back present finished, the next ring
@@ -2393,6 +2433,7 @@ static void vk_present_record_end(VkCommandBuffer cb)
         s_vk.present_order = 1;
         s_vk.presented++;
         s_vk.present_direct++;
+        if (s_vk.fps_on) metal_frame_rate_guest(&s_vk.fps);
         if (window) {
             VkPresentInfoKHR pi = {
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -2400,9 +2441,12 @@ static void vk_present_record_end(VkCommandBuffer cb)
                 .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
             };
             VkResult r = vk_queue_present(&pi);
+            if (s_vk.fps_on && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR))
+                metal_frame_rate_presented(&s_vk.fps, vk_now_seconds());
             if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
             else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
         }
+        if (s_vk.fps_on) vk_fps_report();
         return;
     }
     vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -2482,6 +2526,48 @@ static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
 static uint64_t s_eobj_generation[VK_ENG_MAX_OBJ],s_eobj_next_generation;
 static uint32_t s_eobj_native_pins[VK_ENG_MAX_OBJ];
 static uint8_t s_eobj_retired[VK_ENG_MAX_OBJ];
+/* PS3RECOMP_VK_PIN_RELEASE_NOWAIT=1 (opt-in): the original release of an
+ * image the native side still pins neither flushes-and-waits nor waits for
+ * presentation. It submits the open batch without waiting, ending in a full
+ * dependency on everything submitted before it, and keeps that batch's ticket
+ * with the image. When the last native pin goes (after the native side's own
+ * fences), the image is destroyed at once if that ticket has completed, or
+ * parked on a bounded list that the completion reap destroys later. With no
+ * room left on the list, the release waits as before. */
+#define VK_PIN_RETIRE 64u
+typedef struct { vk_image im; u64 ticket; } vk_pin_retired;
+static vk_pin_retired s_pin_retire[VK_PIN_RETIRE];
+static u32 s_pin_retire_n, s_pin_retire_reserved;
+static pthread_mutex_t s_pin_retire_mu = PTHREAD_MUTEX_INITIALIZER;
+static u64 s_eobj_pin_ticket[VK_ENG_MAX_OBJ];
+static unsigned long long s_pin_nowait, s_pin_fallback, s_pin_immediate, s_pin_deferred, s_pin_destroyed;
+static int vk_pin_release_nowait(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_PIN_RELEASE_NOWAIT"); on = e && !strcmp(e, "1"); }
+    return on;
+}
+/* Destroy without the presentation wait: the caller has established that no
+ * GPU work may still use the image. */
+static void vk_image_destroy_unused(vk_image* im)
+{
+    if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
+    if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
+    if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
+    memset(im, 0, sizeof *im);
+}
+static void vk_pin_retire_reap(u64 completed, int all)
+{
+    pthread_mutex_lock(&s_pin_retire_mu);
+    for (u32 i = 0; i < s_pin_retire_n; ) {
+        if (all || s_pin_retire[i].ticket <= completed) {
+            vk_image_destroy_unused(&s_pin_retire[i].im);
+            s_pin_retire[i] = s_pin_retire[--s_pin_retire_n];
+            s_pin_destroyed++;
+        } else i++;
+    }
+    pthread_mutex_unlock(&s_pin_retire_mu);
+}
 static rsx_native_vulkan_image s_eobj_native_image[VK_ENG_MAX_OBJ];
 /* The last asynchronous ticket that reads or writes each engine image (E5);
  * 0 when none can still be pending. */
@@ -2517,16 +2603,30 @@ static VkFormat vk_eng_format(rsx_be_format f, u32* bpp)
 }
 
 /* Colour formats the E2 passes render into: RGBA8 for ordinary and display
- * targets, RGBA16F for SET_SURFACE_FORMAT 0xB HDR targets. Both are required
- * colour attachment formats with blending in Vulkan 1.0. */
-#define VK_ENG_RT_FORMATS 2
+ * targets, RGBA16F for SET_SURFACE_FORMAT 0xB HDR targets, and R32F / RGBA32F
+ * for the float targets a title renders small reductions into. All four are
+ * required colour attachment formats in Vulkan 1.0; blending is guaranteed only
+ * for the first two (see vk_eng_rt_blendable). */
+#define VK_ENG_RT_FORMATS 4
 static int vk_eng_rt_index(VkFormat f)
 {
     switch (f) {
     case VK_FORMAT_R8G8B8A8_UNORM:      return 0;
     case VK_FORMAT_R16G16B16A16_SFLOAT: return 1;
+    case VK_FORMAT_R32_SFLOAT:          return 2;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return 3;
     default:                            return -1;
     }
+}
+
+/* Whether the device blends into colour format `f` (guaranteed for RGBA8 and
+ * RGBA16F, optional for 32-bit float formats). */
+static int vk_eng_rt_blendable(VkFormat f)
+{
+    if (f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R16G16B16A16_SFLOAT) return 1;
+    VkFormatProperties fp;
+    pvkGetPhysicalDeviceFormatProperties(s_vk.phys, f, &fp);
+    return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
 }
 
 /* The largest image side the engine creates: the device's own limit once a
@@ -2535,8 +2635,14 @@ static u32 vk_max_dim(void) { return s_vk.max_dim ? s_vk.max_dim : 4096u; }
 
 static u32 vk_eng_alloc(void)
 {
-    for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
+    /* Hand out slots round-robin rather than lowest-first, so a handle the
+     * engine releases is not immediately reused: a late or duplicated release
+     * of an old handle then finds a free slot instead of a live object. */
+    static u32 cursor;
+    for (u32 step = 0; step < VK_ENG_MAX_OBJ - 1; step++) {
+        const u32 i = 1 + (cursor + step) % (VK_ENG_MAX_OBJ - 1);
         if (s_eobj[i].kind == VK_ENG_FREE && !s_eobj_native_pins[i]) {
+            cursor = i % (VK_ENG_MAX_OBJ - 1);
             if(vulkan_owner_enabled()) {
                 if(s_eobj_next_generation==UINT64_MAX){vulkan_owner_fault();return 0;}
                 s_eobj_generation[i]=++s_eobj_next_generation;
@@ -2546,6 +2652,7 @@ static u32 vk_eng_alloc(void)
             s_e5_obj_ticket[i]=0;
             return i;
         }
+    }
     VK_LOG("engine: object table full (%d)\n", VK_ENG_MAX_OBJ);
     return 0;
 }
@@ -2673,6 +2780,37 @@ static void vk_eng_release(void* user, u32 handle)
     if ((s_eobj[handle].kind == VK_ENG_COLOR && !s_eobj[handle].snapshot) || s_eobj[handle].kind == VK_ENG_DEPTH)
         vk_eng_drop_framebuffers();
     if(s_eobj_native_pins[handle]) {
+        /* PS3RECOMP_RSX_TARGET_CHURN=1: count these waited releases and their
+         * wall time (diagnostic). */
+        static int churn = -1;
+        if (churn < 0) { const char* e = getenv("PS3RECOMP_RSX_TARGET_CHURN"); churn = e && !strcmp(e, "1"); }
+        const double t0 = churn ? vk_now_seconds() : 0.0;
+        if (vk_pin_release_nowait() && s_bat_on) {
+            pthread_mutex_lock(&s_pin_retire_mu);
+            const int room = s_pin_retire_n + s_pin_retire_reserved < VK_PIN_RETIRE;
+            if (room) s_pin_retire_reserved++;
+            pthread_mutex_unlock(&s_pin_retire_mu);
+            /* An empty batch still ends in the full dependency, so its ticket
+             * covers every earlier submission, presents included. */
+            if (room && !vk_bat_open() && !vk_bat_flush(0) && s_bat_last_ticket) {
+                s_eobj_pin_ticket[handle] = s_bat_last_ticket;
+                s_eobj_retired[handle] = 1;
+                s_pin_nowait++;
+                if (churn) {
+                    static double last; const double t1 = vk_now_seconds();
+                    if (!last) last = t1;
+                    if (t1 - last >= 2.0) {
+                        fprintf(stderr, "[target churn] pinned releases without waiting: %llu, waited fallbacks %llu, "
+                                "destroyed at last pin %llu, parked %llu, destroyed by reap %llu, parked now %u\n",
+                                s_pin_nowait, s_pin_fallback, s_pin_immediate, s_pin_deferred, s_pin_destroyed, s_pin_retire_n);
+                        last = t1;
+                    }
+                }
+                return;
+            }
+            if (room) { pthread_mutex_lock(&s_pin_retire_mu); s_pin_retire_reserved--; pthread_mutex_unlock(&s_pin_retire_mu); }
+            s_pin_fallback++;
+        }
         /* Batched: the native side destroys it after its own fences, which
          * do not cover original work recorded after its boundary; finish
          * that first. */
@@ -2681,6 +2819,16 @@ static void vk_eng_release(void* user, u32 handle)
          * outlive genuine native fences; their final callback must not wait. */
         vk_present_wait_gpu();
         s_eobj_retired[handle]=1;
+        if (churn) {
+            static unsigned long long n; static double ms, last;
+            const double t1 = vk_now_seconds(); n++; ms += (t1 - t0) * 1e3;
+            if (!last) last = t1;
+            if (t1 - last >= 2.0) {
+                fprintf(stderr, "[target churn] vulkan pinned releases: %llu in %.1f s, waited %.1f ms total (%.2f ms each)\n",
+                        n, t1 - last, ms, n ? ms / (double)n : 0.0);
+                n = 0; ms = 0; last = t1;
+            }
+        }
         return;
     }
     if (s_eobj[handle].kind == VK_ENG_COLOR && s_eobj[handle].snapshot) {
@@ -3031,10 +3179,18 @@ static void vk_eng_snapshot_pool_drain(void)
 static u32 vk_eng_color_snapshot(void* user, u32 surface)
 {
     (void)user;
+    static u32 logs;
+#define VK_SNAP_FAIL(why) do { if (logs++ < 8) VK_LOG("engine: colour snapshot of %u failed: %s\n", surface, why); } while (0)
     const vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
-    if (!t || t->snapshot) return 0;
+    if (!t || t->snapshot) {
+        if (logs < 8 && surface < VK_ENG_MAX_OBJ)
+            VK_LOG("engine: colour snapshot of %u: kind %d retired %d native pin %d snapshot %d %ux%u\n", surface,
+                   (int)s_eobj[surface].kind, (int)s_eobj_retired[surface], (int)s_eobj_native_pins[surface],
+                   (int)s_eobj[surface].snapshot, s_eobj[surface].w, s_eobj[surface].h);
+        VK_SNAP_FAIL(!t ? "no colour target" : "target is a snapshot"); return 0;
+    }
     const u32 hd = vk_eng_alloc();
-    if (!hd) return 0;
+    if (!hd) { VK_SNAP_FAIL("no object slot"); return 0; }
     vk_eng_obj* o = &s_eobj[hd];
     int reused = 0;
     for (u32 i = 0; i < s_snap_pool_n; i++)
@@ -3049,11 +3205,12 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
                                    VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&o->im);
         memset(o, 0, sizeof *o);
+        VK_SNAP_FAIL("image creation");
         return 0;
     }
     o->kind = VK_ENG_COLOR; o->snapshot = 1;
     o->fmt = t->fmt; o->bpp = t->bpp; o->w = t->w; o->h = t->h;
-    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    if (vk_begin()) { vk_eng_release(user, hd); VK_SNAP_FAIL("command begin"); return 0; }
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
                      reused ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED);
     vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -3066,8 +3223,9 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
                     o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     /* The copy, made visible to whatever samples it next. */
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    if (vk_submit_and_wait()) { vk_eng_release(user, hd); VK_SNAP_FAIL("submission"); return 0; }
     return hd;
+#undef VK_SNAP_FAIL
 }
 
 /* ---- E4: depth snapshots --------------------------------------------------
@@ -3550,9 +3708,16 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     if ((rs->color_mask >>  0) & 0xFFu) wm |= VK_COLOR_COMPONENT_B_BIT;
     if ((rs->color_mask >> 24) & 0xFFu) wm |= VK_COLOR_COMPONENT_A_BIT;
     VkPipelineColorBlendAttachmentState cba[RSX_BE_MAX_COLOR_TARGETS];
+    /* A device without blending on a float target draws it unblended; that is
+     * reported once, never silently. */
+    const int blend = rs->blend_enable && vk_eng_rt_blendable(P->rt_fmt);
+    if (rs->blend_enable && !blend && !(s_e2.warned & 4096u)) {
+        VK_LOG("engine: blending unsupported for colour format %d on this device; drawing unblended\n", (int)P->rt_fmt);
+        s_e2.warned |= 4096u;
+    }
     for (u32 r = 0; r < P->rt_count; r++)
         cba[r] = (VkPipelineColorBlendAttachmentState){
-            .blendEnable = rs->blend_enable ? VK_TRUE : VK_FALSE,
+            .blendEnable = blend ? VK_TRUE : VK_FALSE,
             .srcColorBlendFactor = vk_gcm_blend_factor(rs->sf_rgb),
             .dstColorBlendFactor = vk_gcm_blend_factor(rs->df_rgb),
             .colorBlendOp = vk_gcm_blend_op(rs->eq_rgb),
@@ -4105,6 +4270,7 @@ static int vk_e5_reap(u64 until, int wait)
         s_e5.count--;
     }
     if (s_bat_on) vk_bat_reap();
+    if (s_pin_retire_n) vk_pin_retire_reap(s_e5.completed, 0);
     /* Images released while their writer was in flight. */
     for (u32 i = 0; i < s_e5.nretire; ) {
         if (s_e5.retire[i].ticket <= s_e5.completed) {
@@ -4533,7 +4699,8 @@ static int vk_e5_defer_destroy(u32 handle)
 static void vk_e5_shutdown(void)
 {
     if (!s_vk.device) { memset(&s_e5, 0, sizeof s_e5); return; }
-    if (s_e5.ready || s_e5.nretire || s_e5.pipe) vk_device_idle();
+    if (s_e5.ready || s_e5.nretire || s_e5.pipe || s_pin_retire_n) vk_device_idle();
+    vk_pin_retire_reap(0, 1);
     for (u32 i = 0; i < s_e5.nretire; i++) vk_destroy_image(&s_e5.retire[i].im);
     for (u32 i = 0; i < VK_E5_SLOTS; i++) {
         vk_destroy_buffer(&s_e5.slot[i].words);
@@ -4875,6 +5042,36 @@ static void owner_vk_eng_release(void* user, u32 handle){
     if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
     vk_eng_release(user,handle);vulkan_owner_finish(vulkan_owner_boundary(before));
 }
+/* The engine releases each object through the call for its kind. Handles are
+ * slots that get reused, so a release naming an object of another kind is a
+ * stale handle: freeing it would destroy a live object that now owns the
+ * slot (a colour target the next feedback draw snapshots). It is refused and
+ * reported instead. */
+static int vk_eng_release_kind_ok(u32 handle, int want_color, int want_depth)
+{
+    if (!handle || handle >= VK_ENG_MAX_OBJ) return 1;
+    const vk_eng_obj* o = &s_eobj[handle];
+    if (o->kind == VK_ENG_FREE || s_eobj_retired[handle]) return 1;   /* vk_eng_release ignores these */
+    const int color = o->kind == VK_ENG_COLOR && !o->snapshot, depth = o->kind == VK_ENG_DEPTH;
+    const int ok = want_color ? color : want_depth ? depth : (!color && !depth);
+    if (!ok) {
+        static u32 logs;
+        if (logs++ < 16)
+            VK_LOG("engine: stale %s release of object %u (kind %d%s, %ux%u) refused\n",
+                   want_color ? "colour target" : want_depth ? "depth target" : "texture", handle,
+                   (int)o->kind, o->snapshot ? " snapshot" : "", o->w, o->h);
+    }
+    return ok;
+}
+static void owner_vk_eng_texture_release(void* user, u32 handle){
+    if(vk_eng_release_kind_ok(handle,0,0))owner_vk_eng_release(user,handle);
+}
+static void owner_vk_eng_color_target_release(void* user, u32 handle){
+    if(vk_eng_release_kind_ok(handle,1,0))owner_vk_eng_release(user,handle);
+}
+static void owner_vk_eng_depth_target_release(void* user, u32 handle){
+    if(vk_eng_release_kind_ok(handle,0,1))owner_vk_eng_release(user,handle);
+}
 static u32 owner_vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                                       const void* seed, u32 seed_row_bytes){
     if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
@@ -4893,7 +5090,7 @@ static u32 owner_vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h){
     u32 result=vk_eng_depth_snapshot(user,depth,w,h);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
 }
 static u32 owner_vk_eng_color_snapshot(void* user, u32 surface){
-    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    if(!vulkan_owner_begin(1)){static u32 logs;if(logs++<8)VK_LOG("engine: colour snapshot of %u refused by the native owner gate\n",surface);return 0;}uint64_t before=s_vulkan_commits;
     u32 result=vk_eng_color_snapshot(user,surface);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
 }
 static u32 owner_vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
@@ -5014,12 +5211,12 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .submit_and_wait      = owner_vk_eng_submit_and_wait,
     .texture_create       = owner_vk_eng_texture_create,
     .texture_upload       = owner_vk_eng_texture_upload,
-    .texture_release      = owner_vk_eng_release,
+    .texture_release      = owner_vk_eng_texture_release,
     .color_target_create  = owner_vk_eng_color_target_create,
-    .color_target_release = owner_vk_eng_release,
+    .color_target_release = owner_vk_eng_color_target_release,
     .surface_view         = owner_vk_eng_surface_view,
     .depth_target_create  = owner_vk_eng_depth_target_create,
-    .depth_target_release = owner_vk_eng_release,
+    .depth_target_release = owner_vk_eng_depth_target_release,
     .depth_snapshot       = owner_vk_eng_depth_snapshot,
     .color_snapshot       = owner_vk_eng_color_snapshot,
     .pipeline_create      = owner_vk_eng_pipeline_create,
@@ -5102,6 +5299,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * live title wants one now and then, not all of them. */
     { const char* e = getenv("PS3RECOMP_VK_DUMP_EVERY");
       s_vk.dump_every = (e && atoi(e) > 0) ? (u32)atoi(e) : 1; }
+    { const char* e = getenv("PS3RECOMP_VK_FPS");
+      s_vk.fps_on = e && !strcmp(e, "1");
+      metal_frame_rate_reset(&s_vk.fps, vk_now_seconds()); }
 
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
     if (vk_load_library()) return -1;
@@ -5624,6 +5824,16 @@ static void vulkan_image_release(void *user,uint64_t life,uint64_t id,uint64_t g
              * the final native pin is released after genuine native fences.
              * Never call vk_destroy_image here: it can wait for presentation. */
             vk_image *image=&s_eobj[id].im;
+            const u64 ticket=s_eobj_pin_ticket[id];s_eobj_pin_ticket[id]=0;
+            if(ticket){
+                /* Released without waiting: the room was reserved then. */
+                pthread_mutex_lock(&s_pin_retire_mu);s_pin_retire_reserved--;
+                if(ticket>__atomic_load_n(&s_e5.completed,__ATOMIC_ACQUIRE)){
+                    s_pin_retire[s_pin_retire_n].im=*image;s_pin_retire[s_pin_retire_n].ticket=ticket;
+                    s_pin_retire_n++;s_pin_deferred++;memset(image,0,sizeof *image);
+                }else s_pin_immediate++;
+                pthread_mutex_unlock(&s_pin_retire_mu);
+            }
             if(image->view)pvkDestroyImageView(s_vk.device,image->view,NULL);
             if(image->img)pvkDestroyImage(s_vk.device,image->img,NULL);
             if(image->mem)pvkFreeMemory(s_vk.device,image->mem,NULL);
