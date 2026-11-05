@@ -833,10 +833,18 @@ static inline bool ppu_live_begin(uint32_t addr)
  * any load-reserve that was not counted yet reads its value after that store,
  * so its reservation already includes it and there is nothing to break. A
  * count left high (a thread that never issued its store-conditional) only
- * keeps the scan. Off, the breaks scan as before. */
+ * keeps the scan. Off, the breaks scan as before.
+ *
+ * The same counts are also kept per line (a hashed table), so a break whose
+ * line no other thread has a reservation on skips the scan even while other
+ * threads hold reservations elsewhere; the argument is the same, per slot. */
 static int s_resv_open_on = -1;
 static int s_resv_open;                         /* threads with a reservation open */
+#define PPU_RESV_LINE_SLOTS 4096u
+static int s_resv_line_open[PPU_RESV_LINE_SLOTS];  /* the same, by the reservation's line */
 static PPU_THREAD_LOCAL bool g_resv_open_held;
+static PPU_THREAD_LOCAL uint32_t g_resv_open_line;
+static inline int* ppu_resv_line_slot(uint32_t ea) { return &s_resv_line_open[(ea >> 7) & (PPU_RESV_LINE_SLOTS - 1u)]; }
 static inline int ppu_resv_open_counting(void)
 {
     int on = __atomic_load_n(&s_resv_open_on, __ATOMIC_RELAXED);
@@ -848,16 +856,22 @@ static inline int ppu_resv_open_counting(void)
     }
     return on;
 }
-static inline void ppu_resv_open_begin(void)
+static inline void ppu_resv_open_begin(uint32_t ea)
 {
-    if (!ppu_resv_open_counting() || g_resv_open_held) return;
-    __atomic_fetch_add(&s_resv_open, 1, __ATOMIC_SEQ_CST);
+    if (!ppu_resv_open_counting()) return;
+    const uint32_t line = ea & ~127u;
+    if (g_resv_open_held && g_resv_open_line == line) return;
+    if (g_resv_open_held) __atomic_fetch_sub(ppu_resv_line_slot(g_resv_open_line), 1, __ATOMIC_RELEASE);
+    else __atomic_fetch_add(&s_resv_open, 1, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(ppu_resv_line_slot(line), 1, __ATOMIC_SEQ_CST);
     g_resv_open_held = true;
+    g_resv_open_line = line;
 }
 static inline void ppu_resv_open_end(void)
 {
     if (!g_resv_open_held) return;
     g_resv_open_held = false;
+    __atomic_fetch_sub(ppu_resv_line_slot(g_resv_open_line), 1, __ATOMIC_RELEASE);
     __atomic_fetch_sub(&s_resv_open, 1, __ATOMIC_RELEASE);
 }
 /* True when no thread but the caller has a reservation open: a break has
@@ -871,12 +885,21 @@ static inline bool ppu_resv_open_at_most(int n)
 static inline bool ppu_resv_none_open(void) { return ppu_resv_open_at_most(g_resv_open_held ? 1 : 0); }
 /* For the breaks that also take the caller's own reservation. */
 static inline bool ppu_resv_none_open_at_all(void) { return ppu_resv_open_at_most(0); }
+/* True when no thread but the caller has a reservation open on ea's line. */
+static inline bool ppu_resv_line_clear(uint32_t ea)
+{
+    if (__atomic_load_n(&s_resv_open_on, __ATOMIC_RELAXED) <= 0) return false;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    int* slot = ppu_resv_line_slot(ea);
+    const int self = g_resv_open_held && ppu_resv_line_slot(g_resv_open_line) == slot;
+    return __atomic_load_n(slot, __ATOMIC_SEQ_CST) <= self;
+}
 
 extern "C" uint32_t ppu_load_reserve32(ppu_context* ctx, uint64_t ea)
 {
     uint32_t addr = (uint32_t)ea;
     spu_lockline_lock();
-    ppu_resv_open_begin();
+    ppu_resv_open_begin(addr);
     const bool live = ppu_live_begin(addr);
     uint64_t epoch = spu_coh_line_epoch(addr);
     uint32_t value = vm_read32(addr);
@@ -890,7 +913,7 @@ extern "C" uint64_t ppu_load_reserve64(ppu_context* ctx, uint64_t ea)
 {
     uint32_t addr = (uint32_t)ea;
     spu_lockline_lock();
-    ppu_resv_open_begin();
+    ppu_resv_open_begin(addr);
     const bool live = ppu_live_begin(addr);
     uint64_t epoch = spu_coh_line_epoch(addr);
     uint64_t value = vm_read64(addr);
@@ -1029,7 +1052,7 @@ extern "C" void ppu_resv_break_store(uint64_t ea)
  * Called (via spu_coh_notify_write) for every write to an SPU-reserved line. */
 extern "C" void ppu_resv_break_line(uint32_t ea)
 {
-    if (ppu_resv_none_open()) return;
+    if (ppu_resv_none_open() || ppu_resv_line_clear(ea)) return;
     const uint32_t line = ea & ~127u;
     ppu_context* self = g_active_ctx;
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
@@ -1071,7 +1094,7 @@ static inline void resv_lock(volatile LONG* L)   { while (_InterlockedExchange(L
 static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
 static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
 {
-    if (ppu_resv_none_open()) return;
+    if (ppu_resv_none_open() || ppu_resv_line_clear((uint32_t)addr)) return;
     uint64_t a = (uint32_t)addr;   /* match the inline guard: reserve_addr holds (uint32_t)ea */
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
