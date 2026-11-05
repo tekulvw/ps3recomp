@@ -1157,6 +1157,37 @@ static void e12_print_stats(void)
             if (s_e12.count[i]) printf(" %s=%llu", s_e12_reason[i], (unsigned long long)s_e12.count[i]);
     printf("\n"); fflush(stdout);
 }
+static void e12_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch);
+/* PS3RECOMP_D3D12_ENGINE_DUMP=N: every Nth presented surface (at most 16) is
+ * read back and written to d3d12_engine_<present>.bmp in the working directory.
+ * Diagnostic only; off by default. */
+static void e12_dump(u32 surface, const e12_obj* o)
+{
+    static long every = -1; static int written = 0;
+    if (every < 0) { const char* e = getenv("PS3RECOMP_D3D12_ENGINE_DUMP"); every = e ? atol(e) : 0; }
+    if (every <= 0 || written >= 16 || s_e12.presents % (u64)every || o->fmt != DXGI_FORMAT_R8G8B8A8_UNORM) return;
+    const u32 w = o->w, h = o->h, pad = (w * 3u + 3u) & ~3u;
+    u8* px = (u8*)malloc((size_t)w * h * 4u);
+    u8* row = (u8*)calloc(1, pad);
+    if (!px || !row) { free(px); free(row); return; }
+    e12_readback(NULL, surface, 0, 0, w, h, px, w * 4u);
+    char name[64]; snprintf(name, sizeof name, "d3d12_engine_%06llu.bmp", (unsigned long long)s_e12.presents);
+    FILE* f = fopen(name, "wb");
+    if (f) {
+        u8 hdr[54] = { 'B', 'M' }; const u32 size = 54u + pad * h;
+        memcpy(hdr + 2, &size, 4); hdr[10] = 54; hdr[14] = 40; memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &h, 4);
+        hdr[26] = 1; hdr[28] = 24; fwrite(hdr, 1, 54, f);
+        for (u32 y = h; y-- > 0;) {
+            for (u32 x = 0; x < w; x++) {
+                const u8* p = px + ((size_t)y * w + x) * 4u;
+                row[x * 3] = p[2]; row[x * 3 + 1] = p[1]; row[x * 3 + 2] = p[0];
+            }
+            fwrite(row, 1, pad, f);
+        }
+        fclose(f); written++;
+    }
+    free(px); free(row);
+}
 static void e12_present(void* user, u32 surface)
 {
     (void)user;
@@ -1189,6 +1220,7 @@ static void e12_present(void* user, u32 surface)
         e12_transition(&back, D3D12_RESOURCE_STATE_PRESENT);
         e12_submit_wait();
         s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0, 0);
+        e12_dump(surface, o);
     }
     e12_print_stats();
     LeaveCriticalSection(&s_e12.lock);
