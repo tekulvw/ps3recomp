@@ -434,6 +434,15 @@ if(PS3RECOMP_BUILD_TESTS)
         add_subdirectory(tests/gcm_reports)
     endif()
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
+    # The native reservation gate (default off) with synthetic spans and threads.
+    add_executable(test_rsx_reservation_gate tests/test_rsx_reservation_gate.c
+        libs/video/rsx_native_reservation.c)
+    if(NOT WIN32)
+        target_link_libraries(test_rsx_reservation_gate PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME rsx_reservation_gate COMMAND test_rsx_reservation_gate)
+    add_test(NAME rsx_reservation_gate_off COMMAND test_rsx_reservation_gate off)
+    set_tests_properties(rsx_reservation_gate rsx_reservation_gate_off PROPERTIES TIMEOUT 60)
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
