@@ -1307,7 +1307,14 @@ static void e12_dump(u32 surface, const e12_obj* o)
     static long every = -1; static int written = 0, all = -1;
     if (every < 0) { const char* e = getenv("PS3RECOMP_D3D12_ENGINE_DUMP"); every = e ? atol(e) : 0; }
     if (all < 0) { const char* e = getenv("PS3RECOMP_D3D12_ENGINE_DUMP_ALL"); all = e && *e == '1'; }
-    if (every <= 0 || written >= 16 || s_e12.presents % (u64)every) return;
+    /* PS3RECOMP_D3D12_ENGINE_DUMP_TRIGGER=<path>: also dump the next present
+     * after that file appears (the file is removed), within the same cap. */
+    static const char* trigger = (const char*)1;
+    if (trigger == (const char*)1) trigger = getenv("PS3RECOMP_D3D12_ENGINE_DUMP_TRIGGER");
+    int due = every > 0 && !(s_e12.presents % (u64)every);
+    if (trigger && *trigger && (s_e12.presents & 15) == 0 && GetFileAttributesA(trigger) != INVALID_FILE_ATTRIBUTES)
+        due = DeleteFileA(trigger) != 0;
+    if (!due || written >= 16) return;
     written++;
     if (!all) { e12_dump_one(surface, o, 0); return; }
     for (u32 i = 1; i < ENG12_MAX_OBJ; i++)   /* every live colour target, named by handle */
