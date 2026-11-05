@@ -1131,6 +1131,21 @@ static void e12_draw(void* user, rsx_topology topology, const void* vertices, u3
         if (y1 > h) y1 = h;
         sc.left = (LONG)x0; sc.top = (LONG)y0; sc.right = (LONG)(x1 > x0 ? x1 : x0); sc.bottom = (LONG)(y1 > y0 ? y1 : y0);
     }
+    { static long trace = -1; static long traced = 0;
+      if (trace < 0) { const char* e = getenv("PS3RECOMP_D3D12_ENGINE_TRACE"); trace = e ? atol(e) : 0; }
+      if (traced < trace) {   /* PS3RECOMP_D3D12_ENGINE_TRACE=N: the first N draws, as encoded */
+          traced++;
+          const float* v0 = (const float*)vertices;
+          printf("[D3D12 engine draw] #%llu topo=%d verts=%u idx=%u stride=%u rt=%u(%ux%u) n=%u depth=%u vp=%.1f,%.1f %.1fx%.1f "
+                 "sc=%ld,%ld-%ld,%ld z(test=%u write=%u func=%X) cull=%u/%X mask=%08X blend=%u v0=(%.3f %.3f %.3f %.3f) "
+                 "vsb=%u psb=%u c0=(%.3f %.3f %.3f %.3f)\n",
+                 (unsigned long long)s_e12.draws, (int)topology, vertex_count, index_count, stride, s_e12.rt[0], w, h,
+                 s_e12.nrt, s_e12.depth, vpt.TopLeftX, vpt.TopLeftY, vpt.Width, vpt.Height,
+                 (long)sc.left, (long)sc.top, (long)sc.right, (long)sc.bottom, P->rs.depth_test, P->rs.depth_write,
+                 P->rs.depth_func, P->rs.cull_enable, P->rs.cull_face, P->rs.color_mask, P->rs.blend_enable,
+                 v0[0], v0[1], v0[2], v0[3], s_e12.vs_bytes, s_e12.ps_bytes,
+                 ((const float*)s_e12.vsc)[0], ((const float*)s_e12.vsc)[1], ((const float*)s_e12.vsc)[2], ((const float*)s_e12.vsc)[3]);
+      } }
     cl->lpVtbl->RSSetViewports(cl, 1, &vpt);
     cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
     cl->lpVtbl->OMSetStencilRef(cl, s_e12.stencil_ref & 0xFFu);
