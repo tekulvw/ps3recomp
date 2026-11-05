@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <stdio.h>
 static SRWLOCK s_queue_lock=SRWLOCK_INIT;
 static HWND s_parent,s_dialog,s_edit;
 static _Atomic(DWORD) s_owner;
@@ -122,8 +123,17 @@ void osk_native_win32_pump(void){
             osk_native_host_closed(request.token);atomic_store(&s_input_active,0);
         }
     }
-    if(confirming && s_dialog && confirming==s_generation && osk_native_is_open(confirming))
-        SendMessageW(GetDlgItem(s_dialog,IDOK),BM_CLICK,0,0);
+    /* The mailbox confirm is the OK command itself, delivered to the dialog
+     * as the button would deliver it. A simulated BM_CLICK depends on the
+     * dialog being active and able to capture the mouse, which a game window
+     * behind another application's foreground is not. */
+    if(confirming){
+        const int match=s_dialog && confirming==s_generation && osk_native_is_open(confirming);
+        if(match)SendMessageW(s_dialog,WM_COMMAND,MAKEWPARAM(IDOK,BN_CLICKED),(LPARAM)GetDlgItem(s_dialog,IDOK));
+        printf("[cellOskDialog] native confirm token=%llu %s\n",(unsigned long long)confirming,
+            !match?"ignored (no matching open dialog)":s_dialog?"not completed":"completed");
+        fflush(stdout);
+    }
 }
 int osk_native_win32_handle_message(void* value){
     return on_owner() && s_dialog && IsDialogMessageW(s_dialog,(MSG*)value);
