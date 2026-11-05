@@ -609,6 +609,49 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
 static void vk_present_wait_gpu(void);
 static double vk_now_seconds(void);
 
+/* PS3RECOMP_VK_PRESENT_TIMING=1 (diagnostic, default off): where a present's
+ * wall time goes, split by stage, separately for presents the FIFO walker
+ * makes at a flip and those the host frame clock makes. Every 240 presents
+ * of a kind one line gives each stage's mean and max in ms. */
+enum { VKPT_FLUSH, VKPT_LOCK, VKPT_COMPLETE, VKPT_SLOT, VKPT_ACQUIRE, VKPT_SUBMIT, VKPT_QPRESENT, VKPT_HOLD, VKPT_TOTAL, VKPT_N };
+static const char* const s_vkpt_name[VKPT_N] = { "flush", "lock", "complete", "slot_wait", "acquire", "submit", "queue_present", "of_which_hold_wait", "total" };
+static int s_vkpt_on = -1;
+static uint64_t s_vkpt_cur[VKPT_N];
+static uint64_t s_vkpt_sum[2][VKPT_N], s_vkpt_max[2][VKPT_N], s_vkpt_n[2];
+static uint64_t vkpt_now(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static int vkpt_enabled(void)
+{
+    if (s_vkpt_on < 0) { const char* e = getenv("PS3RECOMP_VK_PRESENT_TIMING"); s_vkpt_on = e && !strcmp(e, "1"); }
+    return s_vkpt_on;
+}
+static void vkpt_add(int stage, uint64_t t0)
+{
+    if (s_vkpt_on > 0) s_vkpt_cur[stage] += vkpt_now() - t0;
+}
+static void vkpt_commit(int host)
+{
+    if (s_vkpt_on <= 0) return;
+    for (int i = 0; i < VKPT_N; i++) {
+        s_vkpt_sum[host][i] += s_vkpt_cur[i];
+        if (s_vkpt_cur[i] > s_vkpt_max[host][i]) s_vkpt_max[host][i] = s_vkpt_cur[i];
+        s_vkpt_cur[i] = 0;
+    }
+    if (++s_vkpt_n[host] < 240) return;
+    char line[768]; int o = snprintf(line, sizeof line, "[vk present timing] by=%s n=%llu mean/max ms:",
+                                     host ? "host" : "flip", (unsigned long long)s_vkpt_n[host]);
+    for (int i = 0; i < VKPT_N && o > 0 && o < (int)sizeof line; i++)
+        o += snprintf(line + o, sizeof line - (size_t)o, " %s=%.3f/%.3f", s_vkpt_name[i],
+                      (double)s_vkpt_sum[host][i] / 1e6 / (double)s_vkpt_n[host], (double)s_vkpt_max[host][i] / 1e6);
+    fprintf(stderr, "%s\n", line);
+    memset(s_vkpt_sum[host], 0, sizeof s_vkpt_sum[host]);
+    memset(s_vkpt_max[host], 0, sizeof s_vkpt_max[host]);
+    s_vkpt_n[host] = 0;
+}
+
 static void vk_destroy_image_now(vk_image* im)
 {
     /* Never under a present's copy that may still read it. */
@@ -831,7 +874,9 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
 static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
 {
     pthread_mutex_lock(&s_vk.queue_mu);
+    const uint64_t th = s_vkpt_on > 0 ? vkpt_now() : 0;
     vk_hold_wait_locked();               /* it waits on a semaphore a held submission signals */
+    vkpt_add(VKPT_HOLD, th);
     const VkResult r = pvkQueuePresentKHR(s_vk.queue, pi);
     pthread_mutex_unlock(&s_vk.queue_mu);
     return r;
@@ -2341,12 +2386,16 @@ static void vk_present_complete_locked(void)
  * everything submitted so far. */
 static VkCommandBuffer vk_present_record_begin(void)
 {
+    uint64_t tp = s_vkpt_on > 0 ? vkpt_now() : 0;
     vk_present_complete_locked();
+    vkpt_add(VKPT_COMPLETE, tp);
     const u32 slot = (s_vk.present_slot + 1u) % VK_PRESENT_SLOTS;
+    tp = s_vkpt_on > 0 ? vkpt_now() : 0;
     if (s_vk.present_busy[slot]) {
         vk_fence_wait(s_vk.present_fences[slot]);
         __atomic_store_n(&s_vk.present_busy[slot], 0, __ATOMIC_RELEASE);
     }
+    vkpt_add(VKPT_SLOT, tp);
     s_vk.present_slot = slot;
     s_vk.present_cmd = s_vk.present_cmds[slot];
     s_vk.present_fence = s_vk.present_fences[slot];
@@ -2408,9 +2457,11 @@ static void vk_present_record_end(VkCommandBuffer cb)
                     s_vk.present_acquire[slot] = VK_NULL_HANDLE;
             }
             acquire = s_vk.present_acquire[slot];
+            const uint64_t ta = s_vkpt_on > 0 ? vkpt_now() : 0;
             VkResult r = acquire ? pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                                           acquire, VK_NULL_HANDLE, &idx)
                                  : VK_ERROR_INITIALIZATION_FAILED;
+            vkpt_add(VKPT_ACQUIRE, ta);
             if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); window = 0; }
             else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
                 VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); window = 0;
@@ -2426,9 +2477,11 @@ static void vk_present_record_end(VkCommandBuffer cb)
                             .signalSemaphoreCount = window ? 1u : 0u,
                             .pSignalSemaphores = window ? &s_vk.sc_done[idx] : NULL };
         pvkResetFences(s_vk.device, 1, &s_vk.present_fence);
+        const uint64_t tsub = s_vkpt_on > 0 ? vkpt_now() : 0;
         if (vk_queue_submit(&si, s_vk.present_fence) != VK_SUCCESS) {
             VK_LOG("vkQueueSubmit (present) failed\n"); return;
         }
+        vkpt_add(VKPT_SUBMIT, tsub);
         __atomic_store_n(&s_vk.present_busy[slot], 1, __ATOMIC_RELEASE);
         s_vk.present_order = 1;
         s_vk.presented++;
@@ -2440,7 +2493,9 @@ static void vk_present_record_end(VkCommandBuffer cb)
                 .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
                 .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
             };
+            const uint64_t tqp = s_vkpt_on > 0 ? vkpt_now() : 0;
             VkResult r = vk_queue_present(&pi);
+            vkpt_add(VKPT_QPRESENT, tqp);
             if (s_vk.fps_on && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR))
                 metal_frame_rate_presented(&s_vk.fps, vk_now_seconds());
             if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
@@ -2977,10 +3032,14 @@ static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
     if (!s_vk.device) return;
+    const uint64_t t0 = vkpt_enabled() ? vkpt_now() : 0;
     /* Batched: what the frame recorded goes on the queue ahead of the blit. */
     if (s_bat_on) (void)vk_bat_flush(0);
+    vkpt_add(VKPT_FLUSH, t0);
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+    const uint64_t tl = s_vkpt_on > 0 ? vkpt_now() : 0;
     pthread_mutex_lock(&s_vk.present_mu);
+    vkpt_add(VKPT_LOCK, tl);
     VkCommandBuffer cb = vk_present_record_begin();
     if (cb) {
         if (o) {
@@ -2999,6 +3058,7 @@ static void vk_eng_present(void* user, u32 surface)
         }
         vk_present_record_end(cb);
     }
+    if (s_vkpt_on > 0) { vkpt_add(VKPT_TOTAL, t0); vkpt_commit(s_vk.present_split != 0); }
     pthread_mutex_unlock(&s_vk.present_mu);
     s_g.last_draws = s_g.draws;
     s_g.draws = 0;
