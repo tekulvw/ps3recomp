@@ -11,7 +11,16 @@
  * a test failure; the consumer event fixture links the strong real service. */
 #ifndef _WIN32
 WEAK BOOL SetEvent(HANDLE event){(void)event;abort();}
+/* The FIFO-lag record (PS3RECOMP_RSX_LABEL_LAG) starts a sampler thread; the
+ * fixtures leave it off, so an attempt to start one is a test failure. */
+WEAK HANDLE CreateThread(void* sa,SIZE_T stack,PS3_THREAD_FN fn,LPVOID arg,DWORD flags,DWORD* out_tid)
+{(void)sa;(void)stack;(void)fn;(void)arg;(void)flags;(void)out_tid;abort();}
+WEAK BOOL CloseHandle(HANDLE h){(void)h;abort();}
 #endif
+/* The SPU line-commit hook (runtime/spu/spu_channels.c) that
+ * PS3RECOMP_RSX_REPORT_SPURS_KICK calls after a label publication: no SPU
+ * side in these fixtures, so no hook. */
+WEAK void (*g_host_line_write_hook)(uint32_t line)=0;
 WEAK int rsx_draw_engine_async_available(void){return 0;}
 WEAK u64 rsx_draw_engine_submit_async(void){return 0;}
 WEAK int rsx_draw_engine_completion_status(u64 ticket,int wait){(void)ticket;(void)wait;return -1;}
