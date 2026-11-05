@@ -321,6 +321,82 @@ void spu_coh_line_shard_lock(uint32_t ea)
 }
 void spu_coh_line_shard_unlock(uint32_t ea) { __atomic_store_n(spu_coh_shard(ea), 0u, __ATOMIC_RELEASE); }
 
+/* PS3RECOMP_PPU_STORE_LIVE_SPU=1 (opt-in): count the SPU contexts that hold a
+ * reservation on each line, so a locked write to a line no SPU holds now skips
+ * the walk over every registered context.
+ *
+ * Off, the SPU bitmap is sticky: once any SPU has reserved a line, every later
+ * write to it -- PPU stores and store-conditionals, MFC puts, the SPURS
+ * kernel's flag writes -- walks every registered context under the lock-line
+ * lock, though almost always no SPU holds that line any more (a Linux run's
+ * busiest notified lines had a holder in 0-6% of their writes). The lock
+ * itself is unchanged: host code (the SPURS HLE kernel among it) relies on it
+ * to make its read-modify-writes of such lines atomic against PPU stores, so
+ * the writes still take it; only the walk goes.
+ *
+ * On, each context counts itself in s_spu_live for the line of its GETLLAR,
+ * from before it reads the line until its reservation ends on its own thread
+ * (PUTLLC, PUTLLUC, a GETLLAR of another line, unregister); a reservation
+ * another agent invalidates stays counted until then, so the count is never
+ * below the contexts holding the line. A locked notify finding the count at
+ * zero and no watch or context-less interest on the line returns after the
+ * PPU-side bookkeeping. Why it holds: a GETLLAR raises the count (seq_cst)
+ * before it reads the line, and the notify reads the count after the write
+ * and a full fence, so either it sees the count or the GETLLAR's read sees the
+ * write. A count shared by several lines (a hashed slot) only keeps the walk.
+ * Lines marked without a context (watches, SPURS HLE lines) are never skipped. */
+#define SPU_COH_LIVE_SLOTS 65536u
+static uint32_t s_spu_live[SPU_COH_LIVE_SLOTS];
+static unsigned char s_watch_bitmap[SPU_COH_BITMAP_SZ];
+static int s_live_spu_on = -1;
+int spu_coh_live_spu_enabled(void)
+{
+    int on = __atomic_load_n(&s_live_spu_on, __ATOMIC_RELAXED);
+    if (__builtin_expect(on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_PPU_STORE_LIVE_SPU");
+        on = e && !strcmp(e, "1");
+        __atomic_store_n(&s_live_spu_on, on, __ATOMIC_RELAXED);
+        if (on) { fprintf(stderr, "[spu-coh] live SPU reservation tracking on\n"); fflush(stderr); }
+    }
+    return on;
+}
+static inline uint32_t* spu_coh_live_slot(uint32_t ea)
+{
+    return &s_spu_live[(ea >> SPU_COH_LINE_SHIFT) & (SPU_COH_LIVE_SLOTS - 1u)];
+}
+static inline int spu_coh_line_watched(uint32_t ea)
+{
+    const uint32_t l = ea >> SPU_COH_LINE_SHIFT;
+    return (__atomic_load_n(&s_watch_bitmap[l >> 3], __ATOMIC_ACQUIRE) >> (l & 7)) & 1u;
+}
+/* With tracking on: no SPU counts a reservation on the line and no watch is on
+ * it. Off: never (the sticky bitmap decides). */
+unsigned long g_spu_coh_live_skips;   /* notifies that skipped the walk */
+static inline int spu_coh_line_spu_idle(uint32_t ea)
+{
+    if (spu_coh_live_spu_enabled() <= 0 || spu_coh_line_watched(ea)) return 0;
+    return __atomic_load_n(spu_coh_live_slot(ea), __ATOMIC_SEQ_CST) == 0;
+}
+void spu_coh_live_untrack(spu_context* c)
+{
+    if (!c || !c->coh_live_counted) return;
+    c->coh_live_counted = 0;
+    __atomic_fetch_sub(spu_coh_live_slot(c->coh_live_line), 1u, __ATOMIC_RELEASE);
+}
+/* Owner thread, at a GETLLAR, before the line is read. */
+void spu_coh_live_track(spu_context* c, uint32_t ea)
+{
+    if (!c || spu_coh_live_spu_enabled() <= 0) return;
+    const uint32_t line = ea & ~127u;
+    if (c->coh_live_counted && c->coh_live_line == line) return;
+    spu_coh_live_untrack(c);
+    spu_coh_line_shard_lock(line);
+    __atomic_fetch_add(spu_coh_live_slot(line), 1u, __ATOMIC_SEQ_CST);
+    spu_coh_line_shard_unlock(line);
+    c->coh_live_line = line;
+    c->coh_live_counted = 1;
+}
+
 /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
  * bitmap entirely for a title that runs no SPU code, and keeps every existing
  * test that stores through vm_write* paying one compare against a hot global.
@@ -380,7 +456,11 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
     s_coh_armed = 1;
 
-    if (!ctx) return;
+    if (!ctx) {   /* context-less interest (a watch, an HLE line): never idle */
+        __atomic_fetch_or(&s_watch_bitmap[line >> 3], (unsigned char)(1u << (line & 7)), __ATOMIC_RELEASE);
+        return;
+    }
+    spu_coh_live_track(ctx, ea);   /* a holder is counted before its line is read */
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
         if (entry->ctx == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELEASE); return; }
     spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
@@ -400,7 +480,7 @@ void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
 {
     /* Arming the existing bitmap makes PPU stores/CAS and MFC writes use
      * the same serialized commit/notify path as SPU reservations. */
-    spu_coh_reserve(NULL, ea);
+    spu_coh_reserve(NULL, ea);   /* marks the line never idle, too */
     watch->line = ea & ~127u;
     watch->wake = wake;
     watch->opaque = opaque;
@@ -446,6 +526,7 @@ void spu_coh_unregister(spu_context* ctx)
     for (spu_coh_entry** link = &s_coh_ctxs; *link; link = &(*link)->next) {
         if ((*link)->ctx != ctx) continue;
         __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELEASE);
+        spu_coh_live_untrack(ctx);
         spu_coh_entry* entry = *link;
         *link = entry->next;
         free(entry);
@@ -554,6 +635,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     if (!spu_coh_line_spu(line)) return;   /* PPU-only line: no holder, no watch */
     spu_coh_wake_watches(line);
     spu_coh_writer_fence();
+    if (spu_coh_line_spu_idle(line)) { __atomic_fetch_add(&g_spu_coh_live_skips, 1ul, __ATOMIC_RELAXED); return; }   /* no SPU holds it */
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c || (const void*)c == self) continue;
@@ -653,13 +735,13 @@ void spu_coh_ppu_store_unlock(uint32_t ea)
 void spu_coh_notify_write(uint32_t ea);
 #if !defined(_WIN32)
 static int s_clh_on = -1;
-static struct { uint32_t line; unsigned long long n, held; uintptr_t site; } s_clh[4096];
-static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held)
+static struct { uint32_t line; unsigned long long n, held, live; uintptr_t site; } s_clh[4096];
+static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held, int live)
 {
     unsigned i = (line >> 7) * 0x9E3779B1u >> 20;
     for (unsigned k = 0; k < 4096; ++k, i = (i + 1) & 4095u) {
         if (s_clh[i].n && s_clh[i].line != line) continue;
-        s_clh[i].line = line; s_clh[i].n++; s_clh[i].held += held != 0; s_clh[i].site = site;
+        s_clh[i].line = line; s_clh[i].n++; s_clh[i].held += held != 0; s_clh[i].live += live != 0; s_clh[i].site = site;
         break;
     }
     static uint64_t next;
@@ -687,12 +769,12 @@ static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held)
     fprintf(stderr, "[coh-line] anchor spu_coh_notify_write=0x%lx\n", (unsigned long)(uintptr_t)&spu_coh_notify_write);
 #endif
     for (int j = 0; j < nt; ++j)
-        fprintf(stderr, "[coh-line] line=0x%08X n=%llu held=%llu site=0x%lx\n", s_clh[top[j]].line,
-                s_clh[top[j]].n, s_clh[top[j]].held, (unsigned long)s_clh[top[j]].site);
+        fprintf(stderr, "[coh-line] line=0x%08X n=%llu held=%llu live=%llu site=0x%lx\n", s_clh[top[j]].line,
+                s_clh[top[j]].n, s_clh[top[j]].held, s_clh[top[j]].live, (unsigned long)s_clh[top[j]].site);
 }
 #else
 static const int s_clh_on = 0;
-static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held) { (void)line; (void)site; (void)held; }
+static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held, int live) { (void)line; (void)site; (void)held; (void)live; }
 #endif
 
 void spu_coh_notify_write(uint32_t ea)
@@ -705,7 +787,9 @@ void spu_coh_notify_write(uint32_t ea)
         if (s_clh_on) {
             int held = 0;
             for (spu_coh_entry* e = s_coh_ctxs; e; e = e->next) held |= e->ctx && spu_coh_holds(e->ctx, line);
-            spu_coh_line_hist(line, (uintptr_t)__builtin_return_address(0), held);
+            /* live: the line's count in the live table (PS3RECOMP_PPU_STORE_LIVE_SPU). */
+            const int live = __atomic_load_n(spu_coh_live_slot(line), __ATOMIC_RELAXED) != 0;
+            spu_coh_line_hist(line, (uintptr_t)__builtin_return_address(0), held, live);
         }
     }
     ppu_resv_break_line(ea);
@@ -713,6 +797,7 @@ void spu_coh_notify_write(uint32_t ea)
     if (!spu_coh_line_spu(line)) return;   /* PPU-only line: no holder, no watch */
     spu_coh_wake_watches(line);
     spu_coh_writer_fence();
+    if (spu_coh_line_spu_idle(line)) { __atomic_fetch_add(&g_spu_coh_live_skips, 1ul, __ATOMIC_RELAXED); return; }   /* no SPU holds it */
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c) continue;

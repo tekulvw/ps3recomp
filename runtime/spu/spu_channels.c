@@ -896,6 +896,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
              * unannounced. Nothing else about this transaction changes. */
             spu_coh_reserve(ctx, ea);
         }
+        /* Count this reservation's line before reading it (live tracking). */
+        spu_coh_live_track(ctx, ea);
 
         /* ONE read of guest memory, then the snapshot from that copy.
          *
@@ -1024,6 +1026,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) != 0)) {
               ctx->atomic_stat = 1;                  /* PUTLLC_FAILURE -> retry */
               __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
+              spu_coh_live_untrack(ctx);
               spu_dma_publication_observe_atomic(ctx, lsa, ea, cmd, SPU_DMA_ATOMIC_PUTLLC_FAILURE);
               if(observing)spu_atomic_observe_end(ctx->atomic_stat);
         return 1;
@@ -1120,6 +1123,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
+        spu_coh_live_untrack(ctx);
         spu_lockline_unlock();
         spu_dma_publication_observe_atomic(ctx, lsa, ea, cmd,
             ctx->atomic_stat ? SPU_DMA_ATOMIC_PUTLLC_FAILURE : SPU_DMA_ATOMIC_PUTLLC_SUCCESS);
@@ -1148,6 +1152,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * has already overwritten. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+        spu_coh_live_untrack(ctx);
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
         if (s_line_watch) spu_line_watch_commit(ctx, (uint32_t)ea);
