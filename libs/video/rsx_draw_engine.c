@@ -4283,6 +4283,24 @@ static void eng_present_core(u32 buffer_id)
     g.guest_draws = 0;
 }
 
+/* PS3RECOMP_RSX_SINGLE_PRESENT=1 (opt-in): one presenter per flip. The engine
+ * presents a flip when the FIFO reaches its flip method (sink_flip, the lowest
+ * latency); a host frame clock that then presents the same flip again through
+ * rsx_draw_engine_present only blitted and presented the same image twice, and
+ * with a blocking present held its thread an extra refresh. With the switch, a
+ * host present that follows an engine flip-time present with no newer flip in
+ * between is skipped and counted. Unset, both presents happen as before. */
+static int s_single_present = -1;
+static int s_flip_presented;
+static unsigned long long s_single_present_skipped;
+static int eng_single_present(void)
+{
+    if (s_single_present < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_SINGLE_PRESENT");
+        s_single_present = e && !strcmp(e, "1");
+    }
+    return s_single_present;
+}
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
@@ -4296,6 +4314,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
                   (unsigned)g.n_surfaces, (unsigned)ENG_MAX_SURFACES,
                   (unsigned)g.n_zdepths, (unsigned)ENG_MAX_ZDEPTHS); }
     eng_present(g.last_flip_buffer);
+    if (eng_single_present()) s_flip_presented = 1;
 }
 
 /* ---- public API ---------------------------------------------------------- */
@@ -4549,6 +4568,12 @@ static void original_rsx_draw_engine_present(void)
      * re-present a double-buffered title's OTHER scanout. Presenting twice is
      * harmless either way -- the engine never clears the surface, so a second
      * present just blits the same image again. */
+    if (eng_single_present() && s_flip_presented) {
+        s_flip_presented = 0;
+        if (++s_single_present_skipped % 600ull == 0)
+            fprintf(stderr, "[rsx engine] single present: %llu host re-presents skipped\n", s_single_present_skipped);
+        return;
+    }
     eng_present(g.last_flip_buffer);
 }
 
