@@ -91,8 +91,10 @@ int rsx_reservation_open(uint64_t lifetime, const rsx_reservation_span *pinned,
         res_unlock(&s_mu);
         return -4;
     }
-    memcpy(s_spans, pinned, (size_t)count * sizeof *pinned);
-    qsort(s_spans, count, sizeof *s_spans, span_cmp);
+    if (count) { /* pinned may be NULL when count is 0 */
+        memcpy(s_spans, pinned, (size_t)count * sizeof *pinned);
+        qsort(s_spans, count, sizeof *s_spans, span_cmp);
+    }
     s_count = count;
     s_lifetime = lifetime;
     *token = ++s_next_token;
