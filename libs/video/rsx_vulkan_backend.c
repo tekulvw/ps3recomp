@@ -2224,13 +2224,24 @@ static double vk_now_seconds(void)
 }
 
 /* present_mu held. Same line shape as the Metal backend's, plus the clock. */
+/* display/guest count host presents (every vkQueuePresentKHR, so a frame shown
+ * twice counts twice); guest_flips is the guest's own flip requests per second
+ * over the same interval (cellGcm_flip_request_count): the frame rate the title
+ * actually produced. */
+u32 cellGcm_flip_request_count(void);
 static void vk_fps_report(void)
 {
+    static u32 last_requests;
+    static double last_requests_at;
     const double now = vk_now_seconds();
     if (now - s_vk.fps.epoch < 1.0) return;
     MetalFrameRateSample r = metal_frame_rate_sample(&s_vk.fps, now);
-    fprintf(stderr, "[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f clock=host_present_call window=%d\n",
-            r.display_fps, r.guest_fps, r.average_ms, r.p95_ms, r.worst_ms, r.age_seconds, s_vk.windowed && s_vk.swapchain ? 1 : 0);
+    const u32 requests = cellGcm_flip_request_count();
+    const double flips = last_requests_at > 0.0 && now > last_requests_at
+        ? (double)(u32)(requests - last_requests) / (now - last_requests_at) : 0.0;
+    last_requests = requests; last_requests_at = now;
+    fprintf(stderr, "[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f clock=host_present_call window=%d guest_flips=%.2f\n",
+            r.display_fps, r.guest_fps, r.average_ms, r.p95_ms, r.worst_ms, r.age_seconds, s_vk.windowed && s_vk.swapchain ? 1 : 0, flips);
 }
 
 static void vk_dump_ppm(const unsigned char* rgba)
