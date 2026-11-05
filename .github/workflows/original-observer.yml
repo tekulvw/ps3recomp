@@ -1,0 +1,58 @@
+name: Original execution observer
+on:
+  push:
+    branches: [main, master, codex/render-frontend-api]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  synthetic-original-routes:
+    name: Original execution witnesses (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Windows compiler environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Bounded collector, worker generations, faults and concurrent arm/drain
+        run: python tools/test_original_work_observer.py
+      - name: Real generated SPU, full interpreter, microstep, region and leaf
+        if: runner.os != 'Windows'
+        run: python tools/test_original_work_routes.py
+      - name: Real generated PPU mid-function witness and normal guest result
+        if: runner.os != 'Windows'
+        run: python tools/test_ppu_original_work.py
+      - name: Real native worker creation, early-exit cleanup and diagnostic drain
+        run: python tools/test_original_work_threads.py
+      - name: Reject omitted interpreter and fabricated skipped-PC witnesses
+        if: runner.os != 'Windows'
+        run: |
+          python tools/test_original_work_routes.py --negative-interpreter-control
+          python tools/test_original_work_routes.py --negative-halt-control
+      - name: Windows GNU C/POSIX runtime fixture dependencies
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Real Windows runtime and generated PPU/SPU witnesses
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          CC=gcc CXX=g++ python tools/test_original_work_routes.py
+          CC=gcc CXX=g++ python tools/test_ppu_original_work.py
+          CC=gcc CXX=g++ python tools/test_original_work_routes.py --negative-interpreter-control
+          CC=gcc CXX=g++ python tools/test_original_work_routes.py --negative-halt-control
+      # Authored execution witnesses only. No game, removal-proof or FPS claim.

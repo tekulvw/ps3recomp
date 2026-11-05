@@ -10,7 +10,14 @@
  * needs: the shader disk cache, movie mode and its compositor, the a010
  * probe, and every YZ_PERF_PROFILE block.
  */
+#include <stdatomic.h>
 #include "rsx_draw_engine.h"
+#include "rsx_native_handoff.h"
+static _Atomic(const rsx_original_owner_hooks*) s_original_owner_hooks;
+void rsx_draw_engine_set_owner_hooks(const rsx_original_owner_hooks* hooks){
+    atomic_store_explicit(&s_original_owner_hooks,hooks,memory_order_release);
+}
+
 #include "../../runtime/diagnostics/render_ablation.h"
 #include "rsx_binding_capture_filter.h"
 #include "rsx_picture_identity.inc"
@@ -30,7 +37,12 @@
 #include "ps3emu/log_first.h"
 #include <errno.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -111,6 +123,7 @@ typedef struct {
     u32 handle;
     u32 feedback;          /* last immutable own-target copy, engine-owned */
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
+    u32 queued_clear_planes; /* actual full-allocation clear commands only */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
 } eng_surface;
 
@@ -120,12 +133,17 @@ typedef struct {
     u32 handle;
     u32 snapshot;          /* sampleable copy, or 0                        */
     int cleared;
+    u32 queued_clear_planes; /* depth2/stencil4, not arbitrary draw writes */
     int had_write;
     int snapshot_valid;
     u64 depth_serial;      /* g.write_serial of the last depth write or clear */
     int guest_dirty;       /* written since guest memory last got a copy     */
     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
     u32 used_w, used_h;    /* the clip that write went through              */
+    /* PS3RECOMP_RSX_GPU_DEPTH_VIEW: the last GPU-built Z24S8 colour view and
+     * what it was built from (handle, write serial, rectangle, format). */
+    u32 view, view_handle, view_w, view_h, view_remap, view_fmt;
+    u64 view_serial;
 } eng_zdepth;
 
 typedef struct {
@@ -207,8 +225,28 @@ static struct {
 
     rsx_fp_constant_block fp_constants;
 } g;
+/* One synchronous FIFO consumer owns a bounded preparation scope. Staged
+ * objects own backend references independently of the live per-EA cache. */
+#define ENG_NATIVE_STAGED 64u
+#define ENG_NATIVE_STAGE_BIT 0x80000000u
+static struct {
+    u64 id, next, source;
+    const void* vm;
+    u32 count, clears, published;
+    struct { rsx_native_image_key key; eng_surface color; } images[ENG_NATIVE_STAGED];
+} s_native_images;
+static void eng_native_images_release(void)
+{
+    if(g.be)for(u32 i=0;i<s_native_images.count;++i) {
+        if(s_native_images.images[i].color.handle)g.be->color_target_release(g.be->user,s_native_images.images[i].color.handle);
+    }
+    if(s_native_images.clears)fprintf(stderr,"[rsx native POC scope] source=%llu explicit_neutral_color_clears=%u prior_contents_discarded=1\n",
+        (unsigned long long)s_native_images.source,s_native_images.clears);
+    s_native_images.clears=0;s_native_images.published=0;
+    s_native_images.id=0;s_native_images.source=0;s_native_images.vm=NULL;s_native_images.count=0;
+}
 static int (*s_report_barrier)(void);
-void rsx_draw_engine_set_report_barrier(int (*barrier)(void)){s_report_barrier=barrier;}
+static void original_rsx_draw_engine_set_report_barrier(int (*barrier)(void)){s_report_barrier=barrier;}
 static int eng_report_barrier(void){return !s_report_barrier||s_report_barrier();}
 
 
@@ -223,6 +261,42 @@ static atomic_int s_checked_ready, s_checked_failed;
 static atomic_int s_checked_fail_line;
 static void eng_checked_fail_at(int line);
 #define ENG_CHECKED_FAIL() eng_checked_fail_at(__LINE__)
+/* Activated only by the explicit external-pass publication API. Word/array
+ * coverage describes actual subsequent guest method writes, not upload hints. */
+static struct {
+    rsx_native_external_status status;
+    u8 vp_words[RSX_DSP_VP_WORDS];
+    u16 array_formats, array_offsets;
+    u8 vp_start, fp_address, fp_control, bases, indices, frequency;
+} s_external;
+static int eng_external_fail(u32 reason, u32 detail)
+{
+    if (!s_external.status.failure) {
+        s_external.status.failure=reason;s_external.status.detail=detail;
+        s_external.status.vp_start=rsx_dsp_vp_start(&g.rsx);
+        fprintf(stderr,"[rsx external continuation] publication=%llu native_generation=%llu native_ticket=%llu reason=%u detail=%u vp_start=%u\n",
+                (unsigned long long)s_external.status.source_observation,
+                (unsigned long long)s_external.status.native_generation,
+                (unsigned long long)s_external.status.native_ticket,reason,detail,s_external.status.vp_start);
+    }
+    ENG_CHECKED_FAIL();return 0;
+}
+static int eng_external_programs_fresh(void)
+{
+    if (!s_external.status.active) return 1;
+    if (s_external.status.failure) return 0;
+    if (!s_external.vp_start) return eng_external_fail(1,0x1EA0);
+    const u32 start=rsx_dsp_vp_start(&g.rsx);
+    if (start>=RSX_DSP_VP_INSTR) return eng_external_fail(2,start*4);
+    const u32 count=rsx_vp_program_size_instrs((const u8*)(g.rsx.vp+start*4),
+                                              (RSX_DSP_VP_INSTR-start)*16u);
+    for (u32 i=start*4;i<(count?(start+count)*4:RSX_DSP_VP_WORDS);++i)
+        if (!s_external.vp_words[i]) return eng_external_fail(2,i);
+    if (!count) return eng_external_fail(2,RSX_DSP_VP_WORDS);
+    if (!s_external.fp_address) return eng_external_fail(3,0x08E4);
+    if (!s_external.fp_control) return eng_external_fail(4,0x1D60);
+    return 1;
+}
 static atomic_uint_fast64_t s_dirty_generation;
 static char s_vs_hlsl[256 * 1024];
 static char s_ps_hlsl[256 * 1024];
@@ -271,7 +345,7 @@ static struct {
 static rsx_vertex_guest_ptr_fn s_guest_reader;
 static void* s_guest_user;
 
-void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user)
+static void original_rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user)
 {
     s_guest_reader = reader;
     s_guest_user = user;
@@ -679,6 +753,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
     s->handle = handle;
     s->color_serial = 0;
+    s->queued_clear_planes = 0;
     s->guest_dirty = 0;
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 16))
@@ -830,7 +905,7 @@ static void eng_row_convert(u8* dst, const u8* src, u32 w, int rgba, int to_gues
     }
 }
 
-void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
+static void original_rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
 {
     if (!g.ready || !g.be->readback || !pitch || !w || !h) return;
     u32 xb = 0, y = 0;
@@ -878,7 +953,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
     }
 }
 
-void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
+static void original_rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
 {
     if (!g.ready || !g.be->color_target_write || !pitch || !w || !h) return;
     u32 x = 0, y = 0;
@@ -953,11 +1028,14 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
+    if (z->view) g.be->texture_release(g.be->user, z->view);
+    z->view = 0; z->view_serial = 0;
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
     z->snapshot = 0;
     z->cleared = 0;
+    z->queued_clear_planes = 0;
     z->had_write = 0;
     z->snapshot_valid = 0;
     z->depth_serial = 0;
@@ -989,6 +1067,54 @@ static u32 eng_zdepth_snapshot(u32 slot)
     z->snapshot = tex;
     z->snapshot_valid = 1;
     return tex;
+}
+
+/* PS3RECOMP_RSX_GPU_DEPTH_VIEW=1 (read at init; default off): a texture
+ * fetch that reads a depth target's bytes as linear A8R8G8B8 or D8R8G8B8 is
+ * served by a backend view built on the GPU, in stream order, instead of
+ * storing the depth into guest memory and waiting for the GPU to finish.
+ * The fetch then samples exactly what the store would have produced, but
+ * guest memory is left as it was: the target stays guest_dirty, so any later
+ * consumer that does need the bytes (another format, a transfer) still gets
+ * the synchronous store. A guest CPU/SPU read of that memory, which the
+ * engine cannot observe, no longer sees the depth this path used to leave
+ * there as a side effect. */
+static int s_gpu_depth_view;
+static u32 eng_zdepth_gpu_view(u32 slot, const rsx_dsp_texture* t, u32 base_fmt)
+{
+    eng_zdepth* z = &g.zdepths[slot];
+    if (!s_gpu_depth_view || !g.be->depth_z24_view || !g.be->submit_async) return 0;
+    if (!z->handle || !z->guest_dirty || z->zfmt == 1u) return 0;   /* Z16 stays */
+    const u32 w = z->used_w < z->w ? z->used_w : z->w;
+    const u32 h = z->used_h < z->h ? z->used_h : z->h;
+    if ((base_fmt != 0x85u && base_fmt != 0x9Eu) || !(t->format & RSX_TEX_FMT_LINEAR) ||
+        t->cubemap || t->dimension == 3 || t->mipmaps > 1 ||
+        (t->pitch ? t->pitch : t->width * 4u) != z->pitch ||
+        !t->width || !t->height || t->width > w || t->height > h)
+        return 0;
+    const u32 remap = t->remap & 0xFFFFu;
+    if (z->view && z->view_serial == z->depth_serial && z->view_handle == z->handle &&
+        z->view_w == t->width && z->view_h == t->height && z->view_remap == remap &&
+        z->view_fmt == t->format)
+        return z->view;
+    if (!eng_report_barrier()) return 0;
+    const u32 view = g.be->depth_z24_view(g.be->user, z->handle, t->width, t->height,
+                                          remap, t->format);
+    if (!view) return 0;
+    /* The view's conversion is encoded after the draws recorded so far; commit
+     * them now, without waiting, so the draw that samples it follows it. */
+    if (!g.be->submit_async(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE)) {
+        g.be->texture_release(g.be->user, view);
+        ENG_CHECKED_FAIL();
+        return 0;
+    }
+    if (z->view) g.be->texture_release(g.be->user, z->view);
+    z->view = view; z->view_handle = z->handle; z->view_serial = z->depth_serial;
+    z->view_w = t->width; z->view_h = t->height; z->view_remap = remap; z->view_fmt = t->format;
+    if (eng_coherence_log())
+        fprintf(stderr, "[rsx engine] depth 0x%08X %ux%u sampled through a GPU view (guest memory unchanged)\n",
+                z->offset, t->width, t->height);
+    return view;
 }
 
 /* ---- textures ------------------------------------------------------------ */
@@ -1227,8 +1353,7 @@ static void eng_texcache_stats_tick(void)
 {
     if (s_tcs.on < 0) s_tcs.on = getenv("RSX_TEXCACHE_STATS") != NULL;
     if (!s_tcs.on) return;
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    const u64 now = (u64)ts.tv_sec * 1000u + (u64)ts.tv_nsec / 1000000u;
+    const u64 now = eng_ph_now() / 1000000u;
     if (!s_tcs.t0) s_tcs.t0 = now;
     if (now - s_tcs.t0 < 2000) return;
     fprintf(stderr, "[texcache] per s: binds=%llu scanned=%llu sparse=%llu full=%llu uploads=%llu upload_MB=%.1f misses=%llu picture_binds=%llu entries=%u\n",
@@ -2620,6 +2745,75 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
     return ENG_INVALID;
 }
 
+/* Private inventory-only correlation, not allocation readiness or coverage proof.
+ * The backend HostImage receipt owns resource_generation; native_generation below
+ * is the actual submitted owner generation. Never borrow a backend image here:
+ * the original engine owner is already held. */
+typedef struct {
+    u32 offset, expected_handle, published_handle, sampled;
+    u64 source, generation, ticket, serial;
+} eng_native_color_attestation;
+static eng_native_color_attestation s_native_color_attest[2];
+static u64 s_native_color_attest_source;
+static int eng_native_color_attest_enabled(void)
+{
+    const char* inventory = getenv("PS3_RENDER_SHADER_INVENTORY_DIR");
+    return inventory && inventory[0] == '/';
+}
+static void eng_native_color_attest_publish(const rsx_native_external_pass* p)
+{
+    if (!eng_native_color_attest_enabled()) return;
+    if (s_native_color_attest_source && s_native_color_attest_source != p->source_observation) return;
+    const u32 offsets[2] = {0x00030000u, 0x007c0000u};
+    for (u32 n = 0; n < 2; ++n) {
+        if (s_native_color_attest[n].source) continue;
+        const rsx_native_external_image_write* last = NULL;
+        for (u32 i = 0; i < p->write_count; ++i) {
+            const rsx_native_external_image_write* w = &p->writes[i];
+            if (w->key.kind == RSX_NATIVE_COLOR_IMAGE && w->key.location == RSX_LOCATION_LOCAL &&
+                w->key.offset == offsets[n] && (w->planes & 1u)) last = w;
+        }
+        if (!last) continue;
+        s_native_color_attest_source = p->source_observation;
+        eng_native_color_attestation* a = &s_native_color_attest[n];
+        *a = (eng_native_color_attestation){.offset=offsets[n],.expected_handle=last->native_handle,
+            .source=p->source_observation,.generation=p->native_generation,.ticket=p->native_ticket};
+        const eng_surface* surface = NULL;
+        for (u32 i = 0; i < g.n_surfaces; ++i)
+            if (g.surfaces[i].location == RSX_LOCATION_LOCAL && g.surfaces[i].offset == offsets[n]) {
+                surface = &g.surfaces[i]; break;
+            }
+        if (surface) {a->published_handle=surface->handle;a->serial=surface->color_serial;}
+        fprintf(stderr, "[rsx native color attestation] stage=publish source=%llu native_generation=%llu ticket=%llu "
+            "loc=0 offset=%08X expected_handle=%u cache_handle=%u size=%ux%u pitch=%u format=%u aa_grid=%X "
+            "color_serial=%llu resource_generation=backend_receipt_only\n",
+            (unsigned long long)a->source,(unsigned long long)a->generation,(unsigned long long)a->ticket,
+            a->offset,a->expected_handle,a->published_handle,surface?surface->w:0,surface?surface->h:0,
+            surface?surface->pitch:0,surface?(u32)surface->fmt:0,surface?surface->aa_grid:0,
+            (unsigned long long)a->serial);
+    }
+}
+static void eng_native_color_attest_sample(u32 unit, const rsx_dsp_texture* t,
+    u32 handle, const char* source, const eng_surface* surface)
+{
+    if (!s_native_color_attest_source || !surface || t->location != RSX_LOCATION_LOCAL) return;
+    for (u32 n = 0; n < 2; ++n) {
+        eng_native_color_attestation* a = &s_native_color_attest[n];
+        if (!a->source || a->sampled || a->offset != t->offset) continue;
+        a->sampled = 1;
+        fprintf(stderr, "[rsx native color attestation] stage=first-retained-sample source=%llu "
+            "native_generation=%llu ticket=%llu frame=%u guest_draw=%u unit=%u binding=%s loc=%u offset=%08X "
+            "published_handle=%u expected_handle=%u cache_handle=%u view_handle=%u cache_matches_publication=%u "
+            "cache_size=%ux%u cache_pitch=%u cache_format=%u aa_grid=%X color_serial=%llu published_serial=%llu "
+            "texture_size=%ux%u texture_pitch=%u texture_format=%X remap=%08X filter=%08X control0=%08X wrap=%08X\n",
+            (unsigned long long)a->source,(unsigned long long)a->generation,(unsigned long long)a->ticket,
+            g.frames,g.guest_draws,unit,source,t->location,t->offset,a->published_handle,a->expected_handle,
+            surface->handle,handle,surface->handle==a->published_handle,surface->w,surface->h,surface->pitch,
+            (u32)surface->fmt,surface->aa_grid,(unsigned long long)surface->color_serial,
+            (unsigned long long)a->serial,t->width,t->height,t->pitch,t->format,t->remap,t->filter,t->control0,t->wrap);
+    }
+}
+
 /* Bounded opt-in evidence. A trigger file permits arming after a menu opens;
  * only metadata is logged, once per distinct descriptor and binding source. */
 static const char* s_capture_binding_source[RSX_BE_MAX_TEXTURES];
@@ -2628,6 +2822,7 @@ static void eng_texture_descriptor_log(u32 unit, const rsx_dsp_texture* t,
                                        const eng_surface* surface)
 {
     s_capture_binding_source[unit] = source;
+    eng_native_color_attest_sample(unit, t, handle, source, surface);
     enum { MAX_DESCRIPTORS = 512 };
     static int configured, enabled, armed;
     static u32 start_frame, limit = 128, count, checked_frame = UINT32_MAX;
@@ -2833,7 +3028,7 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
 {
     enum { MAX_CAPTURE = 8, MAX_IMAGE_BYTES = 8u << 20,
            MAX_TOTAL_BYTES = 64u << 20, MAX_GEOMETRY_BYTES = 1u << 20 };
-    static int configured, enabled, armed;
+    static int configured, enabled, armed, after_native;
     static rsx_binding_capture_filter consumers[RSX_BINDING_CAPTURE_MAX];
     static u32 offsets[MAX_CAPTURE], count, done[MAX_CAPTURE], location;
     static u32 start_frame, start_draw, draw, checked_frame = UINT32_MAX;
@@ -2871,10 +3066,15 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
         if (frame) { unsigned long value=strtoul(frame,&end,10); if (*end || value>UINT32_MAX) return; start_frame=(u32)value; }
         if (first) { unsigned long value=strtoul(first,&end,10); if (*end || value>UINT32_MAX) return; start_draw=(u32)value; }
         trigger=getenv("PS3RECOMP_RSX_BINDING_CAPTURE_TRIGGER");
+        const char* after=getenv("PS3RECOMP_RSX_BINDING_CAPTURE_AFTER_NATIVE");
+        after_native=after && !strcmp(after,"1");
         armed=!trigger || !*trigger;
         enabled=1;
     }
     if (!enabled || g.frames<start_frame || draw<start_draw) return;
+    /* Explicit inventory capture mode: navigation/menu consumers cannot spend
+     * the once-only offset budget before an owned native Main publication. */
+    if (after_native && !s_native_color_attest_source) return;
     if (!armed && checked_frame!=g.frames) {
         checked_frame=g.frames;
         FILE* f=fopen(trigger,"rb"); if (f) { fclose(f); armed=1; }
@@ -3046,6 +3246,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                 if (snap) { textures[u] = snap; continue; }
             }
+            { const u32 view = eng_zdepth_gpu_view((u32)zsrc, &t, base_fmt);
+              if (view) { textures[u] = view; continue; } }
             ENG_PH_BEGIN(ph_zd);
             const int zd_ok = eng_zdepth_to_guest((u32)zsrc);
             ENG_PH_END(ENG_PH_ZDEPTH, ph_zd);
@@ -3740,8 +3942,23 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
         if (topology == RSX_TOPOLOGY_UNSUPPORTED) {ENG_CHECKED_FAIL();return;}
     }
 
+    if (!eng_external_programs_fresh()) return;
+    if (s_external.status.active && !eng_guest_programs(NULL,NULL,NULL,NULL)) {
+        (void)eng_external_fail(8,0x08E4);return;
+    }
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
+    if (s_external.status.active && !dc.n_immediate) {
+        for (u32 i=0;i<RSX_DSP_NUM_VERTEX_ATTR;++i) if (layout.mask&(1u<<i)) {
+            if (!(s_external.array_formats&(1u<<i))) { (void)eng_external_fail(5,i);return; }
+            rsx_dsp_vertex_attr attr;rsx_dsp_get_vertex_attr(&g.rsx,i,&attr);
+            if (!attr.size || dc.inl_bytes) continue;
+            if (!(s_external.array_offsets&(1u<<i))) { (void)eng_external_fail(6,i);return; }
+            if (s_external.bases!=3) { (void)eng_external_fail(7,s_external.bases!=1?0x1738:0x173C);return; }
+            if (attr.frequency>1 && !s_external.frequency) { (void)eng_external_fail(7,0x1FC0);return; }
+        }
+        if (dc.n_idx && s_external.indices!=3) { (void)eng_external_fail(9,s_external.indices!=1?0x181C:0x1820);return; }
+    }
     DRAW_OBSERVER_STAGE("fetch");
     dc_fetch(&layout, rebuild);
     if (!dc.n_verts || !dc.fetch_ok) {ENG_CHECKED_FAIL();return;}
@@ -3870,6 +4087,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
                                   RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL,
                                   1.0f, 0);
         g.zdepths[zslot].cleared = 1;
+        g.zdepths[zslot].queued_clear_planes |= 6u;
         g.zdepths[zslot].had_write = 0;
     }
 
@@ -3976,8 +4194,10 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         /* Every target the set names, not only A: a deferred pass clears its
          * whole G-buffer in one CLEAR_SURFACE, and B, C and D would otherwise
          * keep whatever the last frame left in them. */
-        for (u32 i = 0; i < n_targets; i++)
+        for (u32 i = 0; i < n_targets; i++) {
             g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
+            g.surfaces[targets[i]].queued_clear_planes |= 1u;
+        }
         eng_surfaces_wrote(targets, n_targets);
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
@@ -4003,6 +4223,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
                                   depth, z16 ? 0 : (u8)(zs & 0xFFu));
         g.zdepths[zslot].cleared = 1;
+        if (mask & RSX_CLEAR_DEPTH) g.zdepths[zslot].queued_clear_planes |= 2u;
+        if (mask & RSX_CLEAR_STENCIL) g.zdepths[zslot].queued_clear_planes |= 4u;
         if (mask & RSX_CLEAR_DEPTH) {
             /* A clear invalidates the older published depth image; the next
              * texture consumer resolves the newly written pass exactly once. */
@@ -4078,17 +4300,17 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 
 /* ---- public API ---------------------------------------------------------- */
 
-void rsx_draw_engine_set_backend(const rsx_draw_backend* backend)
+static void original_rsx_draw_engine_set_backend(const rsx_draw_backend* backend)
 {
     g.be = backend;
 }
 
-void rsx_draw_engine_set_default(int on)
+static void original_rsx_draw_engine_set_default(int on)
 {
     g.default_on = on;
 }
 
-int rsx_draw_engine_enabled(void)
+static int original_rsx_draw_engine_enabled(void)
 {
     static int cached = -1;
     static int env_seen = 0;
@@ -4107,7 +4329,7 @@ int rsx_draw_engine_enabled(void)
     return cached;
 }
 
-int rsx_draw_engine_init(u32 width, u32 height)
+static int original_rsx_draw_engine_init(u32 width, u32 height)
 {
     /* Configuration is parsed once; active mode stays OFF until explicit arm.
        Invalid flags are reported and the diagnostic controller must refuse. */
@@ -4118,6 +4340,10 @@ int rsx_draw_engine_init(u32 width, u32 height)
     g.height = height ? height : 720;
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_RSX_GPU_DEPTH_VIEW");
+      s_gpu_depth_view = e && !strcmp(e, "1");
+      if (s_gpu_depth_view && (!g.be->depth_z24_view || !g.be->submit_async))
+          fprintf(stderr, "[rsx engine] PS3RECOMP_RSX_GPU_DEPTH_VIEW: backend has no GPU depth view; depth reads keep the guest-memory store\n"); }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
@@ -4136,6 +4362,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
+    memset(&s_external,0,sizeof(s_external));
     atomic_store(&s_checked_failed, 0);
     atomic_store(&s_checked_ready, g.be->submit_and_wait_checked != NULL);
     /* Display buffers the title registered before the backend came up. */
@@ -4145,10 +4372,11 @@ int rsx_draw_engine_init(u32 width, u32 height)
     return 0;
 }
 
-void rsx_draw_engine_shutdown(void)
+static void original_rsx_draw_engine_shutdown(void)
 {
     if(!eng_report_barrier())return;
     draw_observer_reset();
+    eng_native_images_release();
     atomic_store(&s_checked_ready, 0);
     for(u32 i=0;i<RSX_BE_MAX_TEXTURES;++i){rsx_picture_release(s_picture_bound[i]);s_picture_bound[i]=0;s_picture_offset_pending[i]=0;}
     if (!g.be) return;
@@ -4162,8 +4390,10 @@ void rsx_draw_engine_shutdown(void)
         if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
     }
-    for (u32 i = 0; i < g.n_zdepths; i++)
+    for (u32 i = 0; i < g.n_zdepths; i++) {
+        if (g.zdepths[i].view) g.be->texture_release(g.be->user, g.zdepths[i].view);
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
+    }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);
@@ -4177,7 +4407,7 @@ void rsx_draw_engine_shutdown(void)
 }
 
 static void eng_method_core(u32 method, u32 arg);
-void rsx_draw_engine_method(u32 method, u32 arg)
+static void original_rsx_draw_engine_method(u32 method, u32 arg)
 {
     ENG_PH_BEGIN(ph);
     eng_method_core(method, arg);
@@ -4205,16 +4435,31 @@ static void eng_method_core(u32 method, u32 arg)
         rsx_picture_release(s_picture_bound[unit]);s_picture_bound[unit]=0;
         s_picture_offset_ea[unit]=s_picture_command_ea;s_picture_offset_pending[unit]=1;
     }
+    if (s_external.status.active) {
+        if (m>=0x0B80 && m<0x0C00) {
+            const u64 pos=(u64)rsx_dsp_reg(&g.rsx,0x1E9C)*4+(((m-0x0B80)>>2)&3);
+            if (pos<RSX_DSP_VP_WORDS) s_external.vp_words[pos]=1;
+        } else if (m==0x1EA0) s_external.vp_start=1;
+        else if (m==0x08E4) s_external.fp_address=1;
+        else if (m==0x1D60) s_external.fp_control=1;
+        else if (m>=0x1740 && m<0x1780) s_external.array_formats|=(u16)(1u<<((m-0x1740)/4));
+        else if (m>=0x1680 && m<0x16C0) s_external.array_offsets|=(u16)(1u<<((m-0x1680)/4));
+        else if (m==0x1738) s_external.bases|=1;
+        else if (m==0x173C) s_external.bases|=2;
+        else if (m==0x181C) s_external.indices|=1;
+        else if (m==0x1820) s_external.indices|=2;
+        else if (m==0x1FC0) s_external.frequency=1;
+    }
     rsx_dispatch_method(&g.rsx, m, arg);
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
 }
 
-void rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea)
+static void original_rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea)
 {
     s_picture_command_ea=data_ea;rsx_draw_engine_method(method,arg);s_picture_command_ea=0;
 }
 
-void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
+static void original_rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
                                         u32 pitch, u32 width, u32 height)
 {
     if (buffer_id >= 8) return;
@@ -4227,7 +4472,7 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
     d->valid = width && height;
 }
 
-void rsx_draw_engine_flush(void)
+static void original_rsx_draw_engine_flush(void)
 {
     ENG_PH_BEGIN(ph);
     if(!eng_report_barrier())return;
@@ -4236,7 +4481,7 @@ void rsx_draw_engine_flush(void)
     ENG_PH_END(ENG_PH_FLUSH, ph);
 }
 
-int rsx_draw_engine_async_available(void){return g.ready&&g.be&&g.be->submit_async&&g.be->completion_status;}
+static int original_rsx_draw_engine_async_available(void){return g.ready&&g.be&&g.be->submit_async&&g.be->completion_status;}
 /* Failure-only witness for the opt-in consumer experiment. No submission,
  * report publication or completion behavior changes, including partial BEGIN. */
 static void eng_async_failure_witness(const char *where,int available)
@@ -4248,7 +4493,7 @@ static void eng_async_failure_witness(const char *where,int available)
         where,available,g.ready,g.rsx.in_begin_end,atomic_load(&s_checked_failed),
         (unsigned long long)g.write_serial);
 }
-u64 rsx_draw_engine_submit_async(void)
+static u64 original_rsx_draw_engine_submit_async(void)
 {
     int available=rsx_draw_engine_async_available();
     if(!available||g.rsx.in_begin_end||atomic_load(&s_checked_failed)){
@@ -4260,7 +4505,7 @@ u64 rsx_draw_engine_submit_async(void)
     if(!ticket)eng_async_failure_witness("backend",available);
     return ticket;
 }
-int rsx_draw_engine_completion_status(u64 ticket,int wait){if(!ticket||!rsx_draw_engine_async_available())return -1;int status=g.be->completion_status(g.be->user,ticket,wait);if(status<0)ENG_CHECKED_FAIL();return status;}
+static int original_rsx_draw_engine_completion_status(u64 ticket,int wait){if(!ticket||!rsx_draw_engine_async_available())return -1;int status=g.be->completion_status(g.be->user,ticket,wait);if(status<0)ENG_CHECKED_FAIL();return status;}
 
 void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes)
 {
@@ -4271,13 +4516,13 @@ void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes)
         ENG_CHECKED_FAIL();
 }
 
-int rsx_draw_engine_checked_ready(void)
+static int original_rsx_draw_engine_checked_ready(void)
 {
     return atomic_load(&s_checked_ready) && !atomic_load(&s_checked_failed) && rsx_picture_ready();
 }
 
 static int eng_flush_checked_core(void);
-int rsx_draw_engine_flush_checked(void)
+static int original_rsx_draw_engine_flush_checked(void)
 {
     ENG_PH_BEGIN(ph);
     const int ok = eng_flush_checked_core();
@@ -4296,7 +4541,7 @@ static int eng_flush_checked_core(void)
     return 1;
 }
 
-void rsx_draw_engine_present(void)
+static void original_rsx_draw_engine_present(void)
 {
     /* A host that drives the flip itself gets whichever buffer the guest's
      * own last flip named, and display buffer 0 before there has been one:
@@ -4307,23 +4552,23 @@ void rsx_draw_engine_present(void)
     eng_present(g.last_flip_buffer);
 }
 
-void rsx_draw_engine_present_buffer(u32 buffer_id)
+static void original_rsx_draw_engine_present_buffer(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
     eng_present(g.last_flip_buffer);
 }
 
-void rsx_draw_engine_note_flip(u32 buffer_id)
+static void original_rsx_draw_engine_note_flip(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
 }
 
-u32 rsx_draw_engine_guest_draws(void)
+static u32 original_rsx_draw_engine_guest_draws(void)
 {
     return g.last_guest_draws;
 }
 
-u32 rsx_draw_engine_readback_center(void)
+static u32 original_rsx_draw_engine_readback_center(void)
 {
     if (!g.ready || !g.be->readback) return 0;
     const u32 slot = g.last_present_surface;
@@ -4346,4 +4591,600 @@ static void eng_checked_fail_at(int line)
         fprintf(stderr, "[rsx checked failure] first failing check at rsx_draw_engine.c:%d "
                 "surfaces=%u/%u zdepths=%u/%u\n", line, (unsigned)g.n_surfaces, (unsigned)ENG_MAX_SURFACES,
                 (unsigned)g.n_zdepths, (unsigned)ENG_MAX_ZDEPTHS);
+}
+
+/* Optional ownership covers CPU-only BEGIN/state/lifetime ingress too. */
+void rsx_draw_engine_set_report_barrier(int (*barrier)(void)){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_LIFECYCLE)){return;}
+    original_rsx_draw_engine_set_report_barrier(barrier);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_LIFECYCLE,0,0);
+}
+void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_LIFECYCLE)){return;}
+    original_rsx_draw_engine_set_guest_memory(reader,user);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_LIFECYCLE,0,0);
+}
+void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return;}
+    original_rsx_draw_engine_guest_read(location,offset,pitch,w,h);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+}
+void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return;}
+    original_rsx_draw_engine_guest_wrote(location,offset,pitch,w,h);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+}
+void rsx_draw_engine_set_backend(const rsx_draw_backend* backend){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_LIFECYCLE)){return;}
+    original_rsx_draw_engine_set_backend(backend);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_LIFECYCLE,0,0);
+}
+void rsx_draw_engine_set_default(int on){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_LIFECYCLE)){return;}
+    original_rsx_draw_engine_set_default(on);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_LIFECYCLE,0,0);
+}
+int rsx_draw_engine_enabled(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_READ)){return 0;}
+    int result=original_rsx_draw_engine_enabled();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
+    return result;
+}
+int rsx_draw_engine_init(u32 width, u32 height){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_LIFECYCLE)){return -1;}
+    int before=g.rsx.in_begin_end!=0;int result=original_rsx_draw_engine_init(width,height);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_LIFECYCLE,(g.rsx.in_begin_end!=0)-before,0);
+    return result;
+}
+void rsx_draw_engine_shutdown(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_LIFECYCLE)){return;}
+    int before=g.rsx.in_begin_end!=0;original_rsx_draw_engine_shutdown();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_LIFECYCLE,(g.rsx.in_begin_end!=0)-before,0);
+}
+void rsx_draw_engine_method(u32 method, u32 arg){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return;}
+    int before=g.rsx.in_begin_end!=0;original_rsx_draw_engine_method(method,arg);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,(g.rsx.in_begin_end!=0)-before,0);
+}
+void rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return;}
+    original_rsx_draw_engine_method_at(method,arg,data_ea);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+}
+void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
+                                        u32 pitch, u32 width, u32 height){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return;}
+    original_rsx_draw_engine_set_display_buffer(buffer_id,location,offset,pitch,width,height);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+}
+void rsx_draw_engine_flush(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_BOUNDARY)){return;}
+    original_rsx_draw_engine_flush();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_BOUNDARY,0,!g.rsx.in_begin_end);
+}
+int rsx_draw_engine_async_available(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_READ)){return 0;}
+    int result=original_rsx_draw_engine_async_available();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
+    return result;
+}
+u64 rsx_draw_engine_submit_async(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_BOUNDARY)){return 0;}
+    u64 result=original_rsx_draw_engine_submit_async();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_BOUNDARY,0,!g.rsx.in_begin_end && result!=0);
+    return result;
+}
+int rsx_draw_engine_completion_status(u64 ticket,int wait){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_READ)){return -1;}
+    int result=original_rsx_draw_engine_completion_status(ticket,wait);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
+    return result;
+}
+int rsx_draw_engine_native_canvas(uint32_t dimensions[2])
+{
+    if (!dimensions) return -1;
+    const rsx_original_owner_hooks* owner = atomic_load_explicit(&s_original_owner_hooks, memory_order_acquire);
+    if (owner && !owner->begin(owner->user, RSX_ORIGINAL_READ)) return -4;
+    int status = 0;
+    if (!g.ready) status = -3;
+    else if (atomic_load(&s_checked_failed)) status = -6;
+    else if (g.rsx.in_begin_end) status = -4;
+    else { dimensions[0] = g.width; dimensions[1] = g.height; }
+    if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
+    return status;
+}
+int rsx_draw_engine_native_registers(const uint32_t* methods, uint32_t* values, uint32_t count)
+{
+    if (!methods || !values || !count || count > 256) return -1;
+    for (uint32_t i = 0; i < count; ++i)
+        if ((methods[i] & 3u) || methods[i] > 0x1ffcu) return -1;
+    const rsx_original_owner_hooks* owner = atomic_load_explicit(&s_original_owner_hooks, memory_order_acquire);
+    if (owner && !owner->begin(owner->user, RSX_ORIGINAL_READ)) return -4;
+    int status = 0;
+    if (!g.ready) status = -3;
+    else if (atomic_load(&s_checked_failed)) status = -6;
+    else if (g.rsx.in_begin_end) status = -4;
+    else {
+        uint32_t snapshot[256];
+        for (uint32_t i = 0; i < count; ++i) snapshot[i] = rsx_dsp_reg(&g.rsx, methods[i]);
+        memcpy(values, snapshot, count * sizeof(*values));
+    }
+    if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
+    return status;
+}
+int rsx_draw_engine_native_image(const rsx_native_image_key* key, rsx_native_image_match* out)
+{
+    if (!out || out->abi_version != 1 || out->struct_size != sizeof(*out)) return -1;
+    memset(out, 0, sizeof(*out));
+    out->abi_version = 1; out->struct_size = sizeof(*out);
+    if (!key || key->abi_version != 1 || key->struct_size != sizeof(*key) ||
+        key->reserved[0] || key->reserved[1] || key->kind > RSX_NATIVE_DEPTH_IMAGE ||
+        key->location > RSX_LOCATION_MAIN || !key->width || !key->height ||
+        key->width > ENG_MAX_SURFACE_DIM || key->height > ENG_MAX_SURFACE_DIM ||
+        key->format > 31 ||
+        (key->kind == RSX_NATIVE_DEPTH_IMAGE ? key->aa_grid != 0 :
+         (key->aa_grid != 0x101 && key->aa_grid != 0x102 && key->aa_grid != 0x202))) return -1;
+    const rsx_original_owner_hooks* owner = atomic_load_explicit(&s_original_owner_hooks, memory_order_acquire);
+    if (owner && !owner->begin(owner->user, RSX_ORIGINAL_READ)) return -4;
+    int status = 0;
+    uint32_t handle = 0, clear_planes = 0;
+    if (!g.ready) status = -3;
+    else if (atomic_load(&s_checked_failed)) status = -6;
+    else if (g.rsx.in_begin_end) status = -4;
+    else if (key->kind == RSX_NATIVE_COLOR_IMAGE) {
+        for (u32 i = 0; i < g.n_surfaces; ++i) {
+            const eng_surface* surface = &g.surfaces[i];
+            if (!surface->handle || surface->location != key->location ||
+                surface->offset != key->offset || surface->pitch != key->pitch ||
+                surface->fmt != eng_surface_format(key->format) ||
+                surface->w != key->width || surface->h != key->height ||
+                surface->aa_grid != key->aa_grid) continue;
+            if (handle) { handle = 0; break; }
+            handle = surface->handle; clear_planes = surface->queued_clear_planes;
+        }
+    } else {
+        for (u32 i = 0; i < g.n_zdepths; ++i) {
+            const eng_zdepth* surface = &g.zdepths[i];
+            if (!surface->handle || surface->location != key->location ||
+                surface->offset != key->offset || surface->pitch != key->pitch ||
+                surface->zfmt != key->format || surface->w != key->width ||
+                surface->h != key->height) continue;
+            if (handle) { handle = 0; break; }
+            handle = surface->handle; clear_planes = surface->queued_clear_planes;
+        }
+    }
+    if (handle) {
+        out->kind = key->kind; out->native_handle = handle;
+        out->width = key->width; out->height = key->height;
+        out->queued_clear_planes = clear_planes;
+        status = 1;
+    }
+    if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
+    return status;
+}
+static int eng_native_key_valid(const rsx_native_image_key* k)
+{
+    return k && k->abi_version==1 && k->struct_size==sizeof(*k) && !k->reserved[0] && !k->reserved[1] &&
+        k->kind<=1 && k->location<=RSX_LOCATION_MAIN && k->width && k->height && k->pitch &&
+        k->width<=ENG_MAX_SURFACE_DIM && k->height<=ENG_MAX_SURFACE_DIM && k->format<=31 &&
+        (k->kind==0 ? (k->aa_grid==0x101 || k->aa_grid==0x102 || k->aa_grid==0x202) :
+                     (!k->aa_grid && (k->format==1 || k->format==2)));
+}
+int rsx_draw_engine_native_images_begin(uint64_t source, uint64_t* scope)
+{
+    if(!source || !scope)return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
+    int status=0;
+    if(!g.ready)status=-3;
+    else if(atomic_load(&s_checked_failed))status=-6;
+    else if(g.rsx.in_begin_end || s_native_images.id)status=-4;
+    else if(s_native_images.next==UINT64_MAX)status=-5;
+    else {s_native_images.id=++s_native_images.next;s_native_images.source=source;
+        s_native_images.vm=vm_base;*scope=s_native_images.id;}
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+    return status;
+}
+int rsx_draw_engine_native_images_end(uint64_t scope)
+{
+    if(!scope)return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
+    int status=0;
+    if(scope!=s_native_images.id)status=-3;
+    else eng_native_images_release();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+    return status;
+}
+int rsx_draw_engine_native_prepare_image(uint64_t scope,const rsx_native_image_key* k,
+    uint32_t sampled,uint32_t attachment,uint32_t flags,rsx_native_image_key* backing,rsx_native_image_match* out)
+{
+    if(!eng_native_key_valid(k) || !backing || !out || out->abi_version!=1 || out->struct_size!=sizeof(*out) ||
+       !scope || (flags&~1u) || !(sampled|attachment) || ((sampled|attachment)&~(k->kind==0?1u:(k->format==1?2u:6u))) ||
+       (flags && (sampled || !attachment)))return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
+    int status=0;u32 handle=0,planes=0,w=k->width,h=k->height,backing_aa=k->aa_grid;int cleared=0;
+    if(!g.ready || scope!=s_native_images.id || s_native_images.vm!=vm_base || s_native_images.published)status=-3;
+    else if(atomic_load(&s_checked_failed))status=-6;
+    else if(g.rsx.in_begin_end)status=-4;
+    /* Current input allocations have priority. Never replace or clear one. */
+    if(!status && k->kind==0)for(u32 i=0;i<g.n_surfaces;++i) {
+        const eng_surface* v=&g.surfaces[i];
+        /* Match the original eng_surface_get rule for the SAME physical
+         * layout. AA describes source viewport/sample-grid interpretation;
+         * exact physical extent/format/pitch is already the same allocation.
+         * Larger-backing reuse still requires the actual cached AA grid. */
+        if(v->handle && v->location==k->location && v->offset==k->offset && v->fmt==eng_surface_format(k->format) &&
+           v->pitch==k->pitch && ((v->w==w && v->h==h) ||
+           (v->aa_grid==k->aa_grid && v->w>=w && v->h>=h))) {
+            handle=v->handle;planes=v->queued_clear_planes;w=v->w;h=v->h;backing_aa=v->aa_grid;break;}
+    }
+    if(!status && k->kind==1)for(u32 i=0;i<g.n_zdepths;++i) {
+        const eng_zdepth* v=&g.zdepths[i];
+        if(v->handle && v->location==k->location && v->offset==k->offset && v->zfmt==k->format &&
+           v->pitch==k->pitch && v->w>=w && v->h>=h) {
+            handle=v->handle;planes=v->queued_clear_planes;w=v->w;h=v->h;break;}
+    }
+    if(!status && !handle)for(u32 i=0;i<s_native_images.count;++i) {
+        if(memcmp(k,&s_native_images.images[i].key,sizeof(*k)))continue;
+        /* Staging is not prior input content, even after its diagnostic clear. */
+        if(sampled){status=-3;break;}
+        const eng_surface* c=&s_native_images.images[i].color;
+        handle=c->handle;planes=c->queued_clear_planes;break;
+    }
+    if(!status && !handle) {
+        if(sampled || !attachment || !flags || k->kind!=0)status=-3;
+        else if(s_native_images.count==ENG_NATIVE_STAGED)status=-5;
+        else if(k->kind==0 && (!g.be->color_target_create || !g.be->clear_color))status=-3;
+        else {
+            handle=g.be->color_target_create(g.be->user,eng_surface_format(k->format),w,h,NULL,0);
+            if(!handle)status=-5;
+            else {
+                u32 i=s_native_images.count++;
+                s_native_images.images[i].key=*k;
+                const float neutral[4]={0,0,0,0};g.be->clear_color(g.be->user,handle,neutral);planes=1;
+                s_native_images.images[i].color=(eng_surface){.location=k->location,.offset=k->offset,.w=w,.h=h,
+                    .pitch=k->pitch,.aa_grid=k->aa_grid,.fmt=eng_surface_format(k->format),.handle=handle,.queued_clear_planes=planes};
+                cleared=1;++s_native_images.clears;
+                static u32 logs=0;if(PS3_LOG_FIRST(logs,8))fprintf(stderr,
+                    "[rsx native POC clear] scope=%llu source=%llu kind=%u offset=%08X size=%ux%u planes=%u prior_contents_discarded=1\n",
+                    (unsigned long long)scope,(unsigned long long)s_native_images.source,k->kind,k->offset,w,h,planes);
+            }
+        }
+    }
+    if(!status) {
+        *backing=*k;backing->width=w;backing->height=h;backing->aa_grid=backing_aa;
+        *out=(rsx_native_image_match){.abi_version=1,.struct_size=sizeof(*out),.kind=k->kind,
+            .native_handle=handle,.width=w,.height=h,.queued_clear_planes=planes};status=1;
+    }
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,cleared?0:1);
+    return status;
+}
+/* This whitelist is passive source state only. Execution, program and guest
+ * vertex/index bindings deliberately require real later original methods.
+ * Base registers are certificates of unchanged inherited state, checked under
+ * the owner gate before mutation; they cannot restore a stale guest base. */
+static int eng_external_passive(u32 m)
+{
+    if (m&3u) return 0;
+    switch(m) {
+    case 0x018C:case 0x0194:case 0x0198:case 0x01B4:case 0x01B8:
+    case 0x0200:case 0x0204:case 0x0208:case 0x020C:case 0x0210:case 0x0214:
+    case 0x0218:case 0x021C:case 0x022C:case 0x0280:case 0x0284:case 0x0288:
+    case 0x028C:case 0x02B8:case 0x1D88:case 0x1D7C:
+    case 0x0300:case 0x0304:case 0x0308:case 0x030C:case 0x0310:case 0x0314:
+    case 0x0318:case 0x031C:case 0x0320:case 0x0324:case 0x0328:case 0x032C:
+    case 0x0330:case 0x0334:case 0x0338:case 0x033C:case 0x0340:case 0x0344:
+    case 0x0348:case 0x034C:case 0x0350:case 0x0354:case 0x0358:case 0x035C:
+    case 0x0360:case 0x0364:case 0x0368:case 0x036C:case 0x0370:case 0x0374:
+    case 0x0378:case 0x037C:case 0x0380:case 0x0384:case 0x0388:case 0x038C:
+    case 0x0390:case 0x0394:case 0x0398:case 0x039C:case 0x03A0:
+    case 0x08C0:case 0x08C4:case 0x08CC:case 0x08D0:
+    case 0x0A00:case 0x0A04:case 0x0A20:case 0x0A24:case 0x0A28:case 0x0A2C:
+    case 0x0A30:case 0x0A34:case 0x0A38:case 0x0A3C:
+    case 0x0A60:case 0x0A64:case 0x0A68:case 0x0A6C:case 0x0A70:case 0x0A74:case 0x0A78:case 0x0A7C:
+    case 0x1738:case 0x173C:
+    case 0x1830:case 0x1834:case 0x1838:case 0x183C:case 0x1FEC:case 0x1D78:case 0x1D90:
+    case 0x1D98:case 0x1D9C:case 0x1DA0:case 0x1DA4:case 0x1DAC:case 0x1DB0:
+    case 0x1FC0:case 0x1FF0:case 0x1FF4:return 1;
+    default:return (m>=0x1A00 && m<0x1C00) || (m>=0x1840 && m<0x1880) ||
+                   (m>=0x0B40 && m<0x0B68) || (m>=0x0B00 && m<0x0B40) ||
+                   (m>=0x1D00 && m<0x1D40);
+    }
+}
+static int eng_external_image_slot(const rsx_native_external_image_write* w,u32* slot)
+{
+    const rsx_native_image_key* k=&w->key;
+    if(k->abi_version!=1 || k->struct_size!=sizeof(*k) || k->reserved[0] || k->reserved[1] ||
+       k->kind>1 || k->location>RSX_LOCATION_MAIN || !k->width || !k->height ||
+       k->width>ENG_MAX_SURFACE_DIM || k->height>ENG_MAX_SURFACE_DIM || k->format>31 ||
+       !w->native_handle || !w->planes || !w->source_clip_width || !w->source_clip_height ||
+       w->source_clip_width>k->width || w->source_clip_height>k->height ||
+       (k->kind==0 ? (w->planes!=1 || (k->aa_grid!=0x101 && k->aa_grid!=0x102 && k->aa_grid!=0x202)) :
+                    ((w->planes&~6u) || k->aa_grid || (k->format==1 && (w->planes&4))))) return -1;
+    u32 found=0;
+    if(k->kind==0) for(u32 i=0;i<g.n_surfaces;++i) {
+        const eng_surface* v=&g.surfaces[i];
+        if(v->handle==w->native_handle && v->location==k->location && v->offset==k->offset &&
+           v->pitch==k->pitch && v->fmt==eng_surface_format(k->format) && v->w==k->width &&
+           v->h==k->height && v->aa_grid==k->aa_grid){*slot=i;++found;}
+    } else for(u32 i=0;i<g.n_zdepths;++i) {
+        const eng_zdepth* v=&g.zdepths[i];
+        if(v->handle==w->native_handle && v->location==k->location && v->offset==k->offset &&
+           v->pitch==k->pitch && v->zfmt==k->format && v->w==k->width && v->h==k->height){*slot=i;++found;}
+    }
+    for(u32 i=0;i<s_native_images.count;++i) {
+        const eng_surface* c=&s_native_images.images[i].color;
+        if(k->kind==0 && c->handle==w->native_handle && c->location==k->location && c->offset==k->offset &&
+             c->pitch==k->pitch && c->fmt==eng_surface_format(k->format) && c->w==k->width && c->h==k->height && c->aa_grid==k->aa_grid) {*slot=ENG_NATIVE_STAGE_BIT|i;++found;}
+    }
+    return found==1?0:-3;
+}
+static const rsx_native_external_image_write* eng_external_ordered_write(
+    const rsx_native_external_pass* p,const rsx_native_external_image_write* clears,u32 clear_count,u32 i)
+{
+    return i<clear_count?&clears[i]:&p->writes[i-clear_count];
+}
+int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
+{
+    if(!p || p->abi_version!=1 || p->struct_size!=sizeof(*p) || !p->source_observation ||
+       !p->native_generation || !p->native_ticket || p->reserved || p->reserved1 || p->reserved2 || p->reserved3 ||
+       (p->write_count&&!p->writes) || (p->register_count&&!p->registers) ||
+       (p->constant_count&&!p->constants) || (p->current_attribute_count&&!p->current_attributes)) return -1;
+    if(p->write_count>4096 || p->register_count>256 || p->constant_count>512 || p->current_attribute_count>16) return -5;
+    for(u32 i=0;i<p->register_count;++i) if(!eng_external_passive(p->registers[i].method))return -1;
+    for(u32 i=0;i<p->constant_count;++i) if(p->constants[i].index>=RSX_DSP_NUM_CONSTANTS)return -1;
+    for(u32 i=0;i<p->current_attribute_count;++i) if(p->current_attributes[i].index>=RSX_DSP_NUM_VERTEX_ATTR)return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
+    int status=0;u32 slots[4096+ENG_NATIVE_STAGED];
+    rsx_native_external_image_write clears[ENG_NATIVE_STAGED];u32 clear_count=0;
+    if(!g.ready)status=-3;
+    else if(atomic_load(&s_checked_failed))status=-6;
+    else if(g.rsx.in_begin_end)status=-4;
+    /* Native Main does not write either guest array base. An explicit carried
+     * word may certify that unchanged value, never overwrite newer state. */
+    for(u32 i=0;!status && i<p->register_count;++i) {
+        const rsx_native_register_write* r=&p->registers[i];
+        if((r->method==0x1738 || r->method==0x173C) &&
+           r->value!=rsx_dsp_reg(&g.rsx,r->method))status=-3;
+    }
+    if(!status && s_native_images.id && (s_native_images.source!=p->source_observation || s_native_images.vm!=vm_base || s_native_images.published))status=-3;
+    /* These are actual earlier queued POC clear commands, not inferred draw
+     * coverage. Publish them before native writes, including clear-only outputs.
+     * Cancel/end without accepted publication never changes the live cache. */
+    for(u32 i=0;!status && i<s_native_images.count;++i) {
+        const eng_surface* v=&s_native_images.images[i].color;
+        if(!v->handle || !(v->queued_clear_planes&1))continue;
+        clears[clear_count]=(rsx_native_external_image_write){.key=s_native_images.images[i].key,
+            .native_handle=v->handle,.planes=1,.source_clip_width=v->w,.source_clip_height=v->h};
+        ++clear_count;
+    }
+    const u32 write_count=clear_count+p->write_count;
+    if(!status && UINT64_MAX-g.write_serial<write_count)status=-5;
+    for(u32 i=0;!status&&i<write_count;++i)
+        status=eng_external_image_slot(eng_external_ordered_write(p,clears,clear_count,i),&slots[i]);
+    /* Prove all promotion capacity before any serial/cache mutation. */
+    u32 new_color=0,new_depth=0;
+    for(u32 i=0;!status&&i<write_count;++i) {
+        const rsx_native_image_key* k=&eng_external_ordered_write(p,clears,clear_count,i)->key;int seen=0;
+        for(u32 j=0;j<i;++j)if(eng_external_ordered_write(p,clears,clear_count,j)->key.kind==k->kind && eng_external_ordered_write(p,clears,clear_count,j)->key.location==k->location && eng_external_ordered_write(p,clears,clear_count,j)->key.offset==k->offset)seen=1;
+        if(seen)continue;
+        if(k->kind==0){for(u32 j=0;j<g.n_surfaces;++j)if(g.surfaces[j].location==k->location&&g.surfaces[j].offset==k->offset)seen=1;
+            if(!seen)++new_color;
+        }else{for(u32 j=0;j<g.n_zdepths;++j)if(g.zdepths[j].location==k->location&&g.zdepths[j].offset==k->offset)seen=1;
+            if(!seen)++new_depth;}
+    }
+    if(!status && (new_color>ENG_MAX_SURFACES-g.n_surfaces || new_depth>ENG_MAX_ZDEPTHS-g.n_zdepths))status=-5;
+    if(!status) {
+        if(s_native_images.id)s_native_images.published=1;
+        for(u32 i=0;i<write_count;++i) {
+            const rsx_native_external_image_write* w=eng_external_ordered_write(p,clears,clear_count,i);
+            if(w->key.kind==0) {
+                eng_surface* v=(slots[i]&ENG_NATIVE_STAGE_BIT)?&s_native_images.images[slots[i]&~ENG_NATIVE_STAGE_BIT].color:&g.surfaces[slots[i]];v->color_serial=++g.write_serial;v->guest_dirty=1;
+            } else {
+                eng_zdepth* v=&g.zdepths[slots[i]];v->depth_serial=++g.write_serial;v->guest_dirty=1;
+                v->snapshot_valid=0;
+                if(w->planes&2)v->had_write=1;
+                v->used_w=w->source_clip_width;v->used_h=w->source_clip_height;
+            }
+        }
+        /* Only the last written physical layout per guest EA becomes current.
+         * Earlier native/input allocations remain alive through HostImage pins. */
+        for(u32 i=0;i<write_count;++i) {
+            const rsx_native_image_key* k=&eng_external_ordered_write(p,clears,clear_count,i)->key;int later=0;
+            for(u32 j=i+1;j<write_count;++j)if(eng_external_ordered_write(p,clears,clear_count,j)->key.kind==k->kind && eng_external_ordered_write(p,clears,clear_count,j)->key.location==k->location && eng_external_ordered_write(p,clears,clear_count,j)->key.offset==k->offset)later=1;
+            if(later || !(slots[i]&ENG_NATIVE_STAGE_BIT))continue;
+            u32 n=slots[i]&~ENG_NATIVE_STAGE_BIT;
+            if(k->kind==0) {
+                u32 j=0;for(;j<g.n_surfaces;++j)if(g.surfaces[j].location==k->location&&g.surfaces[j].offset==k->offset)break;
+                if(j==g.n_surfaces)++g.n_surfaces;
+                else {if(g.surfaces[j].feedback)g.be->texture_release(g.be->user,g.surfaces[j].feedback);
+                    if(g.surfaces[j].handle)g.be->color_target_release(g.be->user,g.surfaces[j].handle);}
+                g.surfaces[j]=s_native_images.images[n].color;s_native_images.images[n].color.handle=0;
+
+            }
+        }
+        eng_native_color_attest_publish(p);
+        for(u32 i=0;i<p->register_count;++i) {
+            const rsx_native_register_write* r=&p->registers[i];
+            g.rsx.regs[r->method>>2]=r->value;
+            if(r->method>=0x1A00 && r->method<0x1C00 && ((r->method&31u)==0 || (r->method&31u)==4)) {
+                const u32 unit=(r->method-0x1A00)/32;
+                rsx_picture_release(s_picture_bound[unit]);s_picture_bound[unit]=0;
+                s_picture_offset_pending[unit]=0;s_picture_offset_ea[unit]=0;
+            }
+        }
+        for(u32 i=0;i<p->constant_count;++i)memcpy(g.rsx.constants[p->constants[i].index],p->constants[i].words,16);
+        for(u32 i=0;i<p->current_attribute_count;++i) {
+            const rsx_native_vector_write* v=&p->current_attributes[i];
+            for(u32 j=0;j<4;++j){const u32 idx=(0x1C00+v->index*16+j*4)>>2;
+                g.rsx.regs[idx]=v->words[j];g.rsx.seen[idx]=1;}
+        }
+        memset(&s_external,0,sizeof(s_external));
+        // Only explicit validated continuation words certify these retained
+        // inputs. Programs, guest array addresses/formats and indices remain
+        // invalid until their real subsequent guest methods arrive.
+        for(u32 i=0;i<p->register_count;++i) {
+            const u32 m=p->registers[i].method;
+            if(m==0x1738)s_external.bases|=1;
+            else if(m==0x173C)s_external.bases|=2;
+            else if(m==0x1FC0)s_external.frequency=1;
+        }
+        s_external.status=(rsx_native_external_status){.abi_version=1,.struct_size=sizeof(rsx_native_external_status),.active=1,
+            .source_observation=p->source_observation,.native_generation=p->native_generation,.native_ticket=p->native_ticket};
+    }
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+    return status;
+}
+int rsx_draw_engine_native_abort_external(uint64_t source,uint64_t generation,uint64_t ticket,int32_t reason)
+{
+    if(!source || !reason)return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_MUTATE))return -4;
+    int result=0;
+    if(!g.ready)result=-3;
+    else {
+        if(!s_external.status.failure) {
+            s_external.status=(rsx_native_external_status){.abi_version=1,.struct_size=sizeof(rsx_native_external_status),
+                .active=1,.failure=10,.source_observation=source,.native_generation=generation,.native_ticket=ticket,
+                .detail=(uint32_t)reason,.vp_start=rsx_dsp_vp_start(&g.rsx)};
+        } else if(s_external.status.source_observation==source) {
+            if(generation)s_external.status.native_generation=generation;
+            if(ticket)s_external.status.native_ticket=ticket;
+        }
+        ENG_CHECKED_FAIL();
+    }
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+    return result;
+}
+int rsx_draw_engine_native_external_status(rsx_native_external_status* out)
+{
+    if(!out || out->abi_version!=1 || out->struct_size!=sizeof(*out))return -1;
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner&&!owner->begin(owner->user,RSX_ORIGINAL_READ))return -4;
+    *out=s_external.status;out->abi_version=1;out->struct_size=sizeof(*out);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
+    return 0;
+}
+int rsx_draw_engine_native_image_clear_planes(uint32_t handle, uint32_t required)
+{
+    if (!handle || !required || (required & ~7u)) return -1;
+    if (!g.ready) return -3;
+    if (atomic_load(&s_checked_failed)) return -6;
+    unsigned matches = 0;
+    uint32_t planes = 0;
+    for (u32 i = 0; i < g.n_surfaces; ++i) if (g.surfaces[i].handle == handle) {
+        ++matches; planes = g.surfaces[i].queued_clear_planes;
+    }
+    for (u32 i = 0; i < g.n_zdepths; ++i) if (g.zdepths[i].handle == handle) {
+        ++matches; planes = g.zdepths[i].queued_clear_planes;
+    }
+    for(u32 i=0;i<s_native_images.count;++i) {
+        if(s_native_images.images[i].color.handle==handle){++matches;planes=s_native_images.images[i].color.queued_clear_planes;}
+    }
+    if (matches != 1) return -3;
+    return (planes & required) == required ? 0 : -5;
+}
+int rsx_draw_engine_native_source_target(rsx_native_source_target* out)
+{
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    const rsx_original_owner_hooks* owner = atomic_load_explicit(&s_original_owner_hooks, memory_order_acquire);
+    if (owner && !owner->begin(owner->user, RSX_ORIGINAL_READ)) return 0;
+    if (g.ready && !g.rsx.in_begin_end && !atomic_load(&s_checked_failed)) {
+        rsx_dsp_surface sf;
+        rsx_dsp_get_surface(&g.rsx, &sf);
+        const u32 horizontal = rsx_dsp_reg(&g.rsx, 0x0200u);
+        const u32 vertical = rsx_dsp_reg(&g.rsx, 0x0204u);
+        out->color_a_offset = sf.color_offset[0];
+        out->color_a_dma = rsx_dsp_reg(&g.rsx, 0x0194u);
+        out->color_a_pitch = sf.color_pitch[0];
+        out->surface_format = rsx_dsp_reg(&g.rsx, 0x0208u);
+        out->clip_x = horizontal & 0xffffu; out->clip_width = horizontal >> 16;
+        out->clip_y = vertical & 0xffffu; out->clip_height = vertical >> 16;
+        out->color_target = sf.color_target;
+        out->viewport_z_scale_bits = rsx_dsp_reg(&g.rsx, 0x0a38u);
+        out->viewport_z_offset_bits = rsx_dsp_reg(&g.rsx, 0x0a28u);
+        /* Lookup only: never call eng_current_target_set/eng_surface_get,
+         * which could create/reseed a target after the original scene. */
+        if (sf.color_target && sf.color_target != CELL_GCM_SURFACE_TARGET_1 && sf.clip_w && sf.clip_h) {
+            for (u32 i = 0; i < g.n_surfaces; ++i) {
+                const eng_surface* surface = &g.surfaces[i];
+                if (!surface->handle || surface->location != sf.color_location[0] ||
+                    surface->offset != sf.color_offset[0] || surface->fmt != eng_surface_format(sf.color_format) ||
+                    surface->pitch != sf.color_pitch[0] || surface->aa_grid != (sf.aa_sx | (sf.aa_sy << 8)) ||
+                    surface->w < sf.clip_w || surface->h < sf.clip_h) continue;
+                if (out->native_surface) { out->native_surface = 0; break; } /* ambiguous allocation */
+                out->native_surface = surface->handle;
+                out->native_width = surface->w; out->native_height = surface->h;
+            }
+        }
+        out->ready = out->native_surface != 0;
+    }
+    if (owner) owner->end(owner->user, RSX_ORIGINAL_READ, 0, 1);
+    return out->ready != 0;
+}
+int rsx_draw_engine_checked_ready(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_READ)){return 0;}
+    int result=original_rsx_draw_engine_checked_ready();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
+    return result;
+}
+int rsx_draw_engine_flush_checked(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_BOUNDARY)){return 0;}
+    int result=original_rsx_draw_engine_flush_checked();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_BOUNDARY,0,!g.rsx.in_begin_end && result!=0);
+    return result;
+}
+void rsx_draw_engine_present(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_BOUNDARY)){return;}
+    original_rsx_draw_engine_present();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_BOUNDARY,0,!g.rsx.in_begin_end);
+}
+void rsx_draw_engine_present_buffer(u32 buffer_id){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_BOUNDARY)){return;}
+    original_rsx_draw_engine_present_buffer(buffer_id);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_BOUNDARY,0,!g.rsx.in_begin_end);
+}
+void rsx_draw_engine_note_flip(u32 buffer_id){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return;}
+    original_rsx_draw_engine_note_flip(buffer_id);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+}
+u32 rsx_draw_engine_guest_draws(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_READ)){return 0;}
+    u32 result=original_rsx_draw_engine_guest_draws();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
+    return result;
+}
+u32 rsx_draw_engine_readback_center(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_BOUNDARY)){return 0;}
+    u32 result=original_rsx_draw_engine_readback_center();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_BOUNDARY,0,!g.rsx.in_begin_end);
+    return result;
 }

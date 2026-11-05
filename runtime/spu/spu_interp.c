@@ -9,6 +9,7 @@
 #include "spu_interp.h"
 #include "spu_interp_observer.h"
 #include "spu_instruction_observer.h"
+#include "../diagnostics/original_work_observer.h"
 #include "spu_helpers.h"
 #include "spu_interp_attribution.inc"
 #include "spu_pc_observer.h"
@@ -656,6 +657,7 @@ static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, 
             instruction_sample(ctx, pc, opcode, instruction_ordinal);
             errno = saved_errno;
         }
+        PS3_ORIGINAL_STEP(ctx,ctx->pc,PS3_ORIGINAL_INTERPRETER);
         if (spu_step(ctx)) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
              * the SPU queue number to its out-mailbox, stops, and lv2 replies

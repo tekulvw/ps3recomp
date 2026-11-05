@@ -64,6 +64,10 @@
 #include "metal_frame_measurement.h"
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
+#include "rsx_frontend_internal.h"
+#include "rsx_draw_engine.h"
+#define RSX_NATIVE_OWNER_PTHREAD
+#include "rsx_native_owner_gate.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_primitives.h"
 #include "rsx_vp_decompiler.h"
@@ -90,8 +94,83 @@ static atomic_int          s_closed;
 static id                  s_window_close_observer;
 #endif
 static int                 s_ready;
+static rsx_frontend_device *s_frontend;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
+
+/* Temporary owner seam: original consumer -> recording gate -> backend locks.
+ * Native callbacks never acquire the consumer lease or wait for GPU work. */
+extern void cellGcm_rsx_consumer_begin(void) __attribute__((weak_import));
+extern void cellGcm_rsx_consumer_end(void) __attribute__((weak_import));
+static int frontend_ordering_ready(void);
+static int fps_backend_failed(void);
+static rsx_native_owner_gate s_metal_owner=RSX_NATIVE_OWNER_GATE_INIT;
+static _Thread_local rsx_native_owner_thread s_metal_owner_thread;
+static _Thread_local int s_metal_consumer;
+static uint64_t s_metal_lifetime,s_metal_commits;
+static int s_metal_shutdown_pending;
+static void metal_native_frame_present(id<MTLCommandBuffer>,id<MTLTexture>,id<CAMetalDrawable>,int);
+static unsigned s_metal_partial_primitives;
+static atomic_int s_metal_unscoped_commit;
+static int metal_owner_enabled(void){
+    static atomic_int setting=-1;int value=atomic_load_explicit(&setting,memory_order_relaxed);
+    if(value<0){const char* text=getenv("PS3RECOMP_RSX_NATIVE_OWNER");value=text&&!strcmp(text,"1");int expected=-1;
+        if(!atomic_compare_exchange_strong_explicit(&setting,&expected,value,memory_order_relaxed,memory_order_relaxed))value=expected;}
+    return value;
+}
+static int metal_owner_begin(int dirty){
+    if(!metal_owner_enabled())return 1;
+    if(s_metal_owner_thread.native){if(dirty)s_metal_owner.failed=1;return 0;}
+    if(!s_metal_owner_thread.original_depth){
+        s_metal_consumer=cellGcm_rsx_consumer_begin&&cellGcm_rsx_consumer_end;
+        if(s_metal_consumer)cellGcm_rsx_consumer_begin();
+    }
+    if(rsx_owner_original_begin(&s_metal_owner,&s_metal_owner_thread))return 0;
+    if(dirty)rsx_owner_dirty(&s_metal_owner,&s_metal_owner_thread);
+    return 1;
+}
+static void metal_owner_finish(int preserve){
+    if(!metal_owner_enabled())return;
+    if(!preserve)rsx_owner_dirty(&s_metal_owner,&s_metal_owner_thread);
+    if(fps_backend_failed()||atomic_load(&s_metal_unscoped_commit))rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,0);
+    const int outer=s_metal_owner_thread.original_depth==1;
+    rsx_owner_original_end(&s_metal_owner,&s_metal_owner_thread);
+    if(outer&&s_metal_consumer){s_metal_consumer=0;cellGcm_rsx_consumer_end();}
+}
+static int metal_owner_common_begin(void* user,uint32_t flags){
+    (void)user;if(!metal_owner_begin((flags&RSX_ORIGINAL_MUTATE)!=0))return 0;
+    if((flags&RSX_ORIGINAL_LIFECYCLE_BIT)&&s_metal_owner.retained){metal_owner_finish(0);return 0;}
+    return 1;
+}
+static void metal_owner_common_end(void* user,uint32_t flags,int delta,int preserve){
+    (void)user;
+    if(flags&RSX_ORIGINAL_FAILURE_BIT)rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,0);
+    if(delta>0){if(s_metal_partial_primitives==UINT_MAX)rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,0);else ++s_metal_partial_primitives;}
+    else if(delta<0){if(!s_metal_partial_primitives)rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,0);else --s_metal_partial_primitives;}
+    metal_owner_finish(preserve&&!s_metal_partial_primitives);
+}
+static const rsx_original_owner_hooks s_metal_original_hooks={NULL,metal_owner_common_begin,metal_owner_common_end};
+static void metal_owner_install_hooks(void){
+    rsx_draw_engine_set_owner_hooks(&s_metal_original_hooks);
+    rsx_commands_set_owner_hooks(&s_metal_original_hooks);
+}
+static void metal_owner_committed(void){
+    if(!metal_owner_enabled())return;
+    if(!s_metal_owner_thread.original_depth){atomic_store(&s_metal_unscoped_commit,1);return;}
+    if(s_metal_commits==UINT64_MAX)rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,0);else ++s_metal_commits;
+}
+static int metal_owner_boundary(uint64_t before){
+    if(!metal_owner_enabled())return 1;
+    const int clean=s_metal_commits>before&&!s_metal_partial_primitives&&frontend_ordering_ready()&&!fps_backend_failed()&&!atomic_load(&s_metal_unscoped_commit);
+    if(clean)rsx_owner_submitted(&s_metal_owner,&s_metal_owner_thread,1);
+    return clean;
+}
+static int metal_owner_activate(void){
+    if(s_metal_lifetime==UINT64_MAX)return -1;
+    if(rsx_owner_generation(&s_metal_owner,&s_metal_owner_thread,++s_metal_lifetime))return -1;
+    s_metal_shutdown_pending=0;atomic_store(&s_metal_unscoped_commit,0);return 0;
+}
+
 
 /* Each initialization owns its counters. A drawable callback retained by the
  * compositor can outlive shutdown without writing into a later session. */
@@ -634,22 +713,44 @@ static void mtl_latch_state(void* ud, const rsx_state* state)
 static void mtl_draw_arrays(void*, u32, u32, u32);
 static void mtl_draw_indexed(void*, u32, u32, u32);
 
+/* Every registered original backend entry shares the host owner gate. */
+static void owner_mtl_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil){
+    if(!metal_owner_begin(1)){return;}
+    mtl_clear(ud,flags,color,depth,stencil);metal_owner_finish(0);
+}
+static void owner_mtl_set_render_target(void* ud, const rsx_state* state){
+    if(!metal_owner_begin(1)){return;}
+    mtl_set_render_target(ud,state);metal_owner_finish(0);
+}
+static void owner_mtl_latch_state(void* ud, const rsx_state* state){
+    if(!metal_owner_begin(1)){return;}
+    mtl_latch_state(ud,state);metal_owner_finish(0);
+}
+static void owner_mtl_draw_arrays(void* ud, u32 primitive, u32 first, u32 count){
+    if(!metal_owner_begin(1)){return;}
+    mtl_draw_arrays(ud,primitive,first,count);metal_owner_finish(0);
+}
+static void owner_mtl_draw_indexed(void* ud, u32 primitive, u32 index_offset, u32 count){
+    if(!metal_owner_begin(1)){return;}
+    mtl_draw_indexed(ud,primitive,index_offset,count);metal_owner_finish(0);
+}
+
 static rsx_backend s_backend_vtable = {
     .userdata           = NULL,
-    .clear              = mtl_clear,
-    .set_render_target  = mtl_set_render_target,
-    .set_vertex_attribs = mtl_latch_state,
-    .set_blend          = mtl_latch_state,
-    .set_depth_stencil  = mtl_latch_state,
-    .set_viewport       = mtl_latch_state,
-    .set_color_mask     = mtl_latch_state,
-    .set_alpha_test     = mtl_latch_state,
+    .clear              = owner_mtl_clear,
+    .set_render_target  = owner_mtl_set_render_target,
+    .set_vertex_attribs = owner_mtl_latch_state,
+    .set_blend          = owner_mtl_latch_state,
+    .set_depth_stencil  = owner_mtl_latch_state,
+    .set_viewport       = owner_mtl_latch_state,
+    .set_color_mask     = owner_mtl_latch_state,
+    .set_alpha_test     = owner_mtl_latch_state,
     /* Programs are resolved when the draw is recorded, from the live state:
      * SET_SHADER_PROGRAM, the transform program words and SHADER_CONTROL
      * all land there before BEGIN_END fires this. */
-    .set_shader         = mtl_latch_state,
-    .draw_arrays        = mtl_draw_arrays,
-    .draw_indexed       = mtl_draw_indexed,
+    .set_shader         = owner_mtl_latch_state,
+    .draw_arrays        = owner_mtl_draw_arrays,
+    .draw_indexed       = owner_mtl_draw_indexed,
 };
 
 /* ---- helpers ------------------------------------------------------------- */
@@ -2382,6 +2483,10 @@ static u32 s_eng_obj_count;
 static u32 s_eng_obj_free[ENG_MAX_OBJECTS];
 static u32 s_eng_obj_free_count;
 static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
+/* Never reused even across device reinitialization; native image import is
+ * scoped by both owner lifetime and this allocation generation. */
+static uint64_t s_eng_obj_generation[ENG_MAX_OBJECTS],s_eng_next_obj_generation;
+static unsigned s_eng_obj_native_pins[ENG_MAX_OBJECTS];
 
 /* RSX_ENG_COUNTS=1: live Metal resources by creation site. A tag is
  * associated with each resource the engine creates and its dealloc runs when
@@ -2531,6 +2636,47 @@ static int eng_completion_status(void *user,u64 ticket,int wait){
 
 #define PS3RECOMP_METAL_TRACKED_COMPLETION 1
 static NSMutableArray<id<MTLCommandBuffer>>* s_eng_submitted;
+/* Bounded work in flight. Every commit gets a sequence number and a
+ * completion handler that only advances s_eng_commit_done; handed-off
+ * staging arenas are counted until the GPU releases them. Commits wait for
+ * the oldest tracked buffer when more than 64 are outstanding (formerly a
+ * checked failure) or when in-flight staging exceeds
+ * PS3RECOMP_METAL_MAX_INFLIGHT_STAGE_MB (default 512, 0 = no byte bound).
+ * PS3RECOMP_RSX_INFLIGHT_LOG=1 prints the counters every two seconds; a
+ * line is also printed (at most every two seconds) whenever a bound waits. */
+/* Pooled GPU depth views (eng_depth_z24_view). */
+enum { ENG_VIEW_POOL = 4 };
+typedef struct { id<MTLBuffer> words; id<MTLTexture> tex; u32 handle, w, h, remap, fmt; uint64_t retired_seq; } EngViewEntry;
+static EngViewEntry s_eng_view_pool[ENG_VIEW_POOL];
+static uint64_t s_eng_commit_seq;
+static _Atomic(uint64_t) s_eng_commit_done;
+static _Atomic(uint64_t) s_eng_stage_inflight, s_eng_stage_inflight_peak;
+static uint64_t s_eng_bound_waits, s_eng_bound_wait_ns, s_eng_cap_waits;
+static uint64_t s_eng_view_made, s_eng_view_reused;
+static int s_eng_bound_log = -1;
+static uint64_t s_eng_stage_limit = UINT64_MAX;
+static uint64_t eng_now_ns(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;}
+static void eng_bound_config(void){
+    if(s_eng_bound_log>=0)return;
+    const char* l=getenv("PS3RECOMP_RSX_INFLIGHT_LOG");s_eng_bound_log=l&&!strcmp(l,"1");
+    const char* m=getenv("PS3RECOMP_METAL_MAX_INFLIGHT_STAGE_MB");
+    const long mb=m?strtol(m,NULL,0):512;
+    s_eng_stage_limit=mb>0?(uint64_t)mb<<20:UINT64_MAX;
+}
+static void eng_bound_report(int waited){
+    static uint64_t last;const uint64_t now=eng_now_ns();
+    if(!s_eng_bound_log&&!waited)return;
+    if(last&&now-last<2000000000ull)return;
+    last=now;
+    fprintf(stderr,"[rsx inflight metal] commits=%llu done=%llu tracked=%lu fences=%lu stage_inflight=%lluMB peak=%lluMB limit=%lldMB stage_waits=%llu wait_ms=%.1f cap_waits=%llu views=%llu reused=%llu metal_allocated=%lluMB\n",
+        (unsigned long long)s_eng_commit_seq,(unsigned long long)atomic_load(&s_eng_commit_done),
+        (unsigned long)[s_eng_submitted count],(unsigned long)[s_eng_fence_cbs count],
+        (unsigned long long)(atomic_load(&s_eng_stage_inflight)>>20),(unsigned long long)(atomic_load(&s_eng_stage_inflight_peak)>>20),
+        s_eng_stage_limit==UINT64_MAX?-1ll:(long long)(s_eng_stage_limit>>20),
+        (unsigned long long)s_eng_bound_waits,s_eng_bound_wait_ns/1e6,(unsigned long long)s_eng_cap_waits,
+        (unsigned long long)s_eng_view_made,(unsigned long long)s_eng_view_reused,
+        (unsigned long long)(s_dev?[s_dev currentAllocatedSize]>>20:0));
+}
 /* Consumer-owned receipts: GPU status is checked directly, without relying
  * on asynchronous completion-handler delivery ordering. */
 static void eng_check_submissions(int barrier_complete)
@@ -2562,7 +2708,12 @@ static void eng_track_submission(id<MTLCommandBuffer> cb)
 {
     eng_check_submissions(0);
     if(!s_eng_submitted)s_eng_submitted=[NSMutableArray new];
-    if(!cb || !s_eng_submitted || [s_eng_submitted count]>=64){eng_checked_fail();return;}
+    while(cb && s_eng_submitted && [s_eng_submitted count]>=64){
+        /* Oldest first: one in-order queue completes them in order. */
+        [s_eng_submitted[0] waitUntilCompleted];++s_eng_cap_waits;
+        eng_check_submissions(0);eng_bound_report(1);
+    }
+    if(!cb || !s_eng_submitted){eng_checked_fail();return;}
     [s_eng_submitted addObject:cb];
     eng_wake_consumer_on_completion(cb);
 }
@@ -2804,6 +2955,7 @@ static NSString* const kEngHelperMSL = @
 static u32 eng_obj_add(id<MTLTexture> t)
 {
     if (!t) return 0;
+    if(metal_owner_enabled()&&s_eng_next_obj_generation==UINT64_MAX)return 0;
     u32 slot;
     if (s_eng_obj_free_count) {
         slot = s_eng_obj_free[--s_eng_obj_free_count];
@@ -2821,6 +2973,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
         slot = s_eng_obj_count++;
     }
     s_eng_obj[slot] = t;
+    if(metal_owner_enabled())s_eng_obj_generation[slot]=++s_eng_next_obj_generation;
     /* RSX_ENG_COUNTS=1: live backend objects every 4096 creations, to show
      * a long session stays bounded. */
     { static int on = -1; static unsigned long long made;
@@ -2865,7 +3018,7 @@ static void eng_collect_retired_objects(void)
 {
     if (s_eng_rec_count) return;
     for (u32 i = 0; i < s_eng_obj_count; ++i) {
-        if (!s_eng_obj_retired[i]) continue;
+        if (!s_eng_obj_retired[i]||s_eng_obj_native_pins[i]) continue;
         s_eng_obj_retired[i] = 0;
         s_eng_obj[i] = nil;
         s_eng_obj_free[s_eng_obj_free_count++] = i;
@@ -3025,6 +3178,7 @@ static void eng_shutdown(void* user)
     s_eng_checked_completed=0;
     s_eng_submitted=nil;
     s_eng_fence_cbs=nil;s_eng_fence_next=s_eng_fence_completed=0;
+    for(u32 i=0;i<ENG_VIEW_POOL;i++){s_eng_view_pool[i].words=nil;s_eng_view_pool[i].tex=nil;s_eng_view_pool[i].handle=0;}
     s_eng_stage_buf = nil; s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
     s_eng_depth_staging = nil;
@@ -3800,7 +3954,7 @@ static int eng_prepare_cpu_read(id<MTLTexture> t, int fence_shared)
         [blit synchronizeResource:t];
         [blit endEncoding];
     }
-    [cb commit];
+    [cb commit]; metal_owner_committed();
     [cb waitUntilCompleted];
     return [cb status] == MTLCommandBufferStatusCompleted;
 }
@@ -4337,7 +4491,10 @@ static void eng_stage_hand_off(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 {
     if (!stage) return;
     atomic_fetch_add(&s_eng_pool_handoff, 1ull);
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> unused) { (void)unused; atomic_fetch_add(&s_eng_pool_handler, 1ull); eng_stage_buffer_release(stage); }];
+    const uint64_t bytes=[stage length];
+    const uint64_t now_inflight=atomic_fetch_add(&s_eng_stage_inflight,bytes)+bytes;
+    if(now_inflight>atomic_load(&s_eng_stage_inflight_peak))atomic_store(&s_eng_stage_inflight_peak,now_inflight);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> unused) { (void)unused; atomic_fetch_add(&s_eng_pool_handler, 1ull); atomic_fetch_sub(&s_eng_stage_inflight,bytes); eng_stage_buffer_release(stage); }];
     s_eng_stage_buf = nil; s_eng_stage = NULL; s_eng_stage_cap = 0;
 }
 static id<MTLCommandBuffer> s_capture_present_cb;
@@ -4388,6 +4545,13 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
         id<MTLBuffer> stage = s_eng_stage_used ? s_eng_stage_buf : nil;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         eng_site_tag_bytes(cb, ENG_SITE_COMMAND_BUFFER, 0);
+        if (cb) {
+            const uint64_t seq = ++s_eng_commit_seq;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                (void)done;uint64_t prev=atomic_load(&s_eng_commit_done);
+                while(prev<seq&&!atomic_compare_exchange_weak(&s_eng_commit_done,&prev,seq)){}
+            }];
+        }
         if(!cb || (s_eng_stage_used && !stage)) {
             eng_checked_fail();fps_note_submission_failure();
             if(windowed_present)dispatch_semaphore_signal(s_inflight);
@@ -4401,6 +4565,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
         eng_encode_records(cb, stage);
         if (s_eng_tail_encode) { s_eng_tail_encode(cb); s_eng_tail_encode = nil; }
         int presented = eng_blit_to_display(cb, present_dst, dst);
+        if(present_dst)metal_native_frame_present(cb,present_dst,drawable,presented);
         if (drawable && !presented) fps_note_skipped_blit();
         if (s_eng_diag.active && !presented && present_dst) s_eng_diag.reason = "blit_skipped";
         const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
@@ -4438,7 +4603,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
             }
             if(critical_start)critical_commit=ps3_critical_now_ns();
             eng_stage_hand_off(cb, stage);
-            [cb commit];
+            [cb commit]; metal_owner_committed();
             if(async_submit&&out_ticket&&*out_ticket&&rsx_ring_progress_metal_committed)
                 rsx_ring_progress_metal_committed(*out_ticket,s_eng_rec_count);
             fps_frame_committed(ticket);
@@ -4446,7 +4611,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
             if(critical_start)critical_commit=ps3_critical_now_ns();
             const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
             eng_stage_hand_off(cb, stage);
-            [cb commit];
+            [cb commit]; metal_owner_committed();
             if(critical_start)critical_wait=ps3_critical_now_ns();
             [cb waitUntilCompleted];
             if (ft_w0) {
@@ -4493,6 +4658,16 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
 
 static u64 eng_submit_async(void *user,u32 reason){
  (void)user;(void)reason;if(atomic_load(&s_eng_checked_failed))return 0;
+ eng_bound_config();
+ /* Staging handed to buffers the GPU has not finished: wait for the oldest
+  * before handing off more. Only asynchronous commits can accumulate it. */
+ if(atomic_load(&s_eng_stage_inflight)>s_eng_stage_limit){
+  const uint64_t t0=eng_now_ns();
+  while(atomic_load(&s_eng_stage_inflight)>s_eng_stage_limit&&[s_eng_submitted count]){
+   [s_eng_submitted[0] waitUntilCompleted];eng_check_submissions(0);
+  }
+  ++s_eng_bound_waits;s_eng_bound_wait_ns+=eng_now_ns()-t0;eng_bound_report(1);
+ } else eng_bound_report(0);
  if([s_eng_fence_cbs count]>=64&&eng_completion_status(NULL,s_eng_fence_completed+1,1)!=1)return 0;
  u64 ticket=0;eng_encode_and_commit_mode(nil,1,&ticket);
  return atomic_load(&s_eng_checked_failed)?0:ticket;
@@ -4526,7 +4701,7 @@ static void eng_capture_raw_1x1(id<MTLTexture> src, const char* path)
             [blit copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
                 sourceSize:MTLSizeMake(1,1,1) toBuffer:buffer destinationOffset:0
                 destinationBytesPerRow:256 destinationBytesPerImage:256];
-            [blit endEncoding]; [cb commit]; [cb waitUntilCompleted]; gpu_status=(long)[cb status];
+            [blit endEncoding]; [cb commit]; metal_owner_committed(); [cb waitUntilCompleted]; gpu_status=(long)[cb status];
             status="gpu_failed";
             if ([cb status]==MTLCommandBufferStatusCompleted && ![cb error]) {
                 FILE* f=fopen(raw,"wb"); status="file_failed";
@@ -4574,7 +4749,7 @@ static int eng_capture_texture_rgba8(void* user, u32 handle, const char* path)
             if (!blit) return 0;
             [blit synchronizeResource:dst]; [blit endEncoding];
         }
-        [cb commit]; [cb waitUntilCompleted];
+        [cb commit]; metal_owner_committed(); [cb waitUntilCompleted];
         if ([cb status]!=MTLCommandBufferStatusCompleted || [cb error]) return 0;
         u8* pixels=malloc(w*h*4); if (!pixels) return 0;
         [dst getBytes:pixels bytesPerRow:w*4 fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
@@ -4755,7 +4930,7 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                     toBuffer:staging destinationOffset:0
          destinationBytesPerRow:copy_pitch destinationBytesPerImage:copy_pitch * h];
         [blit endEncoding];
-        [cb commit]; [cb waitUntilCompleted];
+        [cb commit]; metal_owner_committed(); [cb waitUntilCompleted];
         const int ok = [cb status] == MTLCommandBufferStatusCompleted && ![cb error];
         if (ok) {
             const u8* bytes = [staging contents];
@@ -4882,56 +5057,330 @@ static u32 eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fm
             if ([done status] != MTLCommandBufferStatusCompleted || [done error])
                 eng_checked_fail();
         }];
-        [cb commit];
+        [cb commit]; metal_owner_committed();
         return eng_obj_add(t);
     }
 }
 
+/* The same alias as eng_depth_z24_texture, but nothing goes through shared
+ * staging or the CPU: the conversion writes a private buffer and a blit
+ * fills the texture, both appended to the next commit after the recorded
+ * draws (s_eng_tail_encode). The engine commits asynchronously right after,
+ * so the draw that samples it is encoded after both. */
+static void eng_z24_view_encode(id<MTLCommandBuffer> cb, id<MTLComputePipelineState> pso,
+                                id<MTLTexture> src, id<MTLBuffer> words, id<MTLTexture> t,
+                                uint32_t w, uint32_t h)
+{
+    const struct { uint32_t w, h; } wh = { w, h };
+    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce setComputePipelineState:pso];
+    [ce setTexture:src atIndex:0];
+    [ce setBuffer:words offset:0 atIndex:0];
+    [ce setBytes:&wh length:sizeof wh atIndex:1];
+    const NSUInteger tw = [pso threadExecutionWidth];
+    const NSUInteger th = [pso maxTotalThreadsPerThreadgroup] / tw;
+    [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(tw, th ? th : 1, 1)];
+    [ce endEncoding];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromBuffer:words sourceOffset:0 sourceBytesPerRow:(NSUInteger)w * 4u
+     sourceBytesPerImage:(NSUInteger)w * 4u * h sourceSize:MTLSizeMake(w, h, 1)
+               toTexture:t destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+}
+static u32 eng_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    const u32 base = rsx_fmt & 0x9Fu;
+    if (!depth || !s_dev || !s_queue || !s_eng_helper_lib || !w || !h || w > UINT32_MAX / 4u ||
+        (base != 0x85u && base != 0x9Eu))
+        return 0;
+    id<MTLTexture> src = eng_obj(depth);
+    if (!src || s_eng_obj_retired[depth - 1u] || [src pixelFormat] != MTL_DEPTH_FORMAT ||
+        [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
+        w > [src width] || h > [src height])
+        return 0;
+    @autoreleasepool {
+        if (!s_eng_z24_pso) {
+            NSError* err = nil;
+            id<MTLFunction> fn = [s_eng_helper_lib newFunctionWithName:@"eng_depth_z24_cs"];
+            s_eng_z24_pso = fn ? [s_dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+            if (!s_eng_z24_pso) return 0;
+        }
+        id<MTLComputePipelineState> pso = s_eng_z24_pso;
+        /* A pooled pair is reused once the engine has released its handle and
+         * every commit up to the one that retired it has completed. */
+        EngViewEntry* slot = NULL;
+        for (u32 i = 0; i < ENG_VIEW_POOL; i++) {
+            EngViewEntry* e = &s_eng_view_pool[i];
+            if (!e->tex) { if (!slot) slot = e; continue; }
+            if (e->handle && eng_obj(e->handle) == e->tex) continue;          /* still bound */
+            if (e->handle) { e->handle = 0; e->retired_seq = s_eng_commit_seq; }
+            if (atomic_load(&s_eng_commit_done) < e->retired_seq) continue;    /* GPU may still read */
+            if (e->w == w && e->h == h && e->remap == remap && e->fmt == rsx_fmt) {
+                const u32 handle = eng_obj_add(e->tex);
+                if (!handle) return 0;
+                e->handle = handle; ++s_eng_view_reused;
+                id<MTLBuffer> words = e->words; id<MTLTexture> t = e->tex;
+                const struct { uint32_t w, h; } wh = { w, h };
+                void (^prior)(id<MTLCommandBuffer>) = s_eng_tail_encode;
+                s_eng_tail_encode = ^(id<MTLCommandBuffer> cb) {
+                    if (prior) prior(cb);
+                    eng_z24_view_encode(cb, pso, src, words, t, wh.w, wh.h);
+                };
+                return handle;
+            }
+            if (!slot || slot->tex) slot = e;                                  /* evict an idle one */
+        }
+        id<MTLBuffer> words = [s_dev newBufferWithLength:(NSUInteger)w * h * 4u
+                                                 options:MTLResourceStorageModePrivate];
+        if (!words) return 0;
+        eng_site_tag(words, ENG_SITE_DEPTH_STAGING);
+        const int rotate = !rsx_texture_argb_is_rgba(), alpha_one = base == 0x9Eu;
+        u8 sel[4];
+        rsx_texture_component_remap(remap, base, sel);
+        MTLTextureDescriptor* td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                               width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        td.swizzle = MTLTextureSwizzleChannelsMake(
+            eng_z24_raw_channel(swizzle_sel(sel[1]), rotate, alpha_one),
+            eng_z24_raw_channel(swizzle_sel(sel[2]), rotate, alpha_one),
+            eng_z24_raw_channel(swizzle_sel(sel[3]), rotate, alpha_one),
+            eng_z24_raw_channel(swizzle_sel(sel[0]), rotate, alpha_one));
+        id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+        if (!t) return 0;
+        eng_site_tag(t, ENG_SITE_Z24_TEXTURE);
+        const struct { uint32_t w, h; } wh = { w, h };
+        void (^prior)(id<MTLCommandBuffer>) = s_eng_tail_encode;
+        s_eng_tail_encode = ^(id<MTLCommandBuffer> cb) {
+            if (prior) prior(cb);
+            eng_z24_view_encode(cb, pso, src, words, t, wh.w, wh.h);
+        };
+        const u32 handle = eng_obj_add(t);
+        ++s_eng_view_made;
+        if (handle && slot) {
+            *slot = (EngViewEntry){ .words = words, .tex = t, .handle = handle,
+                                    .w = w, .h = h, .remap = remap, .fmt = rsx_fmt };
+        }
+        return handle;
+    }
+}
+
+/* Every registered original backend entry shares the host owner gate. */
+static int owner_eng_init(void* user, u32 width, u32 height){
+    if(!metal_owner_begin(1)){return -1;}
+    int result=eng_init(user,width,height);metal_owner_finish(0);return result;
+}
+static void owner_eng_shutdown(void* user){
+    if(!metal_owner_begin(1)){return;}
+    eng_shutdown(user);metal_owner_finish(0);
+}
+static void owner_eng_submit_and_wait(void* user, u32 reason){
+    if(!metal_owner_begin(1)){return;}uint64_t before=s_metal_commits;
+    eng_submit_and_wait(user,reason);metal_owner_finish(metal_owner_boundary(before));
+}
+static int owner_eng_submit_and_wait_checked(void* user, u32 reason){
+    if(!metal_owner_begin(1)){return 0;}uint64_t before=s_metal_commits;
+    int result=eng_submit_and_wait_checked(user,reason);metal_owner_finish(metal_owner_boundary(before));return result;
+}
+static u64 owner_eng_submit_async(void *user,u32 reason){
+    if(!metal_owner_begin(1)){return 0;}uint64_t before=s_metal_commits;
+    u64 result=eng_submit_async(user,reason);metal_owner_finish(metal_owner_boundary(before));return result;
+}
+static int owner_eng_completion_status(void *user,u64 ticket,int wait){
+    if(!metal_owner_begin(0)){return -1;}
+    int result=eng_completion_status(user,ticket,wait);metal_owner_finish(1);return result;
+}
+static u32 owner_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+                              u32 mips, u32 faces, u32 remap, u32 rsx_fmt){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_texture_create(user,fmt,w,h,mips,faces,remap,rsx_fmt);metal_owner_finish(0);return result;
+}
+static void owner_eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
+                               u32 w, u32 h, const void* src, u32 row_bytes,
+                               u32 rows){
+    if(!metal_owner_begin(1)){return;}
+    eng_texture_upload(user,handle,face,mip,w,h,src,row_bytes,rows);metal_owner_finish(0);
+}
+static void owner_eng_obj_release(void* user, u32 handle){
+    if(!metal_owner_begin(1)){return;}
+    eng_obj_release(user,handle);metal_owner_finish(0);
+}
+static u32 owner_eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                 u32 depth, u32 mips, u32 remap, u32 rsx_fmt){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_texture_create_3d(user,fmt,w,h,depth,mips,remap,rsx_fmt);metal_owner_finish(0);return result;
+}
+static void owner_eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
+                                  u32 w, u32 h, const void* src, u32 row_bytes){
+    if(!metal_owner_begin(1)){return;}
+    eng_texture_upload_3d(user,handle,z,mip,w,h,src,row_bytes);metal_owner_finish(0);
+}
+static u32 owner_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                   const void* seed, u32 seed_row_bytes){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_color_target_create(user,fmt,w,h,seed,seed_row_bytes);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_surface_view(user,surface,remap,rsx_format);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_depth_target_create(void* user, u32 w, u32 h){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_depth_target_create(user,w,h);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_depth_snapshot(user,depth,w,h);metal_owner_finish(0);return result;
+}
+static int owner_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+                              float* out, u32 out_pitch){
+    if(!metal_owner_begin(1)){return -1;}
+    int result=eng_depth_readback(user,depth,x,y,w,h,out,out_pitch);metal_owner_finish(0);return result;
+}
+static int owner_eng_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32 dst_pitch){
+    if(!metal_owner_begin(1)){return -1;}
+    int result=eng_depth_store_z24(user,depth,w,h,dst,dst_pitch);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_depth_z24_texture(void* user, u32 w, u32 h, u32 remap, u32 rsx_fmt){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_depth_z24_texture(user,w,h,remap,rsx_fmt);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_depth_z24_view(user,depth,w,h,remap,rsx_fmt);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_color_snapshot(void* user, u32 surface){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_color_snapshot(user,surface);metal_owner_finish(0);return result;
+}
+static u32 owner_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                               const rsx_be_render_state* rs,
+                               const rsx_vertex_layout_plan* layout,
+                               u32 vertex_stride, rsx_be_format rt_fmt,
+                               u32 rt_count){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_pipeline_create(user,vs_hlsl,ps_hlsl,rs,layout,vertex_stride,rt_fmt,rt_count);metal_owner_finish(0);return result;
+}
+static void owner_eng_pipeline_release(void* user, u32 pipeline){
+    if(!metal_owner_begin(1)){return;}
+    eng_pipeline_release(user,pipeline);metal_owner_finish(0);
+}
+static void owner_eng_bind_targets(void* user, const u32* surfaces, u32 count,
+                             u32 depth){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_targets(user,surfaces,count,depth);metal_owner_finish(0);
+}
+static void owner_eng_bind_pipeline(void* user, u32 pipeline){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_pipeline(user,pipeline);metal_owner_finish(0);
+}
+static void owner_eng_bind_vs_constants(void* user, const void* data, u32 bytes){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_vs_constants(user,data,bytes);metal_owner_finish(0);
+}
+static void owner_eng_bind_ps_constants(void* user, const void* data, u32 bytes){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_ps_constants(user,data,bytes);metal_owner_finish(0);
+}
+static void owner_eng_bind_textures(void* user, const u32* textures,
+                              const rsx_be_sampler_desc* samplers, u32 mask){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_textures(user,textures,samplers,mask);metal_owner_finish(0);
+}
+static void owner_eng_bind_vertex_textures(void* user, const u32* textures,
+                                     const rsx_be_sampler_desc* samplers, u32 mask){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_vertex_textures(user,textures,samplers,mask);metal_owner_finish(0);
+}
+static void owner_eng_set_viewport(void* user, float x, float y, float w, float h){
+    if(!metal_owner_begin(1)){return;}
+    eng_set_viewport(user,x,y,w,h);metal_owner_finish(0);
+}
+static void owner_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h){
+    if(!metal_owner_begin(1)){return;}
+    eng_set_scissor(user,x,y,w,h);metal_owner_finish(0);
+}
+static void owner_eng_set_stencil_ref(void* user, u32 ref){
+    if(!metal_owner_begin(1)){return;}
+    eng_set_stencil_ref(user,ref);metal_owner_finish(0);
+}
+static void owner_eng_draw(void* user, rsx_topology topology, const void* vertices,
+                     u32 vertex_count, u32 stride, const u32* indices,
+                     u32 index_count){
+    if(!metal_owner_begin(1)){return;}
+    eng_draw(user,topology,vertices,vertex_count,stride,indices,index_count);metal_owner_finish(0);
+}
+static void owner_eng_clear_color(void* user, u32 surface, const float rgba[4]){
+    if(!metal_owner_begin(1)){return;}
+    eng_clear_color(user,surface,rgba);metal_owner_finish(0);
+}
+static void owner_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+                                    float depth_value, u8 stencil){
+    if(!metal_owner_begin(1)){return;}
+    eng_clear_depth_stencil(user,depth,flags,depth_value,stencil);metal_owner_finish(0);
+}
+static void owner_eng_present(void* user, u32 surface){
+    if(!metal_owner_begin(1)){return;}uint64_t before=s_metal_commits;
+    eng_present(user,surface);metal_owner_finish(metal_owner_boundary(before));
+}
+static void owner_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                         void* out, u32 out_pitch){
+    if(!metal_owner_begin(1)){return;}
+    eng_readback(user,surface,x,y,w,h,out,out_pitch);metal_owner_finish(0);
+}
+static int owner_eng_capture_texture_rgba8(void* user, u32 handle, const char* path){
+    if(!metal_owner_begin(1)){return -1;}
+    int result=eng_capture_texture_rgba8(user,handle,path);metal_owner_finish(0);return result;
+}
+
 static const rsx_draw_backend s_engine_backend = {
     .user                 = NULL,
-    .init                 = eng_init,
-    .shutdown             = eng_shutdown,
-    .submit_and_wait      = eng_submit_and_wait,
-    .submit_and_wait_checked = eng_submit_and_wait_checked,
-    .submit_async = eng_submit_async,
-    .completion_status = eng_completion_status,
-    .texture_create       = eng_texture_create,
-    .texture_upload       = eng_texture_upload,
-    .texture_release      = eng_obj_release,
-    .texture_create_3d    = eng_texture_create_3d,
-    .texture_upload_3d    = eng_texture_upload_3d,
-    .color_target_create  = eng_color_target_create,
-    .color_target_release = eng_obj_release,
-    .surface_view         = eng_surface_view,
-    .depth_target_create  = eng_depth_target_create,
-    .depth_target_release = eng_obj_release,
-    .depth_snapshot       = eng_depth_snapshot,
-    .depth_readback       = eng_depth_readback,
-    .depth_store_z24      = eng_depth_store_z24,
-    .depth_z24_texture    = eng_depth_z24_texture,
-    .color_snapshot       = eng_color_snapshot,
-    .pipeline_create      = eng_pipeline_create,
-    .pipeline_release     = eng_pipeline_release,
-    .bind_targets         = eng_bind_targets,
-    .bind_pipeline        = eng_bind_pipeline,
-    .bind_vs_constants    = eng_bind_vs_constants,
-    .bind_ps_constants    = eng_bind_ps_constants,
-    .bind_textures        = eng_bind_textures,
-    .bind_vertex_textures = eng_bind_vertex_textures,
-    .set_viewport         = eng_set_viewport,
-    .set_scissor          = eng_set_scissor,
-    .set_stencil_ref      = eng_set_stencil_ref,
-    .draw                 = eng_draw,
-    .clear_color          = eng_clear_color,
-    .clear_depth_stencil  = eng_clear_depth_stencil,
-    .present              = eng_present,
-    .readback             = eng_readback,
-    .capture_texture_rgba8 = eng_capture_texture_rgba8,
+    .init                 = owner_eng_init,
+    .shutdown             = owner_eng_shutdown,
+    .submit_and_wait      = owner_eng_submit_and_wait,
+    .submit_and_wait_checked = owner_eng_submit_and_wait_checked,
+    .submit_async = owner_eng_submit_async,
+    .completion_status = owner_eng_completion_status,
+    .texture_create       = owner_eng_texture_create,
+    .texture_upload       = owner_eng_texture_upload,
+    .texture_release      = owner_eng_obj_release,
+    .texture_create_3d    = owner_eng_texture_create_3d,
+    .texture_upload_3d    = owner_eng_texture_upload_3d,
+    .color_target_create  = owner_eng_color_target_create,
+    .color_target_release = owner_eng_obj_release,
+    .surface_view         = owner_eng_surface_view,
+    .depth_target_create  = owner_eng_depth_target_create,
+    .depth_target_release = owner_eng_obj_release,
+    .depth_snapshot       = owner_eng_depth_snapshot,
+    .depth_readback       = owner_eng_depth_readback,
+    .depth_store_z24      = owner_eng_depth_store_z24,
+    .depth_z24_texture    = owner_eng_depth_z24_texture,
+    .depth_z24_view       = owner_eng_depth_z24_view,
+    .color_snapshot       = owner_eng_color_snapshot,
+    .pipeline_create      = owner_eng_pipeline_create,
+    .pipeline_release     = owner_eng_pipeline_release,
+    .bind_targets         = owner_eng_bind_targets,
+    .bind_pipeline        = owner_eng_bind_pipeline,
+    .bind_vs_constants    = owner_eng_bind_vs_constants,
+    .bind_ps_constants    = owner_eng_bind_ps_constants,
+    .bind_textures        = owner_eng_bind_textures,
+    .bind_vertex_textures = owner_eng_bind_vertex_textures,
+    .set_viewport         = owner_eng_set_viewport,
+    .set_scissor          = owner_eng_set_scissor,
+    .set_stencil_ref      = owner_eng_set_stencil_ref,
+    .draw                 = owner_eng_draw,
+    .clear_color          = owner_eng_clear_color,
+    .clear_depth_stencil  = owner_eng_clear_depth_stencil,
+    .present              = owner_eng_present,
+    .readback             = owner_eng_readback,
+    .capture_texture_rgba8 = owner_eng_capture_texture_rgba8,
 };
 
 /* ---- public API ---------------------------------------------------------- */
 
-int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+static int metal_original_init(u32 width, u32 height, const char* title)
 {
     @autoreleasepool {
         if (width)  s_width  = width;
@@ -5022,9 +5471,26 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
     }
 }
 
-void rsx_metal_backend_shutdown(void)
+static int frontend_ordering_ready(void)
+{
+    /* No frontend command may overtake uncommitted original-engine/vtable work.
+     * Already committed commands use this same queue and remain ordered. */
+    return !s_eng_rec_count && !s_eng_stage_used && !s_eng_tail_encode &&
+           !s_rec_count && !s_vert_count;
+}
+
+rsx_frontend_device *rsx_metal_backend_frontend(void)
+{
+    if(metal_owner_enabled())return NULL; /* extracted native owner is exclusive with this legacy path */
+    if (!s_ready || !s_dev || !s_queue) return NULL;
+    if (!s_frontend) s_frontend = rsx_frontend_metal_create(s_dev, s_queue, frontend_ordering_ready);
+    return s_frontend;
+}
+
+static void metal_original_shutdown(void)
 {
     @autoreleasepool {
+        rsx_frontend_close(s_frontend); s_frontend = NULL;
         if (s_ready) rsx_set_backend(NULL);
         if (s_eng_active) rsx_draw_engine_shutdown();
         rsx_draw_engine_set_backend(NULL);
@@ -5107,7 +5573,7 @@ int rsx_metal_backend_pump_messages(void)
 #endif
 }
 
-void rsx_metal_backend_present(void)
+static void metal_original_present(void)
 {
     if (!s_ready) return;
     /* Under the draw engine the frame belongs to it: a host that drives the
@@ -5207,7 +5673,7 @@ void rsx_metal_backend_present(void)
 
         if (s_headless) {
             /* The readback below must see a completed frame. */
-            [cb commit];
+            [cb commit]; metal_owner_committed();
             [cb waitUntilCompleted];
         } else {
             dispatch_semaphore_t sem = s_inflight;
@@ -5216,7 +5682,7 @@ void rsx_metal_backend_present(void)
                 dispatch_semaphore_signal(sem);
             }];
             eng_wake_consumer_on_completion(cb);
-            [cb commit];        /* no wait: the CPU goes on to the next frame */
+            [cb commit]; metal_owner_committed();        /* no wait: the CPU goes on to the next frame */
             if(cb)fps_frame_committed(ticket);
         }
 
@@ -5267,7 +5733,7 @@ u32 rsx_metal_backend_guest_draws(void)
 /* Tag the existing presentation call only. Buffer selection, guest callbacks,
  * command encoding, fences, and presentation scheduling retain their behavior.
  * Untagged boot redraws and engine-internal sink flips keep guest ID zero. */
-void rsx_metal_backend_present_guest_frame(uint64_t guest_flip_id,uint32_t buffer_id)
+static void metal_original_present_guest_frame(uint64_t guest_flip_id,uint32_t buffer_id)
 {
     const uint64_t previous_id=s_present_guest_id;
     const uint32_t previous_buffer=s_present_buffer_id;
@@ -5275,4 +5741,306 @@ void rsx_metal_backend_present_guest_frame(uint64_t guest_flip_id,uint32_t buffe
     rsx_metal_backend_note_guest_frame();
     rsx_metal_backend_present();
     s_present_guest_id=previous_id;s_present_buffer_id=previous_buffer;
+}
+
+int rsx_metal_backend_init(u32 w,u32 h,const char* title){
+    if(!metal_owner_begin(1))return -1;
+    if(metal_owner_enabled()&&(s_metal_owner.retained||s_dev||s_frontend)){metal_owner_finish(0);return -1;}
+    if(metal_owner_enabled())metal_owner_install_hooks();
+    int result=metal_original_init(w,h,title);
+    if(metal_owner_enabled()&&!result&&metal_owner_activate())result=-1;
+    metal_owner_finish(0);return result;
+}
+void rsx_metal_backend_shutdown(void){
+    if(!metal_owner_begin(1))return;
+    if(metal_owner_enabled()){
+        s_metal_owner.closing=1;s_metal_shutdown_pending=s_dev!=nil;
+        if(s_metal_owner.retained||s_metal_owner.failed||fps_backend_failed()){metal_owner_finish(0);return;}
+    }
+    metal_original_shutdown();if(metal_owner_enabled()&&!s_dev)s_metal_shutdown_pending=0;
+    metal_owner_finish(0);
+}
+void rsx_metal_backend_present(void){
+    if(!metal_owner_begin(1))return;
+    uint64_t before=s_metal_commits;
+    metal_original_present();metal_owner_finish(metal_owner_boundary(before));
+}
+void rsx_metal_backend_present_guest_frame(uint64_t frame,uint32_t buffer){
+    if(!metal_owner_begin(1))return;
+    uint64_t before=s_metal_commits;
+    metal_original_present_guest_frame(frame,buffer);metal_owner_finish(metal_owner_boundary(before));
+}
+int rsx_metal_backend_native_boundary(uint64_t *original_ticket){
+    if(!original_ticket)return -1;
+    *original_ticket=0;
+    if(!metal_owner_enabled())return -2;
+    if(!metal_owner_begin(0))return -4;
+    int status=0;
+    const uint64_t before=s_metal_commits,previous_ticket=s_eng_fence_next;
+    @try {
+    if(!s_ready||!s_eng_active||s_metal_owner.closing)status=-3;
+    else if(s_metal_owner.failed||fps_backend_failed())status=-6;
+    else if(s_metal_partial_primitives||eng_trace_enabled())status=-4;
+    else if(!rsx_draw_engine_async_available())status=-2;
+    else {
+        /* Retire only already-terminal receipts; never enter the ordinary
+         * eng_submit_async cap path, which is allowed to GPU-wait. */
+        if(s_eng_fence_next&&eng_completion_status(NULL,s_eng_fence_next,0)<0)status=-6;
+        if(!status&&[s_eng_fence_cbs count]>=64)status=-4;
+        if(!status){
+            uint64_t ticket=rsx_draw_engine_submit_async();
+            if(s_metal_commits!=before){
+                *original_ticket=s_eng_fence_next>previous_ticket?s_eng_fence_next:ticket;
+                status=ticket&&*original_ticket&&!fps_backend_failed()?0:1;
+            }else status=fps_backend_failed()?-6:-4;
+        }
+    }
+    }@catch(NSException *exception){
+        (void)exception;
+        if(s_metal_commits!=before){*original_ticket=s_eng_fence_next>previous_ticket?s_eng_fence_next:0;status=1;}
+        else status=-6;
+    }@finally{metal_owner_finish(metal_owner_boundary(before));}
+    return status;
+}
+static int metal_borrow_retain(void* user,uint64_t life){return user==&s_metal_owner?rsx_owner_retain(&s_metal_owner,&s_metal_owner_thread,life):-3;}
+static void metal_borrow_release(void* user,uint64_t life){if(user==&s_metal_owner)(void)rsx_owner_release(&s_metal_owner,&s_metal_owner_thread,life);}
+static int metal_borrow_begin(void* user,uint64_t life){
+    if(user!=&s_metal_owner)return -3;
+    int status=rsx_owner_native_begin(&s_metal_owner,&s_metal_owner_thread,life);if(status)return status;
+    if(!s_ready||!s_dev||!s_queue||fps_backend_failed()||atomic_load(&s_metal_unscoped_commit)){
+        s_metal_owner.failed=1;rsx_owner_native_end(&s_metal_owner,&s_metal_owner_thread);return -6;}
+    if(s_metal_partial_primitives||!frontend_ordering_ready()){rsx_owner_native_end(&s_metal_owner,&s_metal_owner_thread);return -4;}
+    return 0;
+}
+static void metal_borrow_end(void* user,uint64_t life){
+    if(user==&s_metal_owner&&s_metal_owner_thread.gate==&s_metal_owner&&s_metal_owner_thread.native&&life==s_metal_owner.generation)
+        rsx_owner_native_end(&s_metal_owner,&s_metal_owner_thread);
+}
+int rsx_metal_backend_borrow_owner(rsx_native_owner* out){
+    if(!out||out->abi_version!=1||out->struct_size!=sizeof(*out))return -1;
+    if(!metal_owner_enabled())return -2;
+    if(s_metal_owner_thread.gate||!rsx_owner_lock_try(&s_metal_owner.lock))return -4;
+    int status=0;
+    if(!s_ready||!s_dev||!s_queue||s_metal_owner.closing)status=-3;
+    else if(s_frontend)status=-2;
+    else if(s_metal_owner.failed||fps_backend_failed()||atomic_load(&s_metal_unscoped_commit))status=-6;
+    else{
+        if(!s_metal_owner.generation){if(s_metal_lifetime==UINT64_MAX)status=-6;else s_metal_owner.generation=++s_metal_lifetime;}
+        if(!status)metal_owner_install_hooks();
+        if(!status)*out=(rsx_native_owner){.abi_version=1,.struct_size=sizeof(*out),.backend=RSX_NATIVE_OWNER_METAL,
+            .lifetime=s_metal_owner.generation,.device=(__bridge void*)s_dev,.queue=(__bridge void*)s_queue,.userdata=&s_metal_owner,
+            .retain=metal_borrow_retain,.release=metal_borrow_release,.try_begin=metal_borrow_begin,.end=metal_borrow_end};
+    }
+    rsx_owner_lock_release(&s_metal_owner.lock);return status;
+}
+int rsx_metal_backend_owner_shutdown_requested(uint64_t life){
+    if(!metal_owner_enabled())return -2;
+    if(!metal_owner_begin(0))return -4;
+    int status=life&&life==s_metal_owner.generation?s_metal_shutdown_pending:-3;metal_owner_finish(1);return status;
+}
+int rsx_metal_backend_owner_retry_shutdown(uint64_t life){
+    if(!metal_owner_enabled())return -2;
+    if(!metal_owner_begin(0))return -4;
+    int status=0;
+    if(!life||life!=s_metal_owner.generation)status=-3;
+    else if(!s_metal_shutdown_pending)status=0;
+    else if(s_metal_owner.retained)status=-4;
+    else if(s_metal_owner.failed||fps_backend_failed())status=-6;
+    else{metal_original_shutdown();status=s_dev?-6:1;if(status==1)s_metal_shutdown_pending=0;}
+    metal_owner_finish(status==1?0:1);return status;
+}
+
+/* A native image lease keeps the original table slot alive, while independent
+ * validation prevents encoding a new frame against a retired allocation. */
+static int metal_image_identity(uint64_t life,uint64_t id,uint64_t generation,int retired_ok){
+ if(!life||life!=s_metal_owner.generation||!id||id>s_eng_obj_count||!generation||s_eng_obj_generation[id-1]!=generation||!s_eng_obj[id-1]||(!retired_ok&&s_eng_obj_retired[id-1]))return -3;
+ return 0;
+}
+static int metal_image_retain(void *user,uint64_t life,uint64_t id,uint64_t generation){
+ if(user!=&s_metal_owner)return -3;
+ if(s_metal_owner_thread.gate||!rsx_owner_lock_try(&s_metal_owner.lock))return -4;
+ int status=metal_image_identity(life,id,generation,0);
+ if(!status&&s_metal_owner.closing)status=-3;
+ if(!status&&(s_metal_owner.failed||fps_backend_failed()))status=-6;
+ if(!status&&(s_metal_owner.retained==UINT_MAX||s_eng_obj_native_pins[id-1]==UINT_MAX))status=-4;
+ if(!status){++s_metal_owner.retained;++s_eng_obj_native_pins[id-1];}
+ rsx_owner_lock_release(&s_metal_owner.lock);return status;
+}
+static void metal_image_release(void *user,uint64_t life,uint64_t id,uint64_t generation){
+ if(user!=&s_metal_owner||s_metal_owner_thread.gate)return;
+ rsx_owner_lock_acquire(&s_metal_owner.lock);
+ if(!metal_image_identity(life,id,generation,1)&&s_eng_obj_native_pins[id-1]&&s_metal_owner.retained){--s_eng_obj_native_pins[id-1];--s_metal_owner.retained;eng_collect_retired_objects();}
+ rsx_owner_lock_release(&s_metal_owner.lock);
+}
+static int metal_image_validate(void *user,uint64_t life,uint64_t id,uint64_t generation){
+ if(user!=&s_metal_owner)return -3;
+ if(s_metal_owner_thread.gate!=&s_metal_owner||!s_metal_owner_thread.native)return -4;
+ if(s_metal_owner.closing)return -3;
+ if(s_metal_owner.failed||fps_backend_failed())return -6;
+ return metal_image_identity(life,id,generation,0);
+}
+int rsx_metal_backend_validate_image_planes(void *user,uint64_t life,uint64_t id,uint64_t generation,uint32_t required){
+ if(!required||(required&~7u)||id>UINT32_MAX)return -1;
+ int status=metal_image_validate(user,life,id,generation);
+ if(status)return status;
+ return rsx_draw_engine_native_image_clear_planes((uint32_t)id,required);
+}
+int rsx_metal_backend_read_native_image(void *user,uint64_t life,uint64_t resource_id,
+ uint64_t generation,uint32_t width,uint32_t height,void *bytes,uint64_t capacity,
+ rsx_metal_native_readback *out){
+ if(!out||out->abi_version!=1||out->struct_size!=sizeof(*out))return -1;
+ *out=(rsx_metal_native_readback){.abi_version=1,.struct_size=sizeof(*out)};
+ uint32_t row=0,padded=0;uint64_t length=0;
+ if(!bytes||rsx_metal_native_readback_layout(width,height,&row,&padded,&length)||capacity<length)return -1;
+ int status=metal_image_validate(user,life,resource_id,generation);if(status)return status;
+ @autoreleasepool {
+  id<MTLTexture> image=eng_obj((u32)resource_id);
+  if(!s_queue||!image||image.device!=s_dev||image.width!=width||image.height!=height||
+     image.textureType!=MTLTextureType2D||image.sampleCount!=1||image.mipmapLevelCount!=1||image.arrayLength!=1)return -3;
+  out->width=width;out->height=height;out->pixel_format=(uint64_t)image.pixelFormat;
+  out->storage_mode=(uint32_t)image.storageMode;out->row_bytes=row;out->padded_row_bytes=padded;
+  if(image.pixelFormat!=MTLPixelFormatRGBA8Unorm&&image.pixelFormat!=MTLPixelFormatBGRA8Unorm)return -2;
+  id<MTLBuffer> copy=[s_dev newBufferWithLength:(NSUInteger)padded*height options:MTLResourceStorageModeShared];
+  id<MTLCommandBuffer> command=[s_queue commandBuffer];
+  if(!copy||!command)return -5;
+  id<MTLBlitCommandEncoder> blit=[command blitCommandEncoder];if(!blit)return -6;
+  [blit copyFromTexture:image sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+   sourceSize:MTLSizeMake(width,height,1) toBuffer:copy destinationOffset:0
+   destinationBytesPerRow:padded destinationBytesPerImage:(NSUInteger)padded*height];
+  [blit endEncoding];
+  dispatch_semaphore_t done=dispatch_semaphore_create(0);if(!done)return -5;
+  [command addCompletedHandler:^(id<MTLCommandBuffer> completed){(void)completed;dispatch_semaphore_signal(done);}];
+  /* Native diagnostic submission on the borrowed queue, not an original
+   * recorder submission. Calling metal_owner_committed here would falsely
+   * classify a native lease as an unscoped original commit. */
+  [command commit];
+  const long timeout=dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC));
+  out->gpu_status=(uint32_t)command.status;
+  if(timeout)return -4;
+  if(command.status!=MTLCommandBufferStatusCompleted)return -6;
+  out->gpu_completed=1;
+  const uint8_t *source=copy.contents;if(!source)return -6;
+  for(uint32_t y=0;y<height;++y)memcpy((uint8_t*)bytes+(size_t)y*row,source+(size_t)y*padded,row);
+  out->bytes_written=length;
+  return 0;
+ }
+}
+/* Report actual allocation format, not the guest's source format code. */
+static uint32_t metal_native_image_format(MTLPixelFormat format){
+ switch(format){
+  case MTLPixelFormatRGBA8Unorm:return RSX_NATIVE_IMAGE_RGBA8;
+  case MTLPixelFormatBGRA8Unorm:return RSX_NATIVE_IMAGE_BGRA8;
+  case MTLPixelFormatDepth32Float:return RSX_NATIVE_IMAGE_D32F;
+  case MTLPixelFormatRGBA16Float:return RSX_NATIVE_IMAGE_RGBA16F;
+  case MTLPixelFormatRGBA32Float:return RSX_NATIVE_IMAGE_RGBA32F;
+  case MTLPixelFormatR32Float:return RSX_NATIVE_IMAGE_R32F;
+  case MTLPixelFormatDepth24Unorm_Stencil8:return RSX_NATIVE_IMAGE_D24S8;
+  case MTLPixelFormatDepth32Float_Stencil8:return RSX_NATIVE_IMAGE_D32S8;
+  default:return 0;
+ }
+}
+int rsx_metal_backend_borrow_image(uint64_t life,uint32_t handle,rsx_native_image *out){
+ if(!out||out->abi_version!=RSX_NATIVE_IMAGE_ABI||out->struct_size!=sizeof(*out))return -1;
+ if(!metal_owner_enabled())return -2;
+ if(!metal_owner_begin(0))return -4;
+ int status=0;
+ if(!s_ready||s_metal_owner.closing||life!=s_metal_owner.generation||!handle||handle>s_eng_obj_count||s_eng_obj_retired[handle-1]||!s_eng_obj[handle-1]||!s_eng_obj_generation[handle-1])status=-3;
+ else if(s_metal_owner.failed||fps_backend_failed())status=-6;
+ else{ id<MTLTexture> image=s_eng_obj[handle-1];
+  uint32_t format=metal_native_image_format(image.pixelFormat);
+  if(!format||image.textureType!=MTLTextureType2D||image.sampleCount!=1||image.mipmapLevelCount!=1||image.arrayLength!=1)status=-2;
+  if(!status)*out=(rsx_native_image){.abi_version=RSX_NATIVE_IMAGE_ABI,.struct_size=sizeof(*out),.backend=RSX_NATIVE_OWNER_METAL,.format=format,.width=(uint32_t)image.width,.height=(uint32_t)image.height,.owner_lifetime=life,.resource_id=handle,.resource_generation=s_eng_obj_generation[handle-1],.image=(__bridge void*)image,.userdata=&s_metal_owner,.retain=metal_image_retain,.release=metal_image_release,.validate=metal_image_validate};
+ }
+ metal_owner_finish(1);return status;
+}
+
+/* Bounded cross-owner frame association. Async GPU/compositor callbacks use
+ * only this independent mutex; they never take the owner/consumer lease or
+ * release host pins. Poll retires pins on the caller's host lifecycle thread. */
+@interface MetalNativeFrame : NSObject {
+@public rsx_native_frame_source source;
+ uint64_t owner,reservation,target,generation,native_device,native_submission;
+ uint64_t guest,drawable;uint32_t buffer,disposition;
+ int phase,final_done,present_done; /* 0reserved,1nativequeued,2finalattached */
+}
+@end
+@implementation MetalNativeFrame @end
+static pthread_mutex_t s_native_frame_mu=PTHREAD_MUTEX_INITIALIZER;
+static MetalNativeFrame *s_native_frames[2];
+static uint64_t s_native_next_frame;
+static rsx_native_frame_event s_native_frame_events[64];
+static unsigned s_native_frame_head,s_native_frame_count;
+static int s_native_frame_overflow;
+static MetalNativeFrame *metal_native_frame_find(uint64_t life,uint64_t reservation){
+ for(unsigned i=0;i<2;++i){MetalNativeFrame *f=s_native_frames[i];if(f&&f->owner==life&&f->reservation==reservation)return f;}return nil;
+}
+static void metal_native_frame_event(MetalNativeFrame *f,uint32_t kind,uint32_t success,uint32_t status,double time){
+ if(s_native_frame_count==64){s_native_frame_overflow=1;return;}
+ unsigned i=(s_native_frame_head+s_native_frame_count++)%64;
+ s_native_frame_events[i]=(rsx_native_frame_event){.abi_version=1,.struct_size=sizeof(rsx_native_frame_event),.kind=kind,.succeeded=success,.owner_lifetime=f->owner,.reservation=f->reservation,.source=f->source,.native_device_generation=f->native_device,.native_submission=f->native_submission,.target_id=f->target,.target_generation=f->generation,.guest_flip_id=f->guest,.drawable_id=f->drawable,.guest_buffer_id=f->buffer,.native_status=status,.presented_time=time};
+}
+static int metal_native_frame_preflight(void *user,uint64_t life,uint64_t reservation,uint64_t id,uint64_t generation){
+ if(user!=&s_metal_owner)return -3;
+ if(s_metal_owner_thread.gate!=&s_metal_owner||!s_metal_owner_thread.native)return -4;
+ int status=metal_image_identity(life,id,generation,0);if(status)return status;
+ pthread_mutex_lock(&s_native_frame_mu);MetalNativeFrame *f=metal_native_frame_find(life,reservation);
+ status=!f||f->target!=id||f->generation!=generation?-3:f->phase?-4:0;
+ if(s_native_frame_overflow)status=-6;pthread_mutex_unlock(&s_native_frame_mu);return status;
+}
+static int metal_native_frame_committed(void *user,uint64_t life,uint64_t reservation,uint64_t device,uint64_t submission,uint32_t disposition){
+ if(user!=&s_metal_owner)return -3;
+ if(s_metal_owner_thread.gate!=&s_metal_owner||!s_metal_owner_thread.native)return -4;
+ if(!device||!submission||disposition>1)return -1;
+ pthread_mutex_lock(&s_native_frame_mu);MetalNativeFrame *f=metal_native_frame_find(life,reservation);
+ int status=!f?-3:f->phase?-4:0;
+ if(!status){f->native_device=device;f->native_submission=submission;f->disposition=disposition;f->phase=1;metal_native_frame_event(f,RSX_NATIVE_FRAME_NATIVE_QUEUED,disposition==0,disposition,0);if(s_native_frame_overflow)status=-6;}
+ pthread_mutex_unlock(&s_native_frame_mu);return status;
+}
+int rsx_metal_backend_cancel_frame(uint64_t life,uint64_t reservation){
+ if(!metal_owner_enabled())return -2;
+ int native=s_metal_owner_thread.gate==&s_metal_owner&&s_metal_owner_thread.native;
+ if(!native&&!metal_owner_begin(0))return -4;
+ pthread_mutex_lock(&s_native_frame_mu);MetalNativeFrame *f=metal_native_frame_find(life,reservation);int status=!f?-3:f->phase?-4:0;
+ if(!status){for(unsigned i=0;i<2;++i)if(s_native_frames[i]==f)s_native_frames[i]=nil;}
+ pthread_mutex_unlock(&s_native_frame_mu);
+ if(!status){if(!metal_image_identity(life,f->target,f->generation,1)&&s_eng_obj_native_pins[f->target-1]&&s_metal_owner.retained){--s_eng_obj_native_pins[f->target-1];--s_metal_owner.retained;eng_collect_retired_objects();}else status=-6;}
+ if(!native)metal_owner_finish(1);return status;
+}
+static int metal_native_frame_cancel(void *user,uint64_t life,uint64_t reservation){return user==&s_metal_owner?rsx_metal_backend_cancel_frame(life,reservation):-3;}
+int rsx_metal_backend_reserve_frame(const rsx_native_image *image,const rsx_native_frame_source *source,rsx_native_frame *out){
+ if(!image||!source||!out||image->abi_version!=1||image->struct_size!=sizeof(*image)||source->abi_version!=1||source->struct_size!=sizeof(*source)||out->abi_version!=1||out->struct_size!=sizeof(*out)||!source->cohort_id||!source->source_publication||!source->pass_occurrence)return -1;
+ if(!metal_owner_enabled())return -2;
+ if(!metal_owner_begin(0))return -4;
+ int status=metal_image_identity(image->owner_lifetime,image->resource_id,image->resource_generation,0);
+ if(!status&&(image->userdata!=&s_metal_owner||s_metal_owner.closing))status=-3;
+ if(!status&&(s_metal_owner.failed||fps_backend_failed()))status=-6;
+ pthread_mutex_lock(&s_native_frame_mu);unsigned slot=2;
+ if(!status){for(unsigned i=0;i<2;++i){MetalNativeFrame *f=s_native_frames[i];if(!f){if(slot==2)slot=i;continue;}if(f->owner==image->owner_lifetime&&f->target==image->resource_id&&f->generation==image->resource_generation&&f->phase<2)status=-4;}}
+ if(!status&&(slot==2||s_native_frame_count>56))status=-4;
+ if(!status&&(s_native_next_frame==UINT64_MAX||s_native_frame_overflow))status=-6;
+ if(!status&&(s_metal_owner.retained==UINT_MAX||s_eng_obj_native_pins[image->resource_id-1]==UINT_MAX))status=-4;
+ if(!status){MetalNativeFrame *f=[MetalNativeFrame new];if(!f)status=-5;else{f->source=*source;f->owner=image->owner_lifetime;f->reservation=++s_native_next_frame;f->target=image->resource_id;f->generation=image->resource_generation;s_native_frames[slot]=f;++s_metal_owner.retained;++s_eng_obj_native_pins[f->target-1];*out=(rsx_native_frame){.abi_version=1,.struct_size=sizeof(*out),.owner_lifetime=f->owner,.reservation=f->reservation,.userdata=&s_metal_owner,.preflight=metal_native_frame_preflight,.committed=metal_native_frame_committed,.cancel=metal_native_frame_cancel};}}
+ pthread_mutex_unlock(&s_native_frame_mu);metal_owner_finish(1);return status;
+}
+static void metal_native_frame_present(id<MTLCommandBuffer> cb,id<MTLTexture> target,id<CAMetalDrawable> drawable,int blitted){
+ if(!metal_owner_enabled()||!cb||!target)return;
+ pthread_mutex_lock(&s_native_frame_mu);MetalNativeFrame *frame=nil;
+ for(unsigned i=0;i<2;++i){MetalNativeFrame *f=s_native_frames[i];if(f&&f->owner==s_metal_owner.generation&&f->phase==1&&!metal_image_identity(f->owner,f->target,f->generation,1)&&eng_obj((u32)f->target)==target){frame=f;break;}}
+ if(frame){frame->phase=2;frame->guest=s_present_guest_id;frame->buffer=s_present_buffer_id;frame->drawable=drawable?drawable.drawableID:0;
+  if(!drawable||!blitted){frame->present_done=1;metal_native_frame_event(frame,RSX_NATIVE_FRAME_SKIPPED,0,blitted?0:1,0);}}
+ pthread_mutex_unlock(&s_native_frame_mu);if(!frame)return;
+ [cb addCompletedHandler:^(id<MTLCommandBuffer> finished){pthread_mutex_lock(&s_native_frame_mu);frame->final_done=1;metal_native_frame_event(frame,RSX_NATIVE_FRAME_FINAL_GPU_TERMINAL,finished.status==MTLCommandBufferStatusCompleted&&!finished.error,(uint32_t)finished.status,0);pthread_mutex_unlock(&s_native_frame_mu);}];
+ if(drawable&&blitted)[drawable addPresentedHandler:^(id<MTLDrawable> shown){double time=shown.presentedTime;pthread_mutex_lock(&s_native_frame_mu);frame->present_done=1;metal_native_frame_event(frame,isfinite(time)&&time>0?RSX_NATIVE_FRAME_PRESENTED:RSX_NATIVE_FRAME_SKIPPED,isfinite(time)&&time>0,0,time);pthread_mutex_unlock(&s_native_frame_mu);}];
+}
+int rsx_metal_backend_poll_frames(rsx_native_frame_event *events,uint32_t capacity,uint32_t *count){
+ if(count)*count=0;if(!events||!count||!capacity||capacity>64)return -1;
+ if(!metal_owner_enabled())return -2;
+ if(s_metal_owner_thread.gate)return -4;
+ MetalNativeFrame *retire[2]={nil,nil};unsigned retired=0;int overflow;
+ pthread_mutex_lock(&s_native_frame_mu);
+ while(s_native_frame_count&&*count<capacity){events[(*count)++]=s_native_frame_events[s_native_frame_head];s_native_frame_head=(s_native_frame_head+1)%64;--s_native_frame_count;}
+ if(!s_native_frame_count){for(unsigned i=0;i<2;++i){MetalNativeFrame *f=s_native_frames[i];if(f&&f->final_done&&f->present_done){retire[retired++]=f;s_native_frames[i]=nil;}}}
+ overflow=s_native_frame_overflow;pthread_mutex_unlock(&s_native_frame_mu);
+ for(unsigned i=0;i<retired;++i){MetalNativeFrame *f=retire[i];metal_image_release(&s_metal_owner,f->owner,f->target,f->generation);}
+ return *count?0:overflow?-6:0;
 }

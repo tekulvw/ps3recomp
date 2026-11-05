@@ -6,6 +6,7 @@
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
 #include "spu_workload.h"
+#include "../diagnostics/original_work_threads.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
@@ -15,7 +16,7 @@
 #include <stdatomic.h>
 #include "ps3emu/log_first.h"
 #ifdef _WIN32
-#include <windows.h>
+#include "../platform/win32_compat.h"
 #else
 #include <pthread.h>
 #include <errno.h>
@@ -1609,13 +1610,13 @@ int spu_workload_dispatch_async_owned(const uint8_t* image, uint32_t image_size,
     pthread_attr_init(&attr);
     int prc = EINVAL;
     if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
-        prc = pthread_create(&th, &attr, spu_async_thread, j);
+        prc = ps3_original_pthread_create(&th, &attr, spu_async_thread, j);
     pthread_attr_destroy(&attr);
     /* A host that will not reserve that much still gets the thread, on the
      * default stack: a shallow SPU job runs there, and a deep one dying
      * beats never dispatching at all. */
     if (prc != 0)
-        prc = pthread_create(&th, NULL, spu_async_thread, j);
+        prc = ps3_original_pthread_create(&th, NULL, spu_async_thread, j);
     if (prc != 0) { if(j->lifetime_counted) spu_taskset_lifecycle_leave(j->taskset_ea); free(j); return 0; }
     pthread_detach(th);
 #endif

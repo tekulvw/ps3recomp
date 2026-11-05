@@ -15,6 +15,25 @@
  */
 
 #include "rsx_commands.h"
+#include <stdatomic.h>
+static _Atomic(const rsx_original_owner_hooks*) s_original_owner_hooks;
+/* Only observed initialized streams are tracked; state_init must not inspect
+ * indeterminate caller storage. A reset retires the prior observed BEGIN. */
+static struct { rsx_state *state; int open; } s_owner_states[256];
+static int owner_state_slot(rsx_state *state,int create){
+    int empty=-1;
+    for(unsigned i=0;i<256;++i){
+        if(s_owner_states[i].state==state)return (int)i;
+        if(!s_owner_states[i].state && empty<0)empty=(int)i;
+    }
+    if(create && empty>=0)s_owner_states[empty].state=state;
+    return create?empty:-1;
+}
+
+void rsx_commands_set_owner_hooks(const rsx_original_owner_hooks* hooks){
+    atomic_store_explicit(&s_original_owner_hooks,hooks,memory_order_release);
+}
+
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -34,12 +53,12 @@ static rsx_backend* s_backend = NULL;
  * register after each drain so those waits (cellGcmFinish / wait-label) unblock. */
 u32 g_rsx_last_reference = 0;
 
-void rsx_set_backend(rsx_backend* backend)
+static void original_rsx_set_backend(rsx_backend* backend)
 {
     s_backend = backend;
 }
 
-rsx_backend* rsx_get_backend(void)
+static rsx_backend* original_rsx_get_backend(void)
 {
     return s_backend;
 }
@@ -48,7 +67,7 @@ rsx_backend* rsx_get_backend(void)
  * State initialization
  * -----------------------------------------------------------------------*/
 
-void rsx_state_init(rsx_state* state)
+static void original_rsx_state_init(rsx_state* state)
 {
     memset(state, 0, sizeof(rsx_state));
     /* RSX reset value for the constant vertex attributes is (0,0,0,1); a zeroed
@@ -333,7 +352,7 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
  * Main method dispatch
  * -----------------------------------------------------------------------*/
 
-int rsx_process_method(rsx_state* state, u32 method, u32 data)
+static int original_rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
      * The fixed 250 was spent entirely on boot-time setup, so the methods around
@@ -895,7 +914,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
  * Command buffer parsing
  * -----------------------------------------------------------------------*/
 
-int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
+static int original_rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
 {
     int methods_processed = 0;
     u32 pos = 0;
@@ -916,7 +935,8 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
             for (u32 i = 0; i < num_data && pos < count; i++) {
                 u32 data = buf[pos++];
                 u32 m = increasing ? (method + i * 4) : method;
-                rsx_process_method(state, m, data);
+                if(rsx_process_method(state,m,data)==RSX_ORIGINAL_OWNER_REFUSED)
+                    return RSX_ORIGINAL_OWNER_REFUSED;
                 methods_processed++;
             }
         } else if (type == 1) {
@@ -930,4 +950,53 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
     }
 
     return methods_processed;
+}
+
+void rsx_set_backend(rsx_backend* backend){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_LIFECYCLE)){return;}
+    original_rsx_set_backend(backend);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_LIFECYCLE,0,0);
+}
+rsx_backend* rsx_get_backend(void){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_READ)){return NULL;}
+    rsx_backend* result=original_rsx_get_backend();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
+    return result;
+}
+void rsx_state_init(rsx_state* state){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_LIFECYCLE)){return;}
+    int slot=owner?owner_state_slot(state,0):-1;
+    int retired=slot>=0?s_owner_states[slot].open:0;
+    original_rsx_state_init(state);
+    if(slot>=0){s_owner_states[slot].state=NULL;s_owner_states[slot].open=0;}
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_LIFECYCLE,-retired,0);
+}
+int rsx_process_method(rsx_state* state, u32 method, u32 data){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return RSX_ORIGINAL_OWNER_REFUSED;}
+    int slot=owner?owner_state_slot(state,0):-1;
+    /* Only open streams consume slots. Preflight a possible BEGIN before
+     * mutating it; capacity refusal leaves the new stream closed. */
+    if(owner && slot<0 && (state->in_begin_end || (method==NV4097_SET_BEGIN_END && data))){
+        slot=owner_state_slot(state,1);
+        if(slot<0){owner->end(owner->user,RSX_ORIGINAL_MUTATE|RSX_ORIGINAL_FAILURE_BIT,0,0);return RSX_ORIGINAL_OWNER_REFUSED;}
+    }
+    int before=slot>=0?s_owner_states[slot].open:0;
+    int result=original_rsx_process_method(state,method,data);
+    if(slot>=0){
+        s_owner_states[slot].open=state->in_begin_end!=0;
+        if(!s_owner_states[slot].open)s_owner_states[slot].state=NULL;
+    }
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,(state->in_begin_end!=0)-before,0);
+    return result;
+}
+int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return RSX_ORIGINAL_OWNER_REFUSED;}
+    int result=original_rsx_process_command_buffer(state,buf,size);
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+    return result;
 }

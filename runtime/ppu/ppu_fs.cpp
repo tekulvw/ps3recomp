@@ -249,9 +249,10 @@ static void cellFsOpen(ppu_context* ctx)
     host_path(hpath, sizeof hpath, gpath);
 
     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
-     * file and that is opened in its place. */
+     * file and that is opened in its place. SDATA stays raw here: only
+     * cellFsSdataOpen decrypts it. */
     { char dec_path[1200];
-      const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
+      const char* use = edat_resolve_open(hpath, dec_path, sizeof dec_path);
       if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
 
     /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
@@ -531,6 +532,12 @@ static void cellFsWrite(ppu_context* ctx)
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
+    /* cellFsWrite hands the bytes to the kernel; they outlive the process. Hand
+     * them to the host OS too (as sys_fs_write and cellFs.c already do), or a
+     * killed run leaves only what stdio happened to flush: a system-cache index
+     * whose header was still buffered reads back as zeros, and fios then
+     * revalidates it one 512-byte open/read/close at a time. */
+    fflush(f);
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {

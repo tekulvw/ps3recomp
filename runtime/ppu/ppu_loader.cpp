@@ -1,4 +1,5 @@
 #include "../diagnostics/critical_write_trace.h"
+#include "../diagnostics/original_work_observer.h"
 /*
  * ps3recomp - PPU runtime loader
  *
@@ -4095,6 +4096,14 @@ extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
 
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
+#if defined(PS3RECOMP_ORIGINAL_OBSERVER) && PS3RECOMP_ORIGINAL_OBSERVER
+    /* Host controller enrolled main1/generation1 before launching this native
+     * worker. Normal return/unwind retires only after its last guest body. */
+    struct OriginalMainWorker {
+        bool active = ps3_original_worker_register(1,1)==0;
+        ~OriginalMainWorker(){if(active)(void)ps3_original_worker_retire();}
+    } original_main_worker;
+#endif
     /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
      * (stderr); with a redirected block-buffered stdout, printf lines sat in
      * the buffer for minutes and were LOST when the run was killed -- which

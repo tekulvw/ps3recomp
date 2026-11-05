@@ -20,6 +20,7 @@
  */
 
 #include "rsx_live_draw.h"
+#include "rsx_live_draw_owner.h"
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/log_first.h"
@@ -27,6 +28,16 @@
 #if !defined(_WIN32)
 
 /* Non-Windows: the whole path is a no-op (D3D12 is Windows-only). */
+int rsx_live_draw_borrow_owner(rsx_live_draw_owner* owner) { (void)owner; return -2; }
+int rsx_live_draw_owner_shutdown_requested(uint64_t lifetime) { (void)lifetime;return -2; }
+int rsx_live_draw_owner_retry_shutdown(uint64_t lifetime) { (void)lifetime;return -2; }
+int rsx_live_draw_native_image(const rsx_native_image_key* k,rsx_native_image_match* o){(void)k;(void)o;return -2;}
+int rsx_live_draw_borrow_image(uint64_t l,uint32_t h,rsx_native_image* o){(void)l;(void)h;(void)o;return -2;}
+int rsx_live_draw_validate_image_planes(void* u,uint64_t l,uint64_t i,uint64_t g,uint32_t p){(void)u;(void)l;(void)i;(void)g;(void)p;return -2;}
+int rsx_live_draw_native_registers(const uint32_t* m,uint32_t* v,uint32_t n){(void)m;(void)v;(void)n;return -2;}
+int rsx_live_draw_native_canvas(uint32_t d[2]){(void)d;return -2;}
+int rsx_live_draw_native_boundary(uint64_t* t){if(!t)return -1;*t=0;return -2;}
+
 int  rsx_live_draw_enabled(void) { return 0; }
 int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
 { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
@@ -114,6 +125,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <initguid.h>
 #include <d3d12.h>
 #include "rsx_d3d12_checked_fence.h"
+#include "rsx_native_owner_gate.h"
 #include "rsx_picture_identity.h"
 #include <stdatomic.h>
 #include <d3d12sdklayers.h>
@@ -221,6 +233,8 @@ typedef struct {
     u32 w, h;
     DXGI_FORMAT fmt;
     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
+    uint64_t native_generation;
+    uint32_t native_state,native_state_known,native_clear_planes,native_aa_grid,native_source_format;
     u32 pitch;                /* guest row pitch of colour target 0 (bytes), 0 = unknown */
     /* Top-left windows of the surface for smaller aliasing textures (see surface_window). */
     struct { ID3D12Resource* tex; ID3D12Resource* src; u32 w, h, wgen, used; } swin[LD_SWIN_PER];
@@ -253,6 +267,8 @@ typedef struct {
     u32 w, h;
     u32 snapshot_w, snapshot_h;
     D3D12_RESOURCE_STATES snapshot_state;
+    uint64_t native_generation;
+    uint32_t native_state,native_state_known,native_clear_planes,native_pitch,native_source_format;
     int cleared;
     int had_write;
     int snapshot_valid;
@@ -1271,6 +1287,59 @@ static SRWLOCK g_ld_access_lock = SRWLOCK_INIT;
 static volatile LONG g_ld_guest_active = 0;
 static volatile LONG g_ld_host_waiting = 0;
 
+/* Not reset with g: old borrowed owners never acquire a new device lifetime. */
+static u64 s_report_lifetime;
+static int (*s_report_barrier)(void);
+static void (*s_report_lease_begin)(void);
+static void (*s_report_lease_end)(void);
+static SRWLOCK s_owner_consumer_config = SRWLOCK_INIT;
+static rsx_native_owner_gate s_native_owner = RSX_NATIVE_OWNER_GATE_INIT;
+static int s_native_shutdown_pending;
+static _Thread_local rsx_native_owner_thread s_native_thread;
+static _Thread_local void (*s_native_consumer_end)(void);
+static int ld_native_owner_enabled(void) {
+    static atomic_int cached = -1;
+    int value=atomic_load_explicit(&cached,memory_order_relaxed);
+    if(value<0){const char *setting=getenv("PS3RECOMP_RSX_NATIVE_OWNER");
+        value=setting && !strcmp(setting,"1");int expected=-1;
+        if(!atomic_compare_exchange_strong_explicit(&cached,&expected,value,memory_order_relaxed,memory_order_relaxed))value=expected;}
+    return value!=0;
+}
+static int ld_owner_read_begin(void) {
+    if(!ld_native_owner_enabled())return 1;
+    if(s_native_thread.native)return 0;
+    const int outer=!s_native_thread.original_depth;
+    if(outer){
+        AcquireSRWLockShared(&s_owner_consumer_config);
+        void(*begin)(void)=s_report_lease_begin;s_native_consumer_end=s_report_lease_end;
+        ReleaseSRWLockShared(&s_owner_consumer_config);
+        if(begin)begin();
+    }
+    if(rsx_owner_original_begin(&s_native_owner,&s_native_thread)){
+        if(outer && s_native_consumer_end)s_native_consumer_end();return 0;}
+    return 1;
+}
+static int ld_owner_original_begin(void) {
+    if(ld_native_owner_enabled() && s_native_thread.native){s_native_owner.failed=1;g.ready=0;return 0;}
+    if(!ld_owner_read_begin())return 0;
+    if(ld_native_owner_enabled())rsx_owner_dirty(&s_native_owner,&s_native_thread);
+    return 1;
+}
+static void ld_owner_original_finish(int preserve_boundary) {
+    if(!ld_native_owner_enabled())return;
+    if(!preserve_boundary)rsx_owner_dirty(&s_native_owner,&s_native_thread);
+    if(!preserve_boundary && s_native_owner.generation && !g.ready)rsx_owner_submitted(&s_native_owner,&s_native_thread,0);
+    const int outer=s_native_thread.original_depth==1;
+    rsx_owner_original_end(&s_native_owner,&s_native_thread);
+    if(outer){void(*end)(void)=s_native_consumer_end;s_native_consumer_end=NULL;if(end)end();}
+}
+static void ld_owner_failed_boundary(void) {
+    if(ld_native_owner_enabled())rsx_owner_submitted(&s_native_owner,&s_native_thread,0);
+}
+#include "rsx_live_draw_native_image.inc"
+
+
+
 static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
 {
     if (!g.guest_ptr) return NULL;
@@ -1773,7 +1842,7 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
  * -----------------------------------------------------------------------*/
 static void ld_flush(ld_flush_reason reason)
 {
-    if(!g.ready || g.fence_value>=UINT64_MAX-1) {g.ready=0;return;}
+    if(!g.ready || g.fence_value>=UINT64_MAX-1) {g.ready=0;ld_owner_failed_boundary();return;}
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG flush_begin = ld_profile_qpc();
     g_ld_profile.total.flush_reason[reason]++;
@@ -1788,7 +1857,7 @@ static void ld_flush(ld_flush_reason reason)
                 (unsigned long)close_hr, g_ld_frames);
         ld_dump_dred("Close", close_hr);
         g.ready = 0;
-        return;
+        ld_owner_failed_boundary();return;
     }
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
@@ -1801,7 +1870,7 @@ static void ld_flush(ld_flush_reason reason)
                 (unsigned long)signal_hr, g_ld_frames);
         ld_dump_dred("Signal", signal_hr);
         g.ready = 0;
-        return;
+        ld_owner_failed_boundary();return;
     }
 #if defined(YZ_PERF_PROFILE)
         const LONGLONG wait_begin = ld_profile_qpc();
@@ -1810,7 +1879,7 @@ static void ld_flush(ld_flush_reason reason)
         HRESULT removed=g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
         fprintf(stderr,"[d3d-fail] checked fence incomplete value=%llu frame=%u removed=0x%08lX\n",
                 (unsigned long long)v,g_ld_frames,(unsigned long)removed);
-        ld_dump_dred("checked fence",removed);g.ready=0;return;
+        ld_dump_dred("checked fence",removed);g.ready=0;ld_owner_failed_boundary();return;
     }
 #if defined(YZ_PERF_PROFILE)
         const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
@@ -1829,7 +1898,7 @@ static void ld_flush(ld_flush_reason reason)
     if(SUCCEEDED(reset_hr))reset_hr=g.list->lpVtbl->Reset(g.list,g.alloc,NULL);
     if(FAILED(reset_hr)) {
         fprintf(stderr,"[d3d-fail] post-completion Reset hr=0x%08lX frame=%u\n",(unsigned long)reset_hr,g_ld_frames);
-        ld_dump_dred("Reset",reset_hr);g.ready=0;return;
+        ld_dump_dred("Reset",reset_hr);g.ready=0;ld_owner_failed_boundary();return;
     }
     g.upload_used = 0;
 #if defined(YZ_PERF_PROFILE)
@@ -1847,60 +1916,80 @@ static void ld_flush(ld_flush_reason reason)
  * at the call site by RSX_FENCE_SYNC. */
 void rsx_live_draw_flush(void)
 {
-    if (g.ready) ld_flush(LD_FLUSH_GUEST_REFERENCE);
+    if(!ld_owner_original_begin())return;
+    const u64 previous=g.fence_value;
+    if(g.ready)ld_flush(LD_FLUSH_GUEST_REFERENCE);
+    const int clean=g.ready && g.fence_value>previous && !g.rsx.in_begin_end;
+    if(ld_native_owner_enabled() && clean)rsx_owner_submitted(&s_native_owner,&s_native_thread,1);
+    ld_owner_original_finish(clean);
 }
-int rsx_live_draw_checked_ready(void) { return g.ready && rsx_picture_ready(); }
+int rsx_live_draw_checked_ready(void) {
+    if(!ld_owner_read_begin())return 0;
+    int result=g.ready && rsx_picture_ready();ld_owner_original_finish(1);return result;
+}
 int rsx_live_draw_flush_checked(void)
 {
-    if(!g.ready || !rsx_picture_ready() || g.rsx.in_begin_end) return 0;
+    if(!ld_owner_original_begin())return 0;
+    if(!g.ready || !rsx_picture_ready() || g.rsx.in_begin_end){ld_owner_original_finish(0);return 0;}
+    const u64 previous=g.fence_value;
     ld_flush(LD_FLUSH_GUEST_REFERENCE);
-    return g.ready && rsx_picture_ready();
+    const int clean=g.ready && rsx_picture_ready() && g.fence_value>previous;
+    if(ld_native_owner_enabled() && clean)rsx_owner_submitted(&s_native_owner,&s_native_thread,1);
+    ld_owner_original_finish(clean);return clean;
 }
-
-/* Not reset with g: a new D3D device/fence must never validate an old ticket. */
-static u64 s_report_lifetime;
-static int (*s_report_barrier)(void);
-static void (*s_report_lease_begin)(void);
-static void (*s_report_lease_end)(void);
 
 uint64_t rsx_live_draw_report_batch_lifetime(void)
 {
-    return rsx_live_draw_checked_ready() ? s_report_lifetime : 0;
+    if(!ld_owner_read_begin())return 0;
+    const uint64_t result=rsx_live_draw_checked_ready()?s_report_lifetime:0;
+    ld_owner_original_finish(1);return result;
 }
 int rsx_live_draw_report_batch_admit(uint64_t lifetime)
 {
-    return lifetime && lifetime == rsx_live_draw_report_batch_lifetime() &&
-        !g.rsx.in_begin_end;
+    if(!ld_owner_read_begin())return 0;
+    const int result=lifetime && lifetime==rsx_live_draw_report_batch_lifetime() && !g.rsx.in_begin_end;
+    ld_owner_original_finish(1);return result;
 }
 uint64_t rsx_live_draw_report_batch_issue(uint64_t lifetime)
 {
-    if (!rsx_live_draw_report_batch_admit(lifetime)) return 0;
-    const u64 previous = g.fence_value;
-    if (!rsx_live_draw_flush_checked() || g.fence_value <= previous) return 0;
-    return g.fence_value;
+    if(!ld_owner_read_begin())return 0;
+    uint64_t result=0;
+    if(rsx_live_draw_report_batch_admit(lifetime)){
+        const u64 previous=g.fence_value;
+        if(rsx_live_draw_flush_checked() && g.fence_value>previous)result=g.fence_value;
+    }
+    ld_owner_original_finish(1);return result;
 }
-int rsx_live_draw_report_batch_status(uint64_t lifetime, uint64_t fence, int wait)
+int rsx_live_draw_report_batch_status(uint64_t lifetime,uint64_t fence,int wait)
 {
     (void)wait; /* Issue already performed the original synchronous checked wait. */
-    if (!lifetime || lifetime != rsx_live_draw_report_batch_lifetime() ||
-        !fence || fence > g.fence_value || !g.fence || !g.dev)
-        return -1;
-    const u64 completed = g.fence->lpVtbl->GetCompletedValue(g.fence);
-    if (completed == UINT64_MAX || completed < fence ||
-        g.dev->lpVtbl->GetDeviceRemovedReason(g.dev) != S_OK)
-        return -1;
-    return 1;
+    if(!ld_owner_read_begin())return -1;
+    int result=-1;
+    if(lifetime && lifetime==rsx_live_draw_report_batch_lifetime() && fence &&
+       fence<=g.fence_value && g.fence && g.dev){
+        const u64 completed=g.fence->lpVtbl->GetCompletedValue(g.fence);
+        if(completed!=UINT64_MAX && completed>=fence &&
+           g.dev->lpVtbl->GetDeviceRemovedReason(g.dev)==S_OK)result=1;
+    }
+    ld_owner_original_finish(1);return result;
 }
-void rsx_live_draw_set_report_barrier(int (*barrier)(void))
+static void ld_owner_set_report_barrier_body(int (*barrier)(void))
 { s_report_barrier = barrier; }
-int rsx_live_draw_set_report_lease(void (*begin)(void), void (*end)(void))
+static int ld_owner_set_report_lease_body(void (*begin)(void), void (*end)(void))
 {
     if ((begin == NULL) != (end == NULL)) return 0;
+    AcquireSRWLockExclusive(&s_owner_consumer_config);
     s_report_lease_begin = begin; s_report_lease_end = end;
+    ReleaseSRWLockExclusive(&s_owner_consumer_config);
     return 1;
 }
 static int ld_report_effect_begin(void)
 {
+    if(ld_native_owner_enabled()){
+        if(!ld_owner_original_begin())return 0;
+        if(s_report_barrier && !s_report_barrier()){ld_owner_original_finish(0);return 0;}
+        rsx_owner_dirty(&s_native_owner,&s_native_thread);return 1;
+    }
     if (s_report_lease_begin) s_report_lease_begin();
     if (s_report_barrier && !s_report_barrier()) {
         if (s_report_lease_end) s_report_lease_end();
@@ -1909,7 +1998,7 @@ static int ld_report_effect_begin(void)
     return 1;
 }
 static void ld_report_effect_end(void)
-{ if (s_report_lease_end) s_report_lease_end(); }
+{ if(ld_native_owner_enabled())ld_owner_original_finish(0);else if(s_report_lease_end)s_report_lease_end(); }
 
 static int retire_texture(ID3D12Resource* tex)
 {
@@ -2108,7 +2197,7 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     return tex;
 }
 
@@ -2167,7 +2256,7 @@ static ID3D12Resource* create_texture_cube(
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     return tex;
 }
 
@@ -3014,7 +3103,7 @@ static ID3D12Resource* decode_vertex_texture(
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+        ld_native_resource_barriers(1, &b);
         if (out_hash) *out_hash = hash;
     }
     return tex;
@@ -3198,6 +3287,9 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     for (u32 j = 0; j < LD_SWIN_PER; j++)   /* windows are sized and typed for the old resource */
         if (s->swin[j].tex) { retire_texture(s->swin[j].tex); s->swin[j].tex = NULL; }
     s->tex = replacement;
+    s->native_generation=ld_native_new_generation();s->native_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
+    s->native_state_known=1;s->native_clear_planes=0;s->native_aa_grid=0;
+    ld_native_image_gc();
     s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
     s->fmt = want_fmt;
 #if !defined(YZ_PERF_CLEAN)
@@ -3324,7 +3416,7 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
         b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+        ld_native_resource_barriers(2, b);
         D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
         dst.pResource = s->swin[k].tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         src.pResource = s->tex;         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3334,7 +3426,7 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
         b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+        ld_native_resource_barriers(2, b);
         s->swin[k].wgen = s->swin_wgen;
         if ((++g_ld_swin_copies & 0x3FFFu) == 1u)
             fprintf(stderr, "[swin] copies=%llu frame=%u\n", (unsigned long long)g_ld_swin_copies, g_ld_frames);
@@ -3421,13 +3513,13 @@ static u32 surface_feedback_srv(u32 slot)
     b[1].Transition.pResource = s->fb_tex;
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g.list->lpVtbl->ResourceBarrier(g.list, fresh ? 1 : 2, b);
+    ld_native_resource_barriers(fresh ? 1 : 2, b);
     g.list->lpVtbl->CopyResource(g.list, s->fb_tex, s->tex);
     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_native_resource_barriers(2, b);
     return SRV_FEEDBACK_BASE + slot;
 }
 
@@ -3607,7 +3699,7 @@ static int ld_downsample(u32 si, u32 sx, u32 sy, u32 k,
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + di);
     g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
@@ -3625,7 +3717,7 @@ static int ld_downsample(u32 si, u32 sx, u32 sy, u32 k,
     g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     return 1;
 }
 
@@ -3744,7 +3836,7 @@ static int ld_scaled_blit(u32 si, float sx, float sy, float sw, float sh,
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + di);
     g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
@@ -3765,7 +3857,7 @@ static int ld_scaled_blit(u32 si, float sx, float sy, float sw, float sh,
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     ld_surface_note_write(di, LD_SURFACE_WRITE_COPY);
     { static int n = 0; if (n++ < 4)
         fprintf(stderr, "[scaled-blit] surf %u (%.0f,%.0f %.0fx%.0f) -> surf %u (%u,%u %ux%u)\n",
@@ -3849,7 +3941,7 @@ static int ld_resolve_blit_body(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds,
     }
     b[0].Transition.pResource = s;        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[1].Transition.pResource = dst->tex; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_native_resource_barriers(2, b);
     D3D12_TEXTURE_COPY_LOCATION sl = {0}, dl = {0};
     sl.pResource = s;        sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dl.pResource = dst->tex; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3859,7 +3951,7 @@ static int ld_resolve_blit_body(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds,
         b[q].Transition.StateBefore = b[q].Transition.StateAfter;
         b[q].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_native_resource_barriers(2, b);
     ld_surface_note_write(slot, LD_SURFACE_WRITE_COPY);
     if (s_csv_file && s_csv_gate_open) {
         fprintf(s_csv_file, "#resolve,%u,%u:0x%X,%u:0x%X,%u,%u,%ux%u\n", g_ld_frames,
@@ -3917,7 +4009,7 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
     }
     b[0].Transition.pResource = src; b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[1].Transition.pResource = dst; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_native_resource_barriers(2, b);
     D3D12_TEXTURE_COPY_LOCATION s = {0}, d = {0};
     s.pResource = src; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     d.pResource = dst; d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3927,7 +4019,7 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
         b[k].Transition.StateBefore = b[k].Transition.StateAfter;
         b[k].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_native_resource_barriers(2, b);
     ld_surface_note_write((u32)di, LD_SURFACE_WRITE_COPY);
     return 1;
 }
@@ -3939,7 +4031,8 @@ static u32 current_surface(void)
     const u32 slot = surface_get(sf.color_location[0], sf.color_offset[0],
                                  sf.clip_w, sf.clip_h,
                                  ld_color_format(sf.color_format));
-    if (slot != LD_INVALID_SURFACE) g.surfaces[slot].pitch = sf.color_pitch[0];
+    if (slot != LD_INVALID_SURFACE) {g.surfaces[slot].pitch = sf.color_pitch[0];
+        g.surfaces[slot].native_aa_grid=sf.aa_sx|(sf.aa_sy<<8);g.surfaces[slot].native_source_format=sf.color_format;}
     return slot;
 }
 
@@ -4019,7 +4112,7 @@ static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
 }
 
 /* Returns DSV slot 1+i. Slot 0 is the legacy shared depth fallback. */
-static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h,u32 pitch,u32 source_format)
 {
     if (!honor_zeta_track()) return 0;
     /* The DSV must cover the complete live framebuffer/viewport it is bound
@@ -4034,6 +4127,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         zdepth_t* z = &g.zdepths[i];
         if (z->location == location && z->offset == offset) {
             if (z->w >= want_w && z->h >= want_h) {
+                z->native_pitch=pitch;z->native_source_format=source_format;
                 zdepth_grow_snapshot(i, rt_w, rt_h);
                 return 1 + i;
             }
@@ -4096,6 +4190,9 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         z->tex = NULL;
         return 0;
     }
+    z->native_generation=ld_native_new_generation();z->native_state=D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    z->native_state_known=1;z->native_clear_planes=0;z->native_pitch=pitch;z->native_source_format=source_format;
+    ld_native_image_gc();
     z->location = location;
     z->offset = offset;
     z->w = want_w;
@@ -4146,6 +4243,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         g.list, dsv_handle(1 + slot),
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
         1.0f, 0, 0, NULL);
+    z->native_clear_planes|=6u;
     z->cleared = 1;
     fprintf(stderr,
             "[zetatrack] live new #%u %u:0x%X backing=%ux%u "
@@ -4199,7 +4297,7 @@ static int zdepth_snapshot(u32 slot)
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         nbar++;
     }
-    g.list->lpVtbl->ResourceBarrier(g.list, nbar, bars);
+    ld_native_resource_barriers(nbar, bars);
 
     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
@@ -4217,7 +4315,7 @@ static int zdepth_snapshot(u32 slot)
     D3D12_RESOURCE_BARRIER uav_done = {0};
     uav_done.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     uav_done.UAV.pResource = z->snapshot;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &uav_done);
+    ld_native_resource_barriers(1, &uav_done);
 
     D3D12_RESOURCE_BARRIER done[2] = {0};
     done[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -4235,7 +4333,7 @@ static int zdepth_snapshot(u32 slot)
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     done[1].Transition.StateAfter =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, done);
+    ld_native_resource_barriers(2, done);
     z->snapshot_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     z->snapshot_valid = 1;
     z->had_write = 0;
@@ -5866,7 +5964,7 @@ typedef struct ld_stats {
 
 static ld_stats g_ld_stats;
 
-void rsx_live_draw_a010_probe_begin(void)
+static void ld_owner_a010_probe_begin_body(void)
 {
     if ((!getenv("RSX_A010_PROBE") &&
          !getenv("RSX_A010_SURFACE_DUMP")) || !g.ready)
@@ -6506,7 +6604,7 @@ static void ld_movie_capture_overlay(void)
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
     src.pResource = rt;
@@ -6522,7 +6620,7 @@ static void ld_movie_capture_overlay(void)
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
     ld_flush(LD_FLUSH_MOVIE);
 
     const SIZE_T rb_size = (SIZE_T)g.movie_overlay_pitch * g.height;
@@ -6687,7 +6785,7 @@ static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count
     g_ld_stats.packets_queued++;
 }
 
-void rsx_live_draw_set_a010_camera_matrix(const float* matrix16)
+static void ld_owner_set_a010_camera_matrix_body(const float* matrix16)
 {
     if (!matrix16) {
         InterlockedExchange(&g_ld_a010_camera_ready, 0);
@@ -7695,6 +7793,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                                       msf.clip_w, msf.clip_h,
                                       ld_color_format(msf.color_format));
             if (s == LD_INVALID_SURFACE || s == target) break;
+            g.surfaces[s].pitch=msf.color_pitch[r];
+            g.surfaces[s].native_aa_grid=msf.aa_sx|(msf.aa_sy<<8);g.surfaces[s].native_source_format=msf.color_format;
             mrt[n_mrt++] = s;
         }
     }
@@ -7708,7 +7808,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     rsx_dsp_get_surface(&g.rsx, &sf);
     rsx_dsp_get_viewport(&g.rsx, &vp);
     const u32 current_zslot = g.depth
-        ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h)
+        ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h,sf.zeta_pitch,sf.depth_format)
         : 0;
     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
@@ -8056,7 +8156,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         bar.Transition.pResource = g.surfaces[surf_used[k]].tex;
         bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
+        ld_native_resource_barriers(1, &bar);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
     D3D12_CPU_DESCRIPTOR_HANDLE dsv; int have_dsv = 0;
@@ -8070,6 +8170,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                     g.list, dsv,
                     D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                     1.0f, 0, 0, NULL);
+                z->native_clear_planes|=6u;
                 z->cleared = 1;
                 z->had_write = 0;
                 g_ld_stats.implicit_depth_clears++;
@@ -8259,7 +8360,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         bar.Transition.pResource = g.surfaces[surf_used[k]].tex;
         bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         bar.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
+        ld_native_resource_barriers(1, &bar);
     }
     /* A guest-side failure can occur before the next flip even though useful
      * orphanage draws have already reached internal world targets.  Preserve
@@ -8368,13 +8469,14 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
           if (ct < 0) ct = getenv("LD_CLEAR_TEST") ? 1 : 0;
           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
         g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, 0, NULL);
+        g.surfaces[target].native_clear_planes|=1u;
         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
     }
     if ((mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
         rsx_dsp_surface sf;
         rsx_dsp_get_surface(&g.rsx, &sf);
         const u32 zslot = zdepth_get(sf.zeta_location, sf.zeta_offset,
-                                     sf.clip_w, sf.clip_h);
+                                     sf.clip_w, sf.clip_h,sf.zeta_pitch,sf.depth_format);
         D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_handle(zslot);
         D3D12_CLEAR_FLAGS clear_flags = (D3D12_CLEAR_FLAGS)0;
         if (mask & RSX_CLEAR_DEPTH)
@@ -8398,6 +8500,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
                 clear_flags, cd, z16 ? (UINT8)0 : (UINT8)(zs & 0xFFu), 0, NULL);
         }
         if (zslot) {
+            g.zdepths[zslot - 1].native_clear_planes|=((mask&RSX_CLEAR_DEPTH)?2u:0u)|((mask&RSX_CLEAR_STENCIL)?4u:0u);
             g.zdepths[zslot - 1].cleared = 1;
             if (mask & RSX_CLEAR_DEPTH) {
                 g.zdepths[zslot - 1].had_write = 0;
@@ -8872,23 +8975,25 @@ static int ld_init_body(void* hwnd, u32 width, u32 height,
     g.enabled = 1;
     if (s_report_lifetime == UINT64_MAX) { g.ready = 0; return -1; }
     ++s_report_lifetime;
+    if(ld_native_owner_enabled() && rsx_owner_generation(&s_native_owner,&s_native_thread,s_report_lifetime)) {g.ready=0;return -1;}
+    if(ld_native_owner_enabled())s_native_shutdown_pending=0;
     return 0;
 }
 
-void rsx_live_draw_seed_registers(const u32* regs, u32 count)
+static void ld_owner_seed_registers_body(const u32* regs, u32 count)
 {
     if (g.ready) rsx_dispatch_seed_registers(&g.rsx, regs, count);
 }
-void rsx_live_draw_seed_transform_program(const u32* words, u32 count)
+static void ld_owner_seed_transform_program_body(const u32* words, u32 count)
 {
     if (g.ready) rsx_dispatch_seed_transform_program(&g.rsx, words, count);
 }
-void rsx_live_draw_seed_transform_constants(const u32* words, u32 count)
+static void ld_owner_seed_transform_constants_body(const u32* words, u32 count)
 {
     if (g.ready) rsx_dispatch_seed_transform_constants(&g.rsx, words, count);
 }
 
-void rsx_live_draw_set_display_buffer(
+static void ld_owner_set_display_buffer_body(
     u32 buffer_id, u32 location, u32 offset, u32 pitch, u32 width, u32 height)
 {
     if (buffer_id >= 8) return;
@@ -8931,7 +9036,7 @@ static void ld_method_core(u32 method,u32 arg,u32 data_ea)
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))ld_picture_resolve((m-0x1A04)/32);
 }
 void rsx_live_draw_method(u32 method,u32 arg) {rsx_live_draw_method_at(method,arg,0);}
-void rsx_live_draw_method_at(u32 method, u32 arg,u32 data_ea)
+static void ld_owner_method_at_body(u32 method, u32 arg,u32 data_ea)
 {
     /* Bounded ingress trace for the a010 live-vs-capture comparison.  Keep the
      * raw method (including its FIFO subchannel bits) visible: if an SPU-built
@@ -9075,7 +9180,7 @@ static void ld_set_movie_mode_body(int on)
 
 u32 rsx_live_draw_get_frames(void) { return g_ld_frames; }
 
-void rsx_live_draw_set_fifo_position(u32 get, u32 put)
+static void ld_owner_set_fifo_position_body(u32 get, u32 put)
 {
 #if defined(YZ_PERF_CLEAN)
     (void)get;
@@ -9086,7 +9191,7 @@ void rsx_live_draw_set_fifo_position(u32 get, u32 put)
 #endif
 }
 
-void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value)
+static void ld_owner_note_inline_transfer_body(u32 dma, u32 offset, u32 value)
 {
 #if defined(YZ_PERF_CLEAN)
     (void)dma;
@@ -9171,7 +9276,7 @@ double rsx_live_draw_get_present_fps(void)
         : 0.0;
 }
 
-void rsx_live_draw_dump_present_samples(void)
+static void ld_owner_dump_present_samples_body(void)
 {
     ld_present_measure_dump();
 }
@@ -9253,7 +9358,7 @@ static void ld_present_rgba_body(const uint8_t* rgba, u32 w, u32 h)
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
     dst.pResource = bb; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
@@ -9269,7 +9374,7 @@ static void ld_present_rgba_body(const uint8_t* rgba, u32 w, u32 h)
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     ld_flush(LD_FLUSH_MOVIE_PRESENT);
     {
@@ -9354,7 +9459,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
     src.pResource = rt; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
@@ -9368,7 +9473,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_native_resource_barriers(1, &b);
 
     ld_flush(LD_FLUSH_READBACK);                   /* copy completes on the GPU */
 
@@ -9810,7 +9915,7 @@ static void ld_present_body(u32 buffer_id)
     bar[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+    ld_native_resource_barriers(2, bar);
 
     g.list->lpVtbl->CopyResource(g.list, bb, srcimg);
 
@@ -9818,7 +9923,7 @@ static void ld_present_body(u32 buffer_id)
     bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+    ld_native_resource_barriers(2, bar);
 
     ld_flush(LD_FLUSH_PRESENT);
     {
@@ -10698,6 +10803,7 @@ static void ld_shutdown_body(void)
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    if(ld_native_owner_enabled() && s_native_owner.failed)return; /* Unknown original access retains all native objects. */
 #if defined(YZ_PERF_PROFILE)
     fprintf(stderr,
             "[rsx-perf-summary] frames=%u "
@@ -10904,6 +11010,7 @@ static void ld_shutdown_body(void)
     shader_blob_cache_release(&g.ps_blobs);
     for (u32 i = 0; i < g.n_textures; i++) if (g.textures[i].tex) g.textures[i].tex->lpVtbl->Release(g.textures[i].tex);
     for (u32 i = 0; i < g.n_vtex; i++) if (g.vtex[i].tex) g.vtex[i].tex->lpVtbl->Release(g.vtex[i].tex);
+    ld_native_image_records_clear();
     for (u32 i = 0; i < g.n_surfaces; i++) if (g.surfaces[i].tex) g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
     for (u32 i = 0; i < g.n_zdepths; i++) {
         if (g.zdepths[i].tex)
@@ -10958,6 +11065,8 @@ static void ld_shutdown_body(void)
 int rsx_live_draw_init(void* hwnd,u32 w,u32 h,rsx_live_guest_ptr_fn f,void* user)
 {
     if (!ld_report_effect_begin()) return -1;
+    if(ld_native_owner_enabled() && !g.ready &&
+       (s_native_owner.retained || (s_native_owner.failed && g.dev))){ld_report_effect_end();return -1;}
     int result=ld_init_body(hwnd,w,h,f,user);
     ld_report_effect_end(); return result;
 }
@@ -11003,7 +11112,80 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!ld_report_effect_begin()) return;
-    ld_shutdown_body(); ld_report_effect_end();
+    if(ld_native_owner_enabled()){
+        s_native_owner.closing=1;
+        s_native_shutdown_pending=g.dev!=NULL;
+        if(s_native_owner.retained || (s_native_owner.failed && g.dev)){fprintf(stderr,"[native owner] shutdown deferred: retained or failed owner\n");ld_report_effect_end();return;}
+    }
+    ld_shutdown_body();
+    if(ld_native_owner_enabled() && !g.dev)s_native_shutdown_pending=0;
+    ld_report_effect_end();
+}
+
+/* All direct generated-import mutation routes use this temporary owner gate.
+ * Internal calls recurse only through the original TLS scope, never native. */
+void rsx_live_draw_seed_registers(const u32* v,u32 n){if(!ld_owner_original_begin())return;ld_owner_seed_registers_body(v,n);ld_owner_original_finish(0);}
+void rsx_live_draw_seed_transform_program(const u32* v,u32 n){if(!ld_owner_original_begin())return;ld_owner_seed_transform_program_body(v,n);ld_owner_original_finish(0);}
+void rsx_live_draw_seed_transform_constants(const u32* v,u32 n){if(!ld_owner_original_begin())return;ld_owner_seed_transform_constants_body(v,n);ld_owner_original_finish(0);}
+void rsx_live_draw_set_display_buffer(u32 a,u32 b,u32 c,u32 d,u32 e,u32 f){if(!ld_owner_original_begin())return;ld_owner_set_display_buffer_body(a,b,c,d,e,f);ld_owner_original_finish(0);}
+void rsx_live_draw_method_at(u32 a,u32 b,u32 c){if(!ld_owner_original_begin())return;ld_owner_method_at_body(a,b,c);ld_owner_original_finish(0);}
+void rsx_live_draw_set_fifo_position(u32 a,u32 b){if(!ld_owner_original_begin())return;ld_owner_set_fifo_position_body(a,b);ld_owner_original_finish(0);}
+void rsx_live_draw_note_inline_transfer(u32 a,u32 b,u32 c){if(!ld_owner_original_begin())return;ld_owner_note_inline_transfer_body(a,b,c);ld_owner_original_finish(0);}
+void rsx_live_draw_a010_probe_begin(void){if(!ld_owner_original_begin())return;ld_owner_a010_probe_begin_body();ld_owner_original_finish(0);}
+void rsx_live_draw_set_a010_camera_matrix(const float* v){if(!ld_owner_original_begin())return;ld_owner_set_a010_camera_matrix_body(v);ld_owner_original_finish(0);}
+void rsx_live_draw_dump_present_samples(void){if(!ld_owner_original_begin())return;ld_owner_dump_present_samples_body();ld_owner_original_finish(0);}
+void rsx_live_draw_set_report_barrier(int(*barrier)(void)){if(!ld_owner_original_begin())return;ld_owner_set_report_barrier_body(barrier);ld_owner_original_finish(0);}
+int rsx_live_draw_set_report_lease(void(*begin)(void),void(*end)(void)){
+    if(!ld_owner_original_begin())return 0;int result=ld_owner_set_report_lease_body(begin,end);ld_owner_original_finish(0);return result;
+}
+static int ld_borrowed_retain(void *user,uint64_t lifetime) {
+    return user==&s_native_owner?rsx_owner_retain(&s_native_owner,&s_native_thread,lifetime):-3;
+}
+static void ld_borrowed_release(void *user,uint64_t lifetime) {
+    if(user==&s_native_owner && rsx_owner_release(&s_native_owner,&s_native_thread,lifetime))
+        fprintf(stderr,"[native owner] invalid/reentrant release refused\n");
+}
+static int ld_borrowed_begin(void *user,uint64_t lifetime) {
+    if(user!=&s_native_owner)return -3;
+    int status=rsx_owner_native_begin(&s_native_owner,&s_native_thread,lifetime);
+    if(status)return status;
+    if(!g.ready || !g.dev || !g.queue || g.dev->lpVtbl->GetDeviceRemovedReason(g.dev)!=S_OK){
+        s_native_owner.failed=1;rsx_owner_native_end(&s_native_owner,&s_native_thread);return -6;}
+    return 0;
+}
+static void ld_borrowed_end(void *user,uint64_t lifetime) {
+    if(user==&s_native_owner && s_native_thread.gate==&s_native_owner &&
+       s_native_thread.native && lifetime==s_native_owner.generation)
+        rsx_owner_native_end(&s_native_owner,&s_native_thread);
+}
+int rsx_live_draw_owner_shutdown_requested(uint64_t lifetime) {
+    if(!ld_native_owner_enabled())return -2;
+    if(!ld_owner_read_begin())return -4;
+    const int result=lifetime && lifetime==s_native_owner.generation?s_native_shutdown_pending:-3;
+    ld_owner_original_finish(1);return result;
+}
+int rsx_live_draw_owner_retry_shutdown(uint64_t lifetime) {
+    if(!ld_native_owner_enabled())return -2;
+    if(!ld_owner_read_begin())return -4;
+    int status=0;
+    if(!lifetime || lifetime!=s_native_owner.generation)status=-3;
+    else if(!s_native_shutdown_pending)status=0;
+    else if(s_native_owner.retained)status=-4;
+    else if(s_native_owner.failed && g.dev)status=-6;
+    else if(s_report_barrier && !s_report_barrier())status=-6;
+    else {ld_shutdown_body();status=g.dev?-6:1;if(status==1)s_native_shutdown_pending=0;}
+    ld_owner_original_finish(status==1?0:1);return status;
+}
+int rsx_live_draw_borrow_owner(rsx_live_draw_owner *out) {
+    if(!out || out->struct_size!=sizeof(*out) || out->abi_version!=RSX_LIVE_DRAW_OWNER_ABI)return -1;
+    if(!ld_native_owner_enabled())return -2;
+    if(s_native_thread.gate || !TryAcquireSRWLockExclusive(&s_native_owner.lock))return -4;
+    int status=0;
+    if(!g.ready || !g.dev || !g.queue || !s_native_owner.generation || s_native_owner.closing)status=-3;
+    else if(s_native_owner.failed)status=-6;
+    else *out=(rsx_live_draw_owner){sizeof(*out),RSX_LIVE_DRAW_OWNER_ABI,s_native_owner.generation,
+        g.dev,g.queue,&s_native_owner,ld_borrowed_retain,ld_borrowed_release,ld_borrowed_begin,ld_borrowed_end};
+    ReleaseSRWLockExclusive(&s_native_owner.lock);return status;
 }
 
 #endif /* _WIN32 */

@@ -35,6 +35,7 @@
 #endif
 
 #include "win32_compat.h"
+#include "../diagnostics/original_work_threads.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -556,7 +557,7 @@ static HANDLE create_thread(SIZE_T stack, PS3_THREAD_FN fn, unsigned (*fn_crt)(v
         if (sz < (size_t)PTHREAD_STACK_MIN) sz = ((size_t)PTHREAD_STACK_MIN + page - 1) & ~(page - 1);
         pthread_attr_setstacksize(&attr, sz);
     }
-    int rc = pthread_create(&t->pt, &attr, thread_trampoline, t);
+    int rc = ps3_original_pthread_create(&t->pt, &attr, thread_trampoline, t);
     pthread_attr_destroy(&attr);
     if (rc != 0) {
         /* Through the release path: the record is already in the thread table

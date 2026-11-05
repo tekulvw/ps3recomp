@@ -20,6 +20,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Options
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
+option(PS3RECOMP_ORIGINAL_OBSERVER "Compile diagnostic source-qualified original execution witnesses" OFF)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -48,7 +49,7 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
 option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
-list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_(vulkan_backend|frontend_vulkan)\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
     if(WIN32 OR APPLE)
         message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
@@ -60,6 +61,7 @@ if(PS3RECOMP_RSX_VULKAN)
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
     endif()
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_frontend_vulkan.c")
     # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
 endif()
@@ -69,6 +71,7 @@ endif()
 if(APPLE)
     enable_language(OBJC)
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_frontend_metal.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_macos.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc/osk_macos.m")
 endif()
@@ -108,6 +111,10 @@ add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
 )
+if(PS3RECOMP_ORIGINAL_OBSERVER)
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_ORIGINAL_OBSERVER=1)
+    target_include_directories(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/diagnostics")
+endif()
 
 target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_CRITICAL_WRITE_AVAILABLE=1)
 
@@ -187,6 +194,7 @@ if(APPLE)
     )
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_frontend_metal.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_macos.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc/osk_macos.m"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")

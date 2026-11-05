@@ -27,6 +27,9 @@ def emit_connected(lifter, header_name, preamble):
         raise ValueError('connected regions require exact body-span guards')
     groups=plan_regions(lifter.functions,lifter.region_bytes)
     lines=[preamble.format(header_name=header_name),'#include "spu_verified_overlay.h"','']
+    if lifter.observe_original_work:
+        from spu_lifter import ORIGINAL_OBSERVER_PREAMBLE
+        lines.append(ORIGINAL_OBSERVER_PREAMBLE)
     records=[];entries=[];region_count=0
     def gate(f):
         return f'spu_verified_code_enter_span(ctx, {lifter.verified_code_image}, 0x{f.start_addr:X}u, 0x{f.end_addr:X}u)'
@@ -36,7 +39,7 @@ def emit_connected(lifter, header_name, preamble):
         if not first.region_eligible:
             lines.append(f'void {first.name}(spu_context* ctx) {{')
             lines.append(f'    if (!{gate(first)}) {{ {reject(f"0x{first.start_addr:X}u")} }}')
-            lines.extend('    '+b for b in first.body_lines)
+            lines.extend('    '+b.replace('PS3_ORIGINAL_LIFTED','PS3_ORIGINAL_REGION') for b in first.body_lines)
             lines.append('}')
             entries.append((first.start_addr,first.name))
             records.append({'start':first.start_addr,'end':first.end_addr,'kind':'legacy-sensitive-or-unsupported','entries':[first.start_addr]})
@@ -53,7 +56,7 @@ def emit_connected(lifter, header_name, preamble):
                 return (f'ctx->pc = 0x{target:X}u; '
                         f'if (spu_region_local_step(ctx, {m[2]})) goto region_enter_{target:08X}; '
                         f'g_spu_trampoline_fn = {m[2]}; return;')
-            return jump.sub(replace,text).replace("goto loc_", "goto region_pc_")
+            return jump.sub(replace,text).replace("goto loc_", "goto region_pc_").replace('PS3_ORIGINAL_LIFTED','PS3_ORIGINAL_REGION')
         lines.append(f'static void {region}(spu_context* ctx, uint32_t entry) {{')
         lines.append('    switch (entry) {')
         region_entries=[]
