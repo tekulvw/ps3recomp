@@ -30,6 +30,7 @@ void vm_write32(uint32_t a,uint32_t v){(void)a;(void)v;assert(!"fixture cannot p
 void ps3_ms(const char* key){(void)key;assert(!"fixture issues no guest draws/flips");}
 unsigned long long ps3_ms_now(void){assert(!"fixture has no guest notification clock");return 0;}
 void cellGcm_replay_display_buffers_to_engine(void){}
+u32 cellGcm_flip_request_count(void){return 0;}
 rsx_frontend_device* rsx_frontend_vulkan_create(const rsx_frontend_vulkan_owner* owner){(void)owner;assert(!"legacy frontend must not be created");return NULL;}
 void rsx_frontend_close(rsx_frontend_device* device){assert(!device);}
 
