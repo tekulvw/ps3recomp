@@ -12,6 +12,7 @@
  *   test_fs_aio [DIR]     (DIR: where the file goes; default the temp dir)
  */
 #include "ppu_fs.cpp"
+#include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
 #include <thread>
 #include <vector>
 

@@ -22,6 +22,7 @@
  */
 #include "ppu_fs.cpp"
 #include "../../../libs/filesystem/edat.c"
+#include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
 
 /* ---- link stubs: nothing on the paths this test drives calls them ---- */
 extern "C" {
