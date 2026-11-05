@@ -37,6 +37,7 @@
 #include "../diagnostics/ppu_call_span.h"
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
+#define PPU_NO_INLINE_STORES  /* likewise for the inline stores (tools/ppu_header_inline.py) */
 #include "ppu_recomp.h"
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
@@ -1802,6 +1803,27 @@ static struct VmInlineInit {
         vm_inline_ok = !d;
     }
 } s_vm_inline_init;
+
+/* Inline guest stores (vm_write*_inl, in a generated header given them by
+ * tools/ppu_header_inline.py --stores) skip the out-of-line stores' probes, so
+ * they run only while no store diagnostic is armed; the header also checks the
+ * dynamic watches below and the coherence bitmap itself, and falls back to the
+ * out-of-line store for everything else. */
+extern "C" int vm_inline_store_ok = 0;
+#if defined(PS3RECOMP_CRITICAL_WRITE_AVAILABLE) || defined(PS3_CRITICAL_WRITE_IMPLEMENTATION)
+extern "C" const uint64_t* const g_vm_critical_range = &ps3_critical_watch_range;
+#else
+static const uint64_t s_vm_no_critical_range = 0;
+extern "C" const uint64_t* const g_vm_critical_range = &s_vm_no_critical_range;
+#endif
+static struct VmInlineStoreInit {
+    VmInlineStoreInit() {
+        static const char* const vars[] = { "PPU_WVAL", "PPU_WWATCH", "PPU_WWATCH_DYNAMIC", "PT", 0 };
+        int d = 0;
+        for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
+        vm_inline_store_ok = !d;
+    }
+} s_vm_inline_store_init;
 
 /* PS3RECOMP_VM_FAST_ACCESSORS (CMake option, default OFF): the out-of-line
  * guest accessors below start with a fast path that does the plain big-endian
