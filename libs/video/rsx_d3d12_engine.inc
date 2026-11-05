@@ -41,6 +41,7 @@
 #define ENG12_SRV_GPU_HEAP   65536
 #define ENG12_SAMP_GPU_HEAP  2048
 #define ENG12_UPLOAD_RING    (128u << 20)
+#define ENG12_ALLOCATORS     8    /* command allocators in flight for async submissions */
 #define ENG12_DEPTH_FORMAT   DXGI_FORMAT_D32_FLOAT_S8X24_UINT
 #define ENG12_DEPTH_TYPELESS DXGI_FORMAT_R32G8X24_TYPELESS
 #define ENG12_DEPTH_SRV      DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
@@ -54,13 +55,13 @@ enum {
     E12_X_PSO, E12_X_DRAW_NO_PIPELINE, E12_X_DRAW_TARGETS, E12_X_DRAW_TARGET_FORMAT,
     E12_X_DRAW_STRIDE, E12_X_DRAW_TOPOLOGY, E12_X_UPLOAD_TOO_LARGE, E12_X_WRITE_FORMAT,
     E12_X_READBACK, E12_X_DEPTH_BOUNDS_UNSUPPORTED, E12_X_SAMPLER_TABLES, E12_X_PRESENT_NONE,
-    E12_X_DEVICE, E12_X_REASONS
+    E12_X_DEVICE, E12_X_ALLOCATOR_WAIT, E12_X_ASYNC_REFUSED, E12_X_REASONS
 };
 static const char* const s_e12_reason[E12_X_REASONS] = {
     "format", "table_full", "create_failed", "compile_vs", "compile_ps", "pso",
     "draw_no_pipeline", "draw_targets", "draw_target_format", "draw_stride", "draw_topology",
     "upload_too_large", "write_format", "readback", "depth_bounds_unsupported",
-    "sampler_tables_reset", "present_none", "device" };
+    "sampler_tables_reset", "present_none", "device", "allocator_wait", "async_refused" };
 
 typedef struct {
     u8  kind, cube, rt_count, depth_bounds;
@@ -86,7 +87,9 @@ typedef struct { IUnknown* res; u64 fence; } e12_retiree;
 static struct {
     int active, ready, recording, failed;
     CRITICAL_SECTION lock;
-    ID3D12CommandAllocator* alloc;
+    /* One allocator per submission still on the GPU: a list is re-recorded
+     * into an allocator only after the fence passed its last submission. */
+    ID3D12CommandAllocator* alloc[ENG12_ALLOCATORS]; u64 alloc_fence[ENG12_ALLOCATORS]; u32 cur_alloc;
     ID3D12GraphicsCommandList* cl;
     ID3D12GraphicsCommandList1* cl1;   /* OMSetDepthBounds, when supported */
     ID3D12Fence* fence; HANDLE event; u64 fence_value;
@@ -115,7 +118,7 @@ static struct {
     struct { u64 key[RSX_BE_MAX_TEXTURES]; u32 n, base; } stab[ENG12_SAMP_GPU_HEAP / 4];
     u32 stab_n;
     u64 count[E12_X_REASONS];
-    u64 draws, presents, flushes, submits;
+    u64 draws, presents, flushes, submits, async_submits;
 } s_e12;
 static e12_obj s_e12o[ENG12_MAX_OBJ];
 
@@ -138,11 +141,39 @@ static u32 e12_slot_alloc(u8* used, u32 n)
 }
 
 /* ---- submission ----------------------------------------------------------- */
+static int e12_wait_fence(u64 v)
+{
+    if (s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence) >= v) return 0;
+    s_e12.fence->lpVtbl->SetEventOnCompletion(s_e12.fence, v, s_e12.event);
+    if (WaitForSingleObject(s_e12.event, 10000) == WAIT_OBJECT_0) return 0;
+    s_e12.failed = 1; e12_count(E12_X_DEVICE);
+    printf("[D3D12 engine] fence wait timed out (device removed 0x%08lX)\n",
+           (long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device));
+    return -1;
+}
+/* An allocator whose submissions are complete, next in turn; when every one
+ * is still in flight, wait for the oldest (counted: the GPU is that far behind). */
+static int e12_pick_allocator(void)
+{
+    const u64 done = s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence);
+    u32 oldest = 0;
+    for (u32 k = 1; k <= ENG12_ALLOCATORS; k++) {
+        const u32 i = (s_e12.cur_alloc + k) % ENG12_ALLOCATORS;
+        if (s_e12.alloc_fence[i] <= done) { s_e12.cur_alloc = i; return 0; }
+        if (s_e12.alloc_fence[i] < s_e12.alloc_fence[oldest]) oldest = i;
+    }
+    e12_count(E12_X_ALLOCATOR_WAIT);
+    if (e12_wait_fence(s_e12.alloc_fence[oldest])) return -1;
+    s_e12.cur_alloc = oldest;
+    return 0;
+}
 static int e12_begin(void)
 {
     if (s_e12.recording) return 0;
-    if (FAILED(s_e12.alloc->lpVtbl->Reset(s_e12.alloc)) ||
-        FAILED(s_e12.cl->lpVtbl->Reset(s_e12.cl, s_e12.alloc, NULL))) {
+    if (s_e12.failed || e12_pick_allocator()) return -1;
+    ID3D12CommandAllocator* a = s_e12.alloc[s_e12.cur_alloc];
+    if (FAILED(a->lpVtbl->Reset(a)) ||
+        FAILED(s_e12.cl->lpVtbl->Reset(s_e12.cl, a, NULL))) {
         s_e12.failed = 1; e12_count(E12_X_DEVICE); return -1;
     }
     ID3D12DescriptorHeap* heaps[2] = { s_e12.srv_gpu, s_e12.samp_gpu };
@@ -198,29 +229,27 @@ static void e12_drain_info_queue(void)
 }
 /* Execute what is recorded and wait for it: the engine's synchronous contract.
  * After the wait every ring restarts and every retirement is due. */
-static int e12_submit_wait(void)
+/* Execute what is recorded and signal the fence after it; returns the value
+ * that completes it, 0 on failure. The allocator stays busy until then. */
+static u64 e12_execute(void)
 {
-    int rc = 0;
     if (s_e12.recording) {
         s_e12.recording = 0;
-        if (FAILED(s_e12.cl->lpVtbl->Close(s_e12.cl))) { s_e12.failed = 1; e12_count(E12_X_DEVICE); rc = -1; }
-        else {
-            ID3D12CommandList* lists[1] = { (ID3D12CommandList*)s_e12.cl };
-            s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
-            s_e12.submits++;
-        }
+        if (FAILED(s_e12.cl->lpVtbl->Close(s_e12.cl))) { s_e12.failed = 1; e12_count(E12_X_DEVICE); return 0; }
+        ID3D12CommandList* lists[1] = { (ID3D12CommandList*)s_e12.cl };
+        s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
+        s_e12.submits++;
     }
     const u64 v = ++s_e12.fence_value;
-    if (FAILED(s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_e12.fence, v))) { s_e12.failed = 1; return -1; }
-    if (s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence) < v) {
-        s_e12.fence->lpVtbl->SetEventOnCompletion(s_e12.fence, v, s_e12.event);
-        if (WaitForSingleObject(s_e12.event, 10000) != WAIT_OBJECT_0) {
-            s_e12.failed = 1; e12_count(E12_X_DEVICE);
-            printf("[D3D12 engine] fence wait timed out (device removed 0x%08lX)\n",
-                   (long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device));
-            return -1;
-        }
-    }
+    if (FAILED(s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_e12.fence, v))) { s_e12.failed = 1; return 0; }
+    s_e12.alloc_fence[s_e12.cur_alloc] = v;
+    return v;
+}
+static int e12_submit_wait(void)
+{
+    const int rc = s_e12.failed ? -1 : 0;
+    const u64 v = e12_execute();
+    if (!v || e12_wait_fence(v)) return -1;
     e12_retire_now(v);
     e12_drain_info_queue();
     s_e12.upload_next = 0;
@@ -541,8 +570,10 @@ static int e12_init(void* user, u32 width, u32 height)
     (void)user; (void)width; (void)height;
     if (!s_d3d.device || !s_d3d.cmd_queue) return -1;
     ID3D12Device* dv = s_d3d.device;
-    if (FAILED(dv->lpVtbl->CreateCommandAllocator(dv, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&s_e12.alloc)) ||
-        FAILED(dv->lpVtbl->CreateCommandList(dv, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_e12.alloc, NULL,
+    for (u32 i = 0; i < ENG12_ALLOCATORS; i++)
+        if (FAILED(dv->lpVtbl->CreateCommandAllocator(dv, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&s_e12.alloc[i])))
+            goto fail;
+    if (FAILED(dv->lpVtbl->CreateCommandList(dv, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_e12.alloc[0], NULL,
                                              &IID_ID3D12GraphicsCommandList, (void**)&s_e12.cl)) ||
         FAILED(s_e12.cl->lpVtbl->Close(s_e12.cl)) ||
         FAILED(dv->lpVtbl->CreateFence(dv, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&s_e12.fence)))
@@ -599,7 +630,8 @@ static void e12_shutdown(void* user)
     if (s_e12.upload && s_e12.upload_ptr) s_e12.upload->lpVtbl->Unmap(s_e12.upload, 0, NULL);
     E12_REL(s_e12.upload); E12_REL(s_e12.blit_pso); E12_REL(s_e12.blit_root); E12_REL(s_e12.root);
     E12_REL(s_e12.rtv_heap); E12_REL(s_e12.dsv_heap); E12_REL(s_e12.srv_cpu); E12_REL(s_e12.srv_gpu);
-    E12_REL(s_e12.samp_gpu); E12_REL(s_e12.cl1); E12_REL(s_e12.cl); E12_REL(s_e12.alloc); E12_REL(s_e12.fence);
+    E12_REL(s_e12.samp_gpu); E12_REL(s_e12.cl1); E12_REL(s_e12.cl); E12_REL(s_e12.fence);
+    for (u32 i = 0; i < ENG12_ALLOCATORS; i++) E12_REL(s_e12.alloc[i]);
     if (s_e12.event) CloseHandle(s_e12.event);
     CRITICAL_SECTION keep = s_e12.lock; int had = s_e12.active;
     memset(&s_e12, 0, sizeof s_e12);
@@ -619,6 +651,45 @@ static int e12_submit_and_wait_checked(void* user, u32 reason)
     const int ok = e12_submit_wait() == 0 && !s_e12.failed;
     LeaveCriticalSection(&s_e12.lock);
     return ok;
+}
+
+/* Async submission: execute and return the fence value as the ticket. Upload
+ * ring, GPU descriptor tables and retired objects stay untouched until the
+ * GPU passes it (the rings restart only after a full wait), so everything the
+ * submission reads is retained until its terminal status. */
+static u64 e12_submit_async(void* user, u32 reason)
+{
+    (void)user; (void)reason;
+    EnterCriticalSection(&s_e12.lock);
+    u64 v = s_e12.failed ? 0 : e12_execute();
+    if (v) s_e12.async_submits++; else e12_count(E12_X_ASYNC_REFUSED);
+    LeaveCriticalSection(&s_e12.lock);
+    return v;
+}
+/* -1 failure or unknown ticket, 0 pending, 1 completed without device loss. */
+static int e12_completion_status(void* user, u64 ticket, int wait)
+{
+    (void)user;
+    EnterCriticalSection(&s_e12.lock);
+    const int known = ticket && ticket <= s_e12.fence_value && !s_e12.failed && s_e12.fence;
+    LeaveCriticalSection(&s_e12.lock);
+    if (!known) return -1;
+    u64 done = s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence);
+    if (done == UINT64_MAX) return -1;   /* device removed */
+    if (done < ticket) {
+        if (!wait) return 0;
+        HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!ev) return -1;
+        s_e12.fence->lpVtbl->SetEventOnCompletion(s_e12.fence, ticket, ev);
+        const DWORD r = WaitForSingleObject(ev, 10000);
+        CloseHandle(ev);
+        done = s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence);
+        if (r != WAIT_OBJECT_0 || done == UINT64_MAX || done < ticket) return -1;
+    }
+    EnterCriticalSection(&s_e12.lock);
+    e12_retire_now(done);
+    LeaveCriticalSection(&s_e12.lock);
+    return 1;
 }
 
 /* ---- backend: textures and targets ------------------------------------------- */
@@ -1217,9 +1288,10 @@ static void e12_print_stats(void)
     if (every <= 0 || s_e12.presents % (u64)every) return;
     u64 any = 0;
     for (int i = 0; i < E12_X_REASONS; i++) any += s_e12.count[i];
-    printf("[D3D12 engine] presents=%llu draws=%llu submits=%llu flushes=%llu",
+    printf("[D3D12 engine] presents=%llu draws=%llu submits=%llu flushes=%llu async=%llu",
            (unsigned long long)s_e12.presents, (unsigned long long)s_e12.draws,
-           (unsigned long long)s_e12.submits, (unsigned long long)s_e12.flushes);
+           (unsigned long long)s_e12.submits, (unsigned long long)s_e12.flushes,
+           (unsigned long long)s_e12.async_submits);
     if (any)
         for (int i = 0; i < E12_X_REASONS; i++)
             if (s_e12.count[i]) printf(" %s=%llu", s_e12_reason[i], (unsigned long long)s_e12.count[i]);
@@ -1354,6 +1426,7 @@ static const rsx_draw_backend s_d3d12_engine_backend = {
     .draw = e12_draw, .clear_color = e12_clear_color, .clear_depth_stencil = e12_clear_depth_stencil,
     .present = e12_present, .readback = e12_readback,
     .submit_and_wait_checked = e12_submit_and_wait_checked,
+    .submit_async = e12_submit_async, .completion_status = e12_completion_status,
 };
 
 /* Called from rsx_d3d12_backend_init once the device, queue and swapchain

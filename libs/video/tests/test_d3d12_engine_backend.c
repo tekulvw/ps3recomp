@@ -258,6 +258,38 @@ int main(void)
     CHECK(s_e12.retire_n == 0, "retired resources released after the fence");
     CHECK(b->submit_and_wait_checked(b->user, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "checked flush");
 
+    /* Async submission: a ticket per submission, genuine completion status,
+     * resources retained until the GPU passes it, allocators reused. */
+    CHECK(b->submit_async && b->completion_status, "async entry points present");
+    CHECK(b->completion_status(b->user, 0, 0) == -1, "ticket 0 is unknown");
+    CHECK(b->completion_status(b->user, s_e12.fence_value + 100, 0) == -1, "future ticket is unknown");
+    const float blue[4] = { 0, 0, 1, 1 };
+    b->bind_targets(b->user, &rt, 1, 0);
+    b->clear_color(b->user, rt, blue);
+    const u32 doomed = b->texture_create(b->user, RSX_BE_FMT_R8G8B8A8, 4, 4, 1, 1, identity, 0x85u);
+    b->texture_release(b->user, doomed);     /* released while the submission is pending */
+    const u64 t1 = b->submit_async(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    CHECK(t1 != 0, "async ticket");
+    CHECK(s_e12.retire_n >= 1, "released texture retained until the ticket completes");
+    CHECK(b->completion_status(b->user, t1, 1) == 1, "waited ticket completes");
+    CHECK(s_e12.retire_n == 0, "retired after completion");
+    CHECK(px(b, rt, 3, 3) == 0xFFFF0000u, "async work visible after completion");
+    u64 last = 0, first = 0; int polled_ok = 1;
+    for (int i = 0; i < 3 * ENG12_ALLOCATORS; i++) {
+        draw_full(b, pipe);
+        const u64 t = b->submit_async(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        if (!first) first = t;
+        if (!t || t <= last) polled_ok = 0;
+        const int st = b->completion_status(b->user, t, 0);
+        if (st != 0 && st != 1) polled_ok = 0;
+        last = t;
+    }
+    CHECK(polled_ok, "tickets increase and poll as pending or complete");
+    CHECK(b->completion_status(b->user, last, 1) == 1, "last of many async submissions completes");
+    CHECK(b->completion_status(b->user, first, 0) == 1, "earlier ticket complete once a later one is");
+    CHECK(s_e12.count[E12_X_ASYNC_REFUSED] == 0, "no async refusal");
+    CHECK(b->submit_and_wait_checked(b->user, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "checked flush after async");
+
     b->shutdown(b->user);
     const int verrors = validation_errors();
     CHECK(verrors == 0, "no debug-layer errors");
