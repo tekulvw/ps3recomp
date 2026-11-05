@@ -21,6 +21,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 option(PS3RECOMP_ORIGINAL_OBSERVER "Compile diagnostic source-qualified original execution witnesses" OFF)
+option(PS3RECOMP_SPU_DECODE_CACHE_HEAP "Allocate the SPU interpreter decode cache per thread on first use instead of in static TLS" OFF)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -114,6 +115,10 @@ add_library(ps3recomp_runtime STATIC
 if(PS3RECOMP_ORIGINAL_OBSERVER)
     target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_ORIGINAL_OBSERVER=1)
     target_include_directories(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/diagnostics")
+endif()
+
+if(PS3RECOMP_SPU_DECODE_CACHE_HEAP)
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_SPU_DECODE_CACHE_HEAP=1)
 endif()
 
 target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_CRITICAL_WRITE_AVAILABLE=1)

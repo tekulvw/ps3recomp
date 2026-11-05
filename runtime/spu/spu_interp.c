@@ -125,10 +125,61 @@ static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
 #else
 #  define SPU_DECODE_TLS _Thread_local
 #endif
+typedef struct { uint32_t insn, pc; spu_ins decoded; unsigned valid; } spu_dent;
+#if defined(PS3RECOMP_SPU_DECODE_CACHE_HEAP) && PS3RECOMP_SPU_DECODE_CACHE_HEAP
+/* PS3RECOMP_SPU_DECODE_CACHE_HEAP (CMake option, default OFF): the 2 MiB
+ * table is the bulk of the process's static TLS, and every host thread pays
+ * for it at creation (glibc clears the whole static TLS block, so each SPURS
+ * task thread cost a 2 MiB memset in its creator plus the page faults behind
+ * it). Here a thread allocates its table on its first interpreted
+ * instruction instead, zeroed by calloc (fresh pages for a block this size),
+ * and frees it at thread exit, so the storage is still owned by the thread
+ * and nothing is retained after it exits. Threads that never interpret pay
+ * nothing. A failed allocation decodes without the cache. */
+#  if defined(_WIN32)
+#    include <windows.h>
+static INIT_ONCE s_dcache_once = INIT_ONCE_STATIC_INIT;
+static DWORD s_dcache_key = FLS_OUT_OF_INDEXES;
+static void WINAPI spu_dcache_free(void* p) { free(p); }
+static BOOL CALLBACK spu_dcache_key_init(PINIT_ONCE o, void* a, void** c)
+{ (void)o; (void)a; (void)c; s_dcache_key = FlsAlloc(spu_dcache_free); return TRUE; }
+static void spu_dcache_own(void* p)
+{
+    InitOnceExecuteOnce(&s_dcache_once, spu_dcache_key_init, NULL, NULL);
+    if (s_dcache_key != FLS_OUT_OF_INDEXES) FlsSetValue(s_dcache_key, p);
+}
+#  else
+#    include <pthread.h>
+static pthread_once_t s_dcache_once = PTHREAD_ONCE_INIT;
+static pthread_key_t s_dcache_key;
+static int s_dcache_key_ok;
+static void spu_dcache_key_init(void) { s_dcache_key_ok = pthread_key_create(&s_dcache_key, free) == 0; }
+static void spu_dcache_own(void* p)
+{
+    pthread_once(&s_dcache_once, spu_dcache_key_init);
+    if (s_dcache_key_ok) pthread_setspecific(s_dcache_key, p);
+}
+#  endif
+static spu_dent* spu_dcache_table(void)
+{
+    static SPU_DECODE_TLS spu_dent* table;
+    static SPU_DECODE_TLS int failed;
+    if (__builtin_expect(table != NULL, 1)) return table;
+    if (failed) return NULL;
+    table = (spu_dent*)calloc(SPU_LS_SIZE / 4, sizeof(spu_dent));
+    if (!table) { failed = 1; return NULL; }
+    spu_dcache_own(table);
+    return table;
+}
+#endif
 static inline void spu_decode_cached(uint32_t insn, uint32_t pc, spu_ins* d)
 {
-    typedef struct { uint32_t insn, pc; spu_ins decoded; unsigned valid; } spu_dent;
+#if defined(PS3RECOMP_SPU_DECODE_CACHE_HEAP) && PS3RECOMP_SPU_DECODE_CACHE_HEAP
+    spu_dent* cache = spu_dcache_table();
+    if (!cache) { spu_decode1(insn, pc, d); return; }
+#else
     static SPU_DECODE_TLS spu_dent cache[SPU_LS_SIZE / 4];
+#endif
     static SPU_DECODE_TLS int enabled = -1;
     if (enabled < 0) {
         const char* e = getenv("SPU_INTERP_DECODE_CACHE");
