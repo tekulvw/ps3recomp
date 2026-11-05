@@ -28,6 +28,7 @@
 #include "spu_workload.h"
 #include "spurs_policy_service.h"
 #include "spurs_workload_flag.h"
+#include "../diagnostics/wws_census_impl.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -412,6 +413,12 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     ctx->gpr[4]._u32[2] = 0;
     ctx->gpr[4]._u32[3] = 0;
     ctx->gpr[5]._u32[0] = spurs_flag_status(spurs_ea, wid, 1); /* FLAG poll reason */
+
+    /* PS3RECOMP_WWS_CENSUS / PS3RECOMP_WWS_API: opt-in read-only observers of
+     * a job-manager policy's guest interface (diagnostics/wws_census_impl.h). */
+    { static int s_wws = -1;
+      if (s_wws < 0) s_wws = (getenv("PS3RECOMP_WWS_CENSUS") || getenv("PS3RECOMP_WWS_API")) ? 1 : 0;
+      if (s_wws) wws_census_note_run(ctx, image_id, pm_size, wkl_data, wid, spurs_ea); }
 
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;

@@ -413,7 +413,20 @@ typedef struct spu_context {
      * reservation ends on this thread. Owner thread only. */
     uint32_t coh_live_line;
     int coh_live_counted;
+    /* PS3RECOMP_WWS_API (diagnostics/wws_census_impl.h): a read-only observer
+     * of a job-manager policy context's transfers. NULL unless that opt-in
+     * census armed this context; the hooks then cost one compare. */
+    const struct spu_wws_observer* wws_observer;
 } spu_context;
+
+/* Called by spu_indirect_branch (after the pc is masked), by spu_drain_call
+ * when it returns to its return_pc, and by spu_take_interrupt once an
+ * interrupt is taken. Observation only. */
+typedef struct spu_wws_observer {
+    void (*branch)(spu_context* ctx);
+    void (*drain_return)(spu_context* ctx, uint32_t return_pc);
+    void (*irq_taken)(spu_context* ctx);
+} spu_wws_observer;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
  * base) that the HLE kernel plants as exitToKernelAddr / selectWorkloadAddr in

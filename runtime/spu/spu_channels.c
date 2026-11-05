@@ -3488,6 +3488,7 @@ void spu_indirect_branch(spu_context* ctx)
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
     spu_ibhist_note(ctx);
+    if (__builtin_expect(ctx->wws_observer != NULL, 0)) ctx->wws_observer->branch(ctx);
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first

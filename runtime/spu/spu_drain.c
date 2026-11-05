@@ -378,6 +378,7 @@ void (*spu_take_interrupt(spu_context* ctx,
     ctx->srr0 = ctx->pc;             /* resume point for iret */
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
+    if (__builtin_expect(ctx->wws_observer != NULL, 0)) ctx->wws_observer->irq_taken(ctx);
     { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
       if (s_it) { static int _n = 0; if (PS3_LOG_FIRST(_n, 200))
         fprintf(stderr, "[irq] TAKE srr0=0x%05X depth=%d r13=%08X r15=%08X\n",
@@ -573,6 +574,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
                 *tramp = 0;
                 SPU_DRAIN_POP_IRQ();
+                if (__builtin_expect(ctx->wws_observer != NULL, 0)) ctx->wws_observer->drain_return(ctx, return_pc);
                 return;
             }
             void (*fn)(spu_context*) = *tramp;
@@ -607,6 +609,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         }
         if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
             SPU_DRAIN_POP_IRQ();
+            if (__builtin_expect(ctx->wws_observer != NULL, 0)) ctx->wws_observer->drain_return(ctx, return_pc);
             return;
         }
         {
