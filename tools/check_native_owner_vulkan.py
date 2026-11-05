@@ -37,8 +37,9 @@ def main():
         environment['LD_LIBRARY_PATH']=os.pathsep.join(filter(None,[loader,environment.get('LD_LIBRARY_PATH','')]))
         # Per-operation submissions, then batched recording (PS3RECOMP_VK_BATCHED_ENGINE=1).
         # ...and batched with the pinned release that does not wait (PS3RECOMP_VK_PIN_RELEASE_NOWAIT=1).
-        for batched,nowait in (('0','0'),('1','0'),('1','1')):
-            result=subprocess.run([str(binary),str(int(args.require_hardware)),args.vendor_id,args.device_id],env=dict(environment,PS3RECOMP_VK_BATCHED_ENGINE=batched,PS3RECOMP_VK_PIN_RELEASE_NOWAIT=nowait),capture_output=True,text=True,timeout=40)
+        # ...and each engine mode with a present during a reservation deferred (PS3RECOMP_VK_DEFER_HELD_PRESENT=1).
+        for batched,nowait,defer in (('0','0','0'),('1','0','0'),('1','1','0'),('0','0','1'),('1','1','1')):
+            result=subprocess.run([str(binary),str(int(args.require_hardware)),args.vendor_id,args.device_id],env=dict(environment,PS3RECOMP_VK_BATCHED_ENGINE=batched,PS3RECOMP_VK_PIN_RELEASE_NOWAIT=nowait,PS3RECOMP_VK_DEFER_HELD_PRESENT=defer),capture_output=True,text=True,timeout=40)
             print(result.stdout,end='');print(result.stderr,end='');result.check_returncode()
             if any(m in result.stdout+result.stderr for m in('VUID-','THREADING ERROR')):raise RuntimeError('Vulkan validation rejected the fixture')
         if args.report:

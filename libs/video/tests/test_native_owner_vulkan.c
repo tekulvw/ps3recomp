@@ -150,6 +150,76 @@ static void check_pin_release_nowait(rsx_native_owner* owner){
     be->texture_release(NULL,busy_view);be->depth_target_release(NULL,busy);
     printf("pin release bounds: %d releases, %llu waited when the parking was full, all destroyed\n",N,s_pin_fallback-fallback0);
 }
+/* The offscreen target's centre pixel, bytes R,G,B,A. */
+static uint32_t offscreen_center(void){
+    vk_buffer st={0};assert(!vk_create_host_buffer(&st,4,VK_BUFFER_USAGE_TRANSFER_DST_BIT));
+    uint32_t pixel=0;assert(vulkan_owner_begin(1));const uint64_t before=s_vulkan_commits;   /* an original read, scoped */
+    assert(!vk_begin());
+    vk_barrier_image(s_vk.color.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
+    VkBufferImageCopy region={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+        .imageOffset={(int32_t)(s_vk.width/2),(int32_t)(s_vk.height/2),0},.imageExtent={1,1,1}};
+    pvkCmdCopyImageToBuffer(s_vk.cmd,s_vk.color.img,VK_IMAGE_LAYOUT_GENERAL,st.buf,1,&region);
+    VkBufferMemoryBarrier hb={.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask=VK_ACCESS_HOST_READ_BIT,.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
+        .buffer=st.buf,.offset=0,.size=VK_WHOLE_SIZE};
+    pvkCmdPipelineBarrier(s_vk.cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,NULL,1,&hb,0,NULL);
+    assert(!vk_sync());vulkan_owner_finish(vulkan_owner_boundary(before));
+    vk_invalidate(&st);memcpy(&pixel,st.ptr,4);vk_destroy_buffer(&st);
+    return pixel;
+}
+/* PS3RECOMP_VK_DEFER_HELD_PRESENT=1: a present made while a reservation holds
+ * original submissions returns without waiting for it; its capture is queued
+ * behind the held work (so it shows the frame after the native batch), the
+ * show stays pending while the hold lasts and is made by the pump after it,
+ * and a second capture during the hold supersedes the first. Off: presents
+ * never touch the deferred state. */
+static void check_deferred_present(rsx_native_owner* first){
+    const rsx_draw_backend* be=&s_vk_engine_backend;const int on=vk_defer_held_present();
+    native_job j={.order={.abi_version=RSX_NATIVE_QUEUE_ORDER_ABI,.struct_size=sizeof(j.order)}};
+    assert(rsx_vulkan_backend_queue_order(&j.order)==0);
+    uint32_t image=be->color_target_create(NULL,RSX_BE_FMT_R8G8B8A8,s_vk.width,s_vk.height,NULL,0);assert(image);
+    const float red[4]={1,0,0,1};be->clear_color(NULL,image,red);
+    assert(be->submit_and_wait_checked(NULL,RSX_BE_FLUSH_GUEST_REFERENCE)==1);rsx_draw_engine_flush();   /* a settled boundary */
+    j.image=s_eobj[image].im.img;
+    VkCommandPoolCreateInfo pci={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=s_vk.queue_family};
+    assert(pvkCreateCommandPool(s_vk.device,&pci,NULL,&j.pool)==VK_SUCCESS);
+    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=j.pool,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    assert(pvkAllocateCommandBuffers(s_vk.device,&cai,&j.cb)==VK_SUCCESS);
+    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};assert(pvkCreateFence(s_vk.device,&fci,NULL,&j.fence)==VK_SUCCESS);
+    const unsigned long long deferred=s_show.deferred,served=s_show.served,superseded=s_show.superseded;
+    assert(first->try_begin(first->userdata,first->lifetime)==0);
+    assert(j.order.reserve(j.order.userdata,j.order.lifetime,&j.token)==0&&j.token);
+    first->end(first->userdata,first->lifetime);
+    pthread_t worker;assert(pthread_create(&worker,NULL,native_worker,&j)==0);   /* green, 150 ms later */
+    const double t0=ms_now();be->present(NULL,image);const double presented=ms_now()-t0;
+    assert(presented<100.0);                                       /* never waited for the native batch */
+    pthread_mutex_lock(&s_vk.queue_mu);const int held=vk_hold_has_locked(s_vk.present_fence);pthread_mutex_unlock(&s_vk.queue_mu);
+    assert(held);                                                  /* the capture is queued behind the hold */
+    if(on){
+        assert(s_show.pending&&s_show.deferred==deferred+1&&s_show.served==served);
+        vk_show_pump();assert(s_show.pending&&s_show.served==served);           /* still held: not shown */
+        be->present(NULL,image);                                                /* a newer frame during the hold */
+        assert(s_show.pending&&s_show.deferred==deferred+2&&s_show.superseded==superseded+1);
+    }else{
+        assert(!s_show.pending&&!s_show.deferred&&!s_show.served&&!s_show.superseded);
+    }
+    pthread_join(worker,NULL);
+    assert(j.status==VK_SUCCESS&&pvkWaitForFences(s_vk.device,1,&j.fence,VK_TRUE,UINT64_MAX)==VK_SUCCESS);
+    if(on){vk_show_pump();assert(!s_show.pending&&s_show.served==served+1);}  /* shown once the hold ended */
+    else{vk_show_pump();assert(!s_show.pending&&!s_show.served);}
+    vk_fence_wait(s_vk.present_fence);
+    const uint32_t pixel=offscreen_center();
+    fflush(stdout);printf("deferred held present (%s): present returned in %.1f ms during a 150 ms hold; offscreen target %08x after the native green (R,G,B,A = 00,ff,00,ff); deferred=%llu served=%llu superseded=%llu\n",
+           on?"on":"off",presented,pixel,s_show.deferred,s_show.served,s_show.superseded);fflush(stdout);
+    assert(pixel==0xff00ff00u);                                    /* captured after the native batch */
+    /* An ordinary present (no hold) with nothing pending changes nothing. */
+    be->present(NULL,image);assert(!s_show.pending&&s_show.served==(on?served+1:0));
+    uint64_t boundary=0;assert(rsx_vulkan_backend_native_boundary(&boundary)==0&&boundary);
+    assert(first->try_begin(first->userdata,first->lifetime)==0);first->end(first->userdata,first->lifetime);
+    assert(be->submit_and_wait_checked(NULL,RSX_BE_FLUSH_GUEST_REFERENCE)==1);
+    pvkDestroyFence(s_vk.device,j.fence,NULL);pvkDestroyCommandPool(s_vk.device,j.pool,NULL);
+    be->color_target_release(NULL,image);rsx_draw_engine_flush();
+}
 int main(int argc,char** argv){
     if(argc!=4){fprintf(stderr,"usage: owner_fixture REQUIRE_HARDWARE VENDOR_ID DEVICE_ID\n");return 2;}
     int hardware=atoi(argv[1]);uint32_t vendor=(uint32_t)strtoul(argv[2],NULL,0),device=(uint32_t)strtoul(argv[3],NULL,0);
@@ -213,6 +283,7 @@ int main(int argc,char** argv){
     }
     check_pin_release_nowait(&first);
     check_queue_order(&first);
+    check_deferred_present(&first);
     void* original=first.device;rsx_vulkan_backend_shutdown();assert((void*)s_vk.device==original);
     assert(rsx_vulkan_backend_owner_shutdown_requested(first.lifetime)==1);
     assert(rsx_vulkan_backend_owner_retry_shutdown(first.lifetime)==-4);

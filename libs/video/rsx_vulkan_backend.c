@@ -2335,11 +2335,66 @@ static void vk_dump_ppm(const unsigned char* rgba)
  * image on the GPU and signals its present, and nothing waits on the CPU. A
  * ring of VK_PRESENT_SLOTS command buffers and fences keeps frames in flight;
  * a slot is reused only once its fence signalled. */
-/* A fence of the direct-present ring (see rsx_vulkan_backend_native_boundary). */
+/* PS3RECOMP_VK_DEFER_HELD_PRESENT=1 (opt-in): a direct present made while a
+ * reserved queue order holds original submissions does not wait for the
+ * reservation to end on the presenting thread -- the thread that also drains
+ * the FIFO. It is split in two:
+ *  - the capture (the flipped surface blitted into the offscreen target) is
+ *    recorded and submitted at once; vk_queue_submit queues it behind the held
+ *    work, so it still shows exactly the frame that was flipped;
+ *  - the show (acquire, blit into the swapchain image, vkQueuePresentKHR), which
+ *    cannot go to the queue before the held work does, is left pending and
+ *    made by vk_show_pump() from the host's message pump, on the same thread,
+ *    once no reservation is held.
+ * One show is pending at most: a later capture supersedes it (the offscreen
+ * target then holds the newer frame), and so does an ordinary present. The
+ * show uses its own ring of command buffers, fences and acquire semaphores.
+ * Off, nothing here runs and presents are unchanged. */
+#define VK_SHOW_SLOTS 3
+static struct {
+    int pending;                          /* present_mu */
+    u32 slot;
+    VkCommandBuffer cmds[VK_SHOW_SLOTS];
+    VkFence fences[VK_SHOW_SLOTS];
+    VkSemaphore acquire[VK_SHOW_SLOTS];
+    int busy[VK_SHOW_SLOTS];
+    unsigned long long deferred, served, superseded, failed;
+} s_show;
+static int vk_defer_held_present(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_DEFER_HELD_PRESENT"); on = e && !strcmp(e, "1"); }
+    return on;
+}
+static int vk_hold_active(void)
+{
+    pthread_mutex_lock(&s_vk.queue_mu);
+    const int active = s_hold.active;
+    pthread_mutex_unlock(&s_vk.queue_mu);
+    return active;
+}
+static void vk_show_report(void)
+{
+    const unsigned long long n = s_show.deferred;
+    if (n <= 3 || n % 600 == 0)
+        VK_LOG("deferred held present: deferred=%llu served=%llu superseded=%llu failed=%llu\n",
+               n, s_show.served, s_show.superseded, s_show.failed);
+}
+/* present_mu held: a pending show will not be made -- a newer frame takes it. */
+static void vk_show_supersede_locked(void)
+{
+    if (!s_show.pending) return;
+    s_show.pending = 0;
+    s_show.superseded++;
+}
+
+/* A fence of the direct-present ring or of the deferred show ring (see
+ * rsx_vulkan_backend_native_boundary). */
 static int vk_present_is_fence(VkFence f)
 {
     if (!f) return 0;
     for (u32 i = 0; i < VK_PRESENT_SLOTS; i++) if (s_vk.present_fences[i] == f) return 1;
+    for (u32 i = 0; i < VK_SHOW_SLOTS; i++) if (s_show.fences[i] == f) return 1;
     return 0;
 }
 static int vk_present_readback_wanted(void)
@@ -2358,6 +2413,9 @@ static void vk_present_wait_gpu(void)
     for (u32 i = 0; i < VK_PRESENT_SLOTS; i++)
         if (__atomic_load_n(&s_vk.present_busy[i], __ATOMIC_ACQUIRE) && s_vk.present_fences[i])
             vk_fence_wait(s_vk.present_fences[i]);
+    for (u32 i = 0; i < VK_SHOW_SLOTS; i++)
+        if (__atomic_load_n(&s_show.busy[i], __ATOMIC_ACQUIRE) && s_show.fences[i])
+            vk_fence_wait(s_show.fences[i]);
 }
 
 /* present_mu held: finish a read-back present -- wait for its copy, keep the
@@ -2446,9 +2504,12 @@ static void vk_record_window_blit(VkCommandBuffer cb, u32 idx)
 static void vk_present_record_end(VkCommandBuffer cb)
 {
     const u32 slot = s_vk.present_slot;
+    /* Deferred: capture now behind the held work, show from the pump. */
+    const int defer = vk_defer_held_present() && !vk_present_readback_wanted() && vk_hold_active();
+    if (vk_defer_held_present() && !defer) vk_show_supersede_locked();
     if (!vk_present_readback_wanted()) {
         u32 idx = 0;
-        int window = s_vk.windowed && s_vk.swapchain;
+        int window = s_vk.windowed && s_vk.swapchain && !defer;
         VkSemaphore acquire = VK_NULL_HANDLE;
         if (window) {
             if (!s_vk.present_acquire[slot]) {
@@ -2487,6 +2548,12 @@ static void vk_present_record_end(VkCommandBuffer cb)
         s_vk.presented++;
         s_vk.present_direct++;
         if (s_vk.fps_on) metal_frame_rate_guest(&s_vk.fps);
+        if (defer) {
+            if (s_show.pending) s_show.superseded++;
+            s_show.pending = 1;
+            s_show.deferred++;
+            vk_show_report();
+        }
         if (window) {
             VkPresentInfoKHR pi = {
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -2530,6 +2597,88 @@ static void vk_present_record_end(VkCommandBuffer cb)
     __atomic_store_n(&s_vk.present_inflight, 1, __ATOMIC_RELEASE);
     s_vk.present_order = 1;
     if (!(s_vk.present_split && s_vk.eng_active)) vk_present_complete_locked();
+}
+
+/* present_mu held: make the pending show once no reservation holds original
+ * submissions. Returns 1 when the pending show was made (or had no window to
+ * reach), 0 when it is still held or nothing was pending. */
+static int vk_show_service_locked(void)
+{
+    if (!s_show.pending || vk_hold_active()) return 0;
+    s_show.pending = 0;
+    if (!(s_vk.windowed && s_vk.swapchain)) { s_show.served++; return 1; }
+    const u32 slot = (s_show.slot + 1u) % VK_SHOW_SLOTS;
+    if (!s_show.cmds[slot]) {
+        VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                            .commandPool = s_vk.present_pool,
+                                            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        if (pvkAllocateCommandBuffers(s_vk.device, &cai, &s_show.cmds[slot]) != VK_SUCCESS ||
+            pvkCreateFence(s_vk.device, &fci, NULL, &s_show.fences[slot]) != VK_SUCCESS ||
+            pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_show.acquire[slot]) != VK_SUCCESS) {
+            VK_LOG("deferred held present: show slot %u could not be created\n", slot);
+            s_show.failed++; return 0;
+        }
+    }
+    if (s_show.busy[slot]) {
+        vk_fence_wait(s_show.fences[slot]);
+        __atomic_store_n(&s_show.busy[slot], 0, __ATOMIC_RELEASE);
+    }
+    s_show.slot = slot;
+    u32 idx = 0;
+    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+                                        s_show.acquire[slot], VK_NULL_HANDLE, &idx);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); s_show.failed++; return 0; }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        VK_LOG("vkAcquireNextImageKHR (deferred show) failed (VkResult %d)\n", (int)r); s_show.failed++; return 0;
+    }
+    VkCommandBuffer cb = s_show.cmds[slot];
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (pvkResetCommandBuffer(cb, 0) != VK_SUCCESS || pvkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) {
+        VK_LOG("deferred held present: show recording failed\n"); s_show.failed++; return 0;
+    }
+    vk_cmd_after_everything(cb);                 /* after the capture it shows */
+    vk_record_window_blit(cb, idx);
+    if (pvkEndCommandBuffer(cb) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer (deferred show) failed\n"); s_show.failed++; return 0; }
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .waitSemaphoreCount = 1, .pWaitSemaphores = &s_show.acquire[slot],
+                        .pWaitDstStageMask = &wait_stage,
+                        .commandBufferCount = 1, .pCommandBuffers = &cb,
+                        .signalSemaphoreCount = 1, .pSignalSemaphores = &s_vk.sc_done[idx] };
+    pvkResetFences(s_vk.device, 1, &s_show.fences[slot]);
+    if (vk_queue_submit(&si, s_show.fences[slot]) != VK_SUCCESS) {
+        VK_LOG("vkQueueSubmit (deferred show) failed\n"); s_show.failed++; return 0;
+    }
+    __atomic_store_n(&s_show.busy[slot], 1, __ATOMIC_RELEASE);
+    VkPresentInfoKHR pi = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
+        .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
+    };
+    r = vk_queue_present(&pi);
+    if (s_vk.fps_on && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR))
+        metal_frame_rate_presented(&s_vk.fps, vk_now_seconds());
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
+    else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR (deferred show) failed (VkResult %d)\n", (int)r);
+    s_show.served++;
+    return 1;
+}
+
+/* From the host's message pump: make a pending deferred show. Off, or with
+ * nothing pending, it returns at once. */
+static void vk_show_pump(void)
+{
+    if (!vk_defer_held_present() || !s_vk.device) return;
+    if (!__atomic_load_n(&s_show.pending, __ATOMIC_ACQUIRE)) return;
+    if (!vulkan_owner_begin(1)) return;
+    const uint64_t before = s_vulkan_commits;
+    pthread_mutex_lock(&s_vk.present_mu);
+    (void)vk_show_service_locked();
+    pthread_mutex_unlock(&s_vk.present_mu);
+    vulkan_owner_finish(vulkan_owner_boundary(before));
 }
 
 static void vk_cb_present(void* ud, u32 buffer_id)
@@ -5613,6 +5762,10 @@ static void vulkan_original_shutdown(void)
             if (s_vk.present_fences[i]) pvkDestroyFence(s_vk.device, s_vk.present_fences[i], NULL);
             if (s_vk.present_acquire[i]) pvkDestroySemaphore(s_vk.device, s_vk.present_acquire[i], NULL);
         }
+        for (u32 i = 0; i < VK_SHOW_SLOTS; i++) {
+            if (s_show.fences[i]) pvkDestroyFence(s_vk.device, s_show.fences[i], NULL);
+            if (s_show.acquire[i]) pvkDestroySemaphore(s_vk.device, s_show.acquire[i], NULL);
+        }
         if (s_vk.window_fence)  pvkDestroyFence(s_vk.device, s_vk.window_fence, NULL);
         if (s_vk.present_pool)  pvkDestroyCommandPool(s_vk.device, s_vk.present_pool, NULL);
         pvkDestroyDevice(s_vk.device, NULL);
@@ -5623,10 +5776,12 @@ static void vulkan_original_shutdown(void)
     pthread_mutex_destroy(&s_vk.queue_mu);
     pthread_mutex_destroy(&s_vk.present_mu);
     memset(&s_vk, 0, sizeof s_vk);
+    memset(&s_show, 0, sizeof s_show);
 }
 
 int rsx_vulkan_backend_pump_messages(void)
 {
+    vk_show_pump();
     if (!s_vk.windowed) return 0;
     int quit = 0;
     SDL_Event e;
