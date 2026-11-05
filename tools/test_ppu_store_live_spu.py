@@ -30,6 +30,7 @@ driver = r'''
 #include "ppu_recomp.h"
 #include "spu_coherency.h"
 #include <atomic>
+#include <initializer_list>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
