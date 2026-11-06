@@ -58,7 +58,7 @@ int rsx_d3d12_backend_borrow_owner_v2(struct rsx_native_owner_v2* out);
  * engine keeps for the guest surface; image points to rsx_native_d3d12_image,
  * retain before dereference. Native work acquires and hands back the resource
  * in its contract state: RENDER_TARGET for colour, DEPTH_WRITE for depth. */
-#define RSX_D3D12_NATIVE_IMAGE_ABI 1u   /* hosts test this to know the three functions below exist */
+#define RSX_D3D12_IMAGE_LEASE_ABI 1u   /* hosts test this to know the three functions below exist */
 struct rsx_native_image;
 int rsx_d3d12_backend_borrow_image(uint64_t owner_lifetime, uint32_t backend_surface, struct rsx_native_image* out);
 int rsx_d3d12_backend_validate_image_planes(void* user, uint64_t lifetime, uint64_t id, uint64_t generation, uint32_t required);
