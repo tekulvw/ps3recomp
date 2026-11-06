@@ -45,6 +45,12 @@ void rsx_d3d12_backend_shutdown(void);
 
 /* Process Win32 messages. Returns 0 normally, -1 if window closed. */
 int rsx_d3d12_backend_pump_messages(void);
+/* Native-owner seam of the opt-in register-file engine (PS3RECOMP_D3D12_DRAW_ENGINE=1
+ * with PS3RECOMP_RSX_NATIVE_OWNER=1), the contract of rsx_native_owner.h. -2 when the
+ * engine or the owner seam is not active. */
+struct rsx_native_owner; struct rsx_native_owner_v2;
+int rsx_d3d12_backend_borrow_owner(struct rsx_native_owner* out);
+int rsx_d3d12_backend_borrow_owner_v2(struct rsx_native_owner_v2* out);
 
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);

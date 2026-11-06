@@ -40,6 +40,11 @@ void ps3_ms(const char* key) { (void)key; }
 unsigned long long ps3_ms_now(void) { return 0; }
 struct spu_context;
 uint32_t spurs_policy_service_identity(const struct spu_context* c) { (void)c; return 0; }
+/* The owner seam takes the guest consumer lease around original work; the
+ * fixture has no guest, so the lease is a counter. */
+static int consumer_depth;
+void cellGcm_rsx_consumer_begin(void) { consumer_depth++; }
+void cellGcm_rsx_consumer_end(void) { consumer_depth--; }
 
 static int failures, checks;
 #define CHECK(v, name) do { checks++; if (!(v)) { failures++; fprintf(stderr, "FAIL %s\n", name); } \
@@ -582,6 +587,74 @@ int main(void)
     CHECK(s_e12.waits[E12_W_ENGINE_CHECKED] >= 2 && s_e12.waits[E12_W_COLOR_READBACK] > 0 &&
           s_e12.waits[E12_W_DEPTH_READBACK] > 0, "waits are counted by site");
 
+    /* Native-owner seam (PS3RECOMP_RSX_NATIVE_OWNER=1): off by default; when on,
+     * a native consumer gets the device and queue only at a clean boundary,
+     * after retain, for exactly one lease, and its own work on the queue does
+     * not disturb the engine. */
+    {
+        rsx_native_owner o; memset(&o, 0, sizeof o); o.abi_version = 1; o.struct_size = sizeof o;
+        CHECK(rsx_d3d12_backend_borrow_owner(&o) == -2, "owner seam off by default");
+        atomic_store(&s_e12_owner_setting, 1);
+        s_e12.active = 1;
+        CHECK(rsx_d3d12_backend_borrow_owner(&o) == 0 && o.backend == RSX_NATIVE_OWNER_D3D12 &&
+              o.device == (void*)s_d3d.device && o.queue == (void*)s_d3d.cmd_queue && o.lifetime != 0,
+              "borrow names the D3D12 device and queue");
+        rsx_native_owner_v2 o2; memset(&o2, 0, sizeof o2); o2.abi_version = 2; o2.struct_size = sizeof o2;
+        o2.base.abi_version = 1; o2.base.struct_size = sizeof o2.base;
+        CHECK(rsx_d3d12_backend_borrow_owner_v2(&o2) == 0 && o2.base.lifetime == o.lifetime &&
+              (o2.enabled_features & RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS) == (s_e12.depth_bounds_ok ? RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS : 0u),
+              "v2 reports the enabled depth-bounds feature");
+        CHECK(o.try_begin(o.userdata, o.lifetime) == -3, "no lease before retain");
+        CHECK(o.retain(o.userdata, o.lifetime) == 0, "retain");
+        b->bind_targets(b->user, &rt, 1, 0);
+        draw_full(b, pipe);                                    /* recorded, not submitted */
+        CHECK(o.try_begin(o.userdata, o.lifetime) == -4, "no lease while engine work is unsubmitted");
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        CHECK(consumer_depth == 0, "consumer lease balanced around original work");
+        CHECK(o.try_begin(o.userdata, o.lifetime) == 0, "lease at a clean boundary");
+        {   /* native work on the borrowed queue: its own target, list, allocator and fence */
+            ID3D12Device* dv = (ID3D12Device*)o.device; ID3D12CommandQueue* q = (ID3D12CommandQueue*)o.queue;
+            D3D12_RESOURCE_DESC td = e12_tex_desc(DXGI_FORMAT_R8G8B8A8_UNORM, 16, 16, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            ID3D12Resource* nt = e12_committed(D3D12_HEAP_TYPE_DEFAULT, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL);
+            ID3D12DescriptorHeap* nh = NULL; D3D12_DESCRIPTOR_HEAP_DESC hd; memset(&hd, 0, sizeof hd);
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 1;
+            ID3D12CommandAllocator* na = NULL; ID3D12GraphicsCommandList* nl = NULL; ID3D12Fence* nf = NULL;
+            const int made = nt && SUCCEEDED(dv->lpVtbl->CreateDescriptorHeap(dv, &hd, &IID_ID3D12DescriptorHeap, (void**)&nh)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandAllocator(dv, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&na)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandList(dv, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, na, NULL, &IID_ID3D12GraphicsCommandList, (void**)&nl)) &&
+                SUCCEEDED(dv->lpVtbl->CreateFence(dv, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&nf));
+            CHECK(made, "native resources on the borrowed device");
+            if (made) {
+                D3D12_CPU_DESCRIPTOR_HANDLE c; nh->lpVtbl->GetCPUDescriptorHandleForHeapStart(nh, &c);
+                dv->lpVtbl->CreateRenderTargetView(dv, nt, NULL, c);
+                const float green[4] = { 0, 1, 0, 1 };
+                nl->lpVtbl->ClearRenderTargetView(nl, c, green, 0, NULL);
+                nl->lpVtbl->Close(nl);
+                ID3D12CommandList* lists[1] = { (ID3D12CommandList*)nl };
+                q->lpVtbl->ExecuteCommandLists(q, 1, lists);
+                q->lpVtbl->Signal(q, nf, 1);
+            }
+            o.end(o.userdata, o.lifetime);
+            if (made) {   /* the native consumer drains its own fence before releasing its resources */
+                HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+                nf->lpVtbl->SetEventOnCompletion(nf, 1, ev); WaitForSingleObject(ev, 5000); CloseHandle(ev);
+                CHECK(nf->lpVtbl->GetCompletedValue(nf) == 1, "native submission completed");
+            }
+            if (nf) nf->lpVtbl->Release(nf); if (nl) nl->lpVtbl->Release(nl); if (na) na->lpVtbl->Release(na);
+            if (nh) nh->lpVtbl->Release(nh); if (nt) nt->lpVtbl->Release(nt);
+        }
+        CHECK(o.try_begin(o.userdata, o.lifetime) == 0, "a second lease at the same boundary");
+        o.end(o.userdata, o.lifetime);
+        b->clear_color(b->user, rt, red);
+        b->bind_targets(b->user, &rt, 1, 0);
+        draw_full(b, pipe);
+        CHECK(px(b, rt, 32, 32) != 0xFF0000FFu && !s_e12_owner.failed && !s_e12.failed, "engine continues after native leases");
+        o.release(o.userdata, o.lifetime);
+        CHECK(o.try_begin(o.userdata, o.lifetime) == -3, "release ends lease rights");
+        CHECK(s_e12_owner_stats.grants == 2 && s_e12_owner_stats.refused_dirty + s_e12_owner_stats.refused_busy >= 1,
+              "lease grants and refusals counted");
+        atomic_store(&s_e12_owner_setting, 0);
+    }
     b->shutdown(b->user);
     const int verrors = validation_errors();
     CHECK(verrors == 0, "no debug-layer errors");

@@ -34,6 +34,17 @@
  *    (default 600, 0 off) whenever any is nonzero.
  */
 
+#include "rsx_native_owner.h"
+#include "rsx_native_owner_gate.h"
+#include "rsx_original_owner.h"
+#include "rsx_commands.h"
+#include "rsx_fifo_busy.h"
+#include <limits.h>
+#include <stdatomic.h>
+void cellGcm_rsx_consumer_begin(void);
+void cellGcm_rsx_consumer_end(void);
+static void e12_owner_submitted(int ok);
+static void (*e12_owner_stats_print)(void);
 #define ENG12_MAX_OBJ        16384
 #define ENG12_RTV_HEAP       4096
 #define ENG12_DSV_HEAP       1024
@@ -333,6 +344,7 @@ static u64 e12_execute(void)
     s_e12.alloc_fence[s_e12.cur_alloc] = v;
     e12_ring_close(&s_e12.upload_ring, v);
     e12_ring_close(&s_e12.srv_ring, v);
+    e12_owner_submitted(1);
     return v;
 }
 static int e12_submit_wait(int site)
@@ -1549,6 +1561,7 @@ static void e12_print_stats(void)
             if (s_e12.count[i]) printf(" %s=%llu", s_e12_reason[i], (unsigned long long)s_e12.count[i]);
     for (int i = 0; i < E12_W_SITES; i++)
         if (s_e12.waits[i]) printf(" wait_%s=%llu", s_e12_wait_site[i], (unsigned long long)s_e12.waits[i]);
+    if (e12_owner_stats_print) e12_owner_stats_print();
     { const u64 unstored = rsx_draw_engine_depth_unstored_count();
       if (unstored) printf(" engine_depth_unstored=%llu", (unsigned long long)unstored);
       const u64 feedback = rsx_draw_engine_feedback_unserved_count();
@@ -1906,26 +1919,435 @@ static void e12_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, vo
     LeaveCriticalSection(&s_e12.lock);
 }
 
+
+/* ---- native-owner seam (PS3RECOMP_RSX_NATIVE_OWNER=1) ----------------------
+ * The same contract as the Metal and Vulkan engines: every engine operation
+ * runs as original work under the owner gate; a native consumer may take the
+ * device and queue (try_begin) only at a clean boundary, when everything the
+ * engine recorded has been submitted, and holds them through its own encode,
+ * submit and signal. The engine's own draw-engine hooks are installed when an
+ * owner is first borrowed. Off by default: then the gate is never entered. */
+static rsx_native_owner_gate s_e12_owner = RSX_NATIVE_OWNER_GATE_INIT;
+static _Thread_local rsx_native_owner_thread s_e12_owner_thread;
+static _Thread_local int s_e12_consumer;
+static u64 s_e12_lifetime, s_e12_commits;
+static unsigned s_e12_partial_primitives;
+static atomic_int s_e12_unscoped_submit;
+static struct { u64 borrows, grants, refused_dirty, refused_busy, refused_other; } s_e12_owner_stats;
+static atomic_int s_e12_owner_setting = -1;   /* read once; the fixture may set it before use */
+static int e12_owner_enabled(void)
+{
+    int value = atomic_load_explicit(&s_e12_owner_setting, memory_order_relaxed);
+    if (value < 0) {
+        const char* text = getenv("PS3RECOMP_RSX_NATIVE_OWNER"); value = text && !strcmp(text, "1"); int expected = -1;
+        if (!atomic_compare_exchange_strong_explicit(&s_e12_owner_setting, &expected, value, memory_order_relaxed, memory_order_relaxed)) value = expected;
+    }
+    return value;
+}
+static int e12_owner_begin(int dirty)
+{
+    if (!e12_owner_enabled()) return 1;
+    if (s_e12_owner_thread.native) { if (dirty) s_e12_owner.failed = 1; return 0; }
+    if (!s_e12_owner_thread.original_depth) { s_e12_consumer = 1; cellGcm_rsx_consumer_begin(); }
+    const int outer = !s_e12_owner_thread.original_depth;
+    if (outer) rsx_fifo_busy_enter(RSX_FIFO_BUSY_LEASE_WAIT);
+    const int refused = rsx_owner_original_begin(&s_e12_owner, &s_e12_owner_thread);
+    if (outer) rsx_fifo_busy_leave(RSX_FIFO_BUSY_LEASE_WAIT);
+    if (refused) { if (outer && s_e12_consumer) { s_e12_consumer = 0; cellGcm_rsx_consumer_end(); } return 0; }
+    if (dirty) rsx_owner_dirty(&s_e12_owner, &s_e12_owner_thread);
+    return 1;
+}
+static void e12_owner_finish(int preserve)
+{
+    if (!e12_owner_enabled()) return;
+    if (!preserve) rsx_owner_dirty(&s_e12_owner, &s_e12_owner_thread);
+    if (atomic_load(&s_e12_unscoped_submit)) rsx_owner_submitted(&s_e12_owner, &s_e12_owner_thread, 0);
+    const int outer = s_e12_owner_thread.original_depth == 1;
+    rsx_owner_original_end(&s_e12_owner, &s_e12_owner_thread);
+    if (outer && s_e12_consumer) { s_e12_consumer = 0; cellGcm_rsx_consumer_end(); }
+}
+/* Called by e12_execute after a real Close/Execute/Signal. */
+static void e12_owner_submitted(int ok)
+{
+    if (!e12_owner_enabled()) return;
+    if (!s_e12_owner_thread.original_depth) { atomic_store(&s_e12_unscoped_submit, 1); return; }
+    if (!ok || s_e12_commits == UINT64_MAX) rsx_owner_submitted(&s_e12_owner, &s_e12_owner_thread, 0); else ++s_e12_commits;
+}
+/* Clean when this operation submitted and nothing recorded is left behind. */
+static int e12_owner_boundary(u64 before)
+{
+    if (!e12_owner_enabled()) return 1;
+    const int clean = s_e12_commits > before && !s_e12_partial_primitives && !s_e12.recording &&
+                      !s_e12_owner.failed && !s_e12.failed;
+    if (clean) rsx_owner_submitted(&s_e12_owner, &s_e12_owner_thread, 1);
+    return clean;
+}
+static int e12_owner_common_begin(void* user, uint32_t flags)
+{
+    (void)user; if (!e12_owner_begin((flags & RSX_ORIGINAL_MUTATE) != 0)) return 0;
+    if ((flags & RSX_ORIGINAL_LIFECYCLE_BIT) && s_e12_owner.retained) { e12_owner_finish(0); return 0; }
+    return 1;
+}
+static void e12_owner_common_end(void* user, uint32_t flags, int delta, int preserve)
+{
+    (void)user;
+    if (flags & RSX_ORIGINAL_FAILURE_BIT) rsx_owner_submitted(&s_e12_owner, &s_e12_owner_thread, 0);
+    if (delta > 0) { if (s_e12_partial_primitives == UINT_MAX) rsx_owner_submitted(&s_e12_owner, &s_e12_owner_thread, 0); else ++s_e12_partial_primitives; }
+    else if (delta < 0) { if (!s_e12_partial_primitives) rsx_owner_submitted(&s_e12_owner, &s_e12_owner_thread, 0); else --s_e12_partial_primitives; }
+    e12_owner_finish(preserve && !s_e12_partial_primitives);
+}
+static const rsx_original_owner_hooks s_e12_original_hooks = { NULL, e12_owner_common_begin, e12_owner_common_end };
+static int e12_borrow_retain(void* user, uint64_t life)
+{ return user == &s_e12_owner ? rsx_owner_retain(&s_e12_owner, &s_e12_owner_thread, life) : -3; }
+static void e12_borrow_release(void* user, uint64_t life)
+{ if (user == &s_e12_owner) (void)rsx_owner_release(&s_e12_owner, &s_e12_owner_thread, life); }
+static int e12_borrow_begin(void* user, uint64_t life)
+{
+    if (user != &s_e12_owner) return -3;
+    int status = rsx_owner_native_begin(&s_e12_owner, &s_e12_owner_thread, life);
+    if (status) {
+        if (status == -4) s_e12_owner_stats.refused_dirty++; else s_e12_owner_stats.refused_other++;
+        return status;
+    }
+    if (!s_e12.ready || s_e12.failed || !s_d3d.device || !s_d3d.cmd_queue || atomic_load(&s_e12_unscoped_submit)) {
+        s_e12_owner.failed = 1; rsx_owner_native_end(&s_e12_owner, &s_e12_owner_thread);
+        s_e12_owner_stats.refused_other++; return -6;
+    }
+    if (s_e12_partial_primitives || s_e12.recording) {
+        rsx_owner_native_end(&s_e12_owner, &s_e12_owner_thread); s_e12_owner_stats.refused_busy++; return -4;
+    }
+    s_e12_owner_stats.grants++;
+    return 0;
+}
+static void e12_borrow_end(void* user, uint64_t life)
+{
+    if (user == &s_e12_owner && s_e12_owner_thread.gate == &s_e12_owner && s_e12_owner_thread.native && life == s_e12_owner.generation)
+        rsx_owner_native_end(&s_e12_owner, &s_e12_owner_thread);
+}
+static int e12_borrow_owner(rsx_native_owner* out, rsx_native_owner_v2* extended)
+{
+    if (!out || out->abi_version != 1 || out->struct_size != sizeof(*out)) return -1;
+    if (!e12_owner_enabled() || !s_e12.active) return -2;
+    if (s_e12_owner_thread.gate || !rsx_owner_lock_try(&s_e12_owner.lock)) return -4;
+    int status = 0;
+    if (!s_e12.ready || !s_d3d.device || !s_d3d.cmd_queue || s_e12_owner.closing) status = -3;
+    else if (s_e12_owner.failed || s_e12.failed || atomic_load(&s_e12_unscoped_submit)) status = -6;
+    else {
+        if (!s_e12_owner.generation) { if (s_e12_lifetime == UINT64_MAX) status = -6; else s_e12_owner.generation = ++s_e12_lifetime; }
+        if (!status) {
+            rsx_draw_engine_set_owner_hooks(&s_e12_original_hooks);
+            rsx_commands_set_owner_hooks(&s_e12_original_hooks);
+            *out = (rsx_native_owner){ .abi_version = 1, .struct_size = sizeof(*out), .backend = RSX_NATIVE_OWNER_D3D12,
+                .lifetime = s_e12_owner.generation, .device = (void*)s_d3d.device, .queue = (void*)s_d3d.cmd_queue,
+                .userdata = &s_e12_owner, .retain = e12_borrow_retain, .release = e12_borrow_release,
+                .try_begin = e12_borrow_begin, .end = e12_borrow_end };
+            s_e12_owner_stats.borrows++;
+        }
+    }
+    if (!status && extended) {
+        extended->base = *out;
+        extended->known_features = RSX_NATIVE_OWNER_FEATURE_BC | RSX_NATIVE_OWNER_FEATURE_ANISOTROPY | RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS;
+        /* D3D12 feature level 11 always has BC and anisotropy; depth bounds is the device check at init. */
+        extended->enabled_features = RSX_NATIVE_OWNER_FEATURE_BC | RSX_NATIVE_OWNER_FEATURE_ANISOTROPY |
+                                     (s_e12.depth_bounds_ok ? RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS : 0);
+    }
+    rsx_owner_lock_release(&s_e12_owner.lock);
+    return status;
+}
+static void e12_owner_print(void)
+{
+    if (!e12_owner_enabled()) return;
+    printf(" owner_borrows=%llu owner_grants=%llu owner_refused_dirty=%llu owner_refused_busy=%llu owner_refused_other=%llu owner_failed=%d",
+           (unsigned long long)s_e12_owner_stats.borrows, (unsigned long long)s_e12_owner_stats.grants,
+           (unsigned long long)s_e12_owner_stats.refused_dirty, (unsigned long long)s_e12_owner_stats.refused_busy,
+           (unsigned long long)s_e12_owner_stats.refused_other, s_e12_owner.failed);
+}
+int rsx_d3d12_backend_borrow_owner(rsx_native_owner* out) { e12_owner_stats_print = e12_owner_print; return e12_borrow_owner(out, NULL); }
+int rsx_d3d12_backend_borrow_owner_v2(rsx_native_owner_v2* out)
+{
+    if (!out || out->abi_version != 2 || out->struct_size != sizeof(*out)) return -1;
+    e12_owner_stats_print = e12_owner_print;
+    return e12_borrow_owner(&out->base, out);
+}
+
+static void owner_e12_submit_and_wait(void* user, u32 reason)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_submit_and_wait(user, reason);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static u32 owner_e12_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h, u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
+{
+    if (!e12_owner_begin(1)) return 0;
+    const u64 before = s_e12_commits;
+    const u32 r = e12_texture_create(user, fmt, w, h, mips, faces, remap, rsx_fmt);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static void owner_e12_texture_upload(void* user, u32 texture, u32 face, u32 mip, u32 w, u32 h, const void* src, u32 row_bytes, u32 rows)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_texture_upload(user, texture, face, mip, w, h, src, row_bytes, rows);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_texture_release(void* user, u32 texture)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_texture_release(user, texture);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static u32 owner_e12_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h, const void* seed, u32 seed_row_bytes)
+{
+    if (!e12_owner_begin(1)) return 0;
+    const u64 before = s_e12_commits;
+    const u32 r = e12_color_target_create(user, fmt, w, h, seed, seed_row_bytes);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static void owner_e12_color_target_release(void* user, u32 surface)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_color_target_release(user, surface);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_color_target_write(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, const void* rows, u32 row_bytes)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_color_target_write(user, surface, x, y, w, h, rows, row_bytes);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static u32 owner_e12_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
+{
+    if (!e12_owner_begin(1)) return 0;
+    const u64 before = s_e12_commits;
+    const u32 r = e12_surface_view(user, surface, remap, rsx_format);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static u32 owner_e12_depth_target_create(void* user, u32 w, u32 h)
+{
+    if (!e12_owner_begin(1)) return 0;
+    const u64 before = s_e12_commits;
+    const u32 r = e12_depth_target_create(user, w, h);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static void owner_e12_depth_target_release(void* user, u32 depth)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_depth_target_release(user, depth);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static u32 owner_e12_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+{
+    if (!e12_owner_begin(1)) return 0;
+    const u64 before = s_e12_commits;
+    const u32 r = e12_depth_snapshot(user, depth, w, h);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static u32 owner_e12_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl, const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout, u32 stride, rsx_be_format rt_fmt, u32 rt_count)
+{
+    if (!e12_owner_begin(1)) return 0;
+    const u64 before = s_e12_commits;
+    const u32 r = e12_pipeline_create(user, vs_hlsl, ps_hlsl, rs, layout, stride, rt_fmt, rt_count);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static void owner_e12_pipeline_release(void* user, u32 pipeline)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_pipeline_release(user, pipeline);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_bind_targets(void* user, const u32* surfaces, u32 count, u32 depth)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_bind_targets(user, surfaces, count, depth);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_bind_pipeline(void* user, u32 pipeline)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_bind_pipeline(user, pipeline);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_bind_vs_constants(void* user, const void* data, u32 bytes)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_bind_vs_constants(user, data, bytes);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_bind_ps_constants(void* user, const void* data, u32 bytes)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_bind_ps_constants(user, data, bytes);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_bind_textures(void* user, const u32* textures, const rsx_be_sampler_desc* samplers, u32 mask)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_bind_textures(user, textures, samplers, mask);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_bind_vertex_textures(void* user, const u32* textures, const rsx_be_sampler_desc* samplers, u32 mask)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_bind_vertex_textures(user, textures, samplers, mask);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_set_viewport(void* user, float x, float y, float w, float h)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_set_viewport(user, x, y, w, h);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_set_scissor(user, x, y, w, h);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_set_stencil_ref(void* user, u32 ref)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_set_stencil_ref(user, ref);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_set_depth_bounds(void* user, float mn, float mx)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_set_depth_bounds(user, mn, mx);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count, u32 stride, const u32* indices, u32 index_count)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_draw(user, topology, vertices, vertex_count, stride, indices, index_count);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_clear_color(void* user, u32 surface, const float rgba[4])
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_clear_color(user, surface, rgba);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_clear_depth_stencil(void* user, u32 depth, u32 flags, float depth_value, u8 stencil)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_clear_depth_stencil(user, depth, flags, depth_value, stencil);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_present(void* user, u32 surface)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_present(user, surface);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static void owner_e12_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch)
+{
+    if (!e12_owner_begin(1)) return;
+    const u64 before = s_e12_commits;
+    e12_readback(user, surface, x, y, w, h, out, out_pitch);
+    e12_owner_finish(e12_owner_boundary(before));
+}
+static int owner_e12_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h, float* out, u32 out_pitch)
+{
+    if (!e12_owner_begin(1)) return -1;
+    const u64 before = s_e12_commits;
+    const int r = e12_depth_readback(user, depth, x, y, w, h, out, out_pitch);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static int owner_e12_submit_and_wait_checked(void* user, u32 reason)
+{
+    if (!e12_owner_begin(1)) return -1;
+    const u64 before = s_e12_commits;
+    const int r = e12_submit_and_wait_checked(user, reason);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static u64 owner_e12_submit_async(void* user, u32 reason)
+{
+    if (!e12_owner_begin(1)) return 0;
+    const u64 before = s_e12_commits;
+    const u64 r = e12_submit_async(user, reason);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static int owner_e12_completion_status(void* user, u64 ticket, int wait)
+{
+    if (!e12_owner_begin(0)) return -1;
+    const u64 before = s_e12_commits;
+    const int r = e12_completion_status(user, ticket, wait);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static u32 owner_e12_color_snapshot(void* user, u32 surface)
+{
+    if (!e12_owner_begin(1)) return 0;
+    const u64 before = s_e12_commits;
+    const u32 r = e12_color_snapshot(user, surface);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static int owner_e12_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32 dst_pitch)
+{
+    if (!e12_owner_begin(1)) return -1;
+    const u64 before = s_e12_commits;
+    const int r = e12_depth_store_z24(user, depth, w, h, dst, dst_pitch);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
+static u32 owner_e12_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt)
+{
+    if (!e12_owner_begin(1)) return 0;
+    const u64 before = s_e12_commits;
+    const u32 r = e12_depth_z24_view(user, depth, w, h, remap, rsx_fmt);
+    e12_owner_finish(e12_owner_boundary(before));
+    return r;
+}
 static const rsx_draw_backend s_d3d12_engine_backend = {
     .user = NULL,
-    .init = e12_init, .shutdown = e12_shutdown, .submit_and_wait = e12_submit_and_wait,
-    .texture_create = e12_texture_create, .texture_upload = e12_texture_upload, .texture_release = e12_texture_release,
-    .color_target_create = e12_color_target_create, .color_target_release = e12_color_target_release,
-    .color_target_write = e12_color_target_write, .surface_view = e12_surface_view,
-    .depth_target_create = e12_depth_target_create, .depth_target_release = e12_depth_target_release,
-    .depth_snapshot = e12_depth_snapshot,
-    .pipeline_create = e12_pipeline_create, .pipeline_release = e12_pipeline_release,
-    .bind_targets = e12_bind_targets, .bind_pipeline = e12_bind_pipeline,
-    .bind_vs_constants = e12_bind_vs_constants, .bind_ps_constants = e12_bind_ps_constants,
-    .bind_textures = e12_bind_textures, .bind_vertex_textures = e12_bind_vertex_textures,
-    .set_viewport = e12_set_viewport, .set_scissor = e12_set_scissor, .set_stencil_ref = e12_set_stencil_ref,
-    .set_depth_bounds = e12_set_depth_bounds,
-    .draw = e12_draw, .clear_color = e12_clear_color, .clear_depth_stencil = e12_clear_depth_stencil,
-    .present = e12_present, .readback = e12_readback, .depth_readback = e12_depth_readback,
-    .submit_and_wait_checked = e12_submit_and_wait_checked,
-    .submit_async = e12_submit_async, .completion_status = e12_completion_status,
-    .color_snapshot = e12_color_snapshot,
-    .depth_store_z24 = e12_depth_store_z24, .depth_z24_view = e12_depth_z24_view,
+    .init = e12_init, .shutdown = e12_shutdown, .submit_and_wait = owner_e12_submit_and_wait,
+    .texture_create = owner_e12_texture_create, .texture_upload = owner_e12_texture_upload, .texture_release = owner_e12_texture_release,
+    .color_target_create = owner_e12_color_target_create, .color_target_release = owner_e12_color_target_release,
+    .color_target_write = owner_e12_color_target_write, .surface_view = owner_e12_surface_view,
+    .depth_target_create = owner_e12_depth_target_create, .depth_target_release = owner_e12_depth_target_release,
+    .depth_snapshot = owner_e12_depth_snapshot,
+    .pipeline_create = owner_e12_pipeline_create, .pipeline_release = owner_e12_pipeline_release,
+    .bind_targets = owner_e12_bind_targets, .bind_pipeline = owner_e12_bind_pipeline,
+    .bind_vs_constants = owner_e12_bind_vs_constants, .bind_ps_constants = owner_e12_bind_ps_constants,
+    .bind_textures = owner_e12_bind_textures, .bind_vertex_textures = owner_e12_bind_vertex_textures,
+    .set_viewport = owner_e12_set_viewport, .set_scissor = owner_e12_set_scissor, .set_stencil_ref = owner_e12_set_stencil_ref,
+    .set_depth_bounds = owner_e12_set_depth_bounds,
+    .draw = owner_e12_draw, .clear_color = owner_e12_clear_color, .clear_depth_stencil = owner_e12_clear_depth_stencil,
+    .present = owner_e12_present, .readback = owner_e12_readback, .depth_readback = owner_e12_depth_readback,
+    .submit_and_wait_checked = owner_e12_submit_and_wait_checked,
+    .submit_async = owner_e12_submit_async, .completion_status = owner_e12_completion_status,
+    .color_snapshot = owner_e12_color_snapshot,
+    .depth_store_z24 = owner_e12_depth_store_z24, .depth_z24_view = owner_e12_depth_z24_view,
 };
 
 /* Called from rsx_d3d12_backend_init once the device, queue and swapchain

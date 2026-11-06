@@ -15,7 +15,7 @@ extern "C" {
  * Explicit shutdown retry belongs to the external host lifecycle thread after
  * successful native close, outside callbacks, and only for a pending request. */
 #define RSX_NATIVE_OWNER_ABI 1u
-enum rsx_native_owner_backend { RSX_NATIVE_OWNER_METAL=1, RSX_NATIVE_OWNER_VULKAN=2 };
+enum rsx_native_owner_backend { RSX_NATIVE_OWNER_METAL=1, RSX_NATIVE_OWNER_VULKAN=2, RSX_NATIVE_OWNER_D3D12=3 };
 typedef void (*rsx_native_proc)(void);
 typedef struct rsx_native_owner {
     uint32_t abi_version,struct_size,backend,reserved;
