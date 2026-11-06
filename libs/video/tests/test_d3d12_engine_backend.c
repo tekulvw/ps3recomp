@@ -19,6 +19,7 @@
 #endif
 #include "../rsx_d3d12_backend.c"
 #include <assert.h>
+#include <math.h>
 
 /* The fixture has no guest: none of these may be reached on its paths. */
 u8* vm_base; u32 ppu_vm_size, ppu_hle_inject_base;
@@ -368,6 +369,22 @@ int main(void)
         b->set_depth_bounds(b->user, 0.0f, 1.0f);
         draw_full(b, pbounds);
         CHECK(px(b, rt, 8, 8) != 0xFF0000FFu && px(b, rt, 56, 8) != 0xFF0000FFu, "bounds [0, 1] pass both");
+        b->clear_color(b->user, rt, red);
+        b->set_depth_bounds(b->user, NAN, 0.6f);   /* NaN opens its end: [0, 0.6] */
+        draw_full(b, pbounds);
+        CHECK(px(b, rt, 8, 8) != 0xFF0000FFu && px(b, rt, 56, 8) == 0xFF0000FFu, "NaN minimum opens the range");
+        b->clear_color(b->user, rt, red);
+        b->set_depth_bounds(b->user, 0.4f, NAN);   /* [0.4, 1] */
+        draw_full(b, pbounds);
+        CHECK(px(b, rt, 8, 8) != 0xFF0000FFu && px(b, rt, 56, 8) != 0xFF0000FFu, "NaN maximum opens the range");
+        b->clear_color(b->user, rt, red);
+        b->clear_depth_stencil(b->user, zb, RSX_BE_CLEAR_DEPTH, 1.0f, 0);   /* depth exactly 1 everywhere */
+        const u64 skipped = s_e12.bounds_empty_draws;
+        b->set_depth_bounds(b->user, 0.7f, 0.3f);  /* inverted: nothing passes, not even depth 1 */
+        draw_full(b, pbounds);
+        CHECK(px(b, rt, 8, 8) == 0xFF0000FFu && px(b, rt, 56, 8) == 0xFF0000FFu &&
+              s_e12.bounds_empty_draws == skipped + 1, "inverted range draws nothing");
+        b->set_depth_bounds(b->user, 0.0f, 1.0f);
         CHECK(s_e12.count[E12_X_DEPTH_BOUNDS_UNSUPPORTED] == 0, "no depth-bounds fallback counted");
         b->pipeline_release(b->user, pbounds);
         b->bind_targets(b->user, &rt, 1, 0);
