@@ -12,7 +12,7 @@ with tempfile.TemporaryDirectory(prefix="metal-clears-") as tmp:
     binary = pathlib.Path(tmp) / "test"
     subprocess.run(["clang", "-fobjc-arc", "-Iinclude", "-Ilibs/video",
                     "libs/video/tests/test_metal_independent_clears.m",
-                    "libs/video/rsx_texture_layout.c",'runtime/diagnostics/critical_trace.c', "-Wl,-dead_strip",
+                    "libs/video/rsx_texture_layout.c",'runtime/diagnostics/critical_trace.c', "runtime/diagnostics/render_ablation.c", "libs/video/rsx_fifo_busy.c", "-Wl,-dead_strip",
                     "-framework", "Metal", "-framework", "Cocoa",
                     "-framework", "QuartzCore", "-o", str(binary)],
                    cwd=ROOT, check=True, timeout=60)
