@@ -192,6 +192,21 @@ int main(void)
     b->clear_depth_stencil(b->user, z, RSX_BE_CLEAR_DEPTH, 1.0f, 0);
     draw_full(b, pdepth);
     CHECK(px(b, rt, 32, 32) != 0xFF0000FFu, "cleared depth accepts it");
+    /* Depth readback: the cleared 1.0 outside the draw, the draw's 0.5 inside. */
+    CHECK(b->depth_readback != NULL, "depth readback present");
+    {
+        float dv[4 * 3]; memset(dv, 0, sizeof dv);
+        CHECK(b->depth_readback(b->user, z, 30, 31, 4, 3, dv, 4 * sizeof(float)) == 0, "depth readback succeeds");
+        int all_half = 1; for (int i = 0; i < 12; i++) if (dv[i] < 0.499f || dv[i] > 0.501f) all_half = 0;
+        CHECK(all_half, "depth readback reads the drawn depth 0.5 in a sub-rectangle");
+        b->clear_depth_stencil(b->user, z, RSX_BE_CLEAR_DEPTH, 0.75f, 0);
+        float corner = 0; CHECK(b->depth_readback(b->user, z, 63, 63, 1, 1, &corner, 4) == 0 && corner == 0.75f,
+                                "depth readback sees a later clear (0.75)");
+        CHECK(b->depth_readback(b->user, z, 60, 60, 8, 8, dv, 32) != 0, "out-of-bounds depth readback refused");
+        draw_full(b, pdepth);   /* the target is still usable for depth after a readback */
+        CHECK(b->depth_readback(b->user, z, 32, 32, 1, 1, &corner, 4) == 0 && corner > 0.499f && corner < 0.501f,
+              "depth test and write still work after readback");
+    }
     const u32 snap = b->depth_snapshot(b->user, z, 64, 64);
     CHECK(snap != 0, "depth snapshot");
     b->texture_release(b->user, snap);

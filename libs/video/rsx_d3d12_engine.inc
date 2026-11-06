@@ -1407,6 +1407,47 @@ static void e12_present(void* user, u32 surface)
     e12_print_stats();
     LeaveCriticalSection(&s_e12.lock);
 }
+/* Depth back to the CPU as floats in [0, 1], for the engine's guest-memory
+ * store of a depth buffer that a texture reads in a format of its own. A
+ * depth-stencil copy must take the whole subresource, so the depth plane
+ * (plane 0, 32-bit float) is copied in full and the rectangle cut on the CPU.
+ * Waits for the GPU, as the engine's guest store requires. 0 on success. */
+static int e12_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h, float* out, u32 out_pitch)
+{
+    (void)user;
+    int rc = -1;
+    EnterCriticalSection(&s_e12.lock);
+    e12_obj* z = e12_get(depth, E12_DEPTH);
+    if (!z || !out || !w || !h || x + w > z->w || y + h > z->h || out_pitch < w * 4u || e12_begin()) {
+        e12_count(E12_X_READBACK); LeaveCriticalSection(&s_e12.lock); return -1;
+    }
+    const u32 pitch = (z->w * 4u + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    D3D12_RESOURCE_DESC b; memset(&b, 0, sizeof b);
+    b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; b.Width = (u64)pitch * z->h; b.Height = 1; b.DepthOrArraySize = 1;
+    b.MipLevels = 1; b.SampleDesc.Count = 1; b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* rb = e12_committed(D3D12_HEAP_TYPE_READBACK, &b, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
+    if (!rb) { e12_count(E12_X_READBACK); LeaveCriticalSection(&s_e12.lock); return -1; }
+    e12_transition(z, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION d, src; memset(&d, 0, sizeof d); memset(&src, 0, sizeof src);
+    src.pResource = z->res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;  /* depth plane */
+    d.pResource = rb; d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    d.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_TYPELESS; d.PlacedFootprint.Footprint.Width = z->w;
+    d.PlacedFootprint.Footprint.Height = z->h; d.PlacedFootprint.Footprint.Depth = 1; d.PlacedFootprint.Footprint.RowPitch = pitch;
+    s_e12.cl->lpVtbl->CopyTextureRegion(s_e12.cl, &d, 0, 0, 0, &src, NULL);
+    e12_transition(z, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    if (e12_submit_wait() == 0) {
+        void* p = NULL; D3D12_RANGE rr = { 0, (SIZE_T)pitch * z->h };
+        if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &p))) {
+            for (u32 r = 0; r < h; r++)
+                memcpy((u8*)out + (size_t)r * out_pitch, (u8*)p + (size_t)(y + r) * pitch + (size_t)x * 4u, (size_t)w * 4u);
+            D3D12_RANGE none = { 0, 0 }; rb->lpVtbl->Unmap(rb, 0, &none);
+            rc = 0;
+        } else e12_count(E12_X_READBACK);
+    } else e12_count(E12_X_READBACK);
+    rb->lpVtbl->Release(rb);
+    LeaveCriticalSection(&s_e12.lock);
+    return rc;
+}
 static void e12_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch)
 {
     (void)user;
@@ -1454,7 +1495,7 @@ static const rsx_draw_backend s_d3d12_engine_backend = {
     .set_viewport = e12_set_viewport, .set_scissor = e12_set_scissor, .set_stencil_ref = e12_set_stencil_ref,
     .set_depth_bounds = NULL,   /* the stream PSO for the bounds test comes with the batching step */
     .draw = e12_draw, .clear_color = e12_clear_color, .clear_depth_stencil = e12_clear_depth_stencil,
-    .present = e12_present, .readback = e12_readback,
+    .present = e12_present, .readback = e12_readback, .depth_readback = e12_depth_readback,
     .submit_and_wait_checked = e12_submit_and_wait_checked,
     .submit_async = e12_submit_async, .completion_status = e12_completion_status,
 };
