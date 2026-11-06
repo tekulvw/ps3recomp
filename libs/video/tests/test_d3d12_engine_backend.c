@@ -346,6 +346,34 @@ int main(void)
         b->depth_target_release(b->user, zz);
     }
 
+    /* Depth bounds: left half of the depth at 0.5, right half at 0.75; with
+     * bounds [0.4, 0.6] a full-screen draw only lands on the left half. */
+    {
+        CHECK(b->set_depth_bounds != NULL, "depth bounds entry point present");
+        const u32 zb = b->depth_target_create(b->user, 64, 64);
+        b->clear_depth_stencil(b->user, zb, RSX_BE_CLEAR_DEPTH, 0.75f, 0);
+        b->bind_targets(b->user, &rt, 1, zb);
+        b->set_scissor(b->user, 0, 0, 32, 64);
+        draw_full(b, pdepth);
+        b->set_scissor(b->user, 0, 0, 64, 64);
+        rsx_be_render_state rsb = plain_state(); rsb.depth_bounds_test = 1;
+        const u32 pbounds = b->pipeline_create(b->user, VS, PS, &rsb, &lay, sizeof(vtx), RSX_BE_FMT_R8G8B8A8, 1);
+        CHECK(pbounds != 0, "depth-bounds pipeline");
+        b->clear_color(b->user, rt, red);
+        b->set_depth_bounds(b->user, 0.4f, 0.6f);
+        draw_full(b, pbounds);
+        const u32 l = px(b, rt, 8, 8), r = px(b, rt, 56, 8);
+        CHECK(l != 0xFF0000FFu && r == 0xFF0000FFu, "bounds [0.4, 0.6] pass 0.5 and reject 0.75");
+        b->clear_color(b->user, rt, red);
+        b->set_depth_bounds(b->user, 0.0f, 1.0f);
+        draw_full(b, pbounds);
+        CHECK(px(b, rt, 8, 8) != 0xFF0000FFu && px(b, rt, 56, 8) != 0xFF0000FFu, "bounds [0, 1] pass both");
+        CHECK(s_e12.count[E12_X_DEPTH_BOUNDS_UNSUPPORTED] == 0, "no depth-bounds fallback counted");
+        b->pipeline_release(b->user, pbounds);
+        b->bind_targets(b->user, &rt, 1, 0);
+        b->depth_target_release(b->user, zb);
+    }
+
     /* color_target_write at an offset. */
     u8 rows[2 * 2 * 4]; for (int i = 0; i < 4; i++) { rows[4 * i] = 1; rows[4 * i + 1] = 2; rows[4 * i + 2] = 3; rows[4 * i + 3] = 4; }
     b->color_target_write(b->user, rt, 10, 20, 2, 2, rows, 8);

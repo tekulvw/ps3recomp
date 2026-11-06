@@ -612,6 +612,7 @@ static int e12_init(void* user, u32 width, u32 height)
     s_e12.null_srv2d = e12_make_srv(NULL, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     s_e12.null_srvcube = e12_make_srv(NULL, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     if (!s_e12.null_srv2d || !s_e12.null_srvcube || e12_root_signature() || e12_blit_pipeline()) goto fail;
+    s_e12.dbounds[0] = 0.0f; s_e12.dbounds[1] = 1.0f;
     s_e12.ready = 1;
     printf("[D3D12 engine] backend ready (depth bounds %s)\n", s_e12.depth_bounds_ok ? "on" : "unsupported");
     return 0;
@@ -966,6 +967,58 @@ static void e12_pipeline_release(void* user, u32 pipeline)
     if (e12_get(pipeline, E12_PIPELINE)) e12_release_obj(pipeline);
     LeaveCriticalSection(&s_e12.lock);
 }
+/* The same pipeline as a full graphics description, built as a pipeline
+ * state stream so it can carry DEPTH_STENCIL1 with the depth bounds test on.
+ * Each subobject is a type tag followed by its value, pointer-aligned. */
+#define E12_SUBOBJ(T) struct { _Alignas(void*) D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; T v; }
+static int e12_pso_with_depth_bounds(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* g, ID3D12PipelineState** out)
+{
+    ID3D12Device2* dv2 = NULL;
+    if (FAILED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device, &IID_ID3D12Device2, (void**)&dv2)) || !dv2) return -1;
+    struct {
+        E12_SUBOBJ(ID3D12RootSignature*) root;
+        E12_SUBOBJ(D3D12_SHADER_BYTECODE) vs;
+        E12_SUBOBJ(D3D12_SHADER_BYTECODE) ps;
+        E12_SUBOBJ(D3D12_BLEND_DESC) blend;
+        E12_SUBOBJ(UINT) sample_mask;
+        E12_SUBOBJ(D3D12_RASTERIZER_DESC) raster;
+        E12_SUBOBJ(D3D12_DEPTH_STENCIL_DESC1) ds;
+        E12_SUBOBJ(D3D12_INPUT_LAYOUT_DESC) il;
+        E12_SUBOBJ(D3D12_PRIMITIVE_TOPOLOGY_TYPE) topo;
+        E12_SUBOBJ(struct D3D12_RT_FORMAT_ARRAY) rtv;
+        E12_SUBOBJ(DXGI_FORMAT) dsv;
+        E12_SUBOBJ(DXGI_SAMPLE_DESC) sample;
+    } st;
+    memset(&st, 0, sizeof st);
+    st.root.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE; st.root.v = g->pRootSignature;
+    st.vs.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS; st.vs.v = g->VS;
+    st.ps.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS; st.ps.v = g->PS;
+    st.blend.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND; st.blend.v = g->BlendState;
+    st.sample_mask.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK; st.sample_mask.v = g->SampleMask;
+    st.raster.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER; st.raster.v = g->RasterizerState;
+    st.ds.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
+    st.ds.v.DepthEnable = g->DepthStencilState.DepthEnable;
+    st.ds.v.DepthWriteMask = g->DepthStencilState.DepthWriteMask;
+    st.ds.v.DepthFunc = g->DepthStencilState.DepthFunc;
+    st.ds.v.StencilEnable = g->DepthStencilState.StencilEnable;
+    st.ds.v.StencilReadMask = g->DepthStencilState.StencilReadMask;
+    st.ds.v.StencilWriteMask = g->DepthStencilState.StencilWriteMask;
+    st.ds.v.FrontFace = g->DepthStencilState.FrontFace;
+    st.ds.v.BackFace = g->DepthStencilState.BackFace;
+    st.ds.v.DepthBoundsTestEnable = TRUE;
+    st.il.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT; st.il.v = g->InputLayout;
+    st.topo.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY; st.topo.v = g->PrimitiveTopologyType;
+    st.rtv.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+    st.rtv.v.NumRenderTargets = g->NumRenderTargets;
+    for (u32 r = 0; r < 8; r++) st.rtv.v.RTFormats[r] = g->RTVFormats[r];
+    st.dsv.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT; st.dsv.v = g->DSVFormat;
+    st.sample.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC; st.sample.v = g->SampleDesc;
+    D3D12_PIPELINE_STATE_STREAM_DESC sd; sd.SizeInBytes = sizeof st; sd.pPipelineStateSubobjectStream = &st;
+    const HRESULT hr = dv2->lpVtbl->CreatePipelineState(dv2, &sd, &IID_ID3D12PipelineState, (void**)out);
+    dv2->lpVtbl->Release(dv2);
+    if (FAILED(hr)) { *out = NULL; return -1; }
+    return 0;
+}
 static ID3D12PipelineState* e12_pso(e12_obj* P, int type)
 {
     if (P->pso[type]) return P->pso[type];
@@ -1030,10 +1083,13 @@ static ID3D12PipelineState* e12_pso(e12_obj* P, int type)
     d.NumRenderTargets = P->rt_count;
     for (u32 r = 0; r < P->rt_count; r++) d.RTVFormats[r] = P->fmt;
     d.SampleDesc.Count = 1;
-    /* The depth bounds test needs the stream-based PSO (DEPTH_STENCIL1 subobject);
-     * the first cut builds the plain description, so a request is counted and
-     * the draw runs without the test. */
-    if (rs->depth_bounds_test) e12_count(E12_X_DEPTH_BOUNDS_UNSUPPORTED);
+    /* The depth bounds test is only in the stream-built description
+     * (DEPTH_STENCIL1). Without device support a request is counted and the
+     * draw runs without the test. */
+    if (rs->depth_bounds_test) {
+        if (s_e12.depth_bounds_ok && e12_pso_with_depth_bounds(&d, &P->pso[type]) == 0) return P->pso[type];
+        e12_count(E12_X_DEPTH_BOUNDS_UNSUPPORTED);
+    }
     if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &d, &IID_ID3D12PipelineState, (void**)&P->pso[type]))) {
         e12_count(E12_X_PSO);
         P->pso[type] = NULL;
@@ -1090,7 +1146,16 @@ static void e12_set_viewport(void* user, float x, float y, float w, float h)
 static void e12_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 { (void)user; s_e12.sc[0] = x; s_e12.sc[1] = y; s_e12.sc[2] = w; s_e12.sc[3] = h; s_e12.have_sc = 1; }
 static void e12_set_stencil_ref(void* user, u32 ref) { (void)user; s_e12.stencil_ref = ref; }
-static void e12_set_depth_bounds(void* user, float mn, float mx) { (void)user; s_e12.dbounds[0] = mn; s_e12.dbounds[1] = mx; }
+static void e12_set_depth_bounds(void* user, float mn, float mx)
+{
+    (void)user;
+    /* D3D12 needs 0 <= min <= max <= 1; an inverted range passes nothing on
+     * the RSX, which an empty range at max reproduces closely enough. */
+    mn = mn > 0.0f ? (mn < 1.0f ? mn : 1.0f) : 0.0f;
+    mx = mx > 0.0f ? (mx < 1.0f ? mx : 1.0f) : 0.0f;
+    if (mn > mx) mn = mx;
+    s_e12.dbounds[0] = mn; s_e12.dbounds[1] = mx;
+}
 
 /* The SRV a unit samples: a texture, a colour target, a view; else the null
  * SRV of the unit's dimension. A colour target sampled here leaves render-
@@ -1239,6 +1304,8 @@ static void e12_draw(void* user, rsx_topology topology, const void* vertices, u3
     cl->lpVtbl->OMSetRenderTargets(cl, s_e12.nrt, rtvs, FALSE, &dsv);
     cl->lpVtbl->SetGraphicsRootSignature(cl, s_e12.root);
     cl->lpVtbl->SetPipelineState(cl, pso);
+    if (P->rs.depth_bounds_test && s_e12.depth_bounds_ok && s_e12.cl1)
+        s_e12.cl1->lpVtbl->OMSetDepthBounds(s_e12.cl1, s_e12.dbounds[0], s_e12.dbounds[1]);
     cl->lpVtbl->SetGraphicsRootConstantBufferView(cl, 0, vc_va);
     cl->lpVtbl->SetGraphicsRootConstantBufferView(cl, 1, pc_va);
     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 2, t_ps);
@@ -1706,7 +1773,7 @@ static const rsx_draw_backend s_d3d12_engine_backend = {
     .bind_vs_constants = e12_bind_vs_constants, .bind_ps_constants = e12_bind_ps_constants,
     .bind_textures = e12_bind_textures, .bind_vertex_textures = e12_bind_vertex_textures,
     .set_viewport = e12_set_viewport, .set_scissor = e12_set_scissor, .set_stencil_ref = e12_set_stencil_ref,
-    .set_depth_bounds = NULL,   /* the stream PSO for the bounds test comes with the batching step */
+    .set_depth_bounds = e12_set_depth_bounds,
     .draw = e12_draw, .clear_color = e12_clear_color, .clear_depth_stencil = e12_clear_depth_stencil,
     .present = e12_present, .readback = e12_readback, .depth_readback = e12_depth_readback,
     .submit_and_wait_checked = e12_submit_and_wait_checked,
