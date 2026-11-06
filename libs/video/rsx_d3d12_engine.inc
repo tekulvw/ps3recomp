@@ -1579,7 +1579,7 @@ static int e12_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
     "cbuffer C : register(b0) { uint w; uint h; uint pad0; uint pad1; };\n" \
     "Texture2D<float> D : register(t0);\n" \
     "uint z24(float d) {\n" \
-    "  d = saturate(d); uint bits = asuint(d); uint e = bits >> 23;\n" \
+    "  d = saturate(d); uint bits = asuint(d) & 0x7FFFFFFFu; uint e = bits >> 23;\n" \
     "  if (e == 0) return 0;\n" \
     "  uint m = (bits & 0x7FFFFF) | 0x800000; int s = 150 - (int)e;\n" \
     "  if (s >= 50) return 0;\n" \
