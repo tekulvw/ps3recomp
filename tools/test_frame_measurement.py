@@ -9,7 +9,7 @@ with tempfile.TemporaryDirectory(prefix='frame-measurement-fixtures-') as tmp:
         subprocess.run([str(binary)],check=True,timeout=20)
     if platform.system()=='Darwin':
         binary=pathlib.Path(tmp)/'callbacks'
-        subprocess.run(['clang','-fobjc-arc','-DPS3RECOMP_DISABLE_NATIVE_OSK','-I','include','-I','libs/video','libs/video/tests/test_metal_frame_measurement.m','libs/video/rsx_texture_layout.c','runtime/diagnostics/critical_trace.c','runtime/diagnostics/render_ablation.c','libs/input/pad_macos.m','-Wl,-dead_strip','-framework','Metal','-framework','Cocoa','-framework','QuartzCore','-o',str(binary)],cwd=ROOT,check=True,timeout=60)
+        subprocess.run(['clang','-fobjc-arc','-DPS3RECOMP_DISABLE_NATIVE_OSK','-I','include','-I','libs/video','libs/video/tests/test_metal_frame_measurement.m','libs/video/rsx_texture_layout.c','runtime/diagnostics/critical_trace.c','libs/video/rsx_fifo_busy.c','runtime/diagnostics/render_ablation.c','libs/input/pad_macos.m','-Wl,-dead_strip','-framework','Metal','-framework','Cocoa','-framework','QuartzCore','-o',str(binary)],cwd=ROOT,check=True,timeout=60)
         completed=subprocess.run([str(binary)],timeout=20,capture_output=True,text=True)
         print(completed.stdout,end='');print(completed.stderr,end='')
         completed.check_returncode()

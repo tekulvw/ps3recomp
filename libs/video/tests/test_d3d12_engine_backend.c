@@ -19,6 +19,7 @@
 #endif
 #include "../rsx_d3d12_backend.c"
 #include <assert.h>
+#include <math.h>
 
 /* The fixture has no guest: none of these may be reached on its paths. */
 u8* vm_base; u32 ppu_vm_size, ppu_hle_inject_base;
@@ -376,6 +377,39 @@ int main(void)
             fprintf(stderr, "     z24 view %08X %08X, texture %08X %08X\n", left_v, right_v, left_r, right_r);
         CHECK(left_v == left_r && right_v == right_r && left_v != right_v, "z24 view samples like the decoded texture");
         b->texture_release(b->user, zv); b->texture_release(b->user, ref);
+        /* -0.0 (which saturate() can return) stores as 0, not as a huge
+         * exponent. A clear may normalise -0.0, so the depth plane is filled
+         * with the exact bit pattern 0x80000000 by a buffer copy. */
+        {
+            e12_obj* zo = e12_get(zz, E12_DEPTH);
+            const u32 pitch = 256;   /* 64 floats, already 256-byte aligned */
+            D3D12_RESOURCE_DESC bd; memset(&bd, 0, sizeof bd);
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (u64)pitch * 64; bd.Height = 1; bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* up = e12_committed(D3D12_HEAP_TYPE_UPLOAD, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL);
+            u32* mp = NULL; D3D12_RANGE none = { 0, 0 };
+            CHECK(zo && up && SUCCEEDED(up->lpVtbl->Map(up, 0, &none, (void**)&mp)), "negative-zero source buffer");
+            for (u32 i = 0; i < 64u * 64u; i++) mp[i] = 0x80000000u;
+            up->lpVtbl->Unmap(up, 0, NULL);
+            e12_begin();
+            e12_transition(zo, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_TEXTURE_COPY_LOCATION dl, sl; memset(&dl, 0, sizeof dl); memset(&sl, 0, sizeof sl);
+            dl.pResource = zo->res; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
+            sl.pResource = up; sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            sl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_TYPELESS; sl.PlacedFootprint.Footprint.Width = 64;
+            sl.PlacedFootprint.Footprint.Height = 64; sl.PlacedFootprint.Footprint.Depth = 1; sl.PlacedFootprint.Footprint.RowPitch = pitch;
+            s_e12.cl->lpVtbl->CopyTextureRegion(s_e12.cl, &dl, 0, 0, 0, &sl, NULL);
+            e12_transition(zo, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+            up->lpVtbl->Release(up);
+            float nz = 1.0f; u32 nzb = 0;
+            CHECK(b->depth_readback(b->user, zz, 0, 0, 1, 1, &nz, 4) == 0, "negative-zero readback");
+            memcpy(&nzb, &nz, 4);
+            CHECK(nzb == 0x80000000u, "the depth plane holds -0.0 exactly");
+        }
+        memset(words, 0xA5, 16);
+        CHECK(b->depth_store_z24(b->user, zz, 2, 2, words, 8) == 0 &&
+              !words[0] && !words[1] && !words[2] && !words[3] && !words[12] && !words[15], "-0.0 depth stores as zero");
         b->depth_target_release(b->user, zz);
     }
 
@@ -401,6 +435,22 @@ int main(void)
         b->set_depth_bounds(b->user, 0.0f, 1.0f);
         draw_full(b, pbounds);
         CHECK(px(b, rt, 8, 8) != 0xFF0000FFu && px(b, rt, 56, 8) != 0xFF0000FFu, "bounds [0, 1] pass both");
+        b->clear_color(b->user, rt, red);
+        b->set_depth_bounds(b->user, NAN, 0.6f);   /* NaN opens its end: [0, 0.6] */
+        draw_full(b, pbounds);
+        CHECK(px(b, rt, 8, 8) != 0xFF0000FFu && px(b, rt, 56, 8) == 0xFF0000FFu, "NaN minimum opens the range");
+        b->clear_color(b->user, rt, red);
+        b->set_depth_bounds(b->user, 0.4f, NAN);   /* [0.4, 1] */
+        draw_full(b, pbounds);
+        CHECK(px(b, rt, 8, 8) != 0xFF0000FFu && px(b, rt, 56, 8) != 0xFF0000FFu, "NaN maximum opens the range");
+        b->clear_color(b->user, rt, red);
+        b->clear_depth_stencil(b->user, zb, RSX_BE_CLEAR_DEPTH, 1.0f, 0);   /* depth exactly 1 everywhere */
+        const u64 skipped = s_e12.bounds_empty_draws;
+        b->set_depth_bounds(b->user, 0.7f, 0.3f);  /* inverted: nothing passes, not even depth 1 */
+        draw_full(b, pbounds);
+        CHECK(px(b, rt, 8, 8) == 0xFF0000FFu && px(b, rt, 56, 8) == 0xFF0000FFu &&
+              s_e12.bounds_empty_draws == skipped + 1, "inverted range draws nothing");
+        b->set_depth_bounds(b->user, 0.0f, 1.0f);
         CHECK(s_e12.count[E12_X_DEPTH_BOUNDS_UNSUPPORTED] == 0, "no depth-bounds fallback counted");
         b->pipeline_release(b->user, pbounds);
         b->bind_targets(b->user, &rt, 1, 0);

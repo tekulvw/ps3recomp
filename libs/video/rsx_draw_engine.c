@@ -28,6 +28,7 @@ void rsx_draw_engine_set_owner_hooks(const rsx_original_owner_hooks* hooks){
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 #include "rsx_engine_phases.h"
+#include "rsx_fifo_busy.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1650,21 +1651,27 @@ static void eng_depth_row_to_guest(u8* dst, const float* src, u32 w, u32 bpp)
  * Z16 as one big-endian 16-bit value, Z24S8 as a big-endian word with the
  * depth in the top 24 bits. The stencil byte is written as 0: the host depth
  * target keeps no stencil to copy. Returns 0 when it cannot. */
-/* A texture reads an address whose latest write was depth, but the depth
- * could not reach it: no snapshot for its format, no GPU depth view, and no
- * store into guest memory (the backend lacks depth_readback and
- * depth_store_z24, or they failed). The texture then reads guest memory as it
- * is, which can be stale. Counted, and reported once, so it is never silent. */
+/* A texture reads an address whose latest write was depth, and the depth
+ * did not reach it: there was no snapshot for its format and no GPU depth
+ * view, and the store into guest memory was impossible or failed. The texture
+ * is then served something older -- the colour surface at that address, or
+ * guest memory as it is. Counted (one count per such read), and each reason
+ * reported once, so it is never silent. */
 static _Atomic unsigned long long s_depth_unstored;
-static void eng_depth_unstored(const rsx_dsp_texture* t, u32 base_fmt)
+enum { ENG_DEPTH_NO_STORE, ENG_DEPTH_STORE_FAILED, ENG_DEPTH_UNSTORED_REASONS };
+static void eng_depth_unstored(const rsx_dsp_texture* t, u32 base_fmt, int reason, const char* served)
 {
-    if (atomic_fetch_add(&s_depth_unstored, 1) == 0)
-        fprintf(stderr, "[rsx engine] depth-sourced texture read with no depth store or view: "
-                "format 0x%02X %ux%u at %u:0x%08X reads guest memory as it is "
-                "(backend depth_readback=%d depth_store_z24=%d depth_z24_view=%d); counted\n",
-                base_fmt, t->width, t->height, t->location, t->offset,
-                g.be && g.be->depth_readback != NULL, g.be && g.be->depth_store_z24 != NULL,
-                g.be && g.be->depth_z24_view != NULL);
+    static atomic_int reported[ENG_DEPTH_UNSTORED_REASONS];
+    atomic_fetch_add(&s_depth_unstored, 1);
+    if (reason < 0 || reason >= ENG_DEPTH_UNSTORED_REASONS || atomic_exchange(&reported[reason], 1)) return;
+    fprintf(stderr, "[rsx engine] depth-sourced texture read not served from the depth: format 0x%02X %ux%u "
+            "at %u:0x%08X, %s; served %s instead (backend depth_readback=%d depth_store_z24=%d "
+            "depth_z24_view=%d); counted\n",
+            base_fmt, t->width, t->height, t->location, t->offset,
+            reason == ENG_DEPTH_NO_STORE ? "the backend has no depth store"
+                                         : "the depth store failed (report barrier, size or backend error)",
+            served, g.be && g.be->depth_readback != NULL, g.be && g.be->depth_store_z24 != NULL,
+            g.be && g.be->depth_z24_view != NULL);
 }
 u64 rsx_draw_engine_depth_unstored_count(void) { return atomic_load(&s_depth_unstored); }
 /* A texture reads a colour target the same draw renders to, and the backend
@@ -3317,6 +3324,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         /* The depth at this address, when it was written after any colour
          * there: a depth-only pass names its zeta as a colour target too. */
         int zsrc = -1;
+        int depth_unserved = -1;   /* why the depth could not serve this read, if it could not */
         for (u32 i = 0; i < g.n_zdepths; i++) {
             const eng_zdepth* z = &g.zdepths[i];
             if (z->location != t.location || z->offset != t.offset || !z->depth_serial)
@@ -3346,7 +3354,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 continue;
             }
             s_z24_stored.valid = 0;
-            eng_depth_unstored(&t, base_fmt);
+            depth_unserved = (!g.be->depth_readback && !g.be->depth_store_z24) ? ENG_DEPTH_NO_STORE
+                                                                              : ENG_DEPTH_STORE_FAILED;
         }
         if (own && zsrc < 0 && !g.be->color_snapshot) eng_feedback_unserved(&t);
         if (own && zsrc < 0 && g.be->color_snapshot) {
@@ -3393,6 +3402,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 : 0;
             textures[u] = view ? view : g.surfaces[sampled].handle;
             eng_texture_descriptor_log(u, &t, textures[u], "surface", &g.surfaces[sampled]);
+            if (depth_unserved >= 0) eng_depth_unstored(&t, base_fmt, depth_unserved, "the older colour surface");
             continue;
         }
         if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
@@ -3413,6 +3423,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                        (int)t.cubemap, t.remap & 0xFFFFu,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u, s_picture_bound[u]);
         eng_texture_descriptor_log(u, &t, textures[u], "upload", NULL);
+        if (depth_unserved >= 0) eng_depth_unstored(&t, base_fmt, depth_unserved, "guest memory as it is");
     }
     return mask;
 }
@@ -4248,9 +4259,11 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     ENG_PH_BEGIN(ph_draw);
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAW);
     draw_observer_begin();
     sink_end_core(user, r);
     draw_observer_finish();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAW);
     if (ph_draw) eng_ph_stage(NULL);
     ENG_PH_END(ENG_PH_DRAW, ph_draw);
 }
@@ -4343,7 +4356,9 @@ static void eng_present_core(u32 buffer_id);
 static void eng_present(u32 buffer_id)
 {
     ENG_PH_BEGIN(ph);
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT);
     eng_present_core(buffer_id);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT);
     ENG_PH_END(ENG_PH_PRESENT, ph);
 }
 static void eng_present_core(u32 buffer_id)
@@ -4584,8 +4599,10 @@ static void original_rsx_draw_engine_flush(void)
 {
     ENG_PH_BEGIN(ph);
     if(!eng_report_barrier())return;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_FLUSH);
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_FLUSH);
     ENG_PH_END(ENG_PH_FLUSH, ph);
 }
 
@@ -4608,7 +4625,9 @@ static u64 original_rsx_draw_engine_submit_async(void)
         eng_async_failure_witness("guard",available);return 0;
     }
     ENG_PH_BEGIN(ph);
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_FLUSH);
     u64 ticket=g.be->submit_async(g.be->user,RSX_BE_FLUSH_GUEST_REFERENCE);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_FLUSH);
     ENG_PH_END(ENG_PH_ASYNC, ph);
     if(!ticket)eng_async_failure_witness("backend",available);
     return ticket;
@@ -4633,7 +4652,9 @@ static int eng_flush_checked_core(void);
 static int original_rsx_draw_engine_flush_checked(void)
 {
     ENG_PH_BEGIN(ph);
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_FLUSH);
     const int ok = eng_flush_checked_core();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_FLUSH);
     ENG_PH_END(ENG_PH_FLUSH_CHK, ph);
     return ok;
 }
@@ -4659,7 +4680,7 @@ static void original_rsx_draw_engine_present(void)
      * present just blits the same image again. */
     if (eng_single_present() && s_flip_presented) {
         s_flip_presented = 0;
-        if (++s_single_present_skipped % 600ull == 0)
+        if (++s_single_present_skipped <= 4ull || s_single_present_skipped % 600ull == 0)
             fprintf(stderr, "[rsx engine] single present: %llu host re-presents skipped\n", s_single_present_skipped);
         return;
     }

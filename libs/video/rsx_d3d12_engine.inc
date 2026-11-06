@@ -133,7 +133,8 @@ static struct {
     u8  vsc[65536], psc[65536]; u32 vs_bytes, ps_bytes;
     u32 tex[RSX_BE_MAX_TEXTURES], vtex[ENG12_VTEX]; u32 tex_mask, vtex_mask;
     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES], vsamp[ENG12_VTEX];
-    float vp[4]; int have_vp; u32 sc[4]; int have_sc; u32 stencil_ref; float dbounds[2];
+    float vp[4]; int have_vp; u32 sc[4]; int have_sc; u32 stencil_ref; float dbounds[2]; int dbounds_empty;
+    u64 bounds_empty_draws;   /* draws an inverted depth-bounds range rejected entirely */
     int depth_bounds_ok;
     /* sampler table cache: identical tables share one range of the GPU heap */
     struct { u64 key[RSX_BE_MAX_TEXTURES]; u32 n, base; } stab[ENG12_SAMP_GPU_HEAP / 4];
@@ -505,7 +506,7 @@ static void e12_release_obj(u32 h)
 {
     if (!h || h >= ENG12_MAX_OBJ || s_e12o[h].kind == E12_FREE) return;
     e12_obj* o = &s_e12o[h];
-    if (o->kind == E12_COLOR || o->kind == E12_TEXTURE)   /* views of this target go with it */
+    if (o->kind == E12_COLOR || (o->kind == E12_TEXTURE && o->snapshot))   /* views go with their parent */
         for (u32 i = 1; i < ENG12_MAX_OBJ; i++)
             if (s_e12o[i].kind == E12_VIEW && s_e12o[i].parent == h) e12_release_obj(i);
     e12_free_slots(o);
@@ -1254,11 +1255,13 @@ static void e12_set_stencil_ref(void* user, u32 ref) { (void)user; s_e12.stencil
 static void e12_set_depth_bounds(void* user, float mn, float mx)
 {
     (void)user;
-    /* D3D12 needs 0 <= min <= max <= 1; an inverted range passes nothing on
-     * the RSX, which an empty range at max reproduces closely enough. */
-    mn = mn > 0.0f ? (mn < 1.0f ? mn : 1.0f) : 0.0f;
-    mx = mx > 0.0f ? (mx < 1.0f ? mx : 1.0f) : 0.0f;
-    if (mn > mx) mn = mx;
+    /* Clamped to [0, 1]; NaN opens its end of the range, as the Vulkan
+     * backend does. An inverted range passes nothing on the RSX, and D3D12
+     * has no empty bounds (it needs min <= max), so such draws are skipped. */
+    mn = (mn == mn) ? (mn > 0.0f ? (mn < 1.0f ? mn : 1.0f) : 0.0f) : 0.0f;
+    mx = (mx == mx) ? (mx > 0.0f ? (mx < 1.0f ? mx : 1.0f) : 0.0f) : 1.0f;
+    s_e12.dbounds_empty = mn > mx;
+    if (s_e12.dbounds_empty) mn = mx;
     s_e12.dbounds[0] = mn; s_e12.dbounds[1] = mx;
 }
 
@@ -1339,6 +1342,10 @@ static void e12_draw(void* user, rsx_topology topology, const void* vertices, u3
     EnterCriticalSection(&s_e12.lock);
     s_e12.draws++;
     e12_obj* P = e12_get(s_e12.pipeline, E12_PIPELINE);
+    if (P && P->rs.depth_bounds_test && s_e12.dbounds_empty && s_e12.depth_bounds_ok) {
+        s_e12.bounds_empty_draws++;   /* an inverted range: nothing passes, as on the RSX */
+        LeaveCriticalSection(&s_e12.lock); return;
+    }
     int type = -1;
     D3D12_PRIMITIVE_TOPOLOGY topo = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     switch (topology) {
@@ -1700,7 +1707,7 @@ static int e12_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
     "cbuffer C : register(b0) { uint w; uint h; uint pad0; uint pad1; };\n" \
     "Texture2D<float> D : register(t0);\n" \
     "uint z24(float d) {\n" \
-    "  d = saturate(d); uint bits = asuint(d); uint e = bits >> 23;\n" \
+    "  d = saturate(d); uint bits = asuint(d) & 0x7FFFFFFFu; uint e = bits >> 23;\n" \
     "  if (e == 0) return 0;\n" \
     "  uint m = (bits & 0x7FFFFF) | 0x800000; int s = 150 - (int)e;\n" \
     "  if (s >= 50) return 0;\n" \

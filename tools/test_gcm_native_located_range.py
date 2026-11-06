@@ -31,7 +31,7 @@ def run(command,timeout):
 with tempfile.TemporaryDirectory(prefix='gcm-native-located-') as tmp:
     tmp=Path(tmp);binary=tmp/('test.exe' if os.name=='nt' or args.compile_only else 'test')
     compiler=os.environ.get('CC','clang-cl' if os.name=='nt' else 'cc')
-    sources=[root/'tests/test_gcm_native_located_range.c',root/'libs/video/tests/gcm_deferred_fixture_stubs.c']
+    sources=[root/'tests/test_gcm_native_located_range.c',root/'libs/video/tests/gcm_deferred_fixture_stubs.c','libs/video/rsx_fifo_busy.c']
     isolated=os.name=='nt' or args.compile_only
     if isolated:
         text=(root/'libs/video/cellGcmSys.c').read_text()

@@ -19,7 +19,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-get-on-release-') as tmp:
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
                     str(root / 'libs/video/tests/test_gcm_get_on_release.c'),
-                    str(root / 'libs/video/tests/gcm_deferred_fixture_stubs.c'), *linker,
+                    str(root / 'libs/video/tests/gcm_deferred_fixture_stubs.c'),str(root / 'libs/video/rsx_fifo_busy.c'), *linker,
                     '-o', str(binary)], check=True)
     base = {k: v for k, v in os.environ.items() if k != 'GCM_GET_EQ_PUT'}
     for args, extra in (([], {}), (['eq-put'], {'GCM_GET_EQ_PUT': '1'})):

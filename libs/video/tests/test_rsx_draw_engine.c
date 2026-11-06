@@ -1556,7 +1556,7 @@ static void test_depth_read_without_store(void)
     const u64 before = rsx_draw_engine_depth_unstored_count();
     draw_triangle();
     CHECK(rsx_draw_engine_depth_unstored_count() == before + 1,
-          "the unserved depth read is counted (%llu)",
+          "the unserved depth read is counted once (%llu)",
           (unsigned long long)(rsx_draw_engine_depth_unstored_count() - before));
     CHECK(stub.n_depth_readback == 0, "nothing was read back (%d)", stub.n_depth_readback);
     CHECK(stub.n_draw == 2, "the draw still runs, sampling guest memory (%d)", stub.n_draw);
