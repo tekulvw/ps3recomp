@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Clock-controlled actual cellPad HLE; no live game or physical controller."""
-import argparse,json,os,pathlib,shlex,subprocess,tempfile
+import argparse,json,os,pathlib,shlex,subprocess,sys,tempfile
 r=pathlib.Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser();p.add_argument('--output-dir',type=pathlib.Path,help='keep the build here (default: a temporary directory)');a=p.parse_args()
 _scratch=None if a.output_dir else tempfile.TemporaryDirectory(prefix='pad-file-reports-')
 o=(a.output_dir or pathlib.Path(_scratch.name)).resolve();o.mkdir(parents=True,exist_ok=True)
-cmd=['cc','-std=gnu17','-O2','-UNDEBUG','-ffunction-sections','-fdata-sections','-Wl,-dead_strip','-I'+str(r/'include'),'-I'+subprocess.check_output(['sdl2-config','--prefix'],text=True).strip()+'/include',*shlex.split(subprocess.check_output(['sdl2-config','--cflags'],text=True)),str(r/'libs/input/tests/test_pad_file_reports.c'),*shlex.split(subprocess.check_output(['sdl2-config','--libs'],text=True)),'-o',str(o/'fixture')]
+cmd=['cc','-std=gnu17','-O2','-UNDEBUG','-ffunction-sections','-fdata-sections',('-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'),'-I'+str(r/'include'),'-I'+subprocess.check_output(['sdl2-config','--prefix'],text=True).strip()+'/include',*shlex.split(subprocess.check_output(['sdl2-config','--cflags'],text=True)),str(r/'libs/input/tests/test_pad_file_reports.c'),*shlex.split(subprocess.check_output(['sdl2-config','--libs'],text=True)),'-o',str(o/'fixture')]
 (o/'build-argv.json').write_text(json.dumps(cmd,indent=2)+'\n')
 b=subprocess.run(cmd,capture_output=True,text=True,timeout=30)
 (o/'build.stdout').write_text(b.stdout);(o/'build.stderr').write_text(b.stderr)
