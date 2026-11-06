@@ -60,6 +60,8 @@ int main(int argc, char** argv)
     CHECK(s_g.on, "guest programs (glslang) available");
     if (!s_g.on) { rsx_vulkan_backend_shutdown(); return 1; }
     const int readback = getenv("PS3RECOMP_VK_PRESENT_READBACK") && !strcmp(getenv("PS3RECOMP_VK_PRESENT_READBACK"), "1");
+    const int threaded = getenv("PS3RECOMP_RSX_PRESENT_THREAD") && !strcmp(getenv("PS3RECOMP_RSX_PRESENT_THREAD"), "1");
+    CHECK(!threaded == !s_vpt.pt, "the present thread runs exactly when asked for");
 
     u32 rt = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, W, H, NULL, 0);
     rsx_be_render_state rs; memset(&rs, 0, sizeof rs);
@@ -102,9 +104,25 @@ int main(int argc, char** argv)
     vk_eng_readback(NULL, rt, 0, 0, W, H, out, W * 4);
     const u8* c = out + ((size_t)(H / 2) * W + W / 2) * 4;
     const u32 centre = ((u32)c[0] << 16) | ((u32)c[1] << 8) | c[2];
+    if (threaded) {
+        /* Every frame staged; each one then shown or dropped for a newer one,
+         * never waited for. Only the present thread presents. */
+        rsx_present_thread_stats st;
+        for (int i = 0; i < 10000; i++) {
+            rsx_present_thread_get_stats(s_vpt.pt, &st);
+            if (st.presented + st.dropped + st.show_failed >= frames) break;
+            struct timespec ts = { 0, 1000000 };
+            nanosleep(&ts, NULL);
+        }
+        CHECK(st.staged == frames && st.stage_failed == 0, "every present staged");
+        CHECK(st.presented + st.dropped == frames && st.show_failed == 0, "every staged frame shown or dropped");
+        CHECK(st.presented >= 1 && s_vk.presented == st.presented, "the present thread presented");
+        CHECK(s_vk.present_direct == 0 && s_vk.present_readback_count == 0, "no present on the presenting thread");
+    } else
     CHECK(s_vk.presented == frames, "every present counted");
 #ifdef VK_PRESENT_SLOTS
-    if (readback) {
+    if (threaded) {
+    } else if (readback) {
         CHECK(s_vk.present_readback_count == frames && s_vk.present_direct == 0, "every present read back");
         CHECK((rsx_vulkan_backend_presented_center() & 0xFFFFFFu) == centre, "read-back present kept the centre pixel");
     } else {
