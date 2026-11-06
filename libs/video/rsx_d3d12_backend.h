@@ -48,6 +48,7 @@ int rsx_d3d12_backend_pump_messages(void);
 /* Native-owner seam of the opt-in register-file engine (PS3RECOMP_D3D12_DRAW_ENGINE=1
  * with PS3RECOMP_RSX_NATIVE_OWNER=1), the contract of rsx_native_owner.h. -2 when the
  * engine or the owner seam is not active. */
+#define RSX_D3D12_NATIVE_OWNER_ABI 1u   /* hosts test this to know the functions below exist */
 struct rsx_native_owner; struct rsx_native_owner_v2;
 int rsx_d3d12_backend_borrow_owner(struct rsx_native_owner* out);
 int rsx_d3d12_backend_borrow_owner_v2(struct rsx_native_owner_v2* out);
