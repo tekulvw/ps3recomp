@@ -128,6 +128,39 @@ static int validation_errors(void)
     return errors;
 }
 
+
+/* A hidden window and flip-model swap chain on the test queue, so the
+ * engine's present path runs for real. Returns 0 when none can be made (for
+ * example a non-interactive session); the present checks then skip. */
+static LRESULT CALLBACK test_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
+static int open_swap_chain(u32 w, u32 h)
+{
+    WNDCLASSW wc; memset(&wc, 0, sizeof wc); wc.lpfnWndProc = test_wndproc; wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = L"e12_present_fixture"; RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"e12", WS_OVERLAPPEDWINDOW, 0, 0, (int)w, (int)h, NULL, NULL, wc.hInstance, NULL);
+    if (!hwnd) return 0;
+    IDXGIFactory4* f = NULL;
+    if (FAILED(CreateDXGIFactory2(0, &IID_IDXGIFactory4, (void**)&f))) return 0;
+    DXGI_SWAP_CHAIN_DESC1 d; memset(&d, 0, sizeof d);
+    d.Width = w; d.Height = h; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.SampleDesc.Count = 1;
+    d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = FRAME_COUNT; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    IDXGISwapChain1* sc1 = NULL;
+    const HRESULT hr = f->lpVtbl->CreateSwapChainForHwnd(f, (IUnknown*)s_d3d.cmd_queue, hwnd, &d, NULL, NULL, &sc1);
+    f->lpVtbl->Release(f);
+    if (FAILED(hr) || !sc1) { fprintf(stderr, "     no swap chain here (0x%08lX)\n", (long)hr); return 0; }
+    sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&s_d3d.swap_chain); sc1->lpVtbl->Release(sc1);
+    D3D12_DESCRIPTOR_HEAP_DESC hd; memset(&hd, 0, sizeof hd); hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = FRAME_COUNT;
+    if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.rtv_heap))) return 0;
+    s_d3d.rtv_descriptor_size = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE c; s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &c);
+    for (u32 i = 0; i < FRAME_COUNT; i++) {
+        if (FAILED(s_d3d.swap_chain->lpVtbl->GetBuffer(s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.render_targets[i]))) return 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE ci = c; ci.ptr += (SIZE_T)i * s_d3d.rtv_descriptor_size;
+        s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_d3d.render_targets[i], NULL, ci);
+    }
+    s_d3d.width = w; s_d3d.height = h;
+    return 1;
+}
 int main(void)
 {
     const int open = open_device();
@@ -463,6 +496,24 @@ int main(void)
         CHECK(px(b, rt, 32, 32) != 0xFF0000FFu, "drawing through wrapped rings is correct");
         s_e12.srv_ring.size = keep_srv; s_e12.upload_ring.size = keep_up;
     }
+    /* Present: by default every present waits; with async present (opt-in)
+     * presents only wait when the GPU is a whole swap chain behind. */
+    if (open_swap_chain(64, 64)) {
+        b->bind_targets(b->user, &rt, 1, 0);
+        const u64 w0 = s_e12.waits[E12_W_PRESENT], p0 = s_e12.presents;
+        for (int i = 0; i < 6; i++) { draw_full(b, pipe); b->present(b->user, rt); }
+        CHECK(s_e12.presents == p0 + 6 && s_e12.waits[E12_W_PRESENT] == w0 + 6, "default present waits every frame");
+        s_e12.async_present = 1;
+        const u64 w1 = s_e12.waits[E12_W_PRESENT], f1 = s_e12.flushes, fv = s_e12.fence_value;
+        for (int i = 0; i < 30; i++) { for (int k = 0; k < 50; k++) draw_full(b, pipe); b->present(b->user, rt); }
+        CHECK(s_e12.fence_value == fv + 30, "async present submits once per frame");
+        CHECK(s_e12.waits[E12_W_PRESENT] - w1 < 30, "async present does not wait every frame");
+        CHECK(s_e12.backbuffer_fence[0] || s_e12.backbuffer_fence[1], "back buffers carry their frame's fence");
+        (void)f1;
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        CHECK(px(b, rt, 32, 32) != 0xFF0000FFu && !s_e12.failed, "frames after async presents are intact");
+        s_e12.async_present = 0;
+    } else fprintf(stderr, "SKIP present checks: no swap chain in this session\n");
     CHECK(s_e12.waits[E12_W_ENGINE_CHECKED] >= 2 && s_e12.waits[E12_W_COLOR_READBACK] > 0 &&
           s_e12.waits[E12_W_DEPTH_READBACK] > 0, "waits are counted by site");
 

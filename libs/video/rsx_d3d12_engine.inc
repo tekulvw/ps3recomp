@@ -117,6 +117,7 @@ static struct {
     u32 samp_gpu_next, srv_gpu_cap;
     ID3D12Resource* upload; u8* upload_ptr;
     e12_ring upload_ring, srv_ring;
+    u64 backbuffer_fence[4]; int async_present;
     e12_retiree* retire; u32 retire_n, retire_cap;
     u32 null_srv2d, null_srvcube;    /* CPU SRV slots + 1 */
     /* present blit */
@@ -699,6 +700,7 @@ static int e12_init(void* user, u32 width, u32 height)
     if (!s_e12.null_srv2d || !s_e12.null_srvcube || e12_root_signature() || e12_blit_pipeline()) goto fail;
     s_e12.dbounds[0] = 0.0f; s_e12.dbounds[1] = 1.0f;
     s_e12.upload_ring.size = ENG12_UPLOAD_RING;
+    { const char* e = getenv("PS3RECOMP_D3D12_ENGINE_ASYNC_PRESENT"); s_e12.async_present = e && *e == '1'; }
     s_e12.ready = 1;
     printf("[D3D12 engine] backend ready (depth bounds %s)\n", s_e12.depth_bounds_ok ? "on" : "unsupported");
     return 0;
@@ -1570,6 +1572,11 @@ static void e12_present(void* user, u32 surface)
     if (o && s_d3d.swap_chain && e12_begin() == 0) {
         const u32 bi = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
         ID3D12Resource* bb = s_d3d.render_targets[bi];
+        if (s_e12.async_present && s_e12.backbuffer_fence[bi & 3] >
+            s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence)) {
+            s_e12.waits[E12_W_PRESENT]++;
+            e12_wait_fence(s_e12.backbuffer_fence[bi & 3]);
+        }
         e12_obj back; memset(&back, 0, sizeof back); back.res = bb; back.state = D3D12_RESOURCE_STATE_PRESENT;
         e12_transition(o, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         e12_transition(&back, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1590,7 +1597,16 @@ static void e12_present(void* user, u32 surface)
             cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
         }
         e12_transition(&back, D3D12_RESOURCE_STATE_PRESENT);
-        e12_submit_wait(E12_W_PRESENT);
+        if (s_e12.async_present) {
+            /* Opt-in: submit and present without waiting. The back buffer is
+             * reused only after the GPU passed its previous frame (frame latency
+             * bounded by the swap chain's buffer count); retirements run as the
+             * fence advances. */
+            const u64 v = e12_execute();
+            if (v) s_e12.backbuffer_fence[bi & 3] = v;
+            s_e12.flushes++;
+            e12_retire_now(s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence));
+        } else e12_submit_wait(E12_W_PRESENT);
         s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0, 0);
         e12_dump(surface, o);
     }
