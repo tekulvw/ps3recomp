@@ -2,7 +2,7 @@
 #define PS3RECOMP_RSX_FRONTEND_VULKAN_H
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
-#include <pthread.h>
+#include "rsx_vk_thread.h"
 #include "rsx_frontend.h"
 
 /* Borrowed existing owner. begin_submit obtains its nonblocking recording gate;
