@@ -64,7 +64,7 @@ static const char* const s_e12_reason[E12_X_REASONS] = {
     "sampler_tables_reset", "present_none", "device", "allocator_wait", "async_refused" };
 
 typedef struct {
-    u8  kind, cube, rt_count, depth_bounds;
+    u8  kind, cube, rt_count, depth_bounds, snapshot;
     DXGI_FORMAT fmt;                 /* resource/SRV format (pipeline: colour format) */
     u32 w, h, mips, faces, bpp, block;
     ID3D12Resource* res;
@@ -418,7 +418,7 @@ static void e12_release_obj(u32 h)
 {
     if (!h || h >= ENG12_MAX_OBJ || s_e12o[h].kind == E12_FREE) return;
     e12_obj* o = &s_e12o[h];
-    if (o->kind == E12_COLOR)   /* views of this target go with it */
+    if (o->kind == E12_COLOR || o->kind == E12_TEXTURE)   /* views of this target go with it */
         for (u32 i = 1; i < ENG12_MAX_OBJ; i++)
             if (s_e12o[i].kind == E12_VIEW && s_e12o[i].parent == h) e12_release_obj(i);
     e12_free_slots(o);
@@ -768,6 +768,33 @@ static u32 e12_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h, 
     LeaveCriticalSection(&s_e12.lock);
     return hd;
 }
+/* An immutable copy of a colour target, for a draw that samples the target
+ * it renders to. The copy is recorded now, after every draw already recorded
+ * and before the next one; the engine samples it through surface_view and
+ * releases it with texture_release (it retires on the fence). 0 on failure. */
+static u32 e12_color_snapshot(void* user, u32 surface)
+{
+    (void)user;
+    EnterCriticalSection(&s_e12.lock);
+    u32 hd = 0;
+    e12_obj* t = e12_get(surface, E12_COLOR);
+    if (t && e12_begin() == 0 && (hd = e12_alloc()) != 0) {
+        e12_obj* o = &s_e12o[hd];
+        D3D12_RESOURCE_DESC d = e12_tex_desc(t->fmt, t->w, t->h, 1, 1, D3D12_RESOURCE_FLAG_NONE);
+        o->res = e12_committed(D3D12_HEAP_TYPE_DEFAULT, &d, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
+        if (!o->res) { e12_count(E12_X_CREATE_FAILED); memset(o, 0, sizeof *o); hd = 0; }
+        else {
+            o->kind = E12_TEXTURE; o->snapshot = 1; o->fmt = t->fmt; o->w = t->w; o->h = t->h;
+            o->mips = 1; o->faces = 1; o->bpp = t->bpp; o->state = D3D12_RESOURCE_STATE_COPY_DEST;
+            e12_transition(t, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            s_e12.cl->lpVtbl->CopyResource(s_e12.cl, o->res, t->res);
+            o->srv = e12_make_srv(o->res, t->fmt, 1, 0, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+            if (!o->srv) { e12_count(E12_X_CREATE_FAILED); e12_release_obj(hd); hd = 0; }
+        }
+    } else if (!t) e12_count(E12_X_DRAW_TARGETS);
+    LeaveCriticalSection(&s_e12.lock);
+    return hd;
+}
 static void e12_color_target_release(void* user, u32 surface)
 {
     (void)user;
@@ -796,6 +823,7 @@ static u32 e12_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
     EnterCriticalSection(&s_e12.lock);
     u32 hd = 0;
     e12_obj* t = e12_get(surface, E12_COLOR);
+    if (!t) { t = e12_get(surface, E12_TEXTURE); if (t && !t->snapshot) t = NULL; }   /* colour snapshots too */
     if (t) {
         for (u32 i = 1; i < ENG12_MAX_OBJ && !hd; i++)
             if (s_e12o[i].kind == E12_VIEW && s_e12o[i].parent == surface && s_e12o[i].remap == remap &&
@@ -1068,7 +1096,11 @@ static u32 e12_unit_srv(u32 handle, int cube)
 {
     if (handle && handle < ENG12_MAX_OBJ) {
         e12_obj* o = &s_e12o[handle];
-        e12_obj* res = o->kind == E12_VIEW ? e12_get(o->parent, E12_COLOR) : o;
+        e12_obj* res = o;
+        if (o->kind == E12_VIEW) {
+            res = e12_get(o->parent, E12_COLOR);
+            if (!res) res = e12_get(o->parent, E12_TEXTURE);
+        }
         if ((o->kind == E12_TEXTURE || o->kind == E12_COLOR || o->kind == E12_VIEW) && res && o->srv &&
             (int)res->cube == cube) {
             e12_transition(res, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1500,6 +1532,7 @@ static const rsx_draw_backend s_d3d12_engine_backend = {
     .present = e12_present, .readback = e12_readback, .depth_readback = e12_depth_readback,
     .submit_and_wait_checked = e12_submit_and_wait_checked,
     .submit_async = e12_submit_async, .completion_status = e12_completion_status,
+    .color_snapshot = e12_color_snapshot,
 };
 
 /* Called from rsx_d3d12_backend_init once the device, queue and swapchain

@@ -252,6 +252,49 @@ int main(void)
     b->bind_textures(b->user, units, sd, 1u);
     draw_full(b, ptex);
     CHECK(px(b, rt, 32, 32) != 0xFF0000FFu, "surface view sampled");
+    /* 0xAAE4: every output channel takes its remapped input (the low byte alone
+     * selects constants), so these checks see the sampled colour itself. */
+    const u32 pass_through = 0xAAE4u;
+    const u32 live = b->surface_view(b->user, rt2, pass_through, 0x85u);
+    units[0] = live;
+    b->bind_textures(b->user, units, sd, 1u);
+    draw_full(b, ptex);
+    const u32 blue_sample = px(b, rt, 32, 32);
+    CHECK(blue_sample != 0 && blue_sample != 0xFF0000FFu, "pass-through view samples the target's colour");
+
+    /* color_snapshot: an immutable copy taken now, unaffected by later writes,
+     * sampled through a view, and sampled while rendering into its source. */
+    CHECK(b->color_snapshot != NULL, "colour snapshot present");
+    const u32 snapc = b->color_snapshot(b->user, rt2);
+    CHECK(snapc != 0, "colour snapshot");
+    const float lime[4] = { 0, 1, 0, 1 };
+    b->clear_color(b->user, rt2, lime);
+    const u32 sview = b->surface_view(b->user, snapc, pass_through, 0x85u);
+    CHECK(sview != 0, "view of a colour snapshot");
+    units[0] = sview;
+    b->bind_targets(b->user, &rt, 1, 0);
+    b->bind_textures(b->user, units, sd, 1u);
+    draw_full(b, ptex);
+    CHECK(px(b, rt, 32, 32) == blue_sample, "snapshot keeps the contents at the time of the copy");
+    units[0] = live;   /* the live view of rt2 sees the later clear */
+    b->bind_textures(b->user, units, sd, 1u);
+    draw_full(b, ptex);
+    const u32 lime_sample = px(b, rt, 32, 32);
+    CHECK(lime_sample != blue_sample, "live view sees the later write");
+    {   /* feedback: render into rt2 while sampling a snapshot of rt2 */
+        const u32 fb = b->color_snapshot(b->user, rt2);
+        const u32 fbv = fb ? b->surface_view(b->user, fb, pass_through, 0x85u) : 0;
+        CHECK(fb && fbv, "snapshot of a target about to be rendered");
+        units[0] = fbv;
+        b->bind_targets(b->user, &rt2, 1, 0);
+        b->bind_textures(b->user, units, sd, 1u);
+        draw_full(b, ptex);
+        CHECK(px(b, rt2, 32, 32) == lime_sample, "draw into the target while sampling its snapshot");
+        b->texture_release(b->user, fb);
+        b->bind_targets(b->user, &rt, 1, 0);
+    }
+    b->texture_release(b->user, snapc);
+    CHECK(s_e12o[sview].kind == E12_FREE, "releasing a snapshot releases its views");
 
     /* color_target_write at an offset. */
     u8 rows[2 * 2 * 4]; for (int i = 0; i < 4; i++) { rows[4 * i] = 1; rows[4 * i + 1] = 2; rows[4 * i + 2] = 3; rows[4 * i + 3] = 4; }
