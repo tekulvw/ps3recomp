@@ -425,6 +425,16 @@ int main(void)
     CHECK(b->completion_status(b->user, first, 0) == 1, "earlier ticket complete once a later one is");
     CHECK(s_e12.count[E12_X_ASYNC_REFUSED] == 0, "no async refusal");
     CHECK(b->submit_and_wait_checked(b->user, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "checked flush after async");
+    /* The shader-visible heap holds a whole frame of descriptor tables: 4000
+     * draws (20 entries each, more than the old 65536-entry heap) need no wait. */
+    CHECK(s_e12.srv_gpu_cap == ENG12_SRV_GPU_HEAP_MAX, "large shader-visible heap");
+    {
+        const u64 before = s_e12.waits[E12_W_SRV_TABLES];
+        b->bind_targets(b->user, &rt, 1, 0);
+        for (int i = 0; i < 4000; i++) draw_full(b, pipe);
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        CHECK(s_e12.waits[E12_W_SRV_TABLES] == before, "4000 draws without a descriptor-ring wait");
+    }
     CHECK(s_e12.waits[E12_W_ENGINE_CHECKED] >= 2 && s_e12.waits[E12_W_COLOR_READBACK] > 0 &&
           s_e12.waits[E12_W_DEPTH_READBACK] > 0, "waits are counted by site");
 

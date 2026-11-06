@@ -38,7 +38,8 @@
 #define ENG12_RTV_HEAP       4096
 #define ENG12_DSV_HEAP       1024
 #define ENG12_SRV_CPU_HEAP   16384
-#define ENG12_SRV_GPU_HEAP   65536
+#define ENG12_SRV_GPU_HEAP_MAX 1000000u  /* D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1/2 */
+#define ENG12_SRV_GPU_HEAP_MIN 65536u    /* the size used before; the fallback */
 #define ENG12_SAMP_GPU_HEAP  2048
 #define ENG12_UPLOAD_RING    (128u << 20)
 #define ENG12_ALLOCATORS     8    /* command allocators in flight for async submissions */
@@ -103,7 +104,7 @@ static struct {
     ID3D12DescriptorHeap *rtv_heap, *dsv_heap, *srv_cpu, *srv_gpu, *samp_gpu;
     u32 rtv_inc, dsv_inc, srv_inc, samp_inc;
     u8  rtv_used[ENG12_RTV_HEAP], dsv_used[ENG12_DSV_HEAP], srv_used[ENG12_SRV_CPU_HEAP];
-    u32 srv_gpu_next, samp_gpu_next;
+    u32 srv_gpu_next, samp_gpu_next, srv_gpu_cap;
     ID3D12Resource* upload; u8* upload_ptr; u64 upload_next;
     e12_retiree* retire; u32 retire_n, retire_cap;
     u32 null_srv2d, null_srvcube;    /* CPU SRV slots + 1 */
@@ -479,6 +480,23 @@ static int e12_heap(D3D12_DESCRIPTOR_HEAP_TYPE t, u32 n, int visible, ID3D12Desc
     d.Flags = visible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     return FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &d, &IID_ID3D12DescriptorHeap, (void**)out)) ? -1 : 0;
 }
+/* The shader-visible CBV/SRV/UAV heap that per-draw descriptor tables are
+ * carved from. Each draw takes 20 entries and the ring restarts only after a
+ * full GPU wait, so a small heap forces a wait every few thousand draws. Use
+ * the largest size every resource binding tier allows (1,000,000 entries),
+ * falling back to the earlier 65536 when the device refuses it. */
+static int e12_srv_gpu_heap(void)
+{
+    static const u32 sizes[2] = { ENG12_SRV_GPU_HEAP_MAX, ENG12_SRV_GPU_HEAP_MIN };
+    const char* e = getenv("PS3RECOMP_D3D12_ENGINE_SMALL_HEAP");   /* diagnostic: force the fallback */
+    for (int i = (e && *e == '1') ? 1 : 0; i < 2; i++)
+        if (e12_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, sizes[i], 1, &s_e12.srv_gpu) == 0) {
+            s_e12.srv_gpu_cap = sizes[i];
+            if (i) printf("[D3D12 engine] shader-visible descriptor heap: %u entries (larger heap refused)\n", sizes[i]);
+            return 0;
+        }
+    return -1;
+}
 static int e12_root_signature(void)
 {
     D3D12_DESCRIPTOR_RANGE r[4]; memset(r, 0, sizeof r);
@@ -600,7 +618,7 @@ static int e12_init(void* user, u32 width, u32 height)
     if (e12_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, ENG12_RTV_HEAP, 0, &s_e12.rtv_heap) ||
         e12_heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, ENG12_DSV_HEAP, 0, &s_e12.dsv_heap) ||
         e12_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ENG12_SRV_CPU_HEAP, 0, &s_e12.srv_cpu) ||
-        e12_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ENG12_SRV_GPU_HEAP, 1, &s_e12.srv_gpu) ||
+        e12_srv_gpu_heap() ||
         e12_heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, ENG12_SAMP_GPU_HEAP, 1, &s_e12.samp_gpu))
         goto fail;
     s_e12.rtv_inc = dv->lpVtbl->GetDescriptorHandleIncrementSize(dv, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -1213,7 +1231,7 @@ static int e12_sampler_table(const rsx_be_sampler_desc* d, u32 n, D3D12_GPU_DESC
 }
 static int e12_srv_table(const u32* srv_slots, u32 n, D3D12_GPU_DESCRIPTOR_HANDLE* out)
 {
-    if (s_e12.srv_gpu_next + n > ENG12_SRV_GPU_HEAP) {
+    if (s_e12.srv_gpu_next + n > s_e12.srv_gpu_cap) {
         if (e12_submit_wait(E12_W_SRV_TABLES) || e12_begin()) return -1;
     }
     const u32 base = s_e12.srv_gpu_next;
@@ -1648,7 +1666,7 @@ static int e12_z24_pipelines(void)
  * texture or a raw buffer). Two descriptors come from the shader-visible ring. */
 static int e12_z24_dispatch(e12_obj* z, ID3D12Resource* out, int buffer, u32 w, u32 h)
 {
-    if (s_e12.srv_gpu_next + 2 > ENG12_SRV_GPU_HEAP && (e12_submit_wait(E12_W_SRV_TABLES) || e12_begin())) return -1;
+    if (s_e12.srv_gpu_next + 2 > s_e12.srv_gpu_cap && (e12_submit_wait(E12_W_SRV_TABLES) || e12_begin())) return -1;
     const u32 base = s_e12.srv_gpu_next; s_e12.srv_gpu_next += 2;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv; memset(&sv, 0, sizeof sv);
     sv.Format = ENG12_DEPTH_SRV; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
