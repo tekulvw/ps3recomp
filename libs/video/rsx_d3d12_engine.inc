@@ -428,7 +428,7 @@ static void e12_release_obj(u32 h)
 {
     if (!h || h >= ENG12_MAX_OBJ || s_e12o[h].kind == E12_FREE) return;
     e12_obj* o = &s_e12o[h];
-    if (o->kind == E12_COLOR || o->kind == E12_TEXTURE)   /* views of this target go with it */
+    if (o->kind == E12_COLOR || (o->kind == E12_TEXTURE && o->snapshot))   /* views go with their parent */
         for (u32 i = 1; i < ENG12_MAX_OBJ; i++)
             if (s_e12o[i].kind == E12_VIEW && s_e12o[i].parent == h) e12_release_obj(i);
     e12_free_slots(o);
