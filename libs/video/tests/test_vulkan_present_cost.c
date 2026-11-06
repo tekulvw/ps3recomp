@@ -118,6 +118,22 @@ int main(int argc, char** argv)
         CHECK(st.presented + st.dropped == frames && st.show_failed == 0, "every staged frame shown or dropped");
         CHECK(st.presented >= 1 && s_vk.presented == st.presented, "the present thread presented");
         CHECK(s_vk.present_direct == 0 && s_vk.present_readback_count == 0, "no present on the presenting thread");
+        /* Each staging image that exists has the view vk_create_image made,
+         * so its usage must be one a view may have (VUID-VkImageViewCreateInfo-
+         * image-04441), checked here without relying on the validation layer
+         * being installed (the timing runs have none). */
+        const VkImageUsageFlags viewable = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+            VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+        u32 staging_images = 0;
+        for (u32 i = 0; i < RSX_PRESENT_THREAD_MAX_DEPTH; i++) {
+            if (!s_vpt.img[i].img) continue;
+            staging_images++;
+            CHECK(s_vpt.img[i].view != VK_NULL_HANDLE && (s_vpt.img[i].usage & viewable) != 0,
+                  "a staging image's view has a usage it can serve");
+            CHECK(s_vpt.img_w[i] == W && s_vpt.img_h[i] == H, "staging images are the offscreen target's size");
+        }
+        CHECK(staging_images >= 1, "the stage made its staging images");
     } else
     CHECK(s_vk.presented == frames, "every present counted");
 #ifdef VK_PRESENT_SLOTS

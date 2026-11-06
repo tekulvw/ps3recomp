@@ -3319,8 +3319,13 @@ static int vk_pt_stage(void* user, uint32_t slot, uint32_t surface)
         vk_pt_destroy_image(slot);
     }
     if (!s_vpt.img[slot].img) {
+        /* Only ever a blit source and destination, but vk_create_image also
+         * makes a view, and a view needs a usage it can serve (VUID-
+         * VkImageViewCreateInfo-image-04441): SAMPLED, as the offscreen
+         * target's own images have, costs nothing here. */
         if (vk_create_image(&s_vpt.img[slot], s_vk.color.format, s_vk.width, s_vk.height,
-                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                            VK_IMAGE_USAGE_SAMPLED_BIT,
                             VK_IMAGE_ASPECT_COLOR_BIT)) {
             vk_pt_destroy_image(slot);
             return 0;
