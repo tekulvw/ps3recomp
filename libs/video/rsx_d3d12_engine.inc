@@ -1317,7 +1317,9 @@ static void e12_print_stats(void)
         for (int i = 0; i < E12_X_REASONS; i++)
             if (s_e12.count[i]) printf(" %s=%llu", s_e12_reason[i], (unsigned long long)s_e12.count[i]);
     { const u64 unstored = rsx_draw_engine_depth_unstored_count();
-      if (unstored) printf(" engine_depth_unstored=%llu", (unsigned long long)unstored); }
+      if (unstored) printf(" engine_depth_unstored=%llu", (unsigned long long)unstored);
+      const u64 feedback = rsx_draw_engine_feedback_unserved_count();
+      if (feedback) printf(" engine_feedback_unserved=%llu", (unsigned long long)feedback); }
     printf("\n"); fflush(stdout);
 }
 static void e12_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch);

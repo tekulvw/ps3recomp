@@ -1667,6 +1667,18 @@ static void eng_depth_unstored(const rsx_dsp_texture* t, u32 base_fmt)
                 g.be && g.be->depth_z24_view != NULL);
 }
 u64 rsx_draw_engine_depth_unstored_count(void) { return atomic_load(&s_depth_unstored); }
+/* A texture reads a colour target the same draw renders to, and the backend
+ * has no color_snapshot to give it a copy: the texture reads guest memory as
+ * it is, which does not hold what the GPU rendered. Counted, reported once. */
+static _Atomic unsigned long long s_feedback_unserved;
+static void eng_feedback_unserved(const rsx_dsp_texture* t)
+{
+    if (atomic_fetch_add(&s_feedback_unserved, 1) == 0)
+        fprintf(stderr, "[rsx engine] texture reads its own render target and the backend has no "
+                "color_snapshot: %ux%u at %u:0x%08X reads guest memory as it is; counted\n",
+                t->width, t->height, t->location, t->offset);
+}
+u64 rsx_draw_engine_feedback_unserved_count(void) { return atomic_load(&s_feedback_unserved); }
 
 static int eng_zdepth_to_guest(u32 slot)
 {
@@ -3336,6 +3348,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             s_z24_stored.valid = 0;
             eng_depth_unstored(&t, base_fmt);
         }
+        if (own && zsrc < 0 && !g.be->color_snapshot) eng_feedback_unserved(&t);
         if (own && zsrc < 0 && g.be->color_snapshot) {
             eng_surface* s = &g.surfaces[surface_at];
             rsx_dsp_surface sf;
