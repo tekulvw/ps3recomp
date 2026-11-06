@@ -1651,6 +1651,24 @@ static void eng_depth_row_to_guest(u8* dst, const float* src, u32 w, u32 bpp)
  * Z16 as one big-endian 16-bit value, Z24S8 as a big-endian word with the
  * depth in the top 24 bits. The stencil byte is written as 0: the host depth
  * target keeps no stencil to copy. Returns 0 when it cannot. */
+/* A texture reads an address whose latest write was depth, but the depth
+ * could not reach it: no snapshot for its format, no GPU depth view, and no
+ * store into guest memory (the backend lacks depth_readback and
+ * depth_store_z24, or they failed). The texture then reads guest memory as it
+ * is, which can be stale. Counted, and reported once, so it is never silent. */
+static _Atomic unsigned long long s_depth_unstored;
+static void eng_depth_unstored(const rsx_dsp_texture* t, u32 base_fmt)
+{
+    if (atomic_fetch_add(&s_depth_unstored, 1) == 0)
+        fprintf(stderr, "[rsx engine] depth-sourced texture read with no depth store or view: "
+                "format 0x%02X %ux%u at %u:0x%08X reads guest memory as it is "
+                "(backend depth_readback=%d depth_store_z24=%d depth_z24_view=%d); counted\n",
+                base_fmt, t->width, t->height, t->location, t->offset,
+                g.be && g.be->depth_readback != NULL, g.be && g.be->depth_store_z24 != NULL,
+                g.be && g.be->depth_z24_view != NULL);
+}
+u64 rsx_draw_engine_depth_unstored_count(void) { return atomic_load(&s_depth_unstored); }
+
 static int eng_zdepth_to_guest(u32 slot)
 {
     eng_zdepth* z = &g.zdepths[slot];
@@ -3317,6 +3335,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 continue;
             }
             s_z24_stored.valid = 0;
+            eng_depth_unstored(&t, base_fmt);
         }
         if (own && zsrc < 0 && g.be->color_snapshot) {
             eng_surface* s = &g.surfaces[surface_at];
