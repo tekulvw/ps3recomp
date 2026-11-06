@@ -21,6 +21,7 @@
 
 #include "rsx_live_draw.h"
 #include "rsx_live_draw_owner.h"
+#include "rsx_present_thread.h"
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/log_first.h"
@@ -11064,6 +11065,7 @@ static void ld_shutdown_body(void)
  * low-level issue/flush deliberately does not enter this wrapper again. */
 int rsx_live_draw_init(void* hwnd,u32 w,u32 h,rsx_live_guest_ptr_fn f,void* user)
 {
+    if (rsx_present_thread_requested()) rsx_present_thread_unsupported("live draw", NULL);
     if (!ld_report_effect_begin()) return -1;
     if(ld_native_owner_enabled() && !g.ready &&
        (s_native_owner.retained || (s_native_owner.failed && g.dev))){ld_report_effect_end();return -1;}
