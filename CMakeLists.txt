@@ -468,6 +468,12 @@ if(PS3RECOMP_BUILD_TESTS)
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
+    # Opt-in RSX FIFO busy accounting (PS3RECOMP_RSX_FIFO_BUSY) on a scripted clock.
+    if(NOT WIN32)
+        add_executable(test_rsx_fifo_busy libs/video/tests/test_rsx_fifo_busy.c libs/video/rsx_fifo_busy.c)
+        target_link_libraries(test_rsx_fifo_busy PRIVATE Threads::Threads)
+        add_test(NAME rsx_fifo_busy COMMAND test_rsx_fifo_busy)
+    endif()
 
     if(NOT WIN32)
         add_executable(test_spu_lockline_wait

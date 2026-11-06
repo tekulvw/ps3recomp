@@ -50,6 +50,7 @@
 #include <vulkan/vulkan.h>
 
 #include "rsx_vulkan_backend.h"
+#include "rsx_fifo_busy.h"
 #include "rsx_frontend_vulkan.h"
 #include "rsx_frontend_internal.h"
 #define RSX_NATIVE_OWNER_PTHREAD
@@ -344,7 +345,11 @@ static int vulkan_owner_begin(int dirty){
     if(s_vulkan_owner_thread.native){if(dirty)s_vulkan_owner.failed=1;return 0;}
     if(!s_vulkan_owner_thread.original_depth){s_vulkan_consumer=cellGcm_rsx_consumer_begin&&cellGcm_rsx_consumer_end;
         if(s_vulkan_consumer)cellGcm_rsx_consumer_begin();}
-    if(rsx_owner_original_begin(&s_vulkan_owner,&s_vulkan_owner_thread))return 0;
+    const int outer=!s_vulkan_owner_thread.original_depth;
+    if(outer)rsx_fifo_busy_enter(RSX_FIFO_BUSY_LEASE_WAIT);
+    const int refused=rsx_owner_original_begin(&s_vulkan_owner,&s_vulkan_owner_thread);
+    if(outer)rsx_fifo_busy_leave(RSX_FIFO_BUSY_LEASE_WAIT);
+    if(refused)return 0;
     if(dirty)rsx_owner_dirty(&s_vulkan_owner,&s_vulkan_owner_thread);
     return 1;
 }
@@ -873,7 +878,25 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
     return r;
 }
 
+/* PS3RECOMP_RSX_FIFO_BUSY: swapchain acquire and present block the presenting
+ * thread like Metal's drawable wait; both count as "drawable". */
+static VkResult vk_busy_acquire(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+                                VkSemaphore semaphore, VkFence fence, uint32_t* index)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
+    const VkResult r = pvkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, index);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
+    return r;
+}
+static VkResult vk_queue_present_core(const VkPresentInfoKHR* pi);
 static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
+    const VkResult r = vk_queue_present_core(pi);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
+    return r;
+}
+static VkResult vk_queue_present_core(const VkPresentInfoKHR* pi)
 {
     pthread_mutex_lock(&s_vk.queue_mu);
     const uint64_t th = s_vkpt_on > 0 ? vkpt_now() : 0;
@@ -2223,7 +2246,7 @@ static void vk_present_window(void)
     if (!s_vk.windowed || !s_vk.swapchain) return;
 
     u32 idx = 0;
-    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+    VkResult r = vk_busy_acquire(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                         s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); return; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
@@ -2568,7 +2591,7 @@ static void vk_present_record_end(VkCommandBuffer cb)
             }
             acquire = s_vk.present_acquire[slot];
             const uint64_t ta = s_vkpt_on > 0 ? vkpt_now() : 0;
-            VkResult r = acquire ? pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+            VkResult r = acquire ? vk_busy_acquire(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                                           acquire, VK_NULL_HANDLE, &idx)
                                  : VK_ERROR_INITIALIZATION_FAILED;
             vkpt_add(VKPT_ACQUIRE, ta);
@@ -2684,7 +2707,7 @@ static int vk_show_service_locked(void)
     }
     s_show.slot = slot;
     u32 idx = 0;
-    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+    VkResult r = vk_busy_acquire(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                         s_show.acquire[slot], VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); s_show.failed++; return 0; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
