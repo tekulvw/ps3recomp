@@ -64,6 +64,7 @@
 #include "metal_frame_measurement.h"
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
+#include "rsx_fifo_busy.h"
 #include "rsx_frontend_internal.h"
 #include "rsx_draw_engine.h"
 #include "rsx_present_thread.h"
@@ -129,7 +130,11 @@ static int metal_owner_begin(int dirty){
         s_metal_consumer=cellGcm_rsx_consumer_begin&&cellGcm_rsx_consumer_end;
         if(s_metal_consumer)cellGcm_rsx_consumer_begin();
     }
-    if(rsx_owner_original_begin(&s_metal_owner,&s_metal_owner_thread))return 0;
+    const int outer=!s_metal_owner_thread.original_depth;
+    if(outer)rsx_fifo_busy_enter(RSX_FIFO_BUSY_LEASE_WAIT);
+    const int refused=rsx_owner_original_begin(&s_metal_owner,&s_metal_owner_thread);
+    if(outer)rsx_fifo_busy_leave(RSX_FIFO_BUSY_LEASE_WAIT);
+    if(refused)return 0;
     if(dirty)rsx_owner_dirty(&s_metal_owner,&s_metal_owner_thread);
     return 1;
 }
@@ -4532,7 +4537,9 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
         { const uint64_t w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
           if (windowed_present) {
               if(critical_start)semaphore_start=ps3_critical_now_ns();
+              rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
               dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+              rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
               if(critical_start)semaphore_end=ps3_critical_now_ns();
           }
           if (w0 && windowed_present) { const uint64_t w1 = ps3_ft_now();
@@ -4542,7 +4549,9 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
                 dst = s_offscreen;
             } else {
                 if(critical_start)drawable_start=ps3_critical_now_ns();
+                rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
                 drawable = [s_layer nextDrawable];
+                rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
                 if(critical_start)drawable_end=ps3_critical_now_ns();
                 fps_note_drawable(drawable!=nil);
                 if (!drawable) {           /* compositor is busy; skip */
@@ -5890,9 +5899,11 @@ int rsx_metal_backend_pump_messages(void)
     if ([NSThread isMainThread])
         return pump_messages_impl();
     __block int result = 0;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PUMP);
     dispatch_sync(dispatch_get_main_queue(), ^{
         result = pump_messages_impl();
     });
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PUMP);
     return result;
 #else
     return pump_messages_impl();
@@ -6087,14 +6098,18 @@ void rsx_metal_backend_shutdown(void){
     metal_owner_finish(0);
 }
 void rsx_metal_backend_present(void){
-    if(!metal_owner_begin(1))return;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT_HOST);
+    if(!metal_owner_begin(1)){rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);return;}
     uint64_t before=s_metal_commits;
     metal_original_present();metal_owner_finish(metal_owner_boundary(before));
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);
 }
 void rsx_metal_backend_present_guest_frame(uint64_t frame,uint32_t buffer){
-    if(!metal_owner_begin(1))return;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT_HOST);
+    if(!metal_owner_begin(1)){rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);return;}
     uint64_t before=s_metal_commits;
     metal_original_present_guest_frame(frame,buffer);metal_owner_finish(metal_owner_boundary(before));
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);
 }
 int rsx_metal_backend_native_boundary(uint64_t *original_ticket){
     if(!original_ticket)return -1;
