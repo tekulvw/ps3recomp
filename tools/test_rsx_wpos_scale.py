@@ -13,7 +13,7 @@ def main():
         return
     with tempfile.TemporaryDirectory(prefix="rsx-wpos-") as directory:
         binary = Path(directory) / "test"
-        sources = ["tests/test_rsx_wpos_scale.c", "rsx_draw_engine.c", "rsx_dispatch.c",
+        sources = ["tests/test_rsx_wpos_scale.c", "rsx_draw_engine.c", "rsx_fifo_busy.c", "rsx_dispatch.c",
                    "rsx_vertex_compact.c", "rsx_texture_layout.c", "rsx_vp_decompiler.c", "rsx_fp_decompiler.c"]
         subprocess.run([os.environ.get("CC", "cc"), "-O2", "-std=gnu17", "-Iinclude", "-Ilibs/video",
                         "-o", str(binary), *["libs/video/" + s for s in sources]], cwd=ROOT, check=True)

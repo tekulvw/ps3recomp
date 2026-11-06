@@ -8,7 +8,7 @@ import sys
 import tempfile
 ROOT=Path(__file__).resolve().parents[1]
 sources=['libs/video/tests/test_original_owner_ingress.c']+[
-    'libs/video/'+name+'.c' for name in ('rsx_draw_engine','rsx_commands','rsx_dispatch',
+    'libs/video/'+name+'.c' for name in ('rsx_draw_engine','rsx_fifo_busy','rsx_commands','rsx_dispatch',
     'rsx_texture_layout','rsx_vertex_compact','rsx_vertex_fetch','rsx_vp_decompiler','rsx_fp_decompiler')]
 with tempfile.TemporaryDirectory(prefix='original-owner-ingress-') as tmp:
     cc=shutil.which(os.environ.get('CC','clang-cl' if os.name=='nt' else 'cc'))
