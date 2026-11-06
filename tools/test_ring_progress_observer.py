@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix="ring-progress-observer-") as directory:
                "-fsanitize=undefined", "-ffunction-sections", "-fdata-sections",
                "-I", str(ROOT / "include"),
                str(ROOT / "libs/video/tests/test_ring_progress_observer.c"),
-               str(ROOT / "libs/video/tests/gcm_deferred_fixture_stubs.c"),
+               str(ROOT / "libs/video/tests/gcm_deferred_fixture_stubs.c"), str(ROOT / "libs/video/rsx_fifo_busy.c"),
                "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
                "-pthread", "-lm", "-o", str(binary)]
     subprocess.run(command, check=True, timeout=60)

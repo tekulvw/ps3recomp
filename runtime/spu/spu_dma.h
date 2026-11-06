@@ -25,6 +25,7 @@
 #include "spu_dma_disposition.h"
 #include "../diagnostics/critical_write_trace.h"
 #include <stdint.h>
+#include <time.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -235,7 +236,12 @@ static void spu_put_watch_hit(const spu_context* spu, uint32_t lsa, uint64_t ea,
     for (unsigned i = 0; i < 4; ++i)
         if (spu->resident_code[i].image_id && pc >= spu->resident_code[i].lsa &&
             pc - spu->resident_code[i].lsa < spu->resident_code[i].size) { code_image = spu->resident_code[i].image_id; break; }
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts;
+#ifdef _WIN32
+    timespec_get(&ts, TIME_UTC);   /* no clock_gettime on Windows toolchains; ordering only */
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
     fprintf(stderr, "[spu-put-watch] t=%llu spu=%u image=%d pc=0x%05X lr=0x%05X job_image=%d cmd=0x%02X ea=0x%08X lsa=0x%05X size=%u word=0x%08X before=0x%08X after=0x%08X\n",
             (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec,
             spu->spu_id, spu->image_id, pc, spu->gpr[0]._u32[0] & SPU_LS_MASK, code_image, cmd & 0xFFu,

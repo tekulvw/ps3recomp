@@ -22,6 +22,8 @@ def run(command,env=None,expected=0):
     return result
 
 def main():
+    if os.name=='nt':
+        print('SKIP: the audio chronology fixture builds with a POSIX toolchain and SDL2');return
     parser=argparse.ArgumentParser();parser.add_argument('--sanitize',action='store_true');parser.add_argument('--sdl-include');parser.add_argument('--compiler',default='clang');parser.add_argument('--cxx',default='clang++');args=parser.parse_args()
     sdl_flags=[]
     if args.sdl_include:sdl_flags=['-I'+args.sdl_include]

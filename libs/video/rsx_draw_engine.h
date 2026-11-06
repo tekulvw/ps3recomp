@@ -331,6 +331,11 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
 int rsx_draw_engine_async_available(void);
+/* Texture reads of depth that reached neither a snapshot, a GPU view nor a
+ * guest-memory store (see the engine's one-time report). */
+u64 rsx_draw_engine_depth_unstored_count(void);
+/* Same-target colour reads the backend could not copy (no color_snapshot). */
+u64 rsx_draw_engine_feedback_unserved_count(void);
 u64 rsx_draw_engine_submit_async(void);
 int rsx_draw_engine_completion_status(u64 ticket,int wait);
 void rsx_draw_engine_set_report_barrier(int (*barrier)(void));

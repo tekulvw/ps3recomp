@@ -1530,6 +1530,40 @@ static void test_depth_read_as_color(void)
     engine_down();
 }
 
+/* A backend with no depth store and no view: the read cannot be served from
+ * the depth target, so it is counted and the texture reads guest memory. */
+static void test_depth_read_without_store(void)
+{
+    printf("-- zeta read with no depth store or view\n");
+    engine_up();
+    rsx_draw_backend be = g_stub_backend;
+    be.depth_readback = NULL; be.depth_store_z24 = NULL; be.depth_z24_view = NULL;
+    rsx_draw_engine_set_backend(&be);
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, ZETA_OFFSET);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    draw_triangle();
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    const u64 before = rsx_draw_engine_depth_unstored_count();
+    draw_triangle();
+    CHECK(rsx_draw_engine_depth_unstored_count() == before + 1,
+          "the unserved depth read is counted once (%llu)",
+          (unsigned long long)(rsx_draw_engine_depth_unstored_count() - before));
+    CHECK(stub.n_depth_readback == 0, "nothing was read back (%d)", stub.n_depth_readback);
+    CHECK(stub.n_draw == 2, "the draw still runs, sampling guest memory (%d)", stub.n_draw);
+    rsx_draw_engine_set_backend(&g_stub_backend);
+    engine_down();
+}
+
 /* PS3RECOMP_RSX_GPU_DEPTH_VIEW=1: the same read is served by a GPU view,
  * submitted without waiting, with guest memory untouched; reused while the
  * depth is unchanged, rebuilt after a new depth write. */
@@ -1893,6 +1927,7 @@ int main(int argc, char** argv)
     test_antialiased_surface();
     test_surface_reuse_antialias();
     test_depth_read_as_color();
+    test_depth_read_without_store();
     test_depth_read_as_color_gpu_view();
     test_depth_snapshot_released();
     test_color_read_as_float();
