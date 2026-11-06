@@ -435,12 +435,13 @@ int main(void)
         b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         CHECK(s_e12.waits[E12_W_SRV_TABLES] == before, "4000 draws without a descriptor-ring wait");
     }
-    /* Fenced upload ring: shrink it so many async batches must wrap it.
+    /* Fenced rings: shrink both rings so many async batches must wrap them.
      * Space returns as the GPU passes each batch's fence; no full wait is
      * needed, and the drawing stays correct. */
     {
         b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
-        const u64 keep_up = s_e12.upload_ring.size;
+        const u64 keep_srv = s_e12.srv_ring.size, keep_up = s_e12.upload_ring.size;
+        s_e12.srv_ring.size = 2000;            /* 100 draws of 20 descriptors */
         s_e12.upload_ring.size = 4u << 20;     /* a few batches of constants and vertices */
         const u64 flushes = s_e12.flushes;
         b->bind_targets(b->user, &rt, 1, 0);
@@ -454,11 +455,13 @@ int main(void)
             (unsigned long long)(s_e12.flushes - flushes), (unsigned long long)s_e12.upload_ring.head,
             (unsigned long long)s_e12.upload_ring.tail, s_e12.upload_ring.nseg);
         CHECK(s_e12.flushes == flushes, "rings wrapped without a full GPU wait");
-        CHECK(s_e12.upload_ring.head <= s_e12.upload_ring.size,
+        CHECK(s_e12.srv_ring.first + s_e12.srv_ring.nseg > 1 || s_e12.waits[E12_W_SRV_TABLES] > 0,
+              "the descriptor ring did wrap");
+        CHECK(s_e12.srv_ring.head <= s_e12.srv_ring.size && s_e12.upload_ring.head <= s_e12.upload_ring.size,
               "ring heads stay inside the rings");
         b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         CHECK(px(b, rt, 32, 32) != 0xFF0000FFu, "drawing through wrapped rings is correct");
-        s_e12.upload_ring.size = keep_up;
+        s_e12.srv_ring.size = keep_srv; s_e12.upload_ring.size = keep_up;
     }
     CHECK(s_e12.waits[E12_W_ENGINE_CHECKED] >= 2 && s_e12.waits[E12_W_COLOR_READBACK] > 0 &&
           s_e12.waits[E12_W_DEPTH_READBACK] > 0, "waits are counted by site");

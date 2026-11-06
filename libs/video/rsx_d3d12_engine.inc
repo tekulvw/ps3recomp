@@ -90,7 +90,7 @@ typedef struct {
 } e12_obj;
 
 typedef struct { IUnknown* res; u64 fence; } e12_retiree;
-/* A fenced ring (the upload buffer). Each submission
+/* A fenced ring (upload bytes or shader-visible descriptors). Each submission
  * closes a segment ending at the head; a segment's space comes back once the
  * GPU passes its fence. Allocation waits only for the oldest segment when the
  * ring is full, never for the whole queue. */
@@ -114,9 +114,9 @@ static struct {
     ID3D12DescriptorHeap *rtv_heap, *dsv_heap, *srv_cpu, *srv_gpu, *samp_gpu;
     u32 rtv_inc, dsv_inc, srv_inc, samp_inc;
     u8  rtv_used[ENG12_RTV_HEAP], dsv_used[ENG12_DSV_HEAP], srv_used[ENG12_SRV_CPU_HEAP];
-    u32 srv_gpu_next, samp_gpu_next, srv_gpu_cap;
+    u32 samp_gpu_next, srv_gpu_cap;
     ID3D12Resource* upload; u8* upload_ptr;
-    e12_ring upload_ring;
+    e12_ring upload_ring, srv_ring;
     e12_retiree* retire; u32 retire_n, retire_cap;
     u32 null_srv2d, null_srvcube;    /* CPU SRV slots + 1 */
     /* present blit */
@@ -313,6 +313,7 @@ static u64 e12_execute(void)
     if (FAILED(s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_e12.fence, v))) { s_e12.failed = 1; return 0; }
     s_e12.alloc_fence[s_e12.cur_alloc] = v;
     e12_ring_close(&s_e12.upload_ring, v);
+    e12_ring_close(&s_e12.srv_ring, v);
     return v;
 }
 static int e12_submit_wait(int site)
@@ -324,7 +325,7 @@ static int e12_submit_wait(int site)
     e12_retire_now(v);
     e12_drain_info_queue();
     e12_ring_reset(&s_e12.upload_ring);
-    s_e12.srv_gpu_next = 0;
+    e12_ring_reset(&s_e12.srv_ring);
     s_e12.flushes++;
     return rc;
 }
@@ -549,6 +550,7 @@ static int e12_srv_gpu_heap(void)
     for (int i = (e && *e == '1') ? 1 : 0; i < 2; i++)
         if (e12_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, sizes[i], 1, &s_e12.srv_gpu) == 0) {
             s_e12.srv_gpu_cap = sizes[i];
+            s_e12.srv_ring.size = sizes[i];
             if (i) printf("[D3D12 engine] shader-visible descriptor heap: %u entries (larger heap refused)\n", sizes[i]);
             return 0;
         }
@@ -1289,14 +1291,12 @@ static int e12_sampler_table(const rsx_be_sampler_desc* d, u32 n, D3D12_GPU_DESC
 }
 static int e12_srv_table(const u32* srv_slots, u32 n, D3D12_GPU_DESCRIPTOR_HANDLE* out)
 {
-    if (s_e12.srv_gpu_next + n > s_e12.srv_gpu_cap) {
-        if (e12_submit_wait(E12_W_SRV_TABLES) || e12_begin()) return -1;
-    }
-    const u32 base = s_e12.srv_gpu_next;
+    u64 at = 0;
+    if (e12_ring_alloc(&s_e12.srv_ring, n, 1, E12_W_SRV_TABLES, &at)) return -1;
+    const u32 base = (u32)at;
     for (u32 i = 0; i < n; i++)
         s_d3d.device->lpVtbl->CopyDescriptorsSimple(s_d3d.device, 1, e12_cpu(s_e12.srv_gpu, s_e12.srv_inc, base + i),
             e12_cpu(s_e12.srv_cpu, s_e12.srv_inc, srv_slots[i] - 1), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    s_e12.srv_gpu_next += n;
     *out = e12_gpu(s_e12.srv_gpu, s_e12.srv_inc, base);
     return 0;
 }
@@ -1724,8 +1724,9 @@ static int e12_z24_pipelines(void)
  * texture or a raw buffer). Two descriptors come from the shader-visible ring. */
 static int e12_z24_dispatch(e12_obj* z, ID3D12Resource* out, int buffer, u32 w, u32 h)
 {
-    if (s_e12.srv_gpu_next + 2 > s_e12.srv_gpu_cap && (e12_submit_wait(E12_W_SRV_TABLES) || e12_begin())) return -1;
-    const u32 base = s_e12.srv_gpu_next; s_e12.srv_gpu_next += 2;
+    u64 at = 0;
+    if (e12_ring_alloc(&s_e12.srv_ring, 2, 1, E12_W_SRV_TABLES, &at)) return -1;
+    const u32 base = (u32)at;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv; memset(&sv, 0, sizeof sv);
     sv.Format = ENG12_DEPTH_SRV; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
