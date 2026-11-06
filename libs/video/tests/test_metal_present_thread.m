@@ -128,6 +128,7 @@ int main(int argc, char** argv)
         s_dev = MTLCreateSystemDefaultDevice(); assert(s_dev);
         s_queue = [s_dev newCommandQueue]; assert(s_queue);
         setenv("PS3RECOMP_RSX_PRESENT_THREAD_REPORT_S", "0", 1);
+        s_eng_pt_start = eng_pt_start;   /* what metal_original_init sets */
         if (argc > 1 && !strcmp(argv[1], "layer")) return run_layer();
         s_headless = 1;
         g_presenting = pthread_self();

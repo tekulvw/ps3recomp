@@ -3143,6 +3143,9 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
 
 static void eng_pt_start(void);
 static void eng_pt_stop(void);
+/* Set by the backend's own init only: a fixture that drives the engine
+ * directly then links without the present thread's halves. */
+static void (*s_eng_pt_start)(void);
 static int eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
@@ -3164,7 +3167,7 @@ static int eng_init(void* user, u32 width, u32 height)
     sd.magFilter = MTLSamplerMinMagFilterLinear;
     s_eng_linear_sampler = [s_dev newSamplerStateWithDescriptor:sd];
     if (!s_eng_point_sampler || !s_eng_linear_sampler) return -1;
-    if (rsx_present_thread_requested()) eng_pt_start();
+    if (s_eng_pt_start && rsx_present_thread_requested()) s_eng_pt_start();
     return 0;
 }
 
@@ -5771,6 +5774,7 @@ static int metal_original_init(u32 width, u32 height, const char* title)
          * the path that uses it: the FIFO walker feeds both models, so leaving
          * both live would record every draw twice. */
         s_ready  = 1;
+        s_eng_pt_start = eng_pt_start;
         rsx_draw_engine_set_backend(&s_engine_backend);
         /* The engine is this backend's default now that every host mode
          * passes both ways. PS3RECOMP_RSX_ENGINE=vtable is the way back, and
