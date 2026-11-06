@@ -103,6 +103,8 @@ static struct {
     u32 null_srv2d, null_srvcube;    /* CPU SRV slots + 1 */
     /* present blit */
     ID3D12RootSignature* blit_root; ID3D12PipelineState* blit_pso;
+    /* depth -> D24S8 words on the GPU (depth_store_z24 / depth_z24_view), built on first use */
+    ID3D12RootSignature* z24_root; ID3D12PipelineState* z24_view_pso; ID3D12PipelineState* z24_store_pso; int z24_failed;
     /* bound state */
     u32 rt[RSX_BE_MAX_COLOR_TARGETS], nrt, depth, pipeline;
     u32 scratch_depth;
@@ -628,6 +630,7 @@ static void e12_shutdown(void* user)
     e12_retire_now(~0ull);
     free(s_e12.retire);
     if (s_e12.upload && s_e12.upload_ptr) s_e12.upload->lpVtbl->Unmap(s_e12.upload, 0, NULL);
+    E12_REL(s_e12.z24_view_pso); E12_REL(s_e12.z24_store_pso); E12_REL(s_e12.z24_root);
     E12_REL(s_e12.upload); E12_REL(s_e12.blit_pso); E12_REL(s_e12.blit_root); E12_REL(s_e12.root);
     E12_REL(s_e12.rtv_heap); E12_REL(s_e12.dsv_heap); E12_REL(s_e12.srv_cpu); E12_REL(s_e12.srv_gpu);
     E12_REL(s_e12.samp_gpu); E12_REL(s_e12.cl1); E12_REL(s_e12.cl); E12_REL(s_e12.fence);
@@ -1482,6 +1485,182 @@ static int e12_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
     LeaveCriticalSection(&s_e12.lock);
     return rc;
 }
+/* ---- depth as D24S8 words, converted on the GPU ------------------------------
+ * The value stored for a depth d is round-half-up(clamp(d, 0, 1) * (2^24 - 1)),
+ * NaN as 0: what the engine's own CPU store computes in double precision. The
+ * shader reproduces it exactly in 32-bit integers: d is m * 2^-s with a 24-bit
+ * m, so d * (2^24 - 1) = (m * 2^24 - m) * 2^-s, a 48-bit value kept as two
+ * words, rounded by adding 2^(s-1) and shifting right by s. */
+#define E12_Z24_HLSL_COMMON \
+    "cbuffer C : register(b0) { uint w; uint h; uint pad0; uint pad1; };\n" \
+    "Texture2D<float> D : register(t0);\n" \
+    "uint z24(float d) {\n" \
+    "  d = saturate(d); uint bits = asuint(d); uint e = bits >> 23;\n" \
+    "  if (e == 0) return 0;\n" \
+    "  uint m = (bits & 0x7FFFFF) | 0x800000; int s = 150 - (int)e;\n" \
+    "  if (s >= 50) return 0;\n" \
+    "  uint lo = (m & 0xFF) << 24; uint hi = m >> 8;\n" \
+    "  uint lo2 = lo - m; hi -= (lo < m) ? 1u : 0u; lo = lo2;\n" \
+    "  uint t = (uint)(s - 1);\n" \
+    "  if (t < 32) { uint lo3 = lo + (1u << t); hi += (lo3 < lo) ? 1u : 0u; lo = lo3; } else hi += 1u << (t - 32);\n" \
+    "  return (s >= 32) ? (hi >> (uint)(s - 32)) : ((lo >> (uint)s) | (hi << (uint)(32 - s)));\n" \
+    "}\n"
+static ID3D12PipelineState* e12_compute_pso(const char* src)
+{
+    ID3DBlob* cs = e12_compile(src, "cs_5_0", E12_X_COMPILE_PS);
+    if (!cs) return NULL;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC d; memset(&d, 0, sizeof d);
+    d.pRootSignature = s_e12.z24_root;
+    d.CS.pShaderBytecode = cs->lpVtbl->GetBufferPointer(cs); d.CS.BytecodeLength = cs->lpVtbl->GetBufferSize(cs);
+    ID3D12PipelineState* pso = NULL;
+    if (FAILED(s_d3d.device->lpVtbl->CreateComputePipelineState(s_d3d.device, &d, &IID_ID3D12PipelineState, (void**)&pso))) {
+        e12_count(E12_X_PSO); pso = NULL;
+    }
+    cs->lpVtbl->Release(cs);
+    return pso;
+}
+static int e12_z24_pipelines(void)
+{
+    if (s_e12.z24_view_pso && s_e12.z24_store_pso) return 0;
+    if (s_e12.z24_failed) return -1;
+    s_e12.z24_failed = 1;
+    D3D12_DESCRIPTOR_RANGE r[2]; memset(r, 0, sizeof r);
+    r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r[0].NumDescriptors = 1;
+    r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r[1].NumDescriptors = 1; r[1].OffsetInDescriptorsFromTableStart = 1;
+    D3D12_ROOT_PARAMETER p[2]; memset(p, 0, sizeof p);
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; p[0].Constants.Num32BitValues = 4;
+    p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[1].DescriptorTable.NumDescriptorRanges = 2; p[1].DescriptorTable.pDescriptorRanges = r;
+    p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd; memset(&rd, 0, sizeof rd);
+    rd.NumParameters = 2; rd.pParameters = p;
+    ID3DBlob *blob = NULL, *err = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) {
+        if (err) err->lpVtbl->Release(err);
+        return -1;
+    }
+    HRESULT hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0, blob->lpVtbl->GetBufferPointer(blob),
+        blob->lpVtbl->GetBufferSize(blob), &IID_ID3D12RootSignature, (void**)&s_e12.z24_root);
+    blob->lpVtbl->Release(blob);
+    if (FAILED(hr)) return -1;
+    /* View: the words as a linear A8R8G8B8 texture would decode them (word bytes
+     * A,R,G,B = depth[23:16], depth[15:8], depth[7:0], stencil 0). */
+    static const char view_src[] = E12_Z24_HLSL_COMMON
+        "RWTexture2D<unorm float4> O : register(u0);\n"
+        "[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {\n"
+        "  if (id.x >= w || id.y >= h) return;\n"
+        "  uint v = z24(D.Load(int3(id.xy, 0)));\n"
+        "  O[id.xy] = float4((v >> 8) & 255u, v & 255u, 0u, v >> 16) / 255.0;\n"
+        "}\n";
+    /* Store: big-endian words, as guest memory lays out D24S8. */
+    static const char store_src[] = E12_Z24_HLSL_COMMON
+        "RWByteAddressBuffer O : register(u0);\n"
+        "[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {\n"
+        "  if (id.x >= w || id.y >= h) return;\n"
+        "  uint v = z24(D.Load(int3(id.xy, 0)));\n"
+        "  O.Store((id.y * w + id.x) * 4u, (v >> 16) | (((v >> 8) & 255u) << 8) | ((v & 255u) << 16));\n"
+        "}\n";
+    s_e12.z24_view_pso = e12_compute_pso(view_src);
+    s_e12.z24_store_pso = e12_compute_pso(store_src);
+    if (!s_e12.z24_view_pso || !s_e12.z24_store_pso) return -1;
+    s_e12.z24_failed = 0;
+    return 0;
+}
+/* Record the conversion of the top-left w x h of depth `z` into `out` (a UAV
+ * texture or a raw buffer). Two descriptors come from the shader-visible ring. */
+static int e12_z24_dispatch(e12_obj* z, ID3D12Resource* out, int buffer, u32 w, u32 h)
+{
+    if (s_e12.srv_gpu_next + 2 > ENG12_SRV_GPU_HEAP && (e12_submit_wait() || e12_begin())) return -1;
+    const u32 base = s_e12.srv_gpu_next; s_e12.srv_gpu_next += 2;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv; memset(&sv, 0, sizeof sv);
+    sv.Format = ENG12_DEPTH_SRV; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, z->res, &sv, e12_cpu(s_e12.srv_gpu, s_e12.srv_inc, base));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv; memset(&uv, 0, sizeof uv);
+    if (buffer) {
+        uv.Format = DXGI_FORMAT_R32_TYPELESS; uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uv.Buffer.NumElements = w * h; uv.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    } else {
+        uv.Format = DXGI_FORMAT_R8G8B8A8_UNORM; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    }
+    s_d3d.device->lpVtbl->CreateUnorderedAccessView(s_d3d.device, out, NULL, &uv, e12_cpu(s_e12.srv_gpu, s_e12.srv_inc, base + 1));
+    e12_transition(z, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ID3D12GraphicsCommandList* cl = s_e12.cl;
+    cl->lpVtbl->SetComputeRootSignature(cl, s_e12.z24_root);
+    cl->lpVtbl->SetPipelineState(cl, buffer ? s_e12.z24_store_pso : s_e12.z24_view_pso);
+    const u32 k[4] = { w, h, 0, 0 };
+    cl->lpVtbl->SetComputeRoot32BitConstants(cl, 0, 4, k, 0);
+    cl->lpVtbl->SetComputeRootDescriptorTable(cl, 1, e12_gpu(s_e12.srv_gpu, s_e12.srv_inc, base));
+    cl->lpVtbl->Dispatch(cl, (w + 7) / 8, (h + 7) / 8, 1);
+    e12_transition(z, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    return 0;
+}
+/* depth_z24_view: a texture reading the top-left w x h of the depth as the
+ * D24S8 words in a linear A8R8G8B8/D8R8G8B8 texture with the given crossbar.
+ * Encoded now, after every recorded draw; nothing waits. 0 when it cannot. */
+static u32 e12_depth_z24_view(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    EnterCriticalSection(&s_e12.lock);
+    u32 hd = 0;
+    e12_obj* z = e12_get(depth, E12_DEPTH);
+    if (z && w && h && w <= z->w && h <= z->h && e12_begin() == 0 && e12_z24_pipelines() == 0 && (hd = e12_alloc()) != 0) {
+        e12_obj* o = &s_e12o[hd];
+        D3D12_RESOURCE_DESC d = e12_tex_desc(DXGI_FORMAT_R8G8B8A8_UNORM, w, h, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        o->res = e12_committed(D3D12_HEAP_TYPE_DEFAULT, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL);
+        if (!o->res) { e12_count(E12_X_CREATE_FAILED); memset(o, 0, sizeof *o); hd = 0; }
+        else {
+            o->kind = E12_TEXTURE; o->fmt = DXGI_FORMAT_R8G8B8A8_UNORM; o->w = w; o->h = h; o->mips = 1; o->faces = 1;
+            o->bpp = 4; o->state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            o->srv = e12_make_srv(o->res, o->fmt, 1, 0, e12_mapping(remap, rsx_fmt));
+            if (!o->srv || e12_z24_dispatch(z, o->res, 0, w, h)) { e12_count(E12_X_CREATE_FAILED); e12_release_obj(hd); hd = 0; }
+        }
+    }
+    LeaveCriticalSection(&s_e12.lock);
+    return hd;
+}
+/* depth_store_z24: the top-left w x h as big-endian D24S8 words into `dst`
+ * (dst_pitch bytes per row), converted on the GPU after every recorded draw.
+ * Waits for the GPU, as a guest-memory store needs. 0 on success. */
+static int e12_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32 dst_pitch)
+{
+    (void)user;
+    int rc = -1;
+    EnterCriticalSection(&s_e12.lock);
+    e12_obj* z = e12_get(depth, E12_DEPTH);
+    if (!z || !dst || !w || !h || w > z->w || h > z->h || dst_pitch < w * 4u || e12_begin() || e12_z24_pipelines()) {
+        e12_count(E12_X_READBACK); LeaveCriticalSection(&s_e12.lock); return -1;
+    }
+    const u64 bytes = (u64)w * h * 4u;
+    D3D12_RESOURCE_DESC b; memset(&b, 0, sizeof b);
+    b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; b.Width = bytes; b.Height = 1; b.DepthOrArraySize = 1;
+    b.MipLevels = 1; b.SampleDesc.Count = 1; b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_RESOURCE_DESC bu = b; bu.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* buf = e12_committed(D3D12_HEAP_TYPE_DEFAULT, &bu, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL);
+    ID3D12Resource* rb = e12_committed(D3D12_HEAP_TYPE_READBACK, &b, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
+    if (buf && rb && e12_z24_dispatch(z, buf, 1, w, h) == 0) {
+        D3D12_RESOURCE_BARRIER t; memset(&t, 0, sizeof t);
+        t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; t.Transition.pResource = buf;
+        t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        t.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; t.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        s_e12.cl->lpVtbl->ResourceBarrier(s_e12.cl, 1, &t);
+        s_e12.cl->lpVtbl->CopyBufferRegion(s_e12.cl, rb, 0, buf, 0, bytes);
+        if (e12_submit_wait() == 0) {
+            void* p = NULL; D3D12_RANGE rr = { 0, (SIZE_T)bytes };
+            if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &p))) {
+                for (u32 r = 0; r < h; r++) memcpy(dst + (size_t)r * dst_pitch, (u8*)p + (size_t)r * w * 4u, (size_t)w * 4u);
+                D3D12_RANGE none = { 0, 0 }; rb->lpVtbl->Unmap(rb, 0, &none);
+                rc = 0;
+            }
+        }
+    }
+    if (rc) e12_count(E12_X_READBACK);
+    if (buf) e12_retire((IUnknown*)buf);
+    if (rb) e12_retire((IUnknown*)rb);
+    LeaveCriticalSection(&s_e12.lock);
+    return rc;
+}
 static void e12_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch)
 {
     (void)user;
@@ -1533,6 +1712,7 @@ static const rsx_draw_backend s_d3d12_engine_backend = {
     .submit_and_wait_checked = e12_submit_and_wait_checked,
     .submit_async = e12_submit_async, .completion_status = e12_completion_status,
     .color_snapshot = e12_color_snapshot,
+    .depth_store_z24 = e12_depth_store_z24, .depth_z24_view = e12_depth_z24_view,
 };
 
 /* Called from rsx_d3d12_backend_init once the device, queue and swapchain

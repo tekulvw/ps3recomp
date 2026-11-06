@@ -296,6 +296,56 @@ int main(void)
     b->texture_release(b->user, snapc);
     CHECK(s_e12o[sview].kind == E12_FREE, "releasing a snapshot releases its views");
 
+    /* Depth as D24S8 words on the GPU. Left half drawn at 0.5, right half
+     * cleared to 0.75: depth_store_z24 must equal depth_readback plus the
+     * engine's conversion, and a z24 view must sample like a texture made
+     * from the decoded words. */
+    {
+        const u32 zz = b->depth_target_create(b->user, 64, 64);
+        b->clear_depth_stencil(b->user, zz, RSX_BE_CLEAR_DEPTH, 0.75f, 0);   /* LEQUAL lets 0.5 through */
+        b->bind_targets(b->user, &rt, 1, zz);
+        b->set_scissor(b->user, 0, 0, 32, 64);
+        draw_full(b, pdepth);
+        b->set_scissor(b->user, 0, 0, 64, 64);
+        CHECK(b->depth_store_z24 && b->depth_z24_view, "z24 store and view present");
+        static float df[64 * 64]; static u8 words[64 * 64 * 4], expect_words[64 * 64 * 4];
+        CHECK(b->depth_readback(b->user, zz, 0, 0, 64, 64, df, 64 * 4) == 0, "readback for the z24 reference");
+        for (int i = 0; i < 64 * 64; i++) {
+            float d = df[i]; d = d > 0.0f ? d : 0.0f; d = d < 1.0f ? d : 1.0f;
+            const u32 v = (u32)((double)d * 16777215.0 + 0.5);
+            expect_words[4 * i] = (u8)(v >> 16); expect_words[4 * i + 1] = (u8)(v >> 8);
+            expect_words[4 * i + 2] = (u8)v; expect_words[4 * i + 3] = 0;
+        }
+        memset(words, 0xA5, sizeof words);
+        CHECK(b->depth_store_z24(b->user, zz, 64, 64, words, 64 * 4) == 0, "z24 store succeeds");
+        CHECK(memcmp(words, expect_words, sizeof words) == 0, "z24 store equals readback plus the CPU conversion");
+        CHECK(expect_words[0] == 0x80 && expect_words[4 * 63] == 0xBF, "reference holds both depths (0.5 and 0.75)");
+        u8 part[10 * 3 * 4]; memset(part, 0xA5, sizeof part);
+        CHECK(b->depth_store_z24(b->user, zz, 3, 3, part, 40) == 0 && memcmp(part, expect_words, 12) == 0 &&
+              part[12] == 0xA5, "z24 store honours w, h and the destination pitch");
+        /* View vs a texture of the decoded words (A,R,G,B = word bytes 0..3 -> RGBA8 R,G,B,A = 1,2,3,0). */
+        const u32 zv = b->depth_z24_view(b->user, zz, 64, 64, 0xAAE4u, 0x85u);
+        CHECK(zv != 0, "z24 view");
+        static u8 decoded[64 * 64 * 4];
+        for (int i = 0; i < 64 * 64; i++) {
+            decoded[4 * i] = expect_words[4 * i + 1]; decoded[4 * i + 1] = expect_words[4 * i + 2];
+            decoded[4 * i + 2] = expect_words[4 * i + 3]; decoded[4 * i + 3] = expect_words[4 * i];
+        }
+        const u32 ref = b->texture_create(b->user, RSX_BE_FMT_R8G8B8A8, 64, 64, 1, 1, 0xAAE4u, 0x85u);
+        b->texture_upload(b->user, ref, 0, 0, 64, 64, decoded, 64 * 4, 64);
+        b->bind_targets(b->user, &rt, 1, 0);
+        u32 zunits[RSX_BE_MAX_TEXTURES] = { zv };
+        b->bind_textures(b->user, zunits, sd, 1u); draw_full(b, ptex);
+        const u32 left_v = px(b, rt, 8, 8), right_v = px(b, rt, 56, 8);
+        zunits[0] = ref; b->bind_textures(b->user, zunits, sd, 1u); draw_full(b, ptex);
+        const u32 left_r = px(b, rt, 8, 8), right_r = px(b, rt, 56, 8);
+        if (left_v != left_r || right_v != right_r || left_v == right_v)
+            fprintf(stderr, "     z24 view %08X %08X, texture %08X %08X\n", left_v, right_v, left_r, right_r);
+        CHECK(left_v == left_r && right_v == right_r && left_v != right_v, "z24 view samples like the decoded texture");
+        b->texture_release(b->user, zv); b->texture_release(b->user, ref);
+        b->depth_target_release(b->user, zz);
+    }
+
     /* color_target_write at an offset. */
     u8 rows[2 * 2 * 4]; for (int i = 0; i < 4; i++) { rows[4 * i] = 1; rows[4 * i + 1] = 2; rows[4 * i + 2] = 3; rows[4 * i + 3] = 4; }
     b->color_target_write(b->user, rt, 10, 20, 2, 2, rows, 8);
