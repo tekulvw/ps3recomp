@@ -733,8 +733,7 @@ static void eng_churn_note(u32 kind, u32 location, u32 offset, u32 ofmt, u32 ow,
 static void eng_churn_flip(void)
 {
     if (!eng_churn_enabled()) return;
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    const unsigned long long now = (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+    const unsigned long long now = (unsigned long long)eng_ph_now();   /* monotonic ns on every host */
     if (!s_churn_t0) s_churn_t0 = now;
     if (now - s_churn_t0 < 2000000000ull) return;
     const double secs = (double)(now - s_churn_t0) / 1e9;
