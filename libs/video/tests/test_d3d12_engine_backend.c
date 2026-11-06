@@ -425,6 +425,8 @@ int main(void)
     CHECK(b->completion_status(b->user, first, 0) == 1, "earlier ticket complete once a later one is");
     CHECK(s_e12.count[E12_X_ASYNC_REFUSED] == 0, "no async refusal");
     CHECK(b->submit_and_wait_checked(b->user, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "checked flush after async");
+    CHECK(s_e12.waits[E12_W_ENGINE_CHECKED] >= 2 && s_e12.waits[E12_W_COLOR_READBACK] > 0 &&
+          s_e12.waits[E12_W_DEPTH_READBACK] > 0, "waits are counted by site");
 
     b->shutdown(b->user);
     const int verrors = validation_errors();

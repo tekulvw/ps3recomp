@@ -49,6 +49,12 @@
 
 enum { E12_FREE = 0, E12_TEXTURE, E12_COLOR, E12_DEPTH, E12_PIPELINE, E12_VIEW };
 
+/* Where the engine waits for the GPU; counted per site and printed with the stats. */
+enum { E12_W_PRESENT, E12_W_ENGINE_FLUSH, E12_W_ENGINE_CHECKED, E12_W_COLOR_READBACK, E12_W_DEPTH_READBACK,
+       E12_W_Z24_STORE, E12_W_UPLOAD_RING, E12_W_SRV_TABLES, E12_W_SAMPLER_TABLES, E12_W_SHUTDOWN, E12_W_SITES };
+static const char* const s_e12_wait_site[E12_W_SITES] = {
+    "present", "engine_flush", "engine_checked", "color_readback", "depth_readback",
+    "z24_store", "upload_ring", "srv_tables", "sampler_tables", "shutdown" };
 /* Reasons something was refused or fell back; every one is counted. */
 enum {
     E12_X_FORMAT, E12_X_TABLE_FULL, E12_X_CREATE_FAILED, E12_X_COMPILE_VS, E12_X_COMPILE_PS,
@@ -121,6 +127,7 @@ static struct {
     u32 stab_n;
     u64 count[E12_X_REASONS];
     u64 draws, presents, flushes, submits, async_submits;
+    u64 waits[E12_W_SITES];
 } s_e12;
 static e12_obj s_e12o[ENG12_MAX_OBJ];
 
@@ -247,8 +254,9 @@ static u64 e12_execute(void)
     s_e12.alloc_fence[s_e12.cur_alloc] = v;
     return v;
 }
-static int e12_submit_wait(void)
+static int e12_submit_wait(int site)
 {
+    if (site >= 0 && site < E12_W_SITES) s_e12.waits[site]++;
     const int rc = s_e12.failed ? -1 : 0;
     const u64 v = e12_execute();
     if (!v || e12_wait_fence(v)) return -1;
@@ -265,7 +273,7 @@ static void* e12_upload(u64 bytes, u64 align, D3D12_GPU_VIRTUAL_ADDRESS* gpu, u6
     if (bytes > ENG12_UPLOAD_RING) { e12_count(E12_X_UPLOAD_TOO_LARGE); return NULL; }
     u64 at = (s_e12.upload_next + align - 1) & ~(align - 1);
     if (at + bytes > ENG12_UPLOAD_RING) {
-        if (e12_submit_wait() || e12_begin()) return NULL;
+        if (e12_submit_wait(E12_W_UPLOAD_RING) || e12_begin()) return NULL;
         at = 0;
     }
     s_e12.upload_next = at + bytes;
@@ -625,9 +633,9 @@ fail:
 static void e12_shutdown(void* user)
 {
     (void)user;
-    if (s_e12.fence) e12_submit_wait();
+    if (s_e12.fence) e12_submit_wait(E12_W_SHUTDOWN);
     for (u32 i = 1; i < ENG12_MAX_OBJ; i++) e12_release_obj(i);
-    if (s_e12.fence) e12_submit_wait();
+    if (s_e12.fence) e12_submit_wait(E12_W_SHUTDOWN);
     e12_retire_now(~0ull);
     free(s_e12.retire);
     if (s_e12.upload && s_e12.upload_ptr) s_e12.upload->lpVtbl->Unmap(s_e12.upload, 0, NULL);
@@ -645,14 +653,14 @@ static void e12_submit_and_wait(void* user, u32 reason)
 {
     (void)user; (void)reason;
     EnterCriticalSection(&s_e12.lock);
-    e12_submit_wait();
+    e12_submit_wait(E12_W_ENGINE_FLUSH);
     LeaveCriticalSection(&s_e12.lock);
 }
 static int e12_submit_and_wait_checked(void* user, u32 reason)
 {
     (void)user; (void)reason;
     EnterCriticalSection(&s_e12.lock);
-    const int ok = e12_submit_wait() == 0 && !s_e12.failed;
+    const int ok = e12_submit_wait(E12_W_ENGINE_CHECKED) == 0 && !s_e12.failed;
     LeaveCriticalSection(&s_e12.lock);
     return ok;
 }
@@ -1189,7 +1197,7 @@ static int e12_sampler_table(const rsx_be_sampler_desc* d, u32 n, D3D12_GPU_DESC
         }
     if (s_e12.samp_gpu_next + n > ENG12_SAMP_GPU_HEAP || s_e12.stab_n == sizeof s_e12.stab / sizeof s_e12.stab[0]) {
         e12_count(E12_X_SAMPLER_TABLES);
-        if (e12_submit_wait() || e12_begin()) return -1;
+        if (e12_submit_wait(E12_W_SAMPLER_TABLES) || e12_begin()) return -1;
         s_e12.samp_gpu_next = 0; s_e12.stab_n = 0;
     }
     const u32 base = s_e12.samp_gpu_next;
@@ -1206,7 +1214,7 @@ static int e12_sampler_table(const rsx_be_sampler_desc* d, u32 n, D3D12_GPU_DESC
 static int e12_srv_table(const u32* srv_slots, u32 n, D3D12_GPU_DESCRIPTOR_HANDLE* out)
 {
     if (s_e12.srv_gpu_next + n > ENG12_SRV_GPU_HEAP) {
-        if (e12_submit_wait() || e12_begin()) return -1;
+        if (e12_submit_wait(E12_W_SRV_TABLES) || e12_begin()) return -1;
     }
     const u32 base = s_e12.srv_gpu_next;
     for (u32 i = 0; i < n; i++)
@@ -1418,6 +1426,8 @@ static void e12_print_stats(void)
     if (any)
         for (int i = 0; i < E12_X_REASONS; i++)
             if (s_e12.count[i]) printf(" %s=%llu", s_e12_reason[i], (unsigned long long)s_e12.count[i]);
+    for (int i = 0; i < E12_W_SITES; i++)
+        if (s_e12.waits[i]) printf(" wait_%s=%llu", s_e12_wait_site[i], (unsigned long long)s_e12.waits[i]);
     { const u64 unstored = rsx_draw_engine_depth_unstored_count();
       if (unstored) printf(" engine_depth_unstored=%llu", (unsigned long long)unstored);
       const u64 feedback = rsx_draw_engine_feedback_unserved_count();
@@ -1504,7 +1514,7 @@ static void e12_present(void* user, u32 surface)
             cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
         }
         e12_transition(&back, D3D12_RESOURCE_STATE_PRESENT);
-        e12_submit_wait();
+        e12_submit_wait(E12_W_PRESENT);
         s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0, 0);
         e12_dump(surface, o);
     }
@@ -1539,7 +1549,7 @@ static int e12_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
     d.PlacedFootprint.Footprint.Height = z->h; d.PlacedFootprint.Footprint.Depth = 1; d.PlacedFootprint.Footprint.RowPitch = pitch;
     s_e12.cl->lpVtbl->CopyTextureRegion(s_e12.cl, &d, 0, 0, 0, &src, NULL);
     e12_transition(z, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-    if (e12_submit_wait() == 0) {
+    if (e12_submit_wait(E12_W_COLOR_READBACK) == 0) {
         void* p = NULL; D3D12_RANGE rr = { 0, (SIZE_T)pitch * z->h };
         if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &p))) {
             for (u32 r = 0; r < h; r++)
@@ -1638,7 +1648,7 @@ static int e12_z24_pipelines(void)
  * texture or a raw buffer). Two descriptors come from the shader-visible ring. */
 static int e12_z24_dispatch(e12_obj* z, ID3D12Resource* out, int buffer, u32 w, u32 h)
 {
-    if (s_e12.srv_gpu_next + 2 > ENG12_SRV_GPU_HEAP && (e12_submit_wait() || e12_begin())) return -1;
+    if (s_e12.srv_gpu_next + 2 > ENG12_SRV_GPU_HEAP && (e12_submit_wait(E12_W_SRV_TABLES) || e12_begin())) return -1;
     const u32 base = s_e12.srv_gpu_next; s_e12.srv_gpu_next += 2;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv; memset(&sv, 0, sizeof sv);
     sv.Format = ENG12_DEPTH_SRV; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
@@ -1713,7 +1723,7 @@ static int e12_depth_store_z24(void* user, u32 depth, u32 w, u32 h, u8* dst, u32
         t.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; t.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         s_e12.cl->lpVtbl->ResourceBarrier(s_e12.cl, 1, &t);
         s_e12.cl->lpVtbl->CopyBufferRegion(s_e12.cl, rb, 0, buf, 0, bytes);
-        if (e12_submit_wait() == 0) {
+        if (e12_submit_wait(E12_W_Z24_STORE) == 0) {
             void* p = NULL; D3D12_RANGE rr = { 0, (SIZE_T)bytes };
             if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &p))) {
                 for (u32 r = 0; r < h; r++) memcpy(dst + (size_t)r * dst_pitch, (u8*)p + (size_t)r * w * 4u, (size_t)w * 4u);
@@ -1749,7 +1759,7 @@ static void e12_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, vo
     d.PlacedFootprint.Footprint.Height = h; d.PlacedFootprint.Footprint.Depth = 1; d.PlacedFootprint.Footprint.RowPitch = pitch;
     D3D12_BOX box = { x, y, 0, x + w, y + h, 1 };
     s_e12.cl->lpVtbl->CopyTextureRegion(s_e12.cl, &d, 0, 0, 0, &s, &box);
-    if (e12_submit_wait() == 0) {
+    if (e12_submit_wait(E12_W_DEPTH_READBACK) == 0) {
         void* p = NULL; D3D12_RANGE rr = { 0, (SIZE_T)pitch * h };
         if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &p))) {
             for (u32 r = 0; r < h; r++) memcpy((u8*)out + (size_t)r * out_pitch, (u8*)p + (size_t)r * pitch, tight);
