@@ -20,7 +20,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ["libs/video/tests/test_d3d12_engine_backend.c"] + ["libs/video/" + n + ".c" for n in (
     "rsx_draw_engine", "rsx_commands", "rsx_dispatch", "rsx_texture_layout", "rsx_vertex_compact",
-    "rsx_vertex_fetch", "rsx_vp_decompiler", "rsx_fp_decompiler")] + [
+    "rsx_vertex_fetch", "rsx_vp_decompiler", "rsx_fp_decompiler", "rsx_fifo_busy")] + [
     "runtime/diagnostics/critical_trace.c", "runtime/diagnostics/render_ablation.c"]
 
 
