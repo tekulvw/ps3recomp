@@ -90,6 +90,16 @@ typedef struct {
 } e12_obj;
 
 typedef struct { IUnknown* res; u64 fence; } e12_retiree;
+/* A fenced ring (the upload buffer). Each submission
+ * closes a segment ending at the head; a segment's space comes back once the
+ * GPU passes its fence. Allocation waits only for the oldest segment when the
+ * ring is full, never for the whole queue. */
+#define E12_RING_SEGS 1024
+typedef struct { u64 fence, end; } e12_ring_seg;
+typedef struct {
+    u64 size, head, tail, rec_start;
+    e12_ring_seg seg[E12_RING_SEGS]; u32 first, nseg;
+} e12_ring;
 
 static struct {
     int active, ready, recording, failed;
@@ -105,7 +115,8 @@ static struct {
     u32 rtv_inc, dsv_inc, srv_inc, samp_inc;
     u8  rtv_used[ENG12_RTV_HEAP], dsv_used[ENG12_DSV_HEAP], srv_used[ENG12_SRV_CPU_HEAP];
     u32 srv_gpu_next, samp_gpu_next, srv_gpu_cap;
-    ID3D12Resource* upload; u8* upload_ptr; u64 upload_next;
+    ID3D12Resource* upload; u8* upload_ptr;
+    e12_ring upload_ring;
     e12_retiree* retire; u32 retire_n, retire_cap;
     u32 null_srv2d, null_srvcube;    /* CPU SRV slots + 1 */
     /* present blit */
@@ -239,6 +250,54 @@ static void e12_drain_info_queue(void)
 }
 /* Execute what is recorded and wait for it: the engine's synchronous contract.
  * After the wait every ring restarts and every retirement is due. */
+static void e12_ring_reset(e12_ring* r) { r->head = r->tail = r->rec_start = 0; r->first = r->nseg = 0; }
+static void e12_ring_reclaim(e12_ring* r, u64 done)
+{
+    while (r->nseg && r->seg[r->first].fence <= done) {
+        r->tail = r->seg[r->first].end;
+        r->first = (r->first + 1) % E12_RING_SEGS; r->nseg--;
+    }
+    if (!r->nseg && r->head == r->rec_start && r->tail == r->head) e12_ring_reset(r);
+}
+/* Close the current recording's part of the ring under fence `v`. */
+static void e12_ring_close(e12_ring* r, u64 v)
+{
+    if (r->head == r->rec_start) return;
+    if (r->nseg == E12_RING_SEGS) {   /* fold into the newest segment: same fence order */
+        r->seg[(r->first + r->nseg - 1) % E12_RING_SEGS] = (e12_ring_seg){ v, r->head };
+    } else {
+        r->seg[(r->first + r->nseg) % E12_RING_SEGS] = (e12_ring_seg){ v, r->head };
+        r->nseg++;
+    }
+    r->rec_start = r->head;
+}
+static int e12_submit_wait(int site);
+static int e12_begin(void);
+static int e12_wait_fence(u64 v);
+/* Space for n units at `align`; -1 if it can never fit. Waits for the oldest
+ * segment when full (counted at `site`); a full wait only when the current,
+ * unsubmitted recording alone fills the ring. */
+static int e12_ring_alloc(e12_ring* r, u64 n, u64 align, int site, u64* at_out)
+{
+    if (n + align >= r->size) return -1;
+    for (;;) {
+        e12_ring_reclaim(r, s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence));
+        /* In use: [tail, head) wrapping at size; head == tail means empty. The
+         * head never catches the tail from behind, so that stays unambiguous. */
+        const u64 at = (r->head + align - 1) & ~(align - 1);
+        u64 pos = ~0ull;
+        if (r->head >= r->tail) {
+            if (at + n <= r->size) pos = at;
+            else if (n < r->tail) pos = 0;        /* wrap; the skipped end frees with its segment */
+        } else if (at + n < r->tail) pos = at;
+        if (pos != ~0ull) { r->head = pos + n; *at_out = pos; return 0; }
+        if (site >= 0 && site < E12_W_SITES) s_e12.waits[site]++;
+        if (r->nseg) {
+            if (e12_wait_fence(r->seg[r->first].fence)) return -1;
+        } else if (e12_submit_wait(-1) || e12_begin()) return -1;
+    }
+}
+
 /* Execute what is recorded and signal the fence after it; returns the value
  * that completes it, 0 on failure. The allocator stays busy until then. */
 static u64 e12_execute(void)
@@ -253,6 +312,7 @@ static u64 e12_execute(void)
     const u64 v = ++s_e12.fence_value;
     if (FAILED(s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_e12.fence, v))) { s_e12.failed = 1; return 0; }
     s_e12.alloc_fence[s_e12.cur_alloc] = v;
+    e12_ring_close(&s_e12.upload_ring, v);
     return v;
 }
 static int e12_submit_wait(int site)
@@ -263,7 +323,7 @@ static int e12_submit_wait(int site)
     if (!v || e12_wait_fence(v)) return -1;
     e12_retire_now(v);
     e12_drain_info_queue();
-    s_e12.upload_next = 0;
+    e12_ring_reset(&s_e12.upload_ring);
     s_e12.srv_gpu_next = 0;
     s_e12.flushes++;
     return rc;
@@ -271,13 +331,10 @@ static int e12_submit_wait(int site)
 /* Upload-ring space; a full ring flushes (submit + wait) and starts over. */
 static void* e12_upload(u64 bytes, u64 align, D3D12_GPU_VIRTUAL_ADDRESS* gpu, u64* offset)
 {
-    if (bytes > ENG12_UPLOAD_RING) { e12_count(E12_X_UPLOAD_TOO_LARGE); return NULL; }
-    u64 at = (s_e12.upload_next + align - 1) & ~(align - 1);
-    if (at + bytes > ENG12_UPLOAD_RING) {
-        if (e12_submit_wait(E12_W_UPLOAD_RING) || e12_begin()) return NULL;
-        at = 0;
+    u64 at = 0;
+    if (bytes >= ENG12_UPLOAD_RING / 2 || e12_ring_alloc(&s_e12.upload_ring, bytes, align, E12_W_UPLOAD_RING, &at)) {
+        e12_count(E12_X_UPLOAD_TOO_LARGE); return NULL;
     }
-    s_e12.upload_next = at + bytes;
     if (gpu) *gpu = s_e12.upload->lpVtbl->GetGPUVirtualAddress(s_e12.upload) + at;
     if (offset) *offset = at;
     return s_e12.upload_ptr + at;
@@ -639,6 +696,7 @@ static int e12_init(void* user, u32 width, u32 height)
     s_e12.null_srvcube = e12_make_srv(NULL, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     if (!s_e12.null_srv2d || !s_e12.null_srvcube || e12_root_signature() || e12_blit_pipeline()) goto fail;
     s_e12.dbounds[0] = 0.0f; s_e12.dbounds[1] = 1.0f;
+    s_e12.upload_ring.size = ENG12_UPLOAD_RING;
     s_e12.ready = 1;
     printf("[D3D12 engine] backend ready (depth bounds %s)\n", s_e12.depth_bounds_ok ? "on" : "unsupported");
     return 0;

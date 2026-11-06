@@ -435,6 +435,31 @@ int main(void)
         b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         CHECK(s_e12.waits[E12_W_SRV_TABLES] == before, "4000 draws without a descriptor-ring wait");
     }
+    /* Fenced upload ring: shrink it so many async batches must wrap it.
+     * Space returns as the GPU passes each batch's fence; no full wait is
+     * needed, and the drawing stays correct. */
+    {
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        const u64 keep_up = s_e12.upload_ring.size;
+        s_e12.upload_ring.size = 4u << 20;     /* a few batches of constants and vertices */
+        const u64 flushes = s_e12.flushes;
+        b->bind_targets(b->user, &rt, 1, 0);
+        int ok = 1;
+        for (int batch = 0; batch < 40; batch++) {
+            for (int i = 0; i < 60; i++) draw_full(b, pipe);
+            if (!b->submit_async(b->user, RSX_BE_FLUSH_GUEST_REFERENCE)) ok = 0;
+        }
+        CHECK(ok, "40 async batches over small rings");
+        if (s_e12.flushes != flushes) fprintf(stderr, "     full waits %llu, up head %llu tail %llu segs %u\n",
+            (unsigned long long)(s_e12.flushes - flushes), (unsigned long long)s_e12.upload_ring.head,
+            (unsigned long long)s_e12.upload_ring.tail, s_e12.upload_ring.nseg);
+        CHECK(s_e12.flushes == flushes, "rings wrapped without a full GPU wait");
+        CHECK(s_e12.upload_ring.head <= s_e12.upload_ring.size,
+              "ring heads stay inside the rings");
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        CHECK(px(b, rt, 32, 32) != 0xFF0000FFu, "drawing through wrapped rings is correct");
+        s_e12.upload_ring.size = keep_up;
+    }
     CHECK(s_e12.waits[E12_W_ENGINE_CHECKED] >= 2 && s_e12.waits[E12_W_COLOR_READBACK] > 0 &&
           s_e12.waits[E12_W_DEPTH_READBACK] > 0, "waits are counted by site");
 
