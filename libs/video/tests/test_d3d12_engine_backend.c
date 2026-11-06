@@ -649,9 +649,112 @@ int main(void)
         b->bind_targets(b->user, &rt, 1, 0);
         draw_full(b, pipe);
         CHECK(px(b, rt, 32, 32) != 0xFF0000FFu && !s_e12_owner.failed && !s_e12.failed, "engine continues after native leases");
+        /* Image leases on the engine's own targets: borrow names the resource
+         * and its contract state, the boundary moves it there and submits,
+         * native work draws into it, and the engine sees that work after it.
+         * A retained image outlives the engine freeing the target but no
+         * longer validates; a reused handle is a new generation. */
+        {
+            const u32 dz = b->depth_target_create(b->user, 64, 64);
+            rsx_native_image ci, zi, bad;
+            memset(&ci, 0, sizeof ci); ci.abi_version = RSX_NATIVE_IMAGE_ABI; ci.struct_size = sizeof ci; zi = ci; bad = ci;
+            const rsx_native_d3d12_image* cp = NULL; const rsx_native_d3d12_image* zp = NULL;
+            CHECK(rsx_d3d12_backend_borrow_image(o.lifetime, rt, &ci) == 0 && (cp = (const rsx_native_d3d12_image*)ci.image) &&
+                  ci.backend == RSX_NATIVE_OWNER_D3D12 && ci.format == RSX_NATIVE_IMAGE_RGBA8 && ci.width == 64 &&
+                  ci.height == 64 && ci.resource_id == rt && ci.resource_generation && cp->resource == (void*)s_e12o[rt].res &&
+                  cp->abi_version == RSX_NATIVE_D3D12_IMAGE_ABI && cp->acquire_state == D3D12_RESOURCE_STATE_RENDER_TARGET &&
+                  cp->handback_state == D3D12_RESOURCE_STATE_RENDER_TARGET,
+                  "borrow a colour target: its resource and the RENDER_TARGET contract");
+            CHECK(dz && rsx_d3d12_backend_borrow_image(o.lifetime, dz, &zi) == 0 && (zp = (const rsx_native_d3d12_image*)zi.image) &&
+                  zi.format == RSX_NATIVE_IMAGE_D32S8 && zp->acquire_state == D3D12_RESOURCE_STATE_DEPTH_WRITE &&
+                  zp->handback_state == D3D12_RESOURCE_STATE_DEPTH_WRITE, "borrow a depth target: the DEPTH_WRITE contract");
+            CHECK(rsx_d3d12_backend_borrow_image(o.lifetime, pipe, &bad) == -3 &&
+                  rsx_d3d12_backend_borrow_image(o.lifetime + 1, rt, &bad) == -3 &&
+                  rsx_d3d12_backend_borrow_image(o.lifetime, 0, &bad) == -3, "borrow refuses non-targets and a stale lifetime");
+            CHECK(ci.retain(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation) == 0 &&
+                  zi.retain(zi.userdata, zi.owner_lifetime, zi.resource_id, zi.resource_generation) == 0, "retain both images");
+            CHECK(ci.validate(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation) == -4,
+                  "validate only under the native lease");
+            (void)px(b, rt, 1, 1);   /* the engine leaves the target as a copy source */
+            u64 ticket = 0;
+            CHECK(rsx_d3d12_backend_native_boundary(&ticket) == -3 && ticket == 0,
+                  "the public boundary asks the common engine (inactive in this fixture)");
+            CHECK(e12_native_boundary(0, &ticket) == 0 && ticket && ticket == s_e12.fence_value && !s_e12.recording &&
+                  s_e12o[rt].state == D3D12_RESOURCE_STATE_RENDER_TARGET && s_e12o[dz].state == D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                  "boundary submits with borrowed images in their contract state");
+            CHECK(o.try_begin(o.userdata, o.lifetime) == 0, "lease after the boundary");
+            CHECK(ci.validate(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation) == 0 &&
+                  zi.validate(zi.userdata, zi.owner_lifetime, zi.resource_id, zi.resource_generation) == 0,
+                  "both images validate under the lease");
+            CHECK(rsx_d3d12_backend_validate_image_planes(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation, 1) == -3,
+                  "clear-plane evidence comes from the common engine (inactive here)");
+            ID3D12Device* dv = (ID3D12Device*)o.device; ID3D12CommandQueue* q = (ID3D12CommandQueue*)o.queue;
+            ID3D12DescriptorHeap *rh = NULL, *dh = NULL; ID3D12CommandAllocator* na = NULL;
+            ID3D12GraphicsCommandList* nl = NULL; ID3D12Fence* nf = NULL;
+            D3D12_DESCRIPTOR_HEAP_DESC rd; memset(&rd, 0, sizeof rd); rd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rd.NumDescriptors = 1;
+            D3D12_DESCRIPTOR_HEAP_DESC dd = rd; dd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+            const int made = cp && zp &&
+                SUCCEEDED(dv->lpVtbl->CreateDescriptorHeap(dv, &rd, &IID_ID3D12DescriptorHeap, (void**)&rh)) &&
+                SUCCEEDED(dv->lpVtbl->CreateDescriptorHeap(dv, &dd, &IID_ID3D12DescriptorHeap, (void**)&dh)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandAllocator(dv, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&na)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandList(dv, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, na, NULL, &IID_ID3D12GraphicsCommandList, (void**)&nl)) &&
+                SUCCEEDED(dv->lpVtbl->CreateFence(dv, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&nf));
+            CHECK(made, "native views and list on the borrowed device");
+            if (made) {   /* acquired and handed back in the contract states: no barriers needed */
+                D3D12_CPU_DESCRIPTOR_HANDLE rv, zv;
+                rh->lpVtbl->GetCPUDescriptorHandleForHeapStart(rh, &rv); dh->lpVtbl->GetCPUDescriptorHandleForHeapStart(dh, &zv);
+                dv->lpVtbl->CreateRenderTargetView(dv, (ID3D12Resource*)cp->resource, NULL, rv);
+                D3D12_DEPTH_STENCIL_VIEW_DESC zd; memset(&zd, 0, sizeof zd);
+                zd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; zd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+                dv->lpVtbl->CreateDepthStencilView(dv, (ID3D12Resource*)zp->resource, &zd, zv);
+                const float native_blue[4] = { 0, 0, 1, 1 };
+                nl->lpVtbl->ClearRenderTargetView(nl, rv, native_blue, 0, NULL);
+                nl->lpVtbl->ClearDepthStencilView(nl, zv, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, NULL);
+                nl->lpVtbl->Close(nl);
+                ID3D12CommandList* lists[1] = { (ID3D12CommandList*)nl };
+                q->lpVtbl->ExecuteCommandLists(q, 1, lists);
+                q->lpVtbl->Signal(q, nf, 1);
+            }
+            o.end(o.userdata, o.lifetime);
+            float zval = 0;
+            CHECK(made && px(b, rt, 7, 9) == 0xFFFF0000u, "engine reads the native colour work queued after the boundary");
+            CHECK(made && b->depth_readback(b->user, dz, 3, 4, 1, 1, &zval, 4) == 0 && zval == 0.25f,
+                  "engine reads the native depth work queued after the boundary");
+            if (made) {
+                HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+                nf->lpVtbl->SetEventOnCompletion(nf, 1, ev); WaitForSingleObject(ev, 5000); CloseHandle(ev);
+            }
+            if (nf) nf->lpVtbl->Release(nf); if (nl) nl->lpVtbl->Release(nl); if (na) na->lpVtbl->Release(na);
+            if (dh) dh->lpVtbl->Release(dh); if (rh) rh->lpVtbl->Release(rh);
+            ID3D12Resource* kept = cp ? (ID3D12Resource*)cp->resource : NULL;
+            b->color_target_release(b->user, rt);
+            b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);   /* the engine's fenced retirement runs */
+            ULONG refs = 0;
+            if (kept) { refs = kept->lpVtbl->AddRef(kept); kept->lpVtbl->Release(kept); }
+            CHECK(refs == 2, "a retained image keeps the resource after the engine frees the target");
+            CHECK(e12_native_boundary(0, &ticket) == 0 && o.try_begin(o.userdata, o.lifetime) == 0 &&
+                  ci.validate(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation) == -3 &&
+                  zi.validate(zi.userdata, zi.owner_lifetime, zi.resource_id, zi.resource_generation) == 0,
+                  "a freed target no longer validates; the other still does");
+            o.end(o.userdata, o.lifetime);
+            CHECK(ci.retain(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation) == -3,
+                  "a freed target cannot be retained again");
+            const u32 rt2 = b->color_target_create(b->user, RSX_BE_FMT_R8G8B8A8, 64, 64, NULL, 0);
+            rsx_native_image c2 = bad;
+            CHECK(rt2 && rsx_d3d12_backend_borrow_image(o.lifetime, rt2, &c2) == 0 && c2.resource_generation != ci.resource_generation &&
+                  (rt2 != rt || ci.retain(ci.userdata, ci.owner_lifetime, rt2, ci.resource_generation) == -3),
+                  "a new target in a reused handle is a new generation");
+            ci.release(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation);
+            zi.release(zi.userdata, zi.owner_lifetime, zi.resource_id, zi.resource_generation);
+            CHECK(s_e12_owner.retained == 1 && !e12_image_find(ci.resource_id, ci.resource_generation),
+                  "image releases balance and the freed target's record goes");
+            CHECK(s_e12_image_stats.borrows == 3 && s_e12_image_stats.retains == 2 && s_e12_image_stats.boundaries == 2 &&
+                  s_e12_image_stats.transitions >= 1, "image leases counted");
+            b->color_target_release(b->user, rt2); b->depth_target_release(b->user, dz);
+        }
         o.release(o.userdata, o.lifetime);
         CHECK(o.try_begin(o.userdata, o.lifetime) == -3, "release ends lease rights");
-        CHECK(s_e12_owner_stats.grants == 2 && s_e12_owner_stats.refused_dirty + s_e12_owner_stats.refused_busy >= 1,
+        CHECK(s_e12_owner_stats.grants == 4 && s_e12_owner_stats.refused_dirty + s_e12_owner_stats.refused_busy >= 1,
               "lease grants and refusals counted");
         atomic_store(&s_e12_owner_setting, 0);
     }

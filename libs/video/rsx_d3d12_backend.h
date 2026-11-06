@@ -27,6 +27,7 @@
 
 #ifndef PS3RECOMP_RSX_D3D12_BACKEND_H
 #define PS3RECOMP_RSX_D3D12_BACKEND_H
+#include <stdint.h>
 
 #include "rsx_commands.h"
 
@@ -52,6 +53,21 @@ int rsx_d3d12_backend_pump_messages(void);
 struct rsx_native_owner; struct rsx_native_owner_v2;
 int rsx_d3d12_backend_borrow_owner(struct rsx_native_owner* out);
 int rsx_d3d12_backend_borrow_owner_v2(struct rsx_native_owner_v2* out);
+/* Native image leases on the engine's existing colour and depth targets
+ * (rsx_native_image.h). backend_surface is the engine handle the common
+ * engine keeps for the guest surface; image points to rsx_native_d3d12_image,
+ * retain before dereference. Native work acquires and hands back the resource
+ * in its contract state: RENDER_TARGET for colour, DEPTH_WRITE for depth. */
+#define RSX_D3D12_NATIVE_IMAGE_ABI 1u   /* hosts test this to know the three functions below exist */
+struct rsx_native_image;
+int rsx_d3d12_backend_borrow_image(uint64_t owner_lifetime, uint32_t backend_surface, struct rsx_native_image* out);
+int rsx_d3d12_backend_validate_image_planes(void* user, uint64_t lifetime, uint64_t id, uint64_t generation, uint32_t required);
+/* Submits what the engine has recorded (without waiting), with every borrowed
+ * image moved into its contract state, and names that submission's fence
+ * value: native work queued after it on the same queue runs after it. The
+ * caller holds serialized FIFO consumption. 0, or -2 off, -3 stale/inactive,
+ * -4 busy (a primitive is open), -6 failed. */
+int rsx_d3d12_backend_native_boundary(uint64_t* original_ticket);
 
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);

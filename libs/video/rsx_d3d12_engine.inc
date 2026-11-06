@@ -36,6 +36,8 @@
 
 #include "rsx_native_owner.h"
 #include "rsx_native_owner_gate.h"
+#include "rsx_native_image.h"
+#include "rsx_native_d3d12_image.h"
 #include "rsx_original_owner.h"
 #include "rsx_commands.h"
 #include "rsx_fifo_busy.h"
@@ -44,6 +46,7 @@
 void cellGcm_rsx_consumer_begin(void);
 void cellGcm_rsx_consumer_end(void);
 static void e12_owner_submitted(int ok);
+static void e12_image_gc(void);
 static void (*e12_owner_stats_print)(void);
 #define ENG12_MAX_OBJ        16384
 #define ENG12_RTV_HEAP       4096
@@ -155,6 +158,10 @@ static struct {
     u64 waits[E12_W_SITES];
 } s_e12;
 static e12_obj s_e12o[ENG12_MAX_OBJ];
+/* Native image identity: a colour or depth target's generation is set when it
+ * is made and cleared when it is freed, so a handle reused later never matches
+ * an older lease. */
+static u64 s_e12_gen[ENG12_MAX_OBJ], s_e12_gen_seq;
 
 static void e12_count(int reason) { if (reason >= 0 && reason < E12_X_REASONS) s_e12.count[reason]++; }
 
@@ -532,6 +539,7 @@ static void e12_release_obj(u32 h)
     for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++) if (s_e12.rt[i] == h) s_e12.rt[i] = 0;
     if (s_e12.depth == h) s_e12.depth = 0;
     if (s_e12.pipeline == h) s_e12.pipeline = 0;
+    s_e12_gen[h] = 0;
     memset(o, 0, sizeof *o);
 }
 /* Rows into a subresource through the upload ring. */
@@ -745,6 +753,7 @@ static void e12_shutdown(void* user)
     (void)user;
     if (s_e12.fence) e12_submit_wait(E12_W_SHUTDOWN);
     for (u32 i = 1; i < ENG12_MAX_OBJ; i++) e12_release_obj(i);
+    e12_image_gc();   /* a retained image keeps its own reference; teardown refuses those */
     if (s_e12.fence) e12_submit_wait(E12_W_SHUTDOWN);
     e12_retire_now(~0ull);
     free(s_e12.retire);
@@ -874,6 +883,7 @@ static u32 e12_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h, 
         o->rtv = e12_slot_alloc(s_e12.rtv_used, ENG12_RTV_HEAP);
         if (o->res && o->rtv) {
             o->kind = E12_COLOR; o->fmt = f; o->w = w; o->h = h; o->mips = 1; o->faces = 1; o->bpp = bpp;
+            s_e12_gen[hd] = ++s_e12_gen_seq;
             o->state = D3D12_RESOURCE_STATE_COMMON;
             s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, o->res, NULL,
                 e12_cpu(s_e12.rtv_heap, s_e12.rtv_inc, o->rtv - 1));
@@ -972,6 +982,7 @@ static u32 e12_depth_create_locked(u32 w, u32 h)
     o->dsv = e12_slot_alloc(s_e12.dsv_used, ENG12_DSV_HEAP);
     if (!o->res || !o->dsv) { e12_count(E12_X_CREATE_FAILED); e12_release_obj(hd); return 0; }
     o->kind = E12_DEPTH; o->fmt = ENG12_DEPTH_FORMAT; o->w = w; o->h = h; o->mips = 1; o->faces = 1;
+    s_e12_gen[hd] = ++s_e12_gen_seq;
     o->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     D3D12_DEPTH_STENCIL_VIEW_DESC dv; memset(&dv, 0, sizeof dv);
     dv.Format = ENG12_DEPTH_FORMAT; dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
@@ -1934,6 +1945,7 @@ static u64 s_e12_lifetime, s_e12_commits;
 static unsigned s_e12_partial_primitives;
 static atomic_int s_e12_unscoped_submit;
 static struct { u64 borrows, grants, refused_dirty, refused_busy, refused_other; } s_e12_owner_stats;
+static struct { u64 borrows, retains, boundaries, transitions; } s_e12_image_stats;
 static atomic_int s_e12_owner_setting = -1;   /* read once; the fixture may set it before use */
 static int e12_owner_enabled(void)
 {
@@ -2061,6 +2073,9 @@ static void e12_owner_print(void)
            (unsigned long long)s_e12_owner_stats.borrows, (unsigned long long)s_e12_owner_stats.grants,
            (unsigned long long)s_e12_owner_stats.refused_dirty, (unsigned long long)s_e12_owner_stats.refused_busy,
            (unsigned long long)s_e12_owner_stats.refused_other, s_e12_owner.failed);
+    printf(" image_borrows=%llu image_retains=%llu native_boundaries=%llu boundary_transitions=%llu",
+           (unsigned long long)s_e12_image_stats.borrows, (unsigned long long)s_e12_image_stats.retains,
+           (unsigned long long)s_e12_image_stats.boundaries, (unsigned long long)s_e12_image_stats.transitions);
 }
 int rsx_d3d12_backend_borrow_owner(rsx_native_owner* out) { e12_owner_stats_print = e12_owner_print; return e12_borrow_owner(out, NULL); }
 int rsx_d3d12_backend_borrow_owner_v2(rsx_native_owner_v2* out)
@@ -2069,6 +2084,192 @@ int rsx_d3d12_backend_borrow_owner_v2(rsx_native_owner_v2* out)
     e12_owner_stats_print = e12_owner_print;
     return e12_borrow_owner(&out->base, out);
 }
+
+/* ---- Native image leases and the native boundary ---------------------------
+ * A native consumer may draw into the engine's existing colour and depth
+ * targets. borrow_image names one by its engine handle (the handle the common
+ * engine keeps for the guest surface) and returns an unretained description:
+ * the ID3D12Resource and the one state it is in whenever native work may touch
+ * it -- RENDER_TARGET for colour, DEPTH_WRITE for depth. Native work acquires
+ * it in that state and hands it back in the same state before it submits, so
+ * the engine's own state tracking stays exact without re-reading anything.
+ * native_boundary submits what the engine recorded (no wait), first moving
+ * every borrowed image that still exists into its contract state, and names
+ * that submission's fence value: native work queued after it on the same
+ * direct queue runs after it. retain holds a reference of its own, so the
+ * resource outlives the engine freeing the target; validate, under the native
+ * lease, refuses an image whose target was freed or replaced (-3) or that the
+ * engine left in another state since the boundary (-4). */
+typedef struct e12_native_image {
+    u32 id, pins;
+    u64 generation;
+    rsx_native_d3d12_image payload;
+    struct e12_native_image* next;
+} e12_native_image;
+static e12_native_image* s_e12_images;
+
+static D3D12_RESOURCE_STATES e12_image_contract(const e12_obj* o)
+{
+    return o->kind == E12_DEPTH ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+}
+static u32 e12_image_format(const e12_obj* o)
+{
+    if (o->kind == E12_DEPTH) return o->fmt == ENG12_DEPTH_FORMAT ? RSX_NATIVE_IMAGE_D32S8 : 0;
+    switch (o->fmt) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:     return RSX_NATIVE_IMAGE_RGBA8;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return RSX_NATIVE_IMAGE_RGBA16F;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return RSX_NATIVE_IMAGE_RGBA32F;
+    case DXGI_FORMAT_R32_FLOAT:          return RSX_NATIVE_IMAGE_R32F;
+    default: return 0;
+    }
+}
+/* The target a record names, while that same allocation still exists. */
+static e12_obj* e12_image_current(const e12_native_image* r)
+{
+    if (!r->id || r->id >= ENG12_MAX_OBJ || !r->generation || s_e12_gen[r->id] != r->generation) return NULL;
+    e12_obj* o = &s_e12o[r->id];
+    if ((o->kind != E12_COLOR && o->kind != E12_DEPTH) || (void*)o->res != r->payload.resource) return NULL;
+    return o;
+}
+static e12_native_image* e12_image_find(u64 id, u64 generation)
+{
+    for (e12_native_image* r = s_e12_images; r; r = r->next)
+        if (r->id == id && r->generation == generation) return r;
+    return NULL;
+}
+/* Records nobody retains whose target is gone. Under the owner lock. */
+static void e12_image_gc(void)
+{
+    for (e12_native_image** at = &s_e12_images; *at;) {
+        e12_native_image* r = *at;
+        if (!r->pins && !e12_image_current(r)) { *at = r->next; free(r); }
+        else at = &r->next;
+    }
+}
+static int e12_image_identity(void* user, u64 life, u64 id, u64 generation, e12_native_image** out)
+{
+    *out = NULL;
+    if (user != &s_e12_owner || !life || life != s_e12_owner.generation || s_e12_owner.closing) return -3;
+    if (s_e12_owner.failed || s_e12.failed || atomic_load(&s_e12_unscoped_submit)) return -6;
+    e12_native_image* r = e12_image_find(id, generation);
+    if (!r || !e12_image_current(r)) return -3;
+    *out = r;
+    return 0;
+}
+static int e12_image_retain(void* user, uint64_t life, uint64_t id, uint64_t generation)
+{
+    if (user != &s_e12_owner) return -3;
+    if (s_e12_owner_thread.gate || !rsx_owner_lock_try(&s_e12_owner.lock)) return -4;
+    e12_native_image* r;
+    int status = e12_image_identity(user, life, id, generation, &r);
+    if (!status && (s_e12_owner.retained == UINT_MAX || r->pins == UINT_MAX)) status = -4;
+    if (!status) {
+        ID3D12Resource* res = (ID3D12Resource*)r->payload.resource;
+        res->lpVtbl->AddRef(res);
+        ++r->pins; ++s_e12_owner.retained; s_e12_image_stats.retains++;
+    }
+    rsx_owner_lock_release(&s_e12_owner.lock);
+    return status;
+}
+/* The native consumer has drained its own use of the image before releasing;
+ * the engine's own reference, or its fenced retirement, covers the engine's. */
+static void e12_image_release(void* user, uint64_t life, uint64_t id, uint64_t generation)
+{
+    if (user != &s_e12_owner || s_e12_owner_thread.gate) return;
+    rsx_owner_lock_acquire(&s_e12_owner.lock);
+    e12_native_image* r = e12_image_find(id, generation);
+    if (r && r->pins && s_e12_owner.retained && life == s_e12_owner.generation) {
+        ID3D12Resource* res = (ID3D12Resource*)r->payload.resource;
+        --r->pins; --s_e12_owner.retained;
+        res->lpVtbl->Release(res);
+        e12_image_gc();
+    }
+    rsx_owner_lock_release(&s_e12_owner.lock);
+}
+static int e12_image_validate(void* user, uint64_t life, uint64_t id, uint64_t generation)
+{
+    if (user != &s_e12_owner) return -3;
+    if (s_e12_owner_thread.gate != &s_e12_owner || !s_e12_owner_thread.native) return -4;
+    e12_native_image* r;
+    const int status = e12_image_identity(user, life, id, generation, &r);
+    if (status) return status;
+    return e12_image_current(r)->state == (D3D12_RESOURCE_STATES)r->payload.acquire_state ? 0 : -4;
+}
+int rsx_d3d12_backend_validate_image_planes(void* user, uint64_t life, uint64_t id, uint64_t generation, uint32_t required)
+{
+    if (!required || (required & ~7u) || id > UINT32_MAX) return -1;
+    const int status = e12_image_validate(user, life, id, generation);
+    return status ? status : rsx_draw_engine_native_image_clear_planes((uint32_t)id, required);
+}
+int rsx_d3d12_backend_borrow_image(uint64_t life, uint32_t handle, rsx_native_image* out)
+{
+    if (!out || out->abi_version != RSX_NATIVE_IMAGE_ABI || out->struct_size != sizeof(*out)) return -1;
+    if (!e12_owner_enabled() || !s_e12.active) return -2;
+    if (!e12_owner_begin(0)) return -4;
+    int status = 0;
+    e12_obj* o = handle && handle < ENG12_MAX_OBJ ? &s_e12o[handle] : NULL;
+    if (!s_e12.ready || !life || life != s_e12_owner.generation || s_e12_owner.closing || !o ||
+        (o->kind != E12_COLOR && o->kind != E12_DEPTH) || !o->res || !s_e12_gen[handle]) status = -3;
+    else if (s_e12_owner.failed || s_e12.failed || atomic_load(&s_e12_unscoped_submit)) status = -6;
+    else if (!e12_image_format(o)) status = -2;
+    else {
+        e12_image_gc();
+        e12_native_image* r = e12_image_find(handle, s_e12_gen[handle]);
+        if (!r && (r = (e12_native_image*)calloc(1, sizeof *r)) != NULL) {
+            r->id = handle; r->generation = s_e12_gen[handle];
+            r->payload.abi_version = RSX_NATIVE_D3D12_IMAGE_ABI; r->payload.struct_size = sizeof r->payload;
+            r->payload.resource = o->res;
+            r->payload.acquire_state = r->payload.handback_state = (uint32_t)e12_image_contract(o);
+            r->next = s_e12_images; s_e12_images = r;
+        }
+        if (!r) status = -4;
+        else {
+            *out = (rsx_native_image){ .abi_version = RSX_NATIVE_IMAGE_ABI, .struct_size = sizeof(*out),
+                .backend = RSX_NATIVE_OWNER_D3D12, .format = e12_image_format(o), .width = o->w, .height = o->h,
+                .owner_lifetime = life, .resource_id = handle, .resource_generation = r->generation,
+                .image = &r->payload, .userdata = &s_e12_owner,
+                .retain = e12_image_retain, .release = e12_image_release, .validate = e12_image_validate };
+            s_e12_image_stats.borrows++;
+        }
+    }
+    e12_owner_finish(1);
+    return status;
+}
+/* The boundary proper. check_registers asks the common engine whether a
+ * primitive is open (the fixture drives the backend without one). */
+static int e12_native_boundary(int check_registers, uint64_t* ticket)
+{
+    if (!ticket) return -1;
+    *ticket = 0;
+    if (!e12_owner_enabled() || !s_e12.active) return -2;
+    if (!e12_owner_begin(0)) return -4;
+    int status = 0;
+    if (!s_e12.ready || !s_d3d.cmd_queue || !s_e12_owner.generation || s_e12_owner.closing) status = -3;
+    else if (s_e12_owner.failed || s_e12.failed || atomic_load(&s_e12_unscoped_submit)) status = -6;
+    else if (s_e12_partial_primitives) status = -4;
+    if (!status && check_registers) {
+        uint32_t method = NV4097_SET_BEGIN_END, value = 0;
+        status = rsx_draw_engine_native_registers(&method, &value, 1);
+    }
+    if (!status) {
+        EnterCriticalSection(&s_e12.lock);
+        for (e12_native_image* r = s_e12_images; r && !status; r = r->next) {
+            e12_obj* o = e12_image_current(r);
+            if (!o || o->state == (D3D12_RESOURCE_STATES)r->payload.acquire_state) continue;
+            if (e12_begin()) status = -6;
+            else { e12_transition(o, (D3D12_RESOURCE_STATES)r->payload.acquire_state); s_e12_image_stats.transitions++; }
+        }
+        if (!status && (s_e12.recording || !s_e12.fence_value) && !e12_execute()) status = -6;
+        if (!status && s_e12.failed) status = -6;
+        if (!status) { *ticket = s_e12.fence_value; s_e12_image_stats.boundaries++; }
+        LeaveCriticalSection(&s_e12.lock);
+    }
+    if (!status) rsx_owner_submitted(&s_e12_owner, &s_e12_owner_thread, 1);
+    else if (status == -6) rsx_owner_submitted(&s_e12_owner, &s_e12_owner_thread, 0);
+    e12_owner_finish(1);
+    return status;
+}
+int rsx_d3d12_backend_native_boundary(uint64_t* ticket) { return e12_native_boundary(1, ticket); }
 
 static void owner_e12_submit_and_wait(void* user, u32 reason)
 {
