@@ -496,6 +496,21 @@ int main(void)
         CHECK(px(b, rt, 32, 32) != 0xFF0000FFu, "drawing through wrapped rings is correct");
         s_e12.srv_ring.size = keep_srv; s_e12.upload_ring.size = keep_up;
     }
+    /* Rings barely larger than one draw: every draw must make room first,
+     * and that wait or flush must happen before any of its allocations. */
+    {
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        const u64 keep_srv = s_e12.srv_ring.size, keep_up = s_e12.upload_ring.size;
+        s_e12.srv_ring.size = 30; s_e12.upload_ring.size = 24u << 10;
+        const u64 rw = s_e12.waits[E12_W_UPLOAD_RING] + s_e12.waits[E12_W_SRV_TABLES];
+        b->clear_color(b->user, rt, red);
+        b->bind_targets(b->user, &rt, 1, 0);
+        for (int i = 0; i < 20; i++) draw_full(b, pipe);
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        CHECK(s_e12.waits[E12_W_UPLOAD_RING] + s_e12.waits[E12_W_SRV_TABLES] > rw, "tiny rings make draws wait");
+        CHECK(px(b, rt, 32, 32) != 0xFF0000FFu && !s_e12.failed, "draws that waited for ring space are intact");
+        s_e12.srv_ring.size = keep_srv; s_e12.upload_ring.size = keep_up;
+    }
     /* Present: by default every present waits; with async present (opt-in)
      * presents only wait when the GPU is a whole swap chain behind. */
     if (open_swap_chain(64, 64)) {

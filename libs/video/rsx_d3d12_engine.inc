@@ -299,6 +299,23 @@ static int e12_ring_alloc(e12_ring* r, u64 n, u64 align, int site, u64* at_out)
     }
 }
 
+/* Make sure n units (alignment slack included by the caller) can be
+ * allocated from the ring without waiting, doing any wait now. A draw does
+ * this for its whole need before its first allocation, so a wait or a full
+ * flush can never fall between two of its allocations (a full flush resets
+ * the rings and would let later allocations overwrite earlier ones). */
+static int e12_ring_reserve(e12_ring* r, u64 n, int site)
+{
+    if (n >= r->size) return -1;
+    for (;;) {
+        e12_ring_reclaim(r, s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence));
+        if (r->head >= r->tail ? (r->head + n <= r->size || n < r->tail) : (r->head + n < r->tail)) return 0;
+        if (site >= 0 && site < E12_W_SITES) s_e12.waits[site]++;
+        if (r->nseg) {
+            if (e12_wait_fence(r->seg[r->first].fence)) return -1;
+        } else if (e12_submit_wait(-1) || e12_begin()) return -1;
+    }
+}
 /* Execute what is recorded and signal the fence after it; returns the value
  * that completes it, 0 on failure. The allocator stays busy until then. */
 static u64 e12_execute(void)
@@ -1356,9 +1373,28 @@ static void e12_draw(void* user, rsx_topology topology, const void* vertices, u3
     else dsv = e12_scratch_dsv(w, h, &z);
     if (!z) { e12_count(E12_X_CREATE_FAILED); LeaveCriticalSection(&s_e12.lock); return; }
 
-    /* Upload everything the GPU reads from host memory. */
+    /* Upload everything the GPU reads from host memory. Any wait or flush the
+     * draw needs (sampler tables, upload ring, descriptor ring) happens before
+     * its first allocation, never between two of them. */
     D3D12_GPU_VIRTUAL_ADDRESS vb_va = 0, ib_va = 0, vc_va = 0, pc_va = 0;
     const u64 vbytes = (u64)vertex_count * stride, ibytes = indices && index_count ? (u64)index_count * 4u : 0;
+    {
+        const u32 per_draw_samplers = RSX_BE_MAX_TEXTURES + ENG12_VTEX;
+        if (s_e12.samp_gpu_next + per_draw_samplers > ENG12_SAMP_GPU_HEAP ||
+            s_e12.stab_n + 2 > sizeof s_e12.stab / sizeof s_e12.stab[0]) {
+            e12_count(E12_X_SAMPLER_TABLES);
+            if (e12_submit_wait(E12_W_SAMPLER_TABLES) || e12_begin()) { LeaveCriticalSection(&s_e12.lock); return; }
+            s_e12.samp_gpu_next = 0; s_e12.stab_n = 0;
+        }
+        const u64 vsb0 = (s_e12.vs_bytes + 255u) & ~255u, psb0 = (s_e12.ps_bytes + 255u) & ~255u;
+        const u64 up_need = vbytes + 16 + ibytes + 16 + (vsb0 ? vsb0 : 256) + 256 + (psb0 ? psb0 : 256) + 256;
+        if (e12_ring_reserve(&s_e12.upload_ring, up_need, E12_W_UPLOAD_RING) ||
+            e12_ring_reserve(&s_e12.srv_ring, RSX_BE_MAX_TEXTURES + ENG12_VTEX, E12_W_SRV_TABLES) ||
+            e12_ring_reserve(&s_e12.upload_ring, up_need, E12_W_UPLOAD_RING)) {   /* a descriptor flush may have reset it */
+            e12_count(E12_X_UPLOAD_TOO_LARGE); LeaveCriticalSection(&s_e12.lock); return;
+        }
+        if (!s_e12.recording && e12_begin()) { LeaveCriticalSection(&s_e12.lock); return; }
+    }
     void* vp = e12_upload(vbytes, 16, &vb_va, NULL);
     void* ip = ibytes ? e12_upload(ibytes, 16, &ib_va, NULL) : NULL;
     const u32 vsb = (s_e12.vs_bytes + 255u) & ~255u, psb = (s_e12.ps_bytes + 255u) & ~255u;
