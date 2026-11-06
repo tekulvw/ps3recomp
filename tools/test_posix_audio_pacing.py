@@ -4,6 +4,7 @@ from pathlib import Path
 import argparse
 import os
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,7 +15,7 @@ def main():
         flags=['-fsanitize=undefined','-fno-sanitize-recover=all'] if args.sanitize else []
         subprocess.run([os.environ.get('CC','clang'),'-std=gnu17','-O2','-pthread',*flags,
             '-I'+str(ROOT/'include'),'-I/opt/homebrew/include',
-            str(ROOT/'libs/audio/tests/test_posix_audio_pacing.c'),'-Wl,-dead_strip','-o',exe],check=True)
+            str(ROOT/'libs/audio/tests/test_posix_audio_pacing.c'),('-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'),'-o',exe],check=True)
         env={k:v for k,v in os.environ.items() if not k.startswith(('AUDIO_','SPU_DMA_DISPOSITION'))}
         failed=[]
         for mode in range(10):
