@@ -38,7 +38,8 @@ typedef struct rsx_native_owner_v2 {
     rsx_native_owner base;
     uint64_t known_features,enabled_features;
 } rsx_native_owner_v2;
-/* Optional reserved queue order (Vulkan: rsx_vulkan_backend_queue_order).
+/* Optional reserved queue order (Vulkan: rsx_vulkan_backend_queue_order;
+ * D3D12: rsx_d3d12_backend_queue_order, whose submit_info is described there).
  * reserve, called under the native lease at the native boundary, fixes the
  * next native submission's place: original submissions made after it reach
  * the queue only after that submission. submit, called once per reservation

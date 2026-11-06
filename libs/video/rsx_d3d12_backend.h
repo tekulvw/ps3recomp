@@ -68,6 +68,22 @@ int rsx_d3d12_backend_validate_image_planes(void* user, uint64_t lifetime, uint6
  * caller holds serialized FIFO consumption. 0, or -2 off, -3 stale/inactive,
  * -4 busy (a primitive is open), -6 failed. */
 int rsx_d3d12_backend_native_boundary(uint64_t* original_ticket);
+/* Reserved queue order (rsx_native_owner.h's rsx_native_queue_order) on the
+ * engine's direct queue. submit's submit_info is an rsx_native_d3d12_submit
+ * and its fence argument must be NULL: the native batch's own fence and value
+ * travel in the struct. submit returns 0, the HRESULT of a failed signal, -1
+ * for an invalid batch (the reservation is still released, as abandoned) or a
+ * negative owner status. -2 when the owner seam is off. */
+#define RSX_NATIVE_D3D12_SUBMIT_ABI 1u
+typedef struct rsx_native_d3d12_submit {
+    uint32_t abi_version, struct_size;
+    void* const* lists;          /* ID3D12CommandList*, executed in this order */
+    uint32_t list_count, reserved;
+    void* signal_fence;          /* ID3D12Fence* signalled after the lists, or NULL */
+    uint64_t signal_value;
+} rsx_native_d3d12_submit;
+struct rsx_native_queue_order;
+int rsx_d3d12_backend_queue_order(struct rsx_native_queue_order* out);
 
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);

@@ -121,8 +121,11 @@ static struct {
     /* One allocator per submission still on the GPU: a list is re-recorded
      * into an allocator only after the fence passed its last submission. */
     ID3D12CommandAllocator* alloc[ENG12_ALLOCATORS]; u64 alloc_fence[ENG12_ALLOCATORS]; u32 cur_alloc;
-    ID3D12GraphicsCommandList* cl;
+    ID3D12GraphicsCommandList* cl;     /* the list being recorded: cls[cur_alloc] */
     ID3D12GraphicsCommandList1* cl1;   /* OMSetDepthBounds, when supported */
+    /* One list per allocator, so a closed list that a queue-order reservation
+     * holds back is never reset before it reaches the queue. */
+    ID3D12GraphicsCommandList* cls[ENG12_ALLOCATORS]; ID3D12GraphicsCommandList1* cl1s[ENG12_ALLOCATORS];
     ID3D12Fence* fence; HANDLE event; u64 fence_value;
     ID3D12RootSignature* root;
     ID3D12DescriptorHeap *rtv_heap, *dsv_heap, *srv_cpu, *srv_gpu, *samp_gpu;
@@ -182,9 +185,64 @@ static u32 e12_slot_alloc(u8* used, u32 n)
 }
 
 /* ---- submission ----------------------------------------------------------- */
+/* ---- Reserved queue order (rsx_d3d12_backend_queue_order) ------------------
+ * A native submission's place in the queue is fixed at the native boundary
+ * and filled later. A fence wait the engine puts on the queue cannot stand in
+ * for that place: the native signal would come after the wait on the same
+ * queue, which executes in order, so it would never run. The order is kept on
+ * the CPU instead. reserve(), under the native lease, starts a hold: from then
+ * on each engine submission (its closed list and its fence value) is kept
+ * here, in order, instead of reaching the queue; the engine's bookkeeping
+ * runs as if it had been submitted. submit(), once, from any thread without
+ * the lease, executes the native lists and signal first, then every held
+ * submission in order, and ends the hold; submit() without a batch abandons
+ * the reservation the same way. While a hold is active, waiting for a held
+ * fence value blocks until submit() runs (the GPU could not run that work
+ * before the native batch either), a present waits for the hold to end, and
+ * the native lease reports busy, so nothing overtakes held work. */
+static struct {
+    SRWLOCK lock; CONDITION_VARIABLE cv;
+    int active;
+    u64 token, next_token;
+    u64 queued;   /* the highest engine fence value signalled on the queue */
+    struct { ID3D12CommandList* list; u64 value; } held[ENG12_ALLOCATORS + 1]; u32 n;
+    u64 reservations, held_submits, abandoned, failures, blocked_waits;
+} s_e12_hold = { SRWLOCK_INIT, CONDITION_VARIABLE_INIT };
+/* Until fence value v is on the queue (at once unless a hold keeps it). */
+static void e12_hold_wait_for(u64 v)
+{
+    AcquireSRWLockExclusive(&s_e12_hold.lock);
+    if (s_e12_hold.active && s_e12_hold.queued < v) {
+        s_e12_hold.blocked_waits++;
+        while (s_e12_hold.active && s_e12_hold.queued < v)
+            if (!SleepConditionVariableSRW(&s_e12_hold.cv, &s_e12_hold.lock, 10000, 0))
+                printf("[D3D12 engine] fence %llu still held behind a reserved native submission\n", (unsigned long long)v);
+    }
+    ReleaseSRWLockExclusive(&s_e12_hold.lock);
+}
+static int e12_hold_active(void)
+{
+    AcquireSRWLockShared(&s_e12_hold.lock);
+    const int active = s_e12_hold.active;
+    ReleaseSRWLockShared(&s_e12_hold.lock);
+    return active;
+}
+/* Hold lock held: every held submission onto the queue, in order; ends the hold. */
+static void e12_hold_release_locked(void)
+{
+    ID3D12CommandQueue* q = s_d3d.cmd_queue;
+    for (u32 i = 0; i < s_e12_hold.n; i++) {
+        if (s_e12_hold.held[i].list) q->lpVtbl->ExecuteCommandLists(q, 1, &s_e12_hold.held[i].list);
+        if (FAILED(q->lpVtbl->Signal(q, s_e12.fence, s_e12_hold.held[i].value))) { s_e12.failed = 1; s_e12_hold.failures++; }
+        else s_e12_hold.queued = s_e12_hold.held[i].value;
+    }
+    s_e12_hold.n = 0; s_e12_hold.active = 0; s_e12_hold.token = 0;
+    WakeAllConditionVariable(&s_e12_hold.cv);
+}
 static int e12_wait_fence(u64 v)
 {
     if (s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence) >= v) return 0;
+    e12_hold_wait_for(v);
     s_e12.fence->lpVtbl->SetEventOnCompletion(s_e12.fence, v, s_e12.event);
     if (WaitForSingleObject(s_e12.event, 10000) == WAIT_OBJECT_0) return 0;
     s_e12.failed = 1; e12_count(E12_X_DEVICE);
@@ -213,6 +271,7 @@ static int e12_begin(void)
     if (s_e12.recording) return 0;
     if (s_e12.failed || e12_pick_allocator()) return -1;
     ID3D12CommandAllocator* a = s_e12.alloc[s_e12.cur_alloc];
+    s_e12.cl = s_e12.cls[s_e12.cur_alloc]; s_e12.cl1 = s_e12.cl1s[s_e12.cur_alloc];
     if (FAILED(a->lpVtbl->Reset(a)) ||
         FAILED(s_e12.cl->lpVtbl->Reset(s_e12.cl, a, NULL))) {
         s_e12.failed = 1; e12_count(E12_X_DEVICE); return -1;
@@ -339,15 +398,33 @@ static int e12_ring_reserve(e12_ring* r, u64 n, int site)
  * that completes it, 0 on failure. The allocator stays busy until then. */
 static u64 e12_execute(void)
 {
+    ID3D12CommandList* list = NULL;
     if (s_e12.recording) {
         s_e12.recording = 0;
         if (FAILED(s_e12.cl->lpVtbl->Close(s_e12.cl))) { s_e12.failed = 1; e12_count(E12_X_DEVICE); return 0; }
-        ID3D12CommandList* lists[1] = { (ID3D12CommandList*)s_e12.cl };
-        s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
+        list = (ID3D12CommandList*)s_e12.cl;
         s_e12.submits++;
     }
     const u64 v = ++s_e12.fence_value;
-    if (FAILED(s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_e12.fence, v))) { s_e12.failed = 1; return 0; }
+    int ok = 1;
+    AcquireSRWLockExclusive(&s_e12_hold.lock);
+    if (s_e12_hold.active) {
+        /* Kept in order behind the reservation. A signal with no list of its
+         * own only raises the last held value; lists are bounded by the
+         * allocators, which are reused only after their value is signalled. */
+        u32 n = s_e12_hold.n;
+        if (!list && n) s_e12_hold.held[n - 1].value = v;
+        else if (n < sizeof s_e12_hold.held / sizeof s_e12_hold.held[0]) {
+            s_e12_hold.held[n].list = list; s_e12_hold.held[n].value = v; s_e12_hold.n = n + 1;
+        } else ok = 0;
+        s_e12_hold.held_submits++;
+    } else {
+        if (list) s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, &list);
+        ok = SUCCEEDED(s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_e12.fence, v));
+        if (ok) s_e12_hold.queued = v;
+    }
+    ReleaseSRWLockExclusive(&s_e12_hold.lock);
+    if (!ok) { s_e12.failed = 1; return 0; }
     s_e12.alloc_fence[s_e12.cur_alloc] = v;
     e12_ring_close(&s_e12.upload_ring, v);
     e12_ring_close(&s_e12.srv_ring, v);
@@ -697,21 +774,26 @@ static int e12_init(void* user, u32 width, u32 height)
     if (!s_d3d.device || !s_d3d.cmd_queue) return -1;
     ID3D12Device* dv = s_d3d.device;
     for (u32 i = 0; i < ENG12_ALLOCATORS; i++)
-        if (FAILED(dv->lpVtbl->CreateCommandAllocator(dv, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&s_e12.alloc[i])))
+        if (FAILED(dv->lpVtbl->CreateCommandAllocator(dv, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&s_e12.alloc[i])) ||
+            FAILED(dv->lpVtbl->CreateCommandList(dv, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_e12.alloc[i], NULL,
+                                                 &IID_ID3D12GraphicsCommandList, (void**)&s_e12.cls[i])) ||
+            FAILED(s_e12.cls[i]->lpVtbl->Close(s_e12.cls[i])))
             goto fail;
-    if (FAILED(dv->lpVtbl->CreateCommandList(dv, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_e12.alloc[0], NULL,
-                                             &IID_ID3D12GraphicsCommandList, (void**)&s_e12.cl)) ||
-        FAILED(s_e12.cl->lpVtbl->Close(s_e12.cl)) ||
-        FAILED(dv->lpVtbl->CreateFence(dv, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&s_e12.fence)))
+    s_e12.cl = s_e12.cls[0];
+    if (FAILED(dv->lpVtbl->CreateFence(dv, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&s_e12.fence)))
         goto fail;
     s_e12.event = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!s_e12.event) goto fail;
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2; memset(&o2, 0, sizeof o2);
         if (SUCCEEDED(dv->lpVtbl->CheckFeatureSupport(dv, D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof o2)) &&
-            o2.DepthBoundsTestSupported &&
-            SUCCEEDED(s_e12.cl->lpVtbl->QueryInterface(s_e12.cl, &IID_ID3D12GraphicsCommandList1, (void**)&s_e12.cl1)))
+            o2.DepthBoundsTestSupported) {
             s_e12.depth_bounds_ok = 1;
+            for (u32 i = 0; i < ENG12_ALLOCATORS; i++)
+                if (FAILED(s_e12.cls[i]->lpVtbl->QueryInterface(s_e12.cls[i], &IID_ID3D12GraphicsCommandList1, (void**)&s_e12.cl1s[i])))
+                    s_e12.depth_bounds_ok = 0;
+            s_e12.cl1 = s_e12.cl1s[0];
+        }
     }
     if (e12_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, ENG12_RTV_HEAP, 0, &s_e12.rtv_heap) ||
         e12_heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, ENG12_DSV_HEAP, 0, &s_e12.dsv_heap) ||
@@ -761,8 +843,9 @@ static void e12_shutdown(void* user)
     E12_REL(s_e12.z24_view_pso); E12_REL(s_e12.z24_store_pso); E12_REL(s_e12.z24_root);
     E12_REL(s_e12.upload); E12_REL(s_e12.blit_pso); E12_REL(s_e12.blit_root); E12_REL(s_e12.root);
     E12_REL(s_e12.rtv_heap); E12_REL(s_e12.dsv_heap); E12_REL(s_e12.srv_cpu); E12_REL(s_e12.srv_gpu);
-    E12_REL(s_e12.samp_gpu); E12_REL(s_e12.cl1); E12_REL(s_e12.cl); E12_REL(s_e12.fence);
-    for (u32 i = 0; i < ENG12_ALLOCATORS; i++) E12_REL(s_e12.alloc[i]);
+    E12_REL(s_e12.samp_gpu); E12_REL(s_e12.fence);
+    s_e12.cl = NULL; s_e12.cl1 = NULL;
+    for (u32 i = 0; i < ENG12_ALLOCATORS; i++) { E12_REL(s_e12.cl1s[i]); E12_REL(s_e12.cls[i]); E12_REL(s_e12.alloc[i]); }
     if (s_e12.event) CloseHandle(s_e12.event);
     CRITICAL_SECTION keep = s_e12.lock; int had = s_e12.active;
     memset(&s_e12, 0, sizeof s_e12);
@@ -809,6 +892,7 @@ static int e12_completion_status(void* user, u64 ticket, int wait)
     if (done == UINT64_MAX) return -1;   /* device removed */
     if (done < ticket) {
         if (!wait) return 0;
+        e12_hold_wait_for(ticket);
         HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
         if (!ev) return -1;
         s_e12.fence->lpVtbl->SetEventOnCompletion(s_e12.fence, ticket, ev);
@@ -1674,6 +1758,7 @@ static void e12_present(void* user, u32 surface)
             s_e12.flushes++;
             e12_retire_now(s_e12.fence->lpVtbl->GetCompletedValue(s_e12.fence));
         } else e12_submit_wait(E12_W_PRESENT);
+        e12_hold_wait_for(s_e12.fence_value);   /* the frame's work reaches the queue before the present */
         s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0, 0);
         e12_dump(surface, o);
     }
@@ -2025,7 +2110,7 @@ static int e12_borrow_begin(void* user, uint64_t life)
         s_e12_owner.failed = 1; rsx_owner_native_end(&s_e12_owner, &s_e12_owner_thread);
         s_e12_owner_stats.refused_other++; return -6;
     }
-    if (s_e12_partial_primitives || s_e12.recording) {
+    if (s_e12_partial_primitives || s_e12.recording || e12_hold_active()) {
         rsx_owner_native_end(&s_e12_owner, &s_e12_owner_thread); s_e12_owner_stats.refused_busy++; return -4;
     }
     s_e12_owner_stats.grants++;
@@ -2073,6 +2158,10 @@ static void e12_owner_print(void)
            (unsigned long long)s_e12_owner_stats.borrows, (unsigned long long)s_e12_owner_stats.grants,
            (unsigned long long)s_e12_owner_stats.refused_dirty, (unsigned long long)s_e12_owner_stats.refused_busy,
            (unsigned long long)s_e12_owner_stats.refused_other, s_e12_owner.failed);
+    printf(" order_reservations=%llu order_held=%llu order_abandoned=%llu order_failures=%llu order_blocked_waits=%llu",
+           (unsigned long long)s_e12_hold.reservations, (unsigned long long)s_e12_hold.held_submits,
+           (unsigned long long)s_e12_hold.abandoned, (unsigned long long)s_e12_hold.failures,
+           (unsigned long long)s_e12_hold.blocked_waits);
     printf(" image_borrows=%llu image_retains=%llu native_boundaries=%llu boundary_transitions=%llu",
            (unsigned long long)s_e12_image_stats.borrows, (unsigned long long)s_e12_image_stats.retains,
            (unsigned long long)s_e12_image_stats.boundaries, (unsigned long long)s_e12_image_stats.transitions);
@@ -2270,6 +2359,50 @@ static int e12_native_boundary(int check_registers, uint64_t* ticket)
     return status;
 }
 int rsx_d3d12_backend_native_boundary(uint64_t* ticket) { return e12_native_boundary(1, ticket); }
+static int e12_order_reserve(void* user, uint64_t life, uint64_t* token)
+{
+    if (!token) return -1;
+    *token = 0;
+    if (user != &s_e12_owner || !life || life != s_e12_owner.generation) return -3;
+    if (s_e12_owner_thread.gate != &s_e12_owner || !s_e12_owner_thread.native) return -4;
+    if (s_e12_owner.failed || s_e12.failed) return -6;
+    AcquireSRWLockExclusive(&s_e12_hold.lock);
+    int status = 0;
+    if (s_e12_hold.active) status = -4;
+    else if (s_e12_hold.next_token == UINT64_MAX) status = -6;
+    else { s_e12_hold.active = 1; s_e12_hold.token = ++s_e12_hold.next_token; s_e12_hold.reservations++; *token = s_e12_hold.token; }
+    ReleaseSRWLockExclusive(&s_e12_hold.lock);
+    return status;
+}
+static int e12_order_submit(void* user, uint64_t life, uint64_t token, const void* submit_info, void* fence)
+{
+    if (user != &s_e12_owner || !life || life != s_e12_owner.generation) return -3;
+    const rsx_native_d3d12_submit* si = (const rsx_native_d3d12_submit*)submit_info;
+    const int invalid = fence || (si && (si->abi_version != RSX_NATIVE_D3D12_SUBMIT_ABI || si->struct_size != sizeof *si ||
+                                         (si->list_count && !si->lists) || (si->signal_value && !si->signal_fence)));
+    AcquireSRWLockExclusive(&s_e12_hold.lock);
+    if (!s_e12_hold.active || !token || token != s_e12_hold.token) { ReleaseSRWLockExclusive(&s_e12_hold.lock); return -3; }
+    HRESULT hr = S_OK;
+    if (si && !invalid) {
+        ID3D12CommandQueue* q = s_d3d.cmd_queue;
+        if (si->list_count) q->lpVtbl->ExecuteCommandLists(q, si->list_count, (ID3D12CommandList* const*)si->lists);
+        if (si->signal_fence) hr = q->lpVtbl->Signal(q, (ID3D12Fence*)si->signal_fence, si->signal_value);
+        if (FAILED(hr)) s_e12_hold.failures++;
+    } else s_e12_hold.abandoned++;
+    e12_hold_release_locked();   /* after the native batch, whatever became of it */
+    ReleaseSRWLockExclusive(&s_e12_hold.lock);
+    return invalid ? -1 : (int)hr;
+}
+int rsx_d3d12_backend_queue_order(rsx_native_queue_order* out)
+{
+    if (!out || out->abi_version != RSX_NATIVE_QUEUE_ORDER_ABI || out->struct_size != sizeof(*out)) return -1;
+    if (!e12_owner_enabled() || !s_e12.active) return -2;
+    if (!s_e12.ready || !s_d3d.cmd_queue || !s_e12_owner.generation || s_e12_owner.closing) return -3;
+    *out = (rsx_native_queue_order){ .abi_version = RSX_NATIVE_QUEUE_ORDER_ABI, .struct_size = sizeof(*out),
+        .lifetime = s_e12_owner.generation, .userdata = &s_e12_owner,
+        .reserve = e12_order_reserve, .submit = e12_order_submit };
+    return 0;
+}
 
 static void owner_e12_submit_and_wait(void* user, u32 reason)
 {

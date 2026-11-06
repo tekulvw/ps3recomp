@@ -167,6 +167,16 @@ static int open_swap_chain(u32 w, u32 h)
     s_d3d.width = w; s_d3d.height = h;
     return 1;
 }
+/* The native worker of the queue-order check: submits its reserved batch a
+ * little later, while the engine thread waits on work held behind it. */
+typedef struct { rsx_native_queue_order* qo; u64 token; const rsx_native_d3d12_submit* si; int rc; } order_job;
+static DWORD WINAPI order_submit_later(void* p)
+{
+    order_job* job = (order_job*)p;
+    Sleep(150);
+    job->rc = job->qo->submit(job->qo->userdata, job->qo->lifetime, job->token, job->si, NULL);
+    return 0;
+}
 int main(void)
 {
     const int open = open_device();
@@ -752,9 +762,77 @@ int main(void)
                   s_e12_image_stats.transitions >= 1, "image leases counted");
             b->color_target_release(b->user, rt2); b->depth_target_release(b->user, dz);
         }
+        /* Reserved queue order: engine work submitted after a reservation
+         * reaches the queue only after the native batch, so a native clear
+         * recorded first and submitted last still runs before the engine's
+         * clear. A wait on held work blocks until the native submit, made
+         * here from another thread; abandoning releases the hold the same way. */
+        {
+            rsx_native_queue_order qo; memset(&qo, 0, sizeof qo);
+            qo.abi_version = RSX_NATIVE_QUEUE_ORDER_ABI; qo.struct_size = sizeof qo;
+            CHECK(rsx_d3d12_backend_queue_order(&qo) == 0 && qo.lifetime == o.lifetime && qo.reserve && qo.submit,
+                  "queue order available with the owner seam");
+            u64 token = 0, other = 0, ticket = 0;
+            CHECK(qo.reserve(qo.userdata, qo.lifetime, &token) == -4 && !token, "reserve only under the native lease");
+            const u32 rq = b->color_target_create(b->user, RSX_BE_FMT_R8G8B8A8, 64, 64, NULL, 0);
+            rsx_native_image qi; memset(&qi, 0, sizeof qi); qi.abi_version = RSX_NATIVE_IMAGE_ABI; qi.struct_size = sizeof qi;
+            CHECK(rq && rsx_d3d12_backend_borrow_image(o.lifetime, rq, &qi) == 0 &&
+                  qi.retain(qi.userdata, qi.owner_lifetime, qi.resource_id, qi.resource_generation) == 0, "borrow and retain a target");
+            CHECK(e12_native_boundary(0, &ticket) == 0 && o.try_begin(o.userdata, o.lifetime) == 0 &&
+                  qo.reserve(qo.userdata, qo.lifetime, &token) == 0 && token, "reserve under the lease at the boundary");
+            CHECK(qo.reserve(qo.userdata, qo.lifetime, &other) == -4, "one reservation at a time");
+            ID3D12Device* dv = (ID3D12Device*)o.device;
+            ID3D12DescriptorHeap* rh = NULL; ID3D12CommandAllocator* na = NULL; ID3D12GraphicsCommandList* nl = NULL; ID3D12Fence* nf = NULL;
+            D3D12_DESCRIPTOR_HEAP_DESC rd; memset(&rd, 0, sizeof rd); rd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rd.NumDescriptors = 1;
+            const int made = qi.image &&
+                SUCCEEDED(dv->lpVtbl->CreateDescriptorHeap(dv, &rd, &IID_ID3D12DescriptorHeap, (void**)&rh)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandAllocator(dv, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&na)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandList(dv, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, na, NULL, &IID_ID3D12GraphicsCommandList, (void**)&nl)) &&
+                SUCCEEDED(dv->lpVtbl->CreateFence(dv, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&nf));
+            CHECK(made, "native list for the reserved place");
+            if (made) {
+                D3D12_CPU_DESCRIPTOR_HANDLE rv; rh->lpVtbl->GetCPUDescriptorHandleForHeapStart(rh, &rv);
+                dv->lpVtbl->CreateRenderTargetView(dv, (ID3D12Resource*)((const rsx_native_d3d12_image*)qi.image)->resource, NULL, rv);
+                const float native_blue[4] = { 0, 0, 1, 1 };
+                nl->lpVtbl->ClearRenderTargetView(nl, rv, native_blue, 0, NULL);
+                nl->lpVtbl->Close(nl);
+            }
+            o.end(o.userdata, o.lifetime);
+            CHECK(o.try_begin(o.userdata, o.lifetime) == -4, "no lease while a reservation holds the queue");
+            const float engine_red[4] = { 1, 0, 0, 1 };
+            b->clear_color(b->user, rq, engine_red);
+            const u64 held = b->submit_async(b->user, 0);
+            CHECK(held && b->completion_status(b->user, held, 0) == 0 && s_e12_hold.n >= 1 && s_e12_hold.queued < held,
+                  "engine work after the reservation is held, not queued");
+            static void* lists[1]; lists[0] = nl;
+            static rsx_native_d3d12_submit si;
+            si = (rsx_native_d3d12_submit){ .abi_version = RSX_NATIVE_D3D12_SUBMIT_ABI, .struct_size = sizeof si,
+                                            .lists = lists, .list_count = made ? 1u : 0u, .signal_fence = nf, .signal_value = 1 };
+            order_job job = { &qo, token, &si, 99 };
+            HANDLE worker = CreateThread(NULL, 0, order_submit_later, &job, 0, NULL);
+            CHECK(worker && b->completion_status(b->user, held, 1) == 1, "a wait on held work returns once the native batch is submitted");
+            if (worker) { WaitForSingleObject(worker, 10000); CloseHandle(worker); }
+            CHECK(job.rc == 0 && !s_e12_hold.active && (!nf || nf->lpVtbl->GetCompletedValue(nf) == 1), "native submit from another thread");
+            CHECK(made && px(b, rq, 10, 10) == 0xFF0000FFu, "the native batch ran before the engine work held behind it");
+            CHECK(e12_native_boundary(0, &ticket) == 0 && o.try_begin(o.userdata, o.lifetime) == 0 &&
+                  qo.reserve(qo.userdata, qo.lifetime, &token) == 0, "a second reservation");
+            o.end(o.userdata, o.lifetime);
+            b->clear_color(b->user, rq, engine_red);
+            const u64 held2 = b->submit_async(b->user, 0);
+            CHECK(qo.submit(qo.userdata, qo.lifetime, token + 1, NULL, NULL) == -3 && s_e12_hold.active, "a wrong token releases nothing");
+            CHECK(qo.submit(qo.userdata, qo.lifetime, token, NULL, NULL) == 0 && !s_e12_hold.active &&
+                  b->completion_status(b->user, held2, 1) == 1, "abandoning releases the held work");
+            CHECK(qo.submit(qo.userdata, qo.lifetime, token, NULL, NULL) == -3, "a reservation is submitted once");
+            CHECK(s_e12_hold.reservations == 2 && s_e12_hold.abandoned == 1 && s_e12_hold.blocked_waits >= 1 &&
+                  s_e12_hold.failures == 0 && s_e12_hold.held_submits >= 2, "queue order counted");
+            if (nf) nf->lpVtbl->Release(nf); if (nl) nl->lpVtbl->Release(nl); if (na) na->lpVtbl->Release(na);
+            if (rh) rh->lpVtbl->Release(rh);
+            qi.release(qi.userdata, qi.owner_lifetime, qi.resource_id, qi.resource_generation);
+            b->color_target_release(b->user, rq);
+        }
         o.release(o.userdata, o.lifetime);
         CHECK(o.try_begin(o.userdata, o.lifetime) == -3, "release ends lease rights");
-        CHECK(s_e12_owner_stats.grants == 4 && s_e12_owner_stats.refused_dirty + s_e12_owner_stats.refused_busy >= 1,
+        CHECK(s_e12_owner_stats.grants == 6 && s_e12_owner_stats.refused_dirty + s_e12_owner_stats.refused_busy >= 1,
               "lease grants and refusals counted");
         atomic_store(&s_e12_owner_setting, 0);
     }
