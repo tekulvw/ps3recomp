@@ -50,6 +50,7 @@
 #include <vulkan/vulkan.h>
 
 #include "rsx_vulkan_backend.h"
+#include "rsx_fifo_busy.h"
 #include "rsx_frontend_vulkan.h"
 #include "rsx_frontend_internal.h"
 #define RSX_NATIVE_OWNER_PTHREAD
@@ -61,6 +62,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "rsx_present_thread.h"
 #include "metal_frame_rate.h"   /* portable bounded present-rate statistics */
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
@@ -344,7 +346,11 @@ static int vulkan_owner_begin(int dirty){
     if(s_vulkan_owner_thread.native){if(dirty)s_vulkan_owner.failed=1;return 0;}
     if(!s_vulkan_owner_thread.original_depth){s_vulkan_consumer=cellGcm_rsx_consumer_begin&&cellGcm_rsx_consumer_end;
         if(s_vulkan_consumer)cellGcm_rsx_consumer_begin();}
-    if(rsx_owner_original_begin(&s_vulkan_owner,&s_vulkan_owner_thread))return 0;
+    const int outer=!s_vulkan_owner_thread.original_depth;
+    if(outer)rsx_fifo_busy_enter(RSX_FIFO_BUSY_LEASE_WAIT);
+    const int refused=rsx_owner_original_begin(&s_vulkan_owner,&s_vulkan_owner_thread);
+    if(outer)rsx_fifo_busy_leave(RSX_FIFO_BUSY_LEASE_WAIT);
+    if(refused)return 0;
     if(dirty)rsx_owner_dirty(&s_vulkan_owner,&s_vulkan_owner_thread);
     return 1;
 }
@@ -873,7 +879,25 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
     return r;
 }
 
+/* PS3RECOMP_RSX_FIFO_BUSY: swapchain acquire and present block the presenting
+ * thread like Metal's drawable wait; both count as "drawable". */
+static VkResult vk_busy_acquire(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+                                VkSemaphore semaphore, VkFence fence, uint32_t* index)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
+    const VkResult r = pvkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, index);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
+    return r;
+}
+static VkResult vk_queue_present_core(const VkPresentInfoKHR* pi);
 static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
+    const VkResult r = vk_queue_present_core(pi);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
+    return r;
+}
+static VkResult vk_queue_present_core(const VkPresentInfoKHR* pi)
 {
     pthread_mutex_lock(&s_vk.queue_mu);
     const uint64_t th = s_vkpt_on > 0 ? vkpt_now() : 0;
@@ -2223,7 +2247,7 @@ static void vk_present_window(void)
     if (!s_vk.windowed || !s_vk.swapchain) return;
 
     u32 idx = 0;
-    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+    VkResult r = vk_busy_acquire(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                         s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); return; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
@@ -2568,7 +2592,7 @@ static void vk_present_record_end(VkCommandBuffer cb)
             }
             acquire = s_vk.present_acquire[slot];
             const uint64_t ta = s_vkpt_on > 0 ? vkpt_now() : 0;
-            VkResult r = acquire ? pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+            VkResult r = acquire ? vk_busy_acquire(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                                           acquire, VK_NULL_HANDLE, &idx)
                                  : VK_ERROR_INITIALIZATION_FAILED;
             vkpt_add(VKPT_ACQUIRE, ta);
@@ -2684,7 +2708,7 @@ static int vk_show_service_locked(void)
     }
     s_show.slot = slot;
     u32 idx = 0;
-    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+    VkResult r = vk_busy_acquire(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                         s_show.acquire[slot], VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); s_show.failed++; return 0; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
@@ -3001,6 +3025,8 @@ static int vk_eng_make_view(VkImage img, VkFormat fmt, u32 levels, VkComponentMa
     return pvkCreateImageView(s_vk.device, &vci, NULL, out) == VK_SUCCESS ? 0 : -1;
 }
 
+static void vk_pt_start(void);
+static void vk_pt_stop(void);
 static int vk_eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
@@ -3019,6 +3045,7 @@ static int vk_eng_init(void* user, u32 width, u32 height)
         vk_bat_shutdown();
         s_bat_on = 0;
     }
+    if (rsx_present_thread_requested()) vk_pt_start();
     return 0;
 }
 
@@ -3110,6 +3137,7 @@ static void vk_eng_snapshot_pool_drain(void);
 
 static void vk_eng_shutdown(void* user)
 {
+    vk_pt_stop();   /* joins the show thread before anything it uses goes */
     if (s_bat_on) (void)vk_bat_flush(1);
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
@@ -3233,12 +3261,338 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     vk_submit_and_wait();
 }
 
+/* ---------------------------------------------------------------------------
+ * Opt-in present thread (PS3RECOMP_RSX_PRESENT_THREAD=1)
+ *
+ * rsx_present_thread.h owns the ring, the thread and the counters; these are
+ * the Vulkan halves. Direct presents only: a read-back present (a frame dump,
+ * PS3RECOMP_VK_PRESENT_READBACK=1) or the fixed-function path keeps the
+ * ordinary present, with a one-time message.
+ *
+ * Stage (presenting thread, inside the owner gate like vk_eng_present): the
+ * flipped surface blitted into this slot's staging image, on a command buffer
+ * of the presenting thread's own pool, after a full dependency on everything
+ * submitted before, through vk_queue_submit (so it is held behind a
+ * reservation exactly as the present's copy was). present_order then makes the
+ * walker's next command buffer wait for it, so no later write reaches the
+ * surface before the copy has read it. Nothing waits for a swapchain image.
+ *
+ * Show (the present thread): the swapchain image (finite timeouts, so a
+ * shutdown is never stuck behind it), then on its own pool the staging image
+ * into the offscreen target and the offscreen target into the swapchain image
+ * (vk_record_window_blit), then vkQueuePresentKHR. It submits only after the
+ * stage it shows has left any hold (queue order), through queue_mu alone: no
+ * present_mu, no owner gate or consumer lease, and not as the original owner's
+ * submission. In this mode only the show thread uses the offscreen target, the
+ * swapchain and its semaphores; the walker's engine path never draws into
+ * them. The frame-rate counters, which both halves update, take a mutex of
+ * their own.
+ *
+ * Off (the default), none of this is created and vk_eng_present is unchanged. */
+#define VK_PT_STAGE_CMDS 6
+#define VK_PT_SHOW_SLOTS 3
+static struct {
+    rsx_present_thread* pt;
+    int stopping;                                   /* atomic */
+    VkCommandPool stage_pool;                       /* presenting thread */
+    VkCommandBuffer stage_cmds[VK_PT_STAGE_CMDS];
+    VkFence stage_fences[VK_PT_STAGE_CMDS];
+    int stage_busy[VK_PT_STAGE_CMDS];
+    u32 stage_next;
+    vk_image img[RSX_PRESENT_THREAD_MAX_DEPTH];     /* the staging images */
+    u32 img_w[RSX_PRESENT_THREAD_MAX_DEPTH], img_h[RSX_PRESENT_THREAD_MAX_DEPTH];
+    int img_fresh[RSX_PRESENT_THREAD_MAX_DEPTH];    /* still UNDEFINED */
+    VkFence slot_fence[RSX_PRESENT_THREAD_MAX_DEPTH];
+    VkCommandPool show_pool;                        /* present thread */
+    VkCommandBuffer show_cmds[VK_PT_SHOW_SLOTS];
+    VkFence show_fences[VK_PT_SHOW_SLOTS];
+    VkSemaphore show_acquire[VK_PT_SHOW_SLOTS];
+    int show_busy[VK_PT_SHOW_SLOTS];
+    u32 show_next;
+    pthread_mutex_t fps_mu;
+} s_vpt;
+
+static int vk_pt_is_stage_fence(VkFence f)
+{
+    if (!s_vpt.pt || !f) return 0;
+    for (u32 i = 0; i < VK_PT_STAGE_CMDS; i++) if (s_vpt.stage_fences[i] == f) return 1;
+    return 0;
+}
+
+static void vk_pt_destroy_image(u32 slot)
+{
+    vk_image* im = &s_vpt.img[slot];
+    if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
+    if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
+    if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
+    memset(im, 0, sizeof *im);
+    s_vpt.img_w[slot] = s_vpt.img_h[slot] = 0;
+}
+
+static int vk_pt_stage(void* user, uint32_t slot, uint32_t surface)
+{
+    (void)user;
+    vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+    if (!o || slot >= RSX_PRESENT_THREAD_MAX_DEPTH) return 0;
+    /* The offscreen target's size, which the window blit reads. A slot whose
+     * image no longer matches gets a new one; the queue goes idle first, since
+     * a show submitted earlier may still read the old one. */
+    if (s_vpt.img[slot].img && (s_vpt.img_w[slot] != s_vk.width || s_vpt.img_h[slot] != s_vk.height)) {
+        vk_device_idle();
+        vk_pt_destroy_image(slot);
+    }
+    if (!s_vpt.img[slot].img) {
+        /* Only ever a blit source and destination, but vk_create_image also
+         * makes a view, and a view needs a usage it can serve (VUID-
+         * VkImageViewCreateInfo-image-04441): SAMPLED, as the offscreen
+         * target's own images have, costs nothing here. */
+        if (vk_create_image(&s_vpt.img[slot], s_vk.color.format, s_vk.width, s_vk.height,
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                            VK_IMAGE_USAGE_SAMPLED_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT)) {
+            vk_pt_destroy_image(slot);
+            return 0;
+        }
+        s_vpt.img_w[slot] = s_vk.width; s_vpt.img_h[slot] = s_vk.height;
+        s_vpt.img_fresh[slot] = 1;
+    }
+    const u32 c = s_vpt.stage_next;
+    s_vpt.stage_next = (c + 1u) % VK_PT_STAGE_CMDS;
+    if (s_vpt.stage_busy[c]) {           /* VK_PT_STAGE_CMDS stages back: GPU lag only */
+        vk_fence_wait(s_vpt.stage_fences[c]);
+        s_vpt.stage_busy[c] = 0;
+    }
+    pthread_mutex_lock(&s_vk.present_mu);   /* a present's exclusion, as vk_eng_present */
+    VkCommandBuffer cb = s_vpt.stage_cmds[c];
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (pvkResetCommandBuffer(cb, 0) != VK_SUCCESS || pvkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) {
+        pthread_mutex_unlock(&s_vk.present_mu);
+        VK_LOG("present thread: stage recording failed\n");
+        return 0;
+    }
+    vk_cmd_after_everything(cb);
+    vk_barrier_image_on(cb, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image_on(cb, s_vpt.img[slot].img, VK_IMAGE_ASPECT_COLOR_BIT,
+                        s_vpt.img_fresh[slot] ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL);
+    VkImageBlit blit = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffsets = { { 0, 0, 0 }, { (int32_t)o->w, (int32_t)o->h, 1 } },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+    };
+    pvkCmdBlitImage(cb, o->im.img, VK_IMAGE_LAYOUT_GENERAL,
+                    s_vpt.img[slot].img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                    (o->w == s_vk.width && o->h == s_vk.height) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    if (pvkEndCommandBuffer(cb) != VK_SUCCESS) {
+        pthread_mutex_unlock(&s_vk.present_mu);
+        VK_LOG("present thread: vkEndCommandBuffer (stage) failed\n");
+        return 0;
+    }
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = 1, .pCommandBuffers = &cb };
+    pvkResetFences(s_vk.device, 1, &s_vpt.stage_fences[c]);
+    if (vk_queue_submit(&si, s_vpt.stage_fences[c]) != VK_SUCCESS) {
+        pthread_mutex_unlock(&s_vk.present_mu);
+        VK_LOG("present thread: vkQueueSubmit (stage) failed\n");
+        return 0;
+    }
+    s_vpt.stage_busy[c] = 1;
+    s_vpt.slot_fence[slot] = s_vpt.stage_fences[c];
+    s_vpt.img_fresh[slot] = 0;
+    s_vk.present_order = 1;                 /* later writes wait for this copy */
+    if (s_vk.fps_on) {
+        pthread_mutex_lock(&s_vpt.fps_mu);
+        metal_frame_rate_guest(&s_vk.fps);
+        pthread_mutex_unlock(&s_vpt.fps_mu);
+    }
+    pthread_mutex_unlock(&s_vk.present_mu);
+    return 1;
+}
+
+/* The show thread's submission: on the queue at once, and not the original
+ * owner's (it reads only a staging image and writes only the offscreen target
+ * and a swapchain image). */
+static VkResult vk_pt_queue_submit(const VkSubmitInfo* si, VkFence fence)
+{
+    pthread_mutex_lock(&s_vk.queue_mu);
+    const VkResult r = pvkQueueSubmit(s_vk.queue, 1, si, fence);
+    pthread_mutex_unlock(&s_vk.queue_mu);
+    return r;
+}
+
+static int vk_pt_show(void* user, uint32_t slot, rsx_present_show_timing* timing)
+{
+    (void)user;
+    if (slot >= RSX_PRESENT_THREAD_MAX_DEPTH || !s_vpt.img[slot].img) return 0;
+    const uint64_t t0 = vkpt_now();
+    const u32 k = s_vpt.show_next;
+    s_vpt.show_next = (k + 1u) % VK_PT_SHOW_SLOTS;
+    if (s_vpt.show_busy[k]) {
+        vk_fence_wait(s_vpt.show_fences[k]);
+        s_vpt.show_busy[k] = 0;
+    }
+    /* The stage must reach the queue first: wait out a hold it is behind. */
+    pthread_mutex_lock(&s_vk.queue_mu);
+    while (vk_hold_has_locked(s_vpt.slot_fence[slot])) pthread_cond_wait(&s_hold_cv, &s_vk.queue_mu);
+    pthread_mutex_unlock(&s_vk.queue_mu);
+    u32 idx = 0;
+    int window = s_vk.windowed && s_vk.swapchain;
+    if (window) {
+        VkResult r;
+        for (;;) {
+            r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, 100000000ull /* 100 ms */,
+                                       s_vpt.show_acquire[k], VK_NULL_HANDLE, &idx);
+            if ((r == VK_TIMEOUT || r == VK_NOT_READY) && !__atomic_load_n(&s_vpt.stopping, __ATOMIC_ACQUIRE)) continue;
+            break;
+        }
+        if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); window = 0; }
+        else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+            if (r != VK_TIMEOUT && r != VK_NOT_READY) VK_LOG("present thread: vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r);
+            window = 0;
+        }
+        if (!window) { timing->acquire_ns = vkpt_now() - t0; return 0; }
+    }
+    const uint64_t t1 = vkpt_now();
+    timing->acquire_ns = t1 - t0;
+    VkCommandBuffer cb = s_vpt.show_cmds[k];
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (pvkResetCommandBuffer(cb, 0) != VK_SUCCESS || pvkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) {
+        VK_LOG("present thread: show recording failed\n");
+        return 0;   /* an acquired image is left unpresented; the next acquire recycles it */
+    }
+    vk_barrier_image_on(cb, s_vpt.img[slot].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageBlit blit = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_vpt.img_w[slot], (int32_t)s_vpt.img_h[slot], 1 } },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+    };
+    pvkCmdBlitImage(cb, s_vpt.img[slot].img, VK_IMAGE_LAYOUT_GENERAL,
+                    s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                    (s_vpt.img_w[slot] == s_vk.width && s_vpt.img_h[slot] == s_vk.height)
+                        ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    if (window) vk_record_window_blit(cb, idx);
+    if (pvkEndCommandBuffer(cb) != VK_SUCCESS) { VK_LOG("present thread: vkEndCommandBuffer (show) failed\n"); return 0; }
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .waitSemaphoreCount = window ? 1u : 0u, .pWaitSemaphores = &s_vpt.show_acquire[k],
+                        .pWaitDstStageMask = &wait_stage,
+                        .commandBufferCount = 1, .pCommandBuffers = &cb,
+                        .signalSemaphoreCount = window ? 1u : 0u,
+                        .pSignalSemaphores = window ? &s_vk.sc_done[idx] : NULL };
+    pvkResetFences(s_vk.device, 1, &s_vpt.show_fences[k]);
+    if (vk_pt_queue_submit(&si, s_vpt.show_fences[k]) != VK_SUCCESS) {
+        VK_LOG("present thread: vkQueueSubmit (show) failed\n");
+        atomic_store(&s_vk_eng_failed, 1);
+        return 0;
+    }
+    s_vpt.show_busy[k] = 1;
+    s_vk.presented++;
+    if (window) {
+        VkPresentInfoKHR pi = {
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
+            .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
+        };
+        const VkResult r = vk_queue_present_unheld(&pi);
+        if (s_vk.fps_on && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) {
+            pthread_mutex_lock(&s_vpt.fps_mu);
+            metal_frame_rate_presented(&s_vk.fps, vk_now_seconds());
+            vk_fps_report();
+            pthread_mutex_unlock(&s_vpt.fps_mu);
+        }
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
+        else if (r != VK_SUCCESS) VK_LOG("present thread: vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
+    }
+    timing->blit_ns = vkpt_now() - t1;
+    return 1;
+}
+
+static void vk_pt_discard(void* user, uint32_t slot)
+{
+    (void)user; (void)slot;   /* the staging image stays for the slot's next frame */
+}
+
+static void vk_pt_stop(void);
+static void vk_pt_start(void)
+{
+    if (s_vpt.pt || !s_vk.device) return;
+    const char* rb = getenv("PS3RECOMP_VK_PRESENT_READBACK");
+    if ((rb && !strcmp(rb, "1")) || s_vk.dump_path) {
+        rsx_present_thread_unsupported("vulkan", "read-back presents (PS3RECOMP_VK_PRESENT_READBACK / PS3RECOMP_VK_DUMP)");
+        return;
+    }
+    memset(&s_vpt, 0, sizeof s_vpt);
+    if (pthread_mutex_init(&s_vpt.fps_mu, NULL)) return;
+    VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                                    .queueFamilyIndex = s_vk.queue_family };
+    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY };
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    int ok = pvkCreateCommandPool(s_vk.device, &pci, NULL, &s_vpt.stage_pool) == VK_SUCCESS &&
+             pvkCreateCommandPool(s_vk.device, &pci, NULL, &s_vpt.show_pool) == VK_SUCCESS;
+    if (ok) {
+        cai.commandPool = s_vpt.stage_pool; cai.commandBufferCount = VK_PT_STAGE_CMDS;
+        ok = pvkAllocateCommandBuffers(s_vk.device, &cai, s_vpt.stage_cmds) == VK_SUCCESS;
+    }
+    if (ok) {
+        cai.commandPool = s_vpt.show_pool; cai.commandBufferCount = VK_PT_SHOW_SLOTS;
+        ok = pvkAllocateCommandBuffers(s_vk.device, &cai, s_vpt.show_cmds) == VK_SUCCESS;
+    }
+    for (u32 i = 0; ok && i < VK_PT_STAGE_CMDS; i++)
+        ok = pvkCreateFence(s_vk.device, &fci, NULL, &s_vpt.stage_fences[i]) == VK_SUCCESS;
+    for (u32 i = 0; ok && i < VK_PT_SHOW_SLOTS; i++)
+        ok = pvkCreateFence(s_vk.device, &fci, NULL, &s_vpt.show_fences[i]) == VK_SUCCESS &&
+             pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vpt.show_acquire[i]) == VK_SUCCESS;
+    if (ok) {
+        const rsx_present_hooks hooks = { NULL, vk_pt_stage, vk_pt_show, vk_pt_discard };
+        s_vpt.pt = rsx_present_thread_create(&hooks, rsx_present_thread_depth_from(getenv("PS3RECOMP_RSX_PRESENT_THREAD_DEPTH")));
+    }
+    if (!s_vpt.pt) {
+        VK_LOG("present thread could not start; presents stay on the presenting thread\n");
+        vk_pt_stop();
+    }
+}
+
+static void vk_pt_stop(void)
+{
+    __atomic_store_n(&s_vpt.stopping, 1, __ATOMIC_RELEASE);
+    rsx_present_thread_destroy(s_vpt.pt);   /* joins; discards what is still staged */
+    s_vpt.pt = NULL;
+    if (!s_vk.device || (!s_vpt.stage_pool && !s_vpt.show_pool)) return;
+    vk_device_idle();
+    for (u32 i = 0; i < RSX_PRESENT_THREAD_MAX_DEPTH; i++) vk_pt_destroy_image(i);
+    for (u32 i = 0; i < VK_PT_STAGE_CMDS; i++)
+        if (s_vpt.stage_fences[i]) pvkDestroyFence(s_vk.device, s_vpt.stage_fences[i], NULL);
+    for (u32 i = 0; i < VK_PT_SHOW_SLOTS; i++) {
+        if (s_vpt.show_fences[i]) pvkDestroyFence(s_vk.device, s_vpt.show_fences[i], NULL);
+        if (s_vpt.show_acquire[i]) pvkDestroySemaphore(s_vk.device, s_vpt.show_acquire[i], NULL);
+    }
+    if (s_vpt.stage_pool) pvkDestroyCommandPool(s_vk.device, s_vpt.stage_pool, NULL);
+    if (s_vpt.show_pool) pvkDestroyCommandPool(s_vk.device, s_vpt.show_pool, NULL);
+    pthread_mutex_destroy(&s_vpt.fps_mu);
+    memset(&s_vpt, 0, sizeof s_vpt);
+}
+
 /* The named surface becomes the frame: blit it onto the display image, then
  * the existing present does the readback, the PPM dump and the window. */
 static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
     if (!s_vk.device) return;
+    if (s_vpt.pt) {
+        /* Present thread: stage the surface and return (see above). */
+        if (s_bat_on) (void)vk_bat_flush(0);
+        (void)rsx_present_thread_submit(s_vpt.pt, surface);
+        s_g.last_draws = s_g.draws;
+        s_g.draws = 0;
+        return;
+    }
     const uint64_t t0 = vkpt_enabled() ? vkpt_now() : 0;
     /* Batched: what the frame recorded goes on the queue ahead of the blit. */
     if (s_bat_on) (void)vk_bat_flush(0);
@@ -5732,8 +6086,11 @@ static int vulkan_original_init(u32 width, u32 height, const char* title)
     rsx_draw_engine_set_default(s_g.on ? 1 : 0);
     if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
         s_vk.eng_active = 1;
-    else
+    else {
         rsx_set_backend(&s_vulkan_backend);
+        if (rsx_present_thread_requested())
+            rsx_present_thread_unsupported("vulkan fixed-function path", "the draw engine is off");
+    }
     VK_LOG("%s path\n", s_vk.eng_active ? "register-file draw engine" : "vtable");
     VK_LOG("offscreen target %ux%u ready, depth format %d (%s)\n",
            s_vk.width, s_vk.height, (int)s_vk.depth_format, title ? title : "");
@@ -6036,6 +6393,10 @@ int rsx_vulkan_backend_native_boundary(uint64_t *ticket){
                     /* So is a direct present still running: it is on the queue
                      * (never held here) and reads only the offscreen target. */
                     if(result==VK_NOT_READY&&vk_present_is_fence(s_vulkan_boundary_fence))result=VK_SUCCESS;
+                    /* And a present thread's stage on the queue: it reads the
+                     * flipped surface and writes only its staging image. */
+                    if(result==VK_NOT_READY&&!vk_hold_has_locked(s_vulkan_boundary_fence)&&
+                       vk_pt_is_stage_fence(s_vulkan_boundary_fence))result=VK_SUCCESS;
                     if(result==VK_NOT_READY)status=-4;
                     else if(result!=VK_SUCCESS){vulkan_owner_fault();status=-6;}
                     else{

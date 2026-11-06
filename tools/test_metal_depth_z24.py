@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix="metal-depth-z24-") as tmp:
     subprocess.run(["clang", "-fobjc-arc", "-Iinclude", "-Ilibs/video",
                     "libs/video/tests/test_metal_depth_z24.m",
                     "libs/video/rsx_texture_layout.c", "libs/video/rsx_shader_msl.cpp",
-                    "libs/video/tests/gcm_deferred_fixture_stubs.c",
+                    "libs/video/tests/gcm_deferred_fixture_stubs.c","libs/video/rsx_fifo_busy.c",
                     "runtime/diagnostics/render_ablation.c", "-lc++", "-Wl,-dead_strip",
                     "-framework", "Metal", "-framework", "Cocoa",
                     "-framework", "QuartzCore", "-o", str(binary)],

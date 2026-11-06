@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 
 root=Path(__file__).resolve().parents[1]
-sources=["tests/test_texture_binding_capture.c", "rsx_draw_engine.c", "rsx_dispatch.c",
+sources=["tests/test_texture_binding_capture.c", "rsx_draw_engine.c", "rsx_fifo_busy.c", "rsx_dispatch.c",
          "rsx_vertex_compact.c", "rsx_texture_layout.c", "rsx_vp_decompiler.c", "rsx_fp_decompiler.c"]
 with tempfile.TemporaryDirectory(prefix="rsx-binding-capture-") as directory:
     directory=Path(directory); binary=directory/"test"

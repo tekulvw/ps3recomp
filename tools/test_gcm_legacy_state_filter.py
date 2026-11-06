@@ -19,7 +19,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-legacy-state-filter-') as tmp:
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
                     str(root / 'libs/video/tests/test_gcm_legacy_state_filter.c'),
-                    str(root / 'libs/video/tests/gcm_deferred_fixture_stubs.c'), *linker,
+                    str(root / 'libs/video/tests/gcm_deferred_fixture_stubs.c'),str(root / 'libs/video/rsx_fifo_busy.c'), *linker,
                     '-o', str(binary)], check=True)
     result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)
     print(result.stdout.strip())
