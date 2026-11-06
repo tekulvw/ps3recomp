@@ -2333,7 +2333,9 @@ static int e12_native_boundary(int check_registers, uint64_t* ticket)
     if (!e12_owner_enabled() || !s_e12.active) return -2;
     if (!e12_owner_begin(0)) return -4;
     int status = 0;
-    if (!s_e12.ready || !s_d3d.cmd_queue || !s_e12_owner.generation || s_e12_owner.closing) status = -3;
+    /* An original-side boundary: it needs no borrowed owner yet (a frontend may
+     * take its first boundary before it borrows), only a live engine. */
+    if (!s_e12.ready || !s_d3d.cmd_queue || s_e12_owner.closing) status = -3;
     else if (s_e12_owner.failed || s_e12.failed || atomic_load(&s_e12_unscoped_submit)) status = -6;
     else if (s_e12_partial_primitives) status = -4;
     if (!status && check_registers) {

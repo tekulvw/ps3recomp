@@ -606,6 +606,11 @@ int main(void)
         CHECK(rsx_d3d12_backend_borrow_owner(&o) == -2, "owner seam off by default");
         atomic_store(&s_e12_owner_setting, 1);
         s_e12.active = 1;
+        {   /* a frontend may take the boundary before it borrows the owner */
+            u64 early = 0;
+            CHECK(!s_e12_owner.generation && e12_native_boundary(0, &early) == 0 && early == s_e12.fence_value,
+                  "native boundary before any owner borrow");
+        }
         CHECK(rsx_d3d12_backend_borrow_owner(&o) == 0 && o.backend == RSX_NATIVE_OWNER_D3D12 &&
               o.device == (void*)s_d3d.device && o.queue == (void*)s_d3d.cmd_queue && o.lifetime != 0,
               "borrow names the D3D12 device and queue");
@@ -758,7 +763,7 @@ int main(void)
             zi.release(zi.userdata, zi.owner_lifetime, zi.resource_id, zi.resource_generation);
             CHECK(s_e12_owner.retained == 1 && !e12_image_find(ci.resource_id, ci.resource_generation),
                   "image releases balance and the freed target's record goes");
-            CHECK(s_e12_image_stats.borrows == 3 && s_e12_image_stats.retains == 2 && s_e12_image_stats.boundaries == 2 &&
+            CHECK(s_e12_image_stats.borrows == 3 && s_e12_image_stats.retains == 2 && s_e12_image_stats.boundaries == 3 &&
                   s_e12_image_stats.transitions >= 1, "image leases counted");
             b->color_target_release(b->user, rt2); b->depth_target_release(b->user, dz);
         }
