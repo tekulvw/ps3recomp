@@ -28,6 +28,7 @@ void rsx_draw_engine_set_owner_hooks(const rsx_original_owner_hooks* hooks){
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 #include "rsx_engine_phases.h"
+#include "rsx_fifo_busy.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -4258,9 +4259,11 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     ENG_PH_BEGIN(ph_draw);
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAW);
     draw_observer_begin();
     sink_end_core(user, r);
     draw_observer_finish();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAW);
     if (ph_draw) eng_ph_stage(NULL);
     ENG_PH_END(ENG_PH_DRAW, ph_draw);
 }
@@ -4353,7 +4356,9 @@ static void eng_present_core(u32 buffer_id);
 static void eng_present(u32 buffer_id)
 {
     ENG_PH_BEGIN(ph);
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT);
     eng_present_core(buffer_id);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT);
     ENG_PH_END(ENG_PH_PRESENT, ph);
 }
 static void eng_present_core(u32 buffer_id)
@@ -4594,8 +4599,10 @@ static void original_rsx_draw_engine_flush(void)
 {
     ENG_PH_BEGIN(ph);
     if(!eng_report_barrier())return;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_FLUSH);
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_FLUSH);
     ENG_PH_END(ENG_PH_FLUSH, ph);
 }
 
@@ -4618,7 +4625,9 @@ static u64 original_rsx_draw_engine_submit_async(void)
         eng_async_failure_witness("guard",available);return 0;
     }
     ENG_PH_BEGIN(ph);
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_FLUSH);
     u64 ticket=g.be->submit_async(g.be->user,RSX_BE_FLUSH_GUEST_REFERENCE);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_FLUSH);
     ENG_PH_END(ENG_PH_ASYNC, ph);
     if(!ticket)eng_async_failure_witness("backend",available);
     return ticket;
@@ -4643,7 +4652,9 @@ static int eng_flush_checked_core(void);
 static int original_rsx_draw_engine_flush_checked(void)
 {
     ENG_PH_BEGIN(ph);
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_FLUSH);
     const int ok = eng_flush_checked_core();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_FLUSH);
     ENG_PH_END(ENG_PH_FLUSH_CHK, ph);
     return ok;
 }
@@ -4669,7 +4680,7 @@ static void original_rsx_draw_engine_present(void)
      * present just blits the same image again. */
     if (eng_single_present() && s_flip_presented) {
         s_flip_presented = 0;
-        if (++s_single_present_skipped % 600ull == 0)
+        if (++s_single_present_skipped <= 4ull || s_single_present_skipped % 600ull == 0)
             fprintf(stderr, "[rsx engine] single present: %llu host re-presents skipped\n", s_single_present_skipped);
         return;
     }

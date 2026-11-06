@@ -16,6 +16,7 @@
 #include "rsx_ring_progress_observer.h"
 #include "cellGcmSys.h"
 #include "rsx_native_handoff.h"
+#include "rsx_fifo_busy.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
@@ -333,7 +334,9 @@ static void gcm_native_watch_report_one(const gcm_native_watch_report* r, u32 ge
     if (r->status == RSX_NATIVE_WATCH_ARRIVED) rsx_draw_engine_native_source_target(&e->target);
     owned.writer_state_ea = r->watch.writer_state_ea;
     owned.ring_begin_ea = r->watch.ring_begin_ea; owned.ring_bytes = r->watch.ring_bytes;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_HANDOFF);
     r->watch.consume(r->watch.userdata, &owned, r->status);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_HANDOFF);
     AcquireSRWLockExclusive(&s_native_handoff_lock);
     if (s_native_handoffs[r->slot].cookie == r->cookie) gcm_native_handoff_remove(r->slot);
     ReleaseSRWLockExclusive(&s_native_handoff_lock);
@@ -456,8 +459,14 @@ static int gcm_native_handoff_consume(u32 ea, u32 get, u32 put)
             owned.abi_version = RSX_NATIVE_HANDOFF_ABI; owned.struct_size = sizeof(owned);
             owned.source = event; owned.writer_state_ea = ring.writer_state_ea;
             owned.ring_begin_ea = ring.ring_begin_ea; owned.ring_bytes = ring.ring_bytes;
+            rsx_fifo_busy_enter(RSX_FIFO_BUSY_HANDOFF);
             ring.consume(ring.userdata, &owned);
-        } else source.consume(source.userdata, &event);
+            rsx_fifo_busy_leave(RSX_FIFO_BUSY_HANDOFF);
+        } else {
+            rsx_fifo_busy_enter(RSX_FIFO_BUSY_HANDOFF);
+            source.consume(source.userdata, &event);
+            rsx_fifo_busy_leave(RSX_FIFO_BUSY_HANDOFF);
+        }
         AcquireSRWLockExclusive(&s_native_handoff_lock);
         gcm_native_handoff_remove(slot);
         ReleaseSRWLockExclusive(&s_native_handoff_lock);
@@ -567,8 +576,11 @@ static int gcm_reports_live(void) { return s_live_report_batch && rsx_live_draw_
 static int gcm_reports_sync_barrier_at(u32 reason);
 #define gcm_reports_sync_barrier() gcm_reports_sync_barrier_at(__LINE__)
 void cellGcm_rsx_consumer_begin(void) {
-    if (s_deferred_reports && s_consumer_depth++ == 0)
+    if (s_deferred_reports && s_consumer_depth++ == 0) {
+        rsx_fifo_busy_enter(RSX_FIFO_BUSY_LEASE_WAIT);
         AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+        rsx_fifo_busy_leave(RSX_FIFO_BUSY_LEASE_WAIT);
+    }
 }
 void cellGcm_rsx_consumer_end(void) {
     if (s_deferred_reports && --s_consumer_depth == 0)
@@ -1794,9 +1806,10 @@ static int gcm_engine_report_barrier(void){
 }
 static int gcm_reports_sync_barrier_core(u32 reason);
 static int gcm_reports_sync_barrier_at(u32 reason){
-    if(!gph_enabled())return gcm_reports_sync_barrier_core(reason);
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_SYNC);
+    if(!gph_enabled()){const int ok=gcm_reports_sync_barrier_core(reason);rsx_fifo_busy_leave(RSX_FIFO_BUSY_SYNC);return ok;}
     const uint64_t t0=gph_now();const int ok=gcm_reports_sync_barrier_core(reason);
-    gph_site(reason,gph_now()-t0);return ok;
+    gph_site(reason,gph_now()-t0);rsx_fifo_busy_leave(RSX_FIFO_BUSY_SYNC);return ok;
 }
 static int gcm_reports_sync_barrier_core(u32 reason){
     if(!s_deferred_reports)return 1;
@@ -1823,9 +1836,10 @@ static int gcm_reports_sync_barrier_core(u32 reason){
 static int s_inline_no_gpu_wait=-1;
 static int gcm_inline_image_barrier_core(void);
 static int gcm_inline_image_barrier(void){
-    if(!gph_enabled())return gcm_inline_image_barrier_core();
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_SYNC);
+    if(!gph_enabled()){const int ok=gcm_inline_image_barrier_core();rsx_fifo_busy_leave(RSX_FIFO_BUSY_SYNC);return ok;}
     const uint64_t t0=gph_now();const int ok=gcm_inline_image_barrier_core();
-    s_gph.inline_ns+=gph_now()-t0;s_gph.inline_n++;return ok;
+    s_gph.inline_ns+=gph_now()-t0;s_gph.inline_n++;rsx_fifo_busy_leave(RSX_FIFO_BUSY_SYNC);return ok;
 }
 static int gcm_inline_image_barrier_core(void){
     if(s_inline_no_gpu_wait<0){
@@ -3051,8 +3065,10 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     static int on = -1;
     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+    rsx_fifo_busy_idle_begin();
     if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
+    rsx_fifo_busy_idle_end();
 }
 
 
@@ -3208,6 +3224,8 @@ static void wprof_note_walker(void) {}
 void cellGcm_rsx_process_fifo(void)
 {
     wprof_note_walker();
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAIN);
+    rsx_fifo_busy_pass_stopped(RSX_FIFO_BUSY_STOP_OTHER);   /* a pass that returns early */
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     if(!s_deferred_reports){
         AcquireSRWLockExclusive(&s_gcm_fifo_lock);gcm_rsx_process_fifo_unlocked();ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
@@ -3225,6 +3243,7 @@ void cellGcm_rsx_process_fifo(void)
             ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
     }
     if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAIN);
 }
 
 /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
@@ -3497,6 +3516,7 @@ static void gcm_rsx_process_fifo_pass(void)
                           flips, 10); }
             if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                                ps3_ft_span(PS3_FT_FLIP_FIFO, 0, w & 7u, 0, t, t); }
+            rsx_fifo_busy_flip();
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
@@ -4016,6 +4036,10 @@ static void gcm_rsx_process_fifo_pass(void)
      * ring start, and the resync dropped them: inFAMOUS 2 stopped presenting
      * for good that way in about one New Marais run in five ("stuck-get" at a
      * self-jump with no "jump-park" before it). */
+    rsx_fifo_busy_pass_stopped(s_sema_blocked_pass ? RSX_FIFO_BUSY_STOP_SEMA :
+                               producer_waiting ? RSX_FIFO_BUSY_STOP_WRITER :
+                               (!s_park_pass && s_fifo_getoff == put) ? RSX_FIFO_BUSY_STOP_PUT :
+                               RSX_FIFO_BUSY_STOP_OTHER);
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
       if (s_sema_blocked_pass || s_park_pass || producer_waiting) {
           stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }

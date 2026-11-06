@@ -60,6 +60,8 @@ int main(int argc, char** argv)
     CHECK(s_g.on, "guest programs (glslang) available");
     if (!s_g.on) { rsx_vulkan_backend_shutdown(); return 1; }
     const int readback = getenv("PS3RECOMP_VK_PRESENT_READBACK") && !strcmp(getenv("PS3RECOMP_VK_PRESENT_READBACK"), "1");
+    const int threaded = getenv("PS3RECOMP_RSX_PRESENT_THREAD") && !strcmp(getenv("PS3RECOMP_RSX_PRESENT_THREAD"), "1");
+    CHECK(!threaded == !s_vpt.pt, "the present thread runs exactly when asked for");
 
     u32 rt = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, W, H, NULL, 0);
     rsx_be_render_state rs; memset(&rs, 0, sizeof rs);
@@ -102,9 +104,41 @@ int main(int argc, char** argv)
     vk_eng_readback(NULL, rt, 0, 0, W, H, out, W * 4);
     const u8* c = out + ((size_t)(H / 2) * W + W / 2) * 4;
     const u32 centre = ((u32)c[0] << 16) | ((u32)c[1] << 8) | c[2];
+    if (threaded) {
+        /* Every frame staged; each one then shown or dropped for a newer one,
+         * never waited for. Only the present thread presents. */
+        rsx_present_thread_stats st;
+        for (int i = 0; i < 10000; i++) {
+            rsx_present_thread_get_stats(s_vpt.pt, &st);
+            if (st.presented + st.dropped + st.show_failed >= frames) break;
+            struct timespec ts = { 0, 1000000 };
+            nanosleep(&ts, NULL);
+        }
+        CHECK(st.staged == frames && st.stage_failed == 0, "every present staged");
+        CHECK(st.presented + st.dropped == frames && st.show_failed == 0, "every staged frame shown or dropped");
+        CHECK(st.presented >= 1 && s_vk.presented == st.presented, "the present thread presented");
+        CHECK(s_vk.present_direct == 0 && s_vk.present_readback_count == 0, "no present on the presenting thread");
+        /* Each staging image that exists has the view vk_create_image made,
+         * so its usage must be one a view may have (VUID-VkImageViewCreateInfo-
+         * image-04441), checked here without relying on the validation layer
+         * being installed (the timing runs have none). */
+        const VkImageUsageFlags viewable = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+            VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+        u32 staging_images = 0;
+        for (u32 i = 0; i < RSX_PRESENT_THREAD_MAX_DEPTH; i++) {
+            if (!s_vpt.img[i].img) continue;
+            staging_images++;
+            CHECK(s_vpt.img[i].view != VK_NULL_HANDLE && (s_vpt.img[i].usage & viewable) != 0,
+                  "a staging image's view has a usage it can serve");
+            CHECK(s_vpt.img_w[i] == W && s_vpt.img_h[i] == H, "staging images are the offscreen target's size");
+        }
+        CHECK(staging_images >= 1, "the stage made its staging images");
+    } else
     CHECK(s_vk.presented == frames, "every present counted");
 #ifdef VK_PRESENT_SLOTS
-    if (readback) {
+    if (threaded) {
+    } else if (readback) {
         CHECK(s_vk.present_readback_count == frames && s_vk.present_direct == 0, "every present read back");
         CHECK((rsx_vulkan_backend_presented_center() & 0xFFFFFFu) == centre, "read-back present kept the centre pixel");
     } else {

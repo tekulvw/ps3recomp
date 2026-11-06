@@ -2,7 +2,8 @@
 """Vulkan engine presents: a direct present (the default) and a read-back
 present (PS3RECOMP_VK_PRESENT_READBACK=1) of the same synthetic frames must
 leave identical bytes, both clean under the Khronos validation layer (with
-synchronization validation). --timing also reports the present call's CPU
+synchronization validation); so must a run with the opt-in present thread
+(PS3RECOMP_RSX_PRESENT_THREAD=1), whose shows run beside the recording thread. --timing also reports the present call's CPU
 cost in both modes without the layer; --window presents to an SDL window,
 --batched records the engine in batches.
 Synthetic inputs only.
@@ -19,7 +20,8 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-MODES = {"direct": {}, "readback": {"PS3RECOMP_VK_PRESENT_READBACK": "1"}}
+MODES = {"direct": {}, "readback": {"PS3RECOMP_VK_PRESENT_READBACK": "1"},
+         "thread": {"PS3RECOMP_RSX_PRESENT_THREAD": "1"}}
 
 
 def main():
@@ -46,7 +48,7 @@ def main():
     if args.glslang_lib and (Path(args.glslang_lib) / "libSPIRV.so").exists():
         glslang_libs.append("-lSPIRV")
     sources = ["libs/video/tests/test_vulkan_present_cost.c"] + ["libs/video/" + name + ".c" for name in
-        ("rsx_draw_engine", "rsx_commands", "rsx_dispatch", "rsx_texture_layout", "rsx_vertex_compact",
+        ("rsx_draw_engine", "rsx_fifo_busy", "rsx_commands", "rsx_dispatch", "rsx_texture_layout", "rsx_vertex_compact",
          "rsx_vertex_fetch", "rsx_vp_decompiler", "rsx_fp_decompiler")] + [
         "runtime/diagnostics/critical_trace.c", "runtime/diagnostics/render_ablation.c",
         "libs/video/rsx_shader_spirv.cpp"]
@@ -90,6 +92,8 @@ def main():
             outputs[mode] = out.read_bytes()
         if outputs["direct"] != outputs["readback"]:
             raise SystemExit("a direct present left different bytes from a read-back present")
+        if outputs["direct"] != outputs["thread"]:
+            raise SystemExit("a present-thread run left different bytes from a direct present")
         if args.timing:
             plain = {k: v for k, v in environment.items() if k not in ("VK_INSTANCE_LAYERS", "VK_LAYER_SETTINGS_PATH")}
             for mode, extra in MODES.items():

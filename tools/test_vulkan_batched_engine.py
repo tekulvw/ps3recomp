@@ -38,7 +38,7 @@ def main():
     if args.glslang_lib and (Path(args.glslang_lib) / "libSPIRV.so").exists():
         glslang_libs.append("-lSPIRV")
     sources = ["libs/video/tests/test_vulkan_batched_engine.c"] + ["libs/video/" + name + ".c" for name in
-        ("rsx_draw_engine", "rsx_commands", "rsx_dispatch", "rsx_texture_layout", "rsx_vertex_compact",
+        ("rsx_draw_engine", "rsx_fifo_busy", "rsx_commands", "rsx_dispatch", "rsx_texture_layout", "rsx_vertex_compact",
          "rsx_vertex_fetch", "rsx_vp_decompiler", "rsx_fp_decompiler")] + [
         "runtime/diagnostics/critical_trace.c", "runtime/diagnostics/render_ablation.c",
         "libs/video/rsx_shader_spirv.cpp"]
