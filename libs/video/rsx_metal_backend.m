@@ -66,6 +66,7 @@
 #include "rsx_metal_backend.h"
 #include "rsx_frontend_internal.h"
 #include "rsx_draw_engine.h"
+#include "rsx_present_thread.h"
 #define RSX_NATIVE_OWNER_PTHREAD
 #include "rsx_native_owner_gate.h"
 #include "rsx_vertex_fetch.h"
@@ -110,6 +111,9 @@ static _Thread_local int s_metal_consumer;
 static uint64_t s_metal_lifetime,s_metal_commits;
 static int s_metal_shutdown_pending;
 static void metal_native_frame_present(id<MTLCommandBuffer>,id<MTLTexture>,id<CAMetalDrawable>,int);
+@class MetalNativeFrame;
+static MetalNativeFrame *metal_native_frame_stage(id<MTLCommandBuffer>,id<MTLTexture>,int);
+static void metal_native_frame_show(MetalNativeFrame *,id<CAMetalDrawable>,int);
 static unsigned s_metal_partial_primitives;
 static atomic_int s_metal_unscoped_commit;
 static int metal_owner_enabled(void){
@@ -3137,6 +3141,8 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
 
 /* ---- lifecycle ----------------------------------------------------------- */
 
+static void eng_pt_start(void);
+static void eng_pt_stop(void);
 static int eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
@@ -3157,12 +3163,15 @@ static int eng_init(void* user, u32 width, u32 height)
     sd.minFilter = MTLSamplerMinMagFilterLinear;
     sd.magFilter = MTLSamplerMinMagFilterLinear;
     s_eng_linear_sampler = [s_dev newSamplerStateWithDescriptor:sd];
-    return s_eng_point_sampler && s_eng_linear_sampler ? 0 : -1;
+    if (!s_eng_point_sampler || !s_eng_linear_sampler) return -1;
+    if (rsx_present_thread_requested()) eng_pt_start();
+    return 0;
 }
 
 static void eng_shutdown(void* user)
 {
     (void)user;
+    eng_pt_stop();   /* joins the show thread before anything it uses goes */
     for (u32 i = 0; i < s_eng_obj_count; i++) s_eng_obj[i] = nil;
     for (u32 i = 0; i < s_eng_pipe_count; i++) {
         s_eng_pipe[i].pso = nil;
@@ -4851,9 +4860,320 @@ static void eng_dump_frame(id<MTLTexture> src, int presented)
     free(rgba);
 }
 
+/* ---- opt-in present thread (PS3RECOMP_RSX_PRESENT_THREAD=1) ----------------
+ *
+ * rsx_present_thread.h owns the ring, the thread and the counters; these are
+ * the Metal halves.
+ *
+ * Stage (presenting thread, inside the owner gate like any present): encode
+ * everything recorded so far, then the ordinary present pass (FXAA, CAS,
+ * gamma: eng_blit_to_display) into a staging texture of the drawable's size
+ * and format, and commit. It is the same command buffer the drawable used to
+ * get, minus the drawable: no in-flight semaphore, no nextDrawable. One queue
+ * runs it after every earlier commit, and Metal's hazard tracking orders any
+ * later write to the flipped surface after its read here.
+ *
+ * Show (the present thread): the in-flight semaphore, nextDrawable, a 1:1
+ * copy of the staging texture into the drawable, presentDrawable, commit. It
+ * touches only what was captured at start (queue, layer, semaphore, its own
+ * pipeline and samplers), the slot it owns, and the frame-rate and native
+ * frame records, which have locks of their own. It never takes the owner gate
+ * or the consumer lease and never counts as the original owner's commit
+ * (metal_owner_committed), so it shares no lock with the walker or the native
+ * render worker but the ring's. nextDrawable and presentDrawable are legal off
+ * the main thread; the layer's geometry is never touched here.
+ *
+ * Off (the default), none of this is created and eng_present is unchanged. */
+static rsx_present_thread *s_pt;
+static id<MTLCommandQueue> s_pt_queue;
+static CAMetalLayer *s_pt_layer;
+static dispatch_semaphore_t s_pt_inflight;
+static id<MTLTexture> s_pt_offscreen;
+static int s_pt_headless;
+static MTLPixelFormat s_pt_format;
+static id<MTLRenderPipelineState> s_pt_copy_pso;
+static id<MTLSamplerState> s_pt_point, s_pt_linear;
+/* Per slot: written while the slot is STAGING (presenting thread), read while
+ * it is SHOWING (present thread); the ring's mutex orders the two. */
+static id<MTLTexture> s_pt_tex[RSX_PRESENT_THREAD_MAX_DEPTH];
+static MetalNativeFrame *s_pt_native[RSX_PRESENT_THREAD_MAX_DEPTH];
+static uint64_t s_pt_guest[RSX_PRESENT_THREAD_MAX_DEPTH];
+static uint32_t s_pt_buffer[RSX_PRESENT_THREAD_MAX_DEPTH];
+static uint64_t s_pt_capture[RSX_PRESENT_THREAD_MAX_DEPTH], s_pt_command[RSX_PRESENT_THREAD_MAX_DEPTH];
+
+/* eng_encode_and_commit_mode's windowed present with a staging texture for a
+ * destination: same records, tail, present pass, submission tracking and
+ * stage hand-off, and the same owner commit; nothing waits. */
+static int eng_encode_and_stage(id<MTLTexture> src, id<MTLTexture> staging, uint32_t slot)
+{
+    const uint64_t critical_id=atomic_fetch_add(&s_critical_command_sequence,1)+1;
+    const uint64_t critical_capture=ps3_critical_capture_id();
+    const uint64_t critical_start=ps3_critical_enabled()?ps3_critical_now_ns():0;
+    const uint64_t critical_size=((uint64_t)s_eng_rec_count<<32)|s_eng_stage_used;
+    uint64_t critical_commit=0;
+    s_pt_capture[slot]=critical_start?critical_capture:0;s_pt_command[slot]=critical_id;
+    s_eng_checked_completed=0;
+    if(!s_dev || !s_queue){eng_checked_fail();return 0;}
+    if(s_eng_dropped)eng_checked_fail();
+    @autoreleasepool {
+        id<MTLBuffer> stage = s_eng_stage_used ? s_eng_stage_buf : nil;
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        eng_site_tag_bytes(cb, ENG_SITE_COMMAND_BUFFER, 0);
+        if (cb) {
+            const uint64_t seq = ++s_eng_commit_seq;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                (void)done;uint64_t prev=atomic_load(&s_eng_commit_done);
+                while(prev<seq&&!atomic_compare_exchange_weak(&s_eng_commit_done,&prev,seq)){}
+            }];
+        }
+        if(!cb || (s_eng_stage_used && !stage)) {
+            eng_checked_fail();fps_note_submission_failure();
+            return 0;
+        }
+        const uint64_t ft_e0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        const u32 ft_nrec = s_eng_rec_count;
+        if (s_eng_diag.active) s_eng_diag_cb = cb;
+        u32 trace_handles[16];
+        const u32 trace_count=eng_trace_targets(trace_handles, src);
+        eng_encode_records(cb, stage);
+        if (s_eng_tail_encode) { s_eng_tail_encode(cb); s_eng_tail_encode = nil; }
+        const int staged = eng_blit_to_display(cb, src, staging);
+        s_pt_native[slot] = metal_native_frame_stage(cb, src, staged);
+        if (s_eng_diag.active && !staged) s_eng_diag.reason = "blit_skipped";
+        const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
+        if(getenv("RSX_ENGINE_FRAME_CAPTURE")){
+            s_capture_present_cb=cb;s_capture_guest=s_present_guest_id;s_capture_command=critical_id;
+            s_capture_submission=0;s_capture_drawable=0;s_capture_presented=staged;
+        }
+        if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, 1u, ft_nrec, ft_e0, ps3_ft_now());
+        eng_track_submission(cb);
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if([done status]!=MTLCommandBufferStatusCompleted || [done error])eng_checked_fail();
+        }];
+        if(critical_start)critical_commit=ps3_critical_now_ns();
+        eng_stage_hand_off(cb, stage);
+        [cb commit]; metal_owner_committed();
+        if (trace_count) {
+            [cb waitUntilCompleted];
+            if (trace_synced) eng_trace_pixels(trace_handles, trace_count, cb);
+        }
+        if (s_eng_dropped) {
+            fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
+                    s_eng_dropped, ENG_MAX_RECORDS);
+            s_eng_dropped = 0;
+        }
+        /* FLUSH type 3: a staged present (1 is a windowed present, 2 async). */
+        if(critical_start){uint64_t w[8]={critical_start,critical_size,critical_commit,0,s_present_guest_id,0,0,0};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_FLUSH,critical_id,3,w,8);}
+        s_eng_rec_count  = 0;
+        s_eng_stage_used = 0;
+        eng_collect_retired_objects();
+        return staged;
+    }
+}
+
+static int eng_pt_stage(void *user, uint32_t slot, uint32_t surface)
+{
+    (void)user;
+    id<MTLTexture> src = eng_obj(surface);
+    if (!src || slot >= RSX_PRESENT_THREAD_MAX_DEPTH) return 0;
+    /* The drawable's size: what the window pass has always rendered at. A
+     * slot whose texture no longer matches (a resize) gets a new one here,
+     * while it is this thread's alone; a show still reading the old one keeps
+     * it alive through its command buffer. */
+    const NSUInteger w = s_pt_headless ? [s_pt_offscreen width] : (NSUInteger)s_width;
+    const NSUInteger h = s_pt_headless ? [s_pt_offscreen height] : (NSUInteger)s_height;
+    id<MTLTexture> t = s_pt_tex[slot];
+    if (!t || [t width] != w || [t height] != h || [t pixelFormat] != s_pt_format) {
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s_pt_format
+            width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        t = [s_dev newTextureWithDescriptor:td];
+        s_pt_tex[slot] = t;
+        if (!t) return 0;
+    }
+    s_pt_guest[slot] = s_present_guest_id;
+    s_pt_buffer[slot] = s_present_buffer_id;
+    return eng_encode_and_stage(src, t, slot);
+}
+
+/* Present thread: the staging texture onto the drawable, 1:1 when the sizes
+ * agree (they do unless a resize is in between). */
+static int eng_pt_copy(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst)
+{
+    if (!cb || !src || !dst || !s_pt_copy_pso || [dst pixelFormat] != s_pt_format) return 0;
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture     = dst;
+    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!e) return 0;
+    const int same = [src width] == [dst width] && [src height] == [dst height];
+    [e setRenderPipelineState:s_pt_copy_pso];
+    [e setFragmentTexture:src atIndex:0];
+    [e setFragmentSamplerState:same ? s_pt_point : s_pt_linear atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    return 1;
+}
+
+static int eng_pt_show(void *user, uint32_t slot, rsx_present_show_timing *timing)
+{
+    (void)user;
+    if (slot >= RSX_PRESENT_THREAD_MAX_DEPTH) return 0;
+    @autoreleasepool {
+        id<MTLTexture> src = s_pt_tex[slot];
+        MetalNativeFrame *native = s_pt_native[slot];
+        s_pt_native[slot] = nil;
+        const uint64_t critical_capture = s_pt_capture[slot], critical_id = s_pt_command[slot];
+        const uint64_t critical_start = ps3_critical_enabled() ? ps3_critical_now_ns() : 0;
+        uint64_t semaphore_start=0,semaphore_end=0,drawable_start=0,drawable_end=0;
+        /* This thread's frame identity, for the frame-rate ticket and the
+         * native frame record (both thread-local to whoever presents). */
+        s_present_guest_id = s_pt_guest[slot];
+        s_present_buffer_id = s_pt_buffer[slot];
+        const uint64_t t0 = rsx_present_thread_now();
+        id<CAMetalDrawable> drawable = nil;
+        id<MTLTexture> dst = nil;
+        if (s_pt_headless) {
+            dst = s_pt_offscreen;
+        } else {
+            if(critical_start)semaphore_start=ps3_critical_now_ns();
+            dispatch_semaphore_wait(s_pt_inflight, DISPATCH_TIME_FOREVER);
+            if(critical_start)semaphore_end=ps3_critical_now_ns();
+            if(critical_start)drawable_start=ps3_critical_now_ns();
+            drawable = [s_pt_layer nextDrawable];
+            if(critical_start)drawable_end=ps3_critical_now_ns();
+            fps_note_drawable(drawable!=nil);
+            if (!drawable) {
+                dispatch_semaphore_signal(s_pt_inflight);
+                timing->acquire_ns = rsx_present_thread_now() - t0;
+                metal_native_frame_show(native, nil, 0);
+                return 0;
+            }
+            dst = [drawable texture];
+        }
+        const uint64_t t1 = rsx_present_thread_now();
+        timing->acquire_ns = t1 - t0;
+        id<MTLCommandBuffer> cb = [s_pt_queue commandBuffer];
+        if (!cb) {
+            fps_note_submission_failure();
+            if (drawable) dispatch_semaphore_signal(s_pt_inflight);
+            metal_native_frame_show(native, nil, 0);
+            return 0;
+        }
+        const int blitted = eng_pt_copy(cb, src, dst);
+        metal_native_frame_show(native, drawable, blitted);
+        if (drawable && !blitted) fps_note_skipped_blit();
+        MetalFrameTicket *ticket=drawable?fps_frame_ticket():nil;
+        if(ticket){ticket->critical_command_id=critical_id;ticket->critical_capture_id=critical_start?critical_capture:0;}
+        if(critical_start && drawable){uint64_t w[5]={critical_start,semaphore_start,semaphore_end,drawable_start,drawable_end};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_CLOCK,s_present_guest_id,critical_id,w,5);}
+        if(critical_start && drawable){
+            const uint64_t guest_id=s_present_guest_id;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> finished){
+                uint64_t w[4]={(uint64_t)(finished.status==MTLCommandBufferStatusCompleted && !finished.error),critical_double(finished.GPUStartTime),critical_double(finished.GPUEndTime),ticket?ticket->submission_id:0};
+                ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_GPU,guest_id,critical_id,w,4);
+            }];
+        }
+        if (drawable) { fps_track_drawable_tagged(drawable,ticket); [cb presentDrawable:drawable]; }
+        if (drawable && (blitted || ticket)) fps_track_frame_completion_tagged(cb,ticket,blitted);
+        if (drawable) {
+            dispatch_semaphore_t sem = s_pt_inflight;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                if([done status]!=MTLCommandBufferStatusCompleted || [done error])eng_checked_fail();
+                dispatch_semaphore_signal(sem);
+            }];
+        }
+        [cb commit];   /* not the original owner's commit: see above */
+        fps_frame_committed(ticket);
+        if (s_pt_headless) [cb waitUntilCompleted];
+        timing->blit_ns = rsx_present_thread_now() - t1;
+        return blitted;
+    }
+}
+
+static void eng_pt_discard(void *user, uint32_t slot)
+{
+    (void)user;
+    if (slot >= RSX_PRESENT_THREAD_MAX_DEPTH) return;
+    MetalNativeFrame *native = s_pt_native[slot];
+    s_pt_native[slot] = nil;
+    metal_native_frame_show(native, nil, 0);
+}
+
+static void eng_pt_start(void)
+{
+    if (s_pt) return;
+    if (!s_dev || !s_queue || !s_eng_helper_lib || (s_headless ? !s_offscreen : (!s_layer || !s_inflight))) {
+        rsx_present_thread_unsupported("metal", "no window, queue or in-flight bound");
+        return;
+    }
+    s_pt_headless = s_headless;
+    s_pt_format = s_headless ? [s_offscreen pixelFormat] : s_layer.pixelFormat;
+    MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+    pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_blit_fs"];
+    pd.colorAttachments[0].pixelFormat = s_pt_format;
+    NSError* err = nil;
+    s_pt_copy_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+    sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    s_pt_point = [s_dev newSamplerStateWithDescriptor:sd];
+    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+    s_pt_linear = [s_dev newSamplerStateWithDescriptor:sd];
+    if (!s_pt_copy_pso || !s_pt_point || !s_pt_linear) {
+        fprintf(stderr, "[rsx present-thread] metal: copy pipeline failed (%s); presents stay on the presenting thread\n",
+                err ? [[err localizedDescription] UTF8String] : "sampler");
+        s_pt_copy_pso = nil; s_pt_point = s_pt_linear = nil;
+        return;
+    }
+    s_pt_queue = s_queue;
+    s_pt_layer = s_headless ? nil : s_layer;
+    s_pt_inflight = s_inflight;
+    s_pt_offscreen = s_headless ? s_offscreen : nil;
+    const rsx_present_hooks hooks = { NULL, eng_pt_stage, eng_pt_show, eng_pt_discard };
+    s_pt = rsx_present_thread_create(&hooks, rsx_present_thread_depth_from(getenv("PS3RECOMP_RSX_PRESENT_THREAD_DEPTH")));
+    if (!s_pt) {
+        fprintf(stderr, "[rsx present-thread] metal: thread could not start; presents stay on the presenting thread\n");
+        eng_pt_stop();
+    }
+}
+
+static void eng_pt_stop(void)
+{
+    rsx_present_thread_destroy(s_pt);   /* joins; discards what is still staged */
+    s_pt = NULL;
+    for (u32 i = 0; i < RSX_PRESENT_THREAD_MAX_DEPTH; i++) { s_pt_tex[i] = nil; s_pt_native[i] = nil; }
+    s_pt_queue = nil; s_pt_layer = nil; s_pt_inflight = nil; s_pt_offscreen = nil;
+    s_pt_copy_pso = nil; s_pt_point = s_pt_linear = nil;
+}
+
+/* The presenting thread's half: the frame goes to a staging slot and the
+ * present thread shows it. Diagnostics that read the flipped surface itself
+ * (the frame dump) stay here, where the surface is current. */
+static void eng_present_staged(u32 surface)
+{
+    id<MTLTexture> src = eng_obj(surface);
+    eng_diag_begin(surface);
+    if (!src) {
+        if (s_eng_diag.active) s_eng_diag.reason = "no_surface";
+        eng_encode_and_commit(nil);
+        eng_diag_end();
+        return;
+    }
+    if(getenv("RSX_ENGINE_FRAME_CAPTURE")){
+        s_capture_present_cb=nil;s_capture_guest=s_capture_command=s_capture_submission=s_capture_drawable=0;s_capture_presented=0;
+    }
+    const int staged = rsx_present_thread_submit(s_pt, surface);
+    eng_dump_frame(src, staged);
+    eng_diag_end();
+}
+
 static void eng_present(void* user, u32 surface)
 {
     (void)user;
+    if (s_pt) { eng_present_staged(surface); return; }
     id<MTLTexture> src = eng_obj(surface);
     eng_diag_begin(surface);
     if (!src) {
@@ -5461,6 +5781,8 @@ static int metal_original_init(u32 width, u32 height, const char* title)
             s_eng_active = 1;
         } else {
             rsx_set_backend(&s_backend_vtable);
+            if (rsx_present_thread_requested())
+                rsx_present_thread_unsupported("metal vtable path", "the draw engine is off");
         }
         fprintf(stderr, "[RSX metal] %s on %s (%ux%u), guest shaders %s, %s path\n",
                 s_headless ? "headless" : "windowed",
@@ -6030,6 +6352,28 @@ static void metal_native_frame_present(id<MTLCommandBuffer> cb,id<MTLTexture> ta
   if(!drawable||!blitted){frame->present_done=1;metal_native_frame_event(frame,RSX_NATIVE_FRAME_SKIPPED,0,blitted?0:1,0);}}
  pthread_mutex_unlock(&s_native_frame_mu);if(!frame)return;
  [cb addCompletedHandler:^(id<MTLCommandBuffer> finished){pthread_mutex_lock(&s_native_frame_mu);frame->final_done=1;metal_native_frame_event(frame,RSX_NATIVE_FRAME_FINAL_GPU_TERMINAL,finished.status==MTLCommandBufferStatusCompleted&&!finished.error,(uint32_t)finished.status,0);pthread_mutex_unlock(&s_native_frame_mu);}];
+ if(drawable&&blitted)[drawable addPresentedHandler:^(id<MTLDrawable> shown){double time=shown.presentedTime;pthread_mutex_lock(&s_native_frame_mu);frame->present_done=1;metal_native_frame_event(frame,isfinite(time)&&time>0?RSX_NATIVE_FRAME_PRESENTED:RSX_NATIVE_FRAME_SKIPPED,isfinite(time)&&time>0,0,time);pthread_mutex_unlock(&s_native_frame_mu);}];
+}
+/* Present thread (PS3RECOMP_RSX_PRESENT_THREAD=1): metal_native_frame_present
+ * in two halves. The stage's command buffer is the frame's final GPU work, so
+ * it carries the terminal event; the drawable, if any, comes later from the
+ * present thread, which records the presentation (or the skip) under the
+ * same independent mutex. A frame dropped from the ring is a skip. */
+static MetalNativeFrame *metal_native_frame_stage(id<MTLCommandBuffer> cb,id<MTLTexture> target,int staged){
+ if(!metal_owner_enabled()||!cb||!target)return nil;
+ pthread_mutex_lock(&s_native_frame_mu);MetalNativeFrame *frame=nil;
+ for(unsigned i=0;i<2;++i){MetalNativeFrame *f=s_native_frames[i];if(f&&f->owner==s_metal_owner.generation&&f->phase==1&&!metal_image_identity(f->owner,f->target,f->generation,1)&&eng_obj((u32)f->target)==target){frame=f;break;}}
+ if(frame){frame->phase=2;frame->guest=s_present_guest_id;frame->buffer=s_present_buffer_id;frame->drawable=0;
+  if(!staged){frame->present_done=1;metal_native_frame_event(frame,RSX_NATIVE_FRAME_SKIPPED,0,1,0);}}
+ pthread_mutex_unlock(&s_native_frame_mu);if(!frame)return nil;
+ [cb addCompletedHandler:^(id<MTLCommandBuffer> finished){pthread_mutex_lock(&s_native_frame_mu);frame->final_done=1;metal_native_frame_event(frame,RSX_NATIVE_FRAME_FINAL_GPU_TERMINAL,finished.status==MTLCommandBufferStatusCompleted&&!finished.error,(uint32_t)finished.status,0);pthread_mutex_unlock(&s_native_frame_mu);}];
+ return staged?frame:nil;
+}
+static void metal_native_frame_show(MetalNativeFrame *frame,id<CAMetalDrawable> drawable,int blitted){
+ if(!frame)return;
+ pthread_mutex_lock(&s_native_frame_mu);frame->drawable=drawable?drawable.drawableID:0;
+ if(!drawable||!blitted){frame->present_done=1;metal_native_frame_event(frame,RSX_NATIVE_FRAME_SKIPPED,0,blitted?0:1,0);}
+ pthread_mutex_unlock(&s_native_frame_mu);
  if(drawable&&blitted)[drawable addPresentedHandler:^(id<MTLDrawable> shown){double time=shown.presentedTime;pthread_mutex_lock(&s_native_frame_mu);frame->present_done=1;metal_native_frame_event(frame,isfinite(time)&&time>0?RSX_NATIVE_FRAME_PRESENTED:RSX_NATIVE_FRAME_SKIPPED,isfinite(time)&&time>0,0,time);pthread_mutex_unlock(&s_native_frame_mu);}];
 }
 int rsx_metal_backend_poll_frames(rsx_native_frame_event *events,uint32_t capacity,uint32_t *count){
