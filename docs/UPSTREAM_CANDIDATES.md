@@ -27,19 +27,19 @@ otherwise; "mag-recomp" means the downstream port that pins this fork.
 | ID | Item | Status |
 |---|---|---|
 | Q1 | Our four open PRs (#661, #662, #663, #665) | PR open #661, #662, #663, #665 (all four re-checked as still needed, rebased onto v0.19.0 and marked ready for review on 2026-11-08; tests re-run on the new base) |
-| Q2 | glibc static TLS: thread stacks that are too small | in progress |
+| Q2 | glibc static TLS: thread stacks that are too small | PR open #720 |
 | Q3 | 4 GB-aligned POSIX guest arena in the project template | not started |
 | Q4 | Opt-in short-usleep yield on POSIX | not started |
 | Q5 | SPU task thread pool | not started |
-| Q6 | Single present per flip | not started |
-| Q7 | Adaptive flip pacing | not started |
-| Q8 | Kick SPURS on RSX label writes to the instance line | not started |
+| Q6 | Single present per flip | PR open #721 (SDK half; `PS3RECOMP_RSX_SINGLE_PRESENT`) |
+| Q7 | Adaptive flip pacing | PR open #724 |
+| Q8 | Kick SPURS on RSX label writes to the instance line | PR open #729 (seated on upstream's main-memory semaphore release; knob renamed `PS3RECOMP_RSX_RELEASE_LINE_WAKE`) |
 | Q9 | PPU reservation open-count | not started |
 | Q10 | Vulkan backend on Windows | not started |
 | Q11 | Public-tree content guard and pinned SDK fetch for ports | not started |
 | Q12 | Test-only PRs (SPU interpreter, CTR64, TOC across HLE exits) | not started |
 | Q13 | Small diagnostic counters | not started |
-| M1 | Guest write watch and preservation sessions | not started |
+| M1 | Guest write watch and preservation sessions | PR open #727 (write watch), #728 (preservation sessions, stacked on #727); Windows paths not yet run |
 | M2 | Coherence fast paths (series) | not started |
 | M3 | Fast guest accessors, inline stores from the lifter | not started |
 | M4 | Direct Vulkan present | not started |
