@@ -143,7 +143,7 @@ static unsigned s_line_watch_n;
 static void spu_line_watch_commit(const spu_context* c, uint32_t ea)
 {
     static uint64_t from_ns, to_ns;
-    const uint64_t now = spu_host_ns();   /* portable monotonic ns (QPC on Windows) */
+    const uint64_t now = spu_watch_now_ns();
     if (s_line_watch == 1u) {
         /* <hex EA>[,<hex EA>...up to 4][:<start s>:<seconds>], the window counted from this first call. */
         const char* e = getenv("PS3RECOMP_SPU_LINE_WATCH");

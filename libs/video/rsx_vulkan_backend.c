@@ -44,16 +44,27 @@
  * with spaces.
  */
 
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(PS3RECOMP_RSX_VULKAN)
 
 #define VK_NO_PROTOTYPES
+#ifdef _WIN32
+/* Windows (opt-in): a Win32 window with VK_KHR_win32_surface instead of SDL,
+ * and vulkan-1.dll loaded at run time like libvulkan elsewhere. */
+#define VK_USE_PLATFORM_WIN32_KHR
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include <vulkan/vulkan.h>
 
 #include "rsx_vulkan_backend.h"
 #include "rsx_fifo_busy.h"
 #include "rsx_frontend_vulkan.h"
 #include "rsx_frontend_internal.h"
-#define RSX_NATIVE_OWNER_PTHREAD
+#ifndef _WIN32
+#define RSX_NATIVE_OWNER_PTHREAD   /* Windows: the gate's SRW lock */
+#endif
 #include "rsx_native_owner_gate.h"
 #include <stdatomic.h>
 #include "rsx_vertex_fetch.h"
@@ -70,11 +81,17 @@
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
  * opens the optional window. Same include style as those two. */
+#ifdef _WIN32
+#include "../misc/osk_native.h"
+#else
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
+#include "../misc/osk_native.h"
+#include "../input/pad_sdl_keyboard.h"
 
 #include <dlfcn.h>
-#include <pthread.h>
+#endif
+#include "rsx_vk_thread.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -248,7 +265,12 @@ typedef struct vk_state {
     int              anisotropy_ok;   /* samplerAnisotropy enabled          */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
+#ifdef _WIN32
+    HWND             window;
+    int              window_closed;   /* WM_CLOSE or Esc                 */
+#else
     SDL_Window*      window;
+#endif
     const char*      inst_exts[16];
     u32              inst_ext_count;
     VkSurfaceKHR     surface;
@@ -276,8 +298,15 @@ typedef struct vk_state {
 static vk_state s_vk;
 static rsx_frontend_device *s_vk_frontend;
 
+#ifdef _WIN32
+/* cellGcmSys.c is always part of the Windows runtime; COFF has no weak
+ * undefined references, so these are ordinary declarations there. */
+extern void cellGcm_rsx_consumer_begin(void);
+extern void cellGcm_rsx_consumer_end(void);
+#else
 extern void cellGcm_rsx_consumer_begin(void) __attribute__((weak));
 extern void cellGcm_rsx_consumer_end(void) __attribute__((weak));
+#endif
 static rsx_native_owner_gate s_vulkan_owner=RSX_NATIVE_OWNER_GATE_INIT;
 static _Thread_local rsx_native_owner_thread s_vulkan_owner_thread;
 static _Thread_local int s_vulkan_consumer;
@@ -414,6 +443,24 @@ static int vulkan_owner_activate(void){
 /* ---------------------------------------------------------------------------
  * Loading
  * -------------------------------------------------------------------------*/
+#ifdef _WIN32
+static int vk_load_library(void)
+{
+    s_vk.lib = (void*)LoadLibraryA("vulkan-1.dll");
+    if (!s_vk.lib) {
+        VK_LOG("no Vulkan loader found (LoadLibrary vulkan-1.dll: error %lu)\n", GetLastError());
+        return -1;
+    }
+    FARPROC entry = GetProcAddress((HMODULE)s_vk.lib, "vkGetInstanceProcAddr");
+    memcpy(&pvkGetInstanceProcAddr, &entry, sizeof entry);
+    if (!pvkGetInstanceProcAddr) { VK_LOG("vulkan-1.dll has no vkGetInstanceProcAddr\n"); return -1; }
+#define LOAD_G(name) \
+    if (!(p##name = (PFN_##name)pvkGetInstanceProcAddr(VK_NULL_HANDLE, #name))) \
+        { VK_LOG("missing global function " #name "\n"); return -1; }
+    VK_GLOBAL_FNS(LOAD_G)
+    return 0;
+}
+#else
 static int vk_load_library(void)
 {
     static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
@@ -432,6 +479,7 @@ static int vk_load_library(void)
     VK_GLOBAL_FNS(LOAD_G)
     return 0;
 }
+#endif
 
 static int vk_load_instance_functions(void)
 {
@@ -2092,8 +2140,21 @@ static void vk_window_drop(const char* why)
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
     if (s_vk.window) {
+#ifdef _WIN32
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+        osk_native_win32_set_window(NULL);
+#endif
+        DestroyWindow(s_vk.window);
+#else
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+        osk_native_sdl_set_window(NULL);   /* retire a dialog before SDL video goes */
+#endif
+#ifdef PAD_HAS_SDL_KEYBOARD
+        ps3recomp_pad_sdl_keyboard_sample(NULL, 1);   /* release every key */
+#endif
         SDL_DestroyWindow(s_vk.window);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
+#endif
     }
     s_vk.window = NULL;
     s_vk.surface = VK_NULL_HANDLE;
@@ -2103,6 +2164,85 @@ static void vk_window_drop(const char* why)
     s_vk.windowed = 0;
 }
 
+#ifdef _WIN32
+static LRESULT CALLBACK vk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CLOSE:
+        s_vk.window_closed = 1;
+        return 0;   /* vk_window_drop destroys it on the backend's own terms */
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) { s_vk.window_closed = 1; return 0; }
+        break;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void vk_window_open(const char* title)
+{
+    if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
+    WNDCLASSEXA wc;
+    memset(&wc, 0, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = vk_wndproc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = "ps3recomp_vulkan";
+    RegisterClassExA(&wc);   /* a second init finds the class already registered */
+    DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+    int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+    RECT wr = { 0, 0, (LONG)s_vk.width, (LONG)s_vk.height };
+    if (vk_env_on("PS3RECOMP_VK_FULLSCREEN")) {
+        style = WS_POPUP | WS_VISIBLE;
+        x = y = 0;
+        wr.right = GetSystemMetrics(SM_CXSCREEN);
+        wr.bottom = GetSystemMetrics(SM_CYSCREEN);
+    } else {
+        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    }
+    /* Keep the display awake, as the D3D12 and null backends do. */
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+    s_vk.window_closed = 0;
+    s_vk.window = CreateWindowExA(0, "ps3recomp_vulkan",
+                                  title && title[0] ? title : "ps3recomp",
+                                  style, x, y, wr.right - wr.left, wr.bottom - wr.top,
+                                  NULL, NULL, GetModuleHandleA(NULL), NULL);
+    s_vk.windowed = 1;
+    if (!s_vk.window) {
+        char why[128];
+        snprintf(why, sizeof why, "CreateWindowEx failed (error %lu)", GetLastError());
+        vk_window_drop(why);
+        return;
+    }
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    osk_native_win32_set_window(s_vk.window);
+#endif
+    s_vk.inst_exts[0] = VK_KHR_SURFACE_EXTENSION_NAME;
+    s_vk.inst_exts[1] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+    s_vk.inst_ext_count = 2;
+    const char* hold = getenv("PS3RECOMP_VK_HOLD");
+    s_vk.hold_seconds = hold ? atof(hold) : 0.0;
+    VK_LOG("window: Win32, %u surface extension(s)\n", s_vk.inst_ext_count);
+}
+
+static int vk_create_window_surface(void)
+{
+    PFN_vkCreateWin32SurfaceKHR create = (PFN_vkCreateWin32SurfaceKHR)
+        pvkGetInstanceProcAddr(s_vk.instance, "vkCreateWin32SurfaceKHR");
+    if (!create) return -1;
+    VkWin32SurfaceCreateInfoKHR info = { .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                                         .hinstance = GetModuleHandleA(NULL), .hwnd = s_vk.window };
+    return create(s_vk.instance, &info, NULL, &s_vk.surface) == VK_SUCCESS ? 0 : -1;
+}
+
+static void vk_window_drawable_size(int* w, int* h)
+{
+    RECT r = { 0, 0, 0, 0 };
+    GetClientRect(s_vk.window, &r);
+    *w = (int)(r.right - r.left); *h = (int)(r.bottom - r.top);
+}
+#else
 static void vk_window_open(const char* title)
 {
     if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
@@ -2135,7 +2275,22 @@ static void vk_window_open(const char* title)
     s_vk.hold_seconds = hold ? atof(hold) : 0.0;
     VK_LOG("window: SDL video driver '%s', %u surface extension(s)\n",
            SDL_GetCurrentVideoDriver(), n);
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+    /* This thread owns SDL video and pumps it, so the OSK dialog lives here. */
+    osk_native_sdl_set_window(s_vk.window);
+#endif
 }
+
+static int vk_create_window_surface(void)
+{
+    return SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, &s_vk.surface) ? 0 : -1;
+}
+
+static void vk_window_drawable_size(int* w, int* h)
+{
+    SDL_Vulkan_GetDrawableSize(s_vk.window, w, h);
+}
+#endif
 
 static int vk_create_swapchain(void)
 {
@@ -2174,7 +2329,7 @@ static int vk_create_swapchain(void)
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == 0xFFFFFFFFu) {
         int w = 0, hh = 0;
-        SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &hh);
+        vk_window_drawable_size(&w, &hh);
         ext.width = (u32)w; ext.height = (u32)hh;
         if (ext.width  < caps.minImageExtent.width)  ext.width  = caps.minImageExtent.width;
         if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
@@ -5950,9 +6105,13 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed) {
         if (vk_load_wsi_instance_functions()) {
             vk_window_drop("the driver has no surface functions");
-        } else if (!SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, &s_vk.surface)) {
+        } else if (vk_create_window_surface()) {
             char why[256];
+#ifdef _WIN32
+            snprintf(why, sizeof why, "vkCreateWin32SurfaceKHR failed");
+#else
             snprintf(why, sizeof why, "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+#endif
             vk_window_drop(why);
         }
     }
@@ -6139,8 +6298,8 @@ static void vulkan_original_shutdown(void)
     if (s_vk.windowed && s_vk.swapchain && s_vk.presented && s_vk.hold_seconds > 0.0) {
         VK_LOG("holding the last frame on screen for %.1f s "
                "(Esc or closing the window ends it early)\n", s_vk.hold_seconds);
-        const Uint32 end = SDL_GetTicks() + (Uint32)(s_vk.hold_seconds * 1000.0);
-        while (s_vk.windowed && !SDL_TICKS_PASSED(SDL_GetTicks(), end)) {
+        const double end = vk_now_seconds() + s_vk.hold_seconds;
+        while (s_vk.windowed && vk_now_seconds() < end) {
             if (rsx_vulkan_backend_pump_messages() != 0) break;
             vk_present_window();         /* FIFO: paced by the display */
         }
@@ -6186,7 +6345,11 @@ static void vulkan_original_shutdown(void)
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
+#ifdef _WIN32
+    if (s_vk.lib) FreeLibrary((HMODULE)s_vk.lib);
+#else
     if (s_vk.lib) dlclose(s_vk.lib);
+#endif
     free(s_vk.cpu_verts);
     pthread_mutex_destroy(&s_vk.queue_mu);
     pthread_mutex_destroy(&s_vk.present_mu);
@@ -6197,14 +6360,55 @@ static void vulkan_original_shutdown(void)
 int rsx_vulkan_backend_pump_messages(void)
 {
     vk_show_pump();
+#ifdef _WIN32
+    /* The message queue belongs to the thread that created the window: the
+     * host pumps from that thread, as for the D3D12 backend. The native OSK's
+     * Win32 host shares this pump. */
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    osk_native_win32_pump();
+#endif
+    MSG msg;
+    int quit = 0;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) { quit = 1; continue; }
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+        if (osk_native_win32_handle_message(&msg)) continue;
+#endif
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (!s_vk.windowed) return quit ? -1 : 0;
+    return (quit || s_vk.window_closed) ? -1 : 0;
+#else
     if (!s_vk.windowed) return 0;
     int quit = 0;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+        /* An open dialog owns the keyboard and its own window's events. */
+        if (osk_native_sdl_handle_event(&e)) continue;
+#endif
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+        /* With a dialog open the game window is not the last one, so SDL
+         * sends no SDL_QUIT when it closes; its own close event still ends. */
+        else if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE &&
+                 s_vk.window && e.window.windowID == SDL_GetWindowID(s_vk.window)) quit = 1;
     }
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+    osk_native_sdl_pump();   /* queued open/close/confirm, then redraw */
+#endif
+#ifdef PAD_HAS_SDL_KEYBOARD
+    {
+        int dialog = 0;
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+        dialog = osk_native_sdl_input_active();
+#endif
+        ps3recomp_pad_sdl_keyboard_sample(s_vk.window, dialog);
+    }
+#endif
     return quit ? -1 : 0;
+#endif
 }
 
 void rsx_vulkan_backend_present(void)
@@ -6578,4 +6782,4 @@ int rsx_vulkan_backend_queue_order(rsx_native_queue_order* out)
         .reserve = vulkan_order_reserve, .submit = vulkan_order_submit };
     return 0;
 }
-#endif /* !_WIN32 */
+#endif /* !_WIN32 || PS3RECOMP_RSX_VULKAN */

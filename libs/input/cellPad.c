@@ -18,6 +18,7 @@
 #endif
 #endif
 #include "cellPad.h"
+#include "pad_sdl_keyboard.h"
 #include "../misc/osk_native.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -500,6 +501,39 @@ static unsigned long long pad_now_ms(void)
 #endif
 }
 
+#ifdef PAD_HAS_SDL_KEYBOARD
+/* The SDL game window publishes its keyboard (pad_sdl_keyboard.c) from its
+ * event pump; this only reads that snapshot. A physical controller still wins;
+ * the keyboard only fills the vacant port, as on macOS. */
+static void pad_poll_sdl_keyboard(void)
+{
+    static int keyboard_off = -1;
+    if (keyboard_off < 0) keyboard_off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    if (keyboard_off || s_host_state[0].connected) return;
+    PadHostState* hs = &s_host_state[0];
+    PS3RecompSDLKeyboardPadState keyboard = ps3recomp_pad_sdl_keyboard_state();
+    /* Without a game window (headless runs) port 0 is left exactly as before;
+     * a window that goes away releases what its keyboard held, once. */
+    static int s_owned = 0;
+    if (!keyboard.window && !s_owned) return;
+    s_owned = keyboard.window;
+    memset(hs, 0, sizeof(*hs));
+    hs->buttons = keyboard.buttons;
+    hs->analog_lx = keyboard.analog_lx;
+    hs->analog_ly = keyboard.analog_ly;
+    hs->analog_rx = keyboard.analog_rx;
+    hs->analog_ry = keyboard.analog_ry;
+    static int trace = -1;
+    static u16 previous = 0;
+    if (trace < 0) trace = getenv("PAD_KEYBOARD_TRACE") ? 1 : 0;
+    if (trace && keyboard.buttons != previous) {
+        printf("[cellPad] SDL keyboard port 0 buttons=0x%04X\n", keyboard.buttons);
+        fflush(stdout);
+    }
+    previous = keyboard.buttons;
+}
+#endif
+
 static void pad_poll_backend(void)
 {
     /* Benign race: two threads may poll in the same tick. That costs one extra
@@ -520,6 +554,9 @@ static void pad_poll_backend(void)
 #endif
 #ifdef _WIN32
     if (!s_host_state[0].connected) pad_poll_keyboard();
+#endif
+#ifdef PAD_HAS_SDL_KEYBOARD
+    pad_poll_sdl_keyboard();
 #endif
 #if defined(__APPLE__) && !TARGET_OS_IPHONE
     /* Native Metal windows do not publish their key events through SDL. A

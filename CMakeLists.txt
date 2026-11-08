@@ -50,11 +50,13 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux; opt-in on Windows)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_(vulkan_backend|frontend_vulkan)\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32 OR APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
+    # Windows: a Win32 window and vulkan-1.dll loaded at run time; the D3D12
+    # backend is still built and stays the host default.
+    if(APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is not available on macOS")
     endif()
     find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
@@ -327,6 +329,11 @@ endif()
 # libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
 # its fixed-function path.
 if(PS3RECOMP_RSX_VULKAN)
+    # The lookup above is POSIX-only (it serves the Metal translation too);
+    # the opt-in Windows Vulkan backend finds glslang on its own.
+    if(WIN32 AND NOT glslang_FOUND)
+        find_package(glslang CONFIG QUIET)
+    endif()
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
@@ -360,6 +367,20 @@ if(NOT WIN32 AND NOT APPLE)
     option(PS3RECOMP_NATIVE_OSK_HEADLESS "Build the headless native OSK host (mailbox-confirmed)" OFF)
     if(PS3RECOMP_NATIVE_OSK_HEADLESS)
         target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_HEADLESS=1)
+    endif()
+    # A real text-entry dialog in an SDL2 window, opened by the thread that
+    # owns the game window's SDL event pump (libs/misc/osk_sdl.c). Without a
+    # window it hands requests to the headless host above when that is built.
+    option(PS3RECOMP_NATIVE_OSK_SDL "Build the SDL2 native OSK dialog" ON)
+    if(PS3RECOMP_NATIVE_OSK_SDL)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_SDL=1)
+    endif()
+    # Keyboard on controller port 0 while the SDL game window has focus and no
+    # controller occupies it (libs/input/pad_sdl_keyboard.c; PAD_NO_KEYBOARD=1
+    # turns it off at run time).
+    option(PS3RECOMP_PAD_SDL_KEYBOARD "Map the SDL game window's keyboard to pad port 0" ON)
+    if(PS3RECOMP_PAD_SDL_KEYBOARD)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_SDL_KEYBOARD=1)
     endif()
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
