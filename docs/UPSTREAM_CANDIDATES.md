@@ -42,17 +42,17 @@ otherwise; "mag-recomp" means the downstream port that pins this fork.
 | M1 | Guest write watch and preservation sessions | PR open #727 (write watch), #728 (preservation sessions, stacked on #727); Windows paths not yet run |
 | M2 | Coherence fast paths (series) | PR open #731 (live holder counts only). Shard, interest bitmap and no-LR store fast path dropped: they only pay off with fork-only 91df812a (see M15); 1ef14852 already upstream (#484); 9192f907 dropped (neutral) |
 | M3 | Fast guest accessors, inline stores from the lifter | dropped (superseded by upstream 27745b54, which already inlines stores under its own gate) |
-| M4 | Direct Vulkan present | not started |
-| M5 | RSX present thread | not started |
-| M6 | FIFO consumer busy accounting | not started |
-| M7 | Guest longjmp: PPU nonlocal control flow | not started |
+| M4 | Direct Vulkan present | PR open #738 (opt-in `PS3RECOMP_VK_DIRECT_PRESENT`; read-back stays the default) |
+| M5 | RSX present thread | PR open #741 (ring + Metal). Vulkan half in progress, stacked on #738 |
+| M6 | FIFO consumer busy accounting | PR open #745 (header-only; owner/handoff categories dropped) |
+| M7 | Guest longjmp: PPU nonlocal control flow | PR open #735 (`/EHsc-` behind an OFF-by-default CMake option) |
 | M8 | Range-based PPU reservation invalidation | dropped (upstream bulk writes do not break PPU reservations word by word, so there is nothing to speed up; revisit only if upstream wants `PPU_RESV_STORE` to cover bulk and DMA writes) |
 | M9 | D3D12 register-file draw-engine backend | not started |
-| M10 | Native OSK hosts (and Linux SDL keyboard pad) | not started |
-| M11 | SDATA plain opens stay raw; durable cellFsWrite | not started |
-| M12 | Port-template extension points and build receipts | not started |
+| M10 | Native OSK hosts (and Linux SDL keyboard pad) | PR open #739 (lifecycle + headless host), #740 (SDL dialog, stacked on #739). macOS and Windows hosts in progress. SDL keyboard pad dropped (upstream `cellPad.c` keyboard fallback covers it; ignoring keys while a dialog is open is in #740) |
+| M11 | SDATA plain opens stay raw; durable cellFsWrite | PR open #734 (SDATA-raw half only; the write half is covered by open upstream #705) |
+| M12 | Port-template extension points and build receipts | PR open #742 (extensions and lifecycle callbacks), #743 (lift_hooks). Receipts/`provenance.py` not sent (port-specific) |
 | M13 | Function-level lifter-fix splice | PR open #730 |
-| M14 | Small opt-in knobs on systems upstream already has | not started |
+| M14 | Small opt-in knobs on systems upstream already has | PR open #744 (SPU PUT watch). SDL dummy-driver audio clock deferred until upstream #710 lands; SPU line watch and coherence histogram skipped (no standalone fixture / SPURS-kernel field; diagnostic only); live D3D12 report batching skipped (depends on #713 and A1) |
 | M15 | PPU reservation epochs across coherent SPU line writes | not started |
 | A1 | RFC: checked GPU completion for RSX reports and labels | not started (discussion first) |
 | A2 | RFC: native-owner seam | not started (discussion first) |
