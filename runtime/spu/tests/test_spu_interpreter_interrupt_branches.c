@@ -18,6 +18,8 @@ static void word(uint32_t at,uint32_t w){ctx.ls[at]=w>>24;ctx.ls[at+1]=w>>16;ctx
 #ifdef BRANCH_LIFTED
 #include "interrupt_branches_lifted.h"
 #endif
+/* lv2_register.c publishes lifted-job contexts for thread lookup; not linked here. */
+void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
 static unsigned checks;
 static void run(uint32_t opcode,uint32_t cond,int initial,uint32_t target,int want_enable,int alias,int mode){
  memset(&ctx,0,sizeof(ctx));spu_context_init(&ctx,0);ctx.image_id=77;ctx.policy_mode=1;

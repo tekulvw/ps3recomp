@@ -43,6 +43,7 @@ void spu_lockline_lock(void) {
 }
 void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t ea) {(void)ea;}
+void spu_coh_host_rmw_mark(uint32_t ea, uint32_t len) {(void)ea;(void)len;}
 void ps3_ww_report_inline(uint32_t ea,uint64_t value,int width) {(void)ea;(void)value;(void)width;}
 static _Alignas(128) uint8_t memory[0x10000];
 #define PTR(type, ea) ((type*)(uintptr_t)(ea))

@@ -30,7 +30,7 @@ functions = '\n'.join(function(name) for name in
 tables = source[source.index('#define TS_TRACK '):
                 source.index('static uint8_t* ts_running(')]
 fixture = (root / 'runtime/spu/tests/test_spu_taskset_elf_flags.c').read_text()
-fixture = fixture.replace('/* PRODUCTION_FUNCTIONS */', tables + functions)
+fixture = fixture.replace('/* PRODUCTION_FUNCTIONS */', '#include "ps3_log.h"   /* ps3_log_verbose, used by spu_taskset_task_exited */\n' + tables + functions)
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
 with tempfile.TemporaryDirectory(prefix='spu-taskset-elf-flags-') as tmp:
@@ -38,5 +38,5 @@ with tempfile.TemporaryDirectory(prefix='spu-taskset-elf-flags-') as tmp:
     binary = Path(tmp) / 'test'
     c.write_text(fixture)
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
-                    '-Wall', '-Wextra', str(c), '-o', str(binary)], check=True)
+                    '-Wall', '-Wextra', '-I'+str(root/'runtime'), str(c), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)

@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix='spu-xorbi-') as tmp:
     generated = Path(tmp) / 'xorbi_lifted.h'
     generated.write_text('\n'.join(source) + '\n')
     binary = Path(tmp) / 'xorbi_lifted'
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-DXORBI_LIFTED',
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-DXORBI_LIFTED', '-D_GNU_SOURCE',  # -include runs before win32_compat.c can set it
                     '-I'+str(root/'include'), '-I'+str(spu), '-include', str(generated),
                     str(spu/'tests/test_spu_interpreter_xorbi.c'), str(spu/'spu_interp.c'), str(root/'runtime/platform/win32_compat.c'),
                     '-lm', '-o', str(binary)], check=True)

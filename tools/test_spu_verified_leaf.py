@@ -2,7 +2,7 @@
 """Real registry, exact changed-byte, compare-volume and owning-return checks."""
 import pathlib,subprocess,tempfile,os
 r=pathlib.Path(__file__).resolve().parents[1];s=r/'runtime/spu'
-u=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap','spurs_policy_blob_weak','spu_interp']
+u=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap','spurs_policy_blob_weak','spu_interp', '../diagnostics/job_io_recorder']
 e={k:v for k,v in os.environ.items()if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
 with tempfile.TemporaryDirectory(prefix='spu-leaf-check-')as td:
  for san in (False,True):
