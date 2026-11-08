@@ -22,6 +22,7 @@ s32 cellHttpResponseGetStatusCode(CellHttpTransId, s32*) __attribute__((weak));
 s32 cellHttpResponseGetContentLength(CellHttpTransId, u64*) __attribute__((weak));
 s32 cellHttpResponseGetAllHeaders(CellHttpTransId, void*, u32*, void*, u32, u32*) __attribute__((weak));
 #include "../cellHttp.c"
+#include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
 #include <arpa/inet.h>
 
 uint8_t* vm_base;

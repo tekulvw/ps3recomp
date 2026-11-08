@@ -13,6 +13,8 @@
  * Context-aware HLE: guest pointers (path, buffers, out params) are read/written
  * through vm_base in big-endian.
  */
+#include "../memory/vm_watch.h"
+#include <errno.h>
 #include "ppu_recomp.h"      /* ppu_context */
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
@@ -249,9 +251,10 @@ static void cellFsOpen(ppu_context* ctx)
     host_path(hpath, sizeof hpath, gpath);
 
     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
-     * file and that is opened in its place. */
+     * file and that is opened in its place. SDATA stays raw here: only
+     * cellFsSdataOpen decrypts it. */
     { char dec_path[1200];
-      const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
+      const char* use = edat_resolve_open(hpath, dec_path, sizeof dec_path);
       if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
 
     /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
@@ -462,7 +465,9 @@ static void cellFsRead(ppu_context* ctx)
     long fpos_before = ftell(f);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
+    vm_note_write(buf, (size_t)nbytes);   /* kernel write into guest memory */
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
+    vm_note_write_check(n < (size_t)nbytes && ferror(f) && errno == EFAULT, "cellFsRead");
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
@@ -531,6 +536,12 @@ static void cellFsWrite(ppu_context* ctx)
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
+    /* cellFsWrite hands the bytes to the kernel; they outlive the process. Hand
+     * them to the host OS too (as sys_fs_write and cellFs.c already do), or a
+     * killed run leaves only what stdio happened to flush: a system-cache index
+     * whose header was still buffered reads back as zeros, and fios then
+     * revalidates it one 512-byte open/read/close at a time. */
+    fflush(f);
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
@@ -938,8 +949,11 @@ static void cellFsAioRead(ppu_context* ctx)
          * and the seek back (stdio's own calls take the same lock). */
         HOST_LOCKFILE(f);
         const int64_t pos = (int64_t)HOST_FTELL64(f);
-        if (HOST_FSEEK64(f, offset) == 0)
+        if (HOST_FSEEK64(f, offset) == 0) {
+            vm_note_write(buf, (size_t)size);   /* kernel write into guest memory */
             n = fread(vm_base + buf, 1, (size_t)size, f);
+            vm_note_write_check(n < (size_t)size && ferror(f) && errno == EFAULT, "cellFsReadWithOffset");
+        }
         if (pos >= 0) HOST_FSEEK64(f, pos);
         HOST_UNLOCKFILE(f);
         err = CELL_OK;

@@ -20,6 +20,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Options
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
+option(PS3RECOMP_ORIGINAL_OBSERVER "Compile diagnostic source-qualified original execution witnesses" OFF)
+option(PS3RECOMP_VM_FAST_ACCESSORS "Give the out-of-line PPU guest accessors a fast path for accesses that need no probe, coherency or MMIO handling" OFF)
+option(PS3RECOMP_SPU_DECODE_CACHE_HEAP "Allocate the SPU interpreter decode cache per thread on first use instead of in static TLS" OFF)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -48,7 +51,7 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
 option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
-list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_(vulkan_backend|frontend_vulkan)\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
     if(WIN32 OR APPLE)
         message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
@@ -60,6 +63,7 @@ if(PS3RECOMP_RSX_VULKAN)
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
     endif()
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_frontend_vulkan.c")
     # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
 endif()
@@ -69,6 +73,7 @@ endif()
 if(APPLE)
     enable_language(OBJC)
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_frontend_metal.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_macos.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc/osk_macos.m")
 endif()
@@ -108,6 +113,19 @@ add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
 )
+if(PS3RECOMP_ORIGINAL_OBSERVER)
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_ORIGINAL_OBSERVER=1)
+    target_include_directories(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/diagnostics")
+endif()
+
+if(PS3RECOMP_VM_FAST_ACCESSORS)
+    # PUBLIC: the accessors live in runtime/ppu/ppu_loader.cpp, which the game
+    # target compiles, not this library.
+    target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_VM_FAST_ACCESSORS=1)
+endif()
+if(PS3RECOMP_SPU_DECODE_CACHE_HEAP)
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_SPU_DECODE_CACHE_HEAP=1)
+endif()
 
 target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_CRITICAL_WRITE_AVAILABLE=1)
 
@@ -187,6 +205,7 @@ if(APPLE)
     )
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_frontend_metal.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_macos.m"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc/osk_macos.m"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -449,9 +468,26 @@ if(PS3RECOMP_BUILD_TESTS)
         add_subdirectory(tests/gcm_reports)
     endif()
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
+    # The guest write watch (default off) on synthetic guest memory.
+    add_executable(test_vm_write_watch tests/test_vm_write_watch.c runtime/memory/vm_watch.c)
+    target_include_directories(test_vm_write_watch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    if(NOT WIN32)
+        target_link_libraries(test_vm_write_watch PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME vm_write_watch COMMAND test_vm_write_watch)
+    add_test(NAME vm_write_watch_off COMMAND test_vm_write_watch off)
+    add_test(NAME vm_write_watch_strict COMMAND test_vm_write_watch strict)
+    set_tests_properties(vm_write_watch vm_write_watch_off vm_write_watch_strict PROPERTIES TIMEOUT 60)
+    set_tests_properties(vm_write_watch_strict PROPERTIES WILL_FAIL TRUE)
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
+    # Opt-in RSX FIFO busy accounting (PS3RECOMP_RSX_FIFO_BUSY) on a scripted clock.
+    if(NOT WIN32)
+        add_executable(test_rsx_fifo_busy libs/video/tests/test_rsx_fifo_busy.c libs/video/rsx_fifo_busy.c)
+        target_link_libraries(test_rsx_fifo_busy PRIVATE Threads::Threads)
+        add_test(NAME rsx_fifo_busy COMMAND test_rsx_fifo_busy)
+    endif()
 
     if(NOT WIN32)
         add_executable(test_spu_lockline_wait
@@ -470,6 +506,20 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_spu_float_exact PRIVATE m)
         add_test(NAME spu_float_exact COMMAND test_spu_float_exact)
         set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
+        # The vector forms against the scalar per-lane forms, directly.
+        add_executable(test_spu_float_vector_scalar
+            runtime/spu/tests/test_spu_float_vector_scalar.c)
+        target_include_directories(test_spu_float_vector_scalar PRIVATE include runtime/spu)
+        target_compile_options(test_spu_float_vector_scalar PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_float_vector_scalar PRIVATE m)
+        add_test(NAME spu_float_vector_scalar COMMAND test_spu_float_vector_scalar 4)
+        set_tests_properties(spu_float_vector_scalar PROPERTIES TIMEOUT 300)
+        # On x86 both take the ISA the runtime and lifted code are built for, so the SSE4.1
+        # vector form is the one under test; no contraction, as in the runtime.
+        if(PS3RECOMP_HAS_MSSE41)
+            target_compile_options(test_spu_float_exact PRIVATE -msse4.1 -ffp-contract=off)
+            target_compile_options(test_spu_float_vector_scalar PRIVATE -msse4.1 -ffp-contract=off)
+        endif()
     endif()
     # Current colors are explicit shader inputs even when they equal the
     # hardware default; exercise both compact fetch entry points without a GPU.

@@ -27,8 +27,10 @@ int spu_raw_reg_load(uint32_t,uint32_t*){std::abort();}
 void spu_raw_reg_store(uint32_t,uint32_t,unsigned){std::abort();}
 int spu_coh_is_reserved(uint32_t){return 0;}
 void spu_coh_notify_write(uint32_t){std::abort();}
+int spu_coh_ppu_store_lock(uint32_t){std::abort();}
+void spu_coh_ppu_store_unlock(uint32_t){std::abort();}
 void spu_lockline_lock(){std::abort();}void spu_lockline_unlock(){std::abort();}
-void ppu_prof_stamp(void*,unsigned){}uint32_t ppu_prof_resolve_host(void*){return 0;}
+void ppu_prof_stamp(void*,unsigned){}  /* ppu_prof_resolve_host: ppu_loader.cpp defines it */
 int64_t sys_mmapper_allocate_address(ppu_context*){std::abort();}
 int64_t sys_mmapper_search_map_address(uint32_t,uint32_t,uint32_t*){std::abort();}
 }

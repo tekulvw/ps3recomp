@@ -1,3 +1,4 @@
+#include "rsx_original_owner.h"
 /*
  * ps3recomp - platform-neutral RSX draw engine over the register file
  *
@@ -29,6 +30,7 @@
 #define PS3RECOMP_RSX_DRAW_ENGINE_H
 
 #include "rsx_dispatch.h"
+#include "rsx_native_handoff.h"
 #include "rsx_primitives.h"
 #include "rsx_texture_layout.h"
 #include "rsx_vertex_compact.h"
@@ -254,6 +256,14 @@ typedef struct rsx_draw_backend {
      * on the GPU from the backend's own copy. 0 when it cannot; the engine
      * then decodes and uploads. */
     u32  (*depth_z24_texture)(void* user, u32 w, u32 h, u32 remap, u32 rsx_fmt);
+    /* Optional: a texture that samples, as linear A8R8G8B8 or D8R8G8B8
+     * (rsx_fmt, crossbar `remap`), exactly the D24S8 words depth_store_z24
+     * would store for the top-left w x h of `depth`, built entirely on the
+     * GPU. The conversion must be encoded at the backend's next submission,
+     * after every draw recorded before this call; the engine submits with
+     * submit_async right after, so no CPU wait and no guest write happen.
+     * 0 when it cannot; the engine then stores through guest memory. */
+    u32  (*depth_z24_view)(void* user, u32 depth, u32 w, u32 h, u32 remap, u32 rsx_fmt);
     /* Optional same-target colour feedback. Return a fresh, immutable texture
      * of the target's full physical extent and storage format. Its GPU copy
      * must execute after all preceding writes and before the next draw. The
@@ -321,6 +331,11 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
 int rsx_draw_engine_async_available(void);
+/* Texture reads of depth that reached neither a snapshot, a GPU view nor a
+ * guest-memory store (see the engine's one-time report). */
+u64 rsx_draw_engine_depth_unstored_count(void);
+/* Same-target colour reads the backend could not copy (no color_snapshot). */
+u64 rsx_draw_engine_feedback_unserved_count(void);
 u64 rsx_draw_engine_submit_async(void);
 int rsx_draw_engine_completion_status(u64 ticket,int wait);
 void rsx_draw_engine_set_report_barrier(int (*barrier)(void));
@@ -396,6 +411,8 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
                                             const u32* cuts, u32 cut_count,
                                             const u32* occurrence_to_unique,
                                             u32* indices);
+
+void rsx_draw_engine_set_owner_hooks(const rsx_original_owner_hooks *hooks);
 
 #ifdef __cplusplus
 }

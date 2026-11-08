@@ -3,6 +3,15 @@
 #include "../rsx_metal_backend.m"
 #include <assert.h>
 #include <unistd.h>
+/* This protocol-only fixture owns no guest consumer/report queue. Runtime
+ * providers stay unchanged; unexpected interactions fail this fixture. */
+float cellAvconfExt_display_gamma(void) { return 1.0f; }
+int cellGcm_native_consumer_enabled(void) { return 0; }
+void cellGcm_fifo_kick_notify(void) { assert(!"protocol fixture has no FIFO consumer"); }
+void rsx_ring_progress_metal_committed(uint64_t ticket, uint64_t records) {
+    (void)ticket; (void)records;
+    assert(!"protocol fixture does not issue asynchronous guest report tickets");
+}
 @interface MeasurementBuffer : NSObject
 @property(copy) MTLCommandBufferHandler completion;
 @property int failed;
@@ -28,12 +37,17 @@
 - (void)setRenderPipelineState:(id)p {(void)p;}
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i {(void)t;(void)i;}
 - (void)setFragmentSamplerState:(id)t atIndex:(NSUInteger)i {(void)t;(void)i;}
+- (void)setFragmentBytes:(const void*)bytes length:(NSUInteger)length atIndex:(NSUInteger)index {
+ assert(bytes && length==4*sizeof(float) && index==0);
+}
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n {(void)t;(void)s;assert(n==3);}
 - (void)endEncoding {}
 @end
 @interface MeasurementTexture : NSObject @end
 @implementation MeasurementTexture
 - (MTLPixelFormat)pixelFormat {return MTLPixelFormatBGRA8Unorm;}
+- (NSUInteger)width {return 1;}
+- (NSUInteger)height {return 1;}
 @end
 @interface CommittingDrawable : MeasurementDrawable
 @property id texture;

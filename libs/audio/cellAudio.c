@@ -781,6 +781,23 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+/* PS3RECOMP_AUDIO_DUMMY_CLOCK=1 (opt-in): with SDL's "dummy" audio driver, pace
+ * the mix on the 48 kHz clock as if no device were open, and do not queue to it.
+ * The dummy device consumes on its own coarse sleep, so pacing to its queue ran
+ * the guest's audio period (and the title work clocked by it) about 1% slow at
+ * best and several percent slow on average on a loaded host. Its output is
+ * discarded either way. Other drivers are unaffected. */
+static int audio_pace_on_clock(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_AUDIO_DUMMY_CLOCK");
+        const char* driver = s_sdl_audio_dev ? SDL_GetCurrentAudioDriver() : NULL;
+        on = e && !strcmp(e, "1") && driver && !strcmp(driver, "dummy");
+        if (on) printf("[cellAudio] dummy audio driver: pacing on the 48 kHz clock\n");
+    }
+    return on;
+}
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
@@ -795,14 +812,15 @@ static void* audio_mix_thread_func(void* arg)
     clock_gettime(CLOCK_MONOTONIC, &clock);
     u64 epoch_ns = (u64)clock.tv_sec * 1000000000ULL + (u64)clock.tv_nsec;
     u64 blocks = 0;
-    unsigned lead = s_sdl_audio_dev ? 3 : 0;
-    int had_device = s_sdl_audio_dev != 0;
+    const int pace_clock = audio_pace_on_clock();
+    unsigned lead = s_sdl_audio_dev && !pace_clock ? 3 : 0;
+    int had_device = s_sdl_audio_dev != 0 && !pace_clock;
     const u64 block_ns = (u64)CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL /
                          CELL_AUDIO_SAMPLE_RATE;
     while (s_mix_thread_running) {
         clock_gettime(CLOCK_MONOTONIC, &clock);
         const u64 now_ns = (u64)clock.tv_sec * 1000000000ULL + (u64)clock.tv_nsec;
-        const int have_device = s_sdl_audio_dev != 0;
+        const int have_device = s_sdl_audio_dev != 0 && !pace_clock;
         u64 due_ns = epoch_ns + (blocks > lead ? blocks - lead : 0) *
             CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL / CELL_AUDIO_SAMPLE_RATE;
         /* Discard elapsed backlog after a suspension, a frozen device queue,
@@ -816,14 +834,14 @@ static void* audio_mix_thread_func(void* arg)
             blocks = lead = 0;
             had_device = have_device;
         }
-        if (audio_backend_queued_samples() >= CELL_AUDIO_BLOCK_SAMPLES * 4 ||
+        if ((!pace_clock && audio_backend_queued_samples() >= CELL_AUDIO_BLOCK_SAMPLES * 4) ||
             now_ns < due_ns) {
             usleep(1000);
             continue;
         }
         blocks++;
         audio_mix_one_block();
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        if (!pace_clock) audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
         if (s_audio_diag_on) audio_diagnostics_report(audio_diagnostics_now());
         audio_chronology_poll();

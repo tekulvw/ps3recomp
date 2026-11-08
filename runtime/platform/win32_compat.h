@@ -6,7 +6,8 @@
  * the interlocked intrinsics behind the PPU reservation spinlock, and the
  * scalar typedefs (DWORD, ULONGLONG, SIZE_T, ...) those call sites use. This
  * header supplies all of it on POSIX so the call sites compile unchanged. On
- * Windows it is a no-op passthrough to <windows.h>.
+ * Windows it defaults to a passthrough to <windows.h>. Explicit original-work
+ * diagnostics additionally wrap native thread factories and exit functions.
  *
  * Usable from C AND C++. That is deliberate: the runtime library is C but the
  * PPU boot scaffold is C++, and both need these names. Nothing in here may use
@@ -51,6 +52,26 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+#  if defined(__MINGW32__)
+/* The Microsoft SDK supplies these volatile access helpers; MinGW headers do
+ * not. Keep the same actual acquire/release semantics on that compiler. */
+#    ifndef ReadAcquire
+#      define ReadAcquire(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#    endif
+#    ifndef WriteRelease
+#      define WriteRelease(p,v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#    endif
+#  endif
+#  if defined(PS3RECOMP_ORIGINAL_OBSERVER) && PS3RECOMP_ORIGINAL_OBSERVER
+/* Only observed runtime/scaffold sources opt in. Include the real declarations
+ * before aliases, so SDK prototypes and calling conventions remain untouched.
+ * Normal builds still call the native factories directly. */
+#    include "../diagnostics/original_work_threads.h"
+#    define CreateThread ps3_original_CreateThread
+#    define _beginthreadex ps3_original_beginthreadex
+#    define ExitThread ps3_original_ExitThread
+#    define _endthreadex ps3_original_endthreadex
+#  endif
 #else
 
 #include <pthread.h>
@@ -735,7 +756,13 @@ static inline DWORD GetCurrentThreadId(void)
     pthread_threadid_np(NULL, &tid);
     return (DWORD)tid;
 #elif defined(__linux__)
-    /* Not gettid(3): that wrapper only appeared in glibc 2.30. */
+    /* Not gettid(3): that wrapper only appeared in glibc 2.30. A translation
+     * unit that asks for strict POSIX (_POSIX_C_SOURCE) gets no syscall()
+     * prototype from <unistd.h>, so declare it here for C; C++ builds define
+     * _GNU_SOURCE and already have it. */
+#if !defined(__cplusplus) && !defined(__USE_MISC)
+    extern long syscall(long, ...);
+#endif
     return (DWORD)syscall(SYS_gettid);
 #else
     return (DWORD)(uintptr_t)pthread_self();
@@ -790,6 +817,9 @@ BOOL   CancelWaitableTimer(HANDLE h);
 
 HANDLE CreateThread(void* sa, SIZE_T stack, PS3_THREAD_FN fn, LPVOID arg,
                     DWORD flags, DWORD* out_tid);
+/* Host stack size to request for `usable` bytes of stack: glibc takes static
+ * TLS and the guard out of the requested size, other libcs do not. 0 stays 0. */
+size_t ps3_host_thread_stack_size(size_t usable);
 uintptr_t _beginthreadex(void* sa, unsigned stack, unsigned (*fn)(void*),
                          void* arg, unsigned flags, unsigned* out_tid);
 void   ExitThread(DWORD code);

@@ -8,7 +8,7 @@ _tmp=tempfile.TemporaryDirectory(prefix='spu-rejoin-prefilter-');out=Path(_tmp.n
 cc=os.environ.get('CC','cc');flags=['-std=gnu17','-O2','-UNDEBUG','-I'+str(r/'include'),'-I'+str(spu),'-I'+str(r/'runtime/platform')]
 if os.environ.get('PREFILTER_UBSAN'): flags+=['-fsanitize=undefined','-fno-sanitize-recover=all']
 subprocess.run([cc,*flags,'-Dspu_lifted_lookup=spu_lifted_lookup_real','-c',str(spu/'spu_channels.c'),'-o',str(out/'channels.o')],check=True)
-sources=['spu_drain.c','spu_lockstep.c','spu_coherency.c','spu_workload.c','spurs_policy.c','spurs_job.c','spu_tsp_weak.c','spu_vm_pagemap.c','spurs_policy_blob_weak.c','spu_interp.c']
+sources=['spu_drain.c','spu_lockstep.c','spu_coherency.c','spu_workload.c','spurs_policy.c','spurs_job.c','spu_tsp_weak.c','spu_vm_pagemap.c','spurs_policy_blob_weak.c','spu_interp.c', '../diagnostics/job_io_recorder.c']
 subprocess.run([cc,*flags,str(spu/'tests/test_spu_rejoin_prefilter.c'),str(out/'channels.o'),*[str(spu/x) for x in sources],str(r/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out/'test')],check=True)
 for flag in ['0','1']:
  for mode in ['prefilter','top','top-zero','nested-return','nested-return-unlifted','nested-calls','stop-zero','nested-stop','stop-code','halt','smc','pure-interpreter','stepcap','negative-stepcap']:

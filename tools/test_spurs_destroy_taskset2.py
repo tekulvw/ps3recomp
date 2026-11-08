@@ -18,7 +18,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-taskset2-') as tmp:
     assert 'ps3_hle_register(0x1EBCF459u, "cellSpursDestroyTaskset2",' in nids.read_text()
     sources = ['spu_channels', 'spu_drain', 'spu_lockstep', 'spu_coherency',
                'spu_workload', 'spurs_policy', 'spurs_job', 'spu_tsp_weak',
-               'spu_vm_pagemap', 'spurs_policy_blob_weak', 'spu_interp']
+               'spu_vm_pagemap', 'spurs_policy_blob_weak', 'spu_interp', '../diagnostics/job_io_recorder']
     binary = tmp / 'test'
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
         '-ffunction-sections', '-fdata-sections',

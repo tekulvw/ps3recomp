@@ -1,0 +1,45 @@
+name: Native owner synchronization
+on:
+  push:
+    branches: [main, master, codex/render-frontend-api]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  synchronization:
+    name: Owner synchronization (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Windows compiler environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile and execute actual owner synchronization fixture
+        run: python tools/test_native_owner_gate.py
+      - name: Execute real common-engine partial-primitive ownership fixture
+        run: python tools/test_original_owner_ingress.py
+      - name: Verify actual host-only located source translation
+        run: python tools/test_gcm_native_located_range.py
+      - name: Exact FIFO publication and existing source-target lookup
+        if: runner.os != 'Windows'
+        run: python tools/test_gcm_native_handoff.py
+      - name: Preserve checked FIFO reference behavior
+        if: runner.os != 'Windows'
+        run: python tools/test_gcm_checked_reference.py
+      - name: Compile Windows LIVE ownership integration
+        if: runner.os == 'Windows'
+        run: >
+          clang-cl /nologo /std:c17 /W0 /D_CRT_SECURE_NO_WARNINGS
+          /Iinclude /Ilibs/video /Iruntime/platform
+          /c libs/video/rsx_live_draw.c /Folive-owner.obj

@@ -40,7 +40,7 @@
 #include <time.h>      /* nanosleep, in the POSIX half of spu_intr.inc */
 
 #ifdef _WIN32
-#include <windows.h>
+#include "../platform/win32_compat.h"
 #endif
 
 extern uint8_t* vm_base;

@@ -11,6 +11,7 @@
  */
 
 #include "../sysNet.c"
+#include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
 
 #include <assert.h>
 

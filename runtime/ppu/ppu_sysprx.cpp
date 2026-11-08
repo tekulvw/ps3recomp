@@ -11,6 +11,7 @@
  * without hand-written NID literals.
  */
 #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
+#define PPU_NO_INLINE_STORES  /* likewise for the inline stores (tools/ppu_header_inline.py) */
 #include "ppu_recomp.h"     /* ppu_context */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
 #include <atomic>

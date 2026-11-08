@@ -408,6 +408,11 @@ typedef struct spu_context {
      * is bumped on every change to resident_code, dropping the cached
      * resolutions of this context. */
     uint32_t dcache_id, dcache_residency;
+    /* PS3RECOMP_PPU_STORE_LIVE_SPU (spu_coherency.c): the line this context
+     * counts in the live-reservation table, from its GETLLAR until the
+     * reservation ends on this thread. Owner thread only. */
+    uint32_t coh_live_line;
+    int coh_live_counted;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module

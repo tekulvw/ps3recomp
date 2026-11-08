@@ -10,12 +10,12 @@ if os.name == "nt":
     sys.exit(0)
 
 root = Path(__file__).resolve().parents[1]
-sources = ["tests/test_texture_descriptors.c", "rsx_draw_engine.c", "rsx_dispatch.c",
+sources = ["tests/test_texture_descriptors.c", "rsx_draw_engine.c", "rsx_fifo_busy.c", "../../runtime/diagnostics/critical_trace.c", "../../runtime/diagnostics/render_ablation.c", "rsx_dispatch.c",
            "rsx_vertex_compact.c", "rsx_texture_layout.c", "rsx_vp_decompiler.c",
            "rsx_fp_decompiler.c"]
 with tempfile.TemporaryDirectory(prefix="rsx-descriptors-") as directory:
     binary = Path(directory) / "test"
-    subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-Iinclude", "-Ilibs/video",
+    subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-ffunction-sections", "-fdata-sections", ("-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections"), "-Iinclude", "-Ilibs/video",
                     *["libs/video/" + s for s in sources], "-o", str(binary)],
                    cwd=root, check=True)
     env = os.environ.copy()

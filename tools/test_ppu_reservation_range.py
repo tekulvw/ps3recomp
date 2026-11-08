@@ -5,6 +5,9 @@ from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 source=(root/'runtime/ppu/ppu_loader.cpp').read_text()
 assert 'void ppu_resv_break_store_range(' in source, 'missing bulk reservation invalidation API'
+header=(root/'runtime/ppu/ppu_memory.h').read_text()
+for decl in (r'void\s+ppu_resv_break_store\(uint64_t ea\);', r'void\s+ppu_resv_break_store_range\(uint32_t ea, uint64_t bytes\);'):
+ assert re.search(decl, header), 'ppu_memory.h no longer declares '+decl+'; update the driver declarations'
 def function(name):
  m=re.search(r'extern "C" void '+name+r'\([^\n]+\)\s*\{',source); assert m,name
  start=m.start(); pos=m.end(); depth=1
@@ -17,6 +20,9 @@ actual='''#include "ppu_context.h"
 #define PPU_RESV_INVALID 0x100000000ull
 static ppu_context* g_resv_ctxs[PPU_RESV_MAX];
 static long g_resv_ctx_n;
+// The opt-in open-reservation count (PS3RECOMP_PPU_RESV_OPEN_COUNT) is off by
+// default, so every break scans the registry; that default path is what is tested.
+static inline bool ppu_resv_none_open_at_all(void){return false;}
 '''+function('ppu_resv_break_store')+'\n'+function('ppu_resv_break_store_range')+'''
 extern "C" void set_registry(ppu_context** p,long n){g_resv_ctx_n=n;for(int i=0;i<PPU_RESV_MAX;i++)g_resv_ctxs[i]=p[i];}
 '''
@@ -25,7 +31,11 @@ driver=r'''
 #include <cassert>
 #include <cstdio>
 #include <random>
-#include "ppu_memory.h"
+#include "ppu_context.h"
+// ppu_memory.h is a C11 header (stdatomic.h, _Atomic) that no C++17 unit can
+// include; declare the two helpers under test with the signatures it exports.
+extern "C" void ppu_resv_break_store(uint64_t ea);
+extern "C" void ppu_resv_break_store_range(uint32_t ea, uint64_t bytes);
 extern "C" void set_registry(ppu_context**,long);
 int main(){
  std::array<ppu_context,128> old{},now{};std::array<ppu_context*,128> ptr{};

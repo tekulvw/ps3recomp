@@ -13,7 +13,7 @@ root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 common = ['spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c', 'spu_workload.c',
           'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c', 'spu_vm_pagemap.c',
-          'spurs_policy_blob_weak.c', 'spu_interp.c']
+          'spurs_policy_blob_weak.c', 'spu_interp.c', '../diagnostics/job_io_recorder.c']
 failed = []
 with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
     for name in ['test_spu_mfc_slots', 'test_spu_mfc_shared_lookup', 'test_spu_coherency', 'test_spu_lockline_peer', 'test_spu_registry_allocation']:
@@ -23,8 +23,11 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
                    '-I' + str(root / 'runtime/platform'),
                    str(spu / 'tests' / (name + '.c'))]
         if name != 'test_spu_coherency':
+            # A fixture that stubs the job I/O recorder itself must not link the real one.
+            stubs_jobio = 'void ps3_jobio_event(' in (spu / 'tests' / (name + '.c')).read_text()
             command += [str(spu / c) for c in common if not
-                        (name == 'test_spu_registry_allocation' and c == 'spu_coherency.c')]
+                        ((name == 'test_spu_registry_allocation' and c == 'spu_coherency.c') or
+                         (stubs_jobio and c.endswith('job_io_recorder.c')))]
             command += [str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm']
         subprocess.run(command + ['-o', str(binary)], check=True)
         if name == 'test_spu_registry_allocation':

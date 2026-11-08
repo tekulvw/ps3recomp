@@ -55,6 +55,9 @@
 #define PS3RECOMP_RSX_VULKAN_BACKEND_H
 
 #include "rsx_commands.h"
+#include "rsx_frontend.h"
+#include "rsx_native_owner.h"
+#include "rsx_native_vulkan_image.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,6 +68,11 @@ extern "C" {
  * Returns 0 on success, -1 on any failure (reason printed to stderr). */
 int  rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
 
+/* Requires explicit PS3RECOMP_VK_FRONTEND=1 before init (Vulkan1.1), an
+ * existing compute-capable graphics queue, and no implicit device creation. */
+int rsx_vulkan_backend_frontend_available(void);
+rsx_frontend_device *rsx_vulkan_backend_frontend(void);
+
 /* Unregister and destroy every Vulkan object, then unload the library. */
 void rsx_vulkan_backend_shutdown(void);
 
@@ -72,9 +80,17 @@ void rsx_vulkan_backend_shutdown(void);
  * window has been closed or Esc pressed. */
 int  rsx_vulkan_backend_pump_messages(void);
 
-/* Read the frame back to host memory (and to PS3RECOMP_VK_DUMP if set), and
- * show it in the window if there is one. Same as _present_begin() followed
- * by _present_finish(). */
+/* Show the flipped frame in the window if there is one. Same as
+ * _present_begin() followed by _present_finish().
+ *
+ * On the draw engine path a present is direct: the blit into the window is
+ * submitted with the GPU waiting for the swapchain image, and the CPU waits
+ * for nothing (a short ring of presents stays in flight). The frame is read
+ * back to host memory -- the centre pixel for
+ * rsx_vulkan_backend_presented_center() and the PS3RECOMP_VK_DUMP file --
+ * only for the presents PS3RECOMP_VK_DUMP writes, for every present under
+ * PS3RECOMP_VK_PRESENT_READBACK=1, and always on the fixed-function path;
+ * such a present waits for the copy. */
 void rsx_vulkan_backend_present(void);
 
 /* The same present in two halves, for a host that presents on a thread of its
@@ -83,10 +99,12 @@ void rsx_vulkan_backend_present(void);
  * _present_begin() reads the flipped surface: it must not run while the
  * walker is draining (call it under the same lock as
  * cellGcm_rsx_process_fifo). On the draw engine path it only records and
- * submits the copy out of that surface, and returns at once.
+ * submits the copy out of that surface (a direct present: the window blit
+ * too), and returns at once.
  *
- * _present_finish() waits for that copy, reads the frame back, writes the
- * dump and presents to the window. It may run while the walker drains the
+ * _present_finish() waits for a read-back present's copy, reads the frame
+ * back, writes the dump and presents to the window; after a direct present
+ * it has nothing left to do. It may run while the walker drains the
  * next frame: the next frame's commands are ordered after the copy, so they
  * never reach the presented image. On the fixed-function path, where the
  * walker draws into the presented image itself, _present_begin() does all of
@@ -121,6 +139,23 @@ int  rsx_vulkan_backend_depth_bounds(void);
  * rsx_state path instead. Opt-in while the path grows; needs no initialised
  * backend. */
 int  rsx_vulkan_backend_guest_programs(void);
+
+/* Borrow existing native ownership only; no device/queue is created. */
+int rsx_vulkan_backend_borrow_owner(rsx_native_owner *);
+int rsx_vulkan_backend_borrow_owner_v2(rsx_native_owner_v2 *);
+int rsx_vulkan_backend_owner_shutdown_requested(uint64_t lifetime);
+int rsx_vulkan_backend_owner_retry_shutdown(uint64_t lifetime);
+/* Existing allocation only. image points to rsx_native_vulkan_image payload;
+ * retain before dereference. Same-device/queue GENERAL acquisition+handback. */
+int rsx_vulkan_backend_borrow_image(uint64_t owner_lifetime,uint32_t backend_surface,rsx_native_image *);
+int rsx_vulkan_backend_validate_image_planes(void *,uint64_t,uint64_t,uint64_t,uint32_t);
+/* Nonblocking checkpoint of the latest actual original queue fence. Caller
+ * holds serialized FIFO consumption. No new submit, GPU wait or minted ticket;
+ * 0 reports a real successful fence watermark, -4 pending/no checkpoint. */
+int rsx_vulkan_backend_native_boundary(uint64_t *original_ticket);
+/* Reserved queue order for native submissions (rsx_native_owner.h); -2 when
+ * the native owner is not enabled. */
+int rsx_vulkan_backend_queue_order(rsx_native_queue_order *out);
 
 #ifdef __cplusplus
 }

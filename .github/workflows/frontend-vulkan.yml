@@ -1,0 +1,65 @@
+name: Explicit Vulkan frontend
+on:
+  push:
+    branches: [main, master, codex/render-frontend-api]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compute:
+    name: Vulkan build and software diagnostics (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    env:
+      CC: ${{ matrix.compiler }}
+      RUSTUP_TOOLCHAIN: '1.99.0'
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+      VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Native build and software Vulkan dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config libsdl2-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers glslang-tools
+      - name: CPU-only injected driver-fault contract
+        run: python tools/test_frontend_vulkan.py --contract-only
+      - name: Engine GPU depth conversion, views and completion tickets (software device, validation)
+        run: python tools/test_vulkan_depth_z24.py
+      - name: Pinned authored shader tool and synthetic inputs
+        uses: actions/checkout@v4
+        with:
+          repository: tekulvw/mag-recomp
+          ref: 33f0ad6f26dc2d951a6b937c28a1b1383ae7ddd4
+          path: frontend-shader-source
+          persist-credentials: false
+      - name: Pinned shader toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Build pinned shader translator
+        run: |
+          cargo fetch --manifest-path frontend-shader-source/crates/mag-render-shaders/Cargo.toml --locked
+          cargo build --manifest-path frontend-shader-source/crates/mag-render-shaders/Cargo.toml --locked --offline
+      - name: Generate source-bound SPIR-V and manifests
+        run: |
+          frontend-shader-source/crates/mag-render-shaders/target/debug/mag-render-shaders --source frontend-shader-source/shaders/render_frontend/copy_transform.wgsl --out-dir build/frontend-shaders/copy_transform
+          frontend-shader-source/crates/mag-render-shaders/target/debug/mag-render-shaders --source frontend-shader-source/shaders/render_frontend/compact.wgsl --out-dir build/frontend-shaders/compact
+      - name: Software diagnostics under validation (hardware acceptance remains pending)
+        run: |
+          set -o pipefail
+          python tools/test_frontend_vulkan.py --shader-root build/frontend-shaders --require-validation --report build/frontend-software-report.json 2>&1 | tee build/frontend-software.log
+          if grep -q 'VUID-' build/frontend-software.log; then exit 1; fi
+      - name: Retain synthetic diagnostic receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-vulkan-software-${{ matrix.compiler }}
+          path: |
+            build/frontend-software-report.json
+            build/frontend-software.log
+          if-no-files-found: error

@@ -6,6 +6,8 @@
 #include <stdatomic.h>
 #include <unistd.h>
 #include <time.h>
+/* lv2_register.c publishes lifted-job contexts for thread lookup; not linked here. */
+void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x100000;
 int g_resv_store_active;

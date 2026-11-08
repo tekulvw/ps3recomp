@@ -69,6 +69,14 @@ uint64_t spu_coh_line_epoch(uint32_t ea);
  * the lock-line lock and notifies as for any other coherent write. */
 int  spu_coh_ppu_store_lock(uint32_t ea);
 void spu_coh_ppu_store_unlock(uint32_t ea);
+/* PS3RECOMP_PPU_STORE_FASTPATH=1 (see spu_coherency.c): PPU load-reserves
+ * count themselves per line, and spu_coh_ppu_store_unlock skips the
+ * reservation break and epoch bump on a line with no live count. add runs
+ * under the lock-line lock and ea's shard, before the reserved value is read;
+ * drop runs once that reservation can no longer be used. */
+int  spu_coh_ppu_live_tracking(void);
+void spu_coh_ppu_live_add(uint32_t ea);
+void spu_coh_ppu_live_drop(uint32_t ea);
 /* A PPU store-conditional holds this inside the lock-line lock, across its
  * epoch check, compare-and-swap and notify. */
 void spu_coh_line_shard_lock(uint32_t ea);
@@ -77,6 +85,15 @@ void spu_coh_line_shard_unlock(uint32_t ea);
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);
+/* PS3RECOMP_PPU_STORE_LIVE_SPU (spu_coherency.c): a context counts its GETLLAR's
+ * line before reading it, and stops when its reservation ends on its thread. */
+void spu_coh_live_track(spu_context* ctx, uint32_t ea);
+void spu_coh_live_untrack(spu_context* ctx);
+int  spu_coh_live_spu_enabled(void);
+/* PS3RECOMP_PPU_STORE_SHARD_IDLE (spu_coherency.c): host code that
+ * read-modify-writes guest lines under the lock-line lock marks them first. */
+void spu_coh_host_rmw_mark(uint32_t ea, uint32_t len);
+int  spu_coh_shard_idle_enabled(void);
 
 /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
  * whose live reservation covers it, drop that reservation, and wake the host
