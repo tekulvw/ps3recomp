@@ -40,6 +40,11 @@ void ps3_ms(const char* key) { (void)key; }
 unsigned long long ps3_ms_now(void) { return 0; }
 struct spu_context;
 uint32_t spurs_policy_service_identity(const struct spu_context* c) { (void)c; return 0; }
+/* The owner seam takes the guest consumer lease around original work; the
+ * fixture has no guest, so the lease is a counter. */
+static int consumer_depth;
+void cellGcm_rsx_consumer_begin(void) { consumer_depth++; }
+void cellGcm_rsx_consumer_end(void) { consumer_depth--; }
 
 static int failures, checks;
 #define CHECK(v, name) do { checks++; if (!(v)) { failures++; fprintf(stderr, "FAIL %s\n", name); } \
@@ -129,6 +134,49 @@ static int validation_errors(void)
     return errors;
 }
 
+
+/* A hidden window and flip-model swap chain on the test queue, so the
+ * engine's present path runs for real. Returns 0 when none can be made (for
+ * example a non-interactive session); the present checks then skip. */
+static LRESULT CALLBACK test_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
+static int open_swap_chain(u32 w, u32 h)
+{
+    WNDCLASSW wc; memset(&wc, 0, sizeof wc); wc.lpfnWndProc = test_wndproc; wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = L"e12_present_fixture"; RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"e12", WS_OVERLAPPEDWINDOW, 0, 0, (int)w, (int)h, NULL, NULL, wc.hInstance, NULL);
+    if (!hwnd) return 0;
+    IDXGIFactory4* f = NULL;
+    if (FAILED(CreateDXGIFactory2(0, &IID_IDXGIFactory4, (void**)&f))) return 0;
+    DXGI_SWAP_CHAIN_DESC1 d; memset(&d, 0, sizeof d);
+    d.Width = w; d.Height = h; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.SampleDesc.Count = 1;
+    d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = FRAME_COUNT; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    IDXGISwapChain1* sc1 = NULL;
+    const HRESULT hr = f->lpVtbl->CreateSwapChainForHwnd(f, (IUnknown*)s_d3d.cmd_queue, hwnd, &d, NULL, NULL, &sc1);
+    f->lpVtbl->Release(f);
+    if (FAILED(hr) || !sc1) { fprintf(stderr, "     no swap chain here (0x%08lX)\n", (long)hr); return 0; }
+    sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&s_d3d.swap_chain); sc1->lpVtbl->Release(sc1);
+    D3D12_DESCRIPTOR_HEAP_DESC hd; memset(&hd, 0, sizeof hd); hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = FRAME_COUNT;
+    if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.rtv_heap))) return 0;
+    s_d3d.rtv_descriptor_size = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE c; s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &c);
+    for (u32 i = 0; i < FRAME_COUNT; i++) {
+        if (FAILED(s_d3d.swap_chain->lpVtbl->GetBuffer(s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.render_targets[i]))) return 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE ci = c; ci.ptr += (SIZE_T)i * s_d3d.rtv_descriptor_size;
+        s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_d3d.render_targets[i], NULL, ci);
+    }
+    s_d3d.width = w; s_d3d.height = h;
+    return 1;
+}
+/* The native worker of the queue-order check: submits its reserved batch a
+ * little later, while the engine thread waits on work held behind it. */
+typedef struct { rsx_native_queue_order* qo; u64 token; const rsx_native_d3d12_submit* si; int rc; } order_job;
+static DWORD WINAPI order_submit_later(void* p)
+{
+    order_job* job = (order_job*)p;
+    Sleep(150);
+    job->rc = job->qo->submit(job->qo->userdata, job->qo->lifetime, job->token, job->si, NULL);
+    return 0;
+}
 int main(void)
 {
     const int open = open_device();
@@ -475,9 +523,324 @@ int main(void)
     CHECK(b->completion_status(b->user, first, 0) == 1, "earlier ticket complete once a later one is");
     CHECK(s_e12.count[E12_X_ASYNC_REFUSED] == 0, "no async refusal");
     CHECK(b->submit_and_wait_checked(b->user, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "checked flush after async");
+    /* The shader-visible heap holds a whole frame of descriptor tables: 4000
+     * draws (20 entries each, more than the old 65536-entry heap) need no wait. */
+    CHECK(s_e12.srv_gpu_cap == ENG12_SRV_GPU_HEAP_MAX, "large shader-visible heap");
+    {
+        const u64 before = s_e12.waits[E12_W_SRV_TABLES];
+        b->bind_targets(b->user, &rt, 1, 0);
+        for (int i = 0; i < 4000; i++) draw_full(b, pipe);
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        CHECK(s_e12.waits[E12_W_SRV_TABLES] == before, "4000 draws without a descriptor-ring wait");
+    }
+    /* Fenced rings: shrink both rings so many async batches must wrap them.
+     * Space returns as the GPU passes each batch's fence; no full wait is
+     * needed, and the drawing stays correct. */
+    {
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        const u64 keep_srv = s_e12.srv_ring.size, keep_up = s_e12.upload_ring.size;
+        s_e12.srv_ring.size = 2000;            /* 100 draws of 20 descriptors */
+        s_e12.upload_ring.size = 4u << 20;     /* a few batches of constants and vertices */
+        const u64 flushes = s_e12.flushes;
+        b->bind_targets(b->user, &rt, 1, 0);
+        int ok = 1;
+        for (int batch = 0; batch < 40; batch++) {
+            for (int i = 0; i < 60; i++) draw_full(b, pipe);
+            if (!b->submit_async(b->user, RSX_BE_FLUSH_GUEST_REFERENCE)) ok = 0;
+        }
+        CHECK(ok, "40 async batches over small rings");
+        if (s_e12.flushes != flushes) fprintf(stderr, "     full waits %llu, up head %llu tail %llu segs %u\n",
+            (unsigned long long)(s_e12.flushes - flushes), (unsigned long long)s_e12.upload_ring.head,
+            (unsigned long long)s_e12.upload_ring.tail, s_e12.upload_ring.nseg);
+        CHECK(s_e12.flushes == flushes, "rings wrapped without a full GPU wait");
+        CHECK(s_e12.srv_ring.first + s_e12.srv_ring.nseg > 1 || s_e12.waits[E12_W_SRV_TABLES] > 0,
+              "the descriptor ring did wrap");
+        CHECK(s_e12.srv_ring.head <= s_e12.srv_ring.size && s_e12.upload_ring.head <= s_e12.upload_ring.size,
+              "ring heads stay inside the rings");
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        CHECK(px(b, rt, 32, 32) != 0xFF0000FFu, "drawing through wrapped rings is correct");
+        s_e12.srv_ring.size = keep_srv; s_e12.upload_ring.size = keep_up;
+    }
+    /* Rings barely larger than one draw: every draw must make room first,
+     * and that wait or flush must happen before any of its allocations. */
+    {
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        const u64 keep_srv = s_e12.srv_ring.size, keep_up = s_e12.upload_ring.size;
+        s_e12.srv_ring.size = 30; s_e12.upload_ring.size = 24u << 10;
+        const u64 rw = s_e12.waits[E12_W_UPLOAD_RING] + s_e12.waits[E12_W_SRV_TABLES];
+        b->clear_color(b->user, rt, red);
+        b->bind_targets(b->user, &rt, 1, 0);
+        for (int i = 0; i < 20; i++) draw_full(b, pipe);
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        CHECK(s_e12.waits[E12_W_UPLOAD_RING] + s_e12.waits[E12_W_SRV_TABLES] > rw, "tiny rings make draws wait");
+        CHECK(px(b, rt, 32, 32) != 0xFF0000FFu && !s_e12.failed, "draws that waited for ring space are intact");
+        s_e12.srv_ring.size = keep_srv; s_e12.upload_ring.size = keep_up;
+    }
+    /* Present: by default every present waits; with async present (opt-in)
+     * presents only wait when the GPU is a whole swap chain behind. */
+    if (open_swap_chain(64, 64)) {
+        b->bind_targets(b->user, &rt, 1, 0);
+        const u64 w0 = s_e12.waits[E12_W_PRESENT], p0 = s_e12.presents;
+        for (int i = 0; i < 6; i++) { draw_full(b, pipe); b->present(b->user, rt); }
+        CHECK(s_e12.presents == p0 + 6 && s_e12.waits[E12_W_PRESENT] == w0 + 6, "default present waits every frame");
+        s_e12.async_present = 1;
+        const u64 w1 = s_e12.waits[E12_W_PRESENT], f1 = s_e12.flushes, fv = s_e12.fence_value;
+        for (int i = 0; i < 30; i++) { for (int k = 0; k < 50; k++) draw_full(b, pipe); b->present(b->user, rt); }
+        CHECK(s_e12.fence_value == fv + 30, "async present submits once per frame");
+        CHECK(s_e12.waits[E12_W_PRESENT] - w1 < 30, "async present does not wait every frame");
+        CHECK(s_e12.backbuffer_fence[0] || s_e12.backbuffer_fence[1], "back buffers carry their frame's fence");
+        (void)f1;
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        CHECK(px(b, rt, 32, 32) != 0xFF0000FFu && !s_e12.failed, "frames after async presents are intact");
+        s_e12.async_present = 0;
+    } else fprintf(stderr, "SKIP present checks: no swap chain in this session\n");
     CHECK(s_e12.waits[E12_W_ENGINE_CHECKED] >= 2 && s_e12.waits[E12_W_COLOR_READBACK] > 0 &&
           s_e12.waits[E12_W_DEPTH_READBACK] > 0, "waits are counted by site");
 
+    /* Native-owner seam (PS3RECOMP_RSX_NATIVE_OWNER=1): off by default; when on,
+     * a native consumer gets the device and queue only at a clean boundary,
+     * after retain, for exactly one lease, and its own work on the queue does
+     * not disturb the engine. */
+    {
+        rsx_native_owner o; memset(&o, 0, sizeof o); o.abi_version = 1; o.struct_size = sizeof o;
+        CHECK(rsx_d3d12_backend_borrow_owner(&o) == -2, "owner seam off by default");
+        atomic_store(&s_e12_owner_setting, 1);
+        s_e12.active = 1;
+        {   /* a frontend may take the boundary before it borrows the owner */
+            u64 early = 0;
+            CHECK(!s_e12_owner.generation && e12_native_boundary(0, &early) == 0 && early == s_e12.fence_value,
+                  "native boundary before any owner borrow");
+        }
+        CHECK(rsx_d3d12_backend_borrow_owner(&o) == 0 && o.backend == RSX_NATIVE_OWNER_D3D12 &&
+              o.device == (void*)s_d3d.device && o.queue == (void*)s_d3d.cmd_queue && o.lifetime != 0,
+              "borrow names the D3D12 device and queue");
+        rsx_native_owner_v2 o2; memset(&o2, 0, sizeof o2); o2.abi_version = 2; o2.struct_size = sizeof o2;
+        o2.base.abi_version = 1; o2.base.struct_size = sizeof o2.base;
+        CHECK(rsx_d3d12_backend_borrow_owner_v2(&o2) == 0 && o2.base.lifetime == o.lifetime &&
+              (o2.enabled_features & RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS) == (s_e12.depth_bounds_ok ? RSX_NATIVE_OWNER_FEATURE_DEPTH_BOUNDS : 0u),
+              "v2 reports the enabled depth-bounds feature");
+        CHECK(o.try_begin(o.userdata, o.lifetime) == -3, "no lease before retain");
+        CHECK(o.retain(o.userdata, o.lifetime) == 0, "retain");
+        b->bind_targets(b->user, &rt, 1, 0);
+        draw_full(b, pipe);                                    /* recorded, not submitted */
+        CHECK(o.try_begin(o.userdata, o.lifetime) == -4, "no lease while engine work is unsubmitted");
+        b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        CHECK(consumer_depth == 0, "consumer lease balanced around original work");
+        CHECK(o.try_begin(o.userdata, o.lifetime) == 0, "lease at a clean boundary");
+        {   /* native work on the borrowed queue: its own target, list, allocator and fence */
+            ID3D12Device* dv = (ID3D12Device*)o.device; ID3D12CommandQueue* q = (ID3D12CommandQueue*)o.queue;
+            D3D12_RESOURCE_DESC td = e12_tex_desc(DXGI_FORMAT_R8G8B8A8_UNORM, 16, 16, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            ID3D12Resource* nt = e12_committed(D3D12_HEAP_TYPE_DEFAULT, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL);
+            ID3D12DescriptorHeap* nh = NULL; D3D12_DESCRIPTOR_HEAP_DESC hd; memset(&hd, 0, sizeof hd);
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 1;
+            ID3D12CommandAllocator* na = NULL; ID3D12GraphicsCommandList* nl = NULL; ID3D12Fence* nf = NULL;
+            const int made = nt && SUCCEEDED(dv->lpVtbl->CreateDescriptorHeap(dv, &hd, &IID_ID3D12DescriptorHeap, (void**)&nh)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandAllocator(dv, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&na)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandList(dv, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, na, NULL, &IID_ID3D12GraphicsCommandList, (void**)&nl)) &&
+                SUCCEEDED(dv->lpVtbl->CreateFence(dv, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&nf));
+            CHECK(made, "native resources on the borrowed device");
+            if (made) {
+                D3D12_CPU_DESCRIPTOR_HANDLE c; nh->lpVtbl->GetCPUDescriptorHandleForHeapStart(nh, &c);
+                dv->lpVtbl->CreateRenderTargetView(dv, nt, NULL, c);
+                const float green[4] = { 0, 1, 0, 1 };
+                nl->lpVtbl->ClearRenderTargetView(nl, c, green, 0, NULL);
+                nl->lpVtbl->Close(nl);
+                ID3D12CommandList* lists[1] = { (ID3D12CommandList*)nl };
+                q->lpVtbl->ExecuteCommandLists(q, 1, lists);
+                q->lpVtbl->Signal(q, nf, 1);
+            }
+            o.end(o.userdata, o.lifetime);
+            if (made) {   /* the native consumer drains its own fence before releasing its resources */
+                HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+                nf->lpVtbl->SetEventOnCompletion(nf, 1, ev); WaitForSingleObject(ev, 5000); CloseHandle(ev);
+                CHECK(nf->lpVtbl->GetCompletedValue(nf) == 1, "native submission completed");
+            }
+            if (nf) nf->lpVtbl->Release(nf); if (nl) nl->lpVtbl->Release(nl); if (na) na->lpVtbl->Release(na);
+            if (nh) nh->lpVtbl->Release(nh); if (nt) nt->lpVtbl->Release(nt);
+        }
+        CHECK(o.try_begin(o.userdata, o.lifetime) == 0, "a second lease at the same boundary");
+        o.end(o.userdata, o.lifetime);
+        b->clear_color(b->user, rt, red);
+        b->bind_targets(b->user, &rt, 1, 0);
+        draw_full(b, pipe);
+        CHECK(px(b, rt, 32, 32) != 0xFF0000FFu && !s_e12_owner.failed && !s_e12.failed, "engine continues after native leases");
+        /* Image leases on the engine's own targets: borrow names the resource
+         * and its contract state, the boundary moves it there and submits,
+         * native work draws into it, and the engine sees that work after it.
+         * A retained image outlives the engine freeing the target but no
+         * longer validates; a reused handle is a new generation. */
+        {
+            const u32 dz = b->depth_target_create(b->user, 64, 64);
+            rsx_native_image ci, zi, bad;
+            memset(&ci, 0, sizeof ci); ci.abi_version = RSX_NATIVE_IMAGE_ABI; ci.struct_size = sizeof ci; zi = ci; bad = ci;
+            const rsx_native_d3d12_image* cp = NULL; const rsx_native_d3d12_image* zp = NULL;
+            CHECK(rsx_d3d12_backend_borrow_image(o.lifetime, rt, &ci) == 0 && (cp = (const rsx_native_d3d12_image*)ci.image) &&
+                  ci.backend == RSX_NATIVE_OWNER_D3D12 && ci.format == RSX_NATIVE_IMAGE_RGBA8 && ci.width == 64 &&
+                  ci.height == 64 && ci.resource_id == rt && ci.resource_generation && cp->resource == (void*)s_e12o[rt].res &&
+                  cp->abi_version == RSX_NATIVE_D3D12_IMAGE_ABI && cp->acquire_state == D3D12_RESOURCE_STATE_RENDER_TARGET &&
+                  cp->handback_state == D3D12_RESOURCE_STATE_RENDER_TARGET,
+                  "borrow a colour target: its resource and the RENDER_TARGET contract");
+            CHECK(dz && rsx_d3d12_backend_borrow_image(o.lifetime, dz, &zi) == 0 && (zp = (const rsx_native_d3d12_image*)zi.image) &&
+                  zi.format == RSX_NATIVE_IMAGE_D32S8 && zp->acquire_state == D3D12_RESOURCE_STATE_DEPTH_WRITE &&
+                  zp->handback_state == D3D12_RESOURCE_STATE_DEPTH_WRITE, "borrow a depth target: the DEPTH_WRITE contract");
+            CHECK(rsx_d3d12_backend_borrow_image(o.lifetime, pipe, &bad) == -3 &&
+                  rsx_d3d12_backend_borrow_image(o.lifetime + 1, rt, &bad) == -3 &&
+                  rsx_d3d12_backend_borrow_image(o.lifetime, 0, &bad) == -3, "borrow refuses non-targets and a stale lifetime");
+            CHECK(ci.retain(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation) == 0 &&
+                  zi.retain(zi.userdata, zi.owner_lifetime, zi.resource_id, zi.resource_generation) == 0, "retain both images");
+            CHECK(ci.validate(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation) == -4,
+                  "validate only under the native lease");
+            (void)px(b, rt, 1, 1);   /* the engine leaves the target as a copy source */
+            u64 ticket = 0;
+            CHECK(rsx_d3d12_backend_native_boundary(&ticket) == -3 && ticket == 0,
+                  "the public boundary asks the common engine (inactive in this fixture)");
+            CHECK(e12_native_boundary(0, &ticket) == 0 && ticket && ticket == s_e12.fence_value && !s_e12.recording &&
+                  s_e12o[rt].state == D3D12_RESOURCE_STATE_RENDER_TARGET && s_e12o[dz].state == D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                  "boundary submits with borrowed images in their contract state");
+            CHECK(o.try_begin(o.userdata, o.lifetime) == 0, "lease after the boundary");
+            CHECK(ci.validate(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation) == 0 &&
+                  zi.validate(zi.userdata, zi.owner_lifetime, zi.resource_id, zi.resource_generation) == 0,
+                  "both images validate under the lease");
+            CHECK(rsx_d3d12_backend_validate_image_planes(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation, 1) == -3,
+                  "clear-plane evidence comes from the common engine (inactive here)");
+            ID3D12Device* dv = (ID3D12Device*)o.device; ID3D12CommandQueue* q = (ID3D12CommandQueue*)o.queue;
+            ID3D12DescriptorHeap *rh = NULL, *dh = NULL; ID3D12CommandAllocator* na = NULL;
+            ID3D12GraphicsCommandList* nl = NULL; ID3D12Fence* nf = NULL;
+            D3D12_DESCRIPTOR_HEAP_DESC rd; memset(&rd, 0, sizeof rd); rd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rd.NumDescriptors = 1;
+            D3D12_DESCRIPTOR_HEAP_DESC dd = rd; dd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+            const int made = cp && zp &&
+                SUCCEEDED(dv->lpVtbl->CreateDescriptorHeap(dv, &rd, &IID_ID3D12DescriptorHeap, (void**)&rh)) &&
+                SUCCEEDED(dv->lpVtbl->CreateDescriptorHeap(dv, &dd, &IID_ID3D12DescriptorHeap, (void**)&dh)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandAllocator(dv, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&na)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandList(dv, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, na, NULL, &IID_ID3D12GraphicsCommandList, (void**)&nl)) &&
+                SUCCEEDED(dv->lpVtbl->CreateFence(dv, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&nf));
+            CHECK(made, "native views and list on the borrowed device");
+            if (made) {   /* acquired and handed back in the contract states: no barriers needed */
+                D3D12_CPU_DESCRIPTOR_HANDLE rv, zv;
+                rh->lpVtbl->GetCPUDescriptorHandleForHeapStart(rh, &rv); dh->lpVtbl->GetCPUDescriptorHandleForHeapStart(dh, &zv);
+                dv->lpVtbl->CreateRenderTargetView(dv, (ID3D12Resource*)cp->resource, NULL, rv);
+                D3D12_DEPTH_STENCIL_VIEW_DESC zd; memset(&zd, 0, sizeof zd);
+                zd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; zd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+                dv->lpVtbl->CreateDepthStencilView(dv, (ID3D12Resource*)zp->resource, &zd, zv);
+                const float native_blue[4] = { 0, 0, 1, 1 };
+                nl->lpVtbl->ClearRenderTargetView(nl, rv, native_blue, 0, NULL);
+                nl->lpVtbl->ClearDepthStencilView(nl, zv, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, NULL);
+                nl->lpVtbl->Close(nl);
+                ID3D12CommandList* lists[1] = { (ID3D12CommandList*)nl };
+                q->lpVtbl->ExecuteCommandLists(q, 1, lists);
+                q->lpVtbl->Signal(q, nf, 1);
+            }
+            o.end(o.userdata, o.lifetime);
+            float zval = 0;
+            CHECK(made && px(b, rt, 7, 9) == 0xFFFF0000u, "engine reads the native colour work queued after the boundary");
+            CHECK(made && b->depth_readback(b->user, dz, 3, 4, 1, 1, &zval, 4) == 0 && zval == 0.25f,
+                  "engine reads the native depth work queued after the boundary");
+            if (made) {
+                HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+                nf->lpVtbl->SetEventOnCompletion(nf, 1, ev); WaitForSingleObject(ev, 5000); CloseHandle(ev);
+            }
+            if (nf) nf->lpVtbl->Release(nf); if (nl) nl->lpVtbl->Release(nl); if (na) na->lpVtbl->Release(na);
+            if (dh) dh->lpVtbl->Release(dh); if (rh) rh->lpVtbl->Release(rh);
+            ID3D12Resource* kept = cp ? (ID3D12Resource*)cp->resource : NULL;
+            b->color_target_release(b->user, rt);
+            b->submit_and_wait(b->user, RSX_BE_FLUSH_GUEST_REFERENCE);   /* the engine's fenced retirement runs */
+            ULONG refs = 0;
+            if (kept) { refs = kept->lpVtbl->AddRef(kept); kept->lpVtbl->Release(kept); }
+            CHECK(refs == 2, "a retained image keeps the resource after the engine frees the target");
+            CHECK(e12_native_boundary(0, &ticket) == 0 && o.try_begin(o.userdata, o.lifetime) == 0 &&
+                  ci.validate(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation) == -3 &&
+                  zi.validate(zi.userdata, zi.owner_lifetime, zi.resource_id, zi.resource_generation) == 0,
+                  "a freed target no longer validates; the other still does");
+            o.end(o.userdata, o.lifetime);
+            CHECK(ci.retain(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation) == -3,
+                  "a freed target cannot be retained again");
+            const u32 rt2 = b->color_target_create(b->user, RSX_BE_FMT_R8G8B8A8, 64, 64, NULL, 0);
+            rsx_native_image c2 = bad;
+            CHECK(rt2 && rsx_d3d12_backend_borrow_image(o.lifetime, rt2, &c2) == 0 && c2.resource_generation != ci.resource_generation &&
+                  (rt2 != rt || ci.retain(ci.userdata, ci.owner_lifetime, rt2, ci.resource_generation) == -3),
+                  "a new target in a reused handle is a new generation");
+            ci.release(ci.userdata, ci.owner_lifetime, ci.resource_id, ci.resource_generation);
+            zi.release(zi.userdata, zi.owner_lifetime, zi.resource_id, zi.resource_generation);
+            CHECK(s_e12_owner.retained == 1 && !e12_image_find(ci.resource_id, ci.resource_generation),
+                  "image releases balance and the freed target's record goes");
+            CHECK(s_e12_image_stats.borrows == 3 && s_e12_image_stats.retains == 2 && s_e12_image_stats.boundaries == 3 &&
+                  s_e12_image_stats.transitions >= 1, "image leases counted");
+            b->color_target_release(b->user, rt2); b->depth_target_release(b->user, dz);
+        }
+        /* Reserved queue order: engine work submitted after a reservation
+         * reaches the queue only after the native batch, so a native clear
+         * recorded first and submitted last still runs before the engine's
+         * clear. A wait on held work blocks until the native submit, made
+         * here from another thread; abandoning releases the hold the same way. */
+        {
+            rsx_native_queue_order qo; memset(&qo, 0, sizeof qo);
+            qo.abi_version = RSX_NATIVE_QUEUE_ORDER_ABI; qo.struct_size = sizeof qo;
+            CHECK(rsx_d3d12_backend_queue_order(&qo) == 0 && qo.lifetime == o.lifetime && qo.reserve && qo.submit,
+                  "queue order available with the owner seam");
+            u64 token = 0, other = 0, ticket = 0;
+            CHECK(qo.reserve(qo.userdata, qo.lifetime, &token) == -4 && !token, "reserve only under the native lease");
+            const u32 rq = b->color_target_create(b->user, RSX_BE_FMT_R8G8B8A8, 64, 64, NULL, 0);
+            rsx_native_image qi; memset(&qi, 0, sizeof qi); qi.abi_version = RSX_NATIVE_IMAGE_ABI; qi.struct_size = sizeof qi;
+            CHECK(rq && rsx_d3d12_backend_borrow_image(o.lifetime, rq, &qi) == 0 &&
+                  qi.retain(qi.userdata, qi.owner_lifetime, qi.resource_id, qi.resource_generation) == 0, "borrow and retain a target");
+            CHECK(e12_native_boundary(0, &ticket) == 0 && o.try_begin(o.userdata, o.lifetime) == 0 &&
+                  qo.reserve(qo.userdata, qo.lifetime, &token) == 0 && token, "reserve under the lease at the boundary");
+            CHECK(qo.reserve(qo.userdata, qo.lifetime, &other) == -4, "one reservation at a time");
+            ID3D12Device* dv = (ID3D12Device*)o.device;
+            ID3D12DescriptorHeap* rh = NULL; ID3D12CommandAllocator* na = NULL; ID3D12GraphicsCommandList* nl = NULL; ID3D12Fence* nf = NULL;
+            D3D12_DESCRIPTOR_HEAP_DESC rd; memset(&rd, 0, sizeof rd); rd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rd.NumDescriptors = 1;
+            const int made = qi.image &&
+                SUCCEEDED(dv->lpVtbl->CreateDescriptorHeap(dv, &rd, &IID_ID3D12DescriptorHeap, (void**)&rh)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandAllocator(dv, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&na)) &&
+                SUCCEEDED(dv->lpVtbl->CreateCommandList(dv, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, na, NULL, &IID_ID3D12GraphicsCommandList, (void**)&nl)) &&
+                SUCCEEDED(dv->lpVtbl->CreateFence(dv, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&nf));
+            CHECK(made, "native list for the reserved place");
+            if (made) {
+                D3D12_CPU_DESCRIPTOR_HANDLE rv; rh->lpVtbl->GetCPUDescriptorHandleForHeapStart(rh, &rv);
+                dv->lpVtbl->CreateRenderTargetView(dv, (ID3D12Resource*)((const rsx_native_d3d12_image*)qi.image)->resource, NULL, rv);
+                const float native_blue[4] = { 0, 0, 1, 1 };
+                nl->lpVtbl->ClearRenderTargetView(nl, rv, native_blue, 0, NULL);
+                nl->lpVtbl->Close(nl);
+            }
+            o.end(o.userdata, o.lifetime);
+            CHECK(o.try_begin(o.userdata, o.lifetime) == -4, "no lease while a reservation holds the queue");
+            const float engine_red[4] = { 1, 0, 0, 1 };
+            b->clear_color(b->user, rq, engine_red);
+            const u64 held = b->submit_async(b->user, 0);
+            CHECK(held && b->completion_status(b->user, held, 0) == 0 && s_e12_hold.n >= 1 && s_e12_hold.queued < held,
+                  "engine work after the reservation is held, not queued");
+            static void* lists[1]; lists[0] = nl;
+            static rsx_native_d3d12_submit si;
+            si = (rsx_native_d3d12_submit){ .abi_version = RSX_NATIVE_D3D12_SUBMIT_ABI, .struct_size = sizeof si,
+                                            .lists = lists, .list_count = made ? 1u : 0u, .signal_fence = nf, .signal_value = 1 };
+            order_job job = { &qo, token, &si, 99 };
+            HANDLE worker = CreateThread(NULL, 0, order_submit_later, &job, 0, NULL);
+            CHECK(worker && b->completion_status(b->user, held, 1) == 1, "a wait on held work returns once the native batch is submitted");
+            if (worker) { WaitForSingleObject(worker, 10000); CloseHandle(worker); }
+            CHECK(job.rc == 0 && !s_e12_hold.active && (!nf || nf->lpVtbl->GetCompletedValue(nf) == 1), "native submit from another thread");
+            CHECK(made && px(b, rq, 10, 10) == 0xFF0000FFu, "the native batch ran before the engine work held behind it");
+            CHECK(e12_native_boundary(0, &ticket) == 0 && o.try_begin(o.userdata, o.lifetime) == 0 &&
+                  qo.reserve(qo.userdata, qo.lifetime, &token) == 0, "a second reservation");
+            o.end(o.userdata, o.lifetime);
+            b->clear_color(b->user, rq, engine_red);
+            const u64 held2 = b->submit_async(b->user, 0);
+            CHECK(qo.submit(qo.userdata, qo.lifetime, token + 1, NULL, NULL) == -3 && s_e12_hold.active, "a wrong token releases nothing");
+            CHECK(qo.submit(qo.userdata, qo.lifetime, token, NULL, NULL) == 0 && !s_e12_hold.active &&
+                  b->completion_status(b->user, held2, 1) == 1, "abandoning releases the held work");
+            CHECK(qo.submit(qo.userdata, qo.lifetime, token, NULL, NULL) == -3, "a reservation is submitted once");
+            CHECK(s_e12_hold.reservations == 2 && s_e12_hold.abandoned == 1 && s_e12_hold.blocked_waits >= 1 &&
+                  s_e12_hold.failures == 0 && s_e12_hold.held_submits >= 2, "queue order counted");
+            if (nf) nf->lpVtbl->Release(nf); if (nl) nl->lpVtbl->Release(nl); if (na) na->lpVtbl->Release(na);
+            if (rh) rh->lpVtbl->Release(rh);
+            qi.release(qi.userdata, qi.owner_lifetime, qi.resource_id, qi.resource_generation);
+            b->color_target_release(b->user, rq);
+        }
+        o.release(o.userdata, o.lifetime);
+        CHECK(o.try_begin(o.userdata, o.lifetime) == -3, "release ends lease rights");
+        CHECK(s_e12_owner_stats.grants == 6 && s_e12_owner_stats.refused_dirty + s_e12_owner_stats.refused_busy >= 1,
+              "lease grants and refusals counted");
+        atomic_store(&s_e12_owner_setting, 0);
+    }
     b->shutdown(b->user);
     const int verrors = validation_errors();
     CHECK(verrors == 0, "no debug-layer errors");

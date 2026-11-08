@@ -15,7 +15,7 @@ extern "C" {
  * Explicit shutdown retry belongs to the external host lifecycle thread after
  * successful native close, outside callbacks, and only for a pending request. */
 #define RSX_NATIVE_OWNER_ABI 1u
-enum rsx_native_owner_backend { RSX_NATIVE_OWNER_METAL=1, RSX_NATIVE_OWNER_VULKAN=2 };
+enum rsx_native_owner_backend { RSX_NATIVE_OWNER_METAL=1, RSX_NATIVE_OWNER_VULKAN=2, RSX_NATIVE_OWNER_D3D12=3 };
 typedef void (*rsx_native_proc)(void);
 typedef struct rsx_native_owner {
     uint32_t abi_version,struct_size,backend,reserved;
@@ -38,7 +38,8 @@ typedef struct rsx_native_owner_v2 {
     rsx_native_owner base;
     uint64_t known_features,enabled_features;
 } rsx_native_owner_v2;
-/* Optional reserved queue order (Vulkan: rsx_vulkan_backend_queue_order).
+/* Optional reserved queue order (Vulkan: rsx_vulkan_backend_queue_order;
+ * D3D12: rsx_d3d12_backend_queue_order, whose submit_info is described there).
  * reserve, called under the native lease at the native boundary, fixes the
  * next native submission's place: original submissions made after it reach
  * the queue only after that submission. submit, called once per reservation
