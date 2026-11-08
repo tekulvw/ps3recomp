@@ -1,0 +1,397 @@
+# Upstream candidates tracker
+
+A living list of fork changes that could go to upstream `sp00nznet/ps3recomp` (`master`), so we can
+keep monitoring it and work down it. The detailed write-ups below come from a review made on
+2026-11-08 against upstream `master` de4f0903 (v0.19.0) and the fork integration line
+`claude/lane-sdk-2026.11.05` (fork `main` 9bcb7ade). Commit hashes are fork commits unless they say
+otherwise; "mag-recomp" means the downstream port that pins this fork.
+
+## How to update
+
+- Change an item's **Status** in the table below whenever its state changes, in the same fork PR that
+  does the work, or in a small docs PR. Use exactly one of: `not started`, `in progress`,
+  `PR open #N`, `merged #N`, `dropped (reason)`. Upstream PR numbers are on `sp00nznet/ps3recomp`.
+- When an upstream PR merges, note the upstream merge commit next to it. When upstream lands its own
+  equivalent, mark ours `dropped (superseded by upstream #N)` and move a line to section 5.
+- Add new candidates at the end of the matching section with the next free ID (Q14, M15, ...), and
+  add a row to the table.
+- Re-check upstream before sending anything: fetch `master`, search open and merged PRs for the same
+  area, and re-measure where an item claims a speed-up.
+- Each upstream PR is its own branch from current upstream `master` (`upstream/<topic>`), carries a
+  synthetic test, has fork-only dependencies and title-specific wording removed, and uses a neutral
+  conventional-commit message. Never include game files, extracted data, game addresses, private
+  paths or session links, here or upstream.
+
+## Status
+
+| ID | Item | Status |
+|---|---|---|
+| Q1 | Our four open PRs (#661, #662, #663, #665) | PR open #661, #662, #663, #665 (no review yet; nudging is the user's call) |
+| Q2 | glibc static TLS: thread stacks that are too small | not started |
+| Q3 | 4 GB-aligned POSIX guest arena in the project template | not started |
+| Q4 | Opt-in short-usleep yield on POSIX | not started |
+| Q5 | SPU task thread pool | not started |
+| Q6 | Single present per flip | not started |
+| Q7 | Adaptive flip pacing | not started |
+| Q8 | Kick SPURS on RSX label writes to the instance line | not started |
+| Q9 | PPU reservation open-count | not started |
+| Q10 | Vulkan backend on Windows | not started |
+| Q11 | Public-tree content guard and pinned SDK fetch for ports | not started |
+| Q12 | Test-only PRs (SPU interpreter, CTR64, TOC across HLE exits) | not started |
+| Q13 | Small diagnostic counters | not started |
+| M1 | Guest write watch and preservation sessions | not started |
+| M2 | Coherence fast paths (series) | not started |
+| M3 | Fast guest accessors, inline stores from the lifter | not started |
+| M4 | Direct Vulkan present | not started |
+| M5 | RSX present thread | not started |
+| M6 | FIFO consumer busy accounting | not started |
+| M7 | Guest longjmp: PPU nonlocal control flow | not started |
+| M8 | Range-based PPU reservation invalidation | not started |
+| M9 | D3D12 register-file draw-engine backend | not started |
+| M10 | Native OSK hosts (and Linux SDL keyboard pad) | not started |
+| M11 | SDATA plain opens stay raw; durable cellFsWrite | not started |
+| M12 | Port-template extension points and build receipts | not started |
+| M13 | Function-level lifter-fix splice | not started |
+| M14 | Small opt-in knobs on systems upstream already has | not started |
+| A1 | RFC: checked GPU completion for RSX reports and labels | not started (discussion first) |
+| A2 | RFC: native-owner seam | not started (discussion first) |
+| A3 | Design note: decoupled RSX consumer | not started (discussion first) |
+| A4 | Coherence model next steps | not started (on hold) |
+| A5 | Lifter performance passes | not started (measure first) |
+| A6 | Porting workflow: installer framework and clean-room method | not started (discussion first) |
+
+## Executive summary
+
+1. **First action, no new code.** As of 2026-11-08 our four upstream PRs are still open, have no review, and are still mergeable after v0.19.0: #661 cellFsUnlink, #662 live D3D12 immediate vertices, #663 Sail Start/Stop tokens and #665 D3D12 feedback aliases. Nudge or rebase them before sending more.
+2. **Quick wins.** About ten small, opt-in or portability fixes are ready apart from wording. They include the glibc thread-stack/TLS fix, the opt-in short-usleep yield, the SPU task pool, single-present-per-flip, adaptive flip pacing, the SPURS kick on RSX label writes, the reservation open-count, the Vulkan backend on Windows, and the 4 GB-aligned POSIX arena in the project template.
+3. **The highest-value medium items** are the guest write-watch with preservation sessions, the coherence fast-path series (PPU-only shard, interest bitmap, live-SPU and open counts), the fast VM accessors with inline stores emitted by the lifter, direct Vulkan present, the RSX present thread, the FIFO busy counter, PPU guest-longjmp support, and the D3D12 register-file engine backend.
+4. **Upstream has no equivalent of the fork's checked-completion RSX report subsystem** (deferred reports with GPU tickets; early label release and the inline-image no-wait barrier sit on top of it), nor of the native-owner/handoff seam. Both are architectural: open a discussion, not a PR. The coherence series also touches an area you put on hold ("after the reset").
+5. **Already superseded.** Upstream now has its own Vulkan draw batching (#532), keyboard-to-pad fallback, POSIX audio pacing (#710, open), the unresolved-HLE policy (#697, open), the interpreter decode table (#688) and the 64-bit CTR fix. Drop or reconcile our versions of those rather than submitting them.
+
+**Conventions.**
+- Size is the diff including tests.
+- "Opt-in" means the default build or environment behaves the same as today.
+- Every fork commit message needs MAG references and trailers removed before it goes upstream.
+- Most fork commits do not apply cleanly to upstream: of the 548, a `git apply --check` showed only 18 apply cleanly. Plan a rebase for each item.
+
+---
+
+## 1. Quick wins (ranked)
+
+**Q1. Land the four open PRs #661, #662, #663 and #665**
+- **Branches:** `fix/cellfs-unlink-upstream`, `fix/live-d3d12-immediate-upstream`, `fix/sail-call-user-tokens-upstream`, `fix/live-d3d12-current-feedback-upstream`.
+- **Files:** `runtime/ppu/ppu_fs.cpp`; `libs/video/rsx_live_draw.c`; `libs/codec/cellSail.*`. Each PR has a synthetic test.
+- **Size:** +128, +143, +36 and +241 lines.
+- **Value:** real bugs. Upstream's `cellFsUnlink` still returns OK without deleting anything.
+- **Risk:** low.
+- **Prerequisites:** none. GitHub reports all four mergeable.
+- **Action:** a polite ping, or rebase onto v0.19.0.
+
+**Q2. glibc static TLS: thread stacks that are too small**
+- **Commits:** fork 8840a9dd (+62) and 57a249d3 (+7, a `syscall` prototype under strict POSIX). mag-recomp 9252afc (#46) is the same insight applied to Rust threads.
+- **Files:** `runtime/platform/win32_compat.{c,h}`, `runtime/platform/tests/test_win32_compat.c`.
+- **Value:** glibc takes static TLS out of the requested stack. With a large TLS, every 1 MB `CreateThread` fails with EINVAL, and SPURS init then returns NOMEM. That only bites when the TLS is large (our 2 MiB decode cache), so check upstream's TLS size first. The fix is harmless either way.
+- **Seen for real (2026-11-08):** on Linux, SPURS's 1 MiB worker threads failed to start once a
+  2 MiB thread-local SPU decode cache was in the binary. mag-recomp #134 worked around it by moving
+  that cache to the heap; the stack-sizing fix is still the general cure.
+- **Risk:** low; Linux/glibc only.
+- **Prerequisites:** remove the include of fork-only `diagnostics/original_work_threads.h`.
+- **Upstream PR title:** "fix(platform): add glibc's static-TLS overhead to CreateThread stack sizes"
+
+**Q3. 4 GB-aligned POSIX guest arena in the project template**
+- **Source:** mag-recomp branch `fix/posix-guest-arena-alignment` 3760505, `src/mag_guest_arena.h` (36 lines) plus `tests/test_guest_arena.py`.
+- **Value:** upstream `templates/project/main.cpp:alloc_guest_vm` uses a plain `mmap`. The result is page-aligned but not 4 GB-aligned, while `vm.h` assumes pointer truncation works. That is a latent bug for every new port.
+- **Risk:** low.
+- **Upstream PR title:** "templates/project: map the POSIX guest arena 4 GB-aligned, as vm_init does"
+
+**Q4. Opt-in short-usleep yield on POSIX**
+- **Commit:** 4f3de351 (+26), `runtime/syscalls/sys_timer.c`.
+- **Value:** with `PS3RECOMP_USLEEP_SPIN_US=n`, a usleep shorter than n µs yields until a monotonic deadline. This matches the existing Windows branch and avoids Linux's 50 µs timer slack on job-wait polls. Any title that polls with usleep(1..10) benefits.
+- **Risk:** low; off by default.
+- **Missing:** a synthetic test.
+- **Upstream PR title:** "perf(timer): opt-in deadline yield for short sys_timer_usleep on POSIX"
+
+**Q5. SPU task thread pool**
+- **Commit:** c1c07bfe (+98), `runtime/spu/spu_workload.c`.
+- **Value:** `PS3RECOMP_SPU_TASK_POOL=1` reuses host threads for async SPU tasks. A thread is reused only when one is idle, so a task is never queued behind another and there is no deadlock risk. We measured about 2,200 thread births in 6 s on Mac without it.
+- **Risk:** low; off by default.
+- **Missing:** a test. Add a synthetic stress test for reuse and retirement.
+- **Upstream PR title:** "perf(spu): opt-in host thread pool for async SPU tasks (POSIX)"
+
+**Q6. Single present per flip, plus present-each-executed-flip-once**
+- **Commits:** fork 6e9b9184 (+56, `PS3RECOMP_RSX_SINGLE_PRESENT=1`, `rsx_draw_engine.c` plus a fixture). mag-recomp 59231c2 (#90, `frame_present_policy.h`, 23 lines).
+- **Value:** stops the host frame clock from presenting an engine flip twice, which blocks the FIFO thread for one extra refresh. Helps every Metal and Vulkan user.
+- **Risk:** low.
+- **Prerequisites:** the mag-recomp half depends on fork-only flip receipts (5f36a7fa, +962). Send the SDK half alone first.
+- **Upstream PR title:** "feat(video): opt-in single host present per executed engine flip"
+
+**Q7. Adaptive flip pacing**
+- **Commits:** 1b0ee880 / 76a50872 (duplicates; +277 with a fixture), `libs/video/cellGcmSys.c`.
+- **Value:** `PS3RECOMP_GCM_FLIP_PACING=adaptive` completes an executed flip one display period after the previous completion rather than on the next fixed 60 Hz beat. Titles that miss the beat stop losing a whole frame.
+- **Risk:** low to medium (flip semantics), but off by default and tested.
+- **Prerequisites:** rebase onto upstream's flip and ticker code, which changed in v0.19.
+- **Upstream PR title:** "feat(gcm): opt-in adaptive flip completion pacing"
+
+**Q8. Kick SPURS when an RSX label write lands on a SPURS instance line**
+- **Commit:** f2b57af2 (+20). Files: `cellGcmSys.c`, `cellSpurs.c`, a hook header.
+- **Value:** with `PS3RECOMP_RSX_REPORT_SPURS_KICK=1`, a ready count signalled from the command stream wakes the coordinator now instead of on its next timed pass. Generic to SPURS titles.
+- **Risk:** low.
+- **Prerequisites:** upstream has no report-publication hook point with the same name, so this has to be re-seated on upstream's label write.
+- **Upstream PR title:** "perf(spurs): opt-in coordinator wake on RSX label writes to the instance line"
+
+**Q9. PPU reservation open-count**
+- **Commits:** cef8b7a5 (+59), then 97f669ce (+31/−8, per-line counts). Both in `runtime/ppu/ppu_loader.cpp`.
+- **Value:** with `PS3RECOMP_PPU_RESV_OPEN_COUNT=1`, `ppu_resv_break` and `ppu_resv_break_line` skip scanning every context when no other thread has a reservation open. The commit message carries the seq_cst argument for why that is safe. It was about 8% of the game thread on Mac. Upstream has the same scan.
+- **Risk:** medium (memory ordering), but off by default. Tested by `tools/test_ppu_store_fastpath.py` with the option on and off.
+- **Prerequisites:** the test also exercises the store fast path (M2). Split it out.
+- **Upstream PR title:** "perf(ppu): opt-in open-reservation counts let reservation breaks skip the context scan"
+
+**Q10. Vulkan backend on Windows**
+- **Commits:** branch `claude/win-vulkan` f963343b (+275), f86f273c (glslang discovery), 19f8961e.
+- **Files:** `CMakeLists.txt`, `rsx_vulkan_backend.c`, new `rsx_vk_thread.h`.
+- **Value:** upstream's `PS3RECOMP_RSX_VULKAN` is Linux-only (it raises FATAL_ERROR elsewhere). This adds loading `vulkan-1.dll`, a Win32 surface, and SRW-lock threading. D3D12 remains the Windows default.
+- **Risk:** low; it is a build option.
+- **Prerequisites:** remove the dependency on fork-only `rsx_frontend_vulkan.h` and rebase onto upstream's Vulkan file (about 3k lines of fork divergence).
+- **Upstream PR title:** "feat(video): build the opt-in Vulkan RSX backend on Windows"
+
+**Q11. Public-tree content guard and pinned SDK fetch for ports**
+- **Source:** mag-recomp `tools/check_public_tree.py` (68 lines, tested) and `tools/fetch_ps3recomp.py` (65 lines) with the `profiles/framework.json` format and `tests/test_sdk_pins.py`.
+- **Value:** gives every port a CI guard against committing game content, plus reproducible tag- and commit-verified SDK checkouts. Upstream has neither.
+- **Prerequisites:** make the game-suffix and session-ID patterns configurable; drop the `MAG_` and `local/` names.
+- **Upstream PR title:** "tools(templates): content guard and pinned SDK fetch for game ports"
+
+**Q12. Test-only PRs**
+- **Contents:**
+  - the SPU interpreter regression tests fed6570c, a107d2fb, 436f22f6 and 1b97cd19 (mpyui, double arithmetic, rothmi, xorbi; about 460 lines);
+  - the CTR64 lifter test from 901afa04 (`tools/test_ppu_ctr64.py`; the lifter fix itself is already upstream);
+  - 4a0cc21d (TOC restored across HLE exits).
+- **Value:** cheap coverage for behaviour upstream already has.
+- **Prerequisites:** check that they still build against upstream's #688 interpreter.
+- **Upstream PR title:** "test(spu,ppu): interpreter and CTR regression fixtures"
+
+**Q13. Small diagnostic counters**
+- **Commits:** d156a698 + 95d64aad (D3D12 vtable path's dropped-draw, deferred-flip and ticker-flip counts; +95; already fork PR #16), 208ac538 (Vulkan present-rate), 50a32014 (render-target churn).
+- **Value:** low but cheap.
+- **Risk:** none.
+- **Upstream PR title:** "feat(video): opt-in D3D12 drop/flip and Vulkan present-rate counters"
+
+## 2. Medium (ranked)
+
+**M1. Guest write watch and preservation sessions**
+- **Commits:** 07b5698a (+813), e7185547, ac1b3080, 566facce, and `lane/fps2-vm-preserve` 8ab29ad6 (+625). About 1.5k lines in total.
+- **Files:** new `runtime/memory/vm_watch.{c,h}`, `vm_watch_hooks.h`; one-line write announcements in cellFs, sys_fs, sys_net, cellHttp, cellSsl, sysPrxForUser and cellSaveData.
+- **What it does:**
+  - `PS3RECOMP_VM_WRITE_WATCH=1` lets `vm_watch` and `vm_clean_since` report that a guest range is unchanged without reading it.
+  - The fault handler uses only atomics and chains to any earlier handler.
+  - Writes by the OS kernel are announced in advance; a strict mode makes an unannounced one fatal.
+  - Preservation sessions snapshot pages on their first write.
+- **Value:** high. Texture and vertex caches could skip hashing; it applies to any renderer cache.
+- **Risk:** medium, because it touches signal handling. With the option unset, nothing is installed.
+- **Tests:** synthetic `tests/test_vm_write_watch.c` and `tests/test_vm_preserve.c`.
+- **Prerequisites:** remove the SPURS flag-guard interplay (ac1b3080) if the guard does not go upstream. mag_decomp has a reuse protocol ("arm, verify, reuse while clean", torn-input detector) that could become a design doc, but only after a clean-room rewrite.
+- **Upstream PR title:** "feat(memory): opt-in page write-watch so host caches can prove guest data unchanged"
+
+**M2. Coherence fast paths (stacked series; you deferred this area — your call)**
+- **Commits, in order:**
+  1. c4c8d8e1 PPU-only lines use a per-line shard (+239, **on by default**);
+  2. 9bf49b10 interest bitmap (skip the holder and watch walk);
+  3. 1ef14852 and 300e55c7 (ordering fixes);
+  4. 899f06c9 store fast path with no live LR (+270, opt-in);
+  5. c4f37bf6 live-SPU holder counts (+266, opt-in);
+  6. 9192f907 shard for idle SPU lines (+121, opt-in; measured neutral, so drop it).
+- **Files:** `runtime/spu/spu_coherency.{c,h}`, `ppu_loader.cpp`, SPURS and cellSync RMW marks.
+- **Value:** high for SPURS-heavy titles. The lock-line lock took about 87% of 400M acquisitions on PPU-only lines.
+- **Risk:** high (memory model). Each commit carries an ordering argument and stress tests (`test_spu_coherency` 212/212, `test_ppu_store_live_spu.py`).
+- **Prerequisites:**
+  - Rebase onto upstream #672 (holder array) and #666 (lock-line spin), and look at open PR #673.
+  - Upstream has no shard concept at all.
+  - Send the default-on c4c8d8e1 as opt-in first.
+- **Upstream PR title:** "perf(spu): line-shard path for PPU stores to lines no SPU can hold (1/n)"
+
+**M3. Fast guest accessors, with inline stores emitted by the lifter**
+- **Commits:** a548774c (+246, CMake `PS3RECOMP_VM_FAST_ACCESSORS`, `_slow` wrappers in `ppu_loader.cpp`) and 765e4dc8 (+302, `tools/ppu_header_inline.py` patches existing headers).
+- **Value:** guest accessors were about 20% of the main PPU thread. Upstream already inlines loads (12158c45 is upstream) but not stores.
+- **Proposal:** a lifter option that emits inline stores under the same gates (`vm_inline_store_ok`, coherence bitmap, critical range), plus the fast-path wrappers for old lifts. The header-patch tool is a workaround for us, not upstream material.
+- **Risk:** medium. A test compares transcripts across all modes.
+- **Prerequisites:** the store gate reads coherence bitmap views (M2). Split the gate so it works without the shard series.
+- **Upstream PR title:** "perf(ppu): inline guest stores in lifted code, gated like the inline loads"
+
+**M4. Direct Vulkan present**
+- **Commit:** 2babf82d (+422/−55), `rsx_vulkan_backend.c`, `test_vulkan_present_cost.c`.
+- **Value:** high for Vulkan users. Today every present reads the frame back to the CPU and waits twice. The new path blits on the GPU with a three-slot fence ring; read-back stays on request (`PS3RECOMP_VK_PRESENT_READBACK`, dumps).
+- **Risk:** medium; it changes the default present path. Consider making it opt-in first.
+- **Prerequisites:** reconcile with upstream #532 (`VK_DRAW_BATCH`) and #552 (staging reuse), and remove the native-owner hooks.
+- **Upstream PR title:** "perf(video): present Vulkan engine frames on the GPU; read back only on request"
+
+**M5. RSX present thread**
+- **Commits:** 20bbe8a3 (ring header +590 with test), 2940d438 (Metal +598), 48a2fad4 (Vulkan +359), 1f243970, 6d20e76e, 5f505bfe.
+- **Value:** with `PS3RECOMP_RSX_PRESENT_THREAD=1`, the FIFO thread stops waiting on `nextDrawable` or a swapchain image. A ring of 2–3 slots drops the oldest frame and counts drops. Generic.
+- **Risk:** medium; off by default.
+- **Tests:** a synthetic ring test plus per-backend fixtures.
+- **Prerequisites:**
+  - strip the native frame-record and owner-gate references from the Metal half;
+  - D3D12 reports itself unsupported (upstream live D3D12 already has its own present thread).
+- **Upstream PR title:** "feat(rsx): opt-in present thread so the FIFO walker never waits on the display"
+
+**M6. FIFO consumer busy accounting**
+- **Commit:** cd8cb681 (+585), with link fixes a3687c7d, c9e3cea9, 47b05f20, 3963618a.
+- **Files:** new `libs/video/rsx_fifo_busy.{c,h}` and hooks in cellGcmSys and the Metal and Vulkan backends.
+- **Value:** `PS3RECOMP_RSX_FIFO_BUSY=1` splits walker time into categories (idle-by-reason, walk, draw, sync, flush, present, swapchain wait). This complements upstream's `RSX_WALKER_PROF` (#467).
+- **Risk:** low.
+- **Prerequisites:** drop the native-handoff and owner-lock categories, or make them generic "extension" slots.
+- **Upstream PR title:** "feat(video): opt-in FIFO consumer busy accounting by category"
+
+**M7. Guest longjmp: PPU nonlocal control flow**
+- **Commits:** 536aacbd (+522: lifter option `--nonlocal-control-flow`, `runtime/syscalls/ppu_host_unwind.*`, docs, `test_ppu_nonlocal.py`) and 305adee9 (MSVC `/EHsc-` plus a Windows test).
+- **Value:** a lifted guest longjmp currently returns to the wrong host caller. This feature uses an explicit allowlist and resumes the exact owner frame through a typed exception. Generic to any title that uses setjmp/longjmp.
+- **Risk:** low when unused; generated output is unchanged without a config.
+- **Prerequisites:** rebase onto the heavily changed upstream lifter. Note that `/EHsc-` affects every consumer of the C++ target.
+- **Upstream PR title:** "feat(ppu_lifter): opt-in nonlocal control flow for lifted guest longjmp"
+
+**M8. Range-based PPU reservation invalidation**
+- **Commit:** a3bae764 (+88), `ppu_resv_break_store_range` in `ppu_loader.cpp` and `ppu_memory.h`.
+- **Value:** bulk writes (DMA, HLE memcpy) scan the context registry once per range instead of once per word. A synthetic benchmark of 16 KiB across 32 contexts went from about 34 µs to about 10 ns. Upstream has only per-word and per-line breaks.
+- **Risk:** low to medium.
+- **Prerequisites:** wire the callers.
+- **Upstream PR title:** "perf(ppu): break PPU reservations for a byte range in one registry scan"
+
+**M9. D3D12 register-file draw-engine backend**
+- **Commits:** a89ae577 (+1280, new `rsx_d3d12_engine.inc`) plus d34f8d4b, 02ea4fc3, e5f3e002, 247d4abb, 9cc7af6c, c83070cd and others (depth readback, colour snapshot, Z24 on the GPU, depth bounds), and branch `claude/d3d12-descriptor-heap` (+254, fenced upload and descriptor rings, present without a wait).
+- **Size:** about 2.5k lines.
+- **Value:** high for Windows. Upstream's D3D12 path is still the legacy vtable renderer. This puts D3D12 on the same engine as Metal and Vulkan behind `PS3RECOMP_D3D12_DRAW_ENGINE=1`.
+- **Risk:** medium; opt-in. There is a real-adapter test under the debug layer (d99bf91b).
+- **Prerequisites:**
+  - upstream's `rsx_d3d12_backend.c` grew by about 1.5k lines (#600, #617, #618, #669, #695), so this is a significant rebase;
+  - drop the many `PS3RECOMP_D3D12_ENGINE_*` debug switches, or move them to a follow-up;
+  - fork PR #17 is the staging branch.
+- **Upstream PR title:** "feat(video): opt-in D3D12 backend for the register-file draw engine"
+
+**M10. Native OSK hosts**
+- **Commits:** ac8aa329 (macOS), 91902df1, 0d6af11b and 7ab15879 (Windows), 7df38227 (headless Linux), plus `libs/misc/osk_native.{c,h}`. About 800 lines.
+- **Value:** upstream's `cellOskDialog` is a stub. This gives real text entry on all three operating systems.
+- **Linux SDL hosts (2026-11-08):** the SDL OSK dialog on the Vulkan backend's game window
+  (`PS3RECOMP_NATIVE_OSK_SDL`, `docs/LINUX_OSK_DIALOG.md`) and the SDL keyboard pad
+  (`docs/LINUX_KEYBOARD_PAD.md`) are now on fork `main` (fork PRs #26 and #27) and were validated
+  with real keys. Compare the keyboard pad with upstream's `cellPad.c` keyboard fallback before
+  sending it.
+- **Risk:** low; opt-in.
+- **Prerequisites:** check that no MAG text or layout assumptions remain.
+- **Upstream PR title:** "feat(osk): native on-screen keyboard hosts for macOS, Windows and headless Linux"
+
+**M11. SDATA plain opens stay raw; durable cellFsWrite**
+- **Commit:** f0547a67 (+404 with tests). Files: `libs/filesystem/edat.c`, `ppu_fs.cpp`, `sys_fs.c`.
+- **Value:** a plain open of an SDATA container returned decrypted bytes while `cellFsStat` reported the raw size. Copies came out truncated on every host.
+- **Risk:** low.
+- **Prerequisites:**
+  - rewrite the commit message, which tells the story through MAG's launcher;
+  - reconcile the write half with upstream #705 (open, "report failed and short writes") and #620.
+- **Upstream PR title:** "fix(fs): plain opens of SDATA return the container; cellFsWrite reports durable results"
+
+**M12. Port-template extension points and build receipts**
+- **Source:** mag-recomp `src/mag_extension.{h,cpp}`, `cmake/MagExtensions.cmake`, the `tools/lift.py` hooks, `tools/provenance.py` (generic core about 70 lines), and `tools/render_hooks/common.py` (body-hash-pinned, round-trip-verified hook injection).
+- **Value:**
+  - upstream ports have no post-lift hook or lifecycle registry;
+  - the ad-hoc instrument scripts carry hardcoded drive-letter paths;
+  - the receipts tie the binary to its lift outputs and the SDK revision.
+- **Risk:** none; default off.
+- **Prerequisites:**
+  - rename `MAG_*` to `PORT_*`;
+  - drop the payload slots that exist for job-I/O capture;
+  - drop the check that only runs hooks on the retail ELF hash.
+- **Upstream PR titles:** "templates/project: extension hook and lifecycle callbacks" and "tools: lift_hooks, pinned and round-trip-verified hooks for lifted sources"
+
+**M13. Function-level lifter-fix splice**
+- **Source:** mag-recomp `tools/ppu_function_splice.py` (138 lines, no MAG references) and `partial_ppu_relift.py`.
+- **Value:** lift the same input before and after a lifter fix and splice only the functions that differ into an existing lift. Every port that patches lifts needs this.
+- **Missing:** a direct test of the splice tool. Add one.
+- **Upstream PR title:** "tools: ppu_function_splice — apply a lifter fix to an existing lift by its function footprint"
+
+**M14. Small opt-in knobs on systems upstream already has**
+- a04e7187: SDL dummy-driver audio clock (+31). Rebase onto open #710.
+- 0a2d3d17 and b6fbb426: live D3D12 report batching through checked completions (+883). Large, and depends on #713 (open).
+- The SPU watch diagnostics: 8ac6375f, 9a4c66c7, e5d81b27, 5cf92bb6, 954d8471 and a9ad9ed8 (coherence line histogram).
+- **Value:** niche.
+- **Upstream PR title:** propose these one by one later.
+
+## 3. Large / architectural (discussion first)
+
+**A1. Checked GPU completion for RSX reports and labels, with opt-in early release**
+- **Fork work:**
+  - c673e27f, fc79163a, cbc3cb99: deferred reports with GPU tickets;
+  - d1aefd9d, a10addbd, 4028d97f and `docs/RSX_EARLY_LABEL_RELEASE.md`: early release;
+  - 6c2feee7: inline-image barrier without a GPU wait (menu went from about 9 to 57 flips/s);
+  - ed3034f1: batch knob;
+  - 9ba1ed20 / 0a2d3d17: the live D3D12 equivalent.
+- **Size:** several thousand lines in `cellGcmSys.c`.
+- **Pitch:**
+  - Upstream publishes labels and reports at FIFO position, and has no record of whether the GPU work ahead of them finished.
+  - The fork queues each report behind a backend completion ticket, applies it in order, and freezes on failure. That makes "label written" mean "work done". Async backends can then batch and pipeline without guests reading early results.
+  - The early-release mode gives most of the latency back for engines that snapshot their GPU inputs at record time.
+  - Upstream should first decide whether it wants these semantics. The `cellGcmSys.c` diff is too large to review cold.
+- **Upstream issue title:** "RFC: ordered, completion-checked RSX report and label publication for async backends"
+
+**A2. A native-owner seam: let a host renderer replace RSX work**
+- **Fork work:** `rsx_native_owner.h`, `rsx_native_owner_gate.h`, `rsx_native_handoff.h`, `rsx_native_{image,frame}.h`, `rsx_frontend*.c` and `docs/FRONTEND_COMPUTE.md` (fork PR #14, codex/render-frontend-api); Vulkan reserved queue order c7823158; Metal queue order on `feat/metal-queue-order`; D3D12 owner and target leases on `claude/d3d12-native-owner` and `-native-targets`.
+- **Related:** mag-recomp `mag_render_host_bridge` (the consumer side); mag_decomp's RSX state-preamble encoder and completion-receipt ideas (clean-room rewrite only).
+- **Pitch:**
+  - Ports that want to render some passes natively need four things from the SDK: borrow its device and queue with lifetime and generation checks; lease its colour and depth targets; reserve a spot in its queue order; and take over a published command span at an exact FIFO position.
+  - We have a versioned C ABI for all four on Metal, Vulkan and D3D12, off by default.
+  - The current handoff API is shaped around one title's ring writer. A discussion would settle a smaller generic core first: owner borrow, image lease and queue reservation.
+- **Upstream issue title:** "RFC: borrowed native-owner and image-lease ABI for external render frontends"
+
+**A3. A decoupled RSX consumer: one framing for M5, M6, A1 and A2**
+- **Pitch:**
+  - Present on its own thread, account for FIFO-thread time, publish labels at the earliest correct point, and let an extension own spans.
+  - Together these turn the walker into a thread that never blocks on the display or the GPU.
+  - Worth one design note upstream, so the PRs land in a coherent order and don't trickle in one at a time.
+
+**A4. Coherence model next steps**
+- **Covers:** M2 plus the deferred redesign (per-line version counters and lazy delivery of lost reservations).
+- **Pitch:**
+  - Upstream's lock-line, context-walk and notify model costs about 2.7 ms per update on our Mac game thread even after the fast paths.
+  - A per-line version-counter model would remove the global walks.
+  - Propose this only once you lift the "after the reset" hold, with a clean-room spec.
+
+**A5. Lifter performance passes**
+- **Pitch:** keeping guest registers in C locals (SPU `--promote-registers`, 4a59f6f0) was measured as neutral and reverted (b79c5252). That is useful negative data for upstream. Raw stack and private access, dead CR/XER elimination and direct calls are still proposals and are not approved even internally. Start with measurement, not a PR.
+
+**A6. Porting workflow: installer framework and clean-room method**
+- **Sources:**
+  - mag-recomp `installer/mag_installer/{tools,pipeline,safety,model,platforms,capacity}.py`: about 950 generic lines with pinned downloads, bounded extraction and transactional staging;
+  - `docs/native-graphics-reimplementation-method.md`;
+  - the job I/O recorder (`runtime/diagnostics/job_io_recorder.c`, fork-only) with `tools/jobio.py`;
+  - mag_decomp's single-function replay harness design.
+- **Pitch:** a reusable source-kit installer, plus a documented spec-then-implement method with a black-box SPU job recorder. Today every port reinvents these.
+
+## 4. Not upstream material
+
+- **Sail, PAMF and THX playback specifics:** f9ccab6b, 6786a944, e1216e7f, the immutable picture identities, the audio chronology. Tuned to one title's intro; the generic parts already went upstream (#252, #653, #663).
+- **Job-manager diagnostics:** the SPURS dispatch diagnostic and receiver-flag page guards (90dfdc95…a0d3088a, 40b87a79, 73656564) and `claude/wws-hle` 6d0152a9. They inspect one title's job manager.
+- **Native-trial machinery:** native Main ring handoff, scene tickets, original-execution witnesses, render ablation, raw-ISA block admission (7957395e…a95e0773), native service owners, fork PRs #2–#6. Tied to MAG native trials.
+- **The mag-recomp job-wait watchdog:** `src/mag_job_wait_watchdog.h`, #113. Hardcoded game addresses. At most, a generic "named wait watchdog" driven by lift hooks later; upstream has a Windows-only hang watchdog.
+- **mag-recomp getenv interposer:** `src/mag_env_cache.cpp`. Mostly moot since upstream #437 and `ps3_env_once`; a macOS boot_main cache would be a small optional PR at most.
+- **mag-recomp per-title tooling:** lift and assess tools, `profiles/retail-v1.0-*`, `psarc.py`, the player UI, controls and the `crates/mag-render*` frontend.
+- **Fork-only portability shims:** `MagWin32Posix.cmake` and `MagLinuxCompat.cmake`. These fix fork-only diagnostics files (`critical_trace`, `job_io_recorder`, `render_ablation`, and `spu_coherency.c`'s unguarded calls). Fix them in the fork, not upstream.
+- **mag_decomp pass modules:** `native/graphics/*` and the render-adapter pass modules. Game-derived.
+- **Measured-negative experiments:** the Metal vertex-fetch offload, PM-worker QoS (715dca5a) and the timer GCM pump (fcab88be). Keep them only as data points.
+- **Fork docs:** 77e45f21 (how mag-recomp pins the fork).
+
+## 5. Already upstream or superseded
+
+- **Merged:** our PRs #651–#654, #658 and #677–#683; the October batches #234–#326 and #417–#484 (reworded squashes, so `git cherry` only finds 21 matches).
+- **Equivalent code already upstream:** cellVoice port control e82c736f, the Metal border colour 40d49741, shadow-compare order 18bf94e1, the jump-table spill fix 1e7d7c66, inline loads 12158c45, and the 64-bit CTR lifter fix (only our test is left; see Q12).
+- **Superseded or competing upstream work:**
+
+| Ours | Upstream | Note |
+|---|---|---|
+| Batched Vulkan recording (d1889f4e, `PS3RECOMP_VK_BATCHED_ENGINE`) | #532 `VK_DRAW_BATCH` | Reconcile; don't send ours |
+| POSIX audio pacing befbd990 | open #710 | Ours adapted #213 |
+| Unresolved-HLE policy 13da8106 | open #697 | Other author |
+| Depth snapshot release 69f7c28c | #604 | — |
+| macOS window keyboard-to-pad f9b226e0, 391e67b8, 783b6f1f | upstream keyboard fallback in `cellPad.c` | — |
+| SPU decode cache 32309b80 and its heap variant b2c660c2 | #688 decode table | Re-measure before proposing |
+| Vulkan depth bounds (mag-recomp #24) | upstream already enables `depthBounds` | Also #694 Metal emulation and #693 depth clamp |
+| lwmutex and lwcond on POSIX 81efb74d, fe4adbf8 | #621, #684, open #706 | — |
+| Live D3D12 fence validation 9ba1ed20 | open #713 | Compare first |
+
+- **Only useful with A2:** samplerAnisotropy on the Vulkan owner (a9a0008c). Upstream samplers never ask for anisotropy, so it adds nothing upstream until there is a native owner.
