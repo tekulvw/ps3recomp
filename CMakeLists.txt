@@ -329,6 +329,11 @@ endif()
 # libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
 # its fixed-function path.
 if(PS3RECOMP_RSX_VULKAN)
+    # The lookup above is POSIX-only (it serves the Metal translation too);
+    # the opt-in Windows Vulkan backend finds glslang on its own.
+    if(WIN32 AND NOT glslang_FOUND)
+        find_package(glslang CONFIG QUIET)
+    endif()
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
