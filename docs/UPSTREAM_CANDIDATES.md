@@ -26,8 +26,8 @@ otherwise; "mag-recomp" means the downstream port that pins this fork.
 
 | ID | Item | Status |
 |---|---|---|
-| Q1 | Our four open PRs (#661, #662, #663, #665) | PR open #661, #662, #663, #665 (no review yet; nudging is the user's call) |
-| Q2 | glibc static TLS: thread stacks that are too small | not started |
+| Q1 | Our four open PRs (#661, #662, #663, #665) | PR open #661, #662, #663, #665 (all four re-checked as still needed, rebased onto v0.19.0 and marked ready for review on 2026-11-08; tests re-run on the new base) |
+| Q2 | glibc static TLS: thread stacks that are too small | in progress |
 | Q3 | 4 GB-aligned POSIX guest arena in the project template | not started |
 | Q4 | Opt-in short-usleep yield on POSIX | not started |
 | Q5 | SPU task thread pool | not started |
