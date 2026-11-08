@@ -92,13 +92,15 @@ jobs:
         env:
           CI: "1"          # makes a skipped conformance run fail instead of passing
         run: |
-          set -e
+          fails=""
           for t in tools/test_*.py; do
             # Explicit shader-bound native fixtures have dedicated workflows.
             case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py|tools/test_vulkan_present_cost.py) continue ;; esac
             echo "--- $t"
-            python "$t"
+            python "$t" || fails="$fails $t"
           done
+          echo "CENSUS-FAILED:$fails"
+          test -z "$fails"
 
       - name: Run self-contained SPU helper tests
         run: |
