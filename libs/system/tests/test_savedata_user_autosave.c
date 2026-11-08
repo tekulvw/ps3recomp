@@ -11,6 +11,7 @@
  * save root) as argv[1] and removes it afterwards.
  */
 #include "../cellSaveData.c"
+#include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;

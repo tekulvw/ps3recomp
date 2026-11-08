@@ -5,6 +5,8 @@
 #include "sys_fs.h"
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
+#include "../memory/vm_watch.h"
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -351,9 +353,11 @@ int64_t sys_fs_open(ppu_context* ctx)
     /* NPDRM: a file that begins "NPD\0" is an EDAT, and on hardware the guest never
      * sees its ciphertext -- sceNpDrmIsAvailable primes the kernel and cellFsOpen
      * returns plaintext. Decrypt once into a cache file and open that instead, so
-     * every read/seek/stat path below stays unchanged. (libs/filesystem/edat.c) */
+     * every read/seek/stat path below stays unchanged. (libs/filesystem/edat.c)
+     * SDATA is the exception: a plain open returns its raw container on hardware,
+     * and only cellFsSdataOpen decrypts it. */
     { char dec_path[1200];
-      const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
+      const char* use = edat_resolve_open(host_path, dec_path, sizeof dec_path);
       if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use); }
 
     /* Find free fd slot */
@@ -512,7 +516,11 @@ int64_t sys_fs_read(ppu_context* ctx)
      * as a read error on every movie and never decoded a frame -- solid green
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
     if (size) vm_commit(buf_addr, (uint32_t)size);
+    /* A kernel write into guest memory: announce it to the write watch (the
+     * commit above already released the range; this states the contract). */
+    vm_note_write(buf_addr, (size_t)size);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
+    vm_note_write_check(nread < (size_t)size && ferror(f->fp) && errno == EFAULT, "sys_fs read");
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
      *

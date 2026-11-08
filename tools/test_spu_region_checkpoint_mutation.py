@@ -18,7 +18,7 @@ ROOT=pathlib.Path(__file__).resolve().parents[1]
 SPU=ROOT/'runtime/spu'
 COMMON=['spu_lockstep.c','spu_coherency.c','spu_workload.c','spurs_policy.c',
         'spurs_job.c','spu_tsp_weak.c','spu_vm_pagemap.c',
-        'spurs_policy_blob_weak.c','spu_interp.c']
+        'spurs_policy_blob_weak.c','spu_interp.c', '../diagnostics/job_io_recorder.c']
 
 def run():
     env={k:v for k,v in os.environ.items()

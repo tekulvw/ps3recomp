@@ -15,6 +15,8 @@
 #include "rsx_deferred_reports.h"
 #include "rsx_ring_progress_observer.h"
 #include "cellGcmSys.h"
+#include "rsx_native_handoff.h"
+#include "rsx_fifo_busy.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
@@ -36,11 +38,15 @@ static int gcm_checked_backend_ready(void) {
     return s_checked_completion_ready ?
         s_checked_completion_ready(s_checked_completion_user)==1 : rsx_draw_engine_checked_ready();
 }
+static u32 s_engine_barrier_reason;
+#define GCM_BARRIER_REFERENCE 0x10050u
 static int gcm_checked_backend_flush(void) {
     if(s_checked_completion_ready)
         return s_checked_completion_ready(s_checked_completion_user)==1 &&
                s_checked_completion_flush(s_checked_completion_user)==1;
-    return rsx_draw_engine_enabled() && rsx_draw_engine_flush_checked()==1;
+    if(!rsx_draw_engine_enabled())return 0;
+    const u32 outer=s_engine_barrier_reason;s_engine_barrier_reason=GCM_BARRIER_REFERENCE;
+    const int ok=rsx_draw_engine_flush_checked()==1;s_engine_barrier_reason=outer;return ok;
 }
 #include <stdio.h>
 #include <string.h>
@@ -48,6 +54,425 @@ static int gcm_checked_backend_flush(void) {
 #include <stdint.h>
 #include "ps3emu/log_first.h"
 #include <stdatomic.h>
+
+/* Source-qualified, one-shot command publication. No work is done in the
+ * ordinary path until an explicit producer arms an entry. The registry lock
+ * is never held across user code or the owner/consumer lock hierarchy. */
+#define GCM_NATIVE_HANDOFF_CAPACITY 64u
+static SRWLOCK s_native_handoff_lock = SRWLOCK_INIT;
+static atomic_uint s_native_handoff_count;
+static uint64_t s_native_handoff_next = 1;
+static struct {
+    uint64_t cookie;
+    uintptr_t vm_base_identity;
+    unsigned phase; /* 1 armed, 2 published, 3 callback active */
+    rsx_native_handoff_arm source;
+    unsigned ring_writer;
+    rsx_native_handoff_ring_arm ring;
+    uint32_t writer_state[4];
+    unsigned ring_watch; /* published at arm; judged at FIFO arrival */
+    rsx_native_handoff_ring_watch watch;
+    uint32_t flips_left;
+} s_native_handoffs[GCM_NATIVE_HANDOFF_CAPACITY];
+/* Error-only bounded context for the source-owned ring seam. These values
+ * are copies of words already read by its checks, never fresh guest probes. */
+static void gcm_native_ring_refusal(const char* stage,int status,const char* reason,
+    uint64_t cookie,const rsx_native_handoff_ring_arm* a,const uint32_t expected[4],
+    const uint32_t actual[4],unsigned phase,int header_checked,uint32_t header,uint32_t argument)
+{
+    static atomic_uint reported;
+    unsigned n=atomic_load_explicit(&reported,memory_order_relaxed);
+    while(n<8 && !atomic_compare_exchange_weak_explicit(&reported,&n,n+1,memory_order_relaxed,memory_order_relaxed)){}
+    if(n>=8)return;
+    fprintf(stderr,"[gcm native ring refusal] stage=%s status=%d reason=%s cookie=%llu source=%llu vm=%llu writer=%08x ring=%08x+%08x header_ea=%08x phase=%u expected_state=%08x,%08x,%08x,%08x actual_state=%08x,%08x,%08x,%08x header_checked=%d expected_words=%08x,%08x actual_words=%08x,%08x\n",
+        stage,status,reason,(unsigned long long)cookie,(unsigned long long)a->source_observation,
+        (unsigned long long)a->vm_identity,a->writer_state_ea,a->ring_begin_ea,a->ring_bytes,a->header_ea,phase,
+        expected[0],expected[1],expected[2],expected[3],actual[0],actual[1],actual[2],actual[3],
+        header_checked,a->expected_header,a->expected_argument,header,argument);
+}
+static void gcm_native_handoff_remove(unsigned i)
+{
+    memset(&s_native_handoffs[i], 0, sizeof(s_native_handoffs[i]));
+    atomic_fetch_sub_explicit(&s_native_handoff_count, 1, memory_order_release);
+}
+int cellGcm_native_handoff_arm(const rsx_native_handoff_arm* source, uint64_t* cookie)
+{
+    if (cookie) *cookie = 0;
+    if (!source || !cookie || source->abi_version != RSX_NATIVE_HANDOFF_ABI ||
+        source->struct_size != sizeof(*source) || !source->consume || !source->source_observation ||
+        !vm_base || !source->vm_identity ||
+        !source->context_ea || (source->context_ea & 3u) || source->context_ea > UINT32_MAX - 16u ||
+        !source->header_ea || (source->header_ea & 3u) || source->header_ea > UINT32_MAX - 8u ||
+        /* One ordinary method with exactly one argument; no branches/fake opcodes. */
+        (source->expected_header & 0xFFFF0003u) != 0x00040000u)
+        return -1;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    int result = -4;
+    if (vm_read32(source->context_ea + 8) != source->header_ea ||
+        vm_read32(source->context_ea) > source->header_ea ||
+        vm_read32(source->context_ea + 4) < source->header_ea + 8u) {
+        result = -3;
+    } else if (s_native_handoff_next != 0) {
+        unsigned free_slot = GCM_NATIVE_HANDOFF_CAPACITY;
+        int duplicate = 0;
+        for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+            if (!s_native_handoffs[i].phase) free_slot = i;
+            else if (s_native_handoffs[i].source.vm_identity == source->vm_identity &&
+                     s_native_handoffs[i].source.header_ea == source->header_ea) duplicate = 1;
+        }
+        if (!duplicate && free_slot < GCM_NATIVE_HANDOFF_CAPACITY) {
+            s_native_handoffs[free_slot].source = *source;
+            s_native_handoffs[free_slot].vm_base_identity = (uintptr_t)vm_base;
+            s_native_handoffs[free_slot].cookie = s_native_handoff_next++;
+            s_native_handoffs[free_slot].phase = 1;
+            *cookie = s_native_handoffs[free_slot].cookie;
+            atomic_fetch_add_explicit(&s_native_handoff_count, 1, memory_order_release);
+            result = 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    return result;
+}
+int cellGcm_native_handoff_ring_arm(const rsx_native_handoff_ring_arm* source, uint64_t* cookie)
+{
+    if (cookie) *cookie = 0;
+    const uint64_t limit = ppu_vm_size ? (uint64_t)ppu_vm_size : UINT64_C(0x100000000);
+    if (!source || !cookie || source->abi_version != RSX_NATIVE_HANDOFF_ABI ||
+        source->struct_size != sizeof(*source) || !source->consume || !source->source_observation ||
+        !source->vm_identity || !vm_base || !source->writer_state_ea ||
+        (source->writer_state_ea & 3u) || (uint64_t)source->writer_state_ea + 16u > limit ||
+        !source->ring_begin_ea || (source->ring_begin_ea & 3u) || source->ring_bytes < 8u ||
+        (source->ring_bytes & 3u) || (uint64_t)source->ring_begin_ea + source->ring_bytes > limit ||
+        (source->header_ea & 3u) || source->header_ea < source->ring_begin_ea ||
+        (uint64_t)source->header_ea + 8u > (uint64_t)source->ring_begin_ea + source->ring_bytes ||
+        (source->expected_header & 0xFFFF0003u) != 0x00040000u)
+        return -1;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    uint32_t state[4];
+    for (unsigned n = 0; n < 4; ++n) state[n] = vm_read32(source->writer_state_ea + 4u * n);
+    int result = -4;
+    const char* reason = "cookie-exhausted";
+    const uint64_t ring_end=(uint64_t)source->ring_begin_ea+source->ring_bytes;
+    const int in_block=state[0]>=source->ring_begin_ea && state[0]<=source->header_ea &&
+        state[1]>=source->header_ea+8u && (uint64_t)state[1]<=ring_end;
+    /* Main's PPE allocator D12318/D128B4/D129E8 can wrap ONLY current to
+     * the head, retaining begin/end/callback. Admit the observed final
+     * 8192-byte tail shape; other out-of-block currents remain unsupported.
+     * Publish still requires all four captured words to remain unchanged. */
+    const int wrapped_tail=source->header_ea==source->ring_begin_ea &&
+        source->ring_bytes>=0x4000u && state[0]>=source->ring_begin_ea &&
+        (uint64_t)state[0]+0x2000u==ring_end &&
+        (uint64_t)state[1]==(uint64_t)state[0]+0x1FECu;
+    if (state[2] != source->header_ea || (!in_block && !wrapped_tail)) {
+        result = -3;
+        reason = "writer-state-bounds";
+    } else if (s_native_handoff_next != 0) {
+        unsigned free_slot = GCM_NATIVE_HANDOFF_CAPACITY;
+        int duplicate = 0;
+        for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+            if (!s_native_handoffs[i].phase) free_slot = i;
+            else if (s_native_handoffs[i].source.vm_identity == source->vm_identity &&
+                     s_native_handoffs[i].source.header_ea == source->header_ea) duplicate = 1;
+        }
+        reason = duplicate ? "duplicate-header" : "registry-capacity";
+        if (!duplicate && free_slot < GCM_NATIVE_HANDOFF_CAPACITY) {
+            rsx_native_handoff_arm* common = &s_native_handoffs[free_slot].source;
+            common->abi_version = RSX_NATIVE_HANDOFF_ABI; common->struct_size = sizeof(*common);
+            common->vm_identity = source->vm_identity; common->source_observation = source->source_observation;
+            common->context_ea = 0; common->consume = NULL;
+            common->header_ea = source->header_ea; common->expected_header = source->expected_header;
+            common->expected_argument = source->expected_argument; common->userdata = source->userdata;
+            s_native_handoffs[free_slot].ring_writer = 1;
+            s_native_handoffs[free_slot].ring = *source;
+            memcpy(s_native_handoffs[free_slot].writer_state, state, sizeof(state));
+            s_native_handoffs[free_slot].vm_base_identity = (uintptr_t)vm_base;
+            s_native_handoffs[free_slot].cookie = s_native_handoff_next++;
+            s_native_handoffs[free_slot].phase = 1;
+            *cookie = s_native_handoffs[free_slot].cookie;
+            atomic_fetch_add_explicit(&s_native_handoff_count, 1, memory_order_release);
+            result = 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    if(result) { const uint32_t expected[4]={0};
+        gcm_native_ring_refusal("arm",result,reason,0,source,expected,state,0,0,0,0); }
+    return result;
+}
+int cellGcm_native_handoff_ring_publish(uint64_t cookie)
+{
+    if (!cookie) return -3;
+    int result = -3;
+    const char* reason = "cookie-not-found";
+    rsx_native_handoff_ring_arm source={0};
+    uint32_t expected[4]={0},actual[4]={0},header=0,argument=0;
+    unsigned phase=0;int header_checked=0;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+        if (s_native_handoffs[i].cookie != cookie) continue;
+        const rsx_native_handoff_ring_arm* a = &s_native_handoffs[i].ring;
+        source=*a;phase=s_native_handoffs[i].phase;
+        memcpy(expected,s_native_handoffs[i].writer_state,sizeof(expected));
+        reason=!s_native_handoffs[i].ring_writer ? "not-ring" : phase!=1 ? "phase" : "vm-base";
+        if (s_native_handoffs[i].ring_writer && s_native_handoffs[i].phase == 1 &&
+            s_native_handoffs[i].vm_base_identity == (uintptr_t)vm_base) {
+            int same = 1;
+            for (unsigned n = 0; n < 4; ++n) {
+                actual[n]=vm_read32(a->writer_state_ea + 4u * n);
+                if(actual[n]!=expected[n])same=0;
+            }
+            reason="writer-state-changed";
+            if(same) {
+                header=vm_read32(a->header_ea);header_checked=1;reason="header-word";
+                if(header==a->expected_header) {
+                    argument=vm_read32(a->header_ea+4u);header_checked=2;reason="argument-word";
+                }
+            }
+            if (same && header_checked==2 && argument==a->expected_argument) {
+                s_native_handoffs[i].phase = 2;
+                result = 0;
+            }
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    if(result)gcm_native_ring_refusal("publish",result,reason,cookie,&source,expected,actual,phase,header_checked,header,argument);
+    return result;
+}
+int cellGcm_native_handoff_publish(uint64_t cookie)
+{
+    if (!cookie) return -3;
+    int result = -3;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+        if (s_native_handoffs[i].cookie != cookie) continue;
+        const rsx_native_handoff_arm* a = &s_native_handoffs[i].source;
+        if (!s_native_handoffs[i].ring_writer && s_native_handoffs[i].phase == 1 && s_native_handoffs[i].vm_base_identity == (uintptr_t)vm_base &&
+            vm_read32(a->context_ea + 8) == a->header_ea + 8u &&
+            vm_read32(a->header_ea) == a->expected_header &&
+            vm_read32(a->header_ea + 4) == a->expected_argument) {
+            s_native_handoffs[i].phase = 2;
+            result = 0;
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    return result;
+}
+int cellGcm_native_handoff_ring_watch(const rsx_native_handoff_ring_watch* w, uint64_t* cookie)
+{
+    if (cookie) *cookie = 0;
+    const uint64_t limit = ppu_vm_size ? (uint64_t)ppu_vm_size : UINT64_C(0x100000000);
+    const uint64_t words = (w && (w->tail_mask[0] || w->tail_mask[1])) ? 16u : 8u;
+    if (!w || !cookie || w->abi_version != RSX_NATIVE_HANDOFF_ABI ||
+        w->struct_size != sizeof(*w) || !w->consume || !w->source_observation ||
+        !w->vm_identity || !vm_base || !w->writer_state_ea ||
+        (w->writer_state_ea & 3u) || (uint64_t)w->writer_state_ea + 16u > limit ||
+        !w->ring_begin_ea || (w->ring_begin_ea & 3u) || w->ring_bytes < 8u ||
+        (w->ring_bytes & 3u) || (uint64_t)w->ring_begin_ea + w->ring_bytes > limit ||
+        (w->header_ea & 3u) || w->header_ea < w->ring_begin_ea ||
+        (uint64_t)w->header_ea + words > (uint64_t)w->ring_begin_ea + w->ring_bytes ||
+        (w->expected_header & 0xFFFF0003u) != 0x00040000u || w->reserved)
+        return -1;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    int result = -4;
+    if (s_native_handoff_next != 0) {
+        unsigned free_slot = GCM_NATIVE_HANDOFF_CAPACITY;
+        int duplicate = 0;
+        for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+            if (!s_native_handoffs[i].phase) free_slot = i;
+            else if (s_native_handoffs[i].source.vm_identity == w->vm_identity &&
+                     s_native_handoffs[i].source.header_ea == w->header_ea) duplicate = 1;
+        }
+        if (!duplicate && free_slot < GCM_NATIVE_HANDOFF_CAPACITY) {
+            rsx_native_handoff_arm* common = &s_native_handoffs[free_slot].source;
+            common->abi_version = RSX_NATIVE_HANDOFF_ABI; common->struct_size = sizeof(*common);
+            common->vm_identity = w->vm_identity; common->source_observation = w->source_observation;
+            common->context_ea = 0; common->consume = NULL; common->header_ea = w->header_ea;
+            common->expected_header = w->expected_header;
+            common->expected_argument = w->expected_argument; common->userdata = w->userdata;
+            s_native_handoffs[free_slot].ring_watch = 1;
+            s_native_handoffs[free_slot].watch = *w;
+            s_native_handoffs[free_slot].flips_left = w->max_flips;
+            s_native_handoffs[free_slot].vm_base_identity = (uintptr_t)vm_base;
+            s_native_handoffs[free_slot].cookie = s_native_handoff_next++;
+            s_native_handoffs[free_slot].phase = 2; /* nothing to publish */
+            *cookie = s_native_handoffs[free_slot].cookie;
+            atomic_fetch_add_explicit(&s_native_handoff_count, 1, memory_order_release);
+            result = 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    return result;
+}
+/* One watch outcome, copied under the registry lock with its entry held in
+ * phase 3, and reported outside it. */
+typedef struct gcm_native_watch_report {
+    uint64_t cookie;
+    unsigned slot;
+    int32_t status;
+    rsx_native_handoff_ring_watch watch;
+    uint32_t header, argument;
+} gcm_native_watch_report;
+static void gcm_native_watch_take(unsigned i, int32_t status, uint32_t header,
+    uint32_t argument, gcm_native_watch_report* out)
+{
+    s_native_handoffs[i].phase = 3;
+    out->cookie = s_native_handoffs[i].cookie; out->slot = i; out->status = status;
+    out->watch = s_native_handoffs[i].watch; out->header = header; out->argument = argument;
+}
+static void gcm_native_watch_report_one(const gcm_native_watch_report* r, u32 get, u32 put)
+{
+    rsx_native_handoff_ring_event owned = {0};
+    owned.abi_version = RSX_NATIVE_HANDOFF_ABI; owned.struct_size = sizeof(owned);
+    rsx_native_handoff_event* e = &owned.source;
+    e->abi_version = RSX_NATIVE_HANDOFF_ABI; e->struct_size = sizeof(*e);
+    e->cookie = r->cookie; e->vm_identity = r->watch.vm_identity;
+    e->vm_base_identity = (uint64_t)(uintptr_t)vm_base;
+    e->source_observation = r->watch.source_observation;
+    e->header_ea = r->watch.header_ea; e->header = r->header; e->argument = r->argument;
+    e->fifo_get = get; e->fifo_put = put;
+    if (r->status == RSX_NATIVE_WATCH_ARRIVED) rsx_draw_engine_native_source_target(&e->target);
+    owned.writer_state_ea = r->watch.writer_state_ea;
+    owned.ring_begin_ea = r->watch.ring_begin_ea; owned.ring_bytes = r->watch.ring_bytes;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_HANDOFF);
+    r->watch.consume(r->watch.userdata, &owned, r->status);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_HANDOFF);
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    if (s_native_handoffs[r->slot].cookie == r->cookie) gcm_native_handoff_remove(r->slot);
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+}
+/* Judge pending watches at a consumer event, then report the retired ones
+ * outside the lock. kind 0: a JUMP from_ea -> to_ea leaves the ring span
+ * before a header; kind 1: resynchronisation skips every header; kind 2: a
+ * FIFO flip counts down max_flips. A changed VM base retires any watch. */
+static void gcm_native_watch_sweep(int kind, u32 from_ea, u32 to_ea, u32 get, u32 put)
+{
+    if (!atomic_load_explicit(&s_native_handoff_count, memory_order_acquire)) return;
+    gcm_native_watch_report reports[GCM_NATIVE_HANDOFF_CAPACITY];
+    unsigned n = 0;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+        if (!s_native_handoffs[i].ring_watch || s_native_handoffs[i].phase != 2) continue;
+        const rsx_native_handoff_ring_watch* w = &s_native_handoffs[i].watch;
+        int32_t status = 1;
+        if (s_native_handoffs[i].vm_base_identity != (uintptr_t)vm_base) {
+            status = RSX_NATIVE_WATCH_VM_RETIRED;
+        } else if (kind == 0) { /* JUMP from_ea -> to_ea */
+            const uint64_t end = (uint64_t)w->ring_begin_ea + w->ring_bytes;
+            if (from_ea >= w->ring_begin_ea && from_ea < w->header_ea &&
+                (to_ea <= from_ea || to_ea > w->header_ea || (uint64_t)to_ea >= end))
+                status = RSX_NATIVE_WATCH_SKIPPED;
+        } else if (kind == 1) { /* resynchronisation */
+            status = RSX_NATIVE_WATCH_SKIPPED;
+        } else if (kind == 2 && s_native_handoffs[i].flips_left) { /* flip */
+            if (--s_native_handoffs[i].flips_left == 0) status = RSX_NATIVE_WATCH_EXPIRED;
+        }
+        if (status <= 0) gcm_native_watch_take(i, status, 0, 0, &reports[n++]);
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned k = 0; k < n; ++k) gcm_native_watch_report_one(&reports[k], get, put);
+}
+int cellGcm_native_handoff_cancel(uint64_t cookie)
+{
+    if (!cookie) return -3;
+    int result = -3;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+        if (s_native_handoffs[i].cookie != cookie) continue;
+        if (s_native_handoffs[i].phase == 3) result = -4;
+        else { gcm_native_handoff_remove(i); result = 0; }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    return result;
+}
+/* 1 waits for the armed actual writer; 0 allows ordinary decoding. */
+static int gcm_native_handoff_consume(u32 ea, u32 get, u32 put)
+{
+    if (!atomic_load_explicit(&s_native_handoff_count, memory_order_acquire)) return 0;
+    rsx_native_handoff_arm source;
+    rsx_native_handoff_ring_arm ring = {0};
+    unsigned ring_writer = 0;
+    uint64_t cookie = 0;
+    unsigned slot = GCM_NATIVE_HANDOFF_CAPACITY;
+    int waiting = 0;
+    gcm_native_watch_report watched;
+    int watch_due = 0;
+    AcquireSRWLockExclusive(&s_native_handoff_lock);
+    for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+        if (!s_native_handoffs[i].phase || s_native_handoffs[i].source.header_ea != ea) continue;
+        if (s_native_handoffs[i].ring_watch) {
+            if (s_native_handoffs[i].phase != 2) break; /* already reporting */
+            const rsx_native_handoff_ring_watch* w = &s_native_handoffs[i].watch;
+            if (s_native_handoffs[i].vm_base_identity != (uintptr_t)vm_base) {
+                gcm_native_watch_take(i, RSX_NATIVE_WATCH_VM_RETIRED, 0, 0, &watched);
+            } else {
+                const uint32_t header = vm_read32(ea), argument = vm_read32(ea + 4);
+                int same = header == w->expected_header && argument == w->expected_argument;
+                for (unsigned n = 0; n < 2; ++n)
+                    if (w->tail_mask[n] &&
+                        ((vm_read32(ea + 8u + 4u * n) ^ w->expected_tail[n]) & w->tail_mask[n]))
+                        same = 0;
+                gcm_native_watch_take(i, same ? RSX_NATIVE_WATCH_ARRIVED : RSX_NATIVE_WATCH_MISMATCH,
+                                      header, argument, &watched);
+            }
+            watch_due = 1;
+            break;
+        }
+        source = s_native_handoffs[i].source;
+        ring_writer = s_native_handoffs[i].ring_writer;
+        if (ring_writer) ring = s_native_handoffs[i].ring;
+        if (s_native_handoffs[i].vm_base_identity != (uintptr_t)vm_base) {
+            gcm_native_handoff_remove(i);
+        } else if (s_native_handoffs[i].phase == 1) {
+            waiting = 1;
+        } else if (s_native_handoffs[i].phase == 2) {
+            if (vm_read32(ea) != source.expected_header || vm_read32(ea + 4) != source.expected_argument) {
+                gcm_native_handoff_remove(i);
+            } else {
+                s_native_handoffs[i].phase = 3;
+                cookie = s_native_handoffs[i].cookie;
+                slot = i;
+            }
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    if (watch_due) gcm_native_watch_report_one(&watched, get, put);
+    if (cookie) {
+        rsx_native_handoff_event event = {0};
+        event.abi_version = RSX_NATIVE_HANDOFF_ABI;
+        event.struct_size = sizeof(event);
+        event.cookie = cookie;
+        event.vm_identity = source.vm_identity;
+        event.vm_base_identity = (uint64_t)(uintptr_t)vm_base;
+        event.source_observation = source.source_observation;
+        event.context_ea = source.context_ea;
+        event.header_ea = ea;
+        event.header = source.expected_header;
+        event.argument = source.expected_argument;
+        event.fifo_get = get;
+        event.fifo_put = put;
+        rsx_draw_engine_native_source_target(&event.target);
+        if (ring_writer) {
+            rsx_native_handoff_ring_event owned = {0};
+            owned.abi_version = RSX_NATIVE_HANDOFF_ABI; owned.struct_size = sizeof(owned);
+            owned.source = event; owned.writer_state_ea = ring.writer_state_ea;
+            owned.ring_begin_ea = ring.ring_begin_ea; owned.ring_bytes = ring.ring_bytes;
+            rsx_fifo_busy_enter(RSX_FIFO_BUSY_HANDOFF);
+            ring.consume(ring.userdata, &owned);
+            rsx_fifo_busy_leave(RSX_FIFO_BUSY_HANDOFF);
+        } else {
+            rsx_fifo_busy_enter(RSX_FIFO_BUSY_HANDOFF);
+            source.consume(source.userdata, &event);
+            rsx_fifo_busy_leave(RSX_FIFO_BUSY_HANDOFF);
+        }
+        AcquireSRWLockExclusive(&s_native_handoff_lock);
+        gcm_native_handoff_remove(slot);
+        ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    }
+    return waiting;
+}
 
 /* Explicitly initialized by the application before guest/consumer threads.
  * Only launch-static diagnostic configuration is frozen. Runtime diagnostic
@@ -122,6 +547,21 @@ static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
 static _Thread_local unsigned s_consumer_depth;
 static int s_deferred_reports;
 static int s_live_report_batch;
+/* PS3RECOMP_RSX_EARLY_LABEL_RELEASE=1 applies label releases and the SDK's
+ * synthesized reports at their FIFO position instead of at GPU completion.
+ * PS3RECOMP_RSX_EARLY_FIFO_SYNC=1 (with it) also stops the FIFO-ordered
+ * SET_REFERENCE, NV406E ACQUIRE and NV0039 copy from waiting for the GPU.
+ * Both rest on two renderer facts (docs/RSX_EARLY_LABEL_RELEASE.md): every
+ * GPU input is copied out of guest memory when it is recorded, and GPU
+ * results reach guest memory only through explicit synchronous readbacks at
+ * their own stream position. Draw-engine deferred path only; default off. */
+static int s_early_release;
+static int s_early_fifo_sync;
+#define GCM_FRAME_RING 16u
+static u64 s_frame_ticket[GCM_FRAME_RING];
+static u64 s_frame_count,s_frame_waits,s_frame_wait_ns,s_frame_wait_max_ns;
+static u32 s_frames_ahead=3;
+static int s_frame_log;
 /* Every queued LIVE record belongs to this one physical renderer lifetime.
  * Cleared only after the entire consumer-owned queue has published. */
 static uint64_t s_report_live_lifetime;
@@ -130,13 +570,17 @@ static rsx_deferred_report_queue s_reports = {.generation=1};
 static u32 s_backend_label_offset;
 static u32 s_backend_label_dma;
 static int gcm_reports_dependency(void);
+static int gcm_engine_report_barrier(void);
 static int gcm_reports_progress(int wait,int issue);
 static int gcm_reports_live(void) { return s_live_report_batch && rsx_live_draw_enabled(); }
 static int gcm_reports_sync_barrier_at(u32 reason);
 #define gcm_reports_sync_barrier() gcm_reports_sync_barrier_at(__LINE__)
 void cellGcm_rsx_consumer_begin(void) {
-    if (s_deferred_reports && s_consumer_depth++ == 0)
+    if (s_deferred_reports && s_consumer_depth++ == 0) {
+        rsx_fifo_busy_enter(RSX_FIFO_BUSY_LEASE_WAIT);
         AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+        rsx_fifo_busy_leave(RSX_FIFO_BUSY_LEASE_WAIT);
+    }
 }
 void cellGcm_rsx_consumer_end(void) {
     if (s_deferred_reports && --s_consumer_depth == 0)
@@ -176,8 +620,31 @@ static void gcm_deferred_initialize(void) {
     { const char *b=getenv("PS3RECOMP_RSX_DEFERRED_REPORT_BATCH");
       const long n=b?strtol(b,NULL,0):0;
       if(n>0&&n<=(long)RSX_DEFERRED_REPORT_CAPACITY)s_reports.batch=(uint32_t)n; }
+    /* PS3RECOMP_RSX_DEFERRED_REPORT_CAPACITY=<n> (default 1024, up to 8192):
+     * how many records may be queued before a push waits for completion. In
+     * early mode applied records stay queued only to verify their completion,
+     * so a larger bound lets the consumer run on while the GPU is behind; the
+     * frames-ahead bound still limits how far. */
+    { const char *c=getenv("PS3RECOMP_RSX_DEFERRED_REPORT_CAPACITY");
+      const long n=c?strtol(c,NULL,0):0;
+      if(n>=(long)RSX_DEFERRED_REPORT_CAPACITY&&n<=(long)RSX_DEFERRED_REPORT_STORAGE)s_reports.capacity=(uint32_t)n;
+      else if(c)fprintf(stderr,"[deferred reports] ignored PS3RECOMP_RSX_DEFERRED_REPORT_CAPACITY=%s (allowed %u..%u)\n",c,RSX_DEFERRED_REPORT_CAPACITY,RSX_DEFERRED_REPORT_STORAGE); }
+    { const char *a=getenv("PS3RECOMP_RSX_EARLY_LABEL_RELEASE"),*y=getenv("PS3RECOMP_RSX_EARLY_FIFO_SYNC");
+      const int want=a&&!strcmp(a,"1"),want_sync=y&&!strcmp(y,"1");
+      if((want||want_sync)&&(!s_deferred_reports||s_live_report_batch))
+          fprintf(stderr,"[early release] refused: requires PS3RECOMP_RSX_DEFERRED_REPORTS=1 on the draw-engine path without PS3RECOMP_GCM_LIVE_REPORT_BATCH\n");
+      else if(want_sync&&!want)
+          fprintf(stderr,"[early release] refused: PS3RECOMP_RSX_EARLY_FIFO_SYNC requires PS3RECOMP_RSX_EARLY_LABEL_RELEASE=1\n");
+      else{s_early_release=want;s_early_fifo_sync=want&&want_sync;}
+      s_reports.early_mode=(uint32_t)s_early_release;
+      { const char *f=getenv("PS3RECOMP_RSX_MAX_FRAMES_AHEAD"),*l=getenv("PS3RECOMP_RSX_INFLIGHT_LOG");
+        if(f){const long n=strtol(f,NULL,0);s_frames_ahead=n<0?0u:n>(long)GCM_FRAME_RING-1?GCM_FRAME_RING-1u:(u32)n;}
+        s_frame_log=l&&!strcmp(l,"1"); }
+      if(s_early_release)
+          fprintf(stderr,"[early release] labels and synthesized reports publish at FIFO position%s; completion still verified; frames ahead of GPU completion bounded to %u%s\n",
+              s_early_fifo_sync?"; SET_REFERENCE/ACQUIRE/NV0039 do not wait for the GPU":"",s_frames_ahead,s_frames_ahead?"":" (unbounded)"); }
     if (s_deferred_reports) {
-        rsx_draw_engine_set_report_barrier(gcm_reports_dependency);
+        rsx_draw_engine_set_report_barrier(gcm_engine_report_barrier);
         if(s_live_report_batch){
             if(!rsx_live_draw_set_report_lease(cellGcm_rsx_consumer_begin,cellGcm_rsx_consumer_end))s_reports.failed=1;
             rsx_live_draw_set_report_barrier(gcm_reports_dependency);
@@ -185,7 +652,7 @@ static void gcm_deferred_initialize(void) {
         ps3_vm_release_guard.begin=gcm_report_vm_begin;
         ps3_vm_release_guard.end=cellGcm_rsx_consumer_end;
         fprintf(stderr,"[deferred reports] enabled batch=%u capacity=%u consumer-owned genuine completion\n",
-            s_reports.batch?s_reports.batch:RSX_DEFERRED_REPORT_BATCH,RSX_DEFERRED_REPORT_CAPACITY);
+            s_reports.batch?s_reports.batch:RSX_DEFERRED_REPORT_BATCH,rsx_reports_capacity(&s_reports));
     }
     s_deferred_initialized=1;
     ReleaseSRWLockExclusive(&s_deferred_init_lock);
@@ -302,6 +769,8 @@ static int gcm_flip_executed_take(void)
     if (s_flip_direct_pending) { s_flip_direct_pending = 0; return 1; }
     return 0;
 }
+static int s_flip_pacing = -1;              /* PS3RECOMP_GCM_FLIP_PACING: -1 unread, 0 fixed, 1 adaptive */
+static void gcm_flip_adaptive_poll(void);   /* below */
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -864,8 +1333,10 @@ void cellGcmSetWaitFlip(void)
 #ifdef _WIN32
     __declspec(dllimport) void __stdcall Sleep(unsigned long);
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++) {
+        if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
         Sleep(1);
+    }
     /* A flip still WAITING after the bound is left to the tick. Forcing DONE
      * here skipped its completion: the tick only completes WAITING flips, so
      * the flip handler never ran for it, and inFAMOUS 2, whose handler writes
@@ -904,6 +1375,7 @@ u32 cellGcmGetFlipStatus(void)
       if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
+    if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
     return s_flip_status;
 }
 
@@ -937,6 +1409,58 @@ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
 
+/* PS3RECOMP_GCM_FLIP_PACING=adaptive (opt-in; unset keeps the fixed beat).
+ *
+ * By default a flip the drain has executed completes on the next 60 Hz beat
+ * (cellGcmTickFlip), so a frame that misses a beat waits for the one after,
+ * and everything the title orders behind its flip waits with it. Adaptive
+ * pacing completes an executed flip as soon as one display period has passed
+ * since the previous completion: at max(execution, last completion + 1/60 s).
+ * It still completes only flips the drain has executed, through the same
+ * pending-completion and delivery path as the beat (status, handler, the
+ * late-delivery and newer-request rules in ppu_gcm_pump), and never more than
+ * one per period. The vblank count, vblank interrupt and handler stay on the
+ * ticker. Completions are polled wherever one may have become possible: after
+ * each drain, on the beat, and while the guest waits on or polls the status. */
+#define GCM_FLIP_PERIOD_NS 16666667ull
+static int s_flip_done_any;
+static uint64_t s_flip_done_ns;
+static unsigned long long s_flip_adaptive_completions;
+static uint64_t gcm_flip_clock_now(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+#endif
+}
+static uint64_t (*s_flip_clock)(void) = gcm_flip_clock_now;   /* tests substitute it */
+static int gcm_flip_adaptive(void)
+{
+    if (s_flip_pacing < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_FLIP_PACING");
+        s_flip_pacing = e && !strcmp(e, "adaptive");
+        if (s_flip_pacing) fprintf(stderr, "[flip pacing] adaptive: an executed flip completes one period after the last\n");
+    }
+    return s_flip_pacing;
+}
+static void gcm_flip_adaptive_poll(void)
+{
+    if (!gcm_flip_adaptive()) return;
+    const uint64_t now = s_flip_clock();
+    FLIP_LOCK();
+    const int due = !s_flip_done_any || now - s_flip_done_ns >= GCM_FLIP_PERIOD_NS;
+    const int waiting = due && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
+    if (waiting) { s_flip_tick_seq = s_flip_req_seq; s_flip_done_ns = now; s_flip_done_any = 1; }
+    FLIP_UNLOCK();
+    if (!waiting) return;
+    GCM_PENDING_SET(2);
+    if (++s_flip_adaptive_completions % 600ull == 0)
+        fprintf(stderr, "[flip pacing] adaptive completions=%llu\n", s_flip_adaptive_completions);
+}
+
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
 static u32 s_fifo_getoff;   /* tentative: defined below */
@@ -944,6 +1468,7 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
 void cellGcm_request_tick(void)
 {
     s_vblank_count++;
+    if (gcm_flip_adaptive()) { GCM_PENDING_SET(1); gcm_flip_adaptive_poll(); return; }
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
      * actually consumed up to `put`.
      *
@@ -1047,6 +1572,7 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
+    if (gcm_flip_adaptive()) { gcm_flip_adaptive_poll(); return; }
     /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
      * not happened yet. */
     FLIP_LOCK();
@@ -1104,6 +1630,8 @@ static uint64_t gph_now(void){
 #if defined(__APPLE__)
     static mach_timebase_info_data_t tb;if(!tb.denom)mach_timebase_info(&tb);
     return mach_absolute_time()*tb.numer/tb.denom;
+#elif defined(_WIN32)
+    return get_timestamp_ns();
 #else
     struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
 #endif
@@ -1138,13 +1666,27 @@ static void gph_label_published(const rsx_deferred_report *r){
     static const uint64_t edge[7]={100000,250000,500000,1000000,2000000,4000000,8000000};
     u32 b=0;while(b<7&&total>=edge[b])b++;s_gph.lab_hist[b]++;
 }
+/* PS3RECOMP_RSX_REPORT_SPURS_KICK=1: a published label wakes whoever watches
+ * its line (the SPURS coordinator, when a title signals a workload flag or
+ * ready count from the command stream) at once, as an SPU commit to that line
+ * does, instead of on the coordinator's next timed pass. Off by default. */
+static int gcm_report_spurs_kick(void){
+    static int on=-1;
+    if(on<0){const char *e=getenv("PS3RECOMP_RSX_REPORT_SPURS_KICK");on=e&&!strcmp(e,"1");}
+    return on;
+}
+static u32 s_lag_ea;   /* PS3RECOMP_RSX_LABEL_LAG target, defined below */
 static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     (void)user;u32 ea;
+    /* A completion receipt carries no guest effect of its own. */
+    if(r->operation==2)return r->vm==(uintptr_t)vm_base;
     if(r->operation&&s_gph_on>0)gph_label_published(r);
     if(r->operation){
         u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);
         if(!vm_base||r->vm!=(uintptr_t)vm_base||(u64)r->ea+4u>limit)return 0;
         vm_write32(r->ea,r->argument);
+        if(gcm_report_spurs_kick()){extern void (*g_host_line_write_hook)(uint32_t);if(g_host_line_write_hook)g_host_line_write_hook(r->ea&~127u);}
+        if(s_lag_ea&&r->ea==s_lag_ea){static unsigned pn;if(pn++<20000u)fprintf(stderr,"[label-lag] t=%llu publish ea=0x%08X method=0x%04X value=0x%08X early=%u\n",(unsigned long long)ps3_critical_now_ns(),r->ea,r->context,r->argument,(unsigned)r->early);}
         ring_note(RSX_RING_VM_PUBLISH,r->ea,r->argument,r->ticket,r->context);
         if(r->start_ns){uint64_t w[5]={r->start_ns,r->ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,20,r->ea,0,w,5);}
         return 1;
@@ -1163,6 +1705,7 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
             if(g_resv_store_active>0)ppu_resv_break_store(address);
         }
         spu_coh_notify_write(ea);spu_lockline_unlock();
+        if(s_lag_ea&&ea<=s_lag_ea&&s_lag_ea-ea<16u){static unsigned rn;if(rn++<20000u)fprintf(stderr,"[label-lag] t=%llu publish ea=0x%08X method=0x1800 value=0x%08X early=%u\n",(unsigned long long)ps3_critical_now_ns(),s_lag_ea,r->argument,(unsigned)r->early);}
     }
     if(r->start_ns){uint64_t w[5]={r->start_ns,ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,PS3_CRITICAL_REPORT,ea,r->index,w,5);}
     return 1;
@@ -1175,7 +1718,7 @@ static uint64_t gcm_report_issue(void *user){
     }
     if(!target)return rsx_draw_engine_submit_async();
     if(target)for(uint32_t i=0;i<s_reports.count;i++){
-        const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_CAPACITY];
+        const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_STORAGE];
         if(r->operation&&r->ea==target&&!r->ticket){selected=target;value=r->argument;break;}
     }
     atomic_store_explicit(&s_ring_issue_value,value,memory_order_relaxed);
@@ -1183,7 +1726,7 @@ static uint64_t gcm_report_issue(void *user){
     uint64_t ticket=rsx_draw_engine_submit_async();
     atomic_store_explicit(&s_ring_issue_ea,0,memory_order_release);
     if(selected&&ticket)for(uint32_t i=0;i<s_reports.count;i++){
-        const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_CAPACITY];
+        const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_STORAGE];
         if(r->operation&&r->ea==selected&&!r->ticket){
             ring_track(r->ea,r->argument,ticket);
             ring_note(RSX_RING_TICKET_BIND,r->ea,r->argument,ticket,s_reports.generation);
@@ -1210,7 +1753,7 @@ static int gcm_reports_progress(int wait,int issue){
     if(target&&atomic_load_explicit(&s_ring_snapshot_target,memory_order_acquire)!=target){
         atomic_store_explicit(&s_ring_snapshot_target,target,memory_order_release);
         for(uint32_t i=0;i<s_reports.count;i++){
-            const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_CAPACITY];
+            const rsx_deferred_report *r=&s_reports.records[(s_reports.head+i)%RSX_DEFERRED_REPORT_STORAGE];
             if(r->operation&&r->ea==target){
                 ring_track(r->ea,r->argument,r->ticket);
                 ring_note(RSX_RING_PENDING_SNAPSHOT,r->ea,r->argument,r->ticket,s_reports.generation);
@@ -1221,6 +1764,7 @@ static int gcm_reports_progress(int wait,int issue){
     int ok=rsx_reports_progress(&s_reports,&s_report_ops,wait,issue);
     if(ok&&!s_reports.count)s_report_live_lifetime=0;
     if(!ok&&!was_failed)fprintf(stderr,"[deferred reports] FAILED; publication stopped pending=%u issued=%llu published=%llu\n",s_reports.count,(unsigned long long)s_reports.issued,(unsigned long long)s_reports.published);
+    if(s_reports.failed&&s_early_fifo_sync&&gcm_checked_ref_mode())gcm_checked_ref_fail("early-release-completion",s_fifo_getoff);
     return ok;
 }
 static int gcm_reports_can_defer(void){
@@ -1244,11 +1788,28 @@ static int gcm_reports_dependency(void){
     cellGcm_rsx_consumer_begin();int ok=gcm_reports_progress(1,1);
     cellGcm_rsx_consumer_end();return ok;
 }
+/* Draw-engine waits (surface/depth readback into guest memory, synchronous
+ * flushes) pass this barrier first. A critical trace records it as kind 19
+ * with a reason outside the source-line range, so the synchronous commit
+ * that follows can be attributed. Diagnostic only; same dependency. */
+#define GCM_BARRIER_ENGINE 0x10000u
+#define GCM_BARRIER_NV0039 0x10039u
+#define GCM_BARRIER_QUIET 0xffffffffu /* caller records its own event */
+static int gcm_engine_report_barrier(void){
+    if(!ps3_critical_enabled()||s_engine_barrier_reason==GCM_BARRIER_QUIET)return gcm_reports_dependency();
+    uint64_t capture=ps3_critical_capture_id(),start=ps3_critical_now_ns();
+    uint64_t pending=s_reports.count,issued=s_reports.issued,published=s_reports.published;
+    int ok=gcm_reports_dependency();
+    uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};
+    ps3_critical_emit_capture(capture,19,s_engine_barrier_reason?s_engine_barrier_reason:GCM_BARRIER_ENGINE,0,w,7);
+    return ok;
+}
 static int gcm_reports_sync_barrier_core(u32 reason);
 static int gcm_reports_sync_barrier_at(u32 reason){
-    if(!gph_enabled())return gcm_reports_sync_barrier_core(reason);
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_SYNC);
+    if(!gph_enabled()){const int ok=gcm_reports_sync_barrier_core(reason);rsx_fifo_busy_leave(RSX_FIFO_BUSY_SYNC);return ok;}
     const uint64_t t0=gph_now();const int ok=gcm_reports_sync_barrier_core(reason);
-    gph_site(reason,gph_now()-t0);return ok;
+    gph_site(reason,gph_now()-t0);rsx_fifo_busy_leave(RSX_FIFO_BUSY_SYNC);return ok;
 }
 static int gcm_reports_sync_barrier_core(u32 reason){
     if(!s_deferred_reports)return 1;
@@ -1256,7 +1817,10 @@ static int gcm_reports_sync_barrier_core(u32 reason){
     uint64_t pending=s_reports.count,issued=s_reports.issued,published=s_reports.published;
     int ok=gcm_reports_dependency();
     if(ok&&rsx_live_draw_enabled())rsx_live_draw_flush();
-    if(ok&&rsx_draw_engine_async_available())ok=rsx_draw_engine_flush_checked()==1;
+    if(ok&&rsx_draw_engine_async_available()){
+        const u32 outer=s_engine_barrier_reason;s_engine_barrier_reason=GCM_BARRIER_QUIET;
+        ok=rsx_draw_engine_flush_checked()==1;s_engine_barrier_reason=outer;
+    }
     if(start){uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};ps3_critical_emit_capture(capture,19,reason,0,w,7);}
     return ok;
 }
@@ -1272,9 +1836,10 @@ static int gcm_reports_sync_barrier_core(u32 reason){
 static int s_inline_no_gpu_wait=-1;
 static int gcm_inline_image_barrier_core(void);
 static int gcm_inline_image_barrier(void){
-    if(!gph_enabled())return gcm_inline_image_barrier_core();
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_SYNC);
+    if(!gph_enabled()){const int ok=gcm_inline_image_barrier_core();rsx_fifo_busy_leave(RSX_FIFO_BUSY_SYNC);return ok;}
     const uint64_t t0=gph_now();const int ok=gcm_inline_image_barrier_core();
-    s_gph.inline_ns+=gph_now()-t0;s_gph.inline_n++;return ok;
+    s_gph.inline_ns+=gph_now()-t0;s_gph.inline_n++;rsx_fifo_busy_leave(RSX_FIFO_BUSY_SYNC);return ok;
 }
 static int gcm_inline_image_barrier_core(void){
     if(s_inline_no_gpu_wait<0){
@@ -1296,9 +1861,108 @@ static int gcm_inline_image_barrier_core(void){
     if(start){uint64_t w[7]={start,pending,issued,s_reports.issued,published,s_reports.published,(uint64_t)ok};ps3_critical_emit_capture(capture,19,__LINE__,0,w,7);}
     return ok;
 }
+/* Early release eligibility. A label's value comes from the command stream.
+ * A diagnostic ring-progress target keeps completion-gated publication, since
+ * its observer treats publication as a GPU receipt; later records then queue
+ * behind it in order. */
+static int gcm_early_label(u32 ea){
+    if(!s_early_release)return 0;
+    const u32 target=ring_target();
+    if(target&&target==ea){
+        static int noted;if(!noted++)fprintf(stderr,"[early release] observed progress word %08X stays completion-gated\n",ea);
+        return 0;
+    }
+    return 1;
+}
+/* gcm_report_publish writes a fixed value per type and a host timestamp: no
+ * report type carries a measured GPU result. A type that someday does must
+ * return 0 here so it publishes only after completion. */
+static int gcm_report_value_synthesized(u32 argument){(void)argument;return 1;}
+static int gcm_early_report(u32 argument){return s_early_release&&gcm_report_value_synthesized(argument);}
+/* Early release removes the GPU waits that used to pace the FIFO, so bound
+ * how far it may run ahead instead: at each FIFO flip, commit the frame's
+ * recorded work asynchronously and keep its ticket; before the next frame
+ * proceeds, wait until the frame PS3RECOMP_RSX_MAX_FRAMES_AHEAD (default 3,
+ * 0 = unbounded) flips back has genuinely completed. One in-order queue, so
+ * that also covers any other renderer's work queued before it. */
+static uint64_t gcm_bound_now(void){
+#ifdef _WIN32
+    LARGE_INTEGER c,f;QueryPerformanceCounter(&c);QueryPerformanceFrequency(&f);
+    return (uint64_t)(c.QuadPart/f.QuadPart)*1000000000ull+(uint64_t)(c.QuadPart%f.QuadPart)*1000000000ull/(uint64_t)f.QuadPart;
+#else
+    struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;
+#endif
+}
+static void gcm_frame_bound(void){
+    if(!s_early_release||!s_frames_ahead||s_reports.failed||!rsx_draw_engine_async_available())return;
+    const u64 ticket=rsx_draw_engine_submit_async();
+    if(!ticket)return; /* mid-primitive or failed: the failure path reports itself */
+    s_frame_ticket[s_frame_count%GCM_FRAME_RING]=ticket;++s_frame_count;
+    int waited=0;
+    if(s_frame_count>s_frames_ahead){
+        const u64 old=s_frame_ticket[(s_frame_count-1u-s_frames_ahead)%GCM_FRAME_RING];
+        int ready=rsx_draw_engine_completion_status(old,0);
+        if(ready==0){
+            const uint64_t t0=gcm_bound_now();
+            ready=rsx_draw_engine_completion_status(old,1);
+            const uint64_t dt=gcm_bound_now()-t0;
+            ++s_frame_waits;s_frame_wait_ns+=dt;if(dt>s_frame_wait_max_ns)s_frame_wait_max_ns=dt;waited=1;
+        }
+        if(ready<0)s_reports.failed=1;
+    }
+    static uint64_t last;const uint64_t now=gcm_bound_now();
+    if((s_frame_log||waited)&&(!last||now-last>=2000000000ull)){
+        last=now;
+        fprintf(stderr,"[rsx inflight gcm] frames=%llu bound=%u waits=%llu wait_ms=%.1f max_wait_ms=%.2f reports_pending=%u gated=%u max_pending=%u applied_early=%llu capacity=%u capacity_waits=%llu\n",
+            (unsigned long long)s_frame_count,s_frames_ahead,(unsigned long long)s_frame_waits,s_frame_wait_ns/1e6,s_frame_wait_max_ns/1e6,
+            s_reports.count,s_reports.gated,s_reports.max_pending,(unsigned long long)s_reports.applied_early,
+            rsx_reports_capacity(&s_reports),(unsigned long long)s_reports.capacity_waits);
+    }
+}
+/* Early SET_REFERENCE: commit the work recorded so far without waiting, and
+ * queue a receipt so its genuine completion is still verified. A later
+ * failure freezes certification (gcm_reports_progress). */
+static int gcm_early_reference_receipt(void){
+    extern u32 g_rsx_last_reference;
+    if(s_reports.failed||!gcm_checked_backend_ready())return 0;
+    rsx_deferred_report r={0};r.operation=2;r.context=0x50u;r.argument=g_rsx_last_reference;r.vm=(uintptr_t)vm_base;
+    r.capture=ps3_critical_capture_id();
+    return gcm_reports_admit()&&rsx_reports_enqueue_early(&s_reports,&s_report_ops,r)&&rsx_reports_issue(&s_reports,&s_report_ops);
+}
+/* PS3RECOMP_RSX_LABEL_LAG=<hex EA> (opt-in diagnostic, numbers only): for label
+ * writes (semaphore releases of either class) that land on that guest word, print when the FIFO
+ * consumes each one (critical-trace clock) and the command's get offset; from
+ * the first such release, a sampler prints every change of the guest put
+ * pointer for 40 s, so the time put passed each release can be found offline. */
+static u32 s_lag_ea=1u;
+static int s_lag_sampler;
+static DWORD WINAPI gcm_lag_sampler(LPVOID unused){
+    (void)unused;u32 last=0xFFFFFFFFu;unsigned lines=0;
+    const uint64_t end=ps3_critical_now_ns()+40ull*1000000000ull;
+    while(ps3_critical_now_ns()<end&&lines<400000u){
+        const u32 put=vm_read32(GCM_CONTROL_GUEST_ADDR+0);
+        if(put!=last){last=put;lines++;fprintf(stderr,"[label-lag] t=%llu put=0x%08X\n",(unsigned long long)ps3_critical_now_ns(),put);}
+#ifdef _WIN32
+        Sleep(0);
+#else
+        {const struct timespec ts={0,20000};nanosleep(&ts,NULL);}
+#endif
+    }
+    return 0;
+}
+static void gcm_label_lag_note(u32 ea,u32 method,u32 value){
+    if(s_lag_ea==1u){const char *e=getenv("PS3RECOMP_RSX_LABEL_LAG");s_lag_ea=e&&*e?(u32)strtoul(e,0,16):0u;}
+    if(!s_lag_ea||ea!=s_lag_ea)return;
+    if(!s_lag_sampler){s_lag_sampler=1;HANDLE h=CreateThread(NULL,0,gcm_lag_sampler,NULL,0,NULL);if(h)CloseHandle(h);}
+    static unsigned n;
+    if(n++<20000u)fprintf(stderr,"[label-lag] t=%llu consume ea=0x%08X method=0x%04X value=0x%08X get=0x%08X\n",
+        (unsigned long long)ps3_critical_now_ns(),ea,method,value,s_fifo_getoff);
+}
 /* Label writes retain the existing value/byte-order semantics, but release
- * guest reuse only after the same genuine ordered GPU completion as reports. */
+ * guest reuse only after the same genuine ordered GPU completion as reports,
+ * unless early release applies them at their stream position. */
 static int gcm_defer_label_get(u32 ea,u32 value,u32 method,u32 fifo_ea,u32 get_before_publish){
+    if(s_lag_ea)gcm_label_lag_note(ea,method,value);
     if(!gcm_reports_admit())return 0;
     ring_note(RSX_RING_DECODE,ea,value,0,((uint64_t)method<<32)|fifo_ea);
     rsx_deferred_report r={0};r.operation=1;r.main_memory=1;
@@ -1311,7 +1975,7 @@ static int gcm_defer_label_get(u32 ea,u32 value,u32 method,u32 fifo_ea,u32 get_b
      * an NV406E RELEASE when a guest observes its label. */
     if(get_before_publish)vm_write32(GCM_CONTROL_GUEST_ADDR+4,get_before_publish);
     unsigned failed=s_reports.failed;
-    int ok=rsx_reports_enqueue(&s_reports,&s_report_ops,r);
+    int ok=gcm_early_label(ea)?rsx_reports_enqueue_early(&s_reports,&s_report_ops,r):rsx_reports_enqueue(&s_reports,&s_report_ops,r);
     ring_note(RSX_RING_ENQUEUE,ea,value,0,((uint64_t)(ok!=0)<<63)|s_reports.count);
     if(!ok&&!failed)fprintf(stderr,"[deferred reports] label enqueue FAILED; publication stopped\n");
     return ok;
@@ -1342,11 +2006,13 @@ static void gcm_get_report(u32 argument){
     r.start_ns=ps3_critical_enabled()?ps3_critical_now_ns():0;
     r.main_memory=r.context!=GCM_REPORT_DMA_LOCAL;
     if(!gcm_report_destination(argument,r.context,&r.ea))goto invalid;
+    if(s_lag_ea&&r.main_memory&&r.ea<=s_lag_ea&&s_lag_ea-r.ea<16u)gcm_label_lag_note(s_lag_ea,0x1800u,argument);
     {static unsigned reports;if(reports++<6)printf("[GET_REPORT] type=%u idx=%u context=%08X ea=%08X%s\n",argument>>24,r.index,r.context,r.ea,r.main_memory?"":" host-only");}
     if(gcm_reports_can_defer()){
         if(!gcm_reports_admit())goto invalid;
         unsigned failed=s_reports.failed;
-        if(!rsx_reports_enqueue(&s_reports,&s_report_ops,r)&&!failed)
+        const int ok=gcm_early_report(argument)?rsx_reports_enqueue_early(&s_reports,&s_report_ops,r):rsx_reports_enqueue(&s_reports,&s_report_ops,r);
+        if(!ok&&!failed)
             fprintf(stderr,"[deferred reports] enqueue FAILED; publication stopped pending=%u\n",s_reports.count);
         return;
     }
@@ -2012,7 +2678,10 @@ static void nv0039_copy(const u32 v[8])
     /* Order prior draws before the guest resource mutation. This does not
      * materialize GPU-only render targets in guest memory. */
     if(gcm_reports_live()&&!gcm_reports_dependency()){free(snapshot);return;}
-    if(rsx_draw_engine_enabled()) rsx_draw_engine_flush();
+    /* Early FIFO sync: recorded draws already own copies of their inputs, so
+     * only unapplied reports must precede the copy. */
+    if(s_early_fifo_sync){if(!gcm_reports_dependency()){free(snapshot);return;}}
+    else if(rsx_draw_engine_enabled()){s_engine_barrier_reason=GCM_BARRIER_NV0039;rsx_draw_engine_flush();s_engine_barrier_reason=0;}
     if(rsx_live_draw_enabled()) rsx_live_draw_flush();
     for(u32 row=0;row<rows;row++) {
         int64_t off=(int64_t)v[0]+(int64_t)in_pitch*row;
@@ -2199,6 +2868,7 @@ static u32 gcm_spu_block_for_put(u32 put)
  * is not, it deadlocks the title. Sweep the skipped range first. */
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
+    gcm_native_watch_sweep(1, 0, 0, *getoff, put); /* a resync may skip any header */
     if (gcm_checked_ref_mode()) { gcm_checked_ref_fail(why, *getoff); return; }
     static int n = 0;
     if (PS3_LOG_FIRST(n, 8))
@@ -2402,8 +3072,10 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     static int on = -1;
     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+    rsx_fifo_busy_idle_begin();
     if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
+    rsx_fifo_busy_idle_end();
 }
 
 
@@ -2559,6 +3231,8 @@ static void wprof_note_walker(void) {}
 void cellGcm_rsx_process_fifo(void)
 {
     wprof_note_walker();
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAIN);
+    rsx_fifo_busy_pass_stopped(RSX_FIFO_BUSY_STOP_OTHER);   /* a pass that returns early */
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     if(!s_deferred_reports){
         AcquireSRWLockExclusive(&s_gcm_fifo_lock);gcm_rsx_process_fifo_unlocked();ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
@@ -2575,6 +3249,8 @@ void cellGcm_rsx_process_fifo(void)
         if (t1 - ft_t0 >= ps3_ft_min_ns())
             ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
     }
+    if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAIN);
 }
 
 /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
@@ -2770,6 +3446,7 @@ static void gcm_rsx_process_fifo_pass(void)
                             s_fifo_getoff, put);
             }
             if (gcm_checked_ref_mode()) { gcm_checked_ref_fail("no-io-mapping", s_fifo_getoff); break; }
+            gcm_native_watch_sweep(1, 0, 0, s_fifo_getoff, put);
             s_fifo_getoff = put;
             /* Whatever the walker had not reached is gone, and so are the flips
              * queued in it: none of them will ever be executed, so do not let a
@@ -2777,6 +3454,9 @@ static void gcm_rsx_process_fifo_pass(void)
             s_fifo_flips_reached = s_fifo_flips_queued;
             why = "no-io-mapping";
             break;
+        }
+        if (gcm_native_handoff_consume(ea, s_fifo_getoff, put)) {
+            why = "native-source-publication"; producer_waiting = 1; break;
         }
         u32 w = vm_read32(ea);
         gcm_observer_packet(s_fifo_getoff,w,put);
@@ -2843,6 +3523,7 @@ static void gcm_rsx_process_fifo_pass(void)
                           flips, 10); }
             if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                                ps3_ft_span(PS3_FT_FLIP_FIFO, 0, w & 7u, 0, t, t); }
+            rsx_fifo_busy_flip();
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
@@ -2854,6 +3535,8 @@ static void gcm_rsx_process_fifo_pass(void)
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
+            gcm_frame_bound();
+            gcm_native_watch_sweep(2, 0, 0, s_fifo_getoff, put);
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
              * behind it is a deadlock, because the title's ring can only be
@@ -2928,6 +3611,7 @@ static void gcm_rsx_process_fifo_pass(void)
                   break;
               }
               gcm_observer_branch(s_fifo_getoff,"jump",tgt);
+              gcm_native_watch_sweep(0, ea, gcm_io2ea(tgt), s_fifo_getoff, put);
               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
               s_fifo_getoff = tgt;
               /* get is the RSX's fetch pointer: a title polling it sees the
@@ -3014,7 +3698,9 @@ static void gcm_rsx_process_fifo_pass(void)
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
                     { static int sn = 0, recdbg = -1; if (gcm_env_flag(&recdbg, "GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
-                    if(m==0x68u&&!gcm_reports_sync_barrier()){sem_blocked=1;break;}
+                    /* Early FIFO sync: every release an ACQUIRE can depend on
+                     * has already been applied, so no GPU wait is needed. */
+                    if(m==0x68u&&!(s_early_fifo_sync?gcm_reports_dependency():gcm_reports_sync_barrier())){sem_blocked=1;break;}
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
                     if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
@@ -3242,7 +3928,7 @@ static void gcm_rsx_process_fifo_pass(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    if(m==0x50u && !(gcm_checked_ref_mode()?gcm_reports_dependency():gcm_reports_sync_barrier()))return;
+                    if(m==0x50u && !((s_early_fifo_sync||gcm_checked_ref_mode())?gcm_reports_dependency():gcm_reports_sync_barrier()))return;
                     if(m==0x1d6cu)s_backend_label_offset=vm_read32(dea);
                     if(m==0x1a4u)s_backend_label_dma=vm_read32(dea);
                     if((m==0x1d70u||m==0x1d74u)&&gcm_reports_can_defer()){
@@ -3268,8 +3954,8 @@ static void gcm_rsx_process_fifo_pass(void)
                     if (m == 0x50) {
                         if(gcm_checked_ref_mode() && (count!=1 || method!=0x50)){gcm_checked_ref_fail("malformed-reference",s_fifo_getoff);continue;}
                         if (gcm_checked_ref_mode() &&
-                            !gcm_checked_backend_flush())
-                            gcm_checked_ref_fail("backend-completion", s_fifo_getoff);
+                            !(s_early_fifo_sync ? gcm_early_reference_receipt() : gcm_checked_backend_flush()))
+                            gcm_checked_ref_fail(s_early_fifo_sync ? "early-reference-receipt" : "backend-completion", s_fifo_getoff);
                         else gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
                     }
                     if (m == 0x1A8u) {
@@ -3357,6 +4043,10 @@ static void gcm_rsx_process_fifo_pass(void)
      * ring start, and the resync dropped them: inFAMOUS 2 stopped presenting
      * for good that way in about one New Marais run in five ("stuck-get" at a
      * self-jump with no "jump-park" before it). */
+    rsx_fifo_busy_pass_stopped(s_sema_blocked_pass ? RSX_FIFO_BUSY_STOP_SEMA :
+                               producer_waiting ? RSX_FIFO_BUSY_STOP_WRITER :
+                               (!s_park_pass && s_fifo_getoff == put) ? RSX_FIFO_BUSY_STOP_PUT :
+                               RSX_FIFO_BUSY_STOP_OTHER);
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
       if (s_sema_blocked_pass || s_park_pass || producer_waiting) {
           stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
@@ -3369,6 +4059,12 @@ static void gcm_rsx_process_fifo_pass(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
+    if (s_lag_ea && s_lag_ea != 1u && s_lag_sampler) {
+        static unsigned ln;
+        if (ln++ < 60000u)
+            fprintf(stderr, "[label-lag] t=%llu pass why=%s start=0x%08X end=0x%08X put=0x%08X\n",
+                    (unsigned long long)ps3_critical_now_ns(), why, start_off, s_fifo_getoff, put);
+    }
     if (gcm_drain_debug()) {
         static int n2 = 0;
         if (n2++ % s_drain_every == 0)
@@ -4372,6 +5068,36 @@ u32 cellGcmResolveIO(u32 offset)
             return ((u32)ea_page << 20) | (offset & 0xFFFFF);
     }
     return 0;
+}
+
+s32 cellGcmNativeReadLocatedRange(u32 location,u32 offset,u32 requested,
+                                u32* host_ea,u32* host_bytes)
+{
+    if (!host_ea || !host_bytes || host_ea == host_bytes || !s_gcm_initialized ||
+        !requested || (u64)offset + requested > 0x100000000ull)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    u32 ea, bytes;
+    if (location == CELL_GCM_LOCATION_LOCAL) {
+        if (!s_config.localAddress || (u64)offset + requested > s_config.localSize ||
+            (u64)s_config.localAddress + offset + requested > 0x100000000ull)
+            return CELL_GCM_ERROR_INVALID_VALUE;
+        ea = s_config.localAddress + offset;
+        bytes = requested;
+    } else if (location == CELL_GCM_LOCATION_MAIN) {
+        const u32 page = offset >> 20;
+        const u16 mapped = s_ea_address_table[page];
+        if (mapped >= GCM_OFFSET_TABLE_PAGES)
+            return CELL_GCM_ERROR_INVALID_VALUE;
+        ea = ((u32)mapped << 20) | (offset & 0xFFFFFu);
+        bytes = 0x100000u - (offset & 0xFFFFFu);
+        if (bytes > requested) bytes = requested;
+    } else return CELL_GCM_ERROR_INVALID_VALUE;
+    if (ea < 0x10000u || (u64)ea + bytes > 0x100000000ull ||
+        (ppu_vm_size && (u64)ea + bytes > ppu_vm_size))
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    *host_ea = ea;
+    *host_bytes = bytes;
+    return CELL_OK;
 }
 
 /* Location-aware resolve. RSX offsets are TWO overlapping number spaces --

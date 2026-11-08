@@ -17,6 +17,7 @@
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
 #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
+#define PPU_NO_INLINE_STORES  /* likewise for the inline stores (tools/ppu_header_inline.py) */
 #include <chrono>
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */

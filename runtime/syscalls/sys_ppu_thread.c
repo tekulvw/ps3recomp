@@ -22,6 +22,7 @@ static PPU_TLS int     s_exit_armed = 0;
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"
+#include "../diagnostics/original_work_threads.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
 #include "ps3emu/ps3_tprof.h"            /* PS3_TPROF: in-process thread samples */
@@ -515,7 +516,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         if (pthread_attr_setstacksize(&attr, PPU_HOST_STACK_BYTES) == 0) {
-            rc = pthread_create(&t->host_thread, &attr, ppu_host_thread_proc, t);
+            rc = ps3_original_pthread_create(&t->host_thread, &attr, ppu_host_thread_proc, t);
         } else {
             rc = EINVAL;
         }
@@ -529,7 +530,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
                             "falling back to the default\n",
                     (unsigned long long)thread_id,
                     (size_t)(PPU_HOST_STACK_BYTES / (1024 * 1024)), rc);
-            rc = pthread_create(&t->host_thread, NULL, ppu_host_thread_proc, t);
+            rc = ps3_original_pthread_create(&t->host_thread, NULL, ppu_host_thread_proc, t);
         }
     }
     if (rc != 0) {

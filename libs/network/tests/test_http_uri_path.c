@@ -16,6 +16,7 @@
 int main(void) { puts("SKIP: POSIX sockets only"); return 0; }
 #else
 #include "../cellHttp.c"
+#include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
 #include <arpa/inet.h>
 
 uint8_t* vm_base;

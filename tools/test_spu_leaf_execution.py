@@ -2,7 +2,7 @@
 """Generated raw blocks match real interpreter GPR/LS/control state."""
 import pathlib,subprocess,tempfile,os,sys,json,struct
 from spu_leaf_blocks import emit
-r=pathlib.Path(__file__).resolve().parents[1];s=r/'runtime/spu';u=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap','spurs_policy_blob_weak','spu_interp']
+r=pathlib.Path(__file__).resolve().parents[1];s=r/'runtime/spu';u=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap','spurs_policy_blob_weak','spu_interp', '../diagnostics/job_io_recorder']
 e={k:v for k,v in os.environ.items()if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
 words=[0x1c000000|(1<<14)|(20<<7)|20,0x34000000|(10<<7)|9,0x24000000|(1<<14)|(10<<7)|9,0xe0000000|(33<<21)|(31<<14)|(30<<7)|32,0xb0000000|(34<<21)|(11<<14)|(9<<7)|13,0x1c000000|(0x3ff<<14)|(8<<7)|8,0x21000000|(((-6)&0xffff)<<7)|8,0x35000000|(6<<7),0x40200000]
 blob=struct.pack('>9I',*words);bounds=[(0x10000,0x1001c),(0x1001c,0x10020)]

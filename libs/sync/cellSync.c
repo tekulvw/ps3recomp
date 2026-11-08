@@ -421,6 +421,7 @@ static int sq_apply(uint32_t q, sq_op op, uint32_t* pos)
 {
     uint32_t depth = vm_read32(q + 0x0C);
     spu_lockline_lock();
+    { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(q, 8); }
     uint32_t x0 = vm_read32(q), x4 = vm_read32(q + 4);
     int ok = op(&x0, &x4, depth, pos);
     if (ok) {
@@ -435,6 +436,7 @@ static int sq_apply(uint32_t q, sq_op op, uint32_t* pos)
 static void sq_and(uint32_t q, uint32_t m0, uint32_t m4)
 {
     spu_lockline_lock();
+    { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(q, 8); }
     uint32_t raw[2] = { ps3_bswap32(vm_read32(q) & m0), ps3_bswap32(vm_read32(q + 4) & m4) };
     memcpy(vm_ptr8(q), raw, 8);
     if (spu_coh_is_reserved(q)) spu_coh_notify_write(q);

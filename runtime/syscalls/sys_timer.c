@@ -15,6 +15,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
+#ifndef _WIN32
+#include <sched.h>
+#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -258,7 +261,29 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         } while (qpc_now.QuadPart < qpc_deadline);
     }
 #else
-    if (usec > 0) {
+    /* PS3RECOMP_USLEEP_SPIN_US=<n> (opt-in, default 0 = off): a usleep shorter
+     * than n microseconds yields to a precise deadline instead of calling
+     * nanosleep, as the Windows branch above does for sub-millisecond waits.
+     * A nanosleep of 1-10 us -- the game's job-wait polls -- returns only after
+     * the kernel's timer slack (50 us by default on Linux) and a wakeup, so the
+     * poll sees a finished job tens of microseconds late every time. Yielding
+     * keeps the core available to a sibling thread the guest waits on. */
+    static long s_spin_us = -1;
+    if (s_spin_us < 0) {
+        const char* e = getenv("PS3RECOMP_USLEEP_SPIN_US");
+        long v = e ? strtol(e, NULL, 10) : 0;
+        s_spin_us = v > 0 ? v : 0;
+        if (s_spin_us) fprintf(stderr, "[sys_timer] usleep below %ld us yields to its deadline\n", s_spin_us);
+    }
+    if (usec > 0 && usec < (uint64_t)s_spin_us) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const uint64_t deadline = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec + usec * 1000ull;
+        do {
+            sched_yield();
+            clock_gettime(CLOCK_MONOTONIC, &now);
+        } while ((uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec < deadline);
+    } else if (usec > 0) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
         ts.tv_nsec = (long)((usec % 1000000) * 1000);

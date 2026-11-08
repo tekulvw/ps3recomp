@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 root=Path(__file__).resolve().parents[1]
 spu=root/'runtime/spu'
-units=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap','spurs_policy_blob_weak','spu_interp']
+units=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap','spurs_policy_blob_weak','spu_interp', '../diagnostics/job_io_recorder']
 env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
 with tempfile.TemporaryDirectory(prefix='spu-entry-override-') as td:
     for sanitize in (False,True):

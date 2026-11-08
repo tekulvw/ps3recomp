@@ -17,6 +17,7 @@
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
 #include "../../runtime/syscalls/sys_memory_native.h"
+#include "rsx_native_handoff.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -465,6 +466,15 @@ u32 cellGcmGetReportDataLocation(u32 index, u32 location);
  * Unmap requires a nonblocking, non-reentrant proof that producer/output/GPU
  * use is quiescent and no new use can begin. Refusal changes no mapping.
  * Release owned mappings/allocations before GCM or VM teardown. */
+/* Host-only checked source translation: LOCAL0 or MAIN1. Returns one mapped
+ * contiguous piece (MAIN stops at the current1MiB IO-page boundary), never an
+ * offset-space guess. These are HOST output pointers, unlike the guest-EA
+ * output of cellGcmGetConfiguration. On failure outputs stay unchanged.
+ * No guest memory is read/written and no mapping/allocation is retained. Caller
+ * must keep the real VM/mapping source window valid through its bounded copy;
+ * this translation alone is not a streaming-publication/lifetime certificate. */
+s32 cellGcmNativeReadLocatedRange(u32 location,u32 offset,u32 requested,
+                                u32* host_ea,u32* host_bytes);
 typedef struct CellGcmNativeOutputMapping {
     sys_memory_native_allocation allocation;
     u32 io;

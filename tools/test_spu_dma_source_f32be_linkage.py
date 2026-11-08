@@ -33,7 +33,10 @@ int main() {{
 }}
 ''')
         binary = tmp/'probe'
-        subprocess.run([cpp, '-std=gnu++17', '-O1', '-I'+str(root/'include'),
+        # spu_dma.h spells two function-local TLS counters with C11 _Thread_local,
+        # which g++ rejects in C++ (clang accepts it); map it to the C++ keyword
+        # here rather than change the runtime header in a test-only fix.
+        subprocess.run([cpp, '-std=gnu++17', '-O1', '-D_Thread_local=thread_local', '-I'+str(root/'include'),
                         '-I'+str(root/'runtime/spu'), str(source), str(clock_obj), '-o', str(binary)], check=True)
         result = subprocess.run([str(binary)], env=env, capture_output=True, text=True, check=True, timeout=5)
         assert 'words=1 finite=1 nonzero=1 nonfinite=0 peak=0.5' in result.stderr, result.stderr

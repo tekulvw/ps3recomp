@@ -1,0 +1,45 @@
+name: Explicit Metal frontend
+on:
+  push:
+    branches: [main, master, codex/render-frontend-api]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      require_hardware:
+        description: Run strict native Metal hardware fixture in addition to compilation
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  compile:
+    name: Metal source-bound fixture build
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: '1.99.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Pinned authored shader tool and synthetic inputs
+        uses: actions/checkout@v4
+        with:
+          repository: tekulvw/mag-recomp
+          ref: 33f0ad6f26dc2d951a6b937c28a1b1383ae7ddd4
+          path: frontend-shader-source
+          persist-credentials: false
+      - name: Pinned shader toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Generate source-bound MSL and manifests
+        run: |
+          cargo fetch --manifest-path frontend-shader-source/crates/mag-render-shaders/Cargo.toml --locked
+          cargo build --manifest-path frontend-shader-source/crates/mag-render-shaders/Cargo.toml --locked --offline
+          frontend-shader-source/crates/mag-render-shaders/target/debug/mag-render-shaders --source frontend-shader-source/shaders/render_frontend/copy_transform.wgsl --out-dir build/frontend-shaders/copy_transform
+          frontend-shader-source/crates/mag-render-shaders/target/debug/mag-render-shaders --source frontend-shader-source/shaders/render_frontend/compact.wgsl --out-dir build/frontend-shaders/compact
+      - name: Compile explicit native fixture (execution remains pending)
+        run: python tools/test_frontend_metal.py --shader-root build/frontend-shaders --build-only
+      - name: Strict native hardware validation when explicitly requested
+        if: github.event_name == 'workflow_dispatch' && inputs.require_hardware
+        run: python tools/test_frontend_metal.py --shader-root build/frontend-shaders

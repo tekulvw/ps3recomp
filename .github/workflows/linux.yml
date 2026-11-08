@@ -94,6 +94,8 @@ jobs:
         run: |
           set -e
           for t in tools/test_*.py; do
+            # Explicit shader-bound native fixtures have dedicated workflows.
+            case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py|tools/test_vulkan_present_cost.py) continue ;; esac
             echo "--- $t"
             python "$t"
           done
@@ -317,13 +319,13 @@ jobs:
           # holding still while constants change, and restart cuts bounding
           # every topology expansion. No GPU and no host graphics API, so this
           # is where those get checked at all.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_fifo_busy.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread
           /tmp/test_rsx_draw_engine
           # The vertex fetch plan's stable ranges against the per-attribute
           # walk they are now computed without.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
           /tmp/test_vertex_fetch_plan
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_fifo_busy.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread
           /tmp/test_color_feedback_engine
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
@@ -434,6 +436,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/diagnostics/job_io_recorder.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_signalled_atomic
@@ -451,6 +454,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/diagnostics/job_io_recorder.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_taskset_bits_atomic
@@ -498,6 +502,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/diagnostics/job_io_recorder.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_mfc_slots
@@ -516,6 +521,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/diagnostics/job_io_recorder.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_job_stack

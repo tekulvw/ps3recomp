@@ -18,7 +18,7 @@ ROOT=pathlib.Path(__file__).resolve().parents[1]
 SPU=ROOT/'runtime/spu'
 COMMON=['spu_drain.c','spu_lockstep.c','spu_coherency.c','spu_workload.c',
         'spurs_policy.c','spurs_job.c','spu_tsp_weak.c','spu_vm_pagemap.c',
-        'spurs_policy_blob_weak.c','spu_interp.c']
+        'spurs_policy_blob_weak.c','spu_interp.c', '../diagnostics/job_io_recorder.c']
 
 def ai(reg):
     return 0x1c000000|(1<<14)|(reg<<7)|reg

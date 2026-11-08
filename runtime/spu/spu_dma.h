@@ -25,6 +25,7 @@
 #include "spu_dma_disposition.h"
 #include "../diagnostics/critical_write_trace.h"
 #include <stdint.h>
+#include <time.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -209,11 +210,55 @@ static inline void spu_dma_resident_text(const spu_context* spu, char* out, size
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
  */
+/* PS3RECOMP_SPU_PUT_WATCH=<hex EA> (opt-in, numbers only): report every PUT,
+ * list-element PUT or SDCRZ whose guest range covers that word, before it
+ * lands, with the issuing SPU's image, pc, link and the streamed job image
+ * whose code it is running. Unlike SPU_WATCHEA (checked once per submitted
+ * command, so a list's elements escape it) this runs per element. Capped. */
+#if defined(__GNUC__)
+__attribute__((noinline, cold))
+#endif
+static void spu_put_watch_hit(const spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size,
+                              uint32_t cmd, uint32_t watch)
+{
+    static unsigned s_hits;
+    if (__atomic_fetch_add(&s_hits, 1u, __ATOMIC_RELAXED) >= 20000u) return;
+    const uint32_t off = watch - (uint32_t)ea;
+    const uint8_t* now = vm_base + watch;
+    uint32_t before = (uint32_t)now[0] << 24 | (uint32_t)now[1] << 16 | (uint32_t)now[2] << 8 | now[3];
+    uint32_t after = 0;
+    if ((cmd & 0xFFFFu) != MFC_SDCRZ_CMD) {
+        const uint8_t* src = spu->ls + ((lsa + off) & SPU_LS_MASK);
+        after = (uint32_t)src[0] << 24 | (uint32_t)src[1] << 16 | (uint32_t)src[2] << 8 | src[3];
+    }
+    int code_image = 0;
+    const uint32_t pc = spu->pc & SPU_LS_MASK;
+    for (unsigned i = 0; i < 4; ++i)
+        if (spu->resident_code[i].image_id && pc >= spu->resident_code[i].lsa &&
+            pc - spu->resident_code[i].lsa < spu->resident_code[i].size) { code_image = spu->resident_code[i].image_id; break; }
+    struct timespec ts;
+#ifdef _WIN32
+    timespec_get(&ts, TIME_UTC);   /* no clock_gettime on Windows toolchains; ordering only */
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    fprintf(stderr, "[spu-put-watch] t=%llu spu=%u image=%d pc=0x%05X lr=0x%05X job_image=%d cmd=0x%02X ea=0x%08X lsa=0x%05X size=%u word=0x%08X before=0x%08X after=0x%08X\n",
+            (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec,
+            spu->spu_id, spu->image_id, pc, spu->gpr[0]._u32[0] & SPU_LS_MASK, code_image, cmd & 0xFFu,
+            (uint32_t)ea, lsa & SPU_LS_MASK, size, watch, before, after);
+}
+
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
     spu_dma_disposition_token disposition;
     spu_dma_disposition_begin(&disposition, lsa, ea, size, cmd);
+    { static uint32_t s_pw = 1u;   /* 1: not read yet */
+      if (s_pw == 1u) { const char* e = getenv("PS3RECOMP_SPU_PUT_WATCH");
+                        s_pw = e && *e ? (uint32_t)strtoul(e, 0, 16) & ~3u : 0u; }
+      if (s_pw && (mfc_is_put(cmd) || (cmd & 0xFFFFu) == MFC_SDCRZ_CMD) &&
+          !(ea >> 32) && (uint32_t)ea <= s_pw && s_pw - (uint32_t)ea < size)
+          spu_put_watch_hit(spu, lsa, ea, size, cmd, s_pw); }
     unsigned copy_disposition = SPU_DMA_DISPOSITION_NONE;
     /* Upper16 command-channel bits carry replacement/transfer class IDs. */
     if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {

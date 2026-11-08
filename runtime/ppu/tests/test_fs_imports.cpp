@@ -14,6 +14,7 @@
  * Driven by tools/test_ppu_fs_imports.py (writes the stub ppu_recomp.h).
  */
 #include "ppu_fs.cpp"
+#include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
 #include <vector>
 
 /* ---- link stubs: nothing on the paths this test drives calls them ---- */
@@ -28,6 +29,7 @@ void ydkj_host_bt(const char* tag) { (void)tag; }
 }
 ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
 const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
+const char* edat_resolve_open(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
 
 struct Reg { uint32_t nid; const char* name; void (*fn)(ppu_context*); };
 static std::vector<Reg> g_regs;
