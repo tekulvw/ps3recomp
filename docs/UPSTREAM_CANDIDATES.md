@@ -28,31 +28,32 @@ otherwise; "mag-recomp" means the downstream port that pins this fork.
 |---|---|---|
 | Q1 | Our four open PRs (#661, #662, #663, #665) | PR open #661, #662, #663, #665 (all four re-checked as still needed, rebased onto v0.19.0 and marked ready for review on 2026-11-08; tests re-run on the new base) |
 | Q2 | glibc static TLS: thread stacks that are too small | PR open #720 |
-| Q3 | 4 GB-aligned POSIX guest arena in the project template | not started |
-| Q4 | Opt-in short-usleep yield on POSIX | not started |
-| Q5 | SPU task thread pool | not started |
+| Q3 | 4 GB-aligned POSIX guest arena in the project template | PR open #723 (POSIX only; the Windows template arena has the same 64K-alignment gap, not yet sent) |
+| Q4 | Opt-in short-usleep yield on POSIX | PR open #725 |
+| Q5 | SPU task thread pool | PR open #733 |
 | Q6 | Single present per flip | PR open #721 (SDK half; `PS3RECOMP_RSX_SINGLE_PRESENT`) |
 | Q7 | Adaptive flip pacing | PR open #724 |
 | Q8 | Kick SPURS on RSX label writes to the instance line | PR open #729 (seated on upstream's main-memory semaphore release; knob renamed `PS3RECOMP_RSX_RELEASE_LINE_WAKE`) |
-| Q9 | PPU reservation open-count | not started |
+| Q9 | PPU reservation open-count | PR open #732 (re-implemented: upstream lifts lwarx inline, so the lifter gains an opt-in `--resv-open-count`) |
 | Q10 | Vulkan backend on Windows | not started |
-| Q11 | Public-tree content guard and pinned SDK fetch for ports | not started |
-| Q12 | Test-only PRs (SPU interpreter, CTR64, TOC across HLE exits) | not started |
+| Q11 | Public-tree content guard and pinned SDK fetch for ports | PR open #726 |
+| Q12 | Test-only PRs (SPU interpreter, CTR64, TOC across HLE exits) | PR open #722 (game-derived operand values replaced by neutral ones) |
 | Q13 | Small diagnostic counters | not started |
 | M1 | Guest write watch and preservation sessions | PR open #727 (write watch), #728 (preservation sessions, stacked on #727); Windows paths not yet run |
-| M2 | Coherence fast paths (series) | not started |
-| M3 | Fast guest accessors, inline stores from the lifter | not started |
+| M2 | Coherence fast paths (series) | PR open #731 (live holder counts only). Shard, interest bitmap and no-LR store fast path dropped: they only pay off with fork-only 91df812a (see M15); 1ef14852 already upstream (#484); 9192f907 dropped (neutral) |
+| M3 | Fast guest accessors, inline stores from the lifter | dropped (superseded by upstream 27745b54, which already inlines stores under its own gate) |
 | M4 | Direct Vulkan present | not started |
 | M5 | RSX present thread | not started |
 | M6 | FIFO consumer busy accounting | not started |
 | M7 | Guest longjmp: PPU nonlocal control flow | not started |
-| M8 | Range-based PPU reservation invalidation | not started |
+| M8 | Range-based PPU reservation invalidation | dropped (upstream bulk writes do not break PPU reservations word by word, so there is nothing to speed up; revisit only if upstream wants `PPU_RESV_STORE` to cover bulk and DMA writes) |
 | M9 | D3D12 register-file draw-engine backend | not started |
 | M10 | Native OSK hosts (and Linux SDL keyboard pad) | not started |
 | M11 | SDATA plain opens stay raw; durable cellFsWrite | not started |
 | M12 | Port-template extension points and build receipts | not started |
-| M13 | Function-level lifter-fix splice | not started |
+| M13 | Function-level lifter-fix splice | PR open #730 |
 | M14 | Small opt-in knobs on systems upstream already has | not started |
+| M15 | PPU reservation epochs across coherent SPU line writes | not started |
 | A1 | RFC: checked GPU completion for RSX reports and labels | not started (discussion first) |
 | A2 | RFC: native-owner seam | not started (discussion first) |
 | A3 | Design note: decoupled RSX consumer | not started (discussion first) |
@@ -312,6 +313,13 @@ otherwise; "mag-recomp" means the downstream port that pins this fork.
 - The SPU watch diagnostics: 8ac6375f, 9a4c66c7, e5d81b27, 5cf92bb6, 954d8471 and a9ad9ed8 (coherence line histogram).
 - **Value:** niche.
 - **Upstream PR title:** propose these one by one later.
+
+**M15. PPU reservation epochs across coherent SPU line writes**
+- **Commit:** fork 91df812a ("Track PPU reservation epochs across coherent SPU line writes"), with the M2 commits that make it cheap: c4c8d8e1 (per-line shard), 9bf49b10 (interest bitmap) and 899f06c9 (store fast path with no live LR).
+- **Value:** correctness. An SPU write to a line no SPU reserved does not break a PPU reservation on that line upstream. The fork marks every PPU lwarx line in the coherence bitmap to catch it, and the M2 fast paths then remove the cost that marking adds.
+- **Risk:** medium to high (memory model).
+- **Prerequisites:** send it as its own correctness item with a synthetic red/green test first, then the fast paths stacked on it.
+- **Upstream PR title:** "fix(ppu): coherent SPU line writes break PPU reservations on that line"
 
 ## 3. Large / architectural (discussion first)
 
