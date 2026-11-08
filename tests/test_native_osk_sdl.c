@@ -195,6 +195,17 @@ static void text_is(const Job* job, const uint16_t* want, unsigned n)
     for (unsigned i = 0; i < n; i++) CHECK(job->text[i] == want[i]);
 }
 
+/* Publish one mailbox command the way the automation does: complete in a
+ * temporary file, then renamed into place, so the poll never sees a partial
+ * command (the guest thread polls every millisecond). */
+static void publish(const char* control, const char* line)
+{
+    char temporary[4200];
+    CHECK(snprintf(temporary, sizeof temporary, "%s.tmp", control) < (int)sizeof temporary);
+    FILE* f = fopen(temporary, "w"); CHECK(f); CHECK(fputs(line, f) >= 0); CHECK(!fclose(f));
+    CHECK(rename(temporary, control) == 0);
+}
+
 int main(void)
 {
     const char* control = getenv("OSK_NATIVE_CONTROL_FILE");
@@ -213,7 +224,7 @@ int main(void)
         start(&job);
         for (int i = 0; i < 2000 && atomic_load(&events) == 0; i++) usleep(1000);
         CHECK(atomic_load(&events) == 1 && atomic_load(&statuses[0]) == 0x502);
-        FILE* f = fopen(control, "w"); CHECK(f); fputs("confirm 1\n", f); CHECK(!fclose(f));
+        publish(control, "confirm 1\n");
         finish_job();
         static const uint16_t want[] = {'F','a','l','l','b','a','c','k'};
         CHECK(job.result == 0); text_is(&job, want, 8);
@@ -374,11 +385,11 @@ int main(void)
 #endif
         char line[32];
         snprintf(line, sizeof line, "confirm %u\n", token + 1);
-        FILE* f = fopen(control, "w"); CHECK(f); fputs(line, f); CHECK(!fclose(f));
+        publish(control, line);
         for (int i = 0; i < 200; i++) { pump(); usleep(1000); }
         CHECK(osk_native_sdl_describe(NULL, 0, NULL));   /* still open */
         snprintf(line, sizeof line, "confirm %u\n", token);
-        f = fopen(control, "w"); CHECK(f); fputs(line, f); CHECK(!fclose(f));
+        publish(control, line);
         finish_job();
         static const uint16_t want[] = {'a','u','t','o','m','a','t','e','d'};
         CHECK(job.result == 0); text_is(&job, want, 9);

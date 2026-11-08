@@ -83,6 +83,11 @@ static uint64_t control_poll(void){ /* caller holds lifecycle lock */
  int fd=open(s_control_path,O_RDONLY|O_NONBLOCK|O_NOFOLLOW);
  if(fd<0)return 0;
  struct stat st;unsigned char command[64];ssize_t n=-1;
+ /* Writers publish the mailbox atomically (write a temporary file, then link
+  * or rename it into place). Whatever is found here is consumed, including an
+  * empty or partial file, so a stray file never blocks the next command; a
+  * writer that creates the mailbox and writes into it in place can lose its
+  * command to a poll in between. */
  if(!fstat(fd,&st) && S_ISREG(st.st_mode) && st.st_size>0 && st.st_size<=64)
   n=read(fd,command,sizeof(command));
  close(fd);unlink(s_control_path);
