@@ -349,6 +349,13 @@ if(NOT WIN32 AND NOT APPLE)
     if(PS3RECOMP_NATIVE_OSK_SDL)
         target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_SDL=1)
     endif()
+    # Keyboard on controller port 0 while the SDL game window has focus and no
+    # controller occupies it (libs/input/pad_sdl_keyboard.c; PAD_NO_KEYBOARD=1
+    # turns it off at run time).
+    option(PS3RECOMP_PAD_SDL_KEYBOARD "Map the SDL game window's keyboard to pad port 0" ON)
+    if(PS3RECOMP_PAD_SDL_KEYBOARD)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_SDL_KEYBOARD=1)
+    endif()
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE

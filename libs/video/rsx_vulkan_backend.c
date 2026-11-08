@@ -58,6 +58,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 #include "../misc/osk_native.h"
+#include "../input/pad_sdl_keyboard.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -1697,6 +1698,9 @@ static void vk_window_drop(const char* why)
     if (s_vk.window) {
 #ifdef OSK_NATIVE_HAS_SDL_HOST
         osk_native_sdl_set_window(NULL);   /* retire a dialog before SDL video goes */
+#endif
+#ifdef PAD_HAS_SDL_KEYBOARD
+        ps3recomp_pad_sdl_keyboard_sample(NULL, 1);   /* release every key */
 #endif
         SDL_DestroyWindow(s_vk.window);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
@@ -3727,6 +3731,15 @@ int rsx_vulkan_backend_pump_messages(void)
     }
 #ifdef OSK_NATIVE_HAS_SDL_HOST
     osk_native_sdl_pump();   /* queued open/close/confirm, then redraw */
+#endif
+#ifdef PAD_HAS_SDL_KEYBOARD
+    {
+        int dialog = 0;
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+        dialog = osk_native_sdl_input_active();
+#endif
+        ps3recomp_pad_sdl_keyboard_sample(s_vk.window, dialog);
+    }
 #endif
     return quit ? -1 : 0;
 }
