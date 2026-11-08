@@ -47,6 +47,7 @@ HARNESS = r'''
 #include "spu_interp.h"
 #include "spu_pc_observer.h"
 #include "diagnostics/critical_pc_trace.h"
+#include "diagnostics/original_work_observer.h"   /* PS3_ORIGINAL_STEP in the extracted microstep */
 
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
 int g_spu_ls_watch_n = 0;   /* LS watch off */

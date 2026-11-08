@@ -54,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix='dma-publication-') as tmp:
     assert run(dict(raw,SPU_DMA_PUBLICATION_LIMIT='32768'))
     # C++ callers share the C implementation and its process-global cap.
     impl=Path(tmp)/'impl.c'
-    impl.write_text('#include "spu_dma_publication_impl.h"\nvoid SetLastError(DWORD e) {(void)e;}\n')
+    impl.write_text('#include "spu_dma_publication_impl.h"\nvoid SetLastError(DWORD e) {(void)e;}\n/* The LS watch lives in spu_channels.c, which this probe does not link: disarmed stand-ins. */\nint g_spu_ls_watch_n = 0;\nvoid spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr) {(void)lsa;(void)is_write;(void)p;(void)pc;(void)lr;}\n')
     obj=Path(tmp)/'impl.o'
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-pthread','-I'+str(root/'runtime/spu'),'-c',str(impl),'-o',str(obj)],check=True)
     cpp=Path(tmp)/'probe.cpp'
