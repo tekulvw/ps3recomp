@@ -479,6 +479,10 @@ static void test_ppu_only_line(void)
  * -----------------------------------------------------------------------*/
 #include <pthread.h>
 #include <unistd.h>
+/* The LS watch lives in spu_channels.c, which this test does not link: disarmed stand-ins. */
+int g_spu_ls_watch_n = 0;
+void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
+{ (void)lsa; (void)is_write; (void)p; (void)pc; (void)lr; }
 
 static void shard_store32(uint32_t ea, uint32_t v)
 {
