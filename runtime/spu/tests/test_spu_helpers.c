@@ -16,6 +16,10 @@
 #include "../spu_helpers.h"
 #include <stdio.h>
 #include <string.h>
+/* The LS watch lives in spu_channels.c, which this test does not link: disarmed stand-ins. */
+int g_spu_ls_watch_n = 0;
+void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
+{ (void)lsa; (void)is_write; (void)p; (void)pc; (void)lr; }
 
 static int g_pass = 0;
 static int g_fail = 0;

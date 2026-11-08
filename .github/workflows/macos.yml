@@ -481,6 +481,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/diagnostics/job_io_recorder.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_signalled_atomic
@@ -498,6 +499,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/diagnostics/job_io_recorder.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_taskset_bits_atomic
@@ -545,6 +547,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/diagnostics/job_io_recorder.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_mfc_slots
@@ -563,6 +566,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/diagnostics/job_io_recorder.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_job_stack

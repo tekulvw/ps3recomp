@@ -20,6 +20,8 @@
 #include <assert.h>
 #include <sys/mman.h>
 #include <unistd.h>
+/* runtime/memory/vm_watch.c (the guest write watch) is not linked here; nothing is watched. */
+void vm_note_host_write(const void* host, size_t len) { (void)host; (void)len; }
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
