@@ -1885,7 +1885,14 @@ static int gcm_early_report(u32 argument){return s_early_release&&gcm_report_val
  * proceeds, wait until the frame PS3RECOMP_RSX_MAX_FRAMES_AHEAD (default 3,
  * 0 = unbounded) flips back has genuinely completed. One in-order queue, so
  * that also covers any other renderer's work queued before it. */
-static uint64_t gcm_bound_now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;}
+static uint64_t gcm_bound_now(void){
+#ifdef _WIN32
+    LARGE_INTEGER c,f;QueryPerformanceCounter(&c);QueryPerformanceFrequency(&f);
+    return (uint64_t)(c.QuadPart/f.QuadPart)*1000000000ull+(uint64_t)(c.QuadPart%f.QuadPart)*1000000000ull/(uint64_t)f.QuadPart;
+#else
+    struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;
+#endif
+}
 static void gcm_frame_bound(void){
     if(!s_early_release||!s_frames_ahead||s_reports.failed||!rsx_draw_engine_async_available())return;
     const u64 ticket=rsx_draw_engine_submit_async();
