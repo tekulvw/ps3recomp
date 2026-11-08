@@ -50,11 +50,13 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux; opt-in on Windows)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_(vulkan_backend|frontend_vulkan)\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32 OR APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
+    # Windows: a Win32 window and vulkan-1.dll loaded at run time; the D3D12
+    # backend is still built and stays the host default.
+    if(APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is not available on macOS")
     endif()
     find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
@@ -327,6 +329,11 @@ endif()
 # libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
 # its fixed-function path.
 if(PS3RECOMP_RSX_VULKAN)
+    # The lookup above is POSIX-only (it serves the Metal translation too);
+    # the opt-in Windows Vulkan backend finds glslang on its own.
+    if(WIN32 AND NOT glslang_FOUND)
+        find_package(glslang CONFIG QUIET)
+    endif()
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
