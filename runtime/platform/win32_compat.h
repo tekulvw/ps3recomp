@@ -756,7 +756,13 @@ static inline DWORD GetCurrentThreadId(void)
     pthread_threadid_np(NULL, &tid);
     return (DWORD)tid;
 #elif defined(__linux__)
-    /* Not gettid(3): that wrapper only appeared in glibc 2.30. */
+    /* Not gettid(3): that wrapper only appeared in glibc 2.30. A translation
+     * unit that asks for strict POSIX (_POSIX_C_SOURCE) gets no syscall()
+     * prototype from <unistd.h>, so declare it here for C; C++ builds define
+     * _GNU_SOURCE and already have it. */
+#if !defined(__cplusplus) && !defined(__USE_MISC)
+    extern long syscall(long, ...);
+#endif
     return (DWORD)syscall(SYS_gettid);
 #else
     return (DWORD)(uintptr_t)pthread_self();

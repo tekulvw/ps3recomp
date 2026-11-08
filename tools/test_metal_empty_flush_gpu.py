@@ -1,3 +1,6 @@
+import sys
+if sys.platform!='darwin':
+    print('SKIP: Metal requires macOS');raise SystemExit(0)
 from pathlib import Path
 import subprocess
 import tempfile

@@ -15,7 +15,7 @@ with tempfile.TemporaryDirectory(prefix="gcm-native-consumer-") as tmp:
     command = [os.environ.get("CC", "cc"), "-std=gnu17", "-O3", "-UNDEBUG", *flags,
                "-ffunction-sections", "-fdata-sections", "-I" + str(sdk / "include"),
                str(sdk / "libs/video/tests/test_gcm_native_consumer.c"),
-               str(sdk / "libs/video/tests/gcm_deferred_fixture_stubs.c"),
+               str(sdk / "libs/video/tests/gcm_deferred_fixture_stubs.c"), str(sdk / "libs/video/rsx_fifo_busy.c"),
                str(sdk / "runtime/platform/win32_compat.c"),
                "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
                "-pthread", "-lm", "-o", str(out)]

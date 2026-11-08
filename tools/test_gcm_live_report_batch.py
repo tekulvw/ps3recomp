@@ -7,7 +7,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-live-report-')as tmp:
     cc=shutil.which(os.environ.get('CC','clang-cl'if os.name=='nt'else'cc'))
     if not cc:raise SystemExit('C compiler required')
     out=Path(tmp)/('fixture.exe'if os.name=='nt'else'fixture')
-    sources=[str(ROOT/'libs/video/tests/test_gcm_live_report_batch.c'),str(ROOT/'libs/video/tests/gcm_deferred_fixture_stubs.c')]
+    sources=[str(ROOT/'libs/video/tests/test_gcm_live_report_batch.c'),str(ROOT/'libs/video/tests/gcm_deferred_fixture_stubs.c'),str(ROOT/'libs/video/rsx_fifo_busy.c')]
     if os.name=='nt':cmd=[cc,'/nologo','/std:c17','/O1','/Gy','/Gw','/MT','/W0','/UNDEBUG','/D_CRT_SECURE_NO_WARNINGS','/D_CRT_NONSTDC_NO_DEPRECATE','/I'+str(ROOT/'include'),*sources,'/Fo'+tmp+'\\','/Fe'+str(out),'/link','/OPT:REF']
     else:
         sources.append(str(ROOT/'runtime/platform/win32_compat.c'))
