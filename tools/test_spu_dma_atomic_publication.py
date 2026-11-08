@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix='dma-atomic-publication-') as tmp:
     assert len(run(dict(settings,SPU_DMA_PUBLICATION_LIMIT='2')))==2
     assert len(run(dict(settings,SPU_DMA_PUBLICATION_LIMIT='3'),'threads'))==3
     assert all('lsa=3FF80' in s for s in run(settings,'end'))
-    impl=Path(tmp)/'impl.c';impl.write_text('#include "spu_dma_publication_impl.h"\nvoid SetLastError(DWORD x){(void)x;}\n')
+    impl=Path(tmp)/'impl.c';impl.write_text('#include "spu_dma_publication_impl.h"\nvoid SetLastError(DWORD x){(void)x;}\n/* The LS watch lives in spu_channels.c, which this probe does not link: disarmed stand-ins. */\nint g_spu_ls_watch_n = 0;\nvoid spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr) {(void)lsa;(void)is_write;(void)p;(void)pc;(void)lr;}\n')
     obj=Path(tmp)/'impl.o'
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-pthread','-I'+str(spu),'-c',str(impl),'-o',str(obj)],check=True)
     cpp=Path(tmp)/'probe.cpp';cpp.write_text('#include "spu_dma_publication.h"\nint main(){ static spu_context c;static unsigned char ls[SPU_LS_SIZE];c.ls=ls;spu_dma_publication_observe(&c,0,0x20000,128,0x20);for(int i=0;i<8;i++)spu_dma_publication_observe_atomic(&c,0,0x20000,0xD0,SPU_DMA_ATOMIC_GETLLAR_COMPLETE);}\n')

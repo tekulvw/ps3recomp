@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* lv2_register.c publishes lifted-job contexts for thread lookup; not linked here. */
+void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
 
 static unsigned char memory[0x40000];
 uint8_t* vm_base = memory;

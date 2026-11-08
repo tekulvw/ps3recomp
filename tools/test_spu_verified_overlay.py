@@ -54,13 +54,13 @@ with tempfile.TemporaryDirectory(prefix='spu-verified-overlay-') as td:
  assert runtime.count(needle)==1
  instrumented=work/'instrumented-channels.c'
  instrumented.write_bytes(b'unsigned test_verified_compares; unsigned long long test_verified_bytes;\n'+runtime.replace(needle,b'(++test_verified_compares, test_verified_bytes += s->size, memcmp(ctx->ls + s->lsa, s->bytes, s->size))').replace(b'memcmp(ctx->ls + entry, s->bytes + offset, end - entry)',b'(++test_verified_compares, test_verified_bytes += end - entry, memcmp(ctx->ls + entry, s->bytes + offset, end - entry))'))
- sources=['runtime/spu/tests/test_spu_lifted_start.c','runtime/spu/spu_channels.c','runtime/spu/spu_drain.c','runtime/spu/spu_lockstep.c','runtime/spu/spu_coherency.c','runtime/spu/spu_workload.c','runtime/spu/spurs_policy.c','runtime/spu/spurs_job.c','runtime/spu/spu_tsp_weak.c','runtime/spu/spu_vm_pagemap.c','runtime/spu/spurs_policy_blob_weak.c','runtime/spu/spu_interp.c','runtime/spu/spu_lifted_thread.c','runtime/syscalls/spu_fallback.c','runtime/syscalls/sdk_version_weak.c','runtime/platform/win32_compat.c','runtime/diagnostics/job_io_recorder.c']
+ sources=['runtime/spu/tests/test_spu_lifted_start.c','runtime/spu/spu_channels.c','runtime/spu/spu_drain.c','runtime/spu/spu_lockstep.c','runtime/spu/spu_coherency.c','runtime/spu/spu_workload.c','runtime/spu/spurs_policy.c','runtime/spu/spurs_job.c','runtime/spu/spu_tsp_weak.c','runtime/spu/spu_vm_pagemap.c','runtime/spu/spurs_policy_blob_weak.c','runtime/spu/spu_interp.c','runtime/spu/spu_lifted_thread.c','runtime/syscalls/spu_fallback.c','runtime/syscalls/sdk_version_weak.c','runtime/platform/win32_compat.c']  # test_spu_lifted_start.c stubs the job I/O recorder
  flags=['-std=gnu17','-O2','-UNDEBUG','-DSPU_VERIFIED_OVERLAY_TEST','-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform'),'-I'+str(work)]
  if span_mode:flags+=['-DSPU_VERIFIED_SPANS_TEST']
  if os.environ.get('UBSAN')=='1':flags+=['-fsanitize=undefined','-fno-sanitize-recover=all']
  def run(source,label):
   binary=work/label
-  build=subprocess.run([cc,*flags,*[(str(instrumented) if s=='runtime/spu/spu_channels.c' else str(root/s)) for s in sources],str(source),str(work/'outside_recomp.c'),*([str(work/'tail_recomp.c')] if span_mode else []),'-lpthread','-o',str(binary)],capture_output=True,text=True)
+  build=subprocess.run([cc,*flags,*[(str(instrumented) if s=='runtime/spu/spu_channels.c' else str(root/s)) for s in sources],str(source),str(work/'outside_recomp.c'),*([str(work/'tail_recomp.c')] if span_mode else []),'-lpthread','-lm','-o',str(binary)],capture_output=True,text=True)
   if build.returncode:print(build.stdout,build.stderr);raise SystemExit(build.returncode)
   r=subprocess.run([str(binary)],capture_output=True,text=True,timeout=20,env=env)
   summary=[line for line in r.stdout.splitlines() if 'passed' in line or 'FAIL:' in line]

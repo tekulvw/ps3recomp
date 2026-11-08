@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+/* lv2_register.c publishes lifted-job contexts for thread lookup; not linked here. */
+void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
 extern void spu_begin_image(int);
 extern void spu_register_function(uint32_t, void (*)(spu_context*));
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
