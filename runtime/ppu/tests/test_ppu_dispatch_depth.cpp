@@ -33,6 +33,8 @@ uint8_t* vm_base;
 uint32_t ppu_hle_inject_base = 0x20000000;
 int spu_coh_is_reserved(uint32_t) { return 0; }
 void spu_coh_notify_write(uint32_t) { std::abort(); }
+int spu_coh_ppu_store_lock(uint32_t) { std::abort(); }
+void spu_coh_ppu_store_unlock(uint32_t) { std::abort(); }
 void spu_lockline_lock(void) { std::abort(); }
 void spu_lockline_unlock(void) { std::abort(); }
 int spu_raw_reg_load(uint32_t, uint32_t*) { std::abort(); }

@@ -78,7 +78,7 @@ with tempfile.TemporaryDirectory(prefix='output-provenance-') as td:
     td=Path(td);(td/'ppu.cpp').write_text(ppu);(td/'spu.c').write_text(spu)
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-c',str(root/'runtime/platform/win32_compat.c'),'-o',str(td/'compat.o')],check=True)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG','-I'+str(root/'runtime/ppu'),'-I'+str(root/'runtime'),str(td/'ppu.cpp'),str(td/'compat.o'),'-pthread','-o',str(td/'ppu')],check=True)
-    subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG','-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),str(td/'spu.c'),*[str(root/'runtime/spu'/n) for n in common],str(root/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(td/'spu')],check=True)
+    subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG','-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),str(td/'spu.c'),*[str(root/'runtime/spu'/n) for n in common],str(root/'runtime/diagnostics/job_io_recorder.c'),str(root/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(td/'spu')],check=True)
     clean={k:v for k,v in os.environ.items() if not k.startswith(('PS3_OUTPUT_', 'SPU_', 'SPURS_', 'LBP_', 'YDKJ_'))}
     def run(binary,args,options):
         return subprocess.run([str(td/binary),*args],env=dict(clean,**options),capture_output=True,text=True,check=True,timeout=15)
