@@ -342,6 +342,13 @@ if(NOT WIN32 AND NOT APPLE)
     if(PS3RECOMP_NATIVE_OSK_HEADLESS)
         target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_HEADLESS=1)
     endif()
+    # A real text-entry dialog in an SDL2 window, opened by the thread that
+    # owns the game window's SDL event pump (libs/misc/osk_sdl.c). Without a
+    # window it hands requests to the headless host above when that is built.
+    option(PS3RECOMP_NATIVE_OSK_SDL "Build the SDL2 native OSK dialog" ON)
+    if(PS3RECOMP_NATIVE_OSK_SDL)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_SDL=1)
+    endif()
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
