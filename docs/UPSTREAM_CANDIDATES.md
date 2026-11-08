@@ -35,10 +35,11 @@ otherwise; "mag-recomp" means the downstream port that pins this fork.
 | Q7 | Adaptive flip pacing | PR open #724 |
 | Q8 | Kick SPURS on RSX label writes to the instance line | PR open #729 (seated on upstream's main-memory semaphore release; knob renamed `PS3RECOMP_RSX_RELEASE_LINE_WAKE`) |
 | Q9 | PPU reservation open-count | PR open #732 (re-implemented: upstream lifts lwarx inline, so the lifter gains an opt-in `--resv-open-count`) |
-| Q10 | Vulkan backend on Windows | not started |
+| Q10 | Vulkan backend on Windows | PR open #746 (headless smoke test passes on Windows; windowed run on Windows not yet done) |
 | Q11 | Public-tree content guard and pinned SDK fetch for ports | PR open #726 |
 | Q12 | Test-only PRs (SPU interpreter, CTR64, TOC across HLE exits) | PR open #722 (game-derived operand values replaced by neutral ones) |
-| Q13 | Small diagnostic counters | not started |
+| Q13 | Small diagnostic counters | PR open #736 (Vulkan present rate), #737 (render-target churn), #747 (D3D12 vtable drop/deferred-flip counts, now off by default) |
+| Q14 | Opt-in flag tracker for upstream | in progress |
 | M1 | Guest write watch and preservation sessions | PR open #727 (write watch), #728 (preservation sessions, stacked on #727); Windows paths not yet run |
 | M2 | Coherence fast paths (series) | PR open #731 (live holder counts only). Shard, interest bitmap and no-LR store fast path dropped: they only pay off with fork-only 91df812a (see M15); 1ef14852 already upstream (#484); 9192f907 dropped (neutral) |
 | M3 | Fast guest accessors, inline stores from the lifter | dropped (superseded by upstream 27745b54, which already inlines stores under its own gate) |
@@ -47,7 +48,7 @@ otherwise; "mag-recomp" means the downstream port that pins this fork.
 | M6 | FIFO consumer busy accounting | PR open #745 (header-only; owner/handoff categories dropped) |
 | M7 | Guest longjmp: PPU nonlocal control flow | PR open #735 (`/EHsc-` behind an OFF-by-default CMake option) |
 | M8 | Range-based PPU reservation invalidation | dropped (upstream bulk writes do not break PPU reservations word by word, so there is nothing to speed up; revisit only if upstream wants `PPU_RESV_STORE` to cover bulk and DMA writes) |
-| M9 | D3D12 register-file draw-engine backend | not started |
+| M9 | D3D12 register-file draw-engine backend | PR open #748 (55/55 under the debug layer on Windows; present checks need an interactive session, not yet run) |
 | M10 | Native OSK hosts (and Linux SDL keyboard pad) | PR open #739 (lifecycle + headless host), #740 (SDL dialog, stacked on #739). macOS and Windows hosts in progress. SDL keyboard pad dropped (upstream `cellPad.c` keyboard fallback covers it; ignoring keys while a dialog is open is in #740) |
 | M11 | SDATA plain opens stay raw; durable cellFsWrite | PR open #734 (SDATA-raw half only; the write half is covered by open upstream #705) |
 | M12 | Port-template extension points and build receipts | PR open #742 (extensions and lifecycle callbacks), #743 (lift_hooks). Receipts/`provenance.py` not sent (port-specific) |
@@ -175,6 +176,13 @@ otherwise; "mag-recomp" means the downstream port that pins this fork.
 - **Value:** low but cheap.
 - **Risk:** none.
 - **Upstream PR title:** "feat(video): opt-in D3D12 drop/flip and Vulkan present-rate counters"
+
+**Q14. Opt-in flag tracker**
+- **Source:** new work requested on 2026-11-08, not a fork commit.
+- **Contents:** `docs/OPT_IN_FLAGS.md` listing every opt-in environment variable and CMake option in upstream master (name, kind, default, effect, reader, class); a synthetic check that fails when a switch is missing from the doc or the doc lists one that no longer exists; contributor and agent instructions to keep it updated.
+- **Value:** reviewers and users can see every opt-in switch in one place; it pairs with the many opt-in PRs in this list.
+- **Interaction:** our open opt-in PRs each add a flag. Whichever of them merges after the tracker gets a fast-forward follow-up commit that adds its line.
+- **Upstream PR title:** "docs: track every opt-in switch, with a check that keeps the list current"
 
 ## 2. Medium (ranked)
 
