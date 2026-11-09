@@ -149,11 +149,36 @@ static int pacer_wasapi_shape(void) {
     assert(reads>=1874 && reads<=1876 && !starved && !overfull && silence_total==3 && gap_min>=4000000ull);
     puts("PASS shared pacer with WASAPI-shaped device");return 0;
 }
+/* 12: late wake-ups. The waiter asks for the next read time (audio_pace_next_ns)
+ * but wakes 0-3 ms late, as on a busy host or with coarse sleeps. Reads must stay
+ * at least half a period apart and keep the long-run rate. */
+static int pacer_late_wakeups(void) {
+    AudioPacer pc={0};pc.prime_frames=1024;pc.low_frames=256;pc.high_frames=3072;
+    uint64_t t=7000000000ull,last=0,gap_min=~0ull,end=t+10000000000ull;audio_pace_restart(&pc,t);
+    unsigned reads=0,rng=12345,short_gaps=0;long long q=0;uint64_t drained=t;
+    while(t<end) {
+        unsigned silence;
+        /* device: drains continuously */
+        q-=(long long)((t-drained)*48000/1000000000ull);drained=t;if(q<0)q=0;
+        if(audio_pace(&pc,t,q,&silence)) {
+            q+=256ll*(silence+1);reads++;
+            if(last){uint64_t g=t-last;if(g<gap_min)gap_min=g;if(g<2000000ull)short_gaps++;}
+            last=t;continue;
+        }
+        uint64_t next=audio_pace_next_ns(&pc);if(next<t)next=t;
+        rng=rng*1103515245u+12345u;
+        t=next+(uint64_t)((rng>>8)%3000000u);
+    }
+    printf("mode=12 reads=%u min_gap_us=%llu short_gaps=%u\n",reads,(unsigned long long)(gap_min/1000),short_gaps);
+    assert(reads>=1860 && reads<=1876 && gap_min>=2660000ull && !short_gaps);
+    puts("PASS shared pacer with late wake-ups");return 0;
+}
 int main(int argc,char** argv) {
     assert(argc==3);setbuf(stdout,NULL);mode=atoi(argv[1]);start_ns=last_ns=pull_ns=now_ns;
     queue_pacing=!strcmp(argv[2],"queue");assert(queue_pacing || !strcmp(argv[2],"clock"));
     if(queue_pacing)setenv("PS3RECOMP_AUDIO_PACING","queue",1);else unsetenv("PS3RECOMP_AUDIO_PACING");
     if(mode==11)return queue_pacing?0:pacer_wasapi_shape();
+    if(mode==12)return queue_pacing?0:pacer_late_wakeups();
     end_ns=start_ns+(mode==4?3000000000ull:(mode==7?10000000000ull:1000000000ull));
     s_audio_initialized=1;mutex_init(&s_audio_mutex);audio_diagnostics_init();
     AudioPortSlot* p=&s_ports[0];p->in_use=p->running=1;p->param.nChannel=2;p->param.nBlock=8;p->param.level=1;
@@ -172,7 +197,9 @@ int main(int argc,char** argv) {
     printf("mode=%d pacing=%s elapsed_ns=%llu blocks=%u cursor=%llu submit=%llu silence=%llu peak_queue=%u max_batch=%u min_gap_us=%llu pulls=%u starved=%u sleeps=%u queries=%u\n",
         mode,argv[2],(unsigned long long)(now_ns-start_ns),notifications,(unsigned long long)p->read_index,(unsigned long long)submit_count,
         (unsigned long long)silence_submits,peak_queue,max_batch,(unsigned long long)(min_gap/1000),pulls,starved_pulls,sleeps,queue_queries);
-    assert(sleeps>0 && sleeps<(mode==7?11000:1100));
+    /* Clock pacing sleeps until the next read when that is under 1 ms away. */
+    if(queue_pacing)assert(sleeps>0 && sleeps<(mode==7?11000:1100));
+    else assert(sleeps>0 && sleeps<(mode==7?13000:1300));
     if(queue_pacing) {
         /* The previous queue-gated pacing, unchanged. */
         if(mode==2){assert(notifications==0 && p->read_index==0 && ld_be_f32(p->buffer)==.25f);}

@@ -58,6 +58,13 @@ and keeps half of it queued as silence:
 | low | 1 block | as above |
 | high | buffer minus one block | a block needs 256 frames of room |
 
+Between reads the Windows loop waits on a high-resolution waitable timer (Windows 10 1803 and
+later) until the next read is due. `Sleep(1)` lasts a full 15.6 ms system tick unless the process
+has raised the timer resolution, and Windows 11 may ignore that request for an occluded or
+minimized window. A schedule woken that late would read three blocks back to back. The loop logs
+which timer it got at startup. On every platform, reads are never less than half a period apart,
+however late the thread wakes; the schedule catches up at that spacing.
+
 A build with `PS3RECOMP_AUDIO_USE_SDL2` on Windows uses the SDL parameters. Test mode 11 checks this
 WASAPI shape against a simulated device: 480-frame pulls every 10 ms and 1 ms polling. The shape has
 not yet been measured against a real Windows endpoint.
@@ -68,6 +75,19 @@ not yet been measured against a real Windows endpoint.
 |---|---|---|
 | `PS3RECOMP_AUDIO_PACING` | unset (default): clock pacing; `queue`: the previous queue-gated pacing | Selects how guest block reads are paced. `queue` is kept for A/B comparisons |
 
+## Diagnostics
+
+With `AUDIO_DIAGNOSTICS=1` the once-a-second `[audio-diag]` lines also report:
+
+| Field | Line | Meaning |
+|---|---|---|
+| `read_gap_us=[min,median,max]` | summary | intervals between consecutive guest block reads in the window, in microseconds (on Windows from the performance counter, no longer from `GetTickCount64`) |
+| `short_gaps` | summary | intervals under 2 ms: reads that a one-block-per-notification writer cannot keep up with |
+| `refilled_prev` | per port | reads where the slot read one period earlier already holds PCM again. Normal for a writer that runs ahead and refills freed slots. For a writer that fills the next slot just in time, it means the write arrived after the read it was meant for |
+
+If `read_gap_us` stays near 5333 and `short_gaps` is 0 while a just-in-time port still reads
+silence, the reader is not the cause: the writer is late.
+
 ## Tests
 
 `python tools/test_posix_audio_pacing.py` runs the real POSIX mixing thread against a
@@ -77,4 +97,6 @@ two-block pulls:
   starvation;
 - the queue pacing is asserted to read in pairs, which documents the defect.
 
-Mode 11 drives `audio_pace` alone with the shape of a WASAPI endpoint.
+Mode 11 drives `audio_pace` alone with the shape of a WASAPI endpoint. Mode 12 wakes the pacer
+0 to 3 ms late at every wait and checks that reads stay at least half a period apart and keep the
+long-run rate.

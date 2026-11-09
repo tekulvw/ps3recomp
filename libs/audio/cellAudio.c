@@ -169,6 +169,7 @@ typedef struct {
     u32 ring_mask, ring_ridx;
     u64 ring_nonfinite;
     float ring_peak;
+    u64 refilled_prev; /* reads where the slot read one period earlier already holds PCM again */
 } AudioDiagnosticPort;
 static int s_audio_diag_on;
 static AudioDiagnosticPort s_audio_diag_ports[CELL_AUDIO_PORT_MAX];
@@ -177,6 +178,12 @@ static float s_audio_diag_mix[2];
 static u64 s_audio_diag_nonfinite;
 static u32 s_audio_diag_queue_frames;
 static char s_audio_diag_error[128];
+/* Intervals between consecutive guest block reads in this window, in us. */
+#define AUDIO_DIAG_GAPS 1024
+static u32 s_audio_diag_gaps[AUDIO_DIAG_GAPS];
+static u32 s_audio_diag_ngaps;
+static u64 s_audio_diag_last_read_us;
+static u64 audio_diagnostics_now(void);
 
 static void audio_diagnostics_init(void)
 {
@@ -187,6 +194,26 @@ static void audio_diagnostics_init(void)
     s_audio_diag_since = s_audio_diag_blocks = s_audio_diag_submit = s_audio_diag_errors = 0;
     s_audio_diag_nonfinite = s_audio_diag_queue_frames = 0;
     s_audio_diag_error[0] = 0;
+    s_audio_diag_ngaps = 0;
+    s_audio_diag_last_read_us = 0;
+}
+
+/* One guest block read (all ports) happens now. */
+static void audio_diagnostics_read(void)
+{
+    const u64 now = audio_diagnostics_now();
+    if (s_audio_diag_last_read_us && now >= s_audio_diag_last_read_us &&
+        s_audio_diag_ngaps < AUDIO_DIAG_GAPS) {
+        const u64 gap = now - s_audio_diag_last_read_us;
+        s_audio_diag_gaps[s_audio_diag_ngaps++] = gap > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)gap;
+    }
+    s_audio_diag_last_read_us = now;
+}
+
+static int audio_diag_gap_cmp(const void* a, const void* b)
+{
+    const u32 x = *(const u32*)a, y = *(const u32*)b;
+    return x < y ? -1 : x > y;
 }
 
 static void audio_diagnostics_port(int p, const AudioPortSlot* port, const float* src)
@@ -213,6 +240,17 @@ static void audio_diagnostics_port(int p, const AudioPortSlot* port, const float
         }
     }
     d->blocks++;
+    {   /* The slot this port read one period ago was cleared after that read.
+         * PCM there now was written after it was read: normal for a writer
+         * that runs ahead of the read index (it refills the freed slot), but
+         * for a writer that targets the next slot just in time it means the
+         * write came too late for that read. */
+        const u32 nblock = (u32)port->param.nBlock;
+        const u32 prev = (u32)((port->read_index + nblock - 1) % nblock);
+        const float* block = port->buffer + prev * CELL_AUDIO_BLOCK_SAMPLES * d->channels;
+        for (u32 n = 0; n < CELL_AUDIO_BLOCK_SAMPLES * d->channels; n += 7)
+            if (ld_be_f32(block + n) != 0.0f) { d->refilled_prev++; break; }
+    }
     int nonzero = 0;
     for (u32 n = 0; n < CELL_AUDIO_BLOCK_SAMPLES; ++n) {
         for (u32 c = 0; c < d->channels && c < 8; ++c) {
@@ -241,17 +279,28 @@ static void audio_diagnostics_report(u64 now)
                 (unsigned long long)d->nonzero, (unsigned long long)d->nonfinite);
         for (u32 c = 0; c < d->channels && c < 8; ++c)
             fprintf(stderr, "%s%.4g", c ? "," : "", d->peaks[c]);
-        fprintf(stderr, "] ring_ridx=%u ring_mask=%08X ring_peak=%.4g ring_nonfinite=%llu\n",
-                d->ring_ridx, d->ring_mask, d->ring_peak, (unsigned long long)d->ring_nonfinite);
+        fprintf(stderr, "] ring_ridx=%u ring_mask=%08X ring_peak=%.4g ring_nonfinite=%llu refilled_prev=%llu\n",
+                d->ring_ridx, d->ring_mask, d->ring_peak, (unsigned long long)d->ring_nonfinite,
+                (unsigned long long)d->refilled_prev);
+    }
+    u32 gmin = 0, gmed = 0, gmax = 0, gshort = 0;
+    if (s_audio_diag_ngaps) {
+        qsort(s_audio_diag_gaps, s_audio_diag_ngaps, sizeof(u32), audio_diag_gap_cmp);
+        gmin = s_audio_diag_gaps[0];
+        gmed = s_audio_diag_gaps[s_audio_diag_ngaps / 2];
+        gmax = s_audio_diag_gaps[s_audio_diag_ngaps - 1];
+        for (u32 i = 0; i < s_audio_diag_ngaps && s_audio_diag_gaps[i] < 2000; ++i) gshort++;
     }
     fprintf(stderr, "[audio-diag] time_us=%llu duration_us=%llu blocks=%llu mix=[%.4g,%.4g] "
-            "nonfinite=%llu backend=%s submit=%llu errors=%llu queue_frames=%u error=\"%s\"\n",
+            "nonfinite=%llu backend=%s submit=%llu errors=%llu queue_frames=%u error=\"%s\" "
+            "read_gap_us=[%u,%u,%u] short_gaps=%u\n",
             (unsigned long long)now, (unsigned long long)(now - s_audio_diag_since),
             (unsigned long long)s_audio_diag_blocks, s_audio_diag_mix[0], s_audio_diag_mix[1],
             (unsigned long long)s_audio_diag_nonfinite,
             AUDIO_BACKEND_SDL2 ? "SDL" : "WASAPI",
             (unsigned long long)s_audio_diag_submit, (unsigned long long)s_audio_diag_errors,
-            s_audio_diag_queue_frames, s_audio_diag_error);
+            s_audio_diag_queue_frames, s_audio_diag_error, gmin, gmed, gmax, gshort);
+    s_audio_diag_ngaps = 0;
     memset(s_audio_diag_ports, 0, sizeof(s_audio_diag_ports));
     memset(s_audio_diag_mix, 0, sizeof(s_audio_diag_mix));
     s_audio_diag_blocks = s_audio_diag_submit = s_audio_diag_errors = s_audio_diag_nonfinite = 0;
@@ -262,7 +311,14 @@ static void audio_diagnostics_report(u64 now)
 static u64 audio_diagnostics_now(void)
 {
 #ifdef _WIN32
-    return (u64)GetTickCount64() * 1000;
+    /* The performance counter: GetTickCount64 advances in 15-16 ms steps,
+     * too coarse to time 5.33 ms reads. */
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (u64)(c.QuadPart / f.QuadPart) * 1000000ULL +
+           (u64)(c.QuadPart % f.QuadPart) * 1000000ULL / (u64)f.QuadPart;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -594,6 +650,7 @@ typedef struct {
     u32 low_frames;    /* below this at a read, queue one more silence block */
     u32 high_frames;   /* at or above this, move the schedule one period later */
     int primed;
+    u64 last_read_ns;  /* kept across restarts: reads are never closer than half a period */
 } AudioPacer;
 
 static u64 audio_pace_block_time(u64 blocks)
@@ -623,6 +680,10 @@ static int audio_pace(AudioPacer* p, u64 now_ns, long long queued, unsigned* sil
         due = now_ns;
     }
     if (now_ns < due) return 0;
+    /* A wake-up that comes late (a coarse sleep, a busy host) must not turn
+     * into reads back to back: a writer notified at a read gets at least half
+     * a period before the next one. The schedule catches up at that spacing. */
+    if (p->last_read_ns && now_ns - p->last_read_ns < block_ns / 2) return 0;
     if (queued >= 0) {
         if (queued >= (long long)p->high_frames) {
             /* The device is slower than the clock, or stalled: one longer
@@ -640,7 +701,16 @@ static int audio_pace(AudioPacer* p, u64 now_ns, long long queued, unsigned* sil
         }
     }
     p->blocks++;
+    p->last_read_ns = now_ns;
     return 1;
+}
+
+/* The earliest time audio_pace can next return a read (for timed waits). */
+static u64 audio_pace_next_ns(const AudioPacer* p)
+{
+    const u64 due = p->epoch_ns + audio_pace_block_time(p->blocks);
+    const u64 spaced = p->last_read_ns ? p->last_read_ns + audio_pace_block_time(1) / 2 : 0;
+    return due > spaced ? due : spaced;
 }
 
 static int audio_pacing_queue_gated(void)
@@ -677,6 +747,7 @@ static inline float ld_be_f32(const float* p)
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
+    if (s_audio_diag_on) audio_diagnostics_read();
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
 
     mutex_lock(&s_audio_mutex);
@@ -863,6 +934,35 @@ static u64 audio_win32_now_ns(LARGE_INTEGER qf)
            (u64)(now.QuadPart % qf.QuadPart) * 1000000000ULL / (u64)qf.QuadPart;
 }
 
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+/* Sleep for about ns. Sleep(1) lasts a whole 15.6 ms system tick unless the
+ * process raised the timer resolution (timeBeginPeriod), and Windows 11 may
+ * ignore that request for an occluded or minimized window. Woken that late, a
+ * clock schedule falls three reads behind at once. A high-resolution waitable
+ * timer (Windows 10 1803 and later) does not depend on the system tick. */
+static void audio_win32_wait_ns(u64 ns)
+{
+    static HANDLE timer;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        printf("[cellAudio] block pacing waits on a %s timer\n", timer ? "high-resolution" : "Sleep(1)");
+    }
+    if (ns < 200000) ns = 200000;      /* 0.2 ms */
+    if (ns > 10000000) ns = 10000000;  /* 10 ms: stay responsive to device changes */
+    if (timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(ns / 100);  /* relative, 100 ns units */
+        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE) &&
+            WaitForSingleObject(timer, 50) == WAIT_OBJECT_0)
+            return;
+    }
+    Sleep(1);
+}
+
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
@@ -899,8 +999,8 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             }
             unsigned silence;
             if (!audio_pace(&pacer, now_ns, queued, &silence)) {
-                if (have_device && queued >= (long long)pacer.high_frames) audio_backend_wait();
-                else Sleep(1);
+                const u64 next = audio_pace_next_ns(&pacer);
+                audio_win32_wait_ns(next > now_ns ? next - now_ns : 0);
                 continue;
             }
             while (silence--) audio_backend_submit(s_silence_block, CELL_AUDIO_BLOCK_SAMPLES);
@@ -1010,7 +1110,12 @@ static void* audio_mix_thread_func(void* arg)
             if (have_device != had) { pacer.primed = 0; had = have_device; }
             unsigned silence;
             if (!audio_pace(&pacer, now_ns, have_device ? audio_backend_queue_frames() : -1, &silence)) {
-                usleep(1000);
+                /* Up to 1 ms, ending at the next read when that is sooner. */
+                const u64 next = audio_pace_next_ns(&pacer);
+                u64 wait_us = next > now_ns ? (next - now_ns) / 1000 : 0;
+                if (wait_us < 100) wait_us = 100;
+                if (wait_us > 1000) wait_us = 1000;
+                usleep((useconds_t)wait_us);
                 continue;
             }
             while (silence--) audio_backend_submit(s_silence_block, CELL_AUDIO_BLOCK_SAMPLES);

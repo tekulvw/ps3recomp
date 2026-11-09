@@ -20,11 +20,11 @@ def main():
         failed=[]
         env.pop('PS3RECOMP_AUDIO_PACING',None)
         for pacing in ('clock','queue'):
-            for mode in range(12):
+            for mode in range(13):
                 r=subprocess.run([exe,str(mode),pacing],env=env,text=True,capture_output=True,timeout=10)
                 print(r.stdout,end='');print(r.stderr,end='')
                 if r.returncode:failed.append((pacing,mode))
         if failed:raise SystemExit('FAIL modes: '+str(failed))
         print('PASS (clock and queue pacing): normal, no-device, frozen/full, drain recovery, long suspension, port stop/start, '
-              'rejecting sink, ten-second rate, device loss/return, dummy-driver clock pacing, two-block device pulls, WASAPI-shaped pacer')
+              'rejecting sink, ten-second rate, device loss/return, dummy-driver clock pacing, two-block device pulls, WASAPI-shaped pacer, late wake-ups')
 if __name__=='__main__':main()
