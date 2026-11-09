@@ -212,6 +212,7 @@ class LiftedFunction:
     instruction_lines: list = field(default_factory=list)
     region_suffix: list[str] = field(default_factory=list)
     region_eligible: bool = True
+    promoted: bool = False
 
 
 # Mnemonics whose last operand is a branch target address (0x...).
@@ -502,6 +503,315 @@ def compute_link_returns(insns, bounds) -> set:
 
 
 
+# Register-promotion markers (--promote-regs). The translator places _F where
+# every SPU register held in a C local must be stored back to ctx->gpr (before
+# each host return and each out-of-line call that takes ctx), and _R where
+# ctx->gpr / ctx->ls must be re-read (after each such call that returns).
+# Without --promote-regs they are stripped, leaving the text unchanged.
+_F = "@F@"
+_R = "@R@"
+# _X: a host return straight after a stop/halt call that already stored. The
+# call may change ctx->gpr (a serviced stop, a halt that returns), so storing
+# the locals again there would undo it.
+_X = "@X@"
+
+
+def _strip_markers(c: str) -> str:
+    return c.replace(_F, "").replace(_R, "").replace(_X, "")
+
+
+# ---------------------------------------------------------------------------
+# Register promotion (--promote-regs)
+# ---------------------------------------------------------------------------
+# Lifted code normally keeps every SPU register in ctx->gpr[], a union array in
+# an escaped struct: every LS store may alias it, so each result is stored and
+# each operand reloaded. With --promote-regs a function keeps the registers it
+# names in C locals (rg<N>) and keeps ctx->gpr coherent only where anything else
+# can look at it:
+#   * before every host return (trampoline transfers, SPU_RET, halts, stops,
+#     fall-through chaining) and before every out-of-line call that takes ctx
+#     (calls + drains, channel ops, stop, halt) -- the _F markers;
+#   * after such a call returns, every local (and the LS base) is re-read from
+#     ctx, since callees, interrupt restores and channel hooks may change it --
+#     the _R markers.
+# Lifted functions never setjmp, so a longjmp always leaves through one of
+# those calls, after the store. Which registers to store is a forward may-dirty
+# dataflow over the function's instructions; a superset is harmless because a
+# clean local equals memory. Reloading every local is free where it is dead:
+# the C compiler deletes the unused loads.
+
+_GPR_REF = re.compile(r"ctx->gpr\[(\d+)\]")
+_PR_LOCAL = re.compile(r"\brg(\d+)\b")
+_PR_ASSIGN = re.compile(r"\brg(\d+) = (?!=)")
+_PR_READ = re.compile(r"\brg(\d+)\b(?! = (?!=))")
+_PR_TO_V = re.compile(r"\b(rg\d+) = (?!=)([^;]*);")
+_PR_GOTO = re.compile(r"goto loc_([0-9A-F]{8});")
+_PR_CTX_CALL = re.compile(r"\b(\w+)\(ctx\b")
+# Inline helpers that take ctx but never read or write ctx->gpr (outside
+# out-of-line diagnostics) and never longjmp.
+_PR_INLINE_CTX = {"spu_pr_lq", "spu_pr_stq"}
+# Instructions after which execution never falls through to the next one
+# (anything else is assumed to, which only over-approximates dirtiness).
+_PR_NO_FALLTHROUGH = {"bi", "iret", "stopd"}
+
+
+def _pr_mask(regs) -> int:
+    m = 0
+    for r in regs:
+        m |= 1 << int(r)
+    return m
+
+
+def _pr_regs(mask: int):
+    return [i for i in range(128) if mask >> i & 1]
+
+
+def promote_function(items, suffix, max_regs=0):
+    """Rewrite one function's instructions to keep SPU registers in locals.
+
+    `items` is [(insn, has_label, marked_c)], `suffix` the marked fall-through
+    tail (or None). Returns the new body lines, or None when the function cannot
+    be promoted (it is then emitted unpromoted, which is always correct)."""
+    texts = []
+    for insn, _, c in items:
+        t = _GPR_REF.sub(lambda m: "rg" + m.group(1), c)
+        if "ctx->gpr" in t or "gpr[" in t:
+            return None
+        if insn.mnemonic in ("rdch", "rchcnt"):
+            # The channel call must see stored registers, and its result must
+            # not be overwritten by the reload that follows it.
+            m = re.fullmatch(r"(rg\d+) = (.*);", t)
+            if not m:
+                return None
+            t = f"{_F}{{ u128 _ch = {m.group(2)}; {_R}{m.group(1)} = _ch; }}"
+        t = (t.replace("spu_ls_read128(ctx, ", "spu_pr_lq(ctx, ls, ")
+              .replace("spu_ls_write128(ctx, ", "spu_pr_stq(ctx, ls, "))
+        texts.append(t)
+    if suffix is not None:
+        texts.append(suffix)
+    for t in texts:
+        # Every host return must store first; so must every out-of-line call.
+        if re.search(r"(?<!@F@)(?<!@X@)(\breturn;|SPU_RET)", t):
+            raise ValueError("promote-regs: unflushed return in: " + t)
+        if re.search(r"(?<!spu_stop\(ctx\); |spu_halt\(ctx\); )@X@", t):
+            raise ValueError("promote-regs: bare return marker in: " + t)
+        for m in _PR_CTX_CALL.finditer(t):
+            if m.group(1) not in _PR_INLINE_CTX and _F not in t[:m.start()]:
+                raise ValueError("promote-regs: unflushed call in: " + t)
+
+    n = len(items)
+    index = {insn.addr: i for i, (insn, _, _) in enumerate(items)}
+    succs = []
+    for i, (insn, _, _) in enumerate(items):
+        t = texts[i]
+        s = {index[int(a, 16)] for a in _PR_GOTO.findall(t) if int(a, 16) in index}
+        mn = insn.mnemonic
+        falls = not (mn in _PR_NO_FALLTHROUGH
+                     or (mn in ("br", "bra") and "TODO" not in t)
+                     or (mn == "stop" and "SPU_STATUS_RUNNING" not in t))
+        if falls and i + 1 < n:
+            s.add(i + 1)
+        succs.append(s)
+    writes = [_pr_mask(_PR_ASSIGN.findall(t)) for t in texts[:n]]
+    after_sync = [(_pr_mask(_PR_ASSIGN.findall(t.split(_R)[-1])) if _R in t else None)
+                  for t in texts[:n]]
+    dirty_in = [0] * n
+    seen = [False] * n
+    work = [0] if n else []
+    if n:
+        seen[0] = True
+    while work:
+        i = work.pop()
+        out = after_sync[i] if after_sync[i] is not None else dirty_in[i] | writes[i]
+        for j in succs[i]:
+            merged = dirty_in[j] | out
+            if merged != dirty_in[j] or not seen[j]:
+                dirty_in[j] = merged
+                seen[j] = True
+                work.append(j)
+    # Instructions no edge reaches keep an empty dirty set: nothing can have
+    # written a local before them.
+    last_out = 0
+    if n:
+        last_out = after_sync[-1] if after_sync[-1] is not None else dirty_in[-1] | writes[-1]
+
+    used = set()
+    for t in texts:
+        used |= {int(r) for r in _PR_LOCAL.findall(t)}
+    if max_regs and len(used) > max_regs:
+        # More live SPU registers than the host has vector registers: the
+        # compiler would spill them to the stack anyway, often worse than
+        # ctx->gpr traffic. Leave such a function unpromoted.
+        return None
+    used_mask = _pr_mask(used)
+    regs = sorted(used)
+
+    # Backward liveness, so that a call re-reads only the locals that can still
+    # be read after it (the reload text otherwise dominates large functions,
+    # and their compile time). A store at a sync point reads every register
+    # that may be dirty there: on a path where such a register was not written
+    # since the last reload, its local must still hold the memory value.
+    def reads(text):
+        return _pr_mask(_PR_READ.findall(text))
+
+    def uses(text, dirty):
+        return reads(text) | ((dirty | writes_of(text)) if _F in text else 0)
+
+    def writes_of(text):
+        return _pr_mask(_PR_ASSIGN.findall(text))
+
+    live_out = [0] * n
+    live_in = [0] * n
+    preds = [[] for _ in range(n)]
+    for i in range(n):
+        for j in succs[i]:
+            preds[j].append(i)
+    tail_use = (last_out | reads(texts[-1])) if suffix is not None else 0
+    work = list(range(n))
+    while work:
+        i = work.pop()
+        t = texts[i]
+        out = live_out[i] | (tail_use if i == n - 1 else 0)
+        for j in succs[i]:
+            out |= live_in[j]
+        live_out[i] = out
+        if _R in t:
+            before = t.split(_R)[0]
+            new_in = uses(before, dirty_in[i])
+        else:
+            new_in = uses(t, dirty_in[i]) | (out & ~writes[i])
+        if new_in != live_in[i]:
+            live_in[i] = new_in
+            work.extend(preds[i])
+
+    def store(mask):
+        return "".join(f"ctx->gpr[{r}] = rg{r}; " for r in _pr_regs(mask & used_mask))
+
+    def reload(mask):
+        return "".join(f"rg{r} = ctx->gpr[{r}]; " for r in _pr_regs(mask & used_mask)) + "ls = ctx->ls; "
+
+    def expand(t, dirty, after_reload):
+        out = []
+        for part in re.split(r"(@F@|@R@|@X@)", t):
+            if part == _X:
+                pass
+            elif part == _F:
+                # Not cleared: a store inside a conditional exit leaves the
+                # path that does not exit as dirty as before it.
+                out.append(store(dirty))
+            elif part == _R:
+                out.append(reload(after_reload))
+                dirty = 0
+            else:
+                dirty |= _pr_mask(_PR_ASSIGN.findall(part))
+                out.append(part)
+        return "".join(out)
+
+    body = [f"    spu_pr_v rg{r} = ctx->gpr[{r}];" for r in regs]
+    body.append("    uint8_t* ls = ctx->ls; (void)ls;")
+    for i, (insn, label, _) in enumerate(items):
+        if label:
+            body.append(f"loc_{insn.addr:08X}:")
+        after = live_out[i] | (reads(texts[i].split(_R, 1)[1]) if _R in texts[i] else 0)
+        body.append("    " + expand(texts[i], dirty_in[i], after).rstrip())
+    if suffix is not None:
+        body.append("    " + expand(texts[-1], last_out, 0))
+    # The locals are a plain vector type, converted at every use: as the u128
+    # union itself, clang splits each local into scalar halves and shuffles
+    # them through loop-carried phis (and spills them) instead of keeping one
+    # vector register per SPU register.
+    return [_PR_TO_V.sub(r"\1 = SPU_PR_V(\2);", _PR_READ.sub(r"SPU_PR_U(rg\1)", line)) for line in body]
+
+
+PROMOTE_PREAMBLE = """
+/* --promote-regs: SPU registers live in C locals between sync points (see
+ * tools/spu_lifter.py, promote_function). The LS base is a local too, re-read
+ * after every out-of-line call. The per-access LS diagnostic gates
+ * (g_spu_ls_rdiag/wdiag) are compiled in only with -DSPU_LS_DIAG=1; without
+ * it, registration reports once if an LS diagnostic is requested. */
+#ifndef SPU_LS_DIAG
+#define SPU_LS_DIAG 0
+#endif
+#if defined(__clang__) || defined(__GNUC__)
+typedef uint32_t spu_pr_v __attribute__((vector_size(16)));
+static inline __attribute__((always_inline)) spu_pr_v SPU_PR_V(u128 x) { spu_pr_v v; memcpy(&v, &x, 16); return v; }
+static inline __attribute__((always_inline)) u128 SPU_PR_U(spu_pr_v v) { u128 x; memcpy(&x, &v, 16); return x; }
+#else
+typedef u128 spu_pr_v;
+#define SPU_PR_V(x) (x)
+#define SPU_PR_U(x) (x)
+#endif
+#if !defined(__ARM_NEON) && defined(__SSSE3__)
+#include <tmmintrin.h>
+static inline __m128i spu_pr_bswap32_mask(void)
+{
+    return _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
+}
+#endif
+static inline u128 spu_pr_lq(const spu_context* ctx, const uint8_t* ls, uint32_t lsa)
+{
+    u128 v;
+#if SPU_LS_DIAG
+    if (__builtin_expect(g_spu_ls_rdiag != 0, 0))
+        spu_ls_read_diag(ctx, lsa);
+#else
+    (void)ctx;
+#endif
+    lsa &= SPU_LS_MASK & ~0xFu;
+    const uint8_t* p = &ls[lsa];
+#if defined(__ARM_NEON)
+    vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));
+#elif defined(__SSSE3__)
+    /* One load and one byte shuffle; written as four scalar swaps, clang keeps
+     * the value in general registers once it is no longer forced through
+     * ctx->gpr, and then lowers the next vector ops on it as scalar code too. */
+    __m128i x = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)p), spu_pr_bswap32_mask());
+    memcpy(&v, &x, 16);
+#elif SPU_LS_FAST
+    uint32_t w0, w1, w2, w3;
+    memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
+    memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
+    v._u32[0] = SPU_BSWAP32(w0); v._u32[1] = SPU_BSWAP32(w1);
+    v._u32[2] = SPU_BSWAP32(w2); v._u32[3] = SPU_BSWAP32(w3);
+#else
+    for (int i = 0; i < 4; i++)
+        v._u32[i] = ((uint32_t)p[i*4] << 24) | ((uint32_t)p[i*4 + 1] << 16) |
+                    ((uint32_t)p[i*4 + 2] << 8) | (uint32_t)p[i*4 + 3];
+#endif
+    return v;
+}
+static inline void spu_pr_stq(spu_context* ctx, uint8_t* ls, uint32_t lsa, u128 val)
+{
+    lsa &= SPU_LS_MASK & ~0xFu;
+    uint8_t* p = &ls[lsa];
+#if defined(__ARM_NEON)
+    vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));
+#elif defined(__SSSE3__)
+    __m128i x;
+    memcpy(&x, &val, 16);
+    _mm_storeu_si128((__m128i*)p, _mm_shuffle_epi8(x, spu_pr_bswap32_mask()));
+#elif SPU_LS_FAST
+    uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
+    uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
+    memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
+    memcpy(p + 8,  &w2, 4); memcpy(p + 12, &w3, 4);
+#else
+    for (int i = 0; i < 4; i++) {
+        uint32_t w = val._u32[i];
+        p[i*4] = (uint8_t)(w >> 24); p[i*4 + 1] = (uint8_t)(w >> 16);
+        p[i*4 + 2] = (uint8_t)(w >> 8); p[i*4 + 3] = (uint8_t)w;
+    }
+#endif
+#if SPU_LS_DIAG
+    if (__builtin_expect(g_spu_ls_wdiag != 0, 0))
+        spu_ls_write_diag(ctx, lsa, val);
+#else
+    (void)ctx;
+#endif
+}
+"""
+
+
 # lv2 stop-and-signal syscalls that resume at the next instruction (the same
 # set as find_spu_functions.LV2_RESUMING_STOPS, which decides function extents).
 LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
@@ -509,7 +819,13 @@ LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
 class SPULifter:
     def __init__(self, trace: bool = False, prefix: str = "", verified_code_image: int = 0,
                  verified_code_spans: bool = False, connected_regions: bool = False, region_bytes: int = 1024,
-                 observe_original_work: bool = False):
+                 observe_original_work: bool = False, promote_regs: bool = False,
+                 promote_max_regs: int = 0):
+        if promote_regs and (trace or observe_original_work or connected_regions):
+            raise ValueError("--promote-regs cannot be combined with --trace, "
+                             "--observe-original-work or --connected-regions")
+        self.promote_regs = promote_regs
+        self.promote_max_regs = promote_max_regs
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
@@ -560,13 +876,19 @@ class SPULifter:
                 internal.add(tgt)
 
         last_insn = None
+        promo_items = []
         for insn in insns:
             if insn.addr < start or insn.addr >= end:
                 continue
             if insn.addr in internal:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
             instruction_start = len(func.body_lines)
-            c = self._translate(insn, func)
+            if self.promote_regs:
+                marked = self._translate_marked(insn, func)
+                promo_items.append((insn, insn.addr in internal, marked))
+                c = _strip_markers(marked)   # the unpromoted body, if promotion declines
+            else:
+                c = self._translate(insn, func)
             if c:
                 if self.observe_original_work:
                     func.body_lines.append(f"    PS3_ORIGINAL_STEP(ctx, 0x{insn.addr:X}u, PS3_ORIGINAL_LIFTED);")
@@ -582,6 +904,7 @@ class SPULifter:
             last_insn = insn
 
         suffix_start = len(func.body_lines)
+        promo_suffix = None
         # Fall-through chaining: if the final instruction does NOT unconditionally
         # end the basic block (i.e. it's a normal op, a call brsl/bisl, or a
         # conditional branch whose not-taken path continues), execution proceeds
@@ -593,9 +916,9 @@ class SPULifter:
                      or (last_insn.mnemonic == "stop"
                          and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
                 and end in getattr(self, "func_starts", set())):
-            func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
+            promo_suffix = (f"{{ ctx->pc = 0x{end:X}; "
+                            f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; {_F}return; }}")
+            func.body_lines.append("    " + _strip_markers(promo_suffix))
 
         func.region_suffix = func.body_lines[suffix_start:]
 
@@ -606,12 +929,14 @@ class SPULifter:
         # SPURS task runtime's terminal/idle state). Render it as a clean abort
         # (spu_halt longjmps back to the dispatcher) so the host thread returns.
         body_insns = [i for i in insns if start <= i.addr < end]
+        halt_idiom = False
         if body_insns and all(i.mnemonic in ("nop", "lnop", "br", "bra")
                               for i in body_insns):
             last = body_insns[-1]
             ltgt = self._branch_target(last)
             if (last.mnemonic in ("br", "bra") and ltgt is not None
                     and start <= ltgt < end):
+                halt_idiom = True
                 func.region_eligible = False
                 func.body_lines = [
                     "    /* infinite no-op self-loop (SPU halt idiom) -> abort */",
@@ -634,6 +959,11 @@ class SPULifter:
                         witnesses.append("    ps3_original_lost(1);")
                     func.body_lines = witnesses + func.body_lines
 
+        if self.promote_regs and not halt_idiom:
+            promoted = promote_function(promo_items, promo_suffix, self.promote_max_regs)
+            if promoted is not None:
+                func.body_lines = promoted
+                func.promoted = True
         self.functions.append(func)
         return func
 
@@ -671,6 +1001,10 @@ class SPULifter:
 
     # ------------------------------------------------------------------ #
     def _translate(self, insn: SPUInstruction, func: LiftedFunction) -> str:
+        """The C statement(s) for one instruction (registers in ctx->gpr)."""
+        return _strip_markers(self._translate_marked(insn, func))
+
+    def _translate_marked(self, insn: SPUInstruction, func: LiftedFunction) -> str:
         mn = insn.mnemonic
         ops = _ops(insn.operands)
         addr = insn.addr
@@ -702,10 +1036,10 @@ class SPULifter:
                 # reply is read from the inbound mailbox right after the stop).
                 # spu_stop puts the context back to RUNNING when it serviced it.
                 return (f"ctx->stop_code = 0x{code:X}u; "
-                        f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); "
-                        f"if (ctx->status != SPU_STATUS_RUNNING) return;")
+                        f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; {_F}spu_stop(ctx); {_R}"
+                        f"if (ctx->status != SPU_STATUS_RUNNING) {_F}return;")
             return (f"ctx->stop_code = 0x{code:X}u; "
-                    f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; {_F}spu_stop(ctx); {_X}return;")
 
         # ---- immediate loaders ----
         if mn == "il":
@@ -749,11 +1083,11 @@ class SPULifter:
                     f"fprintf(stderr, \"[spu] HALT-ASSERT {mn} pc=0x{addr:05X} "
                     f"img=%d\\n\", ctx->image_id); "
                     f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
-                    f"spu_halt(ctx); return; }}")
+                    f"{_F}spu_halt(ctx); {_X}return; }}")
         if mn == "stopd":
             # stopd has no code field; the architected stop code it reports is 0x3FFF (RPCS3 STOPD).
             return ("ctx->stop_code = 0x3FFFu; "
-                    "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; {_F}spu_stop(ctx); {_X}return;")
 
         # ---- integer arithmetic (register) ----
         rr_bin = {
@@ -914,7 +1248,7 @@ class SPULifter:
             return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
             # operands: channel, $rt
-            return f"spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});"
+            return f"{_F}spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});{_R}"
 
         # ---- branches ----
         if mn in ("br", "bra"):
@@ -924,7 +1258,7 @@ class SPULifter:
             # `goto loc_self` busy-spins the host thread forever; stop the SPU
             # instead (same halt path the lifter emits for a `stop` instruction).
             if tgt == addr:
-                return "ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
+                return f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; {_F}return;"
             return self._uncond_branch(tgt, func)
         if mn in ("brsl", "brasl"):
             # The disassembler drops the link register from brsl operands, so
@@ -941,7 +1275,7 @@ class SPULifter:
             # boot in cri_audio_00023C58). Set the link, then stop the SPU (same
             # halt path the lifter emits for a `stop` instruction).
             if tgt == addr:
-                return f"{link} ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;"
+                return f"{link} ctx->status = SPU_STATUS_STOPPED_BY_HALT; {_F}return;"
             # PC-GETTER IDIOM: `brsl rX, .+4` (target == next instruction) just
             # loads PC+4 into rX for PC-relative addressing / computed jump tables;
             # it is NOT a real call. Emitting a host call here imbalances the C
@@ -959,8 +1293,8 @@ class SPULifter:
                 # callee's own tail-chains so they don't grow the caller frame)
                 # + image save/restore (adopt-on-serve cannot leak upward).
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
-                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
-                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+                        f"ctx->host_depth++; {_F}{self.prefix}spu_func_{tgt:08X}(ctx); "
+                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); {_R}}}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -974,7 +1308,7 @@ class SPULifter:
             # Cross-function conditional branch = conditional tail: hand the
             # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
             return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; {_F}return; }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -999,15 +1333,15 @@ class SPULifter:
                 # publish THAT register as the return PC: SPU_RET publishes r0,
                 # and spu_drain_call restarts dispatch when pc != return_pc.
                 if tgt_reg != "0":
-                    return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
-                return f"{_ied}SPU_RET(ctx);"
+                    return f"{_ied}{_F}SPU_RET_REG(ctx, {tgt_reg});"
+                return f"{_ied}{_F}SPU_RET(ctx);"
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"g_spu_trampoline_fn = spu_indirect_branch; return;")
+                    f"g_spu_trampoline_fn = spu_indirect_branch; {_F}return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
             return (f"{_ied}ctx->pc = ctx->srr0; "
-                    "g_spu_trampoline_fn = spu_indirect_branch; return;")
+                    f"g_spu_trampoline_fn = spu_indirect_branch; {_F}return;")
         if mn in ("bisl",):
             # `bisl rt, ra`: rt = link, ra = TARGET. The disassembler emits BOTH
             # ("$r0, $r2"), so operand 0 is the link register -- taking it as the
@@ -1024,8 +1358,8 @@ class SPULifter:
             return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
                     f"int32_t _si = (int32_t)ctx->image_id; "
                     f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
-                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
-                    f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+                    f"{_F}spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
+                    f"ctx->host_depth--; spu_img_restore(ctx, _si); {_R}}}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link
@@ -1034,7 +1368,7 @@ class SPULifter:
             return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"{_ied}ctx->pc = _tg; "
-                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }} }}")
+                    f"g_spu_trampoline_fn = spu_indirect_branch; {_F}return; }} }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
@@ -1047,10 +1381,10 @@ class SPULifter:
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
                 if tgt_reg != "0":
-                    return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
-                return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
+                    return f"if ({cond}) {{ {_ied}{_F}SPU_RET_REG(ctx, {tgt_reg}); }}"
+                return f"if ({cond}) {{ {_ied}{_F}SPU_RET(ctx); }}"
             return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
+                    f"g_spu_trampoline_fn = spu_indirect_branch; {_F}return; }}")
 
         # hint-for-branch: pure performance hint, safe to drop
         if mn in ("hbr", "hbra", "hbrr"):
@@ -1086,7 +1420,7 @@ class SPULifter:
         # Cross-function unconditional tail: hand the target to the trampoline
         # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
         return (f"{{ ctx->pc = 0x{tgt:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+                f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; {_F}return; }}")
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -1115,6 +1449,9 @@ class SPULifter:
             lines.append(ORIGINAL_OBSERVER_PREAMBLE)
         if self.verified_code_image:
             lines.append('#include "spu_verified_overlay.h"')
+        promoted = any(f.promoted for f in self.functions)
+        if promoted:
+            lines.append(PROMOTE_PREAMBLE)
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         for f in self.functions:
             lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
@@ -1156,11 +1493,21 @@ class SPULifter:
         lines.append("};")
         lines.append("")
         lines.append(f"void {self.prefix}spu_recomp_register(void) {{")
+        if promoted:
+            lines.append("#if !SPU_LS_DIAG")
+            lines.append("    if (getenv(\"SPU_LS_LOWREAD\") || getenv(\"SPU_LS_WATCH\") || "
+                         "getenv(\"SPU_SMC_WATCH\") || getenv(\"SPU_WWS_PROBE\"))")
+            lines.append(f"        fprintf(stderr, \"[spu] {self.prefix}: LS diagnostics are compiled out "
+                         f"of this register-promoted image (rebuild it with -DSPU_LS_DIAG=1)\\n\");")
+            lines.append("#endif")
         lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
         lines.append("        spu_register_function(e->addr, e->func);")
         lines.append("}")
         lines.append("")
-        return "\n".join(lines)
+        source = "\n".join(lines)
+        if _F in source or _R in source or _X in source:
+            raise ValueError("register-promotion marker left in generated source")
+        return source
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -1234,6 +1581,17 @@ def main() -> None:
                         "by trampolines. Every chunk is still emitted and "
                         "registered on its own for indirect entry, so this only "
                         "changes speed, not which code can be reached.")
+    p.add_argument("--promote-regs", action="store_true",
+                   help="Keep SPU registers (and the LS base) in C locals inside each "
+                        "lifted function, storing them to ctx->gpr only before host "
+                        "returns and out-of-line calls and re-reading them after. "
+                        "Same architectural behaviour, far less memory traffic. "
+                        "LS access diagnostics then need -DSPU_LS_DIAG=1. Not "
+                        "combinable with --trace, --observe-original-work or "
+                        "--connected-regions.")
+    p.add_argument("--promote-max-regs", type=int, default=0, metavar="N",
+                   help="With --promote-regs, leave a function unpromoted when it "
+                        "names more than N SPU registers (0 = no limit).")
     p.add_argument("--max-group-insns", type=int, default=4000,
                    help="Cap on instructions per merged group (keeps clang fast).")
     p.add_argument("--force-indirect", default="",
@@ -1251,6 +1609,10 @@ def main() -> None:
     if args.verified_code_spans and not args.verified_code_image:
         p.error("--verified-code-spans requires --verified-code-image")
 
+    if args.promote_regs and (args.trace or args.observe_original_work or args.connected_regions):
+        p.error("--promote-regs cannot be combined with --trace, --observe-original-work or --connected-regions")
+    if args.promote_max_regs and not args.promote_regs:
+        p.error("--promote-max-regs requires --promote-regs")
     if args.connected_regions and not (args.verified_code_image and args.verified_code_spans):
         p.error("--connected-regions requires --verified-code-image and --verified-code-spans")
     if args.auto_functions:
@@ -1368,7 +1730,9 @@ def main() -> None:
                       verified_code_image=args.verified_code_image,
                       verified_code_spans=args.verified_code_spans,
                       connected_regions=args.connected_regions, region_bytes=args.region_bytes,
-                      observe_original_work=args.observe_original_work)
+                      observe_original_work=args.observe_original_work,
+                      promote_regs=args.promote_regs,
+                      promote_max_regs=args.promote_max_regs)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
@@ -1424,6 +1788,8 @@ def main() -> None:
     print(f"Wrote {hp}")
     print(f"Wrote {sp}")
     print(f"  {len(lifter.functions)} function(s) lifted")
+    if args.promote_regs:
+        print(f"  {sum(f.promoted for f in lifter.functions)} function(s) register-promoted")
     print(f"  {len(lifter.call_targets)} call target(s)")
     if lifter.unsupported:
         total = sum(lifter.unsupported.values())
