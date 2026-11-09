@@ -20,6 +20,10 @@ off and on:
 Final memory is the same with the switch off and on. PS3RECOMP_SANITIZE=thread
 (or address) builds the fixture with that sanitizer.
 """
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: compiles ppu_loader.cpp with cc/c++, whose Windows path needs MSVC __try/__except')
+    raise SystemExit(0)
 import os, sys, subprocess, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))

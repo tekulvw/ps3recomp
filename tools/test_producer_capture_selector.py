@@ -1,4 +1,8 @@
 """Actual producer caller wildcard/exact/invalid selection and finite full-frame gate."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: configures itself with setenv/unsetenv')
+    raise SystemExit(0)
 from pathlib import Path
 import os
 import subprocess

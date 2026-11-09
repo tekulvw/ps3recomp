@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Generated raw blocks match real interpreter GPR/LS/control state."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: built with cc and -fsanitize=undefined; MinGW has no UBSan runtime')
+    raise SystemExit(0)
 import pathlib,subprocess,tempfile,os,sys,json,struct
 from spu_leaf_blocks import emit
 r=pathlib.Path(__file__).resolve().parents[1];s=r/'runtime/spu';u=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap','spurs_policy_blob_weak','spu_interp', '../diagnostics/job_io_recorder']

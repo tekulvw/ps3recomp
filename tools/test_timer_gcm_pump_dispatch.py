@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Neutral production-dispatch regression for the PR353 timer GCM pump."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: compiles ppu_loader.cpp with cc/c++, whose Windows path needs MSVC __try/__except')
+    raise SystemExit(0)
 import os,subprocess,sys,tempfile
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent))

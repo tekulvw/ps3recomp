@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Clock-controlled actual cellPad HLE; no live game or physical controller."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: builds the SDL pad path through sdl2-config')
+    raise SystemExit(0)
 import argparse,json,os,pathlib,shlex,subprocess,sys,tempfile
 r=pathlib.Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser();p.add_argument('--output-dir',type=pathlib.Path,help='keep the build here (default: a temporary directory)');a=p.parse_args()

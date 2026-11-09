@@ -3,6 +3,10 @@
 store-watch window (g_ww_lo..g_ww_hi) as it stands at each transfer. Rows name
 the context image and the resident job images. Reuses the synthetic
 DMA-disposition fixture (image 7, synthetic memory)."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: stubs Win32 SetLastError, which collides with kernel32 on Windows')
+    raise SystemExit(0)
 import os, subprocess, tempfile, re
 from pathlib import Path
 root = Path(__file__).resolve().parents[1]

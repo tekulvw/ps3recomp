@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: needs sys/mman.h')
+    raise SystemExit(0)
 import os,subprocess,sys,tempfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]

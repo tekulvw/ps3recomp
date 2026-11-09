@@ -10,6 +10,10 @@ diagnostics that must turn the fast paths off) against each:
   - an old-style header without any inline accesses, given loads and stores by the tool.
 The transcripts must be identical. Each also runs with the runtime's fast accessors compiled in.
 """
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: compiles ppu_loader.cpp with cc/c++, whose Windows path needs MSVC __try/__except')
+    raise SystemExit(0)
 import os, re, subprocess, sys, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))

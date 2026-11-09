@@ -49,6 +49,10 @@ void cellGcm_rsx_consumer_end(void) { consumer_depth--; }
 static int failures, checks;
 #define CHECK(v, name) do { checks++; if (!(v)) { failures++; fprintf(stderr, "FAIL %s\n", name); } \
                             else fprintf(stderr, "ok   %s\n", name); } while (0)
+/* A hardware-only check: a software adapter (WARP) reports it as skipped. */
+static int s_software_adapter;
+#define CHECK_HW(v, name) do { if (s_software_adapter) fprintf(stderr, "skip %s (software adapter)\n", name); \
+                               else CHECK(v, name); } while (0)
 
 static const char VS[] =
     "struct VSInput { float4 a0:ATTR0; float4 a8:ATTR8; };\n"
@@ -111,6 +115,24 @@ static int open_device(void)
     }
     if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&s_d3d.device))) {
         fprintf(stderr, "SKIP: no D3D12 device\n"); return 2;
+    }
+    /* Name the adapter, and note a software one (WARP, the only device on
+     * GPU-less CI runners) for the checks it does not reproduce. */
+    IDXGIFactory4* factory = NULL;
+    if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory))) {
+        LUID luid = {0};
+        s_d3d.device->lpVtbl->GetAdapterLuid(s_d3d.device, &luid);
+        IDXGIAdapter1* adapter = NULL;
+        if (SUCCEEDED(factory->lpVtbl->EnumAdapterByLuid(factory, luid, &IID_IDXGIAdapter1, (void**)&adapter))) {
+            DXGI_ADAPTER_DESC1 ad;
+            if (SUCCEEDED(adapter->lpVtbl->GetDesc1(adapter, &ad))) {
+                s_software_adapter = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+                fprintf(stderr, "adapter %ls (vendor 0x%04X device 0x%04X)%s\n", ad.Description,
+                        ad.VendorId, ad.DeviceId, s_software_adapter ? " [software]" : "");
+            }
+            adapter->lpVtbl->Release(adapter);
+        }
+        factory->lpVtbl->Release(factory);
     }
     D3D12_COMMAND_QUEUE_DESC qd; memset(&qd, 0, sizeof qd); qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(s_d3d.device->lpVtbl->CreateCommandQueue(s_d3d.device, &qd, &IID_ID3D12CommandQueue, (void**)&s_d3d.cmd_queue)))
@@ -445,7 +467,8 @@ int main(void)
         b->set_depth_bounds(b->user, 0.4f, 0.6f);
         draw_full(b, pbounds);
         const u32 l = px(b, rt, 8, 8), r = px(b, rt, 56, 8);
-        CHECK(l != 0xFF0000FFu && r == 0xFF0000FFu, "bounds [0.4, 0.6] pass 0.5 and reject 0.75");
+        /* WARP lets the 0.75 half through these two; hardware rejects it. */
+        CHECK_HW(l != 0xFF0000FFu && r == 0xFF0000FFu, "bounds [0.4, 0.6] pass 0.5 and reject 0.75");
         b->clear_color(b->user, rt, red);
         b->set_depth_bounds(b->user, 0.0f, 1.0f);
         draw_full(b, pbounds);
@@ -453,7 +476,7 @@ int main(void)
         b->clear_color(b->user, rt, red);
         b->set_depth_bounds(b->user, NAN, 0.6f);   /* NaN opens its end: [0, 0.6] */
         draw_full(b, pbounds);
-        CHECK(px(b, rt, 8, 8) != 0xFF0000FFu && px(b, rt, 56, 8) == 0xFF0000FFu, "NaN minimum opens the range");
+        CHECK_HW(px(b, rt, 8, 8) != 0xFF0000FFu && px(b, rt, 56, 8) == 0xFF0000FFu, "NaN minimum opens the range");
         b->clear_color(b->user, rt, red);
         b->set_depth_bounds(b->user, 0.4f, NAN);   /* [0.4, 1] */
         draw_full(b, pbounds);

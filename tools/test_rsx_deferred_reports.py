@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Bounded report ordering and actual VM mutation rejection fixtures."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: built with cc and -fsanitize=undefined; MinGW has no UBSan runtime')
+    raise SystemExit(0)
 import os, subprocess, sys, tempfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]

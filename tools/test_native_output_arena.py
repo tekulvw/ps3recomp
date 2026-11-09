@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Synthetic native output arena through the actual VM and GCM registries."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: relies on POSIX weak linkage for the critical-trace hooks')
+    raise SystemExit(0)
 import os,subprocess,sys,tempfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]

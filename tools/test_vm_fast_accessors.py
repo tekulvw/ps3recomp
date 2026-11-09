@@ -13,6 +13,10 @@ and runs one driver against both:
 and prints the same transcript in both builds. The reservation stress tests run the fast
 accessors through tools/test_ppu_store_fastpath.py (PPU_TEST_EXTRA_DEFINES).
 """
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: compiles ppu_loader.cpp with cc/c++, whose Windows path needs MSVC __try/__except')
+    raise SystemExit(0)
 import os, subprocess, sys, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))

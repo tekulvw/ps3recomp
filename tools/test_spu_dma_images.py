@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """SPU_DMA_IMAGES: a listed image's transfers are reported, others are not.
 Reuses the synthetic DMA-disposition fixture (image 7, synthetic memory)."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: stubs Win32 SetLastError, which collides with kernel32 on Windows')
+    raise SystemExit(0)
 import os, subprocess, tempfile, re
 from pathlib import Path
 root = Path(__file__).resolve().parents[1]
