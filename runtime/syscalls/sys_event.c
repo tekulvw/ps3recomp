@@ -1552,10 +1552,7 @@ void sys_event_init(lv2_syscall_table* tbl)
     memset(g_sys_event_flags,  0, sizeof(g_sys_event_flags));
 
 #ifdef _WIN32
-    if (!s_evt_table_lock_init) {
-        InitializeCriticalSection(&s_evt_table_lock);
-        s_evt_table_lock_init = 1;
-    }
+    InitOnceExecuteOnce(&s_evt_table_lock_once, evt_table_lock_init, NULL, NULL);
 #endif
 
     /* Event queues */
