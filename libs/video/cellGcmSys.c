@@ -21,6 +21,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
+#include "../../runtime/spu/spu_coh_section.h" /* host line read-modify-writes */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
@@ -1696,7 +1697,7 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     u32 value=(r->argument>>24)==1u?0xffffu:0u;
     if(r->index<CELL_GCM_MAX_REPORT_COUNT){s_report_data[r->index].timestamp=timestamp;s_report_data[r->index].value=value;}
     if(r->main_memory){
-        spu_lockline_lock();
+        spu_coh_write_begin(ea, 16);
         const u32 words[4]={(u32)(timestamp>>32),(u32)timestamp,value,0};
         for(u32 i=0;i<4;i++){
             u32 address=ea+i*4u,raw=ps3_bswap32(words[i]);
@@ -1704,7 +1705,7 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
             PS3_WW_CHECK(address,words[i],4);memcpy(vm_base+address,&raw,sizeof(raw));
             if(g_resv_store_active>0)ppu_resv_break_store(address);
         }
-        spu_coh_notify_write(ea);spu_lockline_unlock();
+        spu_coh_notify_write(ea);spu_coh_write_end();
         if(s_lag_ea&&ea<=s_lag_ea&&s_lag_ea-ea<16u){static unsigned rn;if(rn++<20000u)fprintf(stderr,"[label-lag] t=%llu publish ea=0x%08X method=0x1800 value=0x%08X early=%u\n",(unsigned long long)ps3_critical_now_ns(),s_lag_ea,r->argument,(unsigned)r->early);}
     }
     if(r->start_ns){uint64_t w[5]={r->start_ns,ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,PS3_CRITICAL_REPORT,ea,r->index,w,5);}
@@ -2197,11 +2198,11 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
     int reserved = 0;
     for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
     if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
-    spu_lockline_lock();
+    spu_coh_write_begin(d, n);
     memmove(vm_base + d, vm_base + s, n);
     for (u32 a = l0; a <= l1; a += 128)
         if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
-    spu_lockline_unlock();
+    spu_coh_write_end();
 }
 
 static void nv3089_blit(void)
