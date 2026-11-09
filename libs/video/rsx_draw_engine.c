@@ -3057,9 +3057,13 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
                     mn, mx, unit < 0 ? "no free texture unit" : "no depth target");
         return;
     }
-    if (!z->dbz_copy || z->dbz_serial != z->depth_serial || z->dbz_w != z->w || z->dbz_h != z->h) {
+    const int same_size = z->dbz_copy && z->dbz_w == z->w && z->dbz_h == z->h;
+    if (!same_size || z->dbz_serial != z->depth_serial) {
         if (s_dbz_stats.on > 0) s_dbz_stats.snaps++;
-        const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
+        u32 tex = 0;
+        if (same_size && g.be->depth_snapshot_into)   /* reuse the copy's texture */
+            tex = g.be->depth_snapshot_into(g.be->user, z->handle, z->dbz_copy);
+        if (!tex) tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
         if (!tex) return;
         if (z->dbz_copy && z->dbz_copy != tex && g.be->texture_release)
             g.be->texture_release(g.be->user, z->dbz_copy);

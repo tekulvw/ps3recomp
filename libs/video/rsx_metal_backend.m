@@ -4061,6 +4061,25 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     return dst;
 }
 
+/* eng_depth_snapshot into a texture an earlier snapshot returned, instead of
+ * a new one (rsx_draw_backend.depth_snapshot_into). The resolve is recorded
+ * like any snapshot; Metal's hazard tracking orders its pass after the
+ * passes already recorded that sample `dst`. */
+static u32 eng_depth_snapshot_into(void* user, u32 depth, u32 dst)
+{
+    (void)user;
+    id<MTLTexture> d = eng_obj(dst);
+    if (!eng_obj(depth) || !d || !s_eng_depth_pso || [d pixelFormat] != MTLPixelFormatR32Float)
+        return 0;
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; eng_checked_fail(); return 0; }
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_DEPTH_RESOLVE;
+    r->depth = depth;
+    r->resolve_dst = dst;
+    return dst;
+}
+
 static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
 {
     (void)user;
@@ -6843,6 +6862,10 @@ static u32 owner_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h){
     if(!metal_owner_begin(1)){return 0;}
     u32 result=eng_depth_snapshot(user,depth,w,h);metal_owner_finish(0);return result;
 }
+static u32 owner_eng_depth_snapshot_into(void* user, u32 depth, u32 dst){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_depth_snapshot_into(user,depth,dst);metal_owner_finish(0);return result;
+}
 static int owner_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                               float* out, u32 out_pitch){
     if(!metal_owner_begin(1)){return -1;}
@@ -6990,6 +7013,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_target_create  = owner_eng_depth_target_create,
     .depth_target_release = owner_eng_obj_release,
     .depth_snapshot       = owner_eng_depth_snapshot,
+    .depth_snapshot_into  = owner_eng_depth_snapshot_into,
     .depth_readback       = owner_eng_depth_readback,
     .depth_store_z24      = owner_eng_depth_store_z24,
     .depth_z24_texture    = owner_eng_depth_z24_texture,
