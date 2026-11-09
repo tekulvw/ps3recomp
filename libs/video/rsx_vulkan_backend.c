@@ -370,7 +370,34 @@ static struct {
      * a slot sized for a few hundred draws otherwise submits that often. */
     VkDeviceSize arena_want;
     u64 arena_flushes;
+    /* PS3RECOMP_VK_MERGE_PASSES=1: draws merged into an open render pass */
+    int merge;
+    u64 passes, merged_draws, feedback_breaks, binds_skipped;
 } s_bat;
+
+/* The render pass a merged draw left open in the open batch (only with
+ * s_bat.merge), and the dynamic state already recorded in it. Anything other
+ * than a draw that continues it ends it first: vk_bat_begin_op (every other
+ * recorded operation), vk_bat_flush (every submission) and a target release. */
+static struct {
+    int open;
+    VkRenderPass rp;
+    VkFramebuffer fb;
+    u32 w, h, n, rt[RSX_BE_MAX_COLOR_TARGETS];
+    VkPipeline pipe;
+    VkPipelineLayout layout;
+    VkViewport vp;
+    VkRect2D sc;
+    u32 stencil_ref;
+    float bounds[2];
+    int have_state;
+} s_pass;
+static void vk_pass_close(VkCommandBuffer cb)
+{
+    if (!s_pass.open) return;
+    pvkCmdEndRenderPass(cb);
+    s_pass.open = 0;
+}
 
 static int vulkan_owner_enabled(void){
     static atomic_int setting=-1;int value=atomic_load_explicit(&setting,memory_order_relaxed);
@@ -3357,6 +3384,9 @@ static void vk_eng_release(void* user, u32 handle)
 {
     (void)user;
     if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE || s_eobj_retired[handle]) return;
+    /* A merged pass never outlives a target release: the handle (and its
+     * framebuffers) may be reused by the next draw's target. */
+    if (s_bat_on && s_bat.open) vk_pass_close(s_vk.cmd);
     if (s_eobj[handle].kind == VK_ENG_COLOR)
         for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
             if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
@@ -4988,6 +5018,20 @@ static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P, VkDescript
     return set;
 }
 
+/* Does the bound texture set read one of the open pass's colour targets,
+ * directly or through a crossbar view of it? */
+static int vk_pass_samples_target(void)
+{
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        if (!((s_e2.tex_mask >> u) & 1u)) continue;
+        u32 h = s_e2.tex[u];
+        if (!h || h >= VK_ENG_MAX_OBJ) continue;
+        if (s_eobj[h].kind == VK_ENG_VIEW) h = s_eobj[h].surface;
+        for (u32 i = 0; i < s_pass.n; i++) if (s_pass.rt[i] == h) return 1;
+    }
+    return 0;
+}
+
 static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                         u32 stride, const u32* indices, u32 index_count)
 {
@@ -5062,16 +5106,41 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     }
     if (!set) return;
 
-    if (vk_begin()) return;
-    /* Everything submitted before is complete (each submission is waited
-     * on); this orders memory for the surfaces this draw touches. */
-    for (u32 i = 0; i < n; i++)
-        vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-                                  .renderPass = rp, .framebuffer = fb,
-                                  .renderArea = { { 0, 0 }, { w, h } } };
-    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    /* Merged (PS3RECOMP_VK_MERGE_PASSES=1, batched only): a draw into the
+     * framebuffer of the pass the previous draw left open continues it,
+     * without the full dependency and the begin/end every draw otherwise
+     * records -- the run of same-attachment draws the Metal backend encodes
+     * as one pass. Draws inside one subpass are still ordered against each
+     * other's attachment writes (rasterization order). A draw that samples
+     * one of the open pass's colour targets ends it, so its reads follow the
+     * earlier writes through the same dependency as before. */
+    const int merge = s_bat_on && s_bat.merge;
+    const int cont = merge && s_pass.open && s_bat.open && s_pass.fb == fb && s_pass.rp == rp &&
+                     s_pass.w == w && s_pass.h == h && !vk_pass_samples_target();
+    if (merge && s_pass.open && !cont && s_bat.open && s_pass.fb == fb) s_bat.feedback_breaks++;
+    if (!cont) {
+        if (vk_begin()) return;            /* batched: also ends an open pass */
+        /* Everything submitted before is complete (each submission is waited
+         * on); this orders memory for the surfaces this draw touches. */
+        for (u32 i = 0; i < n; i++)
+            vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                      .renderPass = rp, .framebuffer = fb,
+                                      .renderArea = { { 0, 0 }, { w, h } } };
+        pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        if (merge) {
+            s_pass.open = 1; s_pass.rp = rp; s_pass.fb = fb; s_pass.w = w; s_pass.h = h; s_pass.n = n;
+            for (u32 i = 0; i < n; i++) s_pass.rt[i] = s_eng_bound.rt[i];
+            s_pass.have_state = 0;
+            s_bat.passes++;
+        }
+    } else {
+        s_bat.merged_draws++;
+    }
+    const VkPipelineLayout layout = P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout;
+    if (!cont || !s_pass.have_state || s_pass.pipe != pipe)
+        pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    else s_bat.binds_skipped++;
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
         vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1]; vp.width = s_e2.vp[2]; vp.height = s_e2.vp[3];
@@ -5085,20 +5154,31 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         sc.offset.x = (int32_t)x0; sc.offset.y = (int32_t)y0;
         sc.extent.width = x1 > x0 ? x1 - x0 : 0; sc.extent.height = y1 > y0 ? y1 - y0 : 0;
     }
-    pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
-    pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
-    pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
-    if (s_vk.depth_bounds_ok)
+    /* Dynamic state a continued pass already holds is not recorded again. */
+    const int same = cont && s_pass.have_state;
+    if (!same || memcmp(&s_pass.vp, &vp, sizeof vp)) pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
+    if (!same || memcmp(&s_pass.sc, &sc, sizeof sc)) pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
+    if (!same || s_pass.stencil_ref != (s_e2.stencil_ref & 0xFFu))
+        pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
+    if (s_vk.depth_bounds_ok && (!same || memcmp(s_pass.bounds, s_e2.depth_bounds, sizeof s_pass.bounds)))
         pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
-    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                             P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout,
-                             0, 1, &set, 0, NULL);
+    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
     pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &voff);
     if (indices && index_count) {
         pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
         pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+    }
+    if (merge) {
+        s_pass.pipe = pipe; s_pass.layout = layout; s_pass.vp = vp; s_pass.sc = sc;
+        s_pass.stencil_ref = s_e2.stencil_ref & 0xFFu;
+        memcpy(s_pass.bounds, s_e2.depth_bounds, sizeof s_pass.bounds);
+        s_pass.have_state = 1;
+        /* Left open for the next draw; counted as one operation each, so a
+         * batch still submits at PS3RECOMP_VK_BATCH_MAX_OPS (ending it). */
+        (void)vk_bat_end_op();
+        return;
     }
     pvkCmdEndRenderPass(s_vk.cmd);
     vk_submit_and_wait();
@@ -5341,6 +5421,15 @@ static u64 vk_e5_submit(vk_e5_slot* sl, int recorded)
  *     could reference them retires.
  * Nothing about guest memory changes: inputs are still copied when recorded,
  * and every result the CPU reads is still waited for at its stream position.
+ *
+ * PS3RECOMP_VK_MERGE_PASSES=1 (default off; read at init, batched only): a
+ * draw whose framebuffer is that of the render pass the previous draw left
+ * open continues it -- no full dependency, no begin/end, and no dynamic state
+ * or pipeline bind it already holds -- the run of same-attachment draws the
+ * Metal backend encodes as one pass. Every other operation, every submission
+ * and every target release ends the pass first, and a draw that samples one
+ * of its colour targets (or a view of one) starts a new one, so everything
+ * outside such a run is ordered exactly as above.
  * -------------------------------------------------------------------------*/
 #define VK_BAT_SETS 1024u
 #define VK_BAT_ARENA_MAX ((VkDeviceSize)32u << 20)
@@ -5452,6 +5541,7 @@ static int vk_bat_open(void)
 static int vk_bat_begin_op(void)
 {
     if (vk_bat_open()) return -1;
+    vk_pass_close(s_vk.cmd);
     vk_cmd_after_everything(s_vk.cmd);
     return 0;
 }
@@ -5466,6 +5556,7 @@ static int vk_bat_flush(int wait)
         return vk_e5_failed() ? -1 : 0;
     }
     vk_bat_slot* bs = &s_bat.s[s_bat.cur];
+    vk_pass_close(bs->cb);
     vk_cmd_after_everything(bs->cb);
     s_bat.open = 0;
     s_vk.frontend_recording = 0;
@@ -5569,12 +5660,15 @@ static void vk_bat_log(void)
     if (last.tv_sec && now.tv_sec - last.tv_sec < 2) return;
     last = now;
     fprintf(stderr, "[rsx inflight vulkan batch] batches=%llu ops=%llu ops_per_batch=%.1f slot_waits=%llu cpu_waits=%llu "
-            "retired=%llu pending_retire=%u arena_grows=%llu arena_flushes=%llu arena_mib=%llu\n",
+            "retired=%llu pending_retire=%u arena_grows=%llu arena_flushes=%llu arena_mib=%llu passes=%llu merged_draws=%llu "
+            "feedback_breaks=%llu pipeline_binds_skipped=%llu\n",
             (unsigned long long)s_bat.batches, (unsigned long long)s_bat.batch_ops,
             s_bat.batches ? (double)s_bat.batch_ops / (double)s_bat.batches : 0.0,
             (unsigned long long)s_bat.slot_waits, (unsigned long long)s_bat.waits_for_cpu,
             (unsigned long long)s_bat.retired, s_bat.nret, (unsigned long long)s_bat.arena_grows,
-            (unsigned long long)s_bat.arena_flushes, (unsigned long long)(s_bat.s[s_bat.cur].arena.size >> 20));
+            (unsigned long long)s_bat.arena_flushes, (unsigned long long)(s_bat.s[s_bat.cur].arena.size >> 20),
+            (unsigned long long)s_bat.passes, (unsigned long long)s_bat.merged_draws,
+            (unsigned long long)s_bat.feedback_breaks, (unsigned long long)s_bat.binds_skipped);
 }
 
 static int vk_bat_init(void)
@@ -5586,6 +5680,8 @@ static int vk_bat_init(void)
       s_bat.nslots = v < 2 ? 2u : v > (long)VK_BAT_MAX_SLOTS ? VK_BAT_MAX_SLOTS : (u32)v; }
     { const char* n = getenv("PS3RECOMP_VK_BATCH_MAX_OPS"); long v = n ? strtol(n, NULL, 0) : 2048;
       s_bat.max_ops = v < 1 ? 1u : v > 65536 ? 65536u : (u32)v; }
+    { const char* m = getenv("PS3RECOMP_VK_MERGE_PASSES"); s_bat.merge = m && !strcmp(m, "1"); }
+    memset(&s_pass, 0, sizeof s_pass);
     VkPhysicalDeviceProperties p; pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     s_bat.align = 256u;
     if (p.limits.minUniformBufferOffsetAlignment > s_bat.align) s_bat.align = p.limits.minUniformBufferOffsetAlignment;
@@ -5594,7 +5690,8 @@ static int vk_bat_init(void)
     for (u32 i = 0; i < s_bat.nslots; i++) if (vk_bat_slot_init(&s_bat.s[i])) return -1;
     s_bat.legacy_cmd = s_vk.cmd;
     s_bat_on = 1;
-    VK_LOG("engine: batched recording on (%u batches in flight, at most %u operations each)\n", s_bat.nslots, s_bat.max_ops);
+    VK_LOG("engine: batched recording on (%u batches in flight, at most %u operations each%s)\n", s_bat.nslots, s_bat.max_ops,
+           s_bat.merge ? ", same-target draws merged into one render pass" : "");
     return 0;
 }
 

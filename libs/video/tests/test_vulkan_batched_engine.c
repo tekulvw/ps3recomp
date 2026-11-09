@@ -5,7 +5,9 @@
  * and texture release mid-stream, completion tickets, a GPU depth view, a
  * present and readbacks -- headless under the Khronos validation layer.
  *
- * Run once with each recording mode (argv[1] "sync" or "batched"). Each run
+ * Run once with each recording mode (argv[1] "sync", "batched", or "merged":
+ * batched with PS3RECOMP_VK_MERGE_PASSES=1, same-target draws sharing one
+ * render pass). Each run
  * writes its readback bytes to argv[2]; the runner requires the two files to
  * be identical, so batched recording is checked against the per-operation
  * submissions, pixel for pixel. No window, guest memory or game data.
@@ -143,8 +145,10 @@ static void busy_shutdown(void)
 
 int main(int argc, char** argv)
 {
-    if (argc != 4) { fprintf(stderr, "usage: fixture sync|batched OUT DRAWS\n"); return 2; }
-    const int batched = !strcmp(argv[1], "batched");
+    if (argc != 4) { fprintf(stderr, "usage: fixture sync|batched|merged OUT DRAWS\n"); return 2; }
+    const int merged = !strcmp(argv[1], "merged");
+    const int batched = merged || !strcmp(argv[1], "batched");
+    if (merged) setenv("PS3RECOMP_VK_MERGE_PASSES", "1", 1); else unsetenv("PS3RECOMP_VK_MERGE_PASSES");
     const u32 draws = (u32)strtoul(argv[3], NULL, 0);
     setenv("PS3RECOMP_RSX_ENGINE", "dispatch", 1);
     setenv("PS3RECOMP_VK_WINDOW", "0", 1);
@@ -152,6 +156,7 @@ int main(int argc, char** argv)
     if (batched) setenv("PS3RECOMP_VK_BATCHED_ENGINE", "1", 1); else unsetenv("PS3RECOMP_VK_BATCHED_ENGINE");
     assert(rsx_vulkan_backend_init(TW, TH, "batched engine synthetic") == 0 && s_vk.eng_active);
     CHECK(s_bat_on == batched, "recording mode as requested");
+    CHECK(s_bat.merge == merged, "pass merging as requested");
     CHECK(s_g.on, "guest programs (glslang) available");
     if (!s_g.on) { rsx_vulkan_backend_shutdown(); return 1; }
 
@@ -203,6 +208,12 @@ int main(int argc, char** argv)
         }
         u32 target = (i % 5 == 4) ? rt2 : rt;
         u32 bound_tex = t0, snap = 0;
+        /* Sample the other target through a crossbar view: written by earlier
+         * passes, never by the pass this draw may continue. */
+        if (i % 7 == 3) {
+            const u32 view = vk_eng_surface_view(NULL, target == rt ? rt2 : rt, 0xAAE4u, 0x85u);
+            if (view) bound_tex = view;
+        }
         if (i % 61 == 30) {                         /* colour feedback: sample a copy of the target */
             snap = vk_eng_color_snapshot(NULL, target);
             if (snap) bound_tex = snap;
@@ -428,6 +439,31 @@ int main(int argc, char** argv)
             CHECK(px[0] == 0 && px[1] == 0 && px[2] == 0 && px[3] == 0, "unbound 2D and cube units read transparent black");
             vk_eng_pipeline_release(NULL, pu);
         }
+    }
+    /* What ends a merged pass besides a different framebuffer: a draw that
+     * samples one of its colour targets, directly or through a view. */
+    {
+        const int was_open = s_pass.open; const u32 was_n = s_pass.n, was0 = s_pass.rt[0];
+        const u32 tex_was = s_e2.tex[0], mask_was = s_e2.tex_mask;
+        const u32 view = vk_eng_surface_view(NULL, rt, 0xAAE4u, 0x85u);
+        s_pass.n = 1; s_pass.rt[0] = rt;
+        s_e2.tex_mask = 1u;
+        s_e2.tex[0] = t0;   CHECK(!vk_pass_samples_target(), "merge: a texture is not a pass target");
+        s_e2.tex[0] = rt2;  CHECK(!vk_pass_samples_target(), "merge: another target is not this pass's");
+        s_e2.tex[0] = rt;   CHECK(vk_pass_samples_target(), "merge: sampling the pass's target ends it");
+        s_e2.tex[0] = view; CHECK(view && vk_pass_samples_target(), "merge: so does a crossbar view of it");
+        s_e2.tex_mask = 0u; CHECK(!vk_pass_samples_target(), "merge: an unbound unit samples nothing");
+        s_e2.tex[0] = tex_was; s_e2.tex_mask = mask_was;
+        s_pass.n = was_n; s_pass.rt[0] = was0; s_pass.open = was_open;
+    }
+    if (merged) {
+        printf("merged: %llu passes, %llu draws continued an open pass, %llu pipeline binds skipped\n",
+               (unsigned long long)s_bat.passes, (unsigned long long)s_bat.merged_draws,
+               (unsigned long long)s_bat.binds_skipped);
+        CHECK(s_bat.merged_draws > draws / 4, "merge: same-target runs share a pass");
+        CHECK(s_bat.passes > 0 && s_bat.passes < draws, "merge: fewer passes than draws");
+    } else {
+        CHECK(s_bat.merged_draws == 0, "no merging unless asked");
     }
     CHECK(!vk_e5_failed(), "no submission failed");
     if (batched)
