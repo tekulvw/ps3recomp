@@ -3,7 +3,7 @@
  *
  * PS3RECOMP_COH_VERSIONS=1 selects this scheme instead of the lock-line lock,
  * holder walk and notify of spu_coherency.c. The ordering argument is at the
- * top of spu_coh_version.c.
+ * top of spu_coh_version.inc.
  *
  * Every 128-byte guest line has one 32-bit word:
  *

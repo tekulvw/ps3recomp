@@ -13,12 +13,12 @@
  * VM_WRITE_COH / ppu_load_reserve32 / ppu_stwcx32 call them, with
  * PS3RECOMP_PPU_STORE_FASTPATH=1 (MAG's default). ppu_resv_break_line walks a
  * registry of PPU contexts as ppu_loader.cpp's does. "version" runs the same
- * workloads through spu_coh_version.c.
+ * workloads through spu_coh_version.inc.
  *
  * Build:
  *   clang -std=gnu17 -O2 -I include -I runtime/spu -c runtime/spu/spu_coherency.c -o /tmp/coh.o
  *   clang -std=gnu17 -O2 -I include -I runtime/spu -o /tmp/bench_spu_coherence \
- *         runtime/spu/tests/bench_spu_coherence.c runtime/spu/spu_coh_version.c /tmp/coh.o -lpthread
+ *         runtime/spu/tests/bench_spu_coherence.c /tmp/coh.o -lpthread
  * Run:
  *   bench_spu_coherence [seconds-per-case=0.5] [spu-threads=4] [ppu-threads=2]
  *                       [polls-per-claim=4]

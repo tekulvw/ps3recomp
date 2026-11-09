@@ -1,5 +1,5 @@
 /*
- * Per-line version counters (runtime/spu/spu_coh_version.c): semantics and
+ * Per-line version counters (runtime/spu/spu_coh_version.inc): semantics and
  * torture tests, synthetic, on host threads.
  *
  * The scheme replaces "a writer finds every holder of the line and tells it"
@@ -22,7 +22,7 @@
  * Build (also under -fsanitize=thread):
  *   clang -std=gnu17 -O2 -Wall -Wextra -I runtime/spu \
  *         -o /tmp/test_spu_coh_version \
- *         runtime/spu/tests/test_spu_coh_version.c runtime/spu/spu_coh_version.c -lpthread
+ *         runtime/spu/tests/test_spu_coh_version.c -lpthread
  *
  * COHV_TEST_SCALE=<n> multiplies the torture iteration counts (default 1);
  * COHV_TEST_DIV=<n> divides them (use 20 or so under ThreadSanitizer, which
@@ -31,6 +31,7 @@
  */
 
 #include "../spu_coh_version.h"
+#include "../spu_coh_version.inc"   /* the unit under test, standalone */
 
 #include <pthread.h>
 #include <sched.h>

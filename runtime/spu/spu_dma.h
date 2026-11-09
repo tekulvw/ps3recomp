@@ -305,11 +305,15 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * follows the existing plain-MFC-write model; issuer reservation
          * behavior for storage controls is not separately modeled here. */
         if(ps3_jobio_is(spu))ps3_jobio_event(spu,PS3_JOBIO_ZERO,cmd,lsa,ea,size,NULL,0);
-        spu_lockline_lock();
-        memset(vm_base + (uint32_t)ea, 0, size);
-        for (uint32_t offset = 0; offset < size; offset += 128u)
-            spu_coh_notify_write_except((uint32_t)ea + offset, spu);
-        spu_lockline_unlock();
+        if (g_spu_coh_ops) {   /* PS3RECOMP_COH_VERSIONS: each marked line under its count */
+            g_spu_coh_ops->write((uint32_t)ea, vm_base + (uint32_t)ea, NULL, size, spu);
+        } else {
+            spu_lockline_lock();
+            memset(vm_base + (uint32_t)ea, 0, size);
+            for (uint32_t offset = 0; offset < size; offset += 128u)
+                spu_coh_notify_write_except((uint32_t)ea + offset, spu);
+            spu_lockline_unlock();
+        }
         return spu_dma_disposition_finish(&disposition, spu, lsa, ea, size, cmd, 0, SPU_DMA_DISPOSITION_ZERO_EA);
     }
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
@@ -909,7 +913,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
                 if (a == a1) break;
             }
-            if (span_reserved && a0 != a1 && ((a1 - a0) >> 7) < 64u * 3u &&
+            if (span_reserved && g_spu_coh_ops) {
+                /* PS3RECOMP_COH_VERSIONS: each reserved line is written under
+                 * its own count, the rest plainly; holders of those lines see
+                 * the counts move, and this SPU keeps its own reservation. */
+                spu_dma_disposition_before(&disposition, ls_ptr, ea, size);
+                if(ps3_critical_write_watched(ea,size))ps3_critical_write_begin(&critical_write,(uint64_t)(uintptr_t)spu,ea,size,ea_ptr,ls_ptr,9,cmd|((uint32_t)spu->image_id<<16),spu->pc,spu->gpr[0]._u32[0],critical_generation,1);
+                g_spu_coh_ops->write((uint32_t)ea, ea_ptr, ls_ptr, size, spu);
+                if(critical_write.capture)ps3_critical_write_end(&critical_write,ea_ptr);
+                spu_dma_disposition_after(&disposition, ea_ptr);
+                copy_disposition = SPU_DMA_DISPOSITION_PUT;
+            } else if (span_reserved && a0 != a1 && ((a1 - a0) >> 7) < 64u * 3u &&
                 !ps3_critical_write_watched(ea,size)) {
                 /* Only the reserved lines need the lock: they are the ones a
                  * peer's compare-and-commit can be inside. The others are

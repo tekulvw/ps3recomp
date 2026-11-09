@@ -23,9 +23,9 @@
  * Sections do not nest, and a section must not store through vm_write* to a
  * line it holds (the default scheme would deadlock on the lock-line lock).
  *
- * The hooks are one definition per program (weak / selectany) so that targets
- * which stub the lock-line lock and never link spu_coherency.c see NULL and
- * keep the plain lock.
+ * The version scheme is reached through g_spu_coh_ops (spu_coh_ops.h), which is
+ * NULL unless it is on, so targets that stub the lock-line lock and never link
+ * spu_coherency.c keep the plain lock.
  */
 
 #ifndef SPU_COH_SECTION_H
@@ -33,13 +33,7 @@
 
 #include <stdint.h>
 
-#ifndef SPU_COH_SHARED
-#  if defined(_MSC_VER) || defined(__MINGW32__)
-#    define SPU_COH_SHARED __declspec(selectany)
-#  else
-#    define SPU_COH_SHARED __attribute__((weak))
-#  endif
-#endif
+#include "spu_coh_ops.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,21 +42,17 @@ extern "C" {
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
 
-/* Set by spu_coherency.c when per-line version counters are on. */
-SPU_COH_SHARED void (*g_spu_coh_section_begin)(uint32_t ea, uint32_t len) = 0;
-SPU_COH_SHARED void (*g_spu_coh_section_end)(void) = 0;
-
 static inline void spu_coh_write_begin(uint32_t ea, uint32_t len)
 {
     spu_lockline_lock();
-    void (*begin)(uint32_t, uint32_t) = g_spu_coh_section_begin;
-    if (begin) begin(ea, len);
+    const spu_coh_ops* ops = g_spu_coh_ops;
+    if (ops) ops->section_begin(ea, len);
 }
 
 static inline void spu_coh_write_end(void)
 {
-    void (*end)(void) = g_spu_coh_section_end;
-    if (end) end();
+    const spu_coh_ops* ops = g_spu_coh_ops;
+    if (ops) ops->section_end();
     spu_lockline_unlock();
 }
 

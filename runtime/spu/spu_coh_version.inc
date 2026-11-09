@@ -1,6 +1,8 @@
 /*
  * ps3recomp - lock-line coherence by per-line version counters (opt-in)
  *
+ * Compiled as part of spu_coherency.c, which includes this file.
+ *
  * See spu_coh_version.h for the interface. This file holds the version table,
  * the line ownership protocol, the lock-free line snapshot and the wait
  * buckets. It knows nothing about SPU or PPU contexts.
@@ -55,6 +57,13 @@
 #endif
 
 unsigned long long g_spu_cohv_wakes;
+
+/* Measurement hook (PS3RECOMP_COH_STATS in spu_coherency.c); a no-op standalone. */
+#ifndef COHV_STAT_HOOK
+#define COHV_STAT_HOOK(which) ((void)0)
+#endif
+#define COHV_STAT_LOCK_WAIT     0   /* a writer found the line owned */
+#define COHV_STAT_READ_FALLBACK 1   /* a snapshot gave up retrying and took the line */
 
 /* ---------------------------------------------------------------------------
  * The switch
@@ -246,10 +255,17 @@ static inline uint64_t cohv_load_value(const void* p, unsigned size)
 /* ---------------------------------------------------------------------------
  * Snapshots
  * -------------------------------------------------------------------------*/
+/* A line written back to back can keep a lock-free reader retrying forever:
+ * every attempt overlaps some write. After COHV_READ_TRIES attempts the reader
+ * takes the line like a writer -- a turn in the same compare-and-swap the
+ * writers race for -- copies it, and releases it unchanged. */
+#define COHV_READ_TRIES 512u
+
 uint32_t spu_cohv_read_line(uint32_t ea, const void* line, void* dst)
 {
     uint32_t* w = spu_cohv_word(ea);
-    for (unsigned spins = 0;; cohv_backoff(&spins)) {
+    unsigned spins = 0;
+    for (unsigned tries = 0; tries < COHV_READ_TRIES; tries++, cohv_backoff(&spins)) {
         const uint32_t v1 = __atomic_load_n(w, __ATOMIC_ACQUIRE);
         if (v1 & SPU_COHV_WRITING) continue;
         spu_cohv_copy_line(dst, line);
@@ -257,12 +273,18 @@ uint32_t spu_cohv_read_line(uint32_t ea, const void* line, void* dst)
         const uint32_t v2 = __atomic_load_n(w, __ATOMIC_RELAXED);
         if (((v1 ^ v2) & ~SPU_COHV_WAITERS) == 0) return v1 & ~SPU_COHV_FLAGS;
     }
+    COHV_STAT_HOOK(COHV_STAT_READ_FALLBACK);
+    const uint32_t count = spu_cohv_lock(ea);
+    spu_cohv_copy_line(dst, line);
+    spu_cohv_unlock_unchanged(ea);
+    return count;
 }
 
 uint32_t spu_cohv_read_value(uint32_t ea, const void* p, unsigned size, uint64_t* value)
 {
     uint32_t* w = spu_cohv_word(ea);
-    for (unsigned spins = 0;; cohv_backoff(&spins)) {
+    unsigned spins = 0;
+    for (unsigned tries = 0; tries < COHV_READ_TRIES; tries++, cohv_backoff(&spins)) {
         const uint32_t v1 = __atomic_load_n(w, __ATOMIC_ACQUIRE);
         if (v1 & SPU_COHV_WRITING) continue;
         const uint64_t v = cohv_load_value(p, size);
@@ -270,6 +292,11 @@ uint32_t spu_cohv_read_value(uint32_t ea, const void* p, unsigned size, uint64_t
         const uint32_t v2 = __atomic_load_n(w, __ATOMIC_RELAXED);
         if (((v1 ^ v2) & ~SPU_COHV_WAITERS) == 0) { *value = v; return v1 & ~SPU_COHV_FLAGS; }
     }
+    COHV_STAT_HOOK(COHV_STAT_READ_FALLBACK);
+    const uint32_t count = spu_cohv_lock(ea);
+    *value = cohv_load_value(p, size);
+    spu_cohv_unlock_unchanged(ea);
+    return count;
 }
 
 /* ---------------------------------------------------------------------------
@@ -279,13 +306,14 @@ uint32_t spu_cohv_lock(uint32_t ea)
 {
     uint32_t* w = spu_cohv_word(ea);
     uint32_t cur = __atomic_load_n(w, __ATOMIC_RELAXED);
-    for (unsigned spins = 0;;) {
+    for (unsigned spins = 0, waited = 0;;) {
         if (!(cur & SPU_COHV_WRITING)) {
             if (__atomic_compare_exchange_n(w, &cur, cur | SPU_COHV_WRITING, 1,
                                             __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
                 break;
             continue;
         }
+        if (!waited) { waited = 1; COHV_STAT_HOOK(COHV_STAT_LOCK_WAIT); }
         cohv_backoff(&spins);
         cur = __atomic_load_n(w, __ATOMIC_RELAXED);
     }
@@ -314,7 +342,9 @@ static void cohv_wake_line(uint32_t ea);
 uint32_t spu_cohv_unlock_written(uint32_t ea)
 {
     /* WRITING is set, so adding STEP - WRITING clears it and advances the
-     * count in one operation, and leaves WAITERS as it is. */
+     * count in one operation, and leaves WAITERS as it is. (Releasing with a
+     * plain store instead measured the same on the hot-line benchmark, and
+     * needs waiters to stay off owned words; not worth it.) */
     const uint32_t old = __atomic_fetch_add(spu_cohv_word(ea), SPU_COHV_STEP - SPU_COHV_WRITING,
                                             __ATOMIC_RELEASE);
     if (__builtin_expect((old & SPU_COHV_WAITERS) != 0, 0)) cohv_wake_line(ea);

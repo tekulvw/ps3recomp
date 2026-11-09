@@ -440,9 +440,26 @@ jobs:
       - name: Run the lock-line version counter tests
         run: |
           clang -std=gnu17 -O2 -Wall -Wextra -I runtime/spu \
-                -o /tmp/test_spu_coh_version runtime/spu/tests/test_spu_coh_version.c \
-                runtime/spu/spu_coh_version.c -lpthread
+                -o /tmp/test_spu_coh_version runtime/spu/tests/test_spu_coh_version.c -lpthread
           /tmp/test_spu_coh_version
+
+      # The same scheme through the runtime's real paths (GETLLAR/PUTLLC, DMA,
+      # PPU stores and store-conditionals, host sections, the parked wait),
+      # then the scheme-agnostic coherence suites with the switch on.
+      - name: Run the lock-line version counter path tests
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_coh_version_paths \
+            runtime/spu/tests/test_spu_coh_version_paths.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spu_coh_version_paths
+          COHV_PATHS_SCHEME=legacy /tmp/test_spu_coh_version_paths
 
       # The other writer: an SPU. Five SPURS kernels share one management line,
       # so a commit that does not break its peers' reservations lets two of them
@@ -580,3 +597,16 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_job_stack
+
+      # The scheme-agnostic SPU/SPURS coherence suites above again, with
+      # per-line version counters on (PS3RECOMP_COH_VERSIONS, default off).
+      - name: Rerun the SPU coherence suites with version counters
+        env:
+          PS3RECOMP_COH_VERSIONS: "1"
+        run: |
+          for t in test_spu_lockline_peer test_spu_taskset_wake test_spurs_signalled_atomic \
+                   test_spurs_taskset_bits_atomic test_spu_lifted_start test_spu_mfc_slots \
+                   test_spurs_job_stack; do
+            echo "--- $t"
+            /tmp/$t
+          done
