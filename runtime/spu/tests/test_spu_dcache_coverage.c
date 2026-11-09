@@ -57,9 +57,50 @@ static void ownership(void)
     c->ls=calloc(1,SPU_LS_SIZE);CHECK(c->ls!=NULL);expect(c,a,primary);
     free(c->ls);c->ls=c->ls_store;free(c);
 }
+static void later(spu_context* c){(void)c;}
+static void resident(spu_context* c){(void)c;}
+/* A miss at an LSA that nothing covers is cached like a hit and drops with
+ * the same keys: run-time generated code (an interrupt shim) is entered over
+ * and over, and must not re-run the resolver every time; once code for that
+ * LSA is registered or becomes resident, the cached miss must not hide it. */
+static void negative(void)
+{
+    const uint32_t lifted=0xc000, shim=0xc100, other=0xd000;
+    spu_begin_image(341);spu_register_function(lifted,primary);
+    spu_begin_image(342);spu_register_function(other,overlay);spu_begin_image(0);
+    spu_context* c=fresh(341);
+    const int mode=spu_dcache_mode();
+    for(int i=0;i<3;i++){
+        unsigned calls=coverage_full_calls;
+        CHECK(spu_lifted_lookup(c,shim)==NULL);
+        /* only the first miss resolves, unless the cache is off or shadowed */
+        CHECK(coverage_full_calls-calls==(unsigned)(mode!=1||i==0));
+    }
+    spu_begin_image(341);spu_register_function(shim,later);spu_begin_image(0);
+    expect(c,shim,later);                      /* registration drops the miss */
+    CHECK(spu_lifted_lookup(c,other)==NULL);CHECK(spu_lifted_lookup(c,other)==NULL);
+    c->resident_ovl=342;expect(c,other,overlay); /* so does a resident overlay */
+    c->resident_ovl=0;expect(c,other,NULL);
+    /* A miss inside a resident code slot is never cached: the slot can verify
+     * later without a residency change. */
+    const uint32_t slot_lsa=0xe000;
+    spu_begin_image(343);spu_register_function(slot_lsa+0x20,resident);spu_begin_image(0);
+    spu_overlay_register_region(0x620000,0x100,343);
+    spu_overlay_note_get(c,0x620000,c->ls+slot_lsa,0x40);
+    for(int i=0;i<2;i++){
+        unsigned calls=coverage_full_calls;
+        CHECK(spu_lifted_lookup(c,slot_lsa+0x10)==NULL);
+        CHECK(coverage_full_calls-calls==1);
+    }
+    expect(c,slot_lsa+0x20,resident);
+    /* A context's next lifetime never sees the previous lifetime's misses. */
+    spu_context_init(c,0);c->image_id=342;expect(c,other,overlay);
+    free(c);
+}
 int main(void)
 {
     ownership();
+    negative();
     spu_begin_image(321);spu_register_function(0x10000,primary);
     spu_begin_image(331);spu_register_function(0x10000,verified_a);spu_register_function(0x10004,verified_a);
     spu_begin_image(332);spu_register_function(0x10000,verified_b);spu_register_function(0x10004,verified_b);
