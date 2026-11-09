@@ -17,7 +17,9 @@ static u32 pic_offset_count,pic_bytes;
  * every bind, and with none outstanding the 4096-entry scan finds nothing. */
 static u32 pic_command_count;
 static u64 pic_serial;
-static int pic_failed;
+/* Atomic so the per-method readiness check reads it without the lock; every
+ * change is still made under it. */
+static _Atomic int pic_failed;
 static atomic_flag pic_lock=ATOMIC_FLAG_INIT;
 static void pic_enter(void){while(atomic_flag_test_and_set_explicit(&pic_lock,memory_order_acquire)){} }
 static void pic_leave(void){atomic_flag_clear_explicit(&pic_lock,memory_order_release);}
@@ -108,6 +110,6 @@ const u8* rsx_picture_data(u64 token,u32 location,u32 offset,u32 bytes)
     else pic_failed=1;
     pic_leave();return result;
 }
-int rsx_picture_ready(void){pic_enter();int result=!pic_failed;pic_leave();return result;}
+int rsx_picture_ready(void){return !atomic_load_explicit(&pic_failed,memory_order_acquire);}
 int rsx_picture_live_count(void){pic_enter();int result=0;for(unsigned i=0;i<PIC_SLOTS;++i)result+=!!pic_slots[i].token;pic_leave();return result;}
 int rsx_picture_reset(void){pic_enter();int result=1;for(unsigned i=0;i<PIC_SLOTS;++i)if(pic_slots[i].token){result=0;break;}if(result){memset(pic_aliases,0,sizeof(pic_aliases));memset(pic_commands,0,sizeof(pic_commands));pic_command_count=0;pic_offset_count=pic_bytes=0;pic_failed=0;}pic_leave();return result;}

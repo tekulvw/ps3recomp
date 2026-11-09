@@ -3277,6 +3277,50 @@ static int gcm_env_flag(int* cached, const char* name)
     return *cached;
 }
 
+/* Settings the walker's per-word path reads, cached at first use. Kept here
+ * rather than as statics inside the loop so the plain-method path below can
+ * ask for them before the first word. */
+static int s_walk_eng = -1, s_walk_live = -1, s_walk_s1_2d = -1;
+static void gcm_walk_settings(void)
+{
+    if (s_walk_eng < 0) s_walk_eng = rsx_draw_engine_enabled();
+    if (s_walk_live < 0) s_walk_live = rsx_live_draw_enabled();
+    if (s_walk_s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s_walk_s1_2d = e ? atoi(e) : 0; }
+}
+
+/* PS3RECOMP_GCM_FAST_WALK=1 (default off; read once): a data word of a
+ * subchannel 0 (or 3D subchannel 1) packet whose method has no effect outside
+ * the register file goes straight to the draw engine -- the one thing the
+ * general per-word path does with it when no per-word diagnostic, no live
+ * draw engine, no legacy register state and no query observation is on. The
+ * methods with effects of their own (gcm_walk_special) still take the general
+ * path, in stream order. -1 until read; s_walk_diag likewise. */
+static int s_walk_fast = -1, s_walk_diag = -1;
+static int gcm_walk_special(u32 m)
+{
+    switch (m) {
+    case 0x0050u: case 0x0104u: case 0x0180u: case 0x01A4u: case 0x01A8u:
+    case 0x1800u: case 0x1D6Cu: case 0x1D70u: case 0x1D74u:
+        return 1;
+    default:
+        return 0;
+    }
+}
+static int gcm_plain_walk(int legacy_state_live)
+{
+    if (s_walk_fast < 0) { const char* e = getenv("PS3RECOMP_GCM_FAST_WALK"); s_walk_fast = e && !strcmp(e, "1"); }
+    if (!s_walk_fast) return 0;
+    if (s_walk_diag < 0) {
+        const char* vw = getenv("GCM_VAL_WATCH");
+        const char* hs = getenv("GCM_METHOD_HIST");
+        s_walk_diag = getenv("GCM_SUBCH7") || getenv("GCM_SUBCH_GATE") || getenv("GCM_OBJDBG") ||
+                      getenv("RSX_LIVE_FEED_DBG") || (vw && strtoul(vw, 0, 16)) || (hs && atoi(hs) > 0);
+    }
+    gcm_walk_settings();
+    return !s_walk_diag && s_walk_eng && !s_walk_live && !legacy_state_live && !s_query_observe;
+}
+static unsigned long long s_walk_plain_words;
+
 /* The methods rsx_process_method acts on beyond its own rsx_state: notify
  * and semaphore DMA contexts, the notify write, back-end label writes and
  * SET_REFERENCE (g_rsx_last_reference). Everything else only updates state
@@ -3326,6 +3370,7 @@ static void gcm_rsx_process_fifo_pass(void)
     static int s_rsx_trace = -1;
     const int legacy_state_live = rsx_get_backend() != NULL || !rsx_draw_engine_enabled() ||
                                   gcm_env_flag(&s_rsx_trace, "RSX_TRACE");
+    const int plain_walk = gcm_plain_walk(legacy_state_live);
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
      * offset in the control register), decoding method headers and following
@@ -3765,10 +3810,22 @@ static void gcm_rsx_process_fifo_pass(void)
             if(count && (subch==4u||subch==5u) && method<=0x7fcu &&
                (method>=0x400u || (type==0u && (u64)method+(u64)(count-1u)*4u>=0x400u)) &&
                !gcm_inline_image_barrier())return;
+            u32 dea = 0;
             for (u32 i = 0; i < count; i++) {
-                u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                /* Plain walk: within one 1 MB IO page the next word's address
+                 * is the previous one's plus 4 (no method on that path can
+                 * remap IO), so the table is consulted once per page. */
+                const u32 dio = s_fifo_getoff + 4 + i * 4;
+                dea = (plain_walk && dea && (dio & 0xFFFFFu)) ? dea + 4u : gcm_io2ea(dio);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
+                if (plain_walk && (subch == 0 || (subch == 1 && !s_walk_s1_2d)) && !gcm_walk_special(m)) {
+                    const uint64_t e0=s_gph_on>0?gph_now():0;
+                    rsx_draw_engine_method_at((subch << 13) | m, vm_read32(dea), dea);
+                    if(e0){s_gph.eng_ns+=gph_now()-e0;s_gph.eng_n++;}
+                    s_walk_plain_words++;
+                    continue;
+                }
                 if(s_query_observe && subch==0 && (m==0x17c8u||m==0x17ccu||m==0x1800u||m==0x1814u||m==0x1824u))
                     gcm_query_observe(m,vm_read32(dea),s_fifo_getoff+4+i*4);
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
@@ -3828,8 +3885,8 @@ static void gcm_rsx_process_fifo_pass(void)
                  * for every draw in the game. Treat the subchannels the 2D path
                  * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
                  */
-                static int s1_2d = -1;
-                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+                gcm_walk_settings();
+                const int s1_2d = s_walk_s1_2d;
                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                  * non-zero subchannel -- what each binding slot actually carries. */
                 { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
@@ -3856,8 +3913,7 @@ static void gcm_rsx_process_fifo_pass(void)
                  * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
                  * It wants the raw method with its subchannel bits -- it
                  * canonicalises with & 0x1FFC itself. */
-                { static int live = -1;
-                  if (live < 0) live = rsx_live_draw_enabled();
+                { const int live = s_walk_live;
                   /* Close report work before raw dispatch can expose an
                    * effect; the legacy handler below runs too late. */
                   if(gcm_reports_live()&&(((subch<<13)|m)==0xE920u||
@@ -3894,8 +3950,7 @@ static void gcm_rsx_process_fifo_pass(void)
                  * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
                  * It wants the raw method with its subchannel bits for the
                  * same reason the live engine does, and masks them itself. */
-                { static int eng = -1;
-                  if (eng < 0) eng = rsx_draw_engine_enabled();
+                { const int eng = s_walk_eng;
                   if (eng) {
                       const uint64_t e0=s_gph_on>0?gph_now():0;
                       rsx_draw_engine_method_at((subch << 13) | m, vm_read32(dea),dea);
