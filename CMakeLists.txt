@@ -536,6 +536,17 @@ if(PS3RECOMP_BUILD_TESTS)
             target_compile_options(test_spu_float_vector_scalar PRIVATE -msse4.1 -ffp-contract=off)
         endif()
     endif()
+    # The x86 vector forms of the SPU integer/permute helpers against their scalar
+    # references, at the ISA the runtime and lifted code are built for (SSSE3 and up).
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
+        add_executable(test_spu_int_x86 runtime/spu/tests/test_spu_int_x86.c)
+        target_include_directories(test_spu_int_x86 PRIVATE include runtime/spu)
+        if(PS3RECOMP_HAS_MSSE41)
+            target_compile_options(test_spu_int_x86 PRIVATE -msse4.1)
+        endif()
+        add_test(NAME spu_int_x86 COMMAND test_spu_int_x86)
+        set_tests_properties(spu_int_x86 PROPERTIES TIMEOUT 300)
+    endif()
     # Current colors are explicit shader inputs even when they equal the
     # hardware default; exercise both compact fetch entry points without a GPU.
     add_executable(test_vertex_current_color

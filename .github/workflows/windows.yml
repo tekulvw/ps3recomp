@@ -103,6 +103,18 @@ jobs:
           .\test_spu_helpers.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # The x86 vector forms of the SPU integer/permute helpers must match their scalar
+      # references bit for bit at every ISA level a build can select.
+      - name: Run the SPU x86 vector helper test
+        run: |
+          foreach ($isa in @('-mssse3', '-msse4.1', '/clang:-march=x86-64-v3')) {
+            clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS $isa /I include /I runtime/spu /Fe:test_spu_int_x86.exe runtime/spu/tests/test_spu_int_x86.c
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            Write-Output "[$isa]"
+            .\test_spu_int_x86.exe
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
