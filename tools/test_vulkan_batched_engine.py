@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Vulkan engine backend: the same synthetic operation stream recorded per
 operation (default) and batched (PS3RECOMP_VK_BATCHED_ENGINE=1) must read
-back identical bytes, both runs clean under the Khronos validation layer
+back identical bytes, also batched through a pipeline cache saved by one run
+and loaded by the next (PS3RECOMP_VK_PIPELINE_CACHE), both runs clean under the Khronos validation layer
 (with synchronization validation). Synthetic inputs only.
 
 Needs Vulkan/SDL2 development files and glslang (the engine translates its
@@ -90,6 +91,29 @@ def main():
             diff = sum(a != b for a, b in zip(outputs["sync"], outputs["batched"]))
             raise SystemExit(f"batched readback differs from per-operation submission in {diff} bytes")
         print(f"PASS batched recording reads back identically ({len(outputs['sync'])} bytes)")
+        # PS3RECOMP_VK_PIPELINE_CACHE: the first run fills and saves the cache,
+        # the second starts from it; both must read back as the others did.
+        cache = Path(tmp) / "pipeline-cache"
+        cache.mkdir()
+        for run, expect in ((1, "new"), (2, "loaded")):
+            out = Path(tmp) / f"cached-{run}.bin"
+            result = subprocess.run([str(binary), "batched", str(out), args.draws],
+                                    env=dict(environment, PS3RECOMP_VK_PIPELINE_CACHE=str(cache)),
+                                    capture_output=True, text=True, timeout=1800)
+            result.check_returncode()
+            text = result.stdout + result.stderr
+            if "VUID-" in text or "SYNC-HAZARD" in text or "Validation Error" in text:
+                raise SystemExit(f"Vulkan validation rejected pipeline-cache run {run}")
+            line = next((l for l in result.stderr.splitlines() if "pipeline cache" in l), "")
+            print(line)
+            if f": {expect} (" not in line:
+                raise SystemExit(f"pipeline-cache run {run} should have started {expect}: {line!r}")
+            files = list(cache.glob("vk-pipelines-*.bin"))
+            if len(files) != 1 or files[0].stat().st_size <= 32 or list(cache.glob("*.tmp")):
+                raise SystemExit(f"pipeline-cache run {run} left {[f.name for f in cache.iterdir()]}")
+            if out.read_bytes() != outputs["sync"]:
+                raise SystemExit(f"pipeline-cache run {run} reads back differently")
+        print("PASS a saved pipeline cache is reloaded by the next run and changes nothing drawn")
 
 
 if __name__ == "__main__":
