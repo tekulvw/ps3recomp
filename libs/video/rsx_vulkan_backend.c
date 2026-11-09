@@ -373,6 +373,11 @@ static struct {
      * block sizes match the previous one's reuses its set. */
     int desc_reuse;
     u64 sets_written, sets_reused;
+    /* A batch the arena (not the operation or set count) ended early raises
+     * the size every slot grows to when next opened, up to VK_BAT_ARENA_MAX:
+     * a slot sized for a few hundred draws otherwise submits that often. */
+    VkDeviceSize arena_want;
+    u64 arena_flushes;
 } s_bat;
 
 /* The render pass a merged draw left open in the open batch (only with
@@ -5580,7 +5585,9 @@ static u64 vk_e5_submit(vk_e5_slot* sl, int recorded)
  *   - CPU-written bytes. Vertices, indices, constants and upload rows are
  *     copied into the batch's own host-visible arena, never into a buffer an
  *     unfinished batch may read. A batch slot, and its arena (4 MiB, grown
- *     on demand) and descriptor pool (1024 sets), are reused only after its
+ *     on demand; once a batch has had to end because its arena was full,
+ *     every slot grows to twice that size when next opened, up to 32 MiB)
+ *     and descriptor pool (1024 sets), are reused only after its
  *     ticket has completed: PS3RECOMP_VK_BATCH_SLOTS batches in flight
  *     (default 16, at most 32), a full ring waits for the oldest. Every
  *     ticket submits the open batch, so the ring is what bounds how far the
@@ -5602,6 +5609,7 @@ static u64 vk_e5_submit(vk_e5_slot* sl, int recorded)
  * outside such a run is ordered exactly as above.
  * -------------------------------------------------------------------------*/
 #define VK_BAT_SETS 1024u
+#define VK_BAT_ARENA_MAX ((VkDeviceSize)32u << 20)
 static int vk_bat_slot_init(vk_bat_slot* sl)
 {
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -5763,13 +5771,18 @@ static int vk_bat_reserve(VkDeviceSize bytes, u32 sets)
     const VkDeviceSize need = bytes + 4u * s_bat.align;     /* slack for alignment */
     vk_bat_slot* sl = &s_bat.s[s_bat.cur];
     if ((sl->arena.size - sl->used < need || sl->sets_left < sets) && s_bat.ops) {
+        if (sl->arena.size - sl->used < need) {
+            s_bat.arena_flushes++;
+            const VkDeviceSize grown = sl->arena.size * 2u;
+            if (grown > s_bat.arena_want) s_bat.arena_want = grown < VK_BAT_ARENA_MAX ? grown : VK_BAT_ARENA_MAX;
+        }
         if (vk_bat_flush(0) || vk_bat_open()) return -1;
         sl = &s_bat.s[s_bat.cur];
     }
-    if (sl->arena.size - sl->used < need) {
+    if (sl->arena.size - sl->used < need || (!sl->used && sl->arena.size < s_bat.arena_want)) {
         if (sl->used) { vk_e5_fail("batch arena"); return -1; }   /* fresh slot: cannot happen */
         VkDeviceSize size = sl->arena.size ? sl->arena.size : 4u << 20;
-        while (size < need) size *= 2u;
+        while (size < need || size < s_bat.arena_want) size *= 2u;
         /* The slot is idle (just opened), but other batches may be pending. */
         if (sl->arena.buf) vk_destroy_buffer(&sl->arena);
         if (vk_create_host_buffer(&sl->arena, size,
@@ -5825,12 +5838,13 @@ static void vk_bat_log(void)
     if (last.tv_sec && now.tv_sec - last.tv_sec < 2) return;
     last = now;
     fprintf(stderr, "[rsx inflight vulkan batch] batches=%llu ops=%llu ops_per_batch=%.1f slot_waits=%llu cpu_waits=%llu "
-            "retired=%llu pending_retire=%u arena_grows=%llu passes=%llu merged_draws=%llu feedback_breaks=%llu "
-            "pipeline_binds_skipped=%llu\n",
+            "retired=%llu pending_retire=%u arena_grows=%llu arena_flushes=%llu arena_mib=%llu passes=%llu merged_draws=%llu "
+            "feedback_breaks=%llu pipeline_binds_skipped=%llu\n",
             (unsigned long long)s_bat.batches, (unsigned long long)s_bat.batch_ops,
             s_bat.batches ? (double)s_bat.batch_ops / (double)s_bat.batches : 0.0,
             (unsigned long long)s_bat.slot_waits, (unsigned long long)s_bat.waits_for_cpu,
             (unsigned long long)s_bat.retired, s_bat.nret, (unsigned long long)s_bat.arena_grows,
+            (unsigned long long)s_bat.arena_flushes, (unsigned long long)(s_bat.s[s_bat.cur].arena.size >> 20),
             (unsigned long long)s_bat.passes, (unsigned long long)s_bat.merged_draws,
             (unsigned long long)s_bat.feedback_breaks, (unsigned long long)s_bat.binds_skipped);
     if (s_bat.desc_reuse)
