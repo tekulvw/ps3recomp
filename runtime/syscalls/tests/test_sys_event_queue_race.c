@@ -21,6 +21,11 @@ int spu_dispatch_frame_by_queue(uint32_t a, uint32_t b) { (void)a; (void)b; retu
 size_t spu_elf_image_size(const uint8_t* i, size_t m) { (void)i; (void)m; return 0; }
 int spu_workload_dispatch_async(const uint8_t* i, uint32_t s, uint32_t e) { (void)i; (void)s; (void)e; return 0; }
 void ydkj_release_pending_threads(void) {}
+#ifdef _WIN32
+/* sys_timer.c provides these on Windows (inline elsewhere); the timed waits are never reached. */
+int64_t lv2_usec_deadline(uint64_t usec) { (void)usec; return 0; }
+int lv2_deadline_passed(int64_t deadline) { (void)deadline; return 1; }
+#endif
 
 #define KEY 0x8000CAFE00000042ull
 #define ROUNDS 4000
