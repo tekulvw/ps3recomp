@@ -44,6 +44,13 @@ typedef struct rsx_vertex_remap {
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    /* Direct table for a draw whose references share one base index and
+     * span a small range of vertex ids: dense_stamp[id - lo] is
+     * dense_generation when id was seen, at unique index dense_value[...]. */
+    u32* dense_stamp;
+    u32* dense_value;
+    u32 dense_capacity;
+    u32 dense_generation;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {

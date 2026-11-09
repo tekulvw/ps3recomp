@@ -458,8 +458,69 @@ int rsx_vertex_remap_build(
         }
     }
 
+    /* A draw whose references share one base index and cover a range of
+     * vertex ids not much wider than the reference count -- the common
+     * indexed mesh -- is collapsed through a direct table over that range:
+     * the same first-use order and occurrence map the hash gives, without
+     * hashing or probing. */
+    if (count >= 8u) {
+        u32 lo = refs[0].vertex_id, hi = lo;
+        const u32 base = refs[0].base_index;
+        int uniform = 1;
+        for (u32 i = 1; i < count; i++) {
+            const u32 id = refs[i].vertex_id;
+            if (id < lo) lo = id;
+            if (id > hi) hi = id;
+            uniform &= refs[i].base_index == base;
+        }
+        const u64 range = (u64)hi - lo + 1u;
+        if (uniform && range <= (u64)count * 4u + 64u && range <= (1u << 20)) {
+            if (range > remap->dense_capacity) {
+                u32 cap = remap->dense_capacity ? remap->dense_capacity : 256u;
+                while (cap < range) cap *= 2u;
+                u32* stamp = (u32*)realloc(remap->dense_stamp, (size_t)cap * sizeof(u32));
+                if (stamp) remap->dense_stamp = stamp;
+                u32* value = stamp ? (u32*)realloc(remap->dense_value, (size_t)cap * sizeof(u32)) : NULL;
+                if (value) remap->dense_value = value;
+                if (!stamp || !value)
+                    goto hashed;
+                memset(remap->dense_stamp, 0, (size_t)cap * sizeof(u32));
+                remap->dense_capacity = cap;
+                remap->dense_generation = 0;
+            }
+            if (++remap->dense_generation == 0u) {
+                memset(remap->dense_stamp, 0, (size_t)remap->dense_capacity * sizeof(u32));
+                remap->dense_generation = 1u;
+            }
+            const u32 gen = remap->dense_generation;
+            u32* stamp = remap->dense_stamp;
+            u32* value = remap->dense_value;
+            u32* map = remap->occurrence_to_unique;
+            u32 unique = 0;
+            for (u32 occurrence = 0; occurrence < count; occurrence++) {
+                const u32 at = refs[occurrence].vertex_id - lo;
+                if (stamp[at] == gen) {
+                    map[occurrence] = value[at];
+                } else {
+                    stamp[at] = gen;
+                    value[at] = unique;
+                    refs[unique].vertex_id = refs[occurrence].vertex_id;
+                    refs[unique].base_index = base;
+                    map[occurrence] = unique++;
+                }
+            }
+            *unique_count = unique;
+            return 1;
+        }
+    }
+hashed:;
     u32 unique = 0;
-    const u32 mask = remap->slot_capacity - 1u;
+    /* Only as many slots as this draw needs (at least twice its count): a
+     * small draw after a large one probes a table that stays in cache. The
+     * generation marks what is live, so the untouched rest does not matter. */
+    u32 used_slots = 16u;
+    while (used_slots < required_slots) used_slots *= 2u;
+    const u32 mask = used_slots - 1u;
     for (u32 occurrence = 0; occurrence < count; occurrence++) {
         const rsx_vertex_ref ref = refs[occurrence];
         const u64 key = ((u64)ref.base_index << 32) | ref.vertex_id;
@@ -499,6 +560,8 @@ void rsx_vertex_remap_destroy(rsx_vertex_remap* remap)
         return;
     free(remap->occurrence_to_unique);
     free(remap->slots);
+    free(remap->dense_stamp);
+    free(remap->dense_value);
     memset(remap, 0, sizeof(*remap));
 }
 
