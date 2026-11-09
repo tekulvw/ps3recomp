@@ -368,6 +368,11 @@ static struct {
     /* PS3RECOMP_VK_MERGE_PASSES=1: draws merged into an open render pass */
     int merge;
     u64 passes, merged_draws, feedback_breaks, binds_skipped;
+    /* PS3RECOMP_VK_DESCRIPTOR_REUSE=1: engine sets bind their constant
+     * blocks with dynamic offsets, and a draw whose textures, samplers and
+     * block sizes match the previous one's reuses its set. */
+    int desc_reuse;
+    u64 sets_written, sets_reused;
 } s_bat;
 
 /* The render pass a merged draw left open in the open batch (only with
@@ -4382,6 +4387,22 @@ static struct {
     u64                   vs_last_batch;
     int                   vs_last_valid, vs_rebind;
     u64                   vs_uploads, vs_reused;
+    /* PS3RECOMP_VK_DESCRIPTOR_REUSE: the engine's own set and pipeline
+     * layouts, the constant blocks as dynamic uniform buffers ([0] shared
+     * texture binding, [1] one binding per unit), and the last set written
+     * with what it holds. */
+    VkDescriptorSetLayout dyn_set_layout[2];
+    VkPipelineLayout      dyn_pipe_layout[2];
+    struct {
+        int valid;
+        u64 batch;
+        int split;
+        VkImageView views[RSX_MAX_TEXTURES];
+        VkSampler samplers[RSX_MAX_TEXTURES];
+        VkBuffer vbuf, pbuf;
+        VkDeviceSize vrange, prange;
+        VkDescriptorSet set;
+    } dyn_last;
 } s_e2;
 
 #define VK_ENG_SAMP_CACHE 64
@@ -4577,6 +4598,47 @@ static u32 vk_eng_cube_units(const char* ps_hlsl)
     return mask;
 }
 
+/* The descriptor-reuse layouts: as the shared and split layouts, with the two
+ * constant blocks as UNIFORM_BUFFER_DYNAMIC, so a set holds only textures,
+ * samplers and which buffer the blocks live in, and each draw passes where. */
+static VkPipelineLayout vk_eng_dyn_layout(int split)
+{
+    if (s_e2.dyn_pipe_layout[split]) return s_e2.dyn_pipe_layout[split];
+    const VkShaderStageFlags both = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutBinding b[3 + RSX_MAX_TEXTURES];
+    u32 n = 0;
+    b[n++] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_VPCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, both, NULL };
+    b[n++] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_PSCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, both, NULL };
+    b[n++] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_SAMPLER_BINDING, VK_DESCRIPTOR_TYPE_SAMPLER,
+                                             RSX_MAX_TEXTURES, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    if (split) {
+        for (u32 u = 0; u < RSX_MAX_TEXTURES; u++)
+            b[n++] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_TEXTURE_BINDING + u, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                                     VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    } else {
+        b[n++] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_TEXTURE_BINDING, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                                 RSX_MAX_TEXTURES, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    }
+    VkDescriptorSetLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                            .bindingCount = n, .pBindings = b };
+    if (!s_e2.dyn_set_layout[split] &&
+        pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_e2.dyn_set_layout[split]) != VK_SUCCESS) {
+        s_e2.dyn_set_layout[split] = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+    VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                        .setLayoutCount = 1, .pSetLayouts = &s_e2.dyn_set_layout[split] };
+    if (pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_e2.dyn_pipe_layout[split]) != VK_SUCCESS)
+        s_e2.dyn_pipe_layout[split] = VK_NULL_HANDLE;
+    return s_e2.dyn_pipe_layout[split];
+}
+static int vk_eng_dyn_on(void) { return s_bat_on && s_bat.desc_reuse; }
+static VkPipelineLayout vk_eng_pipe_layout(const vk_eng_pipe* P)
+{
+    if (vk_eng_dyn_on()) return vk_eng_dyn_layout(P->cube_mask != 0);
+    return P->cube_mask ? vk_eng_split_layout() : s_g.pipe_layout;
+}
+
 static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                   const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
                                   u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
@@ -4640,7 +4702,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     if (P->variant[topo_idx]) return P->variant[topo_idx];
     VkRenderPass rp = vk_eng_render_pass(P->rt_fmt, P->rt_count);
     if (!rp || P->nslots > VK_GUEST_ATTRS) return VK_NULL_HANDLE;
-    const VkPipelineLayout layout = P->cube_mask ? vk_eng_split_layout() : s_g.pipe_layout;
+    const VkPipelineLayout layout = vk_eng_pipe_layout(P);
     if (!layout) return VK_NULL_HANDLE;
     const rsx_be_render_state* rs = &P->rs;
 
@@ -4760,6 +4822,10 @@ static void vk_eng2_shutdown(void* user)
     if (s_e2.split_pipe_layout) pvkDestroyPipelineLayout(s_vk.device, s_e2.split_pipe_layout, NULL);
     if (s_e2.split_pool)        pvkDestroyDescriptorPool(s_vk.device, s_e2.split_pool, NULL);
     if (s_e2.split_layout)      pvkDestroyDescriptorSetLayout(s_vk.device, s_e2.split_layout, NULL);
+    for (int k = 0; k < 2; k++) {
+        if (s_e2.dyn_pipe_layout[k]) pvkDestroyPipelineLayout(s_vk.device, s_e2.dyn_pipe_layout[k], NULL);
+        if (s_e2.dyn_set_layout[k])  pvkDestroyDescriptorSetLayout(s_vk.device, s_e2.dyn_set_layout[k], NULL);
+    }
     memset(&s_e2, 0, sizeof s_e2);
     for (u32 i = 0; i < s_esamp_count; i++) pvkDestroySampler(s_vk.device, s_esamp[i].s, NULL);
     s_esamp_count = 0;
@@ -5045,6 +5111,74 @@ static int vk_pass_samples_target(void)
         for (u32 i = 0; i < s_pass.n; i++) if (s_pass.rt[i] == h) return 1;
     }
     return 0;
+/* PS3RECOMP_VK_DESCRIPTOR_REUSE: the set for this draw in the open batch.
+ * The constant blocks are dynamic (their offsets are passed at bind), so a set
+ * holds the textures, the samplers and which buffer and size the blocks have;
+ * a draw that matches the previous one in all of those, in the same batch
+ * (whose pool the set came from), binds the same set. Images released while
+ * a batch is open are destroyed only after it completes, so a view handle
+ * seen again within the batch is the same view. */
+static VkDescriptorSet vk_eng_dyn_set(const vk_eng_pipe* P, const VkDescriptorBufferInfo cb[2])
+{
+    const int split = P->cube_mask != 0;
+    const VkImageView dummy_cube = split ? vk_eng_dummy_cube_view() : VK_NULL_HANDLE;
+    if (split && !dummy_cube) return VK_NULL_HANDLE;
+    const VkImageView dummy_2d = vk_eng_dummy_2d_view();
+    if (!dummy_2d) return VK_NULL_HANDLE;
+    VkImageView views[RSX_MAX_TEXTURES];
+    VkSampler samplers[RSX_MAX_TEXTURES];
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        const int cube = (P->cube_mask >> u) & 1u;
+        VkImageView v = ((s_e2.tex_mask >> u) & 1u) ? vk_eng_sample_view(s_e2.tex[u], cube) : VK_NULL_HANDLE;
+        samplers[u] = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
+        views[u] = v ? v : (cube ? dummy_cube : dummy_2d);
+    }
+    if (s_e2.dyn_last.valid && s_bat.open && s_e2.dyn_last.batch == s_bat.batches && s_e2.dyn_last.split == split &&
+        s_e2.dyn_last.vbuf == cb[0].buffer && s_e2.dyn_last.vrange == cb[0].range &&
+        s_e2.dyn_last.pbuf == cb[1].buffer && s_e2.dyn_last.prange == cb[1].range &&
+        !memcmp(s_e2.dyn_last.views, views, sizeof views) && !memcmp(s_e2.dyn_last.samplers, samplers, sizeof samplers)) {
+        s_bat.sets_reused++;
+        return s_e2.dyn_last.set;
+    }
+    if (!vk_eng_dyn_layout(split)) return VK_NULL_HANDLE;
+    const VkDescriptorSet set = vk_bat_set(s_e2.dyn_set_layout[split]);
+    if (!set) return VK_NULL_HANDLE;
+    const VkDescriptorBufferInfo bi[2] = { { cb[0].buffer, 0, cb[0].range }, { cb[1].buffer, 0, cb[1].range } };
+    VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, views[u], VK_IMAGE_LAYOUT_GENERAL };
+        si[u] = (VkDescriptorImageInfo){ samplers[u], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+    }
+    VkWriteDescriptorSet w[3 + RSX_MAX_TEXTURES];
+    u32 n = 0;
+    w[n++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+          .dstBinding = RSX_SPIRV_VPCONST_BINDING, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = &bi[0] };
+    w[n++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+          .dstBinding = RSX_SPIRV_PSCONST_BINDING, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = &bi[1] };
+    w[n++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+          .dstBinding = RSX_SPIRV_SAMPLER_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+          .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = si };
+    if (split) {
+        for (u32 u = 0; u < RSX_MAX_TEXTURES; u++)
+            w[n++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+                  .dstBinding = RSX_SPIRV_TEXTURE_BINDING + u, .descriptorCount = 1,
+                  .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &ii[u] };
+    } else {
+        w[n++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+              .dstBinding = RSX_SPIRV_TEXTURE_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+              .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = ii };
+    }
+    pvkUpdateDescriptorSets(s_vk.device, n, w, 0, NULL);
+    s_e2.dyn_last.valid = 1; s_e2.dyn_last.batch = s_bat.batches; s_e2.dyn_last.split = split;
+    s_e2.dyn_last.vbuf = cb[0].buffer; s_e2.dyn_last.vrange = cb[0].range;
+    s_e2.dyn_last.pbuf = cb[1].buffer; s_e2.dyn_last.prange = cb[1].range;
+    memcpy(s_e2.dyn_last.views, views, sizeof views);
+    memcpy(s_e2.dyn_last.samplers, samplers, sizeof samplers);
+    s_e2.dyn_last.set = set;
+    s_bat.sets_written++;
+    return set;
 }
 
 static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
@@ -5085,6 +5219,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkBuffer vbuf = s_vk.vertices.buf, ibuf = s_e2.indices.buf;
     VkDeviceSize voff = 0, ioff = 0;
     VkDescriptorSet set;
+    u32 dyn_off[2] = { 0, 0 };
     if (s_bat_on) {
         /* Everything the GPU reads from host memory, in this batch's arena;
          * a set of its own. The unbound-unit dummies are made before the
@@ -5118,9 +5253,14 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         }
         if (s_e2.ps_bytes && s_bat.psc) memcpy(pc, s_bat.psc, s_e2.ps_bytes); else memset(pc, 0, psb);
         cb[1].range = psb;
-        const VkDescriptorSet fresh = vk_bat_set(P->cube_mask ? s_e2.split_layout : s_g.set_layout);
-        if (!fresh) return;
-        set = vk_eng_write_descriptors(P, fresh, cb);
+        if (s_bat.desc_reuse) {
+            set = vk_eng_dyn_set(P, cb);
+            dyn_off[0] = (u32)cb[0].offset; dyn_off[1] = (u32)cb[1].offset;
+        } else {
+            const VkDescriptorSet fresh = vk_bat_set(P->cube_mask ? s_e2.split_layout : s_g.set_layout);
+            if (!fresh) return;
+            set = vk_eng_write_descriptors(P, fresh, cb);
+        }
     } else {
         if (vk_ensure_vertex_buffer(vbytes)) return;
         memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
@@ -5164,7 +5304,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     } else {
         s_bat.merged_draws++;
     }
-    const VkPipelineLayout layout = P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout;
+    const VkPipelineLayout layout = vk_eng_pipe_layout(P);
     if (!cont || !s_pass.have_state || s_pass.pipe != pipe)
         pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     else s_bat.binds_skipped++;
@@ -5189,7 +5329,10 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
     if (s_vk.depth_bounds_ok && (!same || memcmp(s_pass.bounds, s_e2.depth_bounds, sizeof s_pass.bounds)))
         pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
-    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
+    if (s_bat_on && s_bat.desc_reuse)
+        pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 2, dyn_off);
+    else
+        pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
     pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &voff);
     if (indices && index_count) {
         pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
@@ -5469,13 +5612,14 @@ static int vk_bat_slot_init(vk_bat_slot* sl)
     if (pvkAllocateCommandBuffers(s_vk.device, &cai, &sl->cb) != VK_SUCCESS) return -1;
     /* A draw's set: two constant buffers, 16 samplers and 16 images (shared
      * or split layout); a GPU depth view's: one storage buffer. */
-    VkDescriptorPoolSize ps[4] = {
+    VkDescriptorPoolSize ps[5] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2u * VK_BAT_SETS },
         { VK_DESCRIPTOR_TYPE_SAMPLER, 16u * VK_BAT_SETS },
         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16u * VK_BAT_SETS },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_BAT_SETS } };
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_BAT_SETS },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, s_bat.desc_reuse ? 2u * VK_BAT_SETS : 2u } };
     VkDescriptorPoolCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                       .maxSets = VK_BAT_SETS, .poolSizeCount = 4, .pPoolSizes = ps };
+                                       .maxSets = VK_BAT_SETS, .poolSizeCount = 5, .pPoolSizes = ps };
     if (pvkCreateDescriptorPool(s_vk.device, &dci, NULL, &sl->dpool) != VK_SUCCESS) return -1;
     sl->sets_left = VK_BAT_SETS;
     return 0;
@@ -5687,6 +5831,9 @@ static void vk_bat_log(void)
             (unsigned long long)s_bat.retired, s_bat.nret, (unsigned long long)s_bat.arena_grows,
             (unsigned long long)s_bat.passes, (unsigned long long)s_bat.merged_draws,
             (unsigned long long)s_bat.feedback_breaks, (unsigned long long)s_bat.binds_skipped);
+    if (s_bat.desc_reuse)
+        fprintf(stderr, "[rsx inflight vulkan batch] descriptor sets written=%llu reused=%llu\n",
+                (unsigned long long)s_bat.sets_written, (unsigned long long)s_bat.sets_reused);
 }
 
 static int vk_bat_init(void)
@@ -5701,6 +5848,8 @@ static int vk_bat_init(void)
     { const char* m = getenv("PS3RECOMP_VK_MERGE_PASSES"); s_bat.merge = m && !strcmp(m, "1"); }
     memset(&s_pass, 0, sizeof s_pass);
     s_e2.vs_last_valid = 0;
+    { const char* r = getenv("PS3RECOMP_VK_DESCRIPTOR_REUSE"); s_bat.desc_reuse = r && !strcmp(r, "1"); }
+    s_e2.dyn_last.valid = 0;
     VkPhysicalDeviceProperties p; pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     s_bat.align = 256u;
     if (p.limits.minUniformBufferOffsetAlignment > s_bat.align) s_bat.align = p.limits.minUniformBufferOffsetAlignment;
@@ -5709,8 +5858,9 @@ static int vk_bat_init(void)
     for (u32 i = 0; i < s_bat.nslots; i++) if (vk_bat_slot_init(&s_bat.s[i])) return -1;
     s_bat.legacy_cmd = s_vk.cmd;
     s_bat_on = 1;
-    VK_LOG("engine: batched recording on (%u batches in flight, at most %u operations each%s)\n", s_bat.nslots, s_bat.max_ops,
-           s_bat.merge ? ", same-target draws merged into one render pass" : "");
+    VK_LOG("engine: batched recording on (%u batches in flight, at most %u operations each%s%s)\n", s_bat.nslots, s_bat.max_ops,
+           s_bat.merge ? ", same-target draws merged into one render pass" : "",
+           s_bat.desc_reuse ? ", descriptor sets reused across draws" : "");
     return 0;
 }
 

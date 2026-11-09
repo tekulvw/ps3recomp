@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Vulkan engine backend: the same synthetic operation stream recorded per
 operation (default), batched (PS3RECOMP_VK_BATCHED_ENGINE=1) and batched with
-same-target draws merged into one render pass (PS3RECOMP_VK_MERGE_PASSES=1)
-must read back identical bytes, both runs clean under the Khronos validation layer
+same-target draws merged into one render pass (PS3RECOMP_VK_MERGE_PASSES=1),
+with descriptor sets reused across draws (PS3RECOMP_VK_DESCRIPTOR_REUSE=1), and
+with both, must read back identical bytes, every run clean under the Khronos validation layer
 (with synchronization validation). Synthetic inputs only.
 
 Needs Vulkan/SDL2 development files and glslang (the engine translates its
@@ -17,7 +18,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-MODES = ("sync", "batched", "merged")
+MODES = ("sync", "batched", "merged", "reuse", "both")
 
 
 def main():
@@ -92,7 +93,7 @@ def main():
             if outputs["sync"] != outputs[mode]:
                 diff = sum(a != b for a, b in zip(outputs["sync"], outputs[mode]))
                 raise SystemExit(f"{mode} readback differs from per-operation submission in {diff} bytes")
-        print(f"PASS batched and merged recording read back identically ({len(outputs['sync'])} bytes)")
+        print(f"PASS batched, merged, reused and merged+reused recording read back identically ({len(outputs['sync'])} bytes)")
 
 
 if __name__ == "__main__":
