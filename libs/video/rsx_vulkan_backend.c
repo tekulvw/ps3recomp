@@ -4036,6 +4036,28 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
     vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);
 }
 
+/* Where the view for a (surface, crossbar, format) was last found. The engine
+ * asks for a sampled target's view on every draw that reads it, and the scan
+ * behind a miss walks all VK_ENG_MAX_OBJ slots. A hint is only used after the
+ * slot it names is checked to still be a view of exactly that key, so a view
+ * released with its surface, or a slot reused for anything else, falls back
+ * to the scan. At most one view per key exists (one is only made after the
+ * scan found none), so a hint and the scan answer with the same handle. */
+#define VK_ENG_VIEW_HINTS 256u
+static u32 s_eview_hint[VK_ENG_VIEW_HINTS];
+static unsigned long long s_eview_hits, s_eview_scans;
+static u32 vk_eng_view_hint_slot(u32 surface, u32 remap, u32 rsx_format)
+{
+    u32 h = surface * 0x9E3779B1u ^ remap * 0x85EBCA77u ^ rsx_format * 0xC2B2AE3Du;
+    h ^= h >> 15;
+    return h & (VK_ENG_VIEW_HINTS - 1u);
+}
+static int vk_eng_view_is(u32 i, u32 surface, u32 remap, u32 rsx_format)
+{
+    return i && i < VK_ENG_MAX_OBJ && s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == surface &&
+           s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format;
+}
+
 /* A colour target sampled with a unit's crossbar: an extra view of the same
  * image, cached by (surface, crossbar, format) and released with the target. */
 static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
@@ -4043,10 +4065,11 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     (void)user;
     vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
     if (!t) return 0;
+    u32* hint = &s_eview_hint[vk_eng_view_hint_slot(surface, remap, rsx_format)];
+    if (vk_eng_view_is(*hint, surface, remap, rsx_format)) { s_eview_hits++; return *hint; }
+    s_eview_scans++;
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
-        if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == surface &&
-            s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format)
-            return i;
+        if (vk_eng_view_is(i, surface, remap, rsx_format)) { *hint = i; return i; }
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
@@ -4055,6 +4078,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     }
     o->kind = VK_ENG_VIEW; o->fmt = t->fmt; o->w = t->w; o->h = t->h;
     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
+    *hint = hd;
     return hd;
 }
 /* ---- colour feedback snapshots ---------------------------------------------
