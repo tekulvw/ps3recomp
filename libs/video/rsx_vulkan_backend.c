@@ -4525,6 +4525,14 @@ static struct {
         VkDeviceSize vrange, prange;
         VkDescriptorSet set;
     } dyn_last;
+    /* Batched: the arena copy of the vertex constants the last draw used, and
+     * the batch it lives in (s_bat.batches while that batch was open). A draw
+     * whose constants the engine reports unchanged (rebind_vs_constants)
+     * points at it again instead of copying the same bytes. */
+    VkDescriptorBufferInfo vs_last;
+    u64                   vs_last_batch;
+    int                   vs_last_valid, vs_rebind;
+    u64                   vs_uploads, vs_reused;
 } s_e2;
 
 #define VK_ENG_SAMP_CACHE 64
@@ -4972,12 +4980,24 @@ static u8* vk_bat_shadow(int ps, u32 cap)
 static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
+    s_e2.vs_rebind = 0;
     if (!s_g.on || !data) { s_e2.vs_bytes = 0; return; }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
     /* Batched: a shadow the draw copies into its batch's arena. */
     memcpy(s_bat_on ? (void*)vk_bat_shadow(0, cap) : s_g.ubo.ptr, data, bytes);
     s_e2.vs_bytes = bytes;
+}
+/* The engine's constants are byte-for-byte those of the last bind. Batched,
+ * the shadow already holds them and the draw may reuse the previous draw's
+ * arena copy; per-operation, the shared UBO is rewritten by other paths, so
+ * the engine binds again. */
+static int vk_eng_rebind_vs_constants(void* user)
+{
+    (void)user;
+    if (!s_bat_on || !s_g.on || !s_e2.vs_bytes || !s_bat.vsc) return 0;
+    s_e2.vs_rebind = 1;
+    return 1;
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
@@ -5343,17 +5363,29 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
         if (vk_bat_reserve(vbytes + ibytes + vsb + psb, 1)) return;
         VkDescriptorBufferInfo cb[2];
+        /* The previous draw's constants, still in this batch's arena, when
+         * the engine reported them unchanged (after the reservation, which
+         * may have submitted that batch). */
+        const int reuse_vs = s_e2.vs_rebind && s_e2.vs_last_valid && s_bat.open &&
+                             s_e2.vs_last_batch == s_bat.batches && s_e2.vs_last.range == vsb;
         void* vp = vk_bat_alloc(vbytes, &vbuf, &voff);
         void* ip = ibytes ? vk_bat_alloc(ibytes, &ibuf, &ioff) : NULL;
-        void* vc = vk_bat_alloc(vsb, &cb[0].buffer, &cb[0].offset);
+        void* vc = reuse_vs ? NULL : vk_bat_alloc(vsb, &cb[0].buffer, &cb[0].offset);
         void* pc = vk_bat_alloc(psb, &cb[1].buffer, &cb[1].offset);
-        if (!vp || (ibytes && !ip) || !vc || !pc) return;
+        if (!vp || (ibytes && !ip) || (!reuse_vs && !vc) || !pc) return;
         memcpy(vp, vertices, (size_t)vbytes);
         if (ip) memcpy(ip, indices, (size_t)ibytes);
-        memset(vc, 0, vsb); memset(pc, 0, psb);
-        if (s_e2.vs_bytes && s_bat.vsc) memcpy(vc, s_bat.vsc, s_e2.vs_bytes);
-        if (s_e2.ps_bytes && s_bat.psc) memcpy(pc, s_bat.psc, s_e2.ps_bytes);
-        cb[0].range = vsb; cb[1].range = psb;
+        /* A bound block fills its whole range (vsb == vs_bytes); only an
+         * empty one is the 16 zero bytes. */
+        if (reuse_vs) { cb[0] = s_e2.vs_last; s_e2.vs_reused++; }
+        else {
+            if (s_e2.vs_bytes && s_bat.vsc) memcpy(vc, s_bat.vsc, s_e2.vs_bytes); else memset(vc, 0, vsb);
+            cb[0].range = vsb;
+            s_e2.vs_last = cb[0]; s_e2.vs_last_batch = s_bat.batches; s_e2.vs_last_valid = 1;
+            s_e2.vs_uploads++;
+        }
+        if (s_e2.ps_bytes && s_bat.psc) memcpy(pc, s_bat.psc, s_e2.ps_bytes); else memset(pc, 0, psb);
+        cb[1].range = psb;
         if (s_bat.desc_reuse) {
             set = vk_eng_dyn_set(P, cb);
             dyn_off[0] = (u32)cb[0].offset; dyn_off[1] = (u32)cb[1].offset;
@@ -5959,6 +5991,7 @@ static int vk_bat_init(void)
     s_e2.dyn_last.valid = 0;
     { const char* m = getenv("PS3RECOMP_VK_MERGE_PASSES"); s_bat.merge = m && !strcmp(m, "1"); }
     memset(&s_pass, 0, sizeof s_pass);
+    s_e2.vs_last_valid = 0;
     VkPhysicalDeviceProperties p; pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     s_bat.align = 256u;
     if (p.limits.minUniformBufferOffsetAlignment > s_bat.align) s_bat.align = p.limits.minUniformBufferOffsetAlignment;
@@ -6488,6 +6521,10 @@ static void owner_vk_eng_bind_vs_constants(void* user, const void* data, u32 byt
     if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
     vk_eng_bind_vs_constants(user,data,bytes);vulkan_owner_finish(vulkan_owner_boundary(before));
 }
+static int owner_vk_eng_rebind_vs_constants(void* user){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    const int result=vk_eng_rebind_vs_constants(user);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
 static void owner_vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes){
     if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
     vk_eng_bind_ps_constants(user,data,bytes);vulkan_owner_finish(vulkan_owner_boundary(before));
@@ -6597,6 +6634,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .bind_targets         = owner_vk_eng_bind_targets,
     .bind_pipeline        = owner_vk_eng_bind_pipeline,
     .bind_vs_constants    = owner_vk_eng_bind_vs_constants,
+    .rebind_vs_constants  = owner_vk_eng_rebind_vs_constants,
     .bind_ps_constants    = owner_vk_eng_bind_ps_constants,
     .bind_textures        = owner_vk_eng_bind_textures,
     .bind_vertex_textures = owner_vk_eng_bind_vertex_textures,
@@ -6956,7 +6994,16 @@ static void vulkan_original_shutdown(void)
     memset(&s_show, 0, sizeof s_show);
 }
 
+static int vk_pump_messages_core(void);
+/* PS3RECOMP_RSX_FIFO_BUSY: the window and event pump, as Metal counts it. */
 int rsx_vulkan_backend_pump_messages(void)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PUMP);
+    const int r = vk_pump_messages_core();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PUMP);
+    return r;
+}
+static int vk_pump_messages_core(void)
 {
     vk_show_pump();
 #ifdef _WIN32
@@ -7010,10 +7057,15 @@ int rsx_vulkan_backend_pump_messages(void)
 #endif
 }
 
+/* PS3RECOMP_RSX_FIFO_BUSY: a host-driven present, outside the engine present
+ * (PRESENT) and the swapchain waits (DRAWABLE) it contains -- the present
+ * ring's fence waits and copies -- as Metal counts it. */
 void rsx_vulkan_backend_present(void)
 {
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT_HOST);
     rsx_vulkan_backend_present_begin();
     rsx_vulkan_backend_present_finish();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);
 }
 
 static void vulkan_original_present_begin(void)

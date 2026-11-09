@@ -219,6 +219,9 @@ static struct {
     u8* tex_staging;
     u32 tex_staging_cap;
     u8* vp_cb;
+    /* vp_cb's content version, and the version the backend last received
+     * through bind_vs_constants (0: none, or a different backend since). */
+    u64 vp_cb_serial, vs_bound_serial;
     u8* fp_cb;
     u32 fp_cb_cap;
     u32* indices;
@@ -4270,6 +4273,15 @@ done:
 
 #include "rsx_frame_capture.inc"
 
+/* Draws that handed the backend their vertex constants, and draws that
+ * reused the previous draw's (rebind_vs_constants). */
+static unsigned long long s_vs_binds, s_vs_rebinds;
+void rsx_draw_engine_vs_constant_counts(unsigned long long* binds, unsigned long long* rebinds)
+{
+    if (binds) *binds = s_vs_binds;
+    if (rebinds) *rebinds = s_vs_rebinds;
+}
+
 static void sink_end_core(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -4420,8 +4432,19 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
-    memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
-    memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    /* vp_cb is kept as a copy: only the constant slots written since the
+     * last draw are copied in (the dispatcher records the span), and the
+     * epilogue only when it moved. Either bumps its version, which is how
+     * the backend can be told nothing changed (rebind_vs_constants). */
+    { u32 lo, hi;
+      if (rsx_dsp_take_constants(&g.rsx, &lo, &hi)) {
+          memcpy(g.vp_cb + lo * 16u, g.rsx.constants[lo], (size_t)(hi - lo + 1u) * 16u);
+          g.vp_cb_serial++;
+      } }
+    if (memcmp(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf)) {
+        memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+        g.vp_cb_serial++;
+    }
 
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
@@ -4462,7 +4485,12 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
         uploaded,indexed ? n_draw : 0,fp_bytes,&rs,&sf,&vp);
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
-    g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+    if (g.vs_bound_serial != g.vp_cb_serial || !g.be->rebind_vs_constants ||
+        !g.be->rebind_vs_constants(g.be->user)) {
+        g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+        g.vs_bound_serial = g.vp_cb_serial;
+        s_vs_binds++;
+    } else s_vs_rebinds++;
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
@@ -4694,6 +4722,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 static void original_rsx_draw_engine_set_backend(const rsx_draw_backend* backend)
 {
     g.be = backend;
+    g.vs_bound_serial = 0;
 }
 
 static void original_rsx_draw_engine_set_default(int on)
@@ -4737,6 +4766,9 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
           fprintf(stderr, "[rsx engine] PS3RECOMP_RSX_GPU_DEPTH_VIEW: backend has no GPU depth view; depth reads keep the guest-memory store\n"); }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
+    /* rsx_dispatch_init below marks the whole constant file written, so the
+     * first draw copies all of it into vp_cb. */
+    g.vp_cb_serial = 1; g.vs_bound_serial = 0;
     eng_pkm_reset();
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
         free(g.vp_cb); g.vp_cb = NULL;
@@ -5439,7 +5471,7 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
                 s_picture_offset_pending[unit]=0;s_picture_offset_ea[unit]=0;
             }
         }
-        for(u32 i=0;i<p->constant_count;++i)memcpy(g.rsx.constants[p->constants[i].index],p->constants[i].words,16);
+        for(u32 i=0;i<p->constant_count;++i){memcpy(g.rsx.constants[p->constants[i].index],p->constants[i].words,16);rsx_dsp_mark_constants(&g.rsx,p->constants[i].index,p->constants[i].index);}
         for(u32 i=0;i<p->current_attribute_count;++i) {
             const rsx_native_vector_write* v=&p->current_attributes[i];
             for(u32 j=0;j<4;++j){const u32 idx=(0x1C00+v->index*16+j*4)>>2;
