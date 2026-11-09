@@ -2972,20 +2972,19 @@ void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned lon
  * pixel and discards. The bounds go in the float4 after fp_alpha. A bound of
  * [0, 1] is no bound. s_dbz says what eng_pipeline_get, the texture binding
  * and the constants need for the current draw.
- * Opt-in (PS3RECOMP_ENG_DEPTH_BOUNDS=1, eng_depth_bounds_on); otherwise the
- * test is ignored there, as before. */
+ * Per pass by default; see eng_depth_bounds_mode for the modes. */
 static struct { u32 unit; u32 copy; float mn, mx; } s_dbz;   /* unit + 1, or 0 */
 
-/* Opt-in in this fork: PS3RECOMP_ENG_DEPTH_BOUNDS=1 or 2 turns the emulation on.
- * On Metal every depth snapshot ends the render pass it falls in and
- * allocates a float texture; a title that bounds many draws after depth
- * writes (MAG's deferred material passes) lost ~160 ms a frame to it.
- * Unset or 0, the test is ignored on a backend without one, as before the
- * emulation existed; backends with native depth bounds (Vulkan, D3D12)
- * are not affected either way.
+/* PS3RECOMP_ENG_DEPTH_BOUNDS, for a backend without a depth-bounds test of
+ * its own (Metal); backends with native depth bounds (Vulkan, D3D12) are
+ * not affected. On Metal every depth snapshot ends the render pass it falls
+ * in, so the exact mode cost MAG ~160 ms a frame (5 fps against 38) before
+ * the snapshot texture was reused, and ~15% after; per pass costs nothing
+ * measurable there and looks the same.
+ *   0: off. The test is ignored, as before the emulation existed.
  *   1: exact. A new snapshot whenever depth was written since the last one
  *      (into the same texture where the backend can: depth_snapshot_into).
- *   2: per pass. At most one snapshot per render pass (a run of draws on the
+ *   2 (the default): per pass. At most one snapshot per render pass (a run of draws on the
  *      same colour targets and zeta), taken at its first bounded draw: depth
  *      written later in the same pass is not seen by its later bounded
  *      draws. Exact for the usual deferred shape (geometry writes depth,
@@ -2997,8 +2996,8 @@ static int eng_depth_bounds_mode(void)
 {
     if (s_dbz_mode < 0) {
         const char* e = getenv("PS3RECOMP_ENG_DEPTH_BOUNDS");
-        const int v = e && *e ? atoi(e) : 0;
-        s_dbz_mode = v == 1 || v == 2 ? v : 0;
+        const int v = e && *e ? atoi(e) : 2;   /* default: per pass */
+        s_dbz_mode = v == 0 || v == 1 ? v : 2;
     }
     return s_dbz_mode;
 }
@@ -5454,6 +5453,29 @@ static u32 eng_present_surface(u32 buffer_id)
 }
 
 static void eng_present_core(u32 buffer_id);
+/* Per-frame bookkeeping, run from every present (eng_present_core) once per
+ * guest flip: the FIFO flip method (sink_flip), a flip the GCM layer names
+ * (rsx_draw_engine_note_flip, the path a title that flips through the host
+ * frame clock takes) or a host present of a named buffer each advance
+ * s_eng_flip_serial, and a host that presents the same flip again (no
+ * PS3RECOMP_RSX_SINGLE_PRESENT) does not count it twice. With no flip ever
+ * noted, every present is a frame. */
+static u32 s_eng_flip_serial, s_eng_hooked_serial;
+static void eng_frame_hooks(void)
+{
+    if (s_eng_flip_serial && s_eng_flip_serial == s_eng_hooked_serial) return;
+    s_eng_hooked_serial = s_eng_flip_serial;
+    eng_dbz_stats_flip();
+    /* RSX_ENG_COUNTS=1: engine resource slots every 600 frames, to see a
+     * long session approach a capacity limit. */
+    { static int on = -1; static u32 frames;
+      if (on < 0) on = getenv("RSX_ENG_COUNTS") ? 1 : 0;
+      if (on && ++frames % 600 == 0)
+          fprintf(stderr, "[rsx engine counts] frames=%u surfaces=%u/%u zdepths=%u/%u\n", frames,
+                  (unsigned)g.n_surfaces, (unsigned)ENG_MAX_SURFACES,
+                  (unsigned)g.n_zdepths, (unsigned)ENG_MAX_ZDEPTHS); }
+}
+
 static void eng_present(u32 buffer_id)
 {
     ENG_PH_BEGIN(ph);
@@ -5484,6 +5506,8 @@ static void eng_present_core(u32 buffer_id)
     g.be->present(g.be->user, g.surfaces[target].handle);
     frame_capture_present(buffer_id,target);
     g.frames++;
+    s_dbz_pass_key = 0;   /* a present ends the pass (eng_dbz_pass_note) */
+    eng_frame_hooks();
     eng_vtx_probe_recheck();
     eng_ph_frame();
     g.last_guest_draws = g.guest_draws;
@@ -5513,16 +5537,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
     (void)user; (void)r;
     g.last_flip_buffer = arg & 7u;
     if (eng_churn_enabled()) { s_churn_flips++; eng_churn_flip(); }
-    eng_dbz_stats_flip();
-    s_dbz_pass_key = 0;   /* a flip ends the pass (eng_dbz_pass_note) */
-    /* RSX_ENG_COUNTS=1: engine resource slots every 600 flips, to see a
-     * long session approach a capacity limit. */
-    { static int on = -1; static u32 flips;
-      if (on < 0) on = getenv("RSX_ENG_COUNTS") ? 1 : 0;
-      if (on && ++flips % 600 == 0)
-          fprintf(stderr, "[rsx engine counts] flips=%u surfaces=%u/%u zdepths=%u/%u\n", flips,
-                  (unsigned)g.n_surfaces, (unsigned)ENG_MAX_SURFACES,
-                  (unsigned)g.n_zdepths, (unsigned)ENG_MAX_ZDEPTHS); }
+    s_eng_flip_serial++;
     eng_present(g.last_flip_buffer);
     if (eng_single_present()) s_flip_presented = 1;
 }
@@ -5835,12 +5850,14 @@ static void original_rsx_draw_engine_present(void)
 static void original_rsx_draw_engine_present_buffer(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
+    s_eng_flip_serial++;
     eng_present(g.last_flip_buffer);
 }
 
 static void original_rsx_draw_engine_note_flip(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
+    s_eng_flip_serial++;
 }
 
 static u32 original_rsx_draw_engine_guest_draws(void)

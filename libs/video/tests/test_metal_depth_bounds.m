@@ -8,10 +8,11 @@
  *   - [0.5, 1.0]: only the right half turns green;
  *   - [0.0, 0.5]: only the left half;
  *   - [0.0, 1.0] (no bound) or the test off: both halves;
- *   - mode 0 (PS3RECOMP_ENG_DEPTH_BOUNDS unset, the fork's default): both
- *     halves in every case, as before the test was emulated;
- *   - modes 1 (exact) and 2 (per pass) bound as above, and differ only when
- *     a pass writes depth between bounded draws (alternating()).
+ *   - mode 0 (PS3RECOMP_ENG_DEPTH_BOUNDS=0): both halves in every case, as
+ *     before the test was emulated;
+ *   - modes 1 (exact) and 2 (per pass, the default when the variable is
+ *     unset) bound as above, and differ only when a pass writes depth
+ *     between bounded draws (alternating()).
  * Every mode runs in one process, the environment's first.
  *
  * Built by CMake (build/test_metal_depth_bounds) only where glslang and
@@ -170,10 +171,10 @@ int main(void)
         rsx_draw_engine_set_backend(&s_engine_backend);
 
         /* Every mode in one process (s_dbz_mode is the engine's cached
-         * switch): 0 off (the fork's default), 1 exact, 2 per pass. The
+         * switch): 0 off, 1 exact, 2 per pass (the default). The
          * environment's value runs first, so the default is also covered. */
         const char* e = getenv("PS3RECOMP_ENG_DEPTH_BOUNDS");
-        const int env_mode = e && *e && (atoi(e) == 1 || atoi(e) == 2) ? atoi(e) : 0;
+        const int env_mode = !(e && *e) ? 2 : atoi(e) == 0 || atoi(e) == 1 ? atoi(e) : 2;
         const int modes[4] = { env_mode, 0, 1, 2 };
         for (int k = 0; k < 4; k++) {
             const int mode = modes[k];
