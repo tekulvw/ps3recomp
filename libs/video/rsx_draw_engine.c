@@ -2984,6 +2984,39 @@ static int eng_depth_bounds_on(void)
     return on;
 }
 
+/* RSX_ENG_DBZ_STATS=1: what the depth-bounds emulation costs, per frame,
+ * averaged and printed every 60 flips: draws with the test on, those whose
+ * bounds were the whole range (skipped), snapshots taken and reused, and the
+ * distinct non-trivial bounds the frames used (up to 8 listed). */
+static struct {
+    int on; u32 flips, draws, trivial, snaps, reused;
+    u32 n_pairs; float pairs[8][2];
+} s_dbz_stats = { -1 };
+static void eng_dbz_stats_pair(float mn, float mx)
+{
+    for (u32 i = 0; i < s_dbz_stats.n_pairs; i++)
+        if (s_dbz_stats.pairs[i][0] == mn && s_dbz_stats.pairs[i][1] == mx) return;
+    if (s_dbz_stats.n_pairs < 8) {
+        s_dbz_stats.pairs[s_dbz_stats.n_pairs][0] = mn;
+        s_dbz_stats.pairs[s_dbz_stats.n_pairs][1] = mx;
+        s_dbz_stats.n_pairs++;
+    }
+}
+static void eng_dbz_stats_flip(void)
+{
+    if (s_dbz_stats.on < 0) s_dbz_stats.on = getenv("RSX_ENG_DBZ_STATS") ? 1 : 0;
+    if (!s_dbz_stats.on || ++s_dbz_stats.flips < 60) return;
+    const float n = (float)s_dbz_stats.flips;
+    fprintf(stderr, "[rsx engine dbz] per frame over %u flips: bounded draws %.1f, whole-range %.1f, "
+            "snapshots %.1f, reused %.1f; bounds seen:", s_dbz_stats.flips,
+            s_dbz_stats.draws / n, s_dbz_stats.trivial / n, s_dbz_stats.snaps / n, s_dbz_stats.reused / n);
+    for (u32 i = 0; i < s_dbz_stats.n_pairs; i++)
+        fprintf(stderr, " [%.4f,%.4f]", s_dbz_stats.pairs[i][0], s_dbz_stats.pairs[i][1]);
+    fprintf(stderr, "%s\n", s_dbz_stats.n_pairs == 8 ? " ..." : "");
+    s_dbz_stats.flips = s_dbz_stats.draws = s_dbz_stats.trivial = 0;
+    s_dbz_stats.snaps = s_dbz_stats.reused = s_dbz_stats.n_pairs = 0;
+}
+
 static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
 {
     s_dbz.unit = 0; s_dbz.copy = 0;
@@ -2997,7 +3030,9 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
      * clamp_depth_bounds_value); NaN reads as 0. */
     mn = mn > 0.0f ? (mn < 1.0f ? mn : 1.0f) : 0.0f;
     mx = mx > 0.0f ? (mx < 1.0f ? mx : 1.0f) : 0.0f;
-    if (mn <= 0.0f && mx >= 1.0f) return;
+    if (s_dbz_stats.on > 0) s_dbz_stats.draws++;
+    if (mn <= 0.0f && mx >= 1.0f) { if (s_dbz_stats.on > 0) s_dbz_stats.trivial++; return; }
+    if (s_dbz_stats.on > 0) eng_dbz_stats_pair(mn, mx);
     const u8* vp_uc = NULL; const u8* fp_uc = NULL; u32 vp_instrs = 0, fp_size = 0;
     if (!eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size)) return;
     /* A unit the program neither samples nor has declared as a cube or a
@@ -3015,6 +3050,7 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
         return;
     }
     if (!z->dbz_copy || z->dbz_serial != z->depth_serial || z->dbz_w != z->w || z->dbz_h != z->h) {
+        if (s_dbz_stats.on > 0) s_dbz_stats.snaps++;
         const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
         if (!tex) return;
         if (z->dbz_copy && z->dbz_copy != tex && g.be->texture_release)
@@ -3022,6 +3058,7 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
         z->dbz_copy = tex; z->dbz_w = z->w; z->dbz_h = z->h;
         z->dbz_serial = z->depth_serial;
     }
+    else if (s_dbz_stats.on > 0) s_dbz_stats.reused++;
     s_dbz.unit = (u32)unit + 1u; s_dbz.copy = z->dbz_copy;
     s_dbz.mn = mn; s_dbz.mx = mx;
 }
@@ -5434,6 +5471,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
     (void)user; (void)r;
     g.last_flip_buffer = arg & 7u;
     if (eng_churn_enabled()) { s_churn_flips++; eng_churn_flip(); }
+    eng_dbz_stats_flip();
     /* RSX_ENG_COUNTS=1: engine resource slots every 600 flips, to see a
      * long session approach a capacity limit. */
     { static int on = -1; static u32 flips;
