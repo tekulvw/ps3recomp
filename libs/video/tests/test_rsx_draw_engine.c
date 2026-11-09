@@ -174,6 +174,7 @@ static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
     return g_snapshot_kept;
 }
 
+static u32 g_pipeline_layout_mask;   /* the input layout the last pipeline was built for */
 static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                 const rsx_be_render_state* rs,
                                 const rsx_vertex_layout_plan* layout,
@@ -183,6 +184,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
     if (!vs || !ps || !*vs || !*ps) return 0;
     stub.n_pipeline_create++;
     stub.pipeline_rt_count = rt_count;
+    g_pipeline_layout_mask = layout ? layout->mask : 0;
     stub.pipeline_rs = *rs;
     return stub_handle();
 }
