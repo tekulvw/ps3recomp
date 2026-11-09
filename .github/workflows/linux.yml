@@ -107,6 +107,18 @@ jobs:
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
+      # The x86 vector forms of the SPU integer/permute helpers must match their scalar
+      # references bit for bit at every ISA level a build can select.
+      - name: Run the SPU x86 vector helper test
+        run: |
+          for isa in -mssse3 -msse4.1 -march=x86-64-v3; do
+            if [ "$isa" = -march=x86-64-v3 ] && ! grep -q avx2 /proc/cpuinfo; then echo "no AVX2: $isa skipped"; continue; fi
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter $isa -I include -I runtime/spu \
+              -o /tmp/test_spu_int_x86 runtime/spu/tests/test_spu_int_x86.c -lm
+            echo "[$isa]"; /tmp/test_spu_int_x86
+          done
+
       # The AVX2 single-precision fast path must match the exact scalar path bit for bit.
       - name: Run the SPU float fast-path test (AVX2)
         run: |
