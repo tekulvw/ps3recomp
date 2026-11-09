@@ -18,10 +18,13 @@ def main():
             str(ROOT/'libs/audio/tests/test_posix_audio_pacing.c'),('-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'),'-o',exe],check=True)
         env={k:v for k,v in os.environ.items() if not k.startswith(('AUDIO_','SPU_DMA_DISPOSITION'))}
         failed=[]
-        for mode in range(10):
-            r=subprocess.run([exe,str(mode)],env=env,text=True,capture_output=True,timeout=10)
-            print(r.stdout,end='');print(r.stderr,end='')
-            if r.returncode:failed.append(mode)
+        env.pop('PS3RECOMP_AUDIO_PACING',None)
+        for pacing in ('clock','queue'):
+            for mode in range(12):
+                r=subprocess.run([exe,str(mode),pacing],env=env,text=True,capture_output=True,timeout=10)
+                print(r.stdout,end='');print(r.stderr,end='')
+                if r.returncode:failed.append((pacing,mode))
         if failed:raise SystemExit('FAIL modes: '+str(failed))
-        print('PASS: normal, no-device, frozen/full, drain recovery, long suspension, port stop/start, rejecting sink, ten-second rate, device loss/return, dummy-driver clock pacing')
+        print('PASS (clock and queue pacing): normal, no-device, frozen/full, drain recovery, long suspension, port stop/start, '
+              'rejecting sink, ten-second rate, device loss/return, dummy-driver clock pacing, two-block device pulls, WASAPI-shaped pacer')
 if __name__=='__main__':main()

@@ -1,0 +1,61 @@
+# cellAudio block pacing
+
+The mixing thread reads one block (256 frames) from every started port, sends the period
+notification and submits the mix to the host device. Guest mixers that are notified once per
+period and write the next block just in time depend on those reads being evenly spaced: one every
+256 frames of the 48 kHz clock, about 5.33 ms.
+
+## The problem with reads tied to device room
+
+Host devices drain their queue in chunks. Through SDL, CoreAudio takes 512 frames (two blocks) at a
+time. The previous pacing read a guest block whenever the device queue had room, within a cap of
+four blocks. Each two-block pull therefore produced two guest reads about 1 ms apart, then none for
+about 10 ms. A synthetic probe against the real CoreAudio device on macOS measured 50% of read
+intervals under 2 ms.
+
+A writer that keeps several blocks ahead of the read index does not notice. A writer that produces
+exactly one block per notification does: it has not written the second block of each pair yet, so
+about half of what it plays is silence. In one title, the movie mixer filled only 97 to 115 of 188
+blocks per second this way, and its audio sounded broken up. Its other audio engine, which writes
+seven blocks ahead, was unaffected.
+
+## Clock pacing (default)
+
+`audio_pace` schedules guest reads on the monotonic clock: block *k* is read at
+`epoch + k * 256 / 48000 s`. The device pull size has no effect on that schedule. The cushion
+for the device's chunked pulls is made of silence, queued once at the device, rather than guest
+blocks read early:
+
+| Parameter | POSIX (SDL) | Meaning |
+|---|---|---|
+| prime | 4 blocks (21.3 ms) | silence queued before the first read, and again after the device returns |
+| low | 1 block | below this at a read, one more silence block is queued (device clock faster than ours) |
+| high | 12 blocks (64 ms) | at or above this, the schedule moves one period later instead of reading (device slower than ours, or stalled) |
+
+Against the real CoreAudio device, the queue holds 1024 to 1280 frames at each read: 21 to 27 ms of
+output latency. The previous pacing held about 768 frames, so the change adds about 5 to 10 ms. Over
+15 s the probe saw no read interval under 2 ms and no silence beyond the initial prime.
+
+Unchanged from before:
+- With no device, or with SDL's dummy driver and `PS3RECOMP_AUDIO_DUMMY_CLOCK=1`, reads are paced
+  on the clock alone.
+- A suspension, or a stall longer than four periods, drops the backlog instead of reading it in a
+  burst.
+- A stalled device stops the guest once twelve blocks are queued.
+
+## Switch
+
+| Variable | Values | Effect |
+|---|---|---|
+| `PS3RECOMP_AUDIO_PACING` | unset (default): clock pacing; `queue`: the previous queue-gated pacing | Selects how guest block reads are paced. `queue` is kept for A/B comparisons |
+
+## Tests
+
+`python tools/test_posix_audio_pacing.py` runs the real POSIX mixing thread against a
+deterministic clock and an inert SDL device, under both pacings. Mode 10 models CoreAudio's
+two-block pulls:
+- clock pacing must keep every read at least 4 ms after the previous one, with no device
+  starvation;
+- the queue pacing is asserted to read in pairs, which documents the defect.
+
+Mode 11 drives `audio_pace` alone with the shape of a WASAPI endpoint.

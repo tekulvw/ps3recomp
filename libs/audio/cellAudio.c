@@ -366,6 +366,12 @@ static u32 audio_backend_queued_samples(void)
     return 0;
 }
 
+/* The clock pacer's view of the device: frames queued, -1 with no device. */
+static inline long long audio_backend_queue_frames(void)
+{
+    return s_sdl_audio_dev ? (long long)audio_backend_queued_samples() : -1;
+}
+
 #endif /* AUDIO_BACKEND_SDL2 */
 
 #if AUDIO_BACKEND_WASAPI
@@ -548,6 +554,92 @@ static void audio_backend_wait(void)
 
 
 #endif /* AUDIO_BACKEND_WASAPI */
+
+/* ---------------------------------------------------------------------------
+ * Guest block pacing
+ * -----------------------------------------------------------------------*/
+
+/* The guest reads one port block per 256 frames of the 48 kHz clock, evenly
+ * spaced, whatever chunk size the host device pulls. Devices drain their queue
+ * in chunks (CoreAudio through SDL takes 512 frames, two blocks, at a time; a
+ * shared-mode WASAPI period is about 480 frames). Reading a guest block for
+ * each frame of room the device frees reads two blocks back to back, about 1 ms
+ * apart, then none for about 10 ms. A guest mixer that writes exactly one block
+ * per period notification, just in time (MAG's surMixer feeding its movie
+ * audio), has had no chance to write the second block, so about half of what
+ * it plays reads as silence. The cushion for the device's chunked pulls is
+ * silence queued once at the device, not guest blocks read ahead of time.
+ *
+ * PS3RECOMP_AUDIO_PACING=queue restores the previous queue-gated pacing for
+ * comparisons. */
+typedef struct {
+    u64 epoch_ns;      /* guest block k is read at epoch_ns + k * 256 frames */
+    u64 blocks;
+    u32 prime_frames;  /* device queue filled with silence before the first read */
+    u32 low_frames;    /* below this at a read, queue one more silence block */
+    u32 high_frames;   /* at or above this, move the schedule one period later */
+    int primed;
+} AudioPacer;
+
+static u64 audio_pace_block_time(u64 blocks)
+{
+    return blocks * CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL / CELL_AUDIO_SAMPLE_RATE;
+}
+
+static void audio_pace_restart(AudioPacer* p, u64 now_ns)
+{
+    p->epoch_ns = now_ns;
+    p->blocks = 0;
+    p->primed = 0;
+}
+
+/* One step of the schedule. Returns 1 when a guest block is due now, after
+ * setting *silence to the silence blocks to queue at the device first. queued
+ * is the device queue in frames, or -1 with no device (pure clock pacing).
+ * A suspension or a long stall drops the elapsed backlog and restarts the
+ * schedule instead of spending it in a burst of guest reads. */
+static int audio_pace(AudioPacer* p, u64 now_ns, long long queued, unsigned* silence)
+{
+    const u64 block_ns = audio_pace_block_time(1);
+    u64 due = p->epoch_ns + audio_pace_block_time(p->blocks);
+    *silence = 0;
+    if (now_ns < p->epoch_ns || (now_ns > due && now_ns - due > 4 * block_ns)) {
+        audio_pace_restart(p, now_ns);
+        due = now_ns;
+    }
+    if (now_ns < due) return 0;
+    if (queued >= 0) {
+        if (queued >= (long long)p->high_frames) {
+            /* The device is slower than the clock, or stalled: one longer
+             * period now, rather than two reads back to back later. */
+            p->epoch_ns += block_ns;
+            return 0;
+        }
+        if (!p->primed) {
+            if (queued < (long long)p->prime_frames)
+                *silence = (unsigned)((p->prime_frames - (u32)queued + CELL_AUDIO_BLOCK_SAMPLES - 1) /
+                                      CELL_AUDIO_BLOCK_SAMPLES);
+            p->primed = 1;
+        } else if (queued < (long long)p->low_frames) {
+            *silence = 1; /* the device runs faster than the clock, or just returned */
+        }
+    }
+    p->blocks++;
+    return 1;
+}
+
+static int audio_pacing_queue_gated(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_AUDIO_PACING");
+        on = e && !strcmp(e, "queue");
+        if (on) printf("[cellAudio] PS3RECOMP_AUDIO_PACING=queue: queue-gated block reads\n");
+    }
+    return on;
+}
+
+static const float s_silence_block[CELL_AUDIO_BLOCK_SAMPLES * 2];
 
 /* ---------------------------------------------------------------------------
  * Mixing
@@ -803,16 +895,52 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
-    /* Queue-before-consume pacing is adapted from Noah Peterson's
-     * 93aa8dfe536d5f5a5d0630b83e93f3bf47573e28 (upstream PR #213).
-     * Prime at most four blocks with a device, then advance at 48 kHz even
-     * when the backend is absent or rejects submissions. Waiting must not
-     * consume a guest slot or send its period notification. */
+    /* Default: clock-paced guest reads (audio_pace above). Waiting must not
+     * consume a guest slot or send its period notification, and the guest
+     * advances at 48 kHz even when the backend is absent or rejects
+     * submissions.
+     *
+     * PS3RECOMP_AUDIO_PACING=queue keeps the previous queue-before-consume
+     * pacing, adapted from Noah Peterson's
+     * 93aa8dfe536d5f5a5d0630b83e93f3bf47573e28 (upstream PR #213): prime at
+     * most four blocks with a device, reading a guest block whenever the device
+     * queue has room. */
     struct timespec clock;
     clock_gettime(CLOCK_MONOTONIC, &clock);
     u64 epoch_ns = (u64)clock.tv_sec * 1000000000ULL + (u64)clock.tv_nsec;
     u64 blocks = 0;
     const int pace_clock = audio_pace_on_clock();
+    if (!audio_pacing_queue_gated()) {
+        /* About 21 ms of silence absorbs the device's two-block pulls; the queue
+         * then holds 3-5 blocks (16-27 ms) and never grows past 12 (64 ms). */
+        AudioPacer pacer = { 0 };
+        pacer.prime_frames = CELL_AUDIO_BLOCK_SAMPLES * 4;
+        pacer.low_frames = CELL_AUDIO_BLOCK_SAMPLES;
+        pacer.high_frames = CELL_AUDIO_BLOCK_SAMPLES * 12;
+        audio_pace_restart(&pacer, epoch_ns);
+        int had = s_sdl_audio_dev != 0 && !pace_clock;
+        while (s_mix_thread_running) {
+            clock_gettime(CLOCK_MONOTONIC, &clock);
+            const u64 now_ns = (u64)clock.tv_sec * 1000000000ULL + (u64)clock.tv_nsec;
+            const int have_device = s_sdl_audio_dev != 0 && !pace_clock;
+            /* A device that goes away or returns keeps the guest's schedule;
+             * only the device cushion is rebuilt. */
+            if (have_device != had) { pacer.primed = 0; had = have_device; }
+            unsigned silence;
+            if (!audio_pace(&pacer, now_ns, have_device ? audio_backend_queue_frames() : -1, &silence)) {
+                usleep(1000);
+                continue;
+            }
+            while (silence--) audio_backend_submit(s_silence_block, CELL_AUDIO_BLOCK_SAMPLES);
+            audio_mix_one_block();
+            if (have_device) audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+            audio_notify_event_queues();
+            if (s_audio_diag_on) audio_diagnostics_report(audio_diagnostics_now());
+            audio_chronology_poll();
+        }
+        printf("[cellAudio] Mixing thread stopped\n");
+        return NULL;
+    }
     unsigned lead = s_sdl_audio_dev && !pace_clock ? 3 : 0;
     int had_device = s_sdl_audio_dev != 0 && !pace_clock;
     const u64 block_ns = (u64)CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL /
