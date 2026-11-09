@@ -12,7 +12,9 @@ static uint64_t tick=1000000;static uint64_t now(){clocks++;return tick;}
 #include <cassert>
 #include <cstring>
 #include <cstdio>
-extern "C" void SetLastError(DWORD){}
+#ifndef _WIN32
+extern "C" void SetLastError(DWORD){}  /* kernel32 provides it on Windows */
+#endif
 #ifndef AUDIO_CHRONOLOGY_SCALAR_NOTES_VERSION
 static uint64_t audio_chronology_scalar_scope(){return 0;}
 static uint64_t audio_chronology_scalar(uint64_t,uint32_t,uint64_t,uint64_t,uint64_t,uint64_t){return 0;}

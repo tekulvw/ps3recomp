@@ -4,6 +4,10 @@
 --mutants proves that skipped history, steps, reset, IRQ and PM-flow checks
 are detected. All mutants live in temporary files; production files stay intact.
 """
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: built with cc and -fsanitize=undefined; MinGW has no UBSan runtime')
+    raise SystemExit(0)
 import argparse
 import os
 import pathlib

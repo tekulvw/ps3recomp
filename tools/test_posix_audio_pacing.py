@@ -9,6 +9,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 def main():
+    if os.name=='nt':print('SKIP: the POSIX mixer fixture needs unistd.h and pthreads');return 0
     p=argparse.ArgumentParser();p.add_argument('--sanitize',action='store_true');args=p.parse_args()
     with tempfile.TemporaryDirectory(prefix='posix-audio-pacing-') as tmp:
         exe=str(Path(tmp)/'fixture')

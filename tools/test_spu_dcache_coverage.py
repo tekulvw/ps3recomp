@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Real cache/resolver preservation; temporary source copies supply observers."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: built with cc and -fsanitize=undefined; MinGW has no UBSan runtime')
+    raise SystemExit(0)
 import argparse,os,pathlib,subprocess,tempfile
 ROOT=pathlib.Path(__file__).resolve().parents[1];SPU=ROOT/'runtime/spu'
 parser=argparse.ArgumentParser();parser.add_argument('--mutants',action='store_true');args=parser.parse_args()

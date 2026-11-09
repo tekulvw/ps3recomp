@@ -1,5 +1,9 @@
 """Real binding snapshots: disabled, bounded, layout bytes and stale-cache evidence."""
 import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: configures itself with setenv/unsetenv')
+    raise SystemExit(0)
+import os
 from pathlib import Path
 import subprocess
 import sys

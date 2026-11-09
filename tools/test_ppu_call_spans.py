@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Source-derived actual fn+trampoline dispatcher span; synthetic host work only."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: compiles the dispatcher with unistd.h')
+    raise SystemExit(0)
 from pathlib import Path
 import argparse,os,subprocess,tempfile,json
 ROOT=Path(__file__).resolve().parents[1]

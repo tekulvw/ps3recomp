@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Actual core/list DMA outcomes, synthetic memory and host-owned trigger only."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: stubs Win32 SetLastError, which collides with kernel32 on Windows')
+    raise SystemExit(0)
 import os, subprocess, tempfile, re
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]

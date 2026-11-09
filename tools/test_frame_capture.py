@@ -1,4 +1,8 @@
 """Finite request lifecycle and actual Metal completed-surface diagnostic tests."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: built with cc and -fsanitize=undefined; MinGW has no UBSan runtime')
+    raise SystemExit(0)
 from pathlib import Path
 import platform
 import subprocess

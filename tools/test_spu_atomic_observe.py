@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Bounded real-runtime observer fixture, never starts native/game services."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: configures itself with setenv/unsetenv')
+    raise SystemExit(0)
 import argparse,json,os,pathlib,subprocess,tempfile,shutil
 p=argparse.ArgumentParser();p.add_argument("--ubsan",action="store_true");p.add_argument("--artifacts",type=pathlib.Path);args=p.parse_args()
 ROOT=pathlib.Path(__file__).resolve().parents[1]; SPU=ROOT/'runtime/spu'

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Actual GCM target-label observer; synthetic genuine-ready backend contract."""
 import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: needs sys/mman.h')
+    raise SystemExit(0)
+import os
 from pathlib import Path
 import subprocess
 import sys

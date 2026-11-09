@@ -18,6 +18,10 @@ spu_coherency.c, then runs the same driver with the switch off and on:
 PPU_RESV_OFF=1 (plain value CAS) must make the PPU stress report violations,
 which shows the check can see the failure it guards against.
 """
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: compiles ppu_loader.cpp with cc/c++, whose Windows path needs MSVC __try/__except')
+    raise SystemExit(0)
 import os, sys, subprocess, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))

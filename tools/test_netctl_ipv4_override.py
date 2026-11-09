@@ -1,4 +1,8 @@
 """Neutral exact GetInfo API tests; no actual DNS or service interaction."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: needs arpa/inet.h and UBSan')
+    raise SystemExit(0)
 from pathlib import Path
 import subprocess
 import tempfile

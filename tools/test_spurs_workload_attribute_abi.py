@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Exercise the real PPU dispatcher and SPURS initializer with a ninth ABI argument."""
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: configures itself with setenv/unsetenv')
+    raise SystemExit(0)
 import os,platform,subprocess,tempfile
 from pathlib import Path
 r=Path(__file__).resolve().parents[1]

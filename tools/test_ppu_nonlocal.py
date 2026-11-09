@@ -211,6 +211,11 @@ def validation_tests(out):
 
 
 def main():
+    if os.name=='nt':
+        # Windows longjmp runs C++ destructors, so host exit behaves differently there;
+        # test_ppu_nonlocal_windows.py runs these fixtures through a clang-cl consumer.
+        print('SKIP: POSIX fixture; tools/test_ppu_nonlocal_windows.py covers Windows')
+        return
     compiler=os.environ.get('CXX') or shutil.which('clang++') or shutil.which('g++')
     assert compiler,'C++ compiler required'
     with tempfile.TemporaryDirectory(prefix='ppu-nonlocal-') as directory:

@@ -4,6 +4,10 @@
 Only temporary source copies acquire counters/publication observation points.
 --output-dir retains the exact compiled binaries, argv and output for review.
 """
+import os
+if os.name == 'nt':
+    print('SKIP: POSIX fixture: built with cc and -fsanitize=undefined; MinGW has no UBSan runtime')
+    raise SystemExit(0)
 import argparse,json,os,pathlib,subprocess,tempfile
 ROOT=pathlib.Path(__file__).resolve().parents[1];SPU=ROOT/'runtime/spu'
 parser=argparse.ArgumentParser()

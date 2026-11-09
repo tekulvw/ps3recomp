@@ -1,5 +1,8 @@
-import json,subprocess,tempfile
+import json,os,subprocess,tempfile
 from pathlib import Path
+if os.name=='nt':
+ print('SKIP: the DMA fixture it includes uses pthreads, sched.h and setenv (POSIX only)')
+ raise SystemExit(0)
 r=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory() as d:
  exe=Path(d)/'actual-dma';out=Path(d)/'capture.json'
