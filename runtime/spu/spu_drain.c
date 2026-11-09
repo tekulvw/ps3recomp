@@ -378,6 +378,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to the driver (srr0=0x%05X)\n",
                                   ctx->host_depth, ctx->pc & SPU_LS_MASK); }
                     extern void spu_restart_dispatch(spu_context*);
+                    ctx->dbg_reset_reason = 4;   /* [spu-restart]: iret to the driver */
                     spu_restart_dispatch(ctx);
                 }
                 return 1;
@@ -731,6 +732,7 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
         }
         {
             extern void spu_restart_dispatch(spu_context*);
+            ctx->dbg_reset_inner_ret = return_pc & SPU_LS_MASK;   /* [spu-restart] */
             SPU_DRAIN_POP_IRQ();
             spu_restart_dispatch(ctx);
             return;

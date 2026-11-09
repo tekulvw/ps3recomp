@@ -428,6 +428,9 @@ typedef struct spu_context {
      * SPU_SETJMP case 2) and the drain_ret_pc it found there; and, with
      * PS3RECOMP_SPU_CHRING=1, its last 16 channel operations. */
     uint32_t dbg_reset_n, dbg_reset_pc, dbg_reset_stale_ret;
+    uint32_t dbg_reset_depth_was;   /* host depth the restart discarded */
+    uint32_t dbg_reset_inner_ret;   /* reason 3: the return point of the drain that gave up */
+    uint32_t dbg_reset_reason;   /* 1 stack-reset entry, 2 task resume, 3 drain restart dispatch, 4 iret to the driver */
     uint32_t dbg_chring_n;
     struct { uint32_t pc, op_ch, value; } dbg_chring[16];   /* op_ch: op << 16 | channel */
     uint32_t region_dispatch_depth, region_return_pc;

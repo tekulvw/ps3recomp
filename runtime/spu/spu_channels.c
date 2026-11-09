@@ -234,6 +234,8 @@ void spu_restart_dispatch(spu_context* ctx)
 {
     ctx->region_dispatch_valid=0;
     g_spu_trampoline_fn = 0;
+    if (!ctx->dbg_reset_reason)
+        ctx->dbg_reset_reason = 3;   /* restart dispatch: no lifted code to resume */
     if (s_spu_halt_armed) spu_interp_attr_unwind(), SPU_LONGJMP(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
@@ -421,6 +423,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         ctx->region_dispatch_valid=0;
         /* A one-way guest stack reset invalidates every lifted host caller.
          * Re-enter its target with the same guest state on the driver stack. */
+        ctx->dbg_reset_depth_was = ctx->host_depth;
         ctx->host_depth = 0;
         g_spu_trampoline_fn = 0;
         /* No drain is live on the driver stack either, so no return point is.
@@ -433,6 +436,25 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         ctx->dbg_reset_n++;
         ctx->dbg_reset_pc = (uint32_t)ctx->pc & SPU_LS_MASK;
         ctx->dbg_reset_stale_ret = ctx->drain_ret_pc;
+        /* PS3RECOMP_SPU_RESTART_LOG=1: report the first 32 depth-0 restarts
+         * and every 1024th after, with why each happened (1 stack-reset
+         * entry, 2 task resume, 3 restart dispatch from a drain, 4 an iret
+         * that unwinds to the driver) and where. A WWS job manager restarts
+         * thousands of times a second, so it is off by default. */
+        { static int s_on = -1;
+          if (s_on < 0) s_on = getenv("PS3RECOMP_SPU_RESTART_LOG") ? 1 : 0;
+          static volatile long s_rs;
+          const long n = s_on ? __atomic_add_fetch(&s_rs, 1, __ATOMIC_RELAXED) : 0;
+          if (s_on && (n <= 32 || (n & 1023) == 0))
+              fprintf(stderr, "[spu-restart] #%ld reason=%u pc=0x%05X lr=0x%05X stale_ret=0x%05X inner_ret=0x%05X depth_was=%u "
+                      "img=%d ovl=%d task=%d pm=%d LS1DC=0x%02X%02X%02X%02X\n", n,
+                      ctx->dbg_reset_reason, ctx->dbg_reset_pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                      ctx->dbg_reset_stale_ret & SPU_LS_MASK, ctx->dbg_reset_inner_ret,
+                      ctx->dbg_reset_depth_was, ctx->image_id, (int)ctx->resident_ovl,
+                      (int)ctx->resident_task, (int)ctx->policy_mode,
+                      ctx->ls[0x1DC], ctx->ls[0x1DD], ctx->ls[0x1DE], ctx->ls[0x1DF]); }
+        ctx->dbg_reset_reason = 0;
+        ctx->dbg_reset_inner_ret = 0;
         { static int s_keep = -1;
           if (s_keep < 0) { const char* e = getenv("PS3RECOMP_SPU_RESET_KEEPS_RET");
                             s_keep = e && e[0] == '1' && !e[1]; }
@@ -2919,6 +2941,7 @@ static void spu_check_stack_reset_scan(spu_context* ctx, void (*fn)(spu_context*
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
             ctx->region_dispatch_valid=0;
+            ctx->dbg_reset_reason = 1;   /* registered stack-reset entry */
             spu_interp_attr_unwind(), SPU_LONGJMP(s_spu_halt_env, 2);
         }
 }
@@ -3943,6 +3966,7 @@ void spu_indirect_branch(spu_context* ctx)
             ctx->resident_task = ti;
             g_spu_trampoline_fn = 0;
             ctx->region_dispatch_valid=0;
+            ctx->dbg_reset_reason = 2;   /* taskset task resume */
             spu_interp_attr_unwind(), SPU_LONGJMP(s_spu_halt_env, 2);
         }
         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
