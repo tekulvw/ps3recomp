@@ -126,7 +126,10 @@ static int open_device(void)
         if (SUCCEEDED(factory->lpVtbl->EnumAdapterByLuid(factory, luid, &IID_IDXGIAdapter1, (void**)&adapter))) {
             DXGI_ADAPTER_DESC1 ad;
             if (SUCCEEDED(adapter->lpVtbl->GetDesc1(adapter, &ad))) {
-                s_software_adapter = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+                /* The Basic Render Driver (Microsoft 0x1414:0x008C) is WARP but
+                 * does not set the software flag. */
+                s_software_adapter = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
+                                     (ad.VendorId == 0x1414 && ad.DeviceId == 0x008C);
                 fprintf(stderr, "adapter %ls (vendor 0x%04X device 0x%04X)%s\n", ad.Description,
                         ad.VendorId, ad.DeviceId, s_software_adapter ? " [software]" : "");
             }
