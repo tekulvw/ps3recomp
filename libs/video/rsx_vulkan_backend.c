@@ -245,6 +245,7 @@ typedef struct vk_state {
     VkFence          present_fences[VK_PRESENT_SLOTS];
     VkSemaphore      present_acquire[VK_PRESENT_SLOTS]; /* direct window presents */
     int              present_busy[VK_PRESENT_SLOTS];    /* submitted, not yet waited */
+    VkImage          present_src[VK_PRESENT_SLOTS];     /* engine image the slot's present reads */
     u32              present_slot;    /* the slot the last present used     */
     VkCommandBuffer  present_cmd;     /* = present_cmds[present_slot]       */
     VkFence          present_fence;   /* = present_fences[present_slot]     */
@@ -706,10 +707,11 @@ static void vkpt_commit(int host)
     s_vkpt_n[host] = 0;
 }
 
+static void vk_present_wait_image(VkImage img);
 static void vk_destroy_image_now(vk_image* im)
 {
     /* Never under a present's copy that may still read it. */
-    if (im->img) vk_present_wait_gpu();
+    if (im->img) vk_present_wait_image(im->img);
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
     if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
@@ -2646,6 +2648,20 @@ static void vk_present_wait_gpu(void)
             vk_fence_wait(s_show.fences[i]);
 }
 
+/* Wait only for the presents that may still read `img`: a ring slot whose
+ * present blits that engine image, and every present and window show when it
+ * is the backend's own colour image (all of them read it). Destroying any
+ * other image does not wait on presentation: before, each one waited for
+ * every present in flight, a CPU stall per released texture or target. */
+static void vk_present_wait_image(VkImage img)
+{
+    if (img == s_vk.color.img) { vk_present_wait_gpu(); return; }
+    for (u32 i = 0; i < VK_PRESENT_SLOTS; i++)
+        if (__atomic_load_n(&s_vk.present_busy[i], __ATOMIC_ACQUIRE) && s_vk.present_fences[i] &&
+            s_vk.present_src[i] == img)
+            vk_fence_wait(s_vk.present_fences[i]);
+}
+
 /* present_mu held: finish a read-back present -- wait for its copy, keep the
  * centre pixel and the dump, then show it in the window. */
 static void vk_present_complete_locked(void)
@@ -2683,6 +2699,7 @@ static VkCommandBuffer vk_present_record_begin(void)
     }
     vkpt_add(VKPT_SLOT, tp);
     s_vk.present_slot = slot;
+    s_vk.present_src[slot] = VK_NULL_HANDLE;   /* set by a present that blits an engine image */
     s_vk.present_cmd = s_vk.present_cmds[slot];
     s_vk.present_fence = s_vk.present_fences[slot];
     VkCommandBuffer cb = s_vk.present_cmd;
@@ -3759,6 +3776,7 @@ static void vk_eng_present(void* user, u32 surface)
     VkCommandBuffer cb = vk_present_record_begin();
     if (cb) {
         if (o) {
+            s_vk.present_src[s_vk.present_slot] = o->im.img;
             vk_barrier_image_on(cb, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
             vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
             VkImageBlit blit = {
