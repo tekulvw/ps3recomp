@@ -713,6 +713,11 @@ class PPULifter:
                 f"underscore; using {prefix + chr(95)!r}"+chr(10))
             prefix += "_"
         self.prefix = prefix
+        # Opt-in passes over each emitted function (tools/ppu_promote.py):
+        # guest registers in C locals, and inline r1-relative accesses. Off by
+        # default, and the default output does not change.
+        self.promote_regs = False
+        self.inline_stack = False
         # Cache for _range_insns: (instructions, len, ordered, addrs). Keyed by
         # the instruction-list identity so the FULL list (mid-function / serial
         # lift) is sorted+indexed once, not rescanned per call.
@@ -3500,7 +3505,23 @@ class PPULifter:
         lines.append("    return (sh >= 64) ? (rs >> 63) : (rs >> sh);")
         lines.append("}")
         lines.append("")
+        if self.promote_regs and self.inline_stack:
+            from ppu_promote import STACK_PREAMBLE
+            lines.append(STACK_PREAMBLE)
         return lines
+
+    def _promoted(self, deflines: list[str]) -> list[str]:
+        """A function's definition lines after the opt-in passes, or unchanged."""
+        if not self.promote_regs:
+            return deflines
+        from ppu_promote import Reject, promote_function
+        at = next(i for i, line in enumerate(deflines) if line.startswith("void "))
+        end = max(i for i, line in enumerate(deflines) if line == "}")
+        try:
+            text = promote_function("\n".join(deflines[at:end + 1]) + "\n", self.inline_stack)
+        except Reject:
+            return deflines
+        return deflines[:at] + text[:-1].split("\n") + deflines[end + 1:]
 
     def _emit_functions(self) -> list["LiftedFunction"]:
         """One definition per start address, widest extent wins.
@@ -3656,7 +3677,7 @@ class PPULifter:
         addr_index = {a: i for i, a in enumerate(sorted_addrs)}
         lines = self._preamble_lines()
         for func in emit_funcs:
-            lines += self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
+            lines += self._promoted(self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index))
         lines += self._table_lines()
         return "\n".join(lines)
 
@@ -3695,11 +3716,13 @@ class PPULifter:
             if i % 10000 == 0:
                 print(f"  ... emitting {i}/{n} functions", flush=True)
             deflines = self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
+            # Chunks are cut by the plain line count, so the opt-in passes keep
+            # every function in the file the plain lift puts it in.
             if cur and cur_len + len(deflines) > max_lines:
                 flush(cur)
                 cur = []
                 cur_len = len(preamble)
-            cur += deflines
+            cur += self._promoted(deflines)
             cur_len += len(deflines)
 
         # Final chunk carries the function table.
@@ -4348,7 +4371,15 @@ def main() -> None:
                              "calls to it dispatch to the HLE handler.")
     parser.add_argument("--nonlocal-control-flow", metavar="FILE",
                         help="Explicit JSON nonlocal_return_functions and owning function/address continuations; C++ exception support required")
+    parser.add_argument("--promote-regs", action="store_true",
+                        help="Opt-in: keep guest GPR/FPR/CR/XER/LR/CTR in C locals within each "
+                             "function, written back at calls and returns (tools/ppu_promote.py)")
+    parser.add_argument("--inline-stack", action="store_true",
+                        help="Opt-in, with --promote-regs: inline r1-relative guest loads and stores "
+                             "behind the runtime fast-accessor gate")
     args = parser.parse_args()
+    if args.inline_stack and not args.promote_regs:
+        parser.error("--inline-stack requires --promote-regs")
     nonlocal_returns, nonlocal_continuations = (load_nonlocal_control_flow(args.nonlocal_control_flow)
                                                if args.nonlocal_control_flow else (set(), {}))
 
@@ -4777,6 +4808,8 @@ def main() -> None:
     lifter = PPULifter(prefix=args.symbol_prefix, nonlocal_return_functions=nonlocal_returns,
                        nonlocal_continuations=nonlocal_continuations)
     lifter.header_name = args.header_name
+    lifter.promote_regs = args.promote_regs
+    lifter.inline_stack = args.inline_stack
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has
     # no glink stub writing the save slot, so the stack read returns garbage -> r2
