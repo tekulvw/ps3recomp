@@ -178,6 +178,8 @@ typedef struct vk_image {
     VkImageUsageFlags usage;
     VkImageAspectFlags aspect;
     u32 levels,layers,samples;
+    u32 w, h;                        /* extent of level 0 */
+    u8  pooled;                      /* returns to the image pool when destroyed */
 } vk_image;
 
 #define VK_SAMPLER_CACHE 32
@@ -245,6 +247,7 @@ typedef struct vk_state {
     VkFence          present_fences[VK_PRESENT_SLOTS];
     VkSemaphore      present_acquire[VK_PRESENT_SLOTS]; /* direct window presents */
     int              present_busy[VK_PRESENT_SLOTS];    /* submitted, not yet waited */
+    VkImage          present_src[VK_PRESENT_SLOTS];     /* engine image the slot's present reads */
     u32              present_slot;    /* the slot the last present used     */
     VkCommandBuffer  present_cmd;     /* = present_cmds[present_slot]       */
     VkFence          present_fence;   /* = present_fences[present_slot]     */
@@ -322,7 +325,7 @@ static atomic_int s_vulkan_unscoped_submit;
 static atomic_int s_vk_eng_failed;
 /* Batched engine recording (E6, PS3RECOMP_VK_BATCHED_ENGINE=1); defined below. */
 static int s_bat_on;
-enum { VK_RET_IMAGE = 1, VK_RET_BUFFER, VK_RET_SPARE, VK_RET_FRAMEBUFFER, VK_RET_PIPELINE };
+enum { VK_RET_IMAGE = 1, VK_RET_BUFFER, VK_RET_SPARE, VK_RET_FRAMEBUFFER, VK_RET_PIPELINE, VK_RET_STAGE };
 static int vk_bat_begin_op(void);
 static int vk_bat_end_op(void);
 static int vk_bat_flush(int wait);
@@ -651,6 +654,7 @@ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 
     VK_CHECK(pvkCreateImageView(s_vk.device, &vci, NULL, &im->view), "vkCreateImageView");
     im->format=fmt;im->usage=usage;im->aspect=aspect;
     im->levels=levels;im->layers=1;im->samples=VK_SAMPLE_COUNT_1_BIT;
+    im->w=w;im->h=h;
     return 0;
 }
 
@@ -658,6 +662,68 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
                            VkImageUsageFlags usage, VkImageAspectFlags aspect)
 {
     return vk_create_image_levels(im, fmt, w, h, 1, usage, aspect);
+}
+
+/* Engine images a scene creates and releases over and over (colour targets,
+ * the RGBA8 aliases GPU depth views fill) keep their memory: once the GPU is
+ * done with a released one, its image goes back to a small pool, and a later
+ * request of the same format, size and usage takes it with a fresh view. The
+ * callers define the contents of what they get (a colour target is cleared,
+ * an alias is filled whole), so a reused image is as good as a new one. */
+#define VK_IMG_POOL       48u
+#define VK_IMG_POOL_BYTES ((VkDeviceSize)256 << 20)
+static vk_image     s_img_pool[VK_IMG_POOL];
+static VkDeviceSize s_img_pool_size[VK_IMG_POOL];
+static u32          s_img_pool_n;
+static VkDeviceSize s_img_pool_bytes;
+static int vk_img_pool_keep(vk_image* im)
+{
+    /* Not with the native owner, which may still hold views of engine images. */
+    if (!im->pooled || !im->img || !im->mem || s_img_pool_n >= VK_IMG_POOL || vulkan_owner_enabled()) return 0;
+    VkMemoryRequirements req;
+    pvkGetImageMemoryRequirements(s_vk.device, im->img, &req);
+    if (s_img_pool_bytes + req.size > VK_IMG_POOL_BYTES) return 0;
+    if (im->view) { pvkDestroyImageView(s_vk.device, im->view, NULL); im->view = VK_NULL_HANDLE; }
+    s_img_pool[s_img_pool_n] = *im;
+    s_img_pool_size[s_img_pool_n++] = req.size;
+    s_img_pool_bytes += req.size;
+    memset(im, 0, sizeof *im);
+    return 1;
+}
+static int vk_create_image_pooled(vk_image* im, VkFormat fmt, u32 w, u32 h,
+                                  VkImageUsageFlags usage, VkImageAspectFlags aspect)
+{
+    for (u32 i = 0; i < s_img_pool_n; i++) {
+        const vk_image* c = &s_img_pool[i];
+        if (c->format != fmt || c->w != w || c->h != h || c->usage != usage || c->aspect != aspect || c->levels != 1)
+            continue;
+        *im = *c;
+        s_img_pool_bytes -= s_img_pool_size[i];
+        s_img_pool[i] = s_img_pool[--s_img_pool_n];
+        s_img_pool_size[i] = s_img_pool_size[s_img_pool_n];
+        VkImageViewCreateInfo vci = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+            .subresourceRange = { aspect, 0, 1, 0, 1 },
+        };
+        if (pvkCreateImageView(s_vk.device, &vci, NULL, &im->view) != VK_SUCCESS) {
+            pvkDestroyImage(s_vk.device, im->img, NULL); pvkFreeMemory(s_vk.device, im->mem, NULL);
+            memset(im, 0, sizeof *im); return -1;
+        }
+        im->pooled = 1;
+        return 0;
+    }
+    if (vk_create_image(im, fmt, w, h, usage, aspect)) return -1;
+    im->pooled = 1;
+    return 0;
+}
+static void vk_img_pool_drain(void)
+{
+    for (u32 i = 0; i < s_img_pool_n; i++) {
+        pvkDestroyImage(s_vk.device, s_img_pool[i].img, NULL);
+        pvkFreeMemory(s_vk.device, s_img_pool[i].mem, NULL);
+    }
+    s_img_pool_n = 0; s_img_pool_bytes = 0;
 }
 
 static void vk_present_wait_gpu(void);
@@ -706,10 +772,12 @@ static void vkpt_commit(int host)
     s_vkpt_n[host] = 0;
 }
 
+static void vk_present_wait_image(VkImage img);
 static void vk_destroy_image_now(vk_image* im)
 {
     /* Never under a present's copy that may still read it. */
-    if (im->img) vk_present_wait_gpu();
+    if (im->img) vk_present_wait_image(im->img);
+    if (vk_img_pool_keep(im)) return;
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
     if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
@@ -770,6 +838,65 @@ static void vk_destroy_buffer_now(vk_buffer* b)
     if (b->buf) pvkDestroyBuffer(s_vk.device, b->buf, NULL);
     if (b->mem) pvkFreeMemory(s_vk.device, b->mem, NULL);
     memset(b, 0, sizeof *b);
+}
+
+/* Host staging buffers for the engine's texture uploads and depth snapshots.
+ * Each used to be created for one copy and destroyed after it, about a
+ * hundred allocations a second in a busy scene. A released one is kept, once
+ * the GPU has finished the copy that read it, and handed to the next request
+ * it is large enough for. Sizes are rounded up to a power of two so they
+ * recur; the pool is bounded by count and bytes, and anything beyond is
+ * destroyed as before. */
+#define VK_STAGE_POOL      32u
+#define VK_STAGE_MIN       ((VkDeviceSize)64 << 10)
+#define VK_STAGE_MAX_BYTES ((VkDeviceSize)256 << 20)
+#define VK_STAGE_USAGE     (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+static vk_buffer    s_stage_free[VK_STAGE_POOL];
+static u32          s_stage_nfree;
+static VkDeviceSize s_stage_bytes;
+static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageFlags usage);
+static void vk_stage_keep_or_destroy(vk_buffer* b)
+{
+    if (!b->buf) return;
+    if (s_stage_nfree < VK_STAGE_POOL && s_stage_bytes + b->size <= VK_STAGE_MAX_BYTES) {
+        s_stage_bytes += b->size;
+        s_stage_free[s_stage_nfree++] = *b;
+        memset(b, 0, sizeof *b);
+    } else vk_destroy_buffer_now(b);
+}
+static int vk_stage_acquire(vk_buffer* out, VkDeviceSize size)
+{
+    u32 best = VK_STAGE_POOL;
+    for (u32 i = 0; i < s_stage_nfree; i++)
+        if (s_stage_free[i].size >= size && (best == VK_STAGE_POOL || s_stage_free[i].size < s_stage_free[best].size))
+            best = i;
+    if (best != VK_STAGE_POOL) {
+        *out = s_stage_free[best];
+        s_stage_bytes -= out->size;
+        s_stage_free[best] = s_stage_free[--s_stage_nfree];
+        return 0;
+    }
+    VkDeviceSize want = VK_STAGE_MIN;
+    while (want < size) want <<= 1;
+    memset(out, 0, sizeof *out);
+    if (vk_create_host_buffer(out, want, VK_STAGE_USAGE) || !out->coherent) {
+        vk_destroy_buffer_now(out); return -1;
+    }
+    return 0;
+}
+static int vk_bat_retire(int kind, const void* object);
+/* After the copy that reads it is recorded: back to the pool once the GPU is
+ * done with it (batched), or at once (per-operation submissions waited). */
+static void vk_stage_release(vk_buffer* b)
+{
+    if (!b->buf) return;
+    if (vk_bat_retire(VK_RET_STAGE, b)) { memset(b, 0, sizeof *b); return; }
+    vk_stage_keep_or_destroy(b);
+}
+static void vk_stage_drain(void)
+{
+    for (u32 i = 0; i < s_stage_nfree; i++) vk_destroy_buffer_now(&s_stage_free[i]);
+    s_stage_nfree = 0; s_stage_bytes = 0;
 }
 
 /* Host writes to non-coherent memory need a flush; there is no
@@ -2646,6 +2773,20 @@ static void vk_present_wait_gpu(void)
             vk_fence_wait(s_show.fences[i]);
 }
 
+/* Wait only for the presents that may still read `img`: a ring slot whose
+ * present blits that engine image, and every present and window show when it
+ * is the backend's own colour image (all of them read it). Destroying any
+ * other image does not wait on presentation: before, each one waited for
+ * every present in flight, a CPU stall per released texture or target. */
+static void vk_present_wait_image(VkImage img)
+{
+    if (img == s_vk.color.img) { vk_present_wait_gpu(); return; }
+    for (u32 i = 0; i < VK_PRESENT_SLOTS; i++)
+        if (__atomic_load_n(&s_vk.present_busy[i], __ATOMIC_ACQUIRE) && s_vk.present_fences[i] &&
+            s_vk.present_src[i] == img)
+            vk_fence_wait(s_vk.present_fences[i]);
+}
+
 /* present_mu held: finish a read-back present -- wait for its copy, keep the
  * centre pixel and the dump, then show it in the window. */
 static void vk_present_complete_locked(void)
@@ -2683,6 +2824,7 @@ static VkCommandBuffer vk_present_record_begin(void)
     }
     vkpt_add(VKPT_SLOT, tp);
     s_vk.present_slot = slot;
+    s_vk.present_src[slot] = VK_NULL_HANDLE;   /* set by a present that blits an engine image */
     s_vk.present_cmd = s_vk.present_cmds[slot];
     s_vk.present_fence = s_vk.present_fences[slot];
     VkCommandBuffer cb = s_vk.present_cmd;
@@ -3018,6 +3160,7 @@ static void vk_e5_shutdown(void);
 
 /* Defined with the E2 pipeline state further down. */
 static void vk_eng_drop_framebuffers(void);
+static void vk_eng_drop_framebuffers_for(u32 handle);
 static void vk_eng2_shutdown(void* user);
 
 static struct {
@@ -3113,8 +3256,7 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
 {
     if (tight > row_bytes) tight = row_bytes;
     vk_buffer st = {0};
-    if (vk_create_host_buffer(&st, (VkDeviceSize)tight * rows, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
-        !st.coherent) { vk_destroy_buffer(&st); return -1; }
+    if (vk_stage_acquire(&st, (VkDeviceSize)tight * rows)) return -1;
     for (u32 y = 0; y < rows; y++)
         memcpy((u8*)st.ptr + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
     int rc = vk_begin();
@@ -3128,7 +3270,7 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         rc = vk_submit_and_wait();
     }
-    vk_destroy_buffer(&st);
+    vk_stage_release(&st);
     return rc;
 }
 
@@ -3222,7 +3364,7 @@ static void vk_eng_release(void* user, u32 handle)
         if (vk_eng_get(snap, VK_ENG_TEXTURE)) vk_eng_release(user, snap);
     }
     if ((s_eobj[handle].kind == VK_ENG_COLOR && !s_eobj[handle].snapshot) || s_eobj[handle].kind == VK_ENG_DEPTH)
-        vk_eng_drop_framebuffers();
+        vk_eng_drop_framebuffers_for(handle);
     if(s_eobj_native_pins[handle]) {
         /* PS3RECOMP_RSX_TARGET_CHURN=1: count these waited releases and their
          * wall time (diagnostic). */
@@ -3325,10 +3467,10 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
-    if (vk_create_image(&o->im, vf, w, h,
-                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        VK_IMAGE_ASPECT_COLOR_BIT)) {
+    if (vk_create_image_pooled(&o->im, vf, w, h,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&o->im); return 0;
     }
     o->kind = VK_ENG_COLOR; o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h;
@@ -3759,6 +3901,7 @@ static void vk_eng_present(void* user, u32 surface)
     VkCommandBuffer cb = vk_present_record_begin();
     if (cb) {
         if (o) {
+            s_vk.present_src[s_vk.present_slot] = o->im.img;
             vk_barrier_image_on(cb, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
             vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
             VkImageBlit blit = {
@@ -4051,10 +4194,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     }
 
     vk_buffer st = {0};
-    if (vk_create_host_buffer(&st, (VkDeviceSize)w * h * 4u,
-                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
-        vk_destroy_buffer(&st); return 0;
-    }
+    if (vk_stage_acquire(&st, (VkDeviceSize)w * h * 4u)) return 0;
     int rc = vk_begin();
     if (!rc) {
         vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
@@ -4074,7 +4214,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
         rc = vk_submit_and_wait();
     }
-    vk_destroy_buffer(&st);
+    vk_stage_release(&st);
     return rc ? 0 : snap;
 }
 /* The depth aspect of a D32_SFLOAT target copies out as 32-bit floats, which
@@ -4186,12 +4326,32 @@ static struct {
 static struct { u64 key; VkSampler s; } s_esamp[VK_ENG_SAMP_CACHE];
 static u32 s_esamp_count;
 
+static void vk_eng_drop_framebuffer_at(u32 i)
+{
+    if (s_e2.fb[i].fb && !vk_bat_retire(VK_RET_FRAMEBUFFER, &s_e2.fb[i].fb))
+        pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
+    memmove(&s_e2.fb[i], &s_e2.fb[i + 1], (size_t)(s_e2.fb_count - i - 1) * sizeof s_e2.fb[0]);
+    s_e2.fb_count--;
+}
+
 static void vk_eng_drop_framebuffers(void)
 {
     for (u32 i = 0; i < s_e2.fb_count; i++)
         if (s_e2.fb[i].fb && !vk_bat_retire(VK_RET_FRAMEBUFFER, &s_e2.fb[i].fb))
             pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
     s_e2.fb_count = 0;
+}
+
+/* A released colour or depth target ends only the framebuffers that name it.
+ * Dropping the whole cache on every release rebuilt every pass's framebuffer
+ * each time any one target went, about twenty a frame in a busy scene. */
+static void vk_eng_drop_framebuffers_for(u32 handle)
+{
+    for (u32 i = 0; i < s_e2.fb_count; ) {
+        int uses = 0;
+        for (u32 k = 0; k <= RSX_BE_MAX_COLOR_TARGETS; k++) uses |= s_e2.fb[i].key[k] == handle;
+        if (uses) vk_eng_drop_framebuffer_at(i); else i++;
+    }
 }
 
 /* The render pass for `n` colour attachments of format `cf` plus depth,
@@ -4629,7 +4789,7 @@ static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, V
     key[RSX_BE_MAX_COLOR_TARGETS] = dkey;
     for (u32 i = 0; i < s_e2.fb_count; i++)
         if (!memcmp(s_e2.fb[i].key, key, sizeof key)) return s_e2.fb[i].fb;
-    if (s_e2.fb_count >= VK_ENG_FB_CACHE) vk_eng_drop_framebuffers();
+    if (s_e2.fb_count >= VK_ENG_FB_CACHE) vk_eng_drop_framebuffer_at(0);   /* the oldest */
     VkImageView views[RSX_BE_MAX_COLOR_TARGETS + 1];
     for (u32 i = 0; i < n; i++) views[i] = s_eobj[rt[i]].im.view;
     views[n] = dview;
@@ -5182,6 +5342,7 @@ static void vk_bat_destroy_now(vk_bat_retired* r)
     case VK_RET_IMAGE:       vk_destroy_image_now(&r->u.im); break;
     case VK_RET_BUFFER:      vk_destroy_buffer_now(&r->u.buf); break;
     case VK_RET_SPARE:       vk_e5_destroy_spare_or_keep(&r->u.buf); break;
+    case VK_RET_STAGE:       vk_stage_keep_or_destroy(&r->u.buf); break;
     case VK_RET_FRAMEBUFFER: pvkDestroyFramebuffer(s_vk.device, r->u.fb, NULL); break;
     case VK_RET_PIPELINE:    pvkDestroyPipeline(s_vk.device, r->u.pipe, NULL); break;
     default: break;
@@ -5221,7 +5382,8 @@ static int vk_bat_retire(int kind, const void* object)
     switch (kind) {
     case VK_RET_IMAGE:       r->u.im = *(const vk_image*)object; break;
     case VK_RET_BUFFER:
-    case VK_RET_SPARE:       r->u.buf = *(const vk_buffer*)object; break;
+    case VK_RET_SPARE:
+    case VK_RET_STAGE:       r->u.buf = *(const vk_buffer*)object; break;
     case VK_RET_FRAMEBUFFER: r->u.fb = *(const VkFramebuffer*)object; break;
     case VK_RET_PIPELINE:    r->u.pipe = *(const VkPipeline*)object; break;
     default: break;
@@ -5408,6 +5570,8 @@ static void vk_bat_shutdown(void)
     s_bat_on = 0;
     for (u32 i = 0; i < s_bat.nret; i++) vk_bat_destroy_now(&s_bat.ret[i]);
     free(s_bat.ret);
+    vk_stage_drain();
+    vk_img_pool_drain();
     for (u32 i = 0; i < s_bat.nslots; i++) {
         vk_destroy_buffer_now(&s_bat.s[i].arena);
         if (s_bat.s[i].dpool) pvkDestroyDescriptorPool(s_vk.device, s_bat.s[i].dpool, NULL);
@@ -5500,6 +5664,8 @@ static void vk_e5_shutdown(void)
         if (s_e5.slot[i].fence) pvkDestroyFence(s_vk.device, s_e5.slot[i].fence, NULL);
     }
     for (u32 i = 0; i < s_e5.nspare; i++) vk_destroy_buffer(&s_e5.spare[i]);
+    vk_stage_drain();
+    vk_img_pool_drain();
     vk_destroy_buffer(&s_e5.store_dev);
     vk_destroy_buffer(&s_e5.store_host);
     if (s_e5.pool) pvkDestroyCommandPool(s_vk.device, s_e5.pool, NULL);
@@ -5661,8 +5827,8 @@ static u32 vk_e5_alias_texture(u32 w, u32 h, u32 remap, u32 rsx_fmt)
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
-    if (vk_create_image(&o->im, VK_FORMAT_R8G8B8A8_UNORM, w, h,
-                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) {
+    if (vk_create_image_pooled(&o->im, VK_FORMAT_R8G8B8A8_UNORM, w, h,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&o->im); memset(o, 0, sizeof *o); return 0;
     }
     pvkDestroyImageView(s_vk.device, o->im.view, NULL);
