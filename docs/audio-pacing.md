@@ -43,6 +43,25 @@ Unchanged from before:
   burst.
 - A stalled device stops the guest once twelve blocks are queued.
 
+## Windows
+
+The WASAPI loop had the same problem. It read a guest block whenever the 20 ms endpoint buffer had
+256 frames of room, and shared-mode WASAPI releases room one device period at a time (about 10 ms,
+480 frames). That gave about two reads back to back per period.
+
+With clock pacing, the Windows loop uses the same `audio_pace`. It requests a 40 ms endpoint buffer
+and keeps half of it queued as silence:
+
+| Parameter | WASAPI | Meaning |
+|---|---|---|
+| prime | half the endpoint buffer, in whole blocks (about 20 ms) | as above |
+| low | 1 block | as above |
+| high | buffer minus one block | a block needs 256 frames of room |
+
+A build with `PS3RECOMP_AUDIO_USE_SDL2` on Windows uses the SDL parameters. Test mode 11 checks this
+WASAPI shape against a simulated device: 480-frame pulls every 10 ms and 1 ms polling. The shape has
+not yet been measured against a real Windows endpoint.
+
 ## Switch
 
 | Variable | Values | Effect |
