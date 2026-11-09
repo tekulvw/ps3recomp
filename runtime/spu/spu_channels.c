@@ -3087,6 +3087,11 @@ static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
                 (unsigned)bits, wobj); }
 }
 
+/* The cri task's EXIT count below, per task. */
+static _Thread_local int s_exit_seen = 0;
+/* An async task's host thread is about to run another task (spu_workload.c). */
+void spu_spurs_task_thread_reset(void) { s_exit_seen = 0; }
+
 void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
@@ -3124,8 +3129,8 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * that has since done work and calls EXIT again means it: returning there makes
      * it re-enter and spin (observed: 6x num=0 from link 0x26E18 once the task is
      * woken). Honour the first call, halt on the rest. Each task runs on its own
-     * host thread, so a thread-local count is per task. */
-    static _Thread_local int s_exit_seen = 0;
+     * host thread, so a thread-local count is per task (a reused pool thread
+     * clears it between tasks: spu_spurs_task_thread_reset). */
     if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
         { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
