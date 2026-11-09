@@ -38,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#include "spu_jmp.h"
 /* setjmp/longjmp also save and restore the signal mask on POSIX: one
  * sigprocmask system call per halt, stack reset or task resume. These frames
  * never cross a signal handler, so the mask is the same at both ends. */
@@ -411,6 +412,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         SPU_DRAIN(ctx);
         break;
     default:
+        spu_jmp_no_unwind(s_spu_halt_env);
         /* SPU_DRAIN trampoline model: the top-level entry runs until its first
          * cross-function tail transfer, which sets g_spu_trampoline_fn and
          * returns; the drain loop re-enters each queued target until the SPU
@@ -455,6 +457,7 @@ static int spu_native_service_call_impl(spu_context* ctx,uint32_t entry_pc,uint3
     s_spu_halt_armed = 1;
     int result;
     int reason = SPU_SETJMP(s_spu_halt_env);
+    if (reason == 0) spu_jmp_no_unwind(s_spu_halt_env);
     if (reason == 1) {
         result = 1;
     } else {
@@ -517,6 +520,7 @@ int spu_native_owner_call(spu_context* ctx, void (*body)(spu_context*))
     if (outer_armed) memcpy(outer_env, s_spu_halt_env, sizeof outer_env);
     s_spu_halt_armed = 1;
     int reason = SPU_SETJMP(s_spu_halt_env);
+    if (reason == 0) spu_jmp_no_unwind(s_spu_halt_env);
     if (!reason) body(ctx);
     if (reason) {
         ctx->host_depth = depth;

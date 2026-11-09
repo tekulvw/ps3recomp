@@ -8,6 +8,7 @@
 #include "spu_context.h"
 #include "spu_lockstep.h"
 #include <setjmp.h>
+#include "spu_jmp.h"
 /* setjmp/longjmp also save and restore the signal mask on POSIX: one
  * sigprocmask system call per halt, stack reset or task resume. These frames
  * never cross a signal handler, so the mask is the same at both ends. */
@@ -591,6 +592,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         ctx->irq_frame = &f;
                     }
                     if (SPU_SETJMP(f.env) == 0) {
+                        spu_jmp_no_unwind(f.env);
                         spu_region_dispatch_invoke(ctx,vf,1,return_pc);
                     } else {
                         ctx->region_dispatch_valid=0;
