@@ -338,6 +338,12 @@ int rsx_draw_engine_async_available(void);
 /* Texture reads of depth that reached neither a snapshot, a GPU view nor a
  * guest-memory store (see the engine's one-time report). */
 u64 rsx_draw_engine_depth_unstored_count(void);
+/* Fragment-program product lookups served from the engine's memo, and the
+ * ones that walked the microcode (a new or changed program). */
+void rsx_draw_engine_fp_memo_counts(unsigned long long* hits, unsigned long long* misses);
+/* Draws whose pipeline-key inputs equaled the previous draw's (no key hash or
+ * table probe), and draws that computed the key. */
+void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned long long* misses);
 /* Repeat texture binds in one frame after a guest-memory write that missed
  * the texture (no re-check), and those a write may have touched (checked). */
 void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked);

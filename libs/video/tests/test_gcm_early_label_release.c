@@ -186,7 +186,29 @@ int main(void) {
     assert(trace_n==2&&trace_owner[1]==GCM_BARRIER_NV0039);
     s_engine_barrier_reason=GCM_BARRIER_QUIET;assert(gcm_engine_report_barrier());s_engine_barrier_reason=0;
     assert(trace_n==2);trace_on=0;
+    /* 10. Lazy issue (PS3RECOMP_RSX_EARLY_LAZY_ISSUE): applied records are
+     * not issued at the end of a pass, only when the batch fills; a pass
+     * ending with an unapplied (gated) record still issues, and completion
+     * then publishes it as before. */
+    reset(1,0);s_lazy_issue=1;s_reports.batch=4;
+    raw32(label,0);
+    { const u32 w[]={0x41d6c,0x900,0x41d74,0x21,0x41d6c,0x900,0x41d74,0x22}; fifo(w,8); }
+    assert(vm_read32(label)==0x22&&s_reports.count==2&&s_reports.unissued==2&&!issued);
+    { const u32 w[]={0x41d6c,0x900,0x41d74,0x23,0x41d6c,0x900,0x41d74,0x24}; fifo(w,8); }
+    assert(vm_read32(label)==0x24&&issued==1&&!s_reports.unissued);   /* the batch filled */
+    completed=issued;cellGcm_rsx_process_fifo();assert(!s_reports.count);
+    rsx_ring_progress_observer_set(watched,observe);raw32(watched,0);
+    { const u32 w[]={0x41d6c,0x930,0x41d74,0x99}; fifo(w,4); }
+    assert(vm_read32(watched)==0&&s_reports.gated==1&&issued==2&&!s_reports.unissued);
+    completed=issued;cellGcm_rsx_process_fifo();
+    assert(vm_read32(watched)==0x99&&!s_reports.count);
+    rsx_ring_progress_observer_set(0,NULL);
+    /* Off: every pass that queued a record issues it, as before. */
+    reset(1,0);s_lazy_issue=0;
+    { const u32 w[]={0x41d6c,0x900,0x41d74,0x31}; fifo(w,4); }
+    assert(issued==1&&!s_reports.unissued);
+    completed=issued;cellGcm_rsx_process_fifo();assert(!s_reports.count);
     s_deferred_reports=0;s_early_release=s_early_fifo_sync=0;
     munmap(vm_base,0x100000000ULL);
-    puts("PASS early label release: FIFO-position labels/reports, ordering, checked reference, acquire, sticky failure, barrier attribution, frame bound");
+    puts("PASS early label release: FIFO-position labels/reports, ordering, checked reference, acquire, sticky failure, barrier attribution, frame bound, lazy issue");
 }

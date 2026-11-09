@@ -174,6 +174,7 @@ static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
     return g_snapshot_kept;
 }
 
+static u32 g_pipeline_layout_mask;   /* the input layout the last pipeline was built for */
 static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                 const rsx_be_render_state* rs,
                                 const rsx_vertex_layout_plan* layout,
@@ -183,6 +184,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
     if (!vs || !ps || !*vs || !*ps) return 0;
     stub.n_pipeline_create++;
     stub.pipeline_rt_count = rt_count;
+    g_pipeline_layout_mask = layout ? layout->mask : 0;
     stub.pipeline_rs = *rs;
     return stub_handle();
 }
@@ -205,7 +207,15 @@ static void stub_bind_vs(void* u, const void* d, u32 n)
     if (d && n >= RSX_DSP_NUM_CONSTANTS * 16u + sizeof stub.vp_xf)
         memcpy(stub.vp_xf, (const u8*)d + RSX_DSP_NUM_CONSTANTS * 16u, sizeof stub.vp_xf);
 }
-static void stub_bind_ps(void* u, const void* d, u32 n) { (void)u; (void)d; (void)n; }
+/* The first constants of the last fragment constant block bound. */
+static u8 g_ps_block[64];
+static u32 g_ps_bytes;
+static void stub_bind_ps(void* u, const void* d, u32 n)
+{
+    (void)u;
+    g_ps_bytes = n;
+    if (d) memcpy(g_ps_block, d, n < sizeof g_ps_block ? n : sizeof g_ps_block);
+}
 
 static void stub_bind_textures(void* u, const u32* tex,
                                const rsx_be_sampler_desc* smp, u32 mask)
