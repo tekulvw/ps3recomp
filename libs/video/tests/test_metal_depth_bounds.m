@@ -8,8 +8,9 @@
  *   - [0.5, 1.0]: only the right half turns green;
  *   - [0.0, 0.5]: only the left half;
  *   - [0.0, 1.0] (no bound) or the test off: both halves;
- *   - PS3RECOMP_ENG_DEPTH_BOUNDS=0 (macos.yml's second run): both halves in
- *     every case, as before the test was emulated.
+ *   - without PS3RECOMP_ENG_DEPTH_BOUNDS=1 (the fork's default, macos.yml's
+ *     second run): both halves in every case, as before the test was
+ *     emulated. The first run sets PS3RECOMP_ENG_DEPTH_BOUNDS=1.
  *
  * Built by CMake (build/test_metal_depth_bounds) only where glslang and
  * spirv-cross were found, like test_metal_poly_offset.
@@ -121,7 +122,7 @@ int main(void)
         rsx_draw_engine_set_backend(&s_engine_backend);
 
         const char* e = getenv("PS3RECOMP_ENG_DEPTH_BOUNDS");
-        const int on = !(e && *e && atoi(e) == 0);
+        const int on = e && *e && atoi(e) != 0;   /* opt-in in this fork */
         const int far_half  = bounded(1, 0.5f, 1.0f);
         const int near_half = bounded(1, 0.0f, 0.5f);
         const int unbound   = bounded(1, 0.0f, 1.0f);
@@ -134,6 +135,6 @@ int main(void)
         rsx_draw_engine_set_backend(NULL);
         free(vm_base);
     }
-    printf("%u checks, %u failed (depth bounds %s)\n", checks, failures, getenv("PS3RECOMP_ENG_DEPTH_BOUNDS") ? "off" : "on");
+    printf("%u checks, %u failed (depth bounds %s)\n", checks, failures, (getenv("PS3RECOMP_ENG_DEPTH_BOUNDS") && atoi(getenv("PS3RECOMP_ENG_DEPTH_BOUNDS"))) ? "on" : "off");
     return failures ? 1 : 0;
 }

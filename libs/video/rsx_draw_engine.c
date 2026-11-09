@@ -2971,15 +2971,23 @@ void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned lon
  * pixel and discards. The bounds go in the float4 after fp_alpha. A bound of
  * [0, 1] is no bound. s_dbz says what eng_pipeline_get, the texture binding
  * and the constants need for the current draw.
- * PS3RECOMP_ENG_DEPTH_BOUNDS=0: the test is ignored there, as before. */
+ * Opt-in (PS3RECOMP_ENG_DEPTH_BOUNDS=1, eng_depth_bounds_on); otherwise the
+ * test is ignored there, as before. */
 static struct { u32 unit; u32 copy; float mn, mx; } s_dbz;   /* unit + 1, or 0 */
 
+/* Opt-in in this fork: PS3RECOMP_ENG_DEPTH_BOUNDS=1 turns the emulation on.
+ * On Metal every depth snapshot ends the render pass it falls in and
+ * allocates a float texture; a title that bounds many draws after depth
+ * writes (MAG's deferred material passes) lost ~160 ms a frame to it.
+ * Unset or 0, the test is ignored on a backend without one, as before the
+ * emulation existed; backends with native depth bounds (Vulkan, D3D12)
+ * are not affected either way. */
 static int eng_depth_bounds_on(void)
 {
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("PS3RECOMP_ENG_DEPTH_BOUNDS");
-        on = !(e && *e && atoi(e) == 0);
+        on = e && *e && atoi(e) != 0;
     }
     return on;
 }
