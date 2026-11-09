@@ -1120,7 +1120,12 @@ static u32 eng_zdepth_snapshot(u32 slot)
      * later pass sampled, and after some minutes of play the backend's object
      * table was full, every surface create failed, and checked submission
      * stopped report publication for good. */
-    if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
+    /* A backend that refills one texture per target hands the same handle
+     * back. Releasing the previous snapshot then destroyed the one just
+     * returned, so the next draw sampled nothing and the request after that
+     * made a new texture: every other frame lost its depth (a whole-frame
+     * lighting toggle on Vulkan). */
+    if (z->snapshot && z->snapshot != tex) g.be->texture_release(g.be->user, z->snapshot);
     z->snapshot = tex;
     z->snapshot_valid = 1;
     return tex;

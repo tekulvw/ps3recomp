@@ -4179,6 +4179,7 @@ static struct {
     VkDescriptorSet       split_set;
     VkPipelineLayout      split_pipe_layout;
     u32                   dummy_cube;
+    u32                   dummy_2d;
 } s_e2;
 
 #define VK_ENG_SAMP_CACHE 64
@@ -4717,19 +4718,31 @@ static VkImageView vk_eng_sample_view(u32 handle, int want_cube)
     return ((int)o->cube == want_cube) ? o->im.view : VK_NULL_HANDLE;
 }
 
-/* What a cube unit with nothing bound samples: a 1x1 cube, magenta on every
- * face like the 2D dummy, made on first use. */
+/* What an engine draw samples on a unit with nothing bound: transparent
+ * black (0,0,0,0), the Metal backend's placeholder, as a 1x1 2D texture and
+ * a 1x1 cube, each made on first use. A title's material that reads a unit it
+ * never binds then adds nothing. The magenta it read before showed through as
+ * a pink cast on character skin. */
+static const u8 s_eng_unbound_texel[4] = { 0x00, 0x00, 0x00, 0x00 };
 static VkImageView vk_eng_dummy_cube_view(void)
 {
     if (!vk_eng_get(s_e2.dummy_cube, VK_ENG_TEXTURE)) {
-        static const u8 magenta[4] = { 0xFF, 0x00, 0xFF, 0xFF };
         s_e2.dummy_cube = vk_eng_texture_create(NULL, RSX_BE_FMT_R8G8B8A8, 1, 1, 1, 6,
                                                 0xAAE4u, 0x85u);
         if (!s_e2.dummy_cube) return VK_NULL_HANDLE;
         for (u32 f = 0; f < 6; f++)
-            vk_eng_texture_upload(NULL, s_e2.dummy_cube, f, 0, 1, 1, magenta, 4, 1);
+            vk_eng_texture_upload(NULL, s_e2.dummy_cube, f, 0, 1, 1, s_eng_unbound_texel, 4, 1);
     }
     return s_eobj[s_e2.dummy_cube].im.view;
+}
+static VkImageView vk_eng_dummy_2d_view(void)
+{
+    if (!vk_eng_get(s_e2.dummy_2d, VK_ENG_TEXTURE)) {
+        s_e2.dummy_2d = vk_eng_texture_create(NULL, RSX_BE_FMT_R8G8B8A8, 1, 1, 1, 1, 0xAAE4u, 0x85u);
+        if (!s_e2.dummy_2d) return VK_NULL_HANDLE;
+        vk_eng_texture_upload(NULL, s_e2.dummy_2d, 0, 0, 1, 1, s_eng_unbound_texel, 4, 1);
+    }
+    return s_eobj[s_e2.dummy_2d].im.view;
 }
 
 /* Fill the set the bound pipeline uses: the shared one (sixteen textures in
@@ -4743,6 +4756,8 @@ static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P, VkDescript
     if (!set) return VK_NULL_HANDLE;
     const VkImageView dummy_cube = split ? vk_eng_dummy_cube_view() : VK_NULL_HANDLE;
     if (split && !dummy_cube) return VK_NULL_HANDLE;
+    const VkImageView dummy_2d = vk_eng_dummy_2d_view();
+    if (!dummy_2d) return VK_NULL_HANDLE;
     VkDescriptorBufferInfo bi[2] = {
         { s_g.ubo.buf, 0, s_e2.vs_bytes ? s_e2.vs_bytes : 16u },
         { s_g.ubo.buf, s_g.ps_off, s_e2.ps_bytes ? s_e2.ps_bytes : 16u },
@@ -4755,7 +4770,7 @@ static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P, VkDescript
                                                      : VK_NULL_HANDLE;
         VkSampler smp = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
         ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE,
-                                         v ? v : (cube ? dummy_cube : s_vk.dummy.view),
+                                         v ? v : (cube ? dummy_cube : dummy_2d),
                                          VK_IMAGE_LAYOUT_GENERAL };
         si[u] = (VkDescriptorImageInfo){ smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
     }
@@ -4824,8 +4839,10 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkDescriptorSet set;
     if (s_bat_on) {
         /* Everything the GPU reads from host memory, in this batch's arena;
-         * a set of its own. The dummy cube is made before the reservation. */
+         * a set of its own. The unbound-unit dummies are made before the
+         * reservation. */
         if (P->cube_mask && !vk_eng_dummy_cube_view()) return;
+        if (!vk_eng_dummy_2d_view()) return;
         const VkDeviceSize ibytes = indices && index_count ? (VkDeviceSize)index_count * 4u : 0;
         const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
         if (vk_bat_reserve(vbytes + ibytes + vsb + psb, 1)) return;

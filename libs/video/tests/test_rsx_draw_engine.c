@@ -162,8 +162,17 @@ static u32 stub_surface_view(void* u, u32 surface, u32 remap, u32 fmt)
 static u32 stub_depth_create(void* u, u32 w, u32 h)
 { (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
 
+/* Set by a test: the backend keeps one snapshot texture per depth target and
+ * hands the same handle back, refilled, while it is alive. */
+static int g_snapshot_in_place;
+static u32 g_snapshot_kept;
 static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
-{ (void)u; (void)d; (void)w; (void)h; stub.n_depth_snapshot++; return stub_handle(); }
+{
+    (void)u; (void)d; (void)w; (void)h; stub.n_depth_snapshot++;
+    if (g_snapshot_in_place && g_snapshot_kept && stub.alive[g_snapshot_kept]) return g_snapshot_kept;
+    g_snapshot_kept = stub_handle();
+    return g_snapshot_kept;
+}
 
 static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                 const rsx_be_render_state* rs,
@@ -1703,6 +1712,46 @@ static void test_depth_snapshot_released(void)
     engine_down();
 }
 
+/* The same passes against a backend that refills one texture in place: the
+ * handle it returns again must stay alive for the draw that samples it. The
+ * engine used to release its previous snapshot unconditionally, which here is
+ * the handle just returned, so every second pass sampled a released texture. */
+static void test_depth_snapshot_refilled_in_place(void)
+{
+    printf("-- depth snapshot refilled in place stays alive for its sampler\n");
+    engine_up();
+    g_snapshot_in_place = 1; g_snapshot_kept = 0;
+    int taken = 0, dead = 0;
+    for (int pass = 0; pass < 4; pass++) {
+        m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+        m(M_SURFACE_FORMAT, 8u | (2u << 5));
+        m(M_ZETA_OFFSET, ZETA_OFFSET);
+        m(M_ZETA_PITCH, 256u * 4u);
+        m(M_COLOR_A_OFFSET, 0x90000u);
+        m(M_COLOR_MASK, 0u);
+        m(M_CLEAR_BUFFERS, RSX_CLEAR_DEPTH);
+        m(M_DEPTH_TEST, 1u);
+        m(M_DEPTH_WRITE, 1u);
+        draw_triangle();
+        m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
+        m(M_DEPTH_TEST, 0u);
+        m(M_DEPTH_WRITE, 0u);
+        m(M_COLOR_MASK, 0x01010101u);
+        bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+        m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((RSX_TEX_FMT_DEPTH24_D8 | 0x20u) << 8) | (1u << 16));
+        const int before = stub.n_depth_snapshot;
+        draw_triangle();
+        if (stub.n_depth_snapshot != before + 1) continue;
+        taken++;
+        const u32 snap = stub.bound_tex[0];
+        if (!snap || snap != g_snapshot_kept || !stub.alive[snap]) dead++;
+    }
+    g_snapshot_in_place = 0; g_snapshot_kept = 0;
+    CHECK(taken == 4, "each pass after a clear asks for a snapshot (%d)", taken);
+    CHECK(dead == 0, "every pass samples the live refilled snapshot (%d sampled a released one)", dead);
+    engine_down();
+}
+
 static void test_color_read_as_float(void)
 {
     printf("-- colour target read as X32_FLOAT\n");
@@ -1930,6 +1979,7 @@ int main(int argc, char** argv)
     test_depth_read_without_store();
     test_depth_read_as_color_gpu_view();
     test_depth_snapshot_released();
+    test_depth_snapshot_refilled_in_place();
     test_color_read_as_float();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
