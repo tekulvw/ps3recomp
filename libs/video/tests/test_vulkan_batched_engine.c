@@ -281,6 +281,47 @@ int main(int argc, char** argv)
     CHECK(lit, "draws landed");
     FILE* f = fopen(argv[2], "wb");
     assert(f && fwrite(out, 1, sizeof out, f) == sizeof out); fclose(f);
+
+    /* A unit the program samples with nothing bound reads transparent black,
+     * the Metal backend's placeholder, for a 2D unit and a cube unit alike. A
+     * coloured "not bound" texture showed through in a title's material that
+     * reads a unit it never binds. */
+    {
+        static const char* PSU =
+            "Texture2D   rsx_tex0 : register(t0);\n"
+            "Texture2D   rsx_tex1 : register(t1);\n"
+            "TextureCube rsx_tex2 : register(t2);\n"
+            "Texture2D   rsx_tex3 : register(t3);\n"
+            "SamplerState rsx_samp[16] : register(s0);\n"
+            "struct VSOut { float4 pos : SV_Position; float4 col : TEXCOORD0; float4 uv : TEXCOORD1; };\n"
+            "float4 main(VSOut i) : SV_Target0 { return rsx_tex3.Sample(rsx_samp[3], i.uv.xy)\n"
+            "  + rsx_tex2.Sample(rsx_samp[2], float3(i.uv.xy * 2.0 - 1.0, 1.0)); }\n";
+        rsx_be_render_state rs; memset(&rs, 0, sizeof rs);
+        rs.color_mask = 0xFFFFFFFFu;
+        rsx_vertex_layout_plan lp; memset(&lp, 0, sizeof lp);
+        lp.mask = 3; lp.stride = 32; lp.count = 2;
+        const u32 pu = vk_eng_pipeline_create(NULL, VS, PSU, &rs, &lp, 32, RSX_BE_FMT_R8G8B8A8, 1);
+        CHECK(pu, "pipeline sampling unbound 2D and cube units");
+        if (pu) {
+            u32 target = rt2;
+            vk_eng_bind_targets(NULL, &target, 1, 0);
+            vk_eng_bind_pipeline(NULL, pu);
+            vk_eng_bind_textures(NULL, &t0, samps, 0u);
+            const float vc0[16] = { 1, 1, 0, 0, 0.5f };
+            vk_eng_bind_vs_constants(NULL, vc0, sizeof vc0);
+            vk_eng_set_viewport(NULL, 0, 0, TW, TH);
+            vk_eng_set_scissor(NULL, 0, 0, TW, TH);
+            const float white[4] = { 1, 1, 1, 1 };
+            quad(verts, -1, -1, 1, 1, white);
+            vk_eng_draw(NULL, RSX_TOPOLOGY_TRIANGLES, verts, 6, 32, NULL, 0);
+            CHECK(vk_eng_submit_and_wait_checked(NULL, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "unbound-unit draw flushed");
+            u8 px[4] = { 0xAA, 0xAA, 0xAA, 0xAA };
+            vk_eng_readback(NULL, rt2, TW / 2, TH / 2, 1, 1, px, 4);
+            printf("%s: unbound units sample %02X %02X %02X %02X\n", argv[1], px[0], px[1], px[2], px[3]);
+            CHECK(px[0] == 0 && px[1] == 0 && px[2] == 0 && px[3] == 0, "unbound 2D and cube units read transparent black");
+            vk_eng_pipeline_release(NULL, pu);
+        }
+    }
     CHECK(!vk_e5_failed(), "no submission failed");
     if (batched)
         printf("batched: %llu batches for %u draws (%.1f ops/batch), %llu slot waits, %llu CPU waits, %llu retired, %u pending\n",
