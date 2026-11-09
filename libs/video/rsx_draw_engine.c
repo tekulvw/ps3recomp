@@ -163,6 +163,7 @@ typedef struct {
     u32 dbz_copy;          /* float copy for the emulated depth-bounds test */
     u32 dbz_w, dbz_h;
     u64 dbz_serial;        /* depth_serial that copy holds                 */
+    u32 dbz_pass;          /* s_dbz_pass_id when that copy was taken       */
 
 } eng_zdepth;
 
@@ -2975,21 +2976,44 @@ void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned lon
  * test is ignored there, as before. */
 static struct { u32 unit; u32 copy; float mn, mx; } s_dbz;   /* unit + 1, or 0 */
 
-/* Opt-in in this fork: PS3RECOMP_ENG_DEPTH_BOUNDS=1 turns the emulation on.
+/* Opt-in in this fork: PS3RECOMP_ENG_DEPTH_BOUNDS=1 or 2 turns the emulation on.
  * On Metal every depth snapshot ends the render pass it falls in and
  * allocates a float texture; a title that bounds many draws after depth
  * writes (MAG's deferred material passes) lost ~160 ms a frame to it.
  * Unset or 0, the test is ignored on a backend without one, as before the
  * emulation existed; backends with native depth bounds (Vulkan, D3D12)
- * are not affected either way. */
-static int eng_depth_bounds_on(void)
+ * are not affected either way.
+ *   1: exact. A new snapshot whenever depth was written since the last one
+ *      (into the same texture where the backend can: depth_snapshot_into).
+ *   2: per pass. At most one snapshot per render pass (a run of draws on the
+ *      same colour targets and zeta), taken at its first bounded draw: depth
+ *      written later in the same pass is not seen by its later bounded
+ *      draws. Exact for the usual deferred shape (geometry writes depth,
+ *      then bounded lights or material passes that do not), and each
+ *      snapshot on Metal ends the pass it falls in, so this bounds the cost.
+ * s_dbz_mode is file-level so the GPU test can switch modes in one process. */
+static int s_dbz_mode = -1;
+static int eng_depth_bounds_mode(void)
 {
-    static int on = -1;
-    if (on < 0) {
+    if (s_dbz_mode < 0) {
         const char* e = getenv("PS3RECOMP_ENG_DEPTH_BOUNDS");
-        on = e && *e && atoi(e) != 0;
+        const int v = e && *e ? atoi(e) : 0;
+        s_dbz_mode = v == 1 || v == 2 ? v : 0;
     }
-    return on;
+    return s_dbz_mode;
+}
+static int eng_depth_bounds_on(void) { return eng_depth_bounds_mode() != 0; }
+
+/* The render pass a draw belongs to, for mode 2: its colour targets and zeta.
+ * Tracked on every draw (so returning to an earlier target set is a new
+ * pass) and restarted at every flip. */
+static u64 s_dbz_pass_key;
+static u32 s_dbz_pass_id;
+static void eng_dbz_pass_note(const u32* targets, u32 n_targets, u32 zslot)
+{
+    u64 k = eng_fnv1a(targets, n_targets * sizeof *targets, 1469598103934665603ull);
+    k = eng_fnv1a(&zslot, sizeof zslot, k);
+    if (k != s_dbz_pass_key) { s_dbz_pass_key = k; s_dbz_pass_id++; }
 }
 
 /* RSX_ENG_DBZ_STATS=1: what the depth-bounds emulation costs, per frame,
@@ -3025,8 +3049,10 @@ static void eng_dbz_stats_flip(void)
     s_dbz_stats.snaps = s_dbz_stats.reused = s_dbz_stats.n_pairs = 0;
 }
 
-static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
+static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs,
+                                     const u32* targets, u32 n_targets)
 {
+    eng_dbz_pass_note(targets, n_targets, zslot);
     s_dbz.unit = 0; s_dbz.copy = 0;
     if (g.be->set_depth_bounds || !g.be->depth_snapshot || !rs->depth_bounds_test ||
         zslot == ENG_INVALID || !eng_depth_bounds_on())
@@ -3058,7 +3084,10 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
         return;
     }
     const int same_size = z->dbz_copy && z->dbz_w == z->w && z->dbz_h == z->h;
-    if (!same_size || z->dbz_serial != z->depth_serial) {
+    const int current = same_size &&
+        (z->dbz_serial == z->depth_serial ||
+         (eng_depth_bounds_mode() == 2 && z->dbz_pass == s_dbz_pass_id));
+    if (!current) {
         if (s_dbz_stats.on > 0) s_dbz_stats.snaps++;
         u32 tex = 0;
         if (same_size && g.be->depth_snapshot_into)   /* reuse the copy's texture */
@@ -3069,6 +3098,7 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
             g.be->texture_release(g.be->user, z->dbz_copy);
         z->dbz_copy = tex; z->dbz_w = z->w; z->dbz_h = z->h;
         z->dbz_serial = z->depth_serial;
+        z->dbz_pass = s_dbz_pass_id;
     }
     else if (s_dbz_stats.on > 0) s_dbz_stats.reused++;
     s_dbz.unit = (u32)unit + 1u; s_dbz.copy = z->dbz_copy;
@@ -5072,7 +5102,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
     u32 tex_used = 0;
     u64 fp_hash = 0;
     DRAW_OBSERVER_STAGE("pipeline");
-    eng_depth_bounds_prepare(zslot, &rs);
+    eng_depth_bounds_prepare(zslot, &rs, targets, n_targets);
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
@@ -5484,6 +5514,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
     g.last_flip_buffer = arg & 7u;
     if (eng_churn_enabled()) { s_churn_flips++; eng_churn_flip(); }
     eng_dbz_stats_flip();
+    s_dbz_pass_key = 0;   /* a flip ends the pass (eng_dbz_pass_note) */
     /* RSX_ENG_COUNTS=1: engine resource slots every 600 flips, to see a
      * long session approach a capacity limit. */
     { static int on = -1; static u32 flips;
