@@ -295,6 +295,12 @@ typedef struct rsx_draw_backend {
      * status: -1 failure/unknown,0 pending,1 actual successful completion. */
     u64 (*submit_async)(void* user,u32 reason);
     int (*completion_status)(void* user,u64 ticket,int wait);
+    /* Optional. The next draw uses exactly the vertex constants the last
+     * bind_vs_constants handed over: the engine asks only when not one byte
+     * changed since. Return 1 when the backend reuses what it already holds
+     * (it may keep the upload it made for the previous draw), 0 to have the
+     * engine call bind_vs_constants with the bytes instead. */
+    int (*rebind_vs_constants)(void* user);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -338,6 +344,9 @@ int rsx_draw_engine_async_available(void);
 /* Texture reads of depth that reached neither a snapshot, a GPU view nor a
  * guest-memory store (see the engine's one-time report). */
 u64 rsx_draw_engine_depth_unstored_count(void);
+/* Draws that bound vertex constants, and draws that reused the previous
+ * draw's unchanged ones through rebind_vs_constants. */
+void rsx_draw_engine_vs_constant_counts(unsigned long long* binds, unsigned long long* rebinds);
 /* Fragment-program product lookups served from the engine's memo, and the
  * ones that walked the microcode (a new or changed program). */
 void rsx_draw_engine_fp_memo_counts(unsigned long long* hits, unsigned long long* misses);

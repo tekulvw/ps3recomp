@@ -201,12 +201,20 @@ static void stub_bind_targets(void* u, const u32* s, u32 count, u32 d)
     stub.bound_depth = d;
 }
 static void stub_bind_pipeline(void* u, u32 p) { (void)u; stub.bound_pipeline = p; }
+/* The whole vertex constant block the last bind handed over, and how many
+ * binds and rebinds the engine made (rebind_vs_constants is only set by the
+ * test that exercises it; g_rebind_answer is what the stub replies). */
+static u8 g_vs_block[(RSX_DSP_NUM_CONSTANTS + 2) * 16];
+static int g_vs_binds, g_vs_rebinds, g_rebind_answer = 1;
 static void stub_bind_vs(void* u, const void* d, u32 n)
 {
     (void)u;
+    g_vs_binds++;
+    if (d && n <= sizeof g_vs_block) memcpy(g_vs_block, d, n);
     if (d && n >= RSX_DSP_NUM_CONSTANTS * 16u + sizeof stub.vp_xf)
         memcpy(stub.vp_xf, (const u8*)d + RSX_DSP_NUM_CONSTANTS * 16u, sizeof stub.vp_xf);
 }
+static int stub_rebind_vs(void* u) { (void)u; g_vs_rebinds++; return g_rebind_answer; }
 /* The first constants of the last fragment constant block bound. */
 static u8 g_ps_block[64];
 static u32 g_ps_bytes;
@@ -1927,6 +1935,91 @@ static void test_immediate_packed_zero_and_inline(void)
 /* ---- PS3RECOMP_RSX_SINGLE_PRESENT: one presenter per flip --------------- */
 
 /* Run in its own process (main's "single" mode): the switch is read once. */
+/* ---- vertex constants: copied as written, rebound when unchanged --------- */
+
+static void upload_constant(u32 slot, u32 seed)
+{
+    m(M_VP_UPLOAD_CONST_ID, slot);
+    for (u32 w = 0; w < 4; w++) m(M_VP_UPLOAD_CONST + w * 4, seed * 16u + w);
+}
+static int constant_is(u32 slot, u32 seed)
+{
+    for (u32 w = 0; w < 4; w++) {
+        u32 v; memcpy(&v, g_vs_block + slot * 16u + w * 4u, 4);
+        if (v != seed * 16u + w) return 0;
+    }
+    return 1;
+}
+
+static void test_vs_constant_upload(void)
+{
+    printf("-- vertex constant upload\n");
+    /* The dispatcher's dirty span on its own. */
+    {
+        static rsx_dispatch d; rsx_dispatch_init(&d, NULL);
+        u32 lo = 9, hi = 9;
+        CHECK(rsx_dsp_take_constants(&d, &lo, &hi) && lo == 0 && hi == RSX_DSP_NUM_CONSTANTS - 1u,
+              "a fresh dispatcher reports the whole file written (%u..%u)", lo, hi);
+        CHECK(!rsx_dsp_take_constants(&d, &lo, &hi), "and nothing after it was taken");
+        rsx_dispatch_method(&d, M_VP_UPLOAD_CONST_ID, 40u);
+        rsx_dispatch_method(&d, M_VP_UPLOAD_CONST + 4u * 9u, 1u);   /* word 9: slot 42 */
+        rsx_dispatch_method(&d, M_VP_UPLOAD_CONST_ID, 7u);
+        rsx_dispatch_method(&d, M_VP_UPLOAD_CONST, 2u);
+        CHECK(rsx_dsp_take_constants(&d, &lo, &hi) && lo == 7 && hi == 42,
+              "uploads widen the span to what they wrote (%u..%u)", lo, hi);
+        rsx_dispatch_method(&d, M_VP_UPLOAD_CONST_ID, RSX_DSP_NUM_CONSTANTS);
+        rsx_dispatch_method(&d, M_VP_UPLOAD_CONST, 3u);
+        CHECK(!rsx_dsp_take_constants(&d, &lo, &hi), "a write past the file marks nothing");
+        const u32 words[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+        rsx_dispatch_seed_transform_constants(&d, words, 8);
+        CHECK(rsx_dsp_take_constants(&d, &lo, &hi) && lo == 0 && hi == 1, "seeding marks what it seeded");
+    }
+
+    g_stub_backend.rebind_vs_constants = stub_rebind_vs;
+    g_rebind_answer = 1;
+    engine_up();
+    upload_constant(3, 0x100); upload_constant(511, 0x200);
+    g_vs_binds = g_vs_rebinds = 0;
+    draw_triangle();
+    CHECK(g_vs_binds == 1 && g_vs_rebinds == 0, "the first draw binds its constants");
+    CHECK(constant_is(3, 0x100) && constant_is(511, 0x200), "with every slot written before it");
+    draw_triangle();
+    draw_triangle();
+    CHECK(g_vs_binds == 1 && g_vs_rebinds == 2, "unchanged constants are rebound, not copied (%d, %d)",
+          g_vs_binds, g_vs_rebinds);
+    /* Written between draws, several slots apart: the next bind has all of
+     * them and keeps the slots nothing touched. */
+    upload_constant(200, 0x300); upload_constant(5, 0x400);
+    draw_triangle();
+    CHECK(g_vs_binds == 2 && constant_is(200, 0x300) && constant_is(5, 0x400) &&
+          constant_is(3, 0x100) && constant_is(511, 0x200), "a later write reaches the next bind with the rest");
+    /* The same value written again is still a write: bound, not rebound. */
+    upload_constant(5, 0x400);
+    draw_triangle();
+    CHECK(g_vs_binds == 3, "a rewritten slot is bound again");
+    /* The viewport epilogue is part of the block too. */
+    m(M_VIEWPORT_SCALE, 0x42000000u);        /* 32.0 */
+    draw_triangle();
+    CHECK(g_vs_binds == 4, "a viewport change is bound again");
+    draw_triangle();
+    CHECK(g_vs_binds == 4, "and then rebound");
+    /* A backend that cannot rebind gets the bytes. */
+    g_rebind_answer = 0;
+    draw_triangle();
+    CHECK(g_vs_binds == 5 && constant_is(200, 0x300), "a refused rebind becomes a bind");
+    unsigned long long binds = 0, rebinds = 0;
+    rsx_draw_engine_vs_constant_counts(&binds, &rebinds);
+    CHECK(binds >= 5 && rebinds >= 3, "the engine counts binds and rebinds (%llu, %llu)", binds, rebinds);
+    engine_down();
+    /* Without the hook every draw binds, as before. */
+    g_stub_backend.rebind_vs_constants = NULL;
+    engine_up();
+    g_vs_binds = 0;
+    draw_triangle(); draw_triangle();
+    CHECK(g_vs_binds == 2, "a backend without rebind_vs_constants is bound every draw");
+    engine_down();
+}
+
 /* A guest-memory write the engine is told about (an NV0039 copy) re-checks,
  * within the frame, only the cached textures whose bytes it touched. */
 static void test_texture_dirty_ranges(void)
@@ -2034,6 +2127,7 @@ int main(int argc, char** argv)
     test_color_read_as_float();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
+    test_vs_constant_upload();
     test_texture_dirty_ranges();
 
     free(vm_base);

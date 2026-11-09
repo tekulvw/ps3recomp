@@ -135,7 +135,8 @@
     X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) \
-    X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCmdCopyBuffer) X(vkResetDescriptorPool)
+    X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCmdCopyBuffer) X(vkResetDescriptorPool) \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
@@ -296,9 +297,16 @@ typedef struct vk_state {
      * returns, not compositor presentation timestamps. present_mu held. */
     int              fps_on;
     MetalFrameRate   fps;
+    /* PS3RECOMP_VK_PIPELINE_CACHE=<directory>: every pipeline is created
+     * through this cache, loaded from and saved to a file there. NULL (the
+     * default) creates pipelines without one, as before. */
+    VkPipelineCache  pcache;
+    char*            pcache_path;
+    u32              pcache_new;       /* pipelines created since the last save */
 } vk_state;
 
 static vk_state s_vk;
+static void vk_pcache_created(void);
 static rsx_frontend_device *s_vk_frontend;
 
 #ifdef _WIN32
@@ -365,6 +373,11 @@ static struct {
     u8 *vsc, *psc; u32 vsc_cap, psc_cap;
     /* PS3RECOMP_RSX_INFLIGHT_LOG=1 counters */
     u64 batches, batch_ops, slot_waits, waits_for_cpu, retired, arena_grows;
+    /* A batch the arena (not the operation or set count) ended early raises
+     * the size every slot grows to when next opened, up to VK_BAT_ARENA_MAX:
+     * a slot sized for a few hundred draws otherwise submits that often. */
+    VkDeviceSize arena_want;
+    u64 arena_flushes;
     /* PS3RECOMP_VK_MERGE_PASSES=1: draws merged into an open render pass */
     int merge;
     u64 passes, merged_draws, feedback_breaks, binds_skipped;
@@ -469,6 +482,121 @@ static int vulkan_owner_activate(void){
              VK_LOG("%s failed (VkResult %d)\n", (what), (int)r_);         \
              vulkan_owner_fault();                                        \
              return -1; } } while (0)
+
+/* ---------------------------------------------------------------------------
+ * Pipeline cache (PS3RECOMP_VK_PIPELINE_CACHE=<existing directory>)
+ *
+ * Engine pipelines are created on the thread that walks the FIFO, on the
+ * draw that first needs them, and a driver compile there is a visible
+ * hitch. With the switch, every pipeline is created through one
+ * VkPipelineCache. The cache is loaded at device creation from
+ * <dir>/vk-pipelines-<vendor>-<device>.bin and saved there, through a
+ * temporary file renamed over it, at shutdown and after every
+ * VK_PCACHE_SAVE_EVERY new pipelines (a run that is killed keeps most of
+ * them). A file whose header names another device, driver build or cache
+ * version is not loaded: the cache starts empty and the file is replaced.
+ * Unset, pipelines are created without a cache, as before.
+ * -------------------------------------------------------------------------*/
+#define VK_PCACHE_SAVE_EVERY 32u
+#define VK_PCACHE_MAX_BYTES  (256u << 20)
+static unsigned long long s_pcache_loaded_bytes, s_pcache_saves;
+
+static void vk_pcache_save(void)
+{
+    if (!s_vk.pcache || !s_vk.pcache_path) return;
+    size_t size = 0;
+    if (pvkGetPipelineCacheData(s_vk.device, s_vk.pcache, &size, NULL) != VK_SUCCESS || !size ||
+        size > VK_PCACHE_MAX_BYTES)
+        return;
+    void* data = malloc(size);
+    if (!data) return;
+    if (pvkGetPipelineCacheData(s_vk.device, s_vk.pcache, &size, data) == VK_SUCCESS) {
+        const size_t n = strlen(s_vk.pcache_path);
+        char* tmp = (char*)malloc(n + 5);
+        if (tmp) {
+            memcpy(tmp, s_vk.pcache_path, n); memcpy(tmp + n, ".tmp", 5);
+            FILE* f = fopen(tmp, "wb");
+            const int ok = f && fwrite(data, 1, size, f) == size;
+            if (f && fclose(f)) { (void)0; }
+            if (ok) {
+#ifdef _WIN32
+                remove(s_vk.pcache_path);
+#endif
+                if (rename(tmp, s_vk.pcache_path) == 0) s_pcache_saves++;
+                else remove(tmp);
+            } else remove(tmp);
+            free(tmp);
+        }
+    }
+    free(data);
+    s_vk.pcache_new = 0;
+}
+
+/* A pipeline is about to be created through the cache. */
+static void vk_pcache_created(void)
+{
+    if (s_vk.pcache && s_vk.pcache_path && ++s_vk.pcache_new >= VK_PCACHE_SAVE_EVERY) vk_pcache_save();
+}
+
+static void vk_pcache_open(void)
+{
+    const char* dir = getenv("PS3RECOMP_VK_PIPELINE_CACHE");
+    if (!dir || !*dir || !s_vk.device) return;
+    VkPhysicalDeviceProperties p; pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+    const size_t n = strlen(dir) + 64;
+    s_vk.pcache_path = (char*)malloc(n);
+    if (!s_vk.pcache_path) return;
+    snprintf(s_vk.pcache_path, n, "%s/vk-pipelines-%04x-%04x.bin", dir, p.vendorID, p.deviceID);
+    void* data = NULL;
+    size_t size = 0;
+    FILE* f = fopen(s_vk.pcache_path, "rb");
+    if (f) {
+        if (fseek(f, 0, SEEK_END) == 0) {
+            const long len = ftell(f);
+            if (len > 32 && (unsigned long)len <= VK_PCACHE_MAX_BYTES && fseek(f, 0, SEEK_SET) == 0 &&
+                (data = malloc((size_t)len)) != NULL && fread(data, 1, (size_t)len, f) == (size_t)len)
+                size = (size_t)len;
+        }
+        fclose(f);
+    }
+    /* The header (VK_PIPELINE_CACHE_HEADER_VERSION_ONE): length, version,
+     * vendor, device, then the driver's cache UUID. Anything else is not
+     * this device's cache. */
+    if (size) {
+        const u8* h = (const u8*)data;
+        u32 len, ver, vendor, device;
+        memcpy(&len, h, 4); memcpy(&ver, h + 4, 4); memcpy(&vendor, h + 8, 4); memcpy(&device, h + 12, 4);
+        if (len < 32 || len > size || ver != (u32)VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+            vendor != p.vendorID || device != p.deviceID ||
+            memcmp(h + 16, p.pipelineCacheUUID, VK_UUID_SIZE)) {
+            VK_LOG("pipeline cache %s is for another device or driver build; starting empty\n", s_vk.pcache_path);
+            size = 0;
+        }
+    }
+    VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                                     .initialDataSize = size, .pInitialData = size ? data : NULL };
+    if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_vk.pcache) != VK_SUCCESS) {
+        ci.initialDataSize = 0; ci.pInitialData = NULL;
+        if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_vk.pcache) != VK_SUCCESS) s_vk.pcache = VK_NULL_HANDLE;
+        size = 0;
+    }
+    free(data);
+    s_pcache_loaded_bytes = size;
+    if (s_vk.pcache)
+        VK_LOG("pipeline cache %s: %s (%zu bytes)\n", s_vk.pcache_path, size ? "loaded" : "new", size);
+}
+
+static void vk_pcache_close(void)
+{
+    if (s_vk.pcache) {
+        vk_pcache_save();
+        pvkDestroyPipelineCache(s_vk.device, s_vk.pcache, NULL);
+        s_vk.pcache = VK_NULL_HANDLE;
+    }
+    free(s_vk.pcache_path);
+    s_vk.pcache_path = NULL;
+    s_vk.pcache_new = 0;
+}
 
 /* ---------------------------------------------------------------------------
  * Loading
@@ -1596,7 +1724,8 @@ static VkPipeline vk_get_pipeline(int ztest, int zwrite, u32 cmp)
         .pDynamicState = &dy, .layout = s_vk.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, s_vk.pcache, 1, &gci, NULL, &p);
+    vk_pcache_created();
     if (r != VK_SUCCESS) { VK_LOG("vkCreateGraphicsPipelines failed (%d)\n", (int)r); return VK_NULL_HANDLE; }
     s_vk.pipelines[slot] = p;
     return p;
@@ -1937,7 +2066,8 @@ static VkPipeline vk_guest_pipeline(int vs, int fs, int ztest, int zwrite, u32 c
         .pDynamicState = &dy, .layout = s_g.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, s_vk.pcache, 1, &gci, NULL, &p);
+    vk_pcache_created();
     if (r != VK_SUCCESS) {
         VK_LOG("guest pipeline: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
         return VK_NULL_HANDLE;
@@ -4374,6 +4504,14 @@ static struct {
     VkPipelineLayout      split_pipe_layout;
     u32                   dummy_cube;
     u32                   dummy_2d;
+    /* Batched: the arena copy of the vertex constants the last draw used, and
+     * the batch it lives in (s_bat.batches while that batch was open). A draw
+     * whose constants the engine reports unchanged (rebind_vs_constants)
+     * points at it again instead of copying the same bytes. */
+    VkDescriptorBufferInfo vs_last;
+    u64                   vs_last_batch;
+    int                   vs_last_valid, vs_rebind;
+    u64                   vs_uploads, vs_reused;
 } s_e2;
 
 #define VK_ENG_SAMP_CACHE 64
@@ -4730,7 +4868,8 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = layout, .renderPass = rp, .subpass = 0 };
-    if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
+    vk_pcache_created();
+    if (pvkCreateGraphicsPipelines(s_vk.device, s_vk.pcache, 1, &gci, NULL,
                                    &P->variant[topo_idx]) != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
         P->variant[topo_idx] = VK_NULL_HANDLE;
@@ -4775,12 +4914,24 @@ static u8* vk_bat_shadow(int ps, u32 cap)
 static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
+    s_e2.vs_rebind = 0;
     if (!s_g.on || !data) { s_e2.vs_bytes = 0; return; }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
     /* Batched: a shadow the draw copies into its batch's arena. */
     memcpy(s_bat_on ? (void*)vk_bat_shadow(0, cap) : s_g.ubo.ptr, data, bytes);
     s_e2.vs_bytes = bytes;
+}
+/* The engine's constants are byte-for-byte those of the last bind. Batched,
+ * the shadow already holds them and the draw may reuse the previous draw's
+ * arena copy; per-operation, the shared UBO is rewritten by other paths, so
+ * the engine binds again. */
+static int vk_eng_rebind_vs_constants(void* user)
+{
+    (void)user;
+    if (!s_bat_on || !s_g.on || !s_e2.vs_bytes || !s_bat.vsc) return 0;
+    s_e2.vs_rebind = 1;
+    return 1;
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
@@ -5075,17 +5226,29 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
         if (vk_bat_reserve(vbytes + ibytes + vsb + psb, 1)) return;
         VkDescriptorBufferInfo cb[2];
+        /* The previous draw's constants, still in this batch's arena, when
+         * the engine reported them unchanged (after the reservation, which
+         * may have submitted that batch). */
+        const int reuse_vs = s_e2.vs_rebind && s_e2.vs_last_valid && s_bat.open &&
+                             s_e2.vs_last_batch == s_bat.batches && s_e2.vs_last.range == vsb;
         void* vp = vk_bat_alloc(vbytes, &vbuf, &voff);
         void* ip = ibytes ? vk_bat_alloc(ibytes, &ibuf, &ioff) : NULL;
-        void* vc = vk_bat_alloc(vsb, &cb[0].buffer, &cb[0].offset);
+        void* vc = reuse_vs ? NULL : vk_bat_alloc(vsb, &cb[0].buffer, &cb[0].offset);
         void* pc = vk_bat_alloc(psb, &cb[1].buffer, &cb[1].offset);
-        if (!vp || (ibytes && !ip) || !vc || !pc) return;
+        if (!vp || (ibytes && !ip) || (!reuse_vs && !vc) || !pc) return;
         memcpy(vp, vertices, (size_t)vbytes);
         if (ip) memcpy(ip, indices, (size_t)ibytes);
-        memset(vc, 0, vsb); memset(pc, 0, psb);
-        if (s_e2.vs_bytes && s_bat.vsc) memcpy(vc, s_bat.vsc, s_e2.vs_bytes);
-        if (s_e2.ps_bytes && s_bat.psc) memcpy(pc, s_bat.psc, s_e2.ps_bytes);
-        cb[0].range = vsb; cb[1].range = psb;
+        /* A bound block fills its whole range (vsb == vs_bytes); only an
+         * empty one is the 16 zero bytes. */
+        if (reuse_vs) { cb[0] = s_e2.vs_last; s_e2.vs_reused++; }
+        else {
+            if (s_e2.vs_bytes && s_bat.vsc) memcpy(vc, s_bat.vsc, s_e2.vs_bytes); else memset(vc, 0, vsb);
+            cb[0].range = vsb;
+            s_e2.vs_last = cb[0]; s_e2.vs_last_batch = s_bat.batches; s_e2.vs_last_valid = 1;
+            s_e2.vs_uploads++;
+        }
+        if (s_e2.ps_bytes && s_bat.psc) memcpy(pc, s_bat.psc, s_e2.ps_bytes); else memset(pc, 0, psb);
+        cb[1].range = psb;
         const VkDescriptorSet fresh = vk_bat_set(P->cube_mask ? s_e2.split_layout : s_g.set_layout);
         if (!fresh) return;
         set = vk_eng_write_descriptors(P, fresh, cb);
@@ -5403,7 +5566,9 @@ static u64 vk_e5_submit(vk_e5_slot* sl, int recorded)
  *   - CPU-written bytes. Vertices, indices, constants and upload rows are
  *     copied into the batch's own host-visible arena, never into a buffer an
  *     unfinished batch may read. A batch slot, and its arena (4 MiB, grown
- *     on demand) and descriptor pool (1024 sets), are reused only after its
+ *     on demand; once a batch has had to end because its arena was full,
+ *     every slot grows to twice that size when next opened, up to 32 MiB)
+ *     and descriptor pool (1024 sets), are reused only after its
  *     ticket has completed: PS3RECOMP_VK_BATCH_SLOTS batches in flight
  *     (default 16, at most 32), a full ring waits for the oldest. Every
  *     ticket submits the open batch, so the ring is what bounds how far the
@@ -5425,6 +5590,7 @@ static u64 vk_e5_submit(vk_e5_slot* sl, int recorded)
  * outside such a run is ordered exactly as above.
  * -------------------------------------------------------------------------*/
 #define VK_BAT_SETS 1024u
+#define VK_BAT_ARENA_MAX ((VkDeviceSize)32u << 20)
 static int vk_bat_slot_init(vk_bat_slot* sl)
 {
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -5585,13 +5751,18 @@ static int vk_bat_reserve(VkDeviceSize bytes, u32 sets)
     const VkDeviceSize need = bytes + 4u * s_bat.align;     /* slack for alignment */
     vk_bat_slot* sl = &s_bat.s[s_bat.cur];
     if ((sl->arena.size - sl->used < need || sl->sets_left < sets) && s_bat.ops) {
+        if (sl->arena.size - sl->used < need) {
+            s_bat.arena_flushes++;
+            const VkDeviceSize grown = sl->arena.size * 2u;
+            if (grown > s_bat.arena_want) s_bat.arena_want = grown < VK_BAT_ARENA_MAX ? grown : VK_BAT_ARENA_MAX;
+        }
         if (vk_bat_flush(0) || vk_bat_open()) return -1;
         sl = &s_bat.s[s_bat.cur];
     }
-    if (sl->arena.size - sl->used < need) {
+    if (sl->arena.size - sl->used < need || (!sl->used && sl->arena.size < s_bat.arena_want)) {
         if (sl->used) { vk_e5_fail("batch arena"); return -1; }   /* fresh slot: cannot happen */
         VkDeviceSize size = sl->arena.size ? sl->arena.size : 4u << 20;
-        while (size < need) size *= 2u;
+        while (size < need || size < s_bat.arena_want) size *= 2u;
         /* The slot is idle (just opened), but other batches may be pending. */
         if (sl->arena.buf) vk_destroy_buffer(&sl->arena);
         if (vk_create_host_buffer(&sl->arena, size,
@@ -5647,12 +5818,13 @@ static void vk_bat_log(void)
     if (last.tv_sec && now.tv_sec - last.tv_sec < 2) return;
     last = now;
     fprintf(stderr, "[rsx inflight vulkan batch] batches=%llu ops=%llu ops_per_batch=%.1f slot_waits=%llu cpu_waits=%llu "
-            "retired=%llu pending_retire=%u arena_grows=%llu passes=%llu merged_draws=%llu feedback_breaks=%llu "
-            "pipeline_binds_skipped=%llu\n",
+            "retired=%llu pending_retire=%u arena_grows=%llu arena_flushes=%llu arena_mib=%llu passes=%llu merged_draws=%llu "
+            "feedback_breaks=%llu pipeline_binds_skipped=%llu\n",
             (unsigned long long)s_bat.batches, (unsigned long long)s_bat.batch_ops,
             s_bat.batches ? (double)s_bat.batch_ops / (double)s_bat.batches : 0.0,
             (unsigned long long)s_bat.slot_waits, (unsigned long long)s_bat.waits_for_cpu,
             (unsigned long long)s_bat.retired, s_bat.nret, (unsigned long long)s_bat.arena_grows,
+            (unsigned long long)s_bat.arena_flushes, (unsigned long long)(s_bat.s[s_bat.cur].arena.size >> 20),
             (unsigned long long)s_bat.passes, (unsigned long long)s_bat.merged_draws,
             (unsigned long long)s_bat.feedback_breaks, (unsigned long long)s_bat.binds_skipped);
 }
@@ -5668,6 +5840,7 @@ static int vk_bat_init(void)
       s_bat.max_ops = v < 1 ? 1u : v > 65536 ? 65536u : (u32)v; }
     { const char* m = getenv("PS3RECOMP_VK_MERGE_PASSES"); s_bat.merge = m && !strcmp(m, "1"); }
     memset(&s_pass, 0, sizeof s_pass);
+    s_e2.vs_last_valid = 0;
     VkPhysicalDeviceProperties p; pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     s_bat.align = 256u;
     if (p.limits.minUniformBufferOffsetAlignment > s_bat.align) s_bat.align = p.limits.minUniformBufferOffsetAlignment;
@@ -5842,7 +6015,8 @@ static int vk_e5_pipeline(void)
         .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                    .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = s_e5.module, .pName = "main" },
         .layout = s_e5.layout };
-    if (pvkCreateComputePipelines(s_vk.device, VK_NULL_HANDLE, 1, &cci, NULL, &s_e5.pipe) != VK_SUCCESS) {
+    vk_pcache_created();
+    if (pvkCreateComputePipelines(s_vk.device, s_vk.pcache, 1, &cci, NULL, &s_e5.pipe) != VK_SUCCESS) {
         s_e5.pipe = VK_NULL_HANDLE; return -1;
     }
     /* One set per ticket slot, so an in-flight view's set is never rewritten,
@@ -6195,6 +6369,10 @@ static void owner_vk_eng_bind_vs_constants(void* user, const void* data, u32 byt
     if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
     vk_eng_bind_vs_constants(user,data,bytes);vulkan_owner_finish(vulkan_owner_boundary(before));
 }
+static int owner_vk_eng_rebind_vs_constants(void* user){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    const int result=vk_eng_rebind_vs_constants(user);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
 static void owner_vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes){
     if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
     vk_eng_bind_ps_constants(user,data,bytes);vulkan_owner_finish(vulkan_owner_boundary(before));
@@ -6304,6 +6482,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .bind_targets         = owner_vk_eng_bind_targets,
     .bind_pipeline        = owner_vk_eng_bind_pipeline,
     .bind_vs_constants    = owner_vk_eng_bind_vs_constants,
+    .rebind_vs_constants  = owner_vk_eng_rebind_vs_constants,
     .bind_ps_constants    = owner_vk_eng_bind_ps_constants,
     .bind_textures        = owner_vk_eng_bind_textures,
     .bind_vertex_textures = owner_vk_eng_bind_vertex_textures,
@@ -6463,6 +6642,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed && vk_load_wsi_device_functions())
         vk_window_drop("the driver has no swapchain functions");
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
+    vk_pcache_open();
 
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -6646,6 +6826,7 @@ static void vulkan_original_shutdown(void)
         }
         if (s_vk.window_fence)  pvkDestroyFence(s_vk.device, s_vk.window_fence, NULL);
         if (s_vk.present_pool)  pvkDestroyCommandPool(s_vk.device, s_vk.present_pool, NULL);
+        vk_pcache_close();
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
@@ -6661,7 +6842,16 @@ static void vulkan_original_shutdown(void)
     memset(&s_show, 0, sizeof s_show);
 }
 
+static int vk_pump_messages_core(void);
+/* PS3RECOMP_RSX_FIFO_BUSY: the window and event pump, as Metal counts it. */
 int rsx_vulkan_backend_pump_messages(void)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PUMP);
+    const int r = vk_pump_messages_core();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PUMP);
+    return r;
+}
+static int vk_pump_messages_core(void)
 {
     vk_show_pump();
 #ifdef _WIN32
@@ -6715,10 +6905,15 @@ int rsx_vulkan_backend_pump_messages(void)
 #endif
 }
 
+/* PS3RECOMP_RSX_FIFO_BUSY: a host-driven present, outside the engine present
+ * (PRESENT) and the swapchain waits (DRAWABLE) it contains -- the present
+ * ring's fence waits and copies -- as Metal counts it. */
 void rsx_vulkan_backend_present(void)
 {
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT_HOST);
     rsx_vulkan_backend_present_begin();
     rsx_vulkan_backend_present_finish();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);
 }
 
 static void vulkan_original_present_begin(void)

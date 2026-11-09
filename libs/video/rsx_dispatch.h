@@ -126,6 +126,13 @@ struct rsx_dispatch {
     u32 inline_len;                   /* bytes accumulated this primitive   */
     u32 inline_dropped;               /* streams lost to the cap            */
 
+    /* Transform constant slots written since a consumer last took them with
+     * rsx_dsp_take_constants: [const_dirty_lo, const_dirty_hi], empty when
+     * lo > hi. Everything that stores into constants[] marks what it wrote
+     * (rsx_dsp_mark_constants), so a consumer keeping a copy refreshes only
+     * that span. Init and seeding mark the whole file. */
+    u32 const_dirty_lo, const_dirty_hi;
+
     /* coverage accounting */
     u32 seen[RSX_DSP_NUM_REGS];       /* per-register write count           */
     u8  klass[RSX_DSP_NUM_REGS];      /* RSX_DSP_CLASS_*                    */
@@ -286,6 +293,29 @@ void rsx_dsp_get_vertex_texture(const rsx_dispatch* rsx, u32 unit,
 static inline const u32* rsx_dsp_constant(const rsx_dispatch* rsx, u32 slot)
 {
     return rsx->constants[slot < RSX_DSP_NUM_CONSTANTS ? slot : 0];
+}
+
+/* Note that constant slots [lo, hi] were written (clamped to the file). */
+static inline void rsx_dsp_mark_constants(rsx_dispatch* rsx, u32 lo, u32 hi)
+{
+    if (lo >= RSX_DSP_NUM_CONSTANTS || lo > hi) return;
+    if (hi >= RSX_DSP_NUM_CONSTANTS) hi = RSX_DSP_NUM_CONSTANTS - 1u;
+    if (rsx->const_dirty_lo > rsx->const_dirty_hi) {
+        rsx->const_dirty_lo = lo; rsx->const_dirty_hi = hi;
+        return;
+    }
+    if (lo < rsx->const_dirty_lo) rsx->const_dirty_lo = lo;
+    if (hi > rsx->const_dirty_hi) rsx->const_dirty_hi = hi;
+}
+
+/* The span written since the last take, and clear it: 1 with [*lo, *hi],
+ * or 0 when nothing was written. */
+static inline int rsx_dsp_take_constants(rsx_dispatch* rsx, u32* lo, u32* hi)
+{
+    if (rsx->const_dirty_lo > rsx->const_dirty_hi) return 0;
+    *lo = rsx->const_dirty_lo; *hi = rsx->const_dirty_hi;
+    rsx->const_dirty_lo = 1u; rsx->const_dirty_hi = 0u;
+    return 1;
 }
 
 /* Fragment program: SHADER_PROGRAM register (offset | dma-context in [1:0],
