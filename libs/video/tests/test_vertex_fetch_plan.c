@@ -130,8 +130,59 @@ static void random_plan(rsx_vertex_fetch_plan* plan, int use_inline,
     }
 }
 
+/* rsx_vertex_remap_build against the obvious first-use collapse: random
+ * reference lists -- dense meshes over small id ranges (the direct table),
+ * sparse ids, mixed base indices and lists past 8 (the hash), large draws
+ * between small ones (the table sized per draw) -- must give the same unique
+ * prefix, unique count and occurrence map. */
+static int test_remap(void)
+{
+    enum { MAXR = 12000 };
+    static rsx_vertex_ref in[MAXR], got[MAXR], want[MAXR];
+    static u32 map[MAXR];
+    rsx_vertex_remap remap; memset(&remap, 0, sizeof remap);
+    int dense = 0, cases = 0;
+    for (int n = 0; n < 4000; n++) {
+        const u32 kind = rnd() % 6;
+        u32 count = 1u + rnd() % (kind == 5 ? MAXR : 300u);
+        const u32 lo = (kind == 4) ? 0xFFFF0u : rnd() % 100000u;
+        const u32 span = kind == 0 ? 1u + count / 2u : kind == 1 ? 1u + count * 4u :
+                         kind == 2 ? 1u + rnd() % 1000000u : 1u + count;
+        for (u32 i = 0; i < count; i++) {
+            in[i].vertex_id = lo + rnd() % span;
+            in[i].base_index = (kind == 3 && rnd() % 4 == 0) ? 7u : 0u;
+        }
+        memcpy(got, in, count * sizeof *in);
+        u32 unique = 0;
+        CHECK(rsx_vertex_remap_build(&remap, got, count, &unique), "remap build %d", n);
+        /* reference */
+        u32 wu = 0;
+        for (u32 i = 0; i < count; i++) {
+            u32 k = 0;
+            while (k < wu && (want[k].vertex_id != in[i].vertex_id || want[k].base_index != in[i].base_index)) k++;
+            if (k == wu) want[wu++] = in[i];
+            map[i] = k;
+            if (wu > 2000) break;    /* the quadratic reference stays cheap */
+        }
+        if (wu > 2000) continue;
+        cases++;
+        if (kind <= 1 && count >= 8) dense++;
+        CHECK(unique == wu, "case %d: %u unique, want %u", n, unique, wu);
+        for (u32 k = 0; k < wu && k < unique; k++)
+            CHECK(got[k].vertex_id == want[k].vertex_id && got[k].base_index == want[k].base_index,
+                  "case %d: unique %u differs", n, k);
+        for (u32 i = 0; i < count; i++)
+            CHECK(rsx_vertex_remap_index(&remap, i) == map[i], "case %d: occurrence %u maps to %u, want %u",
+                  n, i, rsx_vertex_remap_index(&remap, i), map[i]);
+    }
+    rsx_vertex_remap_destroy(&remap);
+    printf("test_vertex_fetch_plan: remap %d cases (%d dense candidates), %d failure(s)\n", cases, dense, fails);
+    return cases > 1000 && dense > 300;
+}
+
 int main(void)
 {
+    if (!test_remap()) { printf("FAIL: too few remap cases\n"); return 1; }
     enum { PLANS = 6000, MAXV = 200 };
     static rsx_vertex_ref refs[MAXV];
     static u8 inl[8192];
