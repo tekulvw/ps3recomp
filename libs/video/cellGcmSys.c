@@ -556,6 +556,16 @@ static int s_live_report_batch;
  * results reach guest memory only through explicit synchronous readbacks at
  * their own stream position. Draw-engine deferred path only; default off. */
 static int s_early_release;
+/* PS3RECOMP_RSX_EARLY_LAZY_ISSUE=1 (default off; with early label release
+ * only): a FIFO pass no longer ends by issuing its queued report records.
+ * With every queued record already applied at its FIFO position, an issue
+ * only asks the backend for a completion ticket to verify them, and on the
+ * batched Vulkan engine every ticket submits the open batch (ending a merged
+ * render pass); a frame took one per pass. The records are issued when the
+ * batch fills (PS3RECOMP_RSX_DEFERRED_REPORT_BATCH), at a dependency, at
+ * capacity, or at a pass that ends with one still unapplied (gated), which
+ * keeps its publication latency as before. */
+static int s_lazy_issue;
 static int s_early_fifo_sync;
 #define GCM_FRAME_RING 16u
 static u64 s_frame_ticket[GCM_FRAME_RING];
@@ -636,6 +646,7 @@ static void gcm_deferred_initialize(void) {
       else if(want_sync&&!want)
           fprintf(stderr,"[early release] refused: PS3RECOMP_RSX_EARLY_FIFO_SYNC requires PS3RECOMP_RSX_EARLY_LABEL_RELEASE=1\n");
       else{s_early_release=want;s_early_fifo_sync=want&&want_sync;}
+      { const char *z=getenv("PS3RECOMP_RSX_EARLY_LAZY_ISSUE"); s_lazy_issue=s_early_release&&z&&!strcmp(z,"1"); }
       s_reports.early_mode=(uint32_t)s_early_release;
       { const char *f=getenv("PS3RECOMP_RSX_MAX_FRAMES_AHEAD"),*l=getenv("PS3RECOMP_RSX_INFLIGHT_LOG");
         if(f){const long n=strtol(f,NULL,0);s_frames_ahead=n<0?0u:n>(long)GCM_FRAME_RING-1?GCM_FRAME_RING-1u:(u32)n;}
@@ -3292,7 +3303,8 @@ void cellGcm_rsx_process_fifo(void)
     } else {
         cellGcm_rsx_consumer_begin();
         const int ph=gph_enabled();uint64_t p0=ph?gph_now():0,p1=0;const u32 g0=s_fifo_getoff;
-        if(gcm_reports_progress(0,0)){gcm_rsx_process_fifo_unlocked();if(ph)p1=gph_now();gcm_reports_progress(0,1);}
+        if(gcm_reports_progress(0,0)){gcm_rsx_process_fifo_unlocked();if(ph)p1=gph_now();
+            gcm_reports_progress(0,!(s_lazy_issue&&s_early_release&&!s_reports.gated));}
         if(ph){const uint64_t p2=gph_now();if(p1){s_gph.pass_ns+=p1-p0;s_gph.pass_n++;s_gph.issue_ns+=p2-p1;s_gph.issue_n++;}
                if(s_fifo_getoff>=g0)s_gph.words+=(s_fifo_getoff-g0)/4u;gph_report();}
         cellGcm_rsx_consumer_end();
