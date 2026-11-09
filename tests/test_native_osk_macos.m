@@ -39,6 +39,10 @@ static void wait_sheet_closed(void){
  assert(!s_alert);
 }
 static void game_keys(NSWindow* window){
+ /* Key status settles asynchronously after a sheet or another app lets go;
+  * give the window server a bounded moment (slow on hosted CI) before asserting. */
+ for(int i=0;i<500 && !(NSApp.isActive && window.isKeyWindow && NSApp.keyWindow==window);i++)
+  [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.002]];
  assert(NSApp.isActive && window.isKeyWindow && NSApp.keyWindow==window);
  assert(window.firstResponder==window.contentView);
  NSEvent* down=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:window.windowNumber context:nil characters:@"x" charactersIgnoringModifiers:@"x" isARepeat:NO keyCode:7];
