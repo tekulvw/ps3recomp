@@ -2730,6 +2730,9 @@ static void eng_track_submission(id<MTLCommandBuffer> cb)
 
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
+/* Bumped whenever the staged bytes are handed to a command buffer or
+ * dropped, so an offset staged under an older value no longer names them. */
+static u64 s_eng_stage_gen;
 /* The staging arena is the contents of a shared MTLBuffer, handed to the
  * command buffer that reads it instead of being copied into a new one at
  * every commit. A committed arena goes back to this pool when the GPU has
@@ -3198,6 +3201,7 @@ static void eng_shutdown(void* user)
     for(u32 i=0;i<ENG_VIEW_POOL;i++){s_eng_view_pool[i].words=nil;s_eng_view_pool[i].tex=nil;s_eng_view_pool[i].handle=0;}
     s_eng_stage_buf = nil; s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
+    s_eng_stage_gen++;
     s_eng_depth_staging = nil;
     s_eng_z24_pso = nil;
     s_eng_z24_valid = 0;
@@ -3791,11 +3795,21 @@ static void eng_bind_targets(void* user, const u32* surfaces, u32 count,
 static void eng_bind_pipeline(void* user, u32 pipeline)
 { (void)user; s_eng_pending.pipeline = pipeline; }
 
+/* The stage generation the pending vertex constants were copied under. */
+static u64 s_eng_vs_gen;
 static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
     if (!eng_stage_copy(data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
     s_eng_pending.vs_cb_bytes = bytes;
+    s_eng_vs_gen = s_eng_stage_gen;
+}
+/* Unchanged constants: the previous draw's staged copy serves this draw too,
+ * while those staged bytes have not been handed to a command buffer. */
+static int eng_rebind_vs_constants(void* user)
+{
+    (void)user;
+    return s_eng_pending.vs_cb_bytes && s_eng_stage && s_eng_vs_gen == s_eng_stage_gen;
 }
 
 static void eng_bind_ps_constants(void* user, const void* data, u32 bytes)
@@ -4513,6 +4527,7 @@ static void eng_stage_hand_off(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
     if(now_inflight>atomic_load(&s_eng_stage_inflight_peak))atomic_store(&s_eng_stage_inflight_peak,now_inflight);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> unused) { (void)unused; atomic_fetch_add(&s_eng_pool_handler, 1ull); atomic_fetch_sub(&s_eng_stage_inflight,bytes); eng_stage_buffer_release(stage); }];
     s_eng_stage_buf = nil; s_eng_stage = NULL; s_eng_stage_cap = 0;
+    s_eng_stage_gen++;
 }
 static id<MTLCommandBuffer> s_capture_present_cb;
 static uint64_t s_capture_guest,s_capture_command,s_capture_submission,s_capture_drawable;
@@ -4672,6 +4687,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
         if(critical_start){uint64_t w[8]={critical_start,critical_size,critical_commit,critical_wait,s_present_guest_id,(uint64_t)([cb status]==MTLCommandBufferStatusCompleted && ![cb error]),critical_double(cb.GPUStartTime),critical_double(cb.GPUEndTime)};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_FLUSH,critical_id,(uint64_t)(windowed_present?1:async_submit?2:0),w,8);}
         s_eng_rec_count  = 0;
         s_eng_stage_used = 0;
+        s_eng_stage_gen++;
         eng_collect_retired_objects();
         return presented;
     }
@@ -4978,6 +4994,7 @@ static int eng_encode_and_stage(id<MTLTexture> src, id<MTLTexture> staging, uint
         if(critical_start){uint64_t w[8]={critical_start,critical_size,critical_commit,0,s_present_guest_id,0,0,0};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_FLUSH,critical_id,3,w,8);}
         s_eng_rec_count  = 0;
         s_eng_stage_used = 0;
+        s_eng_stage_gen++;
         eng_collect_retired_objects();
         return staged;
     }
@@ -5612,6 +5629,10 @@ static void owner_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     if(!metal_owner_begin(1)){return;}
     eng_bind_vs_constants(user,data,bytes);metal_owner_finish(0);
 }
+static int owner_eng_rebind_vs_constants(void* user){
+    if(!metal_owner_begin(1)){return 0;}
+    const int result=eng_rebind_vs_constants(user);metal_owner_finish(0);return result;
+}
 static void owner_eng_bind_ps_constants(void* user, const void* data, u32 bytes){
     if(!metal_owner_begin(1)){return;}
     eng_bind_ps_constants(user,data,bytes);metal_owner_finish(0);
@@ -5696,6 +5717,7 @@ static const rsx_draw_backend s_engine_backend = {
     .bind_targets         = owner_eng_bind_targets,
     .bind_pipeline        = owner_eng_bind_pipeline,
     .bind_vs_constants    = owner_eng_bind_vs_constants,
+    .rebind_vs_constants  = owner_eng_rebind_vs_constants,
     .bind_ps_constants    = owner_eng_bind_ps_constants,
     .bind_textures        = owner_eng_bind_textures,
     .bind_vertex_textures = owner_eng_bind_vertex_textures,
