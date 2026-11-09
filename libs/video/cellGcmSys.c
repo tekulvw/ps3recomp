@@ -4314,7 +4314,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     if (s_recdbg < 0) s_recdbg = getenv("GCM_RECDBG") ? 1 : 0;
     if (s_recdbg)
         fprintf(stderr, "[REC>] tid=%lu begin=%08X cur=%08X put=%08X get=%08X drained=%08X\n",
-                GetCurrentThreadId(), begin, current,
+                (unsigned long)GetCurrentThreadId(), begin, current,
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
                 g_gcm_fifo_drained_ea);
@@ -4372,7 +4372,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
 
     if (s_recdbg)
         fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
-                GetCurrentThreadId(), vm_read32(ctx_ea + 0x8),
+                (unsigned long)GetCurrentThreadId(), vm_read32(ctx_ea + 0x8),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
                 g_gcm_fifo_drained_ea, spins);
