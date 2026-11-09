@@ -5,7 +5,9 @@
  * and texture release mid-stream, completion tickets, a GPU depth view, a
  * present and readbacks -- headless under the Khronos validation layer.
  *
- * Run once with each recording mode (argv[1] "sync" or "batched"). Each run
+ * Run once with each recording mode (argv[1] "sync", "batched", or "reuse":
+ * batched with PS3RECOMP_VK_DESCRIPTOR_REUSE=1, the constant blocks bound with
+ * dynamic offsets and descriptor sets reused across draws). Each run
  * writes its readback bytes to argv[2]; the runner requires the two files to
  * be identical, so batched recording is checked against the per-operation
  * submissions, pixel for pixel. No window, guest memory or game data.
@@ -143,8 +145,10 @@ static void busy_shutdown(void)
 
 int main(int argc, char** argv)
 {
-    if (argc != 4) { fprintf(stderr, "usage: fixture sync|batched OUT DRAWS\n"); return 2; }
-    const int batched = !strcmp(argv[1], "batched");
+    if (argc != 4) { fprintf(stderr, "usage: fixture sync|batched|reuse OUT DRAWS\n"); return 2; }
+    const int reuse = !strcmp(argv[1], "reuse");
+    const int batched = reuse || !strcmp(argv[1], "batched");
+    if (reuse) setenv("PS3RECOMP_VK_DESCRIPTOR_REUSE", "1", 1); else unsetenv("PS3RECOMP_VK_DESCRIPTOR_REUSE");
     const u32 draws = (u32)strtoul(argv[3], NULL, 0);
     setenv("PS3RECOMP_RSX_ENGINE", "dispatch", 1);
     setenv("PS3RECOMP_VK_WINDOW", "0", 1);
@@ -152,6 +156,7 @@ int main(int argc, char** argv)
     if (batched) setenv("PS3RECOMP_VK_BATCHED_ENGINE", "1", 1); else unsetenv("PS3RECOMP_VK_BATCHED_ENGINE");
     assert(rsx_vulkan_backend_init(TW, TH, "batched engine synthetic") == 0 && s_vk.eng_active);
     CHECK(s_bat_on == batched, "recording mode as requested");
+    CHECK(s_bat.desc_reuse == reuse, "descriptor reuse as requested");
     CHECK(s_g.on, "guest programs (glslang) available");
     if (!s_g.on) { rsx_vulkan_backend_shutdown(); return 1; }
 
@@ -370,6 +375,14 @@ int main(int argc, char** argv)
             CHECK(px[0] == 0 && px[1] == 0 && px[2] == 0 && px[3] == 0, "unbound 2D and cube units read transparent black");
             vk_eng_pipeline_release(NULL, pu);
         }
+    }
+    if (reuse) {
+        printf("reuse: %llu descriptor sets written, %llu reused\n",
+               (unsigned long long)s_bat.sets_written, (unsigned long long)s_bat.sets_reused);
+        CHECK(s_bat.sets_reused > draws / 4, "reuse: draws with the same textures share a set");
+        CHECK(s_bat.sets_written > 0, "reuse: and the others get their own");
+    } else {
+        CHECK(s_bat.sets_reused == 0, "no set reuse unless asked");
     }
     CHECK(!vk_e5_failed(), "no submission failed");
     if (batched)

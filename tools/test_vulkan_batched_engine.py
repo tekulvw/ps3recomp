@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Vulkan engine backend: the same synthetic operation stream recorded per
-operation (default) and batched (PS3RECOMP_VK_BATCHED_ENGINE=1) must read
+operation (default), batched (PS3RECOMP_VK_BATCHED_ENGINE=1) and batched with
+descriptor sets reused across draws (PS3RECOMP_VK_DESCRIPTOR_REUSE=1) must read
 back identical bytes, both runs clean under the Khronos validation layer
 (with synchronization validation). Synthetic inputs only.
 
@@ -16,6 +17,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+MODES = ("sync", "batched", "reuse")
 
 
 def main():
@@ -65,7 +67,7 @@ def main():
         loader = subprocess.check_output(["pkg-config", "--variable=libdir", "vulkan"], text=True).strip()
         environment["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None, [loader, environment.get("LD_LIBRARY_PATH", "")]))
         outputs = {}
-        for mode in ("sync", "batched"):
+        for mode in MODES:
             out = Path(tmp) / f"{mode}.bin"
             result = subprocess.run([str(binary), mode, str(out), args.draws], env=environment,
                                     capture_output=True, text=True, timeout=1800)
@@ -78,7 +80,7 @@ def main():
             outputs[mode] = out.read_bytes()
         if args.timing:
             plain = {k: v for k, v in environment.items() if k not in ("VK_INSTANCE_LAYERS", "VK_LAYER_SETTINGS_PATH")}
-            for mode in ("sync", "batched"):
+            for mode in MODES:
                 out = Path(tmp) / f"{mode}-timing.bin"
                 result = subprocess.run([str(binary), mode, str(out), args.draws], env=plain,
                                         capture_output=True, text=True, timeout=1800)
@@ -86,10 +88,11 @@ def main():
                 print("timing, no validation: " + " | ".join(l for l in result.stdout.splitlines() if "draws" in l))
                 if out.read_bytes() != outputs[mode]:
                     raise SystemExit(f"{mode} output changed without the validation layer")
-        if outputs["sync"] != outputs["batched"]:
-            diff = sum(a != b for a, b in zip(outputs["sync"], outputs["batched"]))
-            raise SystemExit(f"batched readback differs from per-operation submission in {diff} bytes")
-        print(f"PASS batched recording reads back identically ({len(outputs['sync'])} bytes)")
+        for mode in MODES[1:]:
+            if outputs["sync"] != outputs[mode]:
+                diff = sum(a != b for a, b in zip(outputs["sync"], outputs[mode]))
+                raise SystemExit(f"{mode} readback differs from per-operation submission in {diff} bytes")
+        print(f"PASS batched recording, with and without descriptor reuse, reads back identically ({len(outputs['sync'])} bytes)")
 
 
 if __name__ == "__main__":
