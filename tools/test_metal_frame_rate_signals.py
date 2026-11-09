@@ -11,7 +11,12 @@ with tempfile.TemporaryDirectory(prefix='metal-fps-signals-') as tmp:
     else:
         common = ['clang', '-fobjc-arc', '-DPS3RECOMP_DISABLE_NATIVE_OSK', '-I', 'include', '-I', 'libs/video']
         link = ['libs/video/rsx_texture_layout.c','runtime/diagnostics/critical_trace.c','libs/video/rsx_fifo_busy.c', 'libs/input/pad_macos.m', '-Wl,-dead_strip', '-framework', 'Metal', '-framework', 'Cocoa', '-framework', 'QuartzCore']
+        # Each fixture links what its own runner does (test_metal_checked_completion.py,
+        # test_metal_frame_rate.py); the backend reaches both extras.
+        extra = {'test_metal_frame_rate_signals': ['runtime/diagnostics/render_ablation.c'],
+                 'test_metal_frame_rate': ['libs/video/rsx_frontend.c', '-Wl,-U,_cellGcm_rsx_consumer_begin',
+                                           '-Wl,-U,_cellGcm_rsx_consumer_end']}
         for name, args in [('test_metal_frame_rate_signals', []), ('test_metal_frame_rate', ['stats'])]:
             binary = pathlib.Path(tmp) / name
-            subprocess.run(common + ['libs/video/tests/' + name + '.m'] + link + ['-o', str(binary)], cwd=ROOT, check=True, timeout=60)
+            subprocess.run(common + ['libs/video/tests/' + name + '.m'] + link + extra[name] + ['-o', str(binary)], cwd=ROOT, check=True, timeout=60)
             subprocess.run([str(binary)] + args, check=True, timeout=20)

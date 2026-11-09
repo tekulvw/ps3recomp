@@ -99,11 +99,11 @@ int main(int argc, char** argv) { @autoreleasepool {
             key(view,NO,sticks[i].code); report("stick released",0,128,128,128,128);
         }
         key(view,YES,13); key(view,YES,2); key(view,YES,40); key(view,YES,38);
-        report("independent simultaneous sticks",0,0,255,255,0);
+        report("independent simultaneous sticks",0,255,0,0,255);   /* W D left, K J right */
         key(view,YES,1); key(view,YES,0); key(view,YES,34); key(view,YES,37);
         report("opposing directions neutral",0,128,128,128,128);
         key(view,NO,1); key(view,NO,0); key(view,NO,34); key(view,NO,37);
-        report("release opposing keys restores held directions",0,0,255,255,0);
+        report("release opposing keys restores held directions",0,255,0,0,255);
         [view windowLostKey:nil]; report("focus clears sticks",0,128,128,128,128);
         key(view,YES,13); report("unfocused keys ignored",0,128,128,128,128);
         [view windowBecameKey:nil]; report("focus return stays released",0,128,128,128,128);

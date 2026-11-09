@@ -35,12 +35,15 @@ int main(void) {
   assert(session->stats.gpu_failed==1 && session->stats.gpu_completed==1);
 
   /* A report flush has no frame drawable and must not register completion
-   * telemetry, even though it successfully completes a command buffer. */
+   * telemetry, even though it successfully completes a command buffer. Every
+   * command buffer carries the commit-sequence handler, and frame telemetry
+   * would be added after it, so completing the last handler must not count. */
   CheckedQueue *queue=[CheckedQueue new];SignalsBuffer *flush=[SignalsBuffer new];
   queue.buffer=flush;s_queue=(id<MTLCommandQueue>)queue;
   s_dev=(id<MTLDevice>)[NSObject new];s_headless=1;
   assert(eng_encode_and_commit(nil)==0 && s_eng_checked_completed==1);
-  assert(!flush.completion && session->stats.gpu_completed==1);
+  if(flush.completion)flush.completion((id<MTLCommandBuffer>)flush);
+  assert(session->stats.gpu_completed==1);
   fps_note_drawable(0);fps_note_drawable(1);fps_note_skipped_blit();
   assert(session->stats.drawable_attempts==2 && session->stats.nil_drawables==1 && session->stats.skipped_blits==1);
 

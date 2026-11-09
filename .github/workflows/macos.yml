@@ -15,7 +15,7 @@ on:
 jobs:
   build:
     name: macOS arm64 (${{ matrix.build_type }})
-    runs-on: macos-14          # Apple Silicon runner
+    runs-on: macos-15          # Apple Silicon runner (macos-14 is retired)
     strategy:
       fail-fast: false
       matrix:
@@ -54,14 +54,20 @@ jobs:
       - name: Run the lifter test suites
         env:
           CI: "1"          # makes a skipped conformance run fail instead of passing
+        # Every suite runs and the step fails at the end with the full list, so
+        # one red runner cannot hide the ones after it.
         run: |
-          set -e
+          failed=""
           for t in tools/test_*.py; do
             # Explicit shader-bound native fixtures have dedicated workflows.
             case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py|tools/test_vulkan_present_cost.py) continue ;; esac
             echo "--- $t"
-            python "$t"
+            python "$t" || failed="$failed $t"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::failed lifter test suites:$failed"
+            exit 1
+          fi
 
       # libs/system/tests/ existed and NOTHING ran it -- two suites checked in,
       # both documenting a macOS clang line in their own header comment, neither
