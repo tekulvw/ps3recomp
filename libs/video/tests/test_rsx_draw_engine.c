@@ -213,7 +213,15 @@ static void stub_bind_vs(void* u, const void* d, u32 n)
         memcpy(stub.vp_xf, (const u8*)d + RSX_DSP_NUM_CONSTANTS * 16u, sizeof stub.vp_xf);
 }
 static int stub_rebind_vs(void* u) { (void)u; g_vs_rebinds++; return g_rebind_answer; }
-static void stub_bind_ps(void* u, const void* d, u32 n) { (void)u; (void)d; (void)n; }
+/* The first constants of the last fragment constant block bound. */
+static u8 g_ps_block[64];
+static u32 g_ps_bytes;
+static void stub_bind_ps(void* u, const void* d, u32 n)
+{
+    (void)u;
+    g_ps_bytes = n;
+    if (d) memcpy(g_ps_block, d, n < sizeof g_ps_block ? n : sizeof g_ps_block);
+}
 
 static void stub_bind_textures(void* u, const u32* tex,
                                const rsx_be_sampler_desc* smp, u32 mask)
