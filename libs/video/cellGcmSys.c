@@ -3296,6 +3296,12 @@ static void gcm_walk_settings(void)
  * methods with effects of their own (gcm_walk_special) still take the general
  * path, in stream order. -1 until read; s_walk_diag likewise. */
 static int s_walk_fast = -1, s_walk_diag = -1;
+/* Keep this list complete: it must name every subchannel 0/1 method the
+ * general per-word path acts on beyond forwarding it to the draw engine --
+ * everything gcm_legacy_method_has_effect names, the report and report-DMA
+ * methods, and any method a report gate, flip or label check tests. A side
+ * effect added to that path for a method missing here is skipped for it under
+ * PS3RECOMP_GCM_FAST_WALK=1. */
 static int gcm_walk_special(u32 m)
 {
     switch (m) {
@@ -3819,6 +3825,9 @@ static void gcm_rsx_process_fifo_pass(void)
                 dea = (plain_walk && dea && (dio & 0xFFFFFu)) ? dea + 4u : gcm_io2ea(dio);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
+                /* Fast path: forwards the word and nothing else. Any per-method
+                 * effect the general path below gains must be matched by adding
+                 * that method to gcm_walk_special, or this path skips it. */
                 if (plain_walk && (subch == 0 || (subch == 1 && !s_walk_s1_2d)) && !gcm_walk_special(m)) {
                     const uint64_t e0=s_gph_on>0?gph_now():0;
                     rsx_draw_engine_method_at((subch << 13) | m, vm_read32(dea), dea);
@@ -3983,6 +3992,8 @@ static void gcm_rsx_process_fifo_pass(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
+                    /* A method this branch acts on must be in gcm_walk_special
+                     * too, or PS3RECOMP_GCM_FAST_WALK=1 never brings it here. */
                     if(m==0x50u && !((s_early_fifo_sync||gcm_checked_ref_mode())?gcm_reports_dependency():gcm_reports_sync_barrier()))return;
                     if(m==0x1d6cu)s_backend_label_offset=vm_read32(dea);
                     if(m==0x1a4u)s_backend_label_dma=vm_read32(dea);
