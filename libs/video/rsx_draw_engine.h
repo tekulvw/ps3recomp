@@ -338,6 +338,9 @@ int rsx_draw_engine_async_available(void);
 /* Texture reads of depth that reached neither a snapshot, a GPU view nor a
  * guest-memory store (see the engine's one-time report). */
 u64 rsx_draw_engine_depth_unstored_count(void);
+/* Fragment-program product lookups served from the engine's memo, and the
+ * ones that walked the microcode (a new or changed program). */
+void rsx_draw_engine_fp_memo_counts(unsigned long long* hits, unsigned long long* misses);
 /* Same-target colour reads the backend could not copy (no color_snapshot). */
 u64 rsx_draw_engine_feedback_unserved_count(void);
 u64 rsx_draw_engine_submit_async(void);

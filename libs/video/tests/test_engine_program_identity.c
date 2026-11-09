@@ -89,6 +89,52 @@ int main(void)
           "a program without constants has no slots");
     CHECK(block.values[0][0] == 0xABABABABu, "and the unused slots are left alone");
 
+    /* The engine keeps what a fragment program's bytes decide (sampled
+     * units, inline constants, structural hash) for the programs recent draws
+     * used, and must still see a constant patched into the program in place,
+     * as a title does between draws. MOV r0, c0 ; END, then c0's 16 bytes. */
+    {
+        engine_up();
+        upload_vp(swizzle(0));
+        u8* fp = vm_base + TEX_OFFSET + 0x1000u;
+        memset(fp, 0, 64);
+        rsx_test_fp_instr(fp, RSX_TEST_FP_OPC(0x01) | RSX_TEST_FP_MASK_XYZW | RSX_TEST_FP_END,
+                          2u /* const */ | RSX_TEST_FP_SWZ_IDENT);
+        const u32 a[4] = { 0x3F800000u, 0x40000000u, 0x40400000u, 0x40800000u };   /* 1 2 3 4 */
+        const u32 b[4] = { 0xBF800000u, 0x3F000000u, 0x00000000u, 0x41200000u };   /* -1 .5 0 10 */
+        for (u32 i = 0; i < 4; i++) rsx_test_fp_put_word(fp + 16 + i * 4, a[i]);
+        m(0x8E4, (TEX_OFFSET + 0x1000u) | 2);
+        m(0x1D60, 64);
+        unsigned long long hits0 = 0, misses0 = 0, hits = 0, misses = 0;
+        rsx_draw_engine_fp_memo_counts(&hits0, &misses0);
+        draw_triangle();
+        const int pipelines = stub.n_pipeline_create;
+        u32 got[4]; memcpy(got, g_ps_block, 16);
+        CHECK(g_ps_bytes >= 16 && !memcmp(got, a, 16), "the program's inline constant reaches the draw");
+        draw_triangle(); draw_triangle();
+        rsx_draw_engine_fp_memo_counts(&hits, &misses);
+        CHECK(misses - misses0 == 1 && hits - hits0 >= 2, "repeat draws reuse the program's products (%llu hits, %llu misses)",
+              hits - hits0, misses - misses0);
+        memcpy(got, g_ps_block, 16);
+        CHECK(!memcmp(got, a, 16), "and still bind its constant");
+        for (u32 i = 0; i < 4; i++) rsx_test_fp_put_word(fp + 16 + i * 4, b[i]);
+        draw_triangle();
+        memcpy(got, g_ps_block, 16);
+        CHECK(!memcmp(got, b, 16), "a constant patched in place reaches the next draw");
+        CHECK(stub.n_pipeline_create == pipelines, "without a new pipeline (%d)", stub.n_pipeline_create);
+        for (u32 i = 0; i < 4; i++) rsx_test_fp_put_word(fp + 16 + i * 4, a[i]);
+        draw_triangle();
+        memcpy(got, g_ps_block, 16);
+        CHECK(!memcmp(got, a, 16) && stub.n_pipeline_create == pipelines, "and patching it back is seen too");
+        /* A different instruction in the same bytes is a different program. */
+        rsx_test_fp_instr(fp, RSX_TEST_FP_OPC(0x01) | RSX_TEST_FP_MASK_XYZW | RSX_TEST_FP_END,
+                          2u | RSX_TEST_FP_SWZ(3, 2, 1, 0));
+        draw_triangle();
+        CHECK(stub.n_pipeline_create == pipelines + 1, "an instruction rewritten in place builds a pipeline (%d)",
+              stub.n_pipeline_create);
+        engine_down();
+    }
+
     free(vm_base);
     printf("program identity failures: %d\n", g_failures);
     return g_failures ? 1 : 0;
