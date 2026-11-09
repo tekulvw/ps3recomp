@@ -428,6 +428,11 @@ int main(int argc, char** argv)
         CHECK(!memcmp(px[0], px[1], sizeof px[0]), "host: UNORM8x4 streams draw the same pixels");
         CHECK(!memcmp(px[0], px[2], sizeof px[0]), "host: HALF4 streams draw the same pixels");
         CHECK(!memcmp(px[0], px[3], sizeof px[0]), "host: SNORM16x4 streams draw the same pixels");
+        {   /* Passing checks print nothing: say this ran, and how it compared. */
+            int same = 0;
+            for (int k = 1; k < 4; k++) same += !memcmp(px[0], px[k], sizeof px[0]);
+            printf("%s: host-format streams (UNORM8x4, HALF4, SNORM16x4) matched float4 pixels in %d of 3\n", argv[1], same);
+        }
         for (int k = 0; k < 4; k++) vk_eng_release(NULL, t[k]);
         vk_eng_pipeline_release(NULL, p4);
         for (int k = 0; k < 3; k++) vk_eng_pipeline_release(NULL, ph[k]);
