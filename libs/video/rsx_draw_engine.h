@@ -295,6 +295,21 @@ typedef struct rsx_draw_backend {
      * status: -1 failure/unknown,0 pending,1 actual successful completion. */
     u64 (*submit_async)(void* user,u32 reason);
     int (*completion_status)(void* user,u64 ticket,int wait);
+    /* Optional pair: host-format vertex streams (rsx_vertex_host_streams_build,
+     * PS3RECOMP_RSX_HOST_VERTEX_FORMATS). pipeline_create_host is
+     * pipeline_create with one RSX_HOST_VF_* format per layout slot instead
+     * of the float4 stride: slot i is attribute location i, read from its own
+     * vertex buffer of tightly packed elements. draw_host draws with those
+     * streams: `data` holds them all (`data_bytes`), slot i at offsets[i],
+     * `vertex_count` elements each; `index_size` is 2 or 4. */
+    u32  (*pipeline_create_host)(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                 const rsx_be_render_state* rs,
+                                 const rsx_vertex_layout_plan* layout,
+                                 const u8* host_formats, rsx_be_format rt_fmt,
+                                 u32 rt_count);
+    void (*draw_host)(void* user, rsx_topology topology, const void* data, u32 data_bytes,
+                      const u32* offsets, u32 streams, u32 vertex_count,
+                      const void* indices, u32 index_count, u32 index_size);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -338,6 +353,9 @@ int rsx_draw_engine_async_available(void);
 /* Texture reads of depth that reached neither a snapshot, a GPU view nor a
  * guest-memory store (see the engine's one-time report). */
 u64 rsx_draw_engine_depth_unstored_count(void);
+/* Draws uploaded as host-format vertex streams, and triangle lists the
+ * builder refused (they took the float4 path). */
+void rsx_draw_engine_host_vertex_counts(unsigned long long* draws, unsigned long long* refused);
 /* Same-target colour reads the backend could not copy (no color_snapshot). */
 u64 rsx_draw_engine_feedback_unserved_count(void);
 u64 rsx_draw_engine_submit_async(void);
