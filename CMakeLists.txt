@@ -529,11 +529,20 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_spu_float_vector_scalar PRIVATE m)
         add_test(NAME spu_float_vector_scalar COMMAND test_spu_float_vector_scalar 4)
         set_tests_properties(spu_float_vector_scalar PROPERTIES TIMEOUT 300)
+        # cflts/cfltu/csflt/cuflt and fi (the vector form a build selects) against their references.
+        add_executable(test_spu_float_convert
+            runtime/spu/tests/test_spu_float_convert.c)
+        target_include_directories(test_spu_float_convert PRIVATE include runtime/spu)
+        target_compile_options(test_spu_float_convert PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_float_convert PRIVATE m)
+        add_test(NAME spu_float_convert COMMAND test_spu_float_convert)
+        set_tests_properties(spu_float_convert PROPERTIES TIMEOUT 300)
         # On x86 both take the ISA the runtime and lifted code are built for, so the SSE4.1
         # vector form is the one under test; no contraction, as in the runtime.
         if(PS3RECOMP_HAS_MSSE41)
             target_compile_options(test_spu_float_exact PRIVATE -msse4.1 -ffp-contract=off)
             target_compile_options(test_spu_float_vector_scalar PRIVATE -msse4.1 -ffp-contract=off)
+            target_compile_options(test_spu_float_convert PRIVATE -msse4.1)
         endif()
     endif()
     # The x86 vector forms of the SPU integer/permute helpers against their scalar

@@ -131,6 +131,22 @@ jobs:
             echo "no AVX2 on this runner: skipped"
           fi
 
+      # The x86 single-precision helpers (fa/fm/fma with SPU zeros handled in the vector, the
+      # float/integer conversions, fi) must match their exact references bit for bit at every
+      # ISA level a build can select; the AVX-512 level runs where the runner has it.
+      - name: Run the SPU x86 float helper tests
+        run: |
+          for isa in -msse4.1 -march=x86-64-v3 -march=x86-64-v4; do
+            if [ "$isa" = -march=x86-64-v3 ] && ! grep -q avx2 /proc/cpuinfo; then echo "no AVX2: $isa skipped"; continue; fi
+            if [ "$isa" = -march=x86-64-v4 ] && ! grep -q avx512bw /proc/cpuinfo; then echo "no AVX-512: $isa skipped"; continue; fi
+            for t in test_spu_float_convert test_spu_float_exact; do
+              ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+                -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off $isa -I include -I runtime/spu \
+                -o /tmp/$t runtime/spu/tests/$t.c -lm
+              echo "[$isa] $t"; /tmp/$t
+            done
+          done
+
       # cellFontInitializeWithRevision initialises the library the way cellFontInit does.
       - name: Run the cellFont init test
         run: |

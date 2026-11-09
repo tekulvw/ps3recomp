@@ -88,6 +88,9 @@ jobs:
           clang -std=gnu17 -I include -I runtime/spu \
                 -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
+          clang -std=gnu17 -O2 -I include -I runtime/spu \
+                -o /tmp/test_spu_float_convert runtime/spu/tests/test_spu_float_convert.c -lm
+          /tmp/test_spu_float_convert
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
