@@ -94,9 +94,9 @@ static inline __m128i spu__xiota(void) { return _mm_setr_epi8(0,1,2,3,4,5,6,7,8,
  * or 0 when I[i] >= 16 (pshufb zeroes a lane whose index has bit 7 set). */
 static inline u128 spu__xperm(u128 a, __m128i I) {
     const __m128i ir = _mm_shuffle_epi8(I, spu__xspuidx());              /* ir[h] = I[h^3] */
-    const __m128i in = _mm_cmpeq_epi8(_mm_min_epu8(ir, _mm_set1_epi8(15)), ir);
-    const __m128i ih = _mm_or_si128(_mm_xor_si128(ir, _mm_set1_epi8(3)),
-                                    _mm_andnot_si128(in, _mm_set1_epi8((char)0x80)));
+    /* Host index ir^3. A saturating +0x70 keeps 0..15 in 0x70..0x7F (pshufb reads the low
+     * nibble) and lifts 16..255 to 0x80 or more, which pshufb turns into zero. */
+    const __m128i ih = _mm_adds_epu8(_mm_xor_si128(ir, _mm_set1_epi8(3)), _mm_set1_epi8(0x70));
     return spu__xst(_mm_shuffle_epi8(spu__xld(a), ih));
 }
 static inline __m128i spu__xshift(int n) { return _mm_add_epi8(spu__xiota(), _mm_set1_epi8((char)(uint8_t)n)); }
@@ -220,6 +220,8 @@ static inline u128 spu_a_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._
 static inline u128 spu_a(u128 a, u128 b) {
     return spu__st(vaddq_u32(spu__ld(a), spu__ld(b)));
 }
+#elif defined(SPU_X86_VECTOR)
+static inline u128 spu_a(u128 a, u128 b) { return spu__xst(_mm_add_epi32(spu__xld(a), spu__xld(b))); }
 #else
 static inline u128 spu_a(u128 a, u128 b) { return spu_a_ref(a, b); }
 #endif
@@ -228,6 +230,8 @@ static inline u128 spu_sf_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._
 static inline u128 spu_sf(u128 a, u128 b) {
     return spu__st(vsubq_u32(spu__ld(b), spu__ld(a)));
 }
+#elif defined(SPU_X86_VECTOR)
+static inline u128 spu_sf(u128 a, u128 b) { return spu__xst(_mm_sub_epi32(spu__xld(b), spu__xld(a))); }
 #else
 static inline u128 spu_sf(u128 a, u128 b) { return spu_sf_ref(a, b); }
 #endif
@@ -238,6 +242,8 @@ static inline u128 spu_ai_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++
 static inline u128 spu_ai(u128 a, int32_t imm) {
     return spu__st(vaddq_u32(spu__ld(a), vdupq_n_u32((uint32_t)imm)));
 }
+#elif defined(SPU_X86_VECTOR)
+static inline u128 spu_ai(u128 a, int32_t imm) { return spu__xst(_mm_add_epi32(spu__xld(a), _mm_set1_epi32(imm))); }
 #else
 static inline u128 spu_ai(u128 a, int32_t imm) { return spu_ai_ref(a, imm); }
 #endif
@@ -247,6 +253,8 @@ static inline u128 spu_sfi_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i+
 static inline u128 spu_sfi(u128 a, int32_t imm) {
     return spu__st(vsubq_u32(vdupq_n_u32((uint32_t)imm), spu__ld(a)));
 }
+#elif defined(SPU_X86_VECTOR)
+static inline u128 spu_sfi(u128 a, int32_t imm) { return spu__xst(_mm_sub_epi32(_mm_set1_epi32(imm), spu__xld(a))); }
 #else
 static inline u128 spu_sfi(u128 a, int32_t imm) { return spu_sfi_ref(a, imm); }
 #endif
@@ -360,6 +368,8 @@ static inline u128 spu_ceq_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r
 static inline u128 spu_ceq(u128 a, u128 b) {
     return spu__st(vceqq_u32(spu__ld(a), spu__ld(b)));
 }
+#elif defined(SPU_X86_VECTOR)
+static inline u128 spu_ceq(u128 a, u128 b) { return spu__xst(_mm_cmpeq_epi32(spu__xld(a), spu__xld(b))); }
 #else
 static inline u128 spu_ceq(u128 a, u128 b) { return spu_ceq_ref(a, b); }
 #endif
@@ -370,6 +380,8 @@ static inline u128 spu_cgt_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r
 static inline u128 spu_cgt(u128 a, u128 b) {
     return spu__st(vcgtq_s32(vreinterpretq_s32_u32(spu__ld(a)), vreinterpretq_s32_u32(spu__ld(b))));
 }
+#elif defined(SPU_X86_VECTOR)
+static inline u128 spu_cgt(u128 a, u128 b) { return spu__xst(_mm_cmpgt_epi32(spu__xld(a), spu__xld(b))); }
 #else
 static inline u128 spu_cgt(u128 a, u128 b) { return spu_cgt_ref(a, b); }
 #endif
@@ -380,6 +392,8 @@ static inline u128 spu_clgt_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r
 static inline u128 spu_clgt(u128 a, u128 b) {
     return spu__st(vcgtq_u32(spu__ld(a), spu__ld(b)));
 }
+#elif defined(SPU_X86_VECTOR)
+static inline u128 spu_clgt(u128 a, u128 b) { const __m128i k = _mm_set1_epi32((int)0x80000000u); return spu__xst(_mm_cmpgt_epi32(_mm_xor_si128(spu__xld(a), k), _mm_xor_si128(spu__xld(b), k))); }
 #else
 static inline u128 spu_clgt(u128 a, u128 b) { return spu_clgt_ref(a, b); }
 #endif
@@ -390,6 +404,8 @@ static inline u128 spu_ceqi_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i
 static inline u128 spu_ceqi(u128 a, int32_t imm) {
     return spu__st(vceqq_u32(spu__ld(a), vdupq_n_u32((uint32_t)imm)));
 }
+#elif defined(SPU_X86_VECTOR)
+static inline u128 spu_ceqi(u128 a, int32_t imm) { return spu__xst(_mm_cmpeq_epi32(spu__xld(a), _mm_set1_epi32(imm))); }
 #else
 static inline u128 spu_ceqi(u128 a, int32_t imm) { return spu_ceqi_ref(a, imm); }
 #endif
@@ -398,6 +414,8 @@ static inline u128 spu_cgti_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i
 static inline u128 spu_cgti(u128 a, int32_t imm) {
     return spu__st(vcgtq_s32(vreinterpretq_s32_u32(spu__ld(a)), vdupq_n_s32(imm)));
 }
+#elif defined(SPU_X86_VECTOR)
+static inline u128 spu_cgti(u128 a, int32_t imm) { return spu__xst(_mm_cmpgt_epi32(spu__xld(a), _mm_set1_epi32(imm))); }
 #else
 static inline u128 spu_cgti(u128 a, int32_t imm) { return spu_cgti_ref(a, imm); }
 #endif
@@ -406,6 +424,8 @@ static inline u128 spu_clgti_ref(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i
 static inline u128 spu_clgti(u128 a, int32_t imm) {
     return spu__st(vcgtq_u32(spu__ld(a), vdupq_n_u32((uint32_t)imm)));
 }
+#elif defined(SPU_X86_VECTOR)
+static inline u128 spu_clgti(u128 a, int32_t imm) { const __m128i k = _mm_set1_epi32((int)0x80000000u); return spu__xst(_mm_cmpgt_epi32(_mm_xor_si128(spu__xld(a), k), _mm_xor_si128(_mm_set1_epi32(imm), k))); }
 #else
 static inline u128 spu_clgti(u128 a, int32_t imm) { return spu_clgti_ref(a, imm); }
 #endif
@@ -437,18 +457,19 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) { return spu_selb_ref(a, b, 
  * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
  * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+    /* Result byte h depends only on control byte h, and both sit at the same host
+     * position (each word's bytes reversed alike), so the result is computed in host
+     * order directly: SPU source byte k lives at host byte k^3, hence index (C&15)^3.
+     * Before, a, b, c and the result were each byte-swapped into SPU order and back. */
     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
-    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
-    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
-    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
-    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
+    const __m128i idx = _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8(0x0F)), _mm_set1_epi8(3));
+    /* blendv reads each byte's top bit: shifting the 16-bit lanes left moves bit 4, 6
+     * or 5 of every byte into its top bit (bits crossing into the next byte stay low). */
+    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), _mm_slli_epi16(C, 3));
     /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
-    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
-    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
-    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
-    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
-    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+    const __m128i ones_or_80 = _mm_blendv_epi8(_mm_set1_epi8((char)0xFF), _mm_set1_epi8((char)0x80), _mm_slli_epi16(C, 2));
+    const __m128i special = _mm_blendv_epi8(_mm_setzero_si128(), ones_or_80, _mm_slli_epi16(C, 1));
+    r = _mm_blendv_epi8(r, special, C);
     u128 out; memcpy(&out, &r, 16); return out;
 }
 #elif defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
@@ -2036,6 +2057,121 @@ static inline u128 spu_fsmb(u128 a) {
     static const uint8_t w[16] = {16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8};
     const uint8x16_t v = vcombine_u8(vdup_n_u8((uint8_t)(a._u32[0] >> 8)), vdup_n_u8((uint8_t)a._u32[0]));
     return spu__st(vreinterpretq_u32_u8(vtstq_u8(v, vld1q_u8(w))));
+}
+#elif defined(SPU_X86_VECTOR)
+/* x86 forms of the per-lane integer ops (SSSE3; bit-identical to spu_X_ref,
+ * tests/test_spu_int_x86.c). Lane i of a halfword or word op is the same host lane on
+ * both sides, so only the bit-gather and mask-forming ops reorder lanes. */
+static inline __m128i spu__xs16(int32_t v) { return _mm_set1_epi16((short)v); }
+static inline __m128i spu__xflip8(__m128i v)  { return _mm_xor_si128(v, _mm_set1_epi8((char)0x80)); }
+static inline __m128i spu__xflip16(__m128i v) { return _mm_xor_si128(v, _mm_set1_epi16((short)0x8000)); }
+static inline __m128i spu__xlo16(__m128i v)   { return _mm_and_si128(v, _mm_set1_epi32(0xFFFF)); }
+static inline u128 spu_absdb(u128 a, u128 b) { const __m128i x = spu__xld(a), y = spu__xld(b); return spu__xst(_mm_or_si128(_mm_subs_epu8(x, y), _mm_subs_epu8(y, x))); }
+static inline u128 spu_avgb(u128 a, u128 b) { return spu__xst(_mm_avg_epu8(spu__xld(a), spu__xld(b))); }
+static inline u128 spu_ceqb(u128 a, u128 b) { return spu__xst(_mm_cmpeq_epi8(spu__xld(a), spu__xld(b))); }
+static inline u128 spu_cgtb(u128 a, u128 b) { return spu__xst(_mm_cmpgt_epi8(spu__xld(a), spu__xld(b))); }
+static inline u128 spu_clgtb(u128 a, u128 b) { return spu__xst(_mm_cmpgt_epi8(spu__xflip8(spu__xld(a)), spu__xflip8(spu__xld(b)))); }
+static inline u128 spu_ceqh(u128 a, u128 b) { return spu__xst(_mm_cmpeq_epi16(spu__xld(a), spu__xld(b))); }
+static inline u128 spu_cgth(u128 a, u128 b) { return spu__xst(_mm_cmpgt_epi16(spu__xld(a), spu__xld(b))); }
+static inline u128 spu_clgth(u128 a, u128 b) { return spu__xst(_mm_cmpgt_epi16(spu__xflip16(spu__xld(a)), spu__xflip16(spu__xld(b)))); }
+static inline u128 spu_ah(u128 a, u128 b) { return spu__xst(_mm_add_epi16(spu__xld(a), spu__xld(b))); }
+static inline u128 spu_sfh(u128 a, u128 b) { return spu__xst(_mm_sub_epi16(spu__xld(b), spu__xld(a))); }
+static inline u128 spu_shlh(u128 a, u128 b) { return spu_shlh_ref(a, b); }
+static inline u128 spu_roth(u128 a, u128 b) { return spu_roth_ref(a, b); }
+static inline u128 spu_rothm(u128 a, u128 b) { return spu_rothm_ref(a, b); }
+static inline u128 spu_rothma(u128 a, u128 b) { return spu_rothma_ref(a, b); }
+static inline u128 spu_shl(u128 a, u128 b) { return spu_shl_ref(a, b); }
+static inline u128 spu_rot(u128 a, u128 b) { return spu_rot_ref(a, b); }
+static inline u128 spu_rotm(u128 a, u128 b) { return spu_rotm_ref(a, b); }
+static inline u128 spu_rotma(u128 a, u128 b) { return spu_rotma_ref(a, b); }
+static inline u128 spu_cg(u128 a, u128 b) { return spu_cg_ref(a, b); }
+static inline u128 spu_bg(u128 a, u128 b) { return spu_bg_ref(a, b); }
+/* 16x16 multiplies: pmaddwd of a word whose high half is zero is the signed product
+ * of the low halves; the unsigned forms take mullo/mulhi of each halfword. */
+static inline __m128i spu__xmulu(__m128i x, __m128i y) {
+    return _mm_or_si128(spu__xlo16(_mm_mullo_epi16(x, y)), _mm_slli_epi32(_mm_mulhi_epu16(x, y), 16));
+}
+static inline u128 spu_mpy(u128 a, u128 b) { return spu__xst(_mm_madd_epi16(spu__xlo16(spu__xld(a)), spu__xlo16(spu__xld(b)))); }
+static inline u128 spu_mpyu(u128 a, u128 b) { return spu__xst(spu__xmulu(spu__xlo16(spu__xld(a)), spu__xlo16(spu__xld(b)))); }
+static inline u128 spu_mpyh(u128 a, u128 b) { return spu__xst(_mm_slli_epi32(_mm_madd_epi16(_mm_srli_epi32(spu__xld(a), 16), spu__xlo16(spu__xld(b))), 16)); }
+static inline u128 spu_mpyhh(u128 a, u128 b) { return spu__xst(_mm_madd_epi16(_mm_srli_epi32(spu__xld(a), 16), _mm_srli_epi32(spu__xld(b), 16))); }
+static inline u128 spu_mpyhhu(u128 a, u128 b) { return spu__xst(spu__xmulu(_mm_srli_epi32(spu__xld(a), 16), _mm_srli_epi32(spu__xld(b), 16))); }
+/* The product of two halfwords shifted right 16 always fits in 16 bits. */
+static inline u128 spu_mpys(u128 a, u128 b) { return spu__xst(_mm_srai_epi32(_mm_madd_epi16(spu__xlo16(spu__xld(a)), spu__xlo16(spu__xld(b))), 16)); }
+static inline u128 spu_sumb(u128 a, u128 b) { return spu_sumb_ref(a, b); }
+static inline u128 spu_ceqbi(u128 a, int32_t imm) { return spu__xst(_mm_cmpeq_epi8(spu__xld(a), _mm_set1_epi8((char)imm))); }
+static inline u128 spu_cgtbi(u128 a, int32_t imm) { return spu__xst(_mm_cmpgt_epi8(spu__xld(a), _mm_set1_epi8((char)imm))); }
+static inline u128 spu_clgtbi(u128 a, int32_t imm) { return spu__xst(_mm_cmpgt_epi8(spu__xflip8(spu__xld(a)), spu__xflip8(_mm_set1_epi8((char)imm)))); }
+static inline u128 spu_ceqhi(u128 a, int32_t imm) { return spu__xst(_mm_cmpeq_epi16(spu__xld(a), spu__xs16(imm))); }
+static inline u128 spu_cgthi(u128 a, int32_t imm) { return spu__xst(_mm_cmpgt_epi16(spu__xld(a), spu__xs16(imm))); }
+static inline u128 spu_clgthi(u128 a, int32_t imm) { return spu__xst(_mm_cmpgt_epi16(spu__xflip16(spu__xld(a)), spu__xflip16(spu__xs16(imm)))); }
+static inline u128 spu_ahi(u128 a, int32_t imm) { return spu__xst(_mm_add_epi16(spu__xld(a), spu__xs16(imm))); }
+static inline u128 spu_sfhi(u128 a, int32_t imm) { return spu__xst(_mm_sub_epi16(spu__xs16(imm), spu__xld(a))); }
+static inline u128 spu_mpyi(u128 a, int32_t imm) { return spu__xst(_mm_madd_epi16(spu__xlo16(spu__xld(a)), _mm_set1_epi32((int32_t)(uint16_t)imm))); }
+static inline u128 spu_mpyui(u128 a, int32_t imm) { return spu__xst(spu__xmulu(spu__xlo16(spu__xld(a)), _mm_set1_epi32((int32_t)(uint16_t)imm))); }
+/* Register-count shifts: a count of 16 (32) or more gives 0, or the sign fill for an
+ * arithmetic shift, as the scalar forms do. */
+static inline u128 spu_rothi(u128 a, int sh) {
+    sh &= 15; const __m128i x = spu__xld(a);
+    return spu__xst(_mm_or_si128(_mm_sll_epi16(x, _mm_cvtsi32_si128(sh)), _mm_srl_epi16(x, _mm_cvtsi32_si128(16 - sh))));
+}
+static inline u128 spu_roti(u128 a, int sh) {
+    sh &= 31; const __m128i x = spu__xld(a);
+    return spu__xst(_mm_or_si128(_mm_sll_epi32(x, _mm_cvtsi32_si128(sh)), _mm_srl_epi32(x, _mm_cvtsi32_si128(32 - sh))));
+}
+static inline u128 spu_rotmahi(u128 a, int i7) { return spu__xst(_mm_sra_epi16(spu__xld(a), _mm_cvtsi32_si128((0 - i7) & 0x1F))); }
+static inline u128 spu_rotmai(u128 a, int i7) { return spu__xst(_mm_sra_epi32(spu__xld(a), _mm_cvtsi32_si128((0 - i7) & 0x3F))); }
+static inline u128 spu_mpya(u128 a, u128 b, u128 c) { return spu__xst(_mm_add_epi32(spu__xld(spu_mpy(a, b)), spu__xld(c))); }
+static inline u128 spu_mpyhha(u128 a, u128 b, u128 t) { return spu__xst(_mm_add_epi32(spu__xld(spu_mpyhh(a, b)), spu__xld(t))); }
+static inline u128 spu_mpyhhau(u128 a, u128 b, u128 t) { return spu__xst(_mm_add_epi32(spu__xld(spu_mpyhhu(a, b)), spu__xld(t))); }
+static inline u128 spu_addx(u128 a, u128 b, u128 t) { return spu_addx_ref(a, b, t); }
+static inline u128 spu_sfx(u128 a, u128 b, u128 t) { return spu_sfx_ref(a, b, t); }
+static inline u128 spu_cgx(u128 a, u128 b, u128 t) { return spu_cgx_ref(a, b, t); }
+static inline u128 spu_bgx(u128 a, u128 b, u128 t) { return spu_bgx_ref(a, b, t); }
+static inline u128 spu_cntb(u128 a) {
+    const __m128i lut = _mm_setr_epi8(0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4), m = _mm_set1_epi8(0x0F), x = spu__xld(a);
+    return spu__xst(_mm_add_epi8(_mm_shuffle_epi8(lut, _mm_and_si128(x, m)), _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(x, 4), m))));
+}
+static inline u128 spu_xsbh(u128 a) { return spu__xst(_mm_srai_epi16(_mm_slli_epi16(spu__xld(a), 8), 8)); }
+static inline u128 spu_xshw(u128 a) { return spu__xst(_mm_srai_epi32(_mm_slli_epi32(spu__xld(a), 16), 16)); }
+static inline u128 spu_xswd(u128 a) {
+    /* Each doubleword: the odd word's value and, below it, its sign fill. */
+    const __m128i x = spu__xld(a), odd = _mm_shuffle_epi32(x, _MM_SHUFFLE(3, 1, 3, 1));
+    return spu__xst(_mm_unpacklo_epi32(_mm_srai_epi32(odd, 31), odd));
+}
+static inline u128 spu_clz(u128 a) { return spu_clz_ref(a); }
+static inline u128 spu_orx(u128 a) { return spu_orx_ref(a); }
+static inline u128 spu_gb(u128 a) {
+    const int m = _mm_movemask_ps(_mm_castsi128_ps(_mm_slli_epi32(spu__xld(a), 31)));   /* bit i = word i's LSB */
+    return spu__xst(_mm_cvtsi32_si128(((m & 1) << 3) | ((m & 2) << 1) | ((m & 4) >> 1) | ((m & 8) >> 3)));
+}
+static inline u128 spu_gbh(u128 a) {
+    /* Bit 7-i is SPU halfword i's LSB, host halfword i^1. */
+    const __m128i lsb = _mm_packs_epi16(_mm_slli_epi16(spu__xld(a), 15), _mm_setzero_si128());
+    const __m128i order = _mm_setr_epi8(6,7,4,5,2,3,0,1, -128,-128,-128,-128,-128,-128,-128,-128);
+    return spu__xst(_mm_cvtsi32_si128(_mm_movemask_epi8(_mm_shuffle_epi8(lsb, order))));
+}
+static inline u128 spu_gbb(u128 a) {
+    /* Bit 15-i is SPU byte i's LSB, host byte i^3. */
+    const __m128i lsb = _mm_slli_epi16(spu__xld(a), 7);
+    const __m128i order = _mm_setr_epi8(12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3);
+    return spu__xst(_mm_cvtsi32_si128(_mm_movemask_epi8(_mm_shuffle_epi8(lsb, order))));
+}
+static inline u128 spu_fsm(u128 a) {
+    const __m128i bit = _mm_setr_epi32(8, 4, 2, 1);
+    return spu__xst(_mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32((int32_t)(a._u32[0] & 0xF)), bit), bit));
+}
+static inline u128 spu_fsmh(u128 a) {
+    /* Host halfword j takes bit 7-(j^1). */
+    const __m128i bit = _mm_setr_epi16(0x40, 0x80, 0x10, 0x20, 0x04, 0x08, 0x01, 0x02);
+    return spu__xst(_mm_cmpeq_epi16(_mm_and_si128(spu__xs16((int32_t)(a._u32[0] & 0xFF)), bit), bit));
+}
+static inline u128 spu_fsmb(u128 a) {
+    /* Host byte j takes bit 15-(j^3) of the low halfword: from its high byte for j^3 < 8. */
+    const __m128i v = _mm_cvtsi32_si128((int32_t)(a._u32[0] & 0xFFFF));
+    const __m128i pick = _mm_shuffle_epi8(v, _mm_setr_epi8(1,1,1,1, 1,1,1,1, 0,0,0,0, 0,0,0,0));
+    const __m128i bit = _mm_setr_epi8(0x10,0x20,0x40,(char)0x80, 0x01,0x02,0x04,0x08, 0x10,0x20,0x40,(char)0x80, 0x01,0x02,0x04,0x08);
+    return spu__xst(_mm_cmpeq_epi8(_mm_and_si128(pick, bit), bit));
 }
 #else
 static inline u128 spu_absdb(u128 a, u128 b) { return spu_absdb_ref(a, b); }

@@ -82,8 +82,43 @@ int main(void)
         check("xori", spu_xori(a, imm), spu_xori_ref(a, imm), a, imm);
         check("selb", spu_selb(a, b, c), spu_selb_ref(a, b, c), a, it);
     }
+    /* Per-lane families: random operands, plus operands that share lanes with each other
+     * (equal lanes for the compares), every immediate class, and the 0x80/0xC0/0xE0
+     * shufb selectors. */
+    for (long it = 0; it < 300000; it++) {
+        u128 a = rnd128(), b = rnd128(), c = rnd128();
+        if (it % 5 == 0) for (int i = 0; i < 16; i++) if (rnd32() & 1) b._u8[i] = a._u8[i];
+        if (it % 11 == 0) { a._u32[it % 4] = 0x80000000u; b._u32[(it + 1) % 4] = 0x7FFFFFFFu; }
+        const int32_t imm = (it & 1) ? (int32_t)rnd32() : (int32_t)(rnd32() & 0x3FF) - 0x200;
+#define C2(op) check(#op, spu_##op(a, b), spu_##op##_ref(a, b), a, it)
+#define CI(op) check(#op, spu_##op(a, imm), spu_##op##_ref(a, imm), a, imm)
+#define C1(op) check(#op, spu_##op(a), spu_##op##_ref(a), a, it)
+#define C3(op) check(#op, spu_##op(a, b, c), spu_##op##_ref(a, b, c), a, it)
+        C2(a); C2(sf); C2(ceq); C2(cgt); C2(clgt); CI(ai); CI(sfi); CI(ceqi); CI(cgti); CI(clgti);
+        C2(absdb); C2(avgb); C2(ceqb); C2(cgtb); C2(clgtb); C2(ceqh); C2(cgth); C2(clgth); C2(ah); C2(sfh);
+        C2(mpy); C2(mpyu); C2(mpyh); C2(mpyhh); C2(mpyhhu); C2(mpys);
+        CI(ceqbi); CI(cgtbi); CI(clgtbi); CI(ceqhi); CI(cgthi); CI(clgthi); CI(ahi); CI(sfhi); CI(mpyi); CI(mpyui);
+        C3(mpya); C3(mpyhha); C3(mpyhhau);
+        C1(cntb); C1(xsbh); C1(xshw); C1(xswd); C1(gb); C1(gbh); C1(gbb); C1(fsm); C1(fsmh); C1(fsmb);
+        if (it % 3 == 0) for (int i = 0; i < 16; i++) { const uint8_t r8 = (uint8_t)rnd32(); if (r8 < 96) c._u8[i] = (uint8_t)(0x80 | (r8 & 0x7F)); }
+        check("shufb", spu_shufb(a, b, c), spu_shufb_ref(a, b, c), a, it);
+#undef C2
+#undef CI
+#undef C1
+#undef C3
+    }
+    /* Immediate rotates and shifts: every count, including out-of-range ones. */
+    for (int it = 0; it < 2000; it++) {
+        const u128 a = rnd128();
+        for (int k = -130; k <= 130; k++) {
+            check("rothi", spu_rothi(a, k), spu_rothi_ref(a, k), a, k);
+            check("roti", spu_roti(a, k), spu_roti_ref(a, k), a, k);
+            check("rotmahi", spu_rotmahi(a, k), spu_rotmahi_ref(a, k), a, k);
+            check("rotmai", spu_rotmai(a, k), spu_rotmai_ref(a, k), a, k);
+        }
+    }
     if (s_bad) { printf("test_spu_int_x86: %ld mismatches of %ld checks\n", s_bad, s_checks); return 1; }
-    printf("test_spu_int_x86: ok (%ld checks, 24 helpers)\n", s_checks);
+    printf("test_spu_int_x86: ok (%ld checks, 78 helpers)\n", s_checks);
     return 0;
 #endif
 }
