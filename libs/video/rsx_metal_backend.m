@@ -3926,8 +3926,10 @@ static void eng_diag_end(void)
 static unsigned s_eng_trace_draws, s_eng_trace_submits;
 static int eng_trace_enabled(void)
 {
-    const char* opt = getenv("PS3RECOMP_METAL_DRAW_DIAGNOSTICS");
-    return opt && !strcmp(opt, "1");
+    /* Asked on every recorded draw: read once. */
+    static int on = -1;
+    if (on < 0) { const char* opt = getenv("PS3RECOMP_METAL_DRAW_DIAGNOSTICS"); on = opt && !strcmp(opt, "1"); }
+    return on;
 }
 static void eng_trace_draw(const EngRecord* r)
 {
@@ -4111,6 +4113,35 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
 
 /* ---- replay -------------------------------------------------------------- */
 
+/* What the open render encoder already holds. A Metal encoder keeps every
+ * binding and piece of state until it is set again, so a draw only sends
+ * what differs from the draw before it in the same pass: a run of draws with
+ * one material changed little more than its buffer offsets, yet sent about
+ * fifty messages each. Identity is the object itself (or the offset, or the
+ * value); `fresh` until the first draw of each encoder sets everything. */
+static struct {
+    int fresh;
+    const void* pso; const void* ds;
+    MTLCullMode cull; MTLWinding winding; u32 stencil_ref;
+    float vp[4]; u32 sc[4];
+    const void* vb; u32 vb_off;
+    const void* vcb; u32 vcb_off;
+    const void* pcb; u32 pcb_off;
+    const void* tex[RSX_BE_MAX_TEXTURES]; const void* samp[RSX_BE_MAX_TEXTURES];
+    const void* vtex[RSX_BE_MAX_VERTEX_TEXTURES]; const void* vsamp[RSX_BE_MAX_VERTEX_TEXTURES];
+    unsigned long long sent, skipped;
+} s_enc;
+/* A new encoder holds nothing: forget every binding (a scissor or constant
+ * buffer the first draw does not set must not match a stale one), keep the
+ * counters. */
+static void eng_encode_state_reset(void)
+{
+    const unsigned long long sent = s_enc.sent, skipped = s_enc.skipped;
+    memset(&s_enc, 0, sizeof s_enc);
+    s_enc.sent = sent; s_enc.skipped = skipped;
+    s_enc.fresh = 1;
+}
+
 static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                             id<MTLBuffer> stage)
 {
@@ -4118,34 +4149,71 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
     if (!p->pso || !p->ds) {eng_checked_fail();return;}
     if (s_eng_diag.active) ++s_eng_diag.encoded_draws;
-    [enc setRenderPipelineState:p->pso];
-    [enc setDepthStencilState:p->ds];
-    [enc setCullMode:p->cull];
-    [enc setFrontFacingWinding:p->winding];
-    [enc setStencilReferenceValue:r->stencil_ref];
-    MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
-    [enc setViewport:vp];
-    if (r->sc[2] && r->sc[3])
-        [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
-    [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
-    if (r->vs_cb_bytes) [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
-    if (r->ps_cb_bytes) [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
+    const int all = s_enc.fresh;
+    s_enc.fresh = 0;
+    u32 sent = 0, skipped = 0;
+#define ENC_SET(differs, update, call) do { if (all || (differs)) { call; update; sent++; } else skipped++; } while (0)
+    ENC_SET(s_enc.pso != (__bridge const void*)p->pso, s_enc.pso = (__bridge const void*)p->pso,
+            [enc setRenderPipelineState:p->pso]);
+    ENC_SET(s_enc.ds != (__bridge const void*)p->ds, s_enc.ds = (__bridge const void*)p->ds,
+            [enc setDepthStencilState:p->ds]);
+    ENC_SET(s_enc.cull != p->cull, s_enc.cull = p->cull, [enc setCullMode:p->cull]);
+    ENC_SET(s_enc.winding != p->winding, s_enc.winding = p->winding, [enc setFrontFacingWinding:p->winding]);
+    ENC_SET(s_enc.stencil_ref != r->stencil_ref, s_enc.stencil_ref = r->stencil_ref,
+            [enc setStencilReferenceValue:r->stencil_ref]);
+    {
+        MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
+        ENC_SET(memcmp(s_enc.vp, r->vp, sizeof s_enc.vp), memcpy(s_enc.vp, r->vp, sizeof s_enc.vp),
+                [enc setViewport:vp]);
+    }
+    /* A draw without a scissor leaves the last one set, as before. */
+    if (r->sc[2] && r->sc[3]) {
+        const MTLScissorRect sc = { r->sc[0], r->sc[1], r->sc[2], r->sc[3] };
+        ENC_SET(memcmp(s_enc.sc, r->sc, sizeof s_enc.sc), memcpy(s_enc.sc, r->sc, sizeof s_enc.sc),
+                [enc setScissorRect:sc]);
+    }
+    /* The same stage buffer at another offset is an offset change. */
+    {
+        const void* sb = (__bridge const void*)stage;
+        if (all || s_enc.vb != sb) { [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX]; sent++; }
+        else if (s_enc.vb_off != r->vb_off) { [enc setVertexBufferOffset:r->vb_off atIndex:MTL_VB_INDEX]; sent++; }
+        else skipped++;
+        s_enc.vb = sb; s_enc.vb_off = r->vb_off;
+        if (r->vs_cb_bytes) {
+            if (all || s_enc.vcb != sb) { [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0]; sent++; }
+            else if (s_enc.vcb_off != r->vs_cb_off) { [enc setVertexBufferOffset:r->vs_cb_off atIndex:0]; sent++; }
+            else skipped++;
+            s_enc.vcb = sb; s_enc.vcb_off = r->vs_cb_off;
+        }
+        if (r->ps_cb_bytes) {
+            if (all || s_enc.pcb != sb) { [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1]; sent++; }
+            else if (s_enc.pcb_off != r->ps_cb_off) { [enc setFragmentBufferOffset:r->ps_cb_off atIndex:1]; sent++; }
+            else skipped++;
+            s_enc.pcb = sb; s_enc.pcb_off = r->ps_cb_off;
+        }
+    }
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         id<MTLTexture> t = eng_obj(r->tex[u]);
         if(r->tex[u] && !t)eng_checked_fail();
-        [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
-        [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
-                                                      : s_default_sampler)
-                             atIndex:(NSUInteger)u];
+        id<MTLTexture> bt = t ? t : s_null_tex;
+        id<MTLSamplerState> bs = r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp : s_default_sampler;
+        ENC_SET(s_enc.tex[u] != (__bridge const void*)bt, s_enc.tex[u] = (__bridge const void*)bt,
+                [enc setFragmentTexture:bt atIndex:(NSUInteger)u]);
+        ENC_SET(s_enc.samp[u] != (__bridge const void*)bs, s_enc.samp[u] = (__bridge const void*)bs,
+                [enc setFragmentSamplerState:bs atIndex:(NSUInteger)u]);
     }
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
         id<MTLTexture> t = eng_obj(r->vtex[u]);
         if(r->vtex[u] && !t)eng_checked_fail();
-        [enc setVertexTexture:(t ? t : s_null_tex) atIndex:MTL_VTEX_INDEX(u)];
-        [enc setVertexSamplerState:(r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
-                                                     : s_default_sampler)
-                           atIndex:MTL_VSAMP_INDEX(u)];
+        id<MTLTexture> bt = t ? t : s_null_tex;
+        id<MTLSamplerState> bs = r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp : s_default_sampler;
+        ENC_SET(s_enc.vtex[u] != (__bridge const void*)bt, s_enc.vtex[u] = (__bridge const void*)bt,
+                [enc setVertexTexture:bt atIndex:MTL_VTEX_INDEX(u)]);
+        ENC_SET(s_enc.vsamp[u] != (__bridge const void*)bs, s_enc.vsamp[u] = (__bridge const void*)bs,
+                [enc setVertexSamplerState:bs atIndex:MTL_VSAMP_INDEX(u)]);
     }
+#undef ENC_SET
+    s_enc.sent += sent; s_enc.skipped += skipped;
     /* An indexed draw is really indexed here: the index buffer is what keeps a
      * strip's shared vertices from being fetched and uploaded per triangle.
      * Only a rebuilt triangle list is ever indexed; points and lines arrive as
@@ -4399,6 +4467,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             continue;
         }
         s_ft_passes++;
+        eng_encode_state_reset();
         while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
                (s_eng_rec[i].depth == depth ||
