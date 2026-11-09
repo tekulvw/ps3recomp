@@ -6540,7 +6540,16 @@ static void vulkan_original_shutdown(void)
     memset(&s_show, 0, sizeof s_show);
 }
 
+static int vk_pump_messages_core(void);
+/* PS3RECOMP_RSX_FIFO_BUSY: the window and event pump, as Metal counts it. */
 int rsx_vulkan_backend_pump_messages(void)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PUMP);
+    const int r = vk_pump_messages_core();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PUMP);
+    return r;
+}
+static int vk_pump_messages_core(void)
 {
     vk_show_pump();
 #ifdef _WIN32
@@ -6594,10 +6603,15 @@ int rsx_vulkan_backend_pump_messages(void)
 #endif
 }
 
+/* PS3RECOMP_RSX_FIFO_BUSY: a host-driven present, outside the engine present
+ * (PRESENT) and the swapchain waits (DRAWABLE) it contains -- the present
+ * ring's fence waits and copies -- as Metal counts it. */
 void rsx_vulkan_backend_present(void)
 {
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT_HOST);
     rsx_vulkan_backend_present_begin();
     rsx_vulkan_backend_present_finish();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);
 }
 
 static void vulkan_original_present_begin(void)
