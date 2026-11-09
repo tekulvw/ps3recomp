@@ -64,7 +64,9 @@ with tempfile.TemporaryDirectory(prefix='spu-dcache-coverage-') as td:
                 'overlap-mask':('if(lsa>=s_verified_images[i].lo && lsa<s_verified_images[i].hi)',
                                 'if(i==0 && lsa>=s_verified_images[i].lo && lsa<s_verified_images[i].hi)'),
                 'odd-publication':('if(vregistration&1u)return spu_lifted_lookup_full(ctx,lsa);','/* bug: accepts incomplete publication */'),
-                'mixed-store':('if (fn && __atomic_load_n(&s_verified_generation,__ATOMIC_ACQUIRE)==vregistration) {','if (fn) {'),
+                'mixed-store':('if (cacheable && __atomic_load_n(&s_verified_generation,__ATOMIC_ACQUIRE)==vregistration) {','if (cacheable) {'),
+                'cached-slot-miss':('                cacheable = 0;\n','                ;\n'),
+                'uncached-miss':('    if (!fn && !vmask) {\n        cacheable = 1;','    if (0) {\n        cacheable = 1;'),
             }
             for name,(old,new) in controls.items():
                 assert original.count(old)==1,(name,original.count(old))

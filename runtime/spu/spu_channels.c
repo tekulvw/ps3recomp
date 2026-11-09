@@ -2832,10 +2832,20 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
  *    image whose range covers its target, so a GET that could change what
  *    the resolver compares invalidates it, whichever way the answer went.
  * Like residency (verify once per load), an SPU store into code is not
- * tracked. Misses are not cached. =shadow runs the full resolver on every
- * hit, counts disagreements and returns the full answer. */
+ * tracked. =shadow runs the full resolver on every hit, counts disagreements
+ * and returns the full answer.
+ *
+ * Misses are cached too, under the same keys, where nothing the keys miss
+ * can turn them into hits: only at an LSA that no verified image's range and
+ * no resident code slot covers (a pending slot can verify later without a
+ * residency change). Code the game writes at run time and branches to -- the
+ * WWS job manager's interrupt save/restore shim is entered ~100k times a
+ * second -- otherwise re-ran the whole resolver on every entry. A stale
+ * cached miss could only send code to the interpreter, which runs the same
+ * live local store, never to the wrong lifted function. */
 typedef struct {
-    spu_lifted_fn fn;
+    spu_lifted_fn fn;   /* NULL with `valid` set: a cached miss */
+    uint8_t valid;
     uint32_t id, lsa, rgen, vgen, vregistration, residency, vsum; uint16_t vmask;
     int image, ovl, task; uint8_t flags;
 } spu_dcache_ent;
@@ -2922,10 +2932,10 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     spu_dcache_tls* t = &t_dcache;
     const uint8_t flags = (uint8_t)((ctx->policy_mode ? 1 : 0) | (ctx->ls != ctx->ls_store ? 2 : 0));
     spu_dcache_ent* e = &t->ent[(((lsa >> 2) ^ id) * 0x9E3779B1u) >> 23];
-    const uint16_t vmask=e->fn && e->lsa==lsa && e->vgen==vgen &&
+    const uint16_t vmask=e->valid && e->lsa==lsa && e->vgen==vgen &&
         e->vregistration==vregistration ? e->vmask : spu_dcache_coverage_mask(lsa,vgen);
     uint32_t vsum=spu_dcache_epoch_sum(t,vmask);
-    if (e->fn && e->id == id && e->lsa == lsa && e->image == ctx->image_id &&
+    if (e->valid && e->id == id && e->lsa == lsa && e->image == ctx->image_id &&
         e->ovl == ctx->resident_ovl && e->task == ctx->resident_task && e->flags == flags &&
         e->rgen == rgen && e->vgen == vgen &&
         e->vregistration==vregistration &&
@@ -2939,7 +2949,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
                 if (bad < 16)
                     fprintf(stderr, "[spu-dcache] shadow mismatch img=%d ovl=%d task=%d lsa=0x%05X cached=%p full=%p\n",
                             ctx->image_id, ctx->resident_ovl, ctx->resident_task, lsa, (void*)e->fn, (void*)full);
-                e->fn = NULL;
+                e->valid = 0;
                 return full;
             }
             spu_dcache_stats();
@@ -2953,8 +2963,17 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     /* The full resolver may verify a resident slot (pending -> verified);
      * read the epochs after it so the entry describes the state it saw. */
     spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa);
-    if (fn && __atomic_load_n(&s_verified_generation,__ATOMIC_ACQUIRE)==vregistration) {
+    int cacheable = fn != NULL;
+    if (!fn && !vmask) {
+        cacheable = 1;
+        for (unsigned slot = 0; slot < 4; ++slot)
+            if (ctx->resident_code[slot].image_id && lsa >= ctx->resident_code[slot].lsa &&
+                lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
+                cacheable = 0;
+    }
+    if (cacheable && __atomic_load_n(&s_verified_generation,__ATOMIC_ACQUIRE)==vregistration) {
         vsum=spu_dcache_epoch_sum(t,vmask);
+        e->valid = 1;
         e->id = id; e->fn = fn; e->lsa = lsa; e->image = ctx->image_id;
         e->ovl = ctx->resident_ovl; e->task = ctx->resident_task; e->flags = flags;
         e->rgen = rgen; e->vgen = vgen; e->vregistration=vregistration;
