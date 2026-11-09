@@ -218,6 +218,18 @@ int main(void)
         m(M_DRAW_ARRAYS, 0u | ((3u - 1u) << 24));
         m(M_BEGIN_END, 0u);
         CHECK(g_host.creates == 1 && g_host.draws == hosts0 + 2, "the next draw reuses the pipeline");
+        /* A float4 draw with the same program and state, then the host draw
+         * again: each takes its own pipeline, never the other's. */
+        const int creates_before = stub.n_pipeline_create;
+        m(M_VTXFMT, 6u | (1u << 4) | (16u << 8));            /* CMP32: float4 path */
+        draw_triangle();
+        const u32 float4_pipe = stub.bound_pipeline;
+        m(M_VTXFMT, 2u | (4u << 4) | (16u << 8));
+        m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+        m(M_DRAW_ARRAYS, 0u | ((3u - 1u) << 24));
+        m(M_BEGIN_END, 0u);
+        CHECK(stub.n_pipeline_create == creates_before + 1 && stub.bound_pipeline != float4_pipe &&
+              g_host.draws == hosts0 + 3, "float4 and host-format draws of one program keep separate pipelines");
         /* CMP32 has no host format: refused, drawn as float4. */
         m(M_VTXFMT, 6u | (1u << 4) | (16u << 8));
         unsigned long long hd = 0, hr = 0;
@@ -225,7 +237,7 @@ int main(void)
         draw_triangle();
         unsigned long long hd2 = 0, hr2 = 0;
         rsx_draw_engine_host_vertex_counts(&hd2, &hr2);
-        CHECK(hr2 == hr + 1 && stub.n_draw == draws0 + 1 && g_host.draws == hosts0 + 2,
+        CHECK(hr2 == hr + 1 && stub.n_draw == draws0 + 2 && g_host.draws == hosts0 + 3,
               "an attribute without a host format takes the float4 path");
         m(M_VTXFMT, 2u | (4u << 4) | (16u << 8));
         engine_down();
@@ -236,7 +248,7 @@ int main(void)
         m(0x1D60, 64);
         const int before = stub.n_draw;
         draw_triangle();
-        CHECK(stub.n_draw == before + 1 && g_host.draws == hosts0 + 2, "with the switch off every draw is float4");
+        CHECK(stub.n_draw == before + 1 && g_host.draws == hosts0 + 3, "with the switch off every draw is float4");
         engine_down();
         g_stub_backend.pipeline_create_host = NULL;
         g_stub_backend.draw_host = NULL;

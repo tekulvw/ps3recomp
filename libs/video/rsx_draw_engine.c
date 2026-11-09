@@ -2494,6 +2494,8 @@ typedef struct {
     rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES];
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
     u32 layout_mask, layout_stride, rt_fmt, rt_count;
+    u32 host_on;                                  /* host-format streams (#65) */
+    u8 host_formats[RSX_DSP_NUM_VERTEX_ATTR];
     rsx_be_render_state rs;
 } eng_key_inputs;
 static struct {
@@ -2616,6 +2618,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     }
     in.layout_mask = layout->mask; in.layout_stride = layout->stride;
     in.rt_fmt = (u32)rt_fmt; in.rt_count = rt_count;
+    if (host_formats) { in.host_on = 1; memcpy(in.host_formats, host_formats, layout->count); }
     in.rs = *rs;
     if (s_pkm.valid && !memcmp(&s_pkm.in, &in, sizeof in)) {
         s_pkm.hits++;
