@@ -281,6 +281,32 @@ int main(int argc, char** argv)
         else CHECK(still == VK_SUCCESS, "per-operation submissions wait for foreign queue work");
     }
 
+    /* Large draws with no ticket between them: a batch whose arena fills is
+     * submitted and the slots grow, so later batches hold more draws. Each
+     * draw is 2,046 vertices (64 KB) of one faint quad, repeated. */
+    {
+        enum { BIG = 2046 };
+        static float big[BIG * 8];
+        const float faint[4] = { 0.2f, 0.9f, 0.4f, 0.02f };
+        for (u32 q = 0; q < BIG / 6; q++) quad(big + q * 6 * 8, -0.8f, -0.8f, -0.2f, 0.4f, faint);
+        u32 target = rt;
+        const unsigned long long grows0 = s_bat.arena_grows;
+        for (u32 i = 0; i < 160; i++) {
+            vk_eng_bind_targets(NULL, &target, 1, z);
+            vk_eng_bind_pipeline(NULL, p_blend);
+            vk_eng_bind_textures(NULL, &t0, samps, 1u);
+            vk_eng_draw(NULL, RSX_TOPOLOGY_TRIANGLES, big, BIG - BIG % 6, 32, NULL, 0);
+        }
+        CHECK(vk_eng_submit_and_wait_checked(NULL, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "large draws flushed");
+        if (batched) {
+            printf("%s: arena flushes %llu, slots grown %llu, arena now %llu MiB\n", argv[1],
+                   (unsigned long long)s_bat.arena_flushes, (unsigned long long)(s_bat.arena_grows - grows0),
+                   (unsigned long long)(s_bat.arena_want >> 20));
+            CHECK(s_bat.arena_flushes > 0 && s_bat.arena_want > (4u << 20) && s_bat.arena_grows > grows0,
+                  "a full arena grows the slots");
+        }
+    }
+
     /* Everything the CPU reads: both targets and the depth. */
     static u8 out[2 * TW * TH * 4 + TW * TH * 4];
     vk_eng_readback(NULL, rt, 0, 0, TW, TH, out, TW * 4);
