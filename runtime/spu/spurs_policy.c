@@ -534,7 +534,33 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                     spu_num, (void*)ctx, pm_halted, ctx->status, (uint32_t)ctx->pc & SPU_LS_MASK,
                     ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], ctx->host_depth);
             for (unsigned k = 0; k < n; k++) fprintf(stderr, " %05X", r[k]);
-            fprintf(stderr, "\n"); fflush(stderr); } }
+            fprintf(stderr, "\n");
+            /* Which workload and code the run was in, the drain/interrupt state
+             * it ended with, and the depth-0 restarts it went through (the
+             * return pc each one found: a stale one stops the interpreter
+             * fallback at a mid-function return address). */
+            fprintf(stderr, "[pm-end]   wid=%u spurs=0x%08X data=0x%llX img=%d ovl=%d task=%d "
+                    "LS1DC=0x%08X drain_ret=0x%05X irq_frame=%d int_en=%u ev=0x%X/0x%X "
+                    "resets=%u last_reset_pc=0x%05X stale_ret=0x%05X\n",
+                    wid, spurs_ea, (unsigned long long)wkl_data, ctx->image_id,
+                    (int)ctx->resident_ovl, (int)ctx->resident_task,
+                    ((uint32_t)ctx->ls[0x1DC] << 24) | ((uint32_t)ctx->ls[0x1DD] << 16) |
+                    ((uint32_t)ctx->ls[0x1DE] << 8) | ctx->ls[0x1DF],
+                    ctx->drain_ret_pc & SPU_LS_MASK, ctx->irq_frame != 0, (unsigned)ctx->int_enable,
+                    ctx->event_status, ctx->event_mask, ctx->dbg_reset_n,
+                    ctx->dbg_reset_pc, ctx->dbg_reset_stale_ret & SPU_LS_MASK);
+            const uint32_t cn = ctx->dbg_chring_n < 16 ? ctx->dbg_chring_n : 16;
+            if (cn) {   /* PS3RECOMP_SPU_CHRING=1: oldest first; op 0 rdch, 1 wrch */
+                fprintf(stderr, "[pm-end]   channels:");
+                for (uint32_t k = 0; k < cn; k++) {
+                    const uint32_t i = (ctx->dbg_chring_n - cn + k) & 15u;
+                    fprintf(stderr, " %s%u@%05X=%08X", (ctx->dbg_chring[i].op_ch >> 16) ? "w" : "r",
+                            ctx->dbg_chring[i].op_ch & 0xFFFFu, ctx->dbg_chring[i].pc,
+                            ctx->dbg_chring[i].value);
+                }
+                fprintf(stderr, "\n");
+            }
+            fflush(stderr); } }
 
     if (s_claimlog) {
         unsigned claims = g_spu_putllc_sync_hit - claim_before;

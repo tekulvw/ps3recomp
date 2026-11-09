@@ -395,6 +395,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     ctx->host_depth = 0;
     ctx->irq_frame = 0;
     ctx->drain_ret_pc = 0;
+    ctx->dbg_reset_n = 0;   /* this run's depth-0 restarts, for [pm-end] */
     /* Nest-safe: a job run synchronously from inside another SPU's execution
      * re-enters here on the same host thread. The halt target is per-thread,
      * so save the outer one and put it back on the way out -- otherwise the
@@ -422,6 +423,20 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;
         g_spu_trampoline_fn = 0;
+        /* No drain is live on the driver stack either, so no return point is.
+         * The innermost abandoned drain's return pc used to survive here: a
+         * later `bi $lr` to that same mid-function address stopped the
+         * interpreter fallback at once and ended the run outside the kernel
+         * ([pm-end]). Upstream's drain exit restoring the enclosing pc
+         * (SPU_DRAIN_POP_IRQ) kept the stale value alive for the rest of the
+         * run. PS3RECOMP_SPU_RESET_KEEPS_RET=1 restores the old behaviour. */
+        ctx->dbg_reset_n++;
+        ctx->dbg_reset_pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+        ctx->dbg_reset_stale_ret = ctx->drain_ret_pc;
+        { static int s_keep = -1;
+          if (s_keep < 0) { const char* e = getenv("PS3RECOMP_SPU_RESET_KEEPS_RET");
+                            s_keep = e && e[0] == '1' && !e[1]; }
+          if (!s_keep) ctx->drain_ret_pc = 0; }
         spu_indirect_branch(ctx);
         SPU_DRAIN(ctx);
         break;
@@ -1250,11 +1265,28 @@ static int channel_is_mfc(uint32_t ch)
     }
 }
 
+/* PS3RECOMP_SPU_CHRING=1: keep each context's last 16 channel operations
+ * (spu_context.dbg_chring) for the [pm-end] report. Off: one cached load. */
+static int s_spu_chring = -1;
+static inline void spu_chring_note(spu_context* ctx, uint32_t op, uint32_t channel, uint32_t value)
+{
+    if (__builtin_expect(s_spu_chring < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_SPU_CHRING");
+        s_spu_chring = e && e[0] == '1' && !e[1];
+    }
+    if (!s_spu_chring) return;
+    const uint32_t i = ctx->dbg_chring_n++ & 15u;
+    ctx->dbg_chring[i].pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+    ctx->dbg_chring[i].op_ch = op << 16 | (channel & 0xFFFFu);
+    ctx->dbg_chring[i].value = value;
+}
+
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
+    spu_chring_note(ctx, 1, channel, value._u32[0]);
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
      * work descriptor or is waiting on a channel we never satisfy; the channel
@@ -1599,6 +1631,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
          * tag mask, stall status, atomic status): mfc_channel_read never uses
          * the engine, so a tag or atomic-status poll does not look it up. */
         v = mfc_channel_read(NULL, ctx, channel);
+        spu_chring_note(ctx, 0, channel, v);
         return spu_make_preferred_u32(v);
     }
 
@@ -1671,6 +1704,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
         v = 0;
         break;
     }
+    spu_chring_note(ctx, 0, channel, v);
     return spu_make_preferred_u32(v);
 }
 

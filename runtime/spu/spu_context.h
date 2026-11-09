@@ -422,6 +422,14 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+    /* Diagnostics for a run that ends outside exitToKernel ([pm-end] in
+     * spurs_policy.c): the last depth-0 restart of this context (a guest
+     * stack reset, a task resume or a restart dispatch: the driver's
+     * SPU_SETJMP case 2) and the drain_ret_pc it found there; and, with
+     * PS3RECOMP_SPU_CHRING=1, its last 16 channel operations. */
+    uint32_t dbg_reset_n, dbg_reset_pc, dbg_reset_stale_ret;
+    uint32_t dbg_chring_n;
+    struct { uint32_t pc, op_ch, value; } dbg_chring[16];   /* op_ch: op << 16 | channel */
     uint32_t region_dispatch_depth, region_return_pc;
     int region_dispatch_valid, region_has_return;
 
