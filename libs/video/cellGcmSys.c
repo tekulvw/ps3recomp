@@ -2819,8 +2819,61 @@ void gcm_forget_spu_blocks(void)
     s_spu_blk_w = 0;
 }
 
+/* PS3RECOMP_GCM_PARK_KICK=1 (default off; read once): wake the walker when an
+ * SPU transfer lands on the self-JUMP it parked on. A title whose SPU jobs
+ * fill reserved holes in the command stream leaves a jump-to-self where the
+ * walker must wait; the fill is an SPU DMA, which kicks nothing, so a walker
+ * that reached the hole first slept until the next PPU put or its idle
+ * timeout. s_park_wait_ea is the parked word's guest address (0: not parked):
+ * set by the walker when a pass ends on a park, taken by the transfer that
+ * covers it, cleared when the next pass starts. */
+void cellGcm_fifo_kick_notify(void);
+static int s_park_kick = -1;
+static _Atomic u32 s_park_wait_ea;
+static _Atomic unsigned long long s_park_kicks, s_park_self_kicks;
+static int gcm_park_kick_on(void)
+{
+    if (s_park_kick < 0) { const char* e = getenv("PS3RECOMP_GCM_PARK_KICK"); s_park_kick = e && !strcmp(e, "1"); }
+    return s_park_kick;
+}
+static void gcm_park_kick_put(u32 ea, u32 size)
+{
+    /* Pairs with the walker's store-then-reread in gcm_park_kick_arm: either
+     * this load sees the park, or the walker's reread sees this write. */
+    atomic_thread_fence(memory_order_seq_cst);
+    u32 pe = atomic_load_explicit(&s_park_wait_ea, memory_order_relaxed);
+    if (!pe || pe - ea >= size) return;
+    if (!atomic_compare_exchange_strong(&s_park_wait_ea, &pe, 0u)) return;
+    atomic_fetch_add(&s_park_kicks, 1ull);
+    cellGcm_fifo_kick_notify();
+}
+static void gcm_park_kick_arm(u32 ea, u32 word)
+{
+    if (!gcm_park_kick_on() || !ea) return;
+    static unsigned long long parks, last_ms;
+    parks++;
+    if (s_frame_log) {   /* PS3RECOMP_RSX_INFLIGHT_LOG=1 */
+        extern unsigned long long ps3_ms_now(void);
+        const unsigned long long now = ps3_ms_now();
+        if (now - last_ms >= 2000u) {
+            last_ms = now;
+            fprintf(stderr, "[park kick] parks=%llu kicked_by_fill=%llu kicked_on_reread=%llu\n",
+                    parks, (unsigned long long)atomic_load(&s_park_kicks),
+                    (unsigned long long)atomic_load(&s_park_self_kicks));
+        }
+    }
+    atomic_store(&s_park_wait_ea, ea);
+    /* A fill that landed after the walker read the park and before the store
+     * above found nothing to wake: look at the word again. */
+    if (vm_read32(ea) != word && atomic_exchange(&s_park_wait_ea, 0u)) {
+        atomic_fetch_add(&s_park_self_kicks, 1ull);
+        cellGcm_fifo_kick_notify();
+    }
+}
+
 void gcm_note_spu_put(u32 ea, u32 size)
 {
+    if (s_park_kick > 0 && size) gcm_park_kick_put(ea, size);
     if (!size || size > 0x40000u) return;
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
@@ -3318,6 +3371,8 @@ static void gcm_rsx_process_fifo_pass(void)
      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (gcm_checked_ref_mode() && atomic_load(&s_checked_ref_failed)) return;
+    /* This pass looks at the stream again: a park it ends on is armed anew. */
+    if (s_park_kick > 0) atomic_store(&s_park_wait_ea, 0u);
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
     /* rsx_state feeds only the legacy vtable backend. With the draw engine
      * up and no vtable registered, the state it builds is never read, and
@@ -3604,6 +3659,7 @@ static void gcm_rsx_process_fifo_pass(void)
                   }
                   why = "parked";
                   s_park_pass = 1;
+                  gcm_park_kick_arm(ea, w);
                   if (gcm_checked_ref_mode()) {
                       producer_waiting=1;
                       why="checked-jump-producer-wait";
