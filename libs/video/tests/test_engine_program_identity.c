@@ -111,7 +111,12 @@ int main(void)
         const int pipelines = stub.n_pipeline_create;
         u32 got[4]; memcpy(got, g_ps_block, 16);
         CHECK(g_ps_bytes >= 16 && !memcmp(got, a, 16), "the program's inline constant reaches the draw");
+        unsigned long long ph0 = 0, pm0 = 0, ph = 0, pm = 0;
+        rsx_draw_engine_pipeline_memo_counts(&ph0, &pm0);
         draw_triangle(); draw_triangle();
+        rsx_draw_engine_pipeline_memo_counts(&ph, &pm);
+        CHECK(ph - ph0 == 2 && pm == pm0 && stub.n_pipeline_create == pipelines,
+              "repeat draws take the previous draw's pipeline without a key (%llu hits)", ph - ph0);
         rsx_draw_engine_fp_memo_counts(&hits, &misses);
         CHECK(misses - misses0 == 1 && hits - hits0 >= 2, "repeat draws reuse the program's products (%llu hits, %llu misses)",
               hits - hits0, misses - misses0);
@@ -132,6 +137,17 @@ int main(void)
         draw_triangle();
         CHECK(stub.n_pipeline_create == pipelines + 1, "an instruction rewritten in place builds a pipeline (%d)",
               stub.n_pipeline_create);
+        /* Render state is key input too: a blend change is a new pipeline,
+         * and changing it back finds the old one. */
+        const u32 before = stub.bound_pipeline;
+        m(0x0310, 1u);                       /* BLEND_ENABLE */
+        draw_triangle();
+        CHECK(stub.n_pipeline_create == pipelines + 2 && stub.bound_pipeline != before,
+              "a render-state change is not served from the previous draw (%d)", stub.n_pipeline_create);
+        m(0x0310, 0u);
+        draw_triangle();
+        CHECK(stub.n_pipeline_create == pipelines + 2 && stub.bound_pipeline == before,
+              "and restoring it finds the earlier pipeline");
         engine_down();
     }
 

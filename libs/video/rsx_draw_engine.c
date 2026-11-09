@@ -2385,10 +2385,12 @@ static eng_fp_memo* eng_fp_products(const u8* uc, u32 size)
     m->gamma_ok = m->expand_ok = m->hash_ok = 0;
     return m;
 }
+static void eng_pkm_reset(void);
 static void eng_fp_memo_reset(void)
 {
     for (u32 i = 0; i < ENG_FP_MEMO; i++) { free(s_fpm[i].copy); memset(&s_fpm[i], 0, sizeof s_fpm[i]); }
     s_fpm_next = 0;
+    eng_pkm_reset();
 }
 static int eng_fp_uses_wpos(eng_fp_memo* m, const u8* uc, u32 size)
 {
@@ -2451,6 +2453,37 @@ static u64 eng_fp_structural_hash(eng_fp_memo* m, const u8* uc, u32 size, u64 se
         m->hash_ok = 1;
     }
     return m->hash;
+}
+
+/* Everything the pipeline key is made of, beyond the program bytes (which
+ * enter as `head`, the key so far). A draw whose inputs equal the previous
+ * draw's has the previous draw's key, so it skips the byte-wise key hash and
+ * the table probe and takes the previous answer. Pipelines are only added
+ * while the engine is up, so a cached answer stays valid until shutdown. */
+typedef struct {
+    u64 head;
+    u32 fp_ctrl_key, wpos_grid, srgb_output, gamma_units, expand_units;
+    u32 cube_mask, vol_mask, shadow_mask, vtex_mask, unnorm_mask;
+    u8 gamma_masks[RSX_DSP_NUM_TEXTURES], expand_masks[RSX_DSP_NUM_TEXTURES];
+    rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES];
+    u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
+    u32 layout_mask, layout_stride, rt_fmt, rt_count;
+    rsx_be_render_state rs;
+} eng_key_inputs;
+static struct {
+    int valid;
+    eng_key_inputs in;
+    u32 handle, tex_used;
+    int fixed;
+    u64 fp_hash;
+    unsigned long long hits, misses;
+} s_pkm;
+
+static void eng_pkm_reset(void) { s_pkm.valid = 0; }
+void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned long long* misses)
+{
+    if (hits) *hits = s_pkm.hits;
+    if (misses) *misses = s_pkm.misses;
 }
 
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
@@ -2532,6 +2565,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * SHADER_CONTROL, the cube and vertex-texture masks, the input layout,
      * and the structural render state. */
     u64 key = 1469598103934665603ull;
+    eng_key_inputs in;
+    memset(&in, 0, sizeof in);
     if (fixed) {
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
@@ -2539,6 +2574,32 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
         key = eng_fp_structural_hash(fpm, fp_uc, fp_size, key);
         if (!key) return 0;
+    }
+    /* The previous draw's answer when nothing the key is made of changed. */
+    in.head = key;
+    if (!fixed) {
+        in.fp_ctrl_key = fp_ctrl & 0x4Eu; in.wpos_grid = wpos_grid; in.srgb_output = srgb_output;
+        in.gamma_units = gamma_units; in.expand_units = expand_units;
+        memcpy(in.gamma_masks, gamma_masks, sizeof in.gamma_masks);
+        memcpy(in.expand_masks, expand_masks, sizeof in.expand_masks);
+        in.cube_mask = cube_mask; in.vol_mask = vol_mask; in.shadow_mask = shadow_mask;
+        memcpy(in.shadow, shadow, sizeof in.shadow);
+        in.vtex_mask = vtex_mask; in.unnorm_mask = unnorm_mask;
+        memcpy(in.unnorm_dim, unnorm_dim, sizeof in.unnorm_dim);
+    }
+    in.layout_mask = layout->mask; in.layout_stride = layout->stride;
+    in.rt_fmt = (u32)rt_fmt; in.rt_count = rt_count;
+    in.rs = *rs;
+    if (s_pkm.valid && !memcmp(&s_pkm.in, &in, sizeof in)) {
+        s_pkm.hits++;
+        *out_fixed = s_pkm.fixed;
+        *out_tex_used = s_pkm.tex_used;
+        *out_fp_hash = s_pkm.fp_hash;
+        return s_pkm.handle;
+    }
+    s_pkm.misses++;
+    s_pkm.valid = 0;
+    if (!fixed) {
         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         if (wpos_grid) key = eng_fnv1a(&wpos_grid, sizeof wpos_grid, key);
@@ -2570,6 +2631,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             *out_fixed = p->fixed;
             *out_tex_used = p->tex_used;
             *out_fp_hash = p->fp_hash;
+            if (p->handle) {
+                s_pkm.in = in; s_pkm.fixed = p->fixed; s_pkm.tex_used = p->tex_used;
+                s_pkm.fp_hash = p->fp_hash; s_pkm.handle = p->handle; s_pkm.valid = 1;
+            }
             return p->handle;
         }
     }
@@ -2655,6 +2720,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipeline_index[slot] = (u16)(g.n_pipelines + 1u);
     g.n_pipelines++;
     *out_fixed = fixed;
+    if (handle) {
+        s_pkm.in = in; s_pkm.fixed = fixed; s_pkm.tex_used = *out_tex_used;
+        s_pkm.fp_hash = *out_fp_hash; s_pkm.handle = handle; s_pkm.valid = 1;
+    }
     return handle;
 }
 
@@ -4624,6 +4693,7 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
           fprintf(stderr, "[rsx engine] PS3RECOMP_RSX_GPU_DEPTH_VIEW: backend has no GPU depth view; depth reads keep the guest-memory store\n"); }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
+    eng_pkm_reset();
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
         free(g.vp_cb); g.vp_cb = NULL;
         return -1;
