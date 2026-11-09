@@ -213,7 +213,7 @@ def main():
         module=make_lifter(prefix='module_');module.header_name='module.h'
         (out/'module.h').write_text(module.emit_header());(out/'module.cpp').write_text(module.emit_source())
         (out/'lifted.cpp').write_text(lifter.emit_source());(out/'driver.cpp').write_text(runtime_driver())
-        command=[compiler,'-std=c++20','-O2','-pthread',str(out/'lifted.cpp'),str(out/'module.cpp'),str(out/'driver.cpp'),'-o',str(out/'test')]
+        command=[compiler,'-DPPU_NO_INLINE_LOADS','-I'+str(ROOT/'runtime/ppu'),'-std=c++20','-O2','-pthread',str(out/'lifted.cpp'),str(out/'module.cpp'),str(out/'driver.cpp'),'-o',str(out/'test')]
         hook=ROOT/'runtime/syscalls/ppu_host_unwind.c'
         if hook.exists():
             obj=out/'hook.o';subprocess.run([shutil.which('clang') or 'cc','-c',str(hook),'-o',str(obj)],check=True)
