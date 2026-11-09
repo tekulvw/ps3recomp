@@ -5111,6 +5111,8 @@ static int vk_pass_samples_target(void)
         for (u32 i = 0; i < s_pass.n; i++) if (s_pass.rt[i] == h) return 1;
     }
     return 0;
+}
+
 /* PS3RECOMP_VK_DESCRIPTOR_REUSE: the set for this draw in the open batch.
  * The constant blocks are dynamic (their offsets are passed at bind), so a set
  * holds the textures, the samplers and which buffer and size the blocks have;
