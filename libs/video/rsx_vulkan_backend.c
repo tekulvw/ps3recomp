@@ -3094,6 +3094,7 @@ static void vk_e5_shutdown(void);
 
 /* Defined with the E2 pipeline state further down. */
 static void vk_eng_drop_framebuffers(void);
+static void vk_eng_drop_framebuffers_for(u32 handle);
 static void vk_eng2_shutdown(void* user);
 
 static struct {
@@ -3297,7 +3298,7 @@ static void vk_eng_release(void* user, u32 handle)
         if (vk_eng_get(snap, VK_ENG_TEXTURE)) vk_eng_release(user, snap);
     }
     if ((s_eobj[handle].kind == VK_ENG_COLOR && !s_eobj[handle].snapshot) || s_eobj[handle].kind == VK_ENG_DEPTH)
-        vk_eng_drop_framebuffers();
+        vk_eng_drop_framebuffers_for(handle);
     if(s_eobj_native_pins[handle]) {
         /* PS3RECOMP_RSX_TARGET_CHURN=1: count these waited releases and their
          * wall time (diagnostic). */
@@ -4259,12 +4260,32 @@ static struct {
 static struct { u64 key; VkSampler s; } s_esamp[VK_ENG_SAMP_CACHE];
 static u32 s_esamp_count;
 
+static void vk_eng_drop_framebuffer_at(u32 i)
+{
+    if (s_e2.fb[i].fb && !vk_bat_retire(VK_RET_FRAMEBUFFER, &s_e2.fb[i].fb))
+        pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
+    memmove(&s_e2.fb[i], &s_e2.fb[i + 1], (size_t)(s_e2.fb_count - i - 1) * sizeof s_e2.fb[0]);
+    s_e2.fb_count--;
+}
+
 static void vk_eng_drop_framebuffers(void)
 {
     for (u32 i = 0; i < s_e2.fb_count; i++)
         if (s_e2.fb[i].fb && !vk_bat_retire(VK_RET_FRAMEBUFFER, &s_e2.fb[i].fb))
             pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
     s_e2.fb_count = 0;
+}
+
+/* A released colour or depth target ends only the framebuffers that name it.
+ * Dropping the whole cache on every release rebuilt every pass's framebuffer
+ * each time any one target went, about twenty a frame in a busy scene. */
+static void vk_eng_drop_framebuffers_for(u32 handle)
+{
+    for (u32 i = 0; i < s_e2.fb_count; ) {
+        int uses = 0;
+        for (u32 k = 0; k <= RSX_BE_MAX_COLOR_TARGETS; k++) uses |= s_e2.fb[i].key[k] == handle;
+        if (uses) vk_eng_drop_framebuffer_at(i); else i++;
+    }
 }
 
 /* The render pass for `n` colour attachments of format `cf` plus depth,
@@ -4702,7 +4723,7 @@ static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, V
     key[RSX_BE_MAX_COLOR_TARGETS] = dkey;
     for (u32 i = 0; i < s_e2.fb_count; i++)
         if (!memcmp(s_e2.fb[i].key, key, sizeof key)) return s_e2.fb[i].fb;
-    if (s_e2.fb_count >= VK_ENG_FB_CACHE) vk_eng_drop_framebuffers();
+    if (s_e2.fb_count >= VK_ENG_FB_CACHE) vk_eng_drop_framebuffer_at(0);   /* the oldest */
     VkImageView views[RSX_BE_MAX_COLOR_TARGETS + 1];
     for (u32 i = 0; i < n; i++) views[i] = s_eobj[rt[i]].im.view;
     views[n] = dview;
