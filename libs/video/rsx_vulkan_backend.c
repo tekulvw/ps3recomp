@@ -178,6 +178,8 @@ typedef struct vk_image {
     VkImageUsageFlags usage;
     VkImageAspectFlags aspect;
     u32 levels,layers,samples;
+    u32 w, h;                        /* extent of level 0 */
+    u8  pooled;                      /* returns to the image pool when destroyed */
 } vk_image;
 
 #define VK_SAMPLER_CACHE 32
@@ -652,6 +654,7 @@ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 
     VK_CHECK(pvkCreateImageView(s_vk.device, &vci, NULL, &im->view), "vkCreateImageView");
     im->format=fmt;im->usage=usage;im->aspect=aspect;
     im->levels=levels;im->layers=1;im->samples=VK_SAMPLE_COUNT_1_BIT;
+    im->w=w;im->h=h;
     return 0;
 }
 
@@ -659,6 +662,68 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
                            VkImageUsageFlags usage, VkImageAspectFlags aspect)
 {
     return vk_create_image_levels(im, fmt, w, h, 1, usage, aspect);
+}
+
+/* Engine images a scene creates and releases over and over (colour targets,
+ * the RGBA8 aliases GPU depth views fill) keep their memory: once the GPU is
+ * done with a released one, its image goes back to a small pool, and a later
+ * request of the same format, size and usage takes it with a fresh view. The
+ * callers define the contents of what they get (a colour target is cleared,
+ * an alias is filled whole), so a reused image is as good as a new one. */
+#define VK_IMG_POOL       48u
+#define VK_IMG_POOL_BYTES ((VkDeviceSize)256 << 20)
+static vk_image     s_img_pool[VK_IMG_POOL];
+static VkDeviceSize s_img_pool_size[VK_IMG_POOL];
+static u32          s_img_pool_n;
+static VkDeviceSize s_img_pool_bytes;
+static int vk_img_pool_keep(vk_image* im)
+{
+    /* Not with the native owner, which may still hold views of engine images. */
+    if (!im->pooled || !im->img || !im->mem || s_img_pool_n >= VK_IMG_POOL || vulkan_owner_enabled()) return 0;
+    VkMemoryRequirements req;
+    pvkGetImageMemoryRequirements(s_vk.device, im->img, &req);
+    if (s_img_pool_bytes + req.size > VK_IMG_POOL_BYTES) return 0;
+    if (im->view) { pvkDestroyImageView(s_vk.device, im->view, NULL); im->view = VK_NULL_HANDLE; }
+    s_img_pool[s_img_pool_n] = *im;
+    s_img_pool_size[s_img_pool_n++] = req.size;
+    s_img_pool_bytes += req.size;
+    memset(im, 0, sizeof *im);
+    return 1;
+}
+static int vk_create_image_pooled(vk_image* im, VkFormat fmt, u32 w, u32 h,
+                                  VkImageUsageFlags usage, VkImageAspectFlags aspect)
+{
+    for (u32 i = 0; i < s_img_pool_n; i++) {
+        const vk_image* c = &s_img_pool[i];
+        if (c->format != fmt || c->w != w || c->h != h || c->usage != usage || c->aspect != aspect || c->levels != 1)
+            continue;
+        *im = *c;
+        s_img_pool_bytes -= s_img_pool_size[i];
+        s_img_pool[i] = s_img_pool[--s_img_pool_n];
+        s_img_pool_size[i] = s_img_pool_size[s_img_pool_n];
+        VkImageViewCreateInfo vci = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+            .subresourceRange = { aspect, 0, 1, 0, 1 },
+        };
+        if (pvkCreateImageView(s_vk.device, &vci, NULL, &im->view) != VK_SUCCESS) {
+            pvkDestroyImage(s_vk.device, im->img, NULL); pvkFreeMemory(s_vk.device, im->mem, NULL);
+            memset(im, 0, sizeof *im); return -1;
+        }
+        im->pooled = 1;
+        return 0;
+    }
+    if (vk_create_image(im, fmt, w, h, usage, aspect)) return -1;
+    im->pooled = 1;
+    return 0;
+}
+static void vk_img_pool_drain(void)
+{
+    for (u32 i = 0; i < s_img_pool_n; i++) {
+        pvkDestroyImage(s_vk.device, s_img_pool[i].img, NULL);
+        pvkFreeMemory(s_vk.device, s_img_pool[i].mem, NULL);
+    }
+    s_img_pool_n = 0; s_img_pool_bytes = 0;
 }
 
 static void vk_present_wait_gpu(void);
@@ -712,6 +777,7 @@ static void vk_destroy_image_now(vk_image* im)
 {
     /* Never under a present's copy that may still read it. */
     if (im->img) vk_present_wait_image(im->img);
+    if (vk_img_pool_keep(im)) return;
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
     if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
@@ -3401,10 +3467,10 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
-    if (vk_create_image(&o->im, vf, w, h,
-                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        VK_IMAGE_ASPECT_COLOR_BIT)) {
+    if (vk_create_image_pooled(&o->im, vf, w, h,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&o->im); return 0;
     }
     o->kind = VK_ENG_COLOR; o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h;
@@ -5505,6 +5571,7 @@ static void vk_bat_shutdown(void)
     for (u32 i = 0; i < s_bat.nret; i++) vk_bat_destroy_now(&s_bat.ret[i]);
     free(s_bat.ret);
     vk_stage_drain();
+    vk_img_pool_drain();
     for (u32 i = 0; i < s_bat.nslots; i++) {
         vk_destroy_buffer_now(&s_bat.s[i].arena);
         if (s_bat.s[i].dpool) pvkDestroyDescriptorPool(s_vk.device, s_bat.s[i].dpool, NULL);
@@ -5598,6 +5665,7 @@ static void vk_e5_shutdown(void)
     }
     for (u32 i = 0; i < s_e5.nspare; i++) vk_destroy_buffer(&s_e5.spare[i]);
     vk_stage_drain();
+    vk_img_pool_drain();
     vk_destroy_buffer(&s_e5.store_dev);
     vk_destroy_buffer(&s_e5.store_host);
     if (s_e5.pool) pvkDestroyCommandPool(s_vk.device, s_e5.pool, NULL);
@@ -5759,8 +5827,8 @@ static u32 vk_e5_alias_texture(u32 w, u32 h, u32 remap, u32 rsx_fmt)
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
-    if (vk_create_image(&o->im, VK_FORMAT_R8G8B8A8_UNORM, w, h,
-                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) {
+    if (vk_create_image_pooled(&o->im, VK_FORMAT_R8G8B8A8_UNORM, w, h,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&o->im); memset(o, 0, sizeof *o); return 0;
     }
     pvkDestroyImageView(s_vk.device, o->im.view, NULL);

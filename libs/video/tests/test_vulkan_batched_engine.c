@@ -282,6 +282,55 @@ int main(int argc, char** argv)
     FILE* f = fopen(argv[2], "wb");
     assert(f && fwrite(out, 1, sizeof out, f) == sizeof out); fclose(f);
 
+    /* A released colour target's image is pooled and a same-sized request
+     * takes it back: the new target still starts transparent black, and the
+     * release leaves every other target's framebuffer usable. */
+    {
+        enum { PW = 24, PH = 16 };
+        static u8 seedp[PW * PH * 4]; texels(seedp, PW, PH, 11);
+        u32 a = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, PW, PH, seedp, PW * 4);
+        u32 keep = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, PW, PH, NULL, 0);
+        CHECK(a && keep, "pool: two targets");
+        const float red[4] = { 1, 0, 0, 1 };
+        u32 both[2] = { a, keep };
+        for (int k = 0; k < 2; k++) {
+            vk_eng_bind_targets(NULL, &both[k], 1, 0);
+            vk_eng_bind_pipeline(NULL, p_blend);
+            vk_eng_bind_textures(NULL, &t0, samps, 1u);
+            const float vcp[16] = { 1, 1, 0, 0, 0.5f };
+            vk_eng_bind_vs_constants(NULL, vcp, sizeof vcp);
+            const float pcp[8] = { 1, 1, 1, 1, 0, 0, 0, 0 };
+            vk_eng_bind_ps_constants(NULL, pcp, sizeof pcp);
+            vk_eng_set_viewport(NULL, 0, 0, PW, PH); vk_eng_set_scissor(NULL, 0, 0, PW, PH);
+            quad(verts, -1, -1, 1, 1, red);
+            vk_eng_draw(NULL, RSX_TOPOLOGY_TRIANGLES, verts, 6, 32, NULL, 0);
+        }
+        CHECK(vk_eng_submit_and_wait_checked(NULL, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "pool: draws flushed");
+        vk_eng_release(NULL, a);
+        CHECK(vk_eng_submit_and_wait_checked(NULL, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "pool: release retired");
+        vk_eng_completion_status(NULL, s_e5.issued, 1);
+        if (s_bat_on) vk_bat_reap();
+        const u32 pooled_before = s_img_pool_n;
+        u32 b = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, PW, PH, NULL, 0);
+        CHECK(b && pooled_before >= 1 && s_img_pool_n == pooled_before - 1, "pool: the released image was taken back");
+        static u8 px[PW * PH * 4];
+        memset(px, 0xAA, sizeof px);
+        vk_eng_readback(NULL, b, 0, 0, PW, PH, px, PW * 4);
+        int nonzero = 0; for (u32 i = 0; i < sizeof px; i++) nonzero |= px[i];
+        CHECK(!nonzero, "pool: a reused target starts transparent black");
+        /* The kept target's framebuffer survived the release: draw again. */
+        const float green[4] = { 0, 1, 0, 1 };
+        vk_eng_bind_targets(NULL, &keep, 1, 0);
+        vk_eng_bind_pipeline(NULL, p_blend);
+        quad(verts, -1, -1, 1, 1, green);
+        vk_eng_draw(NULL, RSX_TOPOLOGY_TRIANGLES, verts, 6, 32, NULL, 0);
+        CHECK(vk_eng_submit_and_wait_checked(NULL, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "pool: draw after a release");
+        u8 one[4] = { 0 };
+        vk_eng_readback(NULL, keep, PW / 2, PH / 2, 1, 1, one, 4);
+        CHECK(one[1] > one[0], "pool: the kept target took the later draw");
+        vk_eng_release(NULL, b); vk_eng_release(NULL, keep);
+    }
+
     /* A unit the program samples with nothing bound reads transparent black,
      * the Metal backend's placeholder, for a 2D unit and a cube unit alike. A
      * coloured "not bound" texture showed through in a title's material that
