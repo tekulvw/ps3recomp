@@ -88,7 +88,7 @@ jobs:
                   im = imgs[i].get('name', '?') if i is not None and i < len(imgs) else '?'
                   print(' ', im, fr.get('symbol'), fr.get('symbolLocation'), fr.get('sourceFile', ''), fr.get('sourceLine', ''))
           PY
-          for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -4); do
+          for f in $(grep -l 'SIGSEGV\|SIGBUS' ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null); do
             echo "=== $f"; python3 /tmp/ips.py "$f" || head -c 4000 "$f"
           done
 

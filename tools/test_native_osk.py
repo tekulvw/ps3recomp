@@ -51,8 +51,15 @@ with tempfile.TemporaryDirectory(prefix='native-osk-') as t:
    # LaunchServices does not inherit the subprocess environment reliably; pass
    # each per-run control path explicitly. Empty is the default opt-out case.
    control_path=str(Path(t)/'ui-control') if controlled else ''
-   subprocess.run(['/usr/bin/open','-W','-n','--env','OSK_FIXTURE_RECEIPT='+str(receipt),'--env','OSK_FIXTURE_OTHER_APP='+str(other),'--env','OSK_NATIVE_CONTROL_FILE='+control_path,'--stdout',str(log),'--stderr',str(errors),str(app)],check=True,timeout=30,env=env)
-   print(label+' real AppKit fixture:',flush=True)
-   print(log.read_text() if log.exists() else 'No AppKit fixture output',flush=True)
-   print(errors.read_text() if errors.exists() else 'No AppKit fixture errors',flush=True)
+   # The fixture moves key focus between two apps. On a shared hosted CI
+   # desktop that occasionally loses a focus race, so CI gets one retry; a
+   # second failure still fails.
+   for attempt in range(2 if os.environ.get('CI') else 1):
+    if attempt:print(label+' real AppKit fixture: retrying once on CI after a failed attempt',flush=True)
+    receipt.unlink(missing_ok=True)
+    subprocess.run(['/usr/bin/open','-W','-n','--env','OSK_FIXTURE_RECEIPT='+str(receipt),'--env','OSK_FIXTURE_OTHER_APP='+str(other),'--env','OSK_NATIVE_CONTROL_FILE='+control_path,'--stdout',str(log),'--stderr',str(errors),str(app)],check=True,timeout=30,env=env)
+    print(label+' real AppKit fixture:',flush=True)
+    print(log.read_text() if log.exists() else 'No AppKit fixture output',flush=True)
+    print(errors.read_text() if errors.exists() else 'No AppKit fixture errors',flush=True)
+    if receipt.exists() and receipt.read_text()=='passed\n':break
    assert receipt.exists() and receipt.read_text()=='passed\n', 'real native UI fixture failed; see output above'
