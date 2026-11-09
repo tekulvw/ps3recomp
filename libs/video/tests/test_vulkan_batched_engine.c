@@ -209,9 +209,16 @@ int main(int argc, char** argv)
         }
         vk_eng_bind_targets(NULL, &target, 1, z);
         vk_eng_bind_pipeline(NULL, (i % 3) ? p_blend : p_depth);
-        const float vc[16] = { 0.25f, 0.25f, ((float)(i % 13) / 6.5f) - 0.9f, ((float)(i % 7) / 3.5f) - 0.9f,
-                               (float)((i * 37) % 100) / 100.0f, 0, 0, 0 };
-        vk_eng_bind_vs_constants(NULL, vc, sizeof vc);
+        float vc[16] = { 0.25f, 0.25f, ((float)(i % 13) / 6.5f) - 0.9f, ((float)(i % 7) / 3.5f) - 0.9f,
+                         (float)((i * 37) % 100) / 100.0f, 0, 0, 0 };
+        /* Every fourth draw repeats the previous constants the way the engine
+         * does: a rebind, or the same bytes when the backend refuses one. */
+        static float prev_vc[16];
+        if (i % 4 == 1) {
+            memcpy(vc, prev_vc, sizeof vc);
+            if (!vk_eng_rebind_vs_constants(NULL)) vk_eng_bind_vs_constants(NULL, vc, sizeof vc);
+        } else vk_eng_bind_vs_constants(NULL, vc, sizeof vc);
+        memcpy(prev_vc, vc, sizeof vc);
         const float pc[8] = { 1, 1, 1, 0.5f + 0.5f * (float)(i % 2), 0.3f, 0.3f, 0.3f, 0.25f };
         vk_eng_bind_ps_constants(NULL, pc, sizeof pc);
         vk_eng_bind_textures(NULL, &bound_tex, samps, 1u);
@@ -371,6 +378,8 @@ int main(int argc, char** argv)
             vk_eng_pipeline_release(NULL, pu);
         }
     }
+    if (batched) CHECK(s_e2.vs_reused > 0 && s_e2.vs_uploads > 0, "batched: unchanged constants reuse the arena copy");
+    else CHECK(s_e2.vs_reused == 0, "per-operation: constants always rebound");
     CHECK(!vk_e5_failed(), "no submission failed");
     if (batched)
         printf("batched: %llu batches for %u draws (%.1f ops/batch), %llu slot waits, %llu CPU waits, %llu retired, %u pending\n",
