@@ -401,6 +401,16 @@ jobs:
                 -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
           /tmp/test_spu_coherency
 
+      # Per-line version counters (opt-in PS3RECOMP_COH_VERSIONS): PUTLLC and
+      # stwcx. atomicity with SPU and PPU threads on one line, and no lost
+      # lost-reservation wakeups with no timeout to hide one.
+      - name: Run the lock-line version counter tests
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -I runtime/spu \
+                -o /tmp/test_spu_coh_version runtime/spu/tests/test_spu_coh_version.c \
+                runtime/spu/spu_coh_version.c -lpthread
+          /tmp/test_spu_coh_version
+
       # The other writer: an SPU. Five SPURS kernels share one management line,
       # so a commit that does not break its peers' reservations lets two of them
       # win the same compare-and-swap, and the queue is quietly wrong afterwards.
