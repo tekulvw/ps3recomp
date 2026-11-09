@@ -159,6 +159,8 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * the seed, consumers substituted mask=ALL for 0 and force-wrote the
      * depth-only pass's garbage FP output (the blue-character class). */
     rsx->regs[M_COLOR_MASK >> 2] = 0x01010101u;
+    /* The whole constant file is new to every consumer. */
+    rsx->const_dirty_lo = 0u; rsx->const_dirty_hi = RSX_DSP_NUM_CONSTANTS - 1u;
 
     /* NV40 reset state is counter-clockwise front winding.  Leaving this
      * register zero made a live stream that relied on the hardware default
@@ -251,6 +253,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
     if (count > max_words)
         count = max_words;
     memcpy(rsx->constants, words, count * sizeof(u32));
+    if (count) rsx_dsp_mark_constants(rsx, 0u, (count - 1u) / 4u);
 }
 
 /* Every NV4097_SET_VERTEX_DATA* variant writes the same constant ("current")
@@ -354,8 +357,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
-        if (slot < RSX_DSP_NUM_CONSTANTS)
+        if (slot < RSX_DSP_NUM_CONSTANTS) {
             rsx->constants[slot][word & 3] = arg;
+            rsx_dsp_mark_constants(rsx, slot, slot);
+        }
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
          * slot range (first 400) -- what a shader's constants really were. */
         { static int lo = -2, hi = 0, n = 0;
