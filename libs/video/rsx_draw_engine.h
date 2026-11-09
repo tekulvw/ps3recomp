@@ -353,6 +353,9 @@ void rsx_draw_engine_fp_memo_counts(unsigned long long* hits, unsigned long long
 /* Draws whose pipeline-key inputs equaled the previous draw's (no key hash or
  * table probe), and draws that computed the key. */
 void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned long long* misses);
+/* Repeat texture binds in one frame after a guest-memory write that missed
+ * the texture (no re-check), and those a write may have touched (checked). */
+void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked);
 /* Same-target colour reads the backend could not copy (no color_snapshot). */
 u64 rsx_draw_engine_feedback_unserved_count(void);
 u64 rsx_draw_engine_submit_async(void);

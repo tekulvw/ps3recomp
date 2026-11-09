@@ -302,6 +302,18 @@ static int eng_external_programs_fresh(void)
     return 1;
 }
 static atomic_uint_fast64_t s_dirty_generation;
+/* Where the guest-memory writes behind the last ENG_DIRTY_RING generations
+ * landed (rsx_draw_engine_mark_guest_dirty: NV0039 copies). A cached texture
+ * checked earlier this frame is checked again only when one of the writes
+ * since its check overlaps its bytes, rather than after any write anywhere.
+ * Entry `gen % ENG_DIRTY_RING` holds generation `gen` until it is reused; a
+ * texture whose generation is older than the ring holds, or whose bytes are
+ * not plain guest memory, is checked as before. */
+#define ENG_DIRTY_RING 256u
+static struct { u64 gen; u32 ea, bytes; } s_dirty_ring[ENG_DIRTY_RING];
+static atomic_flag s_dirty_lock = ATOMIC_FLAG_INIT;
+static unsigned long long s_dirty_skips, s_dirty_hits;
+static int eng_dirty_overlaps(u64 since, u64 now, u32 ea, u32 bytes);
 static char s_vs_hlsl[256 * 1024];
 static char s_ps_hlsl[256 * 1024];
 
@@ -1469,6 +1481,17 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
 #undef ENG_TEXTURE_KEY_MATCHES
     if (hit) {
         eng_texture* e = hit;
+        /* Checked this frame already: only a recorded write over its own
+         * bytes calls for another check. Picture-backed contents and a
+         * custom guest reader keep the old rule (any write). */
+        if (e->handle && e->last_hash_frame == g.frames && e->dirty_generation != generation &&
+            !identity && !s_guest_reader) {
+            const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+            if (ea && !eng_dirty_overlaps(e->dirty_generation, generation, ea, span)) {
+                e->dirty_generation = generation;
+                s_dirty_skips++;
+            } else s_dirty_hits++;
+        }
         if (e->handle && (e->last_hash_frame != g.frames || e->dirty_generation != generation)) {
             /* Every cached texture used to be hashed in full every frame;
              * in a big scene that is hundreds of MB a second for the few
@@ -4941,8 +4964,37 @@ void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes)
     if (!bytes || (u64)ea + bytes > 0x100000000ull) {
         ENG_CHECKED_FAIL(); return;
     }
-    if(atomic_fetch_add_explicit(&s_dirty_generation,1,memory_order_release)==UINT64_MAX)
+    while (atomic_flag_test_and_set_explicit(&s_dirty_lock, memory_order_acquire)) {}
+    const u64 gen = atomic_load_explicit(&s_dirty_generation, memory_order_relaxed) + 1u;
+    s_dirty_ring[gen % ENG_DIRTY_RING].gen = gen;
+    s_dirty_ring[gen % ENG_DIRTY_RING].ea = ea;
+    s_dirty_ring[gen % ENG_DIRTY_RING].bytes = bytes;
+    const u64 prev = atomic_fetch_add_explicit(&s_dirty_generation,1,memory_order_release);
+    atomic_flag_clear_explicit(&s_dirty_lock, memory_order_release);
+    if(prev==UINT64_MAX)
         ENG_CHECKED_FAIL();
+}
+
+/* Did a write recorded after generation `since` (up to `now`) touch the
+ * guest bytes [ea, ea + bytes)? 1 when unknown. */
+static int eng_dirty_overlaps(u64 since, u64 now, u32 ea, u32 bytes)
+{
+    if (now <= since) return 0;
+    if (now - since > ENG_DIRTY_RING) return 1;
+    int hit = 0;
+    while (atomic_flag_test_and_set_explicit(&s_dirty_lock, memory_order_acquire)) {}
+    for (u64 gen = since + 1u; gen <= now && !hit; gen++) {
+        const u32 i = (u32)(gen % ENG_DIRTY_RING);
+        if (s_dirty_ring[i].gen != gen) { hit = 1; break; }
+        hit = (u64)s_dirty_ring[i].ea < (u64)ea + bytes && (u64)ea < (u64)s_dirty_ring[i].ea + s_dirty_ring[i].bytes;
+    }
+    atomic_flag_clear_explicit(&s_dirty_lock, memory_order_release);
+    return hit;
+}
+void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked)
+{
+    if (skipped) *skipped = s_dirty_skips;
+    if (rechecked) *rechecked = s_dirty_hits;
 }
 
 static int original_rsx_draw_engine_checked_ready(void)
