@@ -169,6 +169,7 @@ typedef struct {
     u32 ring_mask, ring_ridx;
     u64 ring_nonfinite;
     float ring_peak;
+    u64 refilled_prev; /* reads where the slot read one period earlier already holds PCM again */
 } AudioDiagnosticPort;
 static int s_audio_diag_on;
 static AudioDiagnosticPort s_audio_diag_ports[CELL_AUDIO_PORT_MAX];
@@ -177,6 +178,12 @@ static float s_audio_diag_mix[2];
 static u64 s_audio_diag_nonfinite;
 static u32 s_audio_diag_queue_frames;
 static char s_audio_diag_error[128];
+/* Intervals between consecutive guest block reads in this window, in us. */
+#define AUDIO_DIAG_GAPS 1024
+static u32 s_audio_diag_gaps[AUDIO_DIAG_GAPS];
+static u32 s_audio_diag_ngaps;
+static u64 s_audio_diag_last_read_us;
+static u64 audio_diagnostics_now(void);
 
 static void audio_diagnostics_init(void)
 {
@@ -187,6 +194,26 @@ static void audio_diagnostics_init(void)
     s_audio_diag_since = s_audio_diag_blocks = s_audio_diag_submit = s_audio_diag_errors = 0;
     s_audio_diag_nonfinite = s_audio_diag_queue_frames = 0;
     s_audio_diag_error[0] = 0;
+    s_audio_diag_ngaps = 0;
+    s_audio_diag_last_read_us = 0;
+}
+
+/* One guest block read (all ports) happens now. */
+static void audio_diagnostics_read(void)
+{
+    const u64 now = audio_diagnostics_now();
+    if (s_audio_diag_last_read_us && now >= s_audio_diag_last_read_us &&
+        s_audio_diag_ngaps < AUDIO_DIAG_GAPS) {
+        const u64 gap = now - s_audio_diag_last_read_us;
+        s_audio_diag_gaps[s_audio_diag_ngaps++] = gap > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)gap;
+    }
+    s_audio_diag_last_read_us = now;
+}
+
+static int audio_diag_gap_cmp(const void* a, const void* b)
+{
+    const u32 x = *(const u32*)a, y = *(const u32*)b;
+    return x < y ? -1 : x > y;
 }
 
 static void audio_diagnostics_port(int p, const AudioPortSlot* port, const float* src)
@@ -213,6 +240,17 @@ static void audio_diagnostics_port(int p, const AudioPortSlot* port, const float
         }
     }
     d->blocks++;
+    {   /* The slot this port read one period ago was cleared after that read.
+         * PCM there now was written after it was read: normal for a writer
+         * that runs ahead of the read index (it refills the freed slot), but
+         * for a writer that targets the next slot just in time it means the
+         * write came too late for that read. */
+        const u32 nblock = (u32)port->param.nBlock;
+        const u32 prev = (u32)((port->read_index + nblock - 1) % nblock);
+        const float* block = port->buffer + prev * CELL_AUDIO_BLOCK_SAMPLES * d->channels;
+        for (u32 n = 0; n < CELL_AUDIO_BLOCK_SAMPLES * d->channels; n += 7)
+            if (ld_be_f32(block + n) != 0.0f) { d->refilled_prev++; break; }
+    }
     int nonzero = 0;
     for (u32 n = 0; n < CELL_AUDIO_BLOCK_SAMPLES; ++n) {
         for (u32 c = 0; c < d->channels && c < 8; ++c) {
@@ -241,17 +279,28 @@ static void audio_diagnostics_report(u64 now)
                 (unsigned long long)d->nonzero, (unsigned long long)d->nonfinite);
         for (u32 c = 0; c < d->channels && c < 8; ++c)
             fprintf(stderr, "%s%.4g", c ? "," : "", d->peaks[c]);
-        fprintf(stderr, "] ring_ridx=%u ring_mask=%08X ring_peak=%.4g ring_nonfinite=%llu\n",
-                d->ring_ridx, d->ring_mask, d->ring_peak, (unsigned long long)d->ring_nonfinite);
+        fprintf(stderr, "] ring_ridx=%u ring_mask=%08X ring_peak=%.4g ring_nonfinite=%llu refilled_prev=%llu\n",
+                d->ring_ridx, d->ring_mask, d->ring_peak, (unsigned long long)d->ring_nonfinite,
+                (unsigned long long)d->refilled_prev);
+    }
+    u32 gmin = 0, gmed = 0, gmax = 0, gshort = 0;
+    if (s_audio_diag_ngaps) {
+        qsort(s_audio_diag_gaps, s_audio_diag_ngaps, sizeof(u32), audio_diag_gap_cmp);
+        gmin = s_audio_diag_gaps[0];
+        gmed = s_audio_diag_gaps[s_audio_diag_ngaps / 2];
+        gmax = s_audio_diag_gaps[s_audio_diag_ngaps - 1];
+        for (u32 i = 0; i < s_audio_diag_ngaps && s_audio_diag_gaps[i] < 2000; ++i) gshort++;
     }
     fprintf(stderr, "[audio-diag] time_us=%llu duration_us=%llu blocks=%llu mix=[%.4g,%.4g] "
-            "nonfinite=%llu backend=%s submit=%llu errors=%llu queue_frames=%u error=\"%s\"\n",
+            "nonfinite=%llu backend=%s submit=%llu errors=%llu queue_frames=%u error=\"%s\" "
+            "read_gap_us=[%u,%u,%u] short_gaps=%u\n",
             (unsigned long long)now, (unsigned long long)(now - s_audio_diag_since),
             (unsigned long long)s_audio_diag_blocks, s_audio_diag_mix[0], s_audio_diag_mix[1],
             (unsigned long long)s_audio_diag_nonfinite,
             AUDIO_BACKEND_SDL2 ? "SDL" : "WASAPI",
             (unsigned long long)s_audio_diag_submit, (unsigned long long)s_audio_diag_errors,
-            s_audio_diag_queue_frames, s_audio_diag_error);
+            s_audio_diag_queue_frames, s_audio_diag_error, gmin, gmed, gmax, gshort);
+    s_audio_diag_ngaps = 0;
     memset(s_audio_diag_ports, 0, sizeof(s_audio_diag_ports));
     memset(s_audio_diag_mix, 0, sizeof(s_audio_diag_mix));
     s_audio_diag_blocks = s_audio_diag_submit = s_audio_diag_errors = s_audio_diag_nonfinite = 0;
@@ -262,7 +311,14 @@ static void audio_diagnostics_report(u64 now)
 static u64 audio_diagnostics_now(void)
 {
 #ifdef _WIN32
-    return (u64)GetTickCount64() * 1000;
+    /* The performance counter: GetTickCount64 advances in 15-16 ms steps,
+     * too coarse to time 5.33 ms reads. */
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (u64)(c.QuadPart / f.QuadPart) * 1000000ULL +
+           (u64)(c.QuadPart % f.QuadPart) * 1000000ULL / (u64)f.QuadPart;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -273,6 +329,8 @@ static u64 audio_diagnostics_now(void)
 /* ---------------------------------------------------------------------------
  * Host audio output backend
  * -----------------------------------------------------------------------*/
+
+static int audio_pacing_queue_gated(void);
 
 #if AUDIO_BACKEND_SDL2
 
@@ -366,6 +424,16 @@ static u32 audio_backend_queued_samples(void)
     return 0;
 }
 
+/* The clock pacer's view of the device: frames queued (-1 with no device) and
+ * a fixed capacity (0: SDL's queue is unbounded). */
+static inline long long audio_backend_queue_frames(void)
+{
+    return s_sdl_audio_dev ? (long long)audio_backend_queued_samples() : -1;
+}
+#ifdef _WIN32
+static inline u32 audio_backend_capacity(void) { return 0; }
+#endif
+
 #endif /* AUDIO_BACKEND_SDL2 */
 
 #if AUDIO_BACKEND_WASAPI
@@ -420,7 +488,9 @@ static int audio_backend_init(void)
     wfx.cbSize          = 0;
 
     /* Request event-driven mode with a ~20ms buffer */
-    REFERENCE_TIME buf_duration = 200000; /* 20ms in 100ns units */
+    /* 20 ms; 40 ms with clock pacing, which keeps half of it queued as the
+     * cushion for the device's period-sized pulls (see audio_pace). */
+    REFERENCE_TIME buf_duration = audio_pacing_queue_gated() ? 200000 : 400000; /* 100 ns units */
     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     /* Shared mode only takes the device's own mix format unless the stream
@@ -547,7 +617,114 @@ static void audio_backend_wait(void)
 }
 
 
+static inline long long audio_backend_queue_frames(void)
+{
+    const int room = audio_backend_room();
+    return room < 0 ? -1 : (long long)s_wasapi_buf_frames - room;
+}
+static inline u32 audio_backend_capacity(void) { return s_wasapi_buf_frames; }
+
 #endif /* AUDIO_BACKEND_WASAPI */
+
+/* ---------------------------------------------------------------------------
+ * Guest block pacing
+ * -----------------------------------------------------------------------*/
+
+/* The guest reads one port block per 256 frames of the 48 kHz clock, evenly
+ * spaced, whatever chunk size the host device pulls. Devices drain their queue
+ * in chunks (CoreAudio through SDL takes 512 frames, two blocks, at a time; a
+ * shared-mode WASAPI period is about 480 frames). Reading a guest block for
+ * each frame of room the device frees reads two blocks back to back, about 1 ms
+ * apart, then none for about 10 ms. A guest mixer that writes exactly one block
+ * per period notification, just in time (MAG's surMixer feeding its movie
+ * audio), has had no chance to write the second block, so about half of what
+ * it plays reads as silence. The cushion for the device's chunked pulls is
+ * silence queued once at the device, not guest blocks read ahead of time.
+ *
+ * PS3RECOMP_AUDIO_PACING=queue restores the previous queue-gated pacing for
+ * comparisons. */
+typedef struct {
+    u64 epoch_ns;      /* guest block k is read at epoch_ns + k * 256 frames */
+    u64 blocks;
+    u32 prime_frames;  /* device queue filled with silence before the first read */
+    u32 low_frames;    /* below this at a read, queue one more silence block */
+    u32 high_frames;   /* at or above this, move the schedule one period later */
+    int primed;
+    u64 last_read_ns;  /* kept across restarts: reads are never closer than half a period */
+} AudioPacer;
+
+static u64 audio_pace_block_time(u64 blocks)
+{
+    return blocks * CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL / CELL_AUDIO_SAMPLE_RATE;
+}
+
+static void audio_pace_restart(AudioPacer* p, u64 now_ns)
+{
+    p->epoch_ns = now_ns;
+    p->blocks = 0;
+    p->primed = 0;
+}
+
+/* One step of the schedule. Returns 1 when a guest block is due now, after
+ * setting *silence to the silence blocks to queue at the device first. queued
+ * is the device queue in frames, or -1 with no device (pure clock pacing).
+ * A suspension or a long stall drops the elapsed backlog and restarts the
+ * schedule instead of spending it in a burst of guest reads. */
+static int audio_pace(AudioPacer* p, u64 now_ns, long long queued, unsigned* silence)
+{
+    const u64 block_ns = audio_pace_block_time(1);
+    u64 due = p->epoch_ns + audio_pace_block_time(p->blocks);
+    *silence = 0;
+    if (now_ns < p->epoch_ns || (now_ns > due && now_ns - due > 4 * block_ns)) {
+        audio_pace_restart(p, now_ns);
+        due = now_ns;
+    }
+    if (now_ns < due) return 0;
+    /* A wake-up that comes late (a coarse sleep, a busy host) must not turn
+     * into reads back to back: a writer notified at a read gets at least half
+     * a period before the next one. The schedule catches up at that spacing. */
+    if (p->last_read_ns && now_ns - p->last_read_ns < block_ns / 2) return 0;
+    if (queued >= 0) {
+        if (queued >= (long long)p->high_frames) {
+            /* The device is slower than the clock, or stalled: one longer
+             * period now, rather than two reads back to back later. */
+            p->epoch_ns += block_ns;
+            return 0;
+        }
+        if (!p->primed) {
+            if (queued < (long long)p->prime_frames)
+                *silence = (unsigned)((p->prime_frames - (u32)queued + CELL_AUDIO_BLOCK_SAMPLES - 1) /
+                                      CELL_AUDIO_BLOCK_SAMPLES);
+            p->primed = 1;
+        } else if (queued < (long long)p->low_frames) {
+            *silence = 1; /* the device runs faster than the clock, or just returned */
+        }
+    }
+    p->blocks++;
+    p->last_read_ns = now_ns;
+    return 1;
+}
+
+/* The earliest time audio_pace can next return a read (for timed waits). */
+static u64 audio_pace_next_ns(const AudioPacer* p)
+{
+    const u64 due = p->epoch_ns + audio_pace_block_time(p->blocks);
+    const u64 spaced = p->last_read_ns ? p->last_read_ns + audio_pace_block_time(1) / 2 : 0;
+    return due > spaced ? due : spaced;
+}
+
+static int audio_pacing_queue_gated(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_AUDIO_PACING");
+        on = e && !strcmp(e, "queue");
+        if (on) printf("[cellAudio] PS3RECOMP_AUDIO_PACING=queue: queue-gated block reads\n");
+    }
+    return on;
+}
+
+static const float s_silence_block[CELL_AUDIO_BLOCK_SAMPLES * 2];
 
 /* ---------------------------------------------------------------------------
  * Mixing
@@ -570,6 +747,7 @@ static inline float ld_be_f32(const float* p)
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
+    if (s_audio_diag_on) audio_diagnostics_read();
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
 
     mutex_lock(&s_audio_mutex);
@@ -711,18 +889,140 @@ static void audio_notify_event_queues(void)
 }
 
 #ifdef _WIN32
+/* AUDIO_PEAK / AUDIO_WAV diagnostics on the block just mixed (before submit). */
+static void audio_win32_mixed_block_diagnostics(void)
+{
+    /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
+     * "is any port producing sound" is answerable (LBP Bink movie audio). */
+    { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
+      if (_ap) { static unsigned _n = 0; float pk = 0.0f;
+        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+            float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
+        if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
+            fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
+    /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
+     * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
+    { static FILE* _wf = (FILE*)-1;
+      if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
+      if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
+}
+
+/* AUDIO_RATE diagnostic, after the block was submitted. */
+static void audio_win32_rate_diagnostic(void)
+{
+    /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
+    { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
+      if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
+        ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
+        { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
+          if (!nz) z++; }
+        if (now - t0 >= 5000) {
+            fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
+                    n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
+            #if AUDIO_BACKEND_WASAPI
+                    (unsigned)s_wasapi_buf_frames, 10);
+#else
+                    0u, 10);
+#endif
+            n = z = 0; d0 = g_audio_dropped; t0 = now; } } }
+}
+
+static u64 audio_win32_now_ns(LARGE_INTEGER qf)
+{
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    return (u64)(now.QuadPart / qf.QuadPart) * 1000000000ULL +
+           (u64)(now.QuadPart % qf.QuadPart) * 1000000000ULL / (u64)qf.QuadPart;
+}
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+/* Sleep for about ns. Sleep(1) lasts a whole 15.6 ms system tick unless the
+ * process raised the timer resolution (timeBeginPeriod), and Windows 11 may
+ * ignore that request for an occluded or minimized window. Woken that late, a
+ * clock schedule falls three reads behind at once. A high-resolution waitable
+ * timer (Windows 10 1803 and later) does not depend on the system tick. */
+static void audio_win32_wait_ns(u64 ns)
+{
+    static HANDLE timer;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        printf("[cellAudio] block pacing waits on a %s timer\n", timer ? "high-resolution" : "Sleep(1)");
+    }
+    if (ns < 200000) ns = 200000;      /* 0.2 ms */
+    if (ns > 10000000) ns = 10000000;  /* 10 ms: stay responsive to device changes */
+    if (timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(ns / 100);  /* relative, 100 ns units */
+        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE) &&
+            WaitForSingleObject(timer, 50) == WAIT_OBJECT_0)
+            return;
+    }
+    Sleep(1);
+}
+
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
-    /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;
+    LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
+    if (!audio_pacing_queue_gated()) {
+        /* Clock-paced guest reads (audio_pace). WASAPI releases room one device
+         * period (about 10 ms, 480 frames) at a time; a read per 256 frames of
+         * room read about two guest blocks back to back. The device cushion is
+         * silence queued once, half the endpoint buffer (40 ms requested in
+         * this mode), so it holds about 20-30 ms. */
+        AudioPacer pacer = { 0 };
+        audio_pace_restart(&pacer, audio_win32_now_ns(qf));
+        int had = -1;
+        while (s_mix_thread_running) {
+            const u64 now_ns = audio_win32_now_ns(qf);
+            const long long queued = audio_backend_queue_frames();
+            const int have_device = queued >= 0;
+            if (have_device != had) { pacer.primed = 0; had = have_device; }
+            if (have_device) {
+                const u32 buf = audio_backend_capacity();
+                if (buf) {
+                    u32 prime = buf / 2 / CELL_AUDIO_BLOCK_SAMPLES * CELL_AUDIO_BLOCK_SAMPLES;
+                    if (prime < CELL_AUDIO_BLOCK_SAMPLES) prime = CELL_AUDIO_BLOCK_SAMPLES;
+                    pacer.prime_frames = prime;
+                    /* A block needs 256 frames of room. */
+                    pacer.high_frames = buf > CELL_AUDIO_BLOCK_SAMPLES ? buf - CELL_AUDIO_BLOCK_SAMPLES + 1 : 1;
+                } else { /* SDL (PS3RECOMP_AUDIO_USE_SDL2): as on POSIX */
+                    pacer.prime_frames = CELL_AUDIO_BLOCK_SAMPLES * 4;
+                    pacer.high_frames = CELL_AUDIO_BLOCK_SAMPLES * 12;
+                }
+                pacer.low_frames = CELL_AUDIO_BLOCK_SAMPLES;
+            }
+            unsigned silence;
+            if (!audio_pace(&pacer, now_ns, queued, &silence)) {
+                const u64 next = audio_pace_next_ns(&pacer);
+                audio_win32_wait_ns(next > now_ns ? next - now_ns : 0);
+                continue;
+            }
+            while (silence--) audio_backend_submit(s_silence_block, CELL_AUDIO_BLOCK_SAMPLES);
+            audio_mix_one_block();
+            audio_win32_mixed_block_diagnostics();
+            if (have_device) audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+            audio_win32_rate_diagnostic();
+            audio_notify_event_queues();
+            if (s_audio_diag_on) audio_diagnostics_report(audio_diagnostics_now());
+            audio_chronology_poll();
+        }
+        printf("[cellAudio] Mixing thread stopped\n");
+        return 0;
+    }
+
+    /* PS3RECOMP_AUDIO_PACING=queue: the previous pacing. Pace to the device
+     * clock. The PS3 consumes one block every 5.33 ms;
      * the old Sleep(2)/Sleep(5) loop keyed on a queue depth the 1056-frame
      * WASAPI buffer can never reach, so it mixed ~225 blocks/s and the device
      * dropped the surplus: 20% of the audio thrown away, and a guest mixer
      * (GH3's FMOD) that could not keep ahead of the read index played gaps.
      * With no device, pace on the performance counter instead. */
-    LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
     unsigned long long blocks = 0;
     while (s_mix_thread_running) {
         const int room = audio_backend_room();
@@ -741,35 +1041,9 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         blocks++;
         /* Mix and submit one block */
         audio_mix_one_block();
-        /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
-         * "is any port producing sound" is answerable (LBP Bink movie audio). */
-        { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
-          if (_ap) { static unsigned _n = 0; float pk = 0.0f;
-            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
-                float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
-            if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
-                fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
-        /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
-         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
-        { static FILE* _wf = (FILE*)-1;
-          if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
-          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
+        audio_win32_mixed_block_diagnostics();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
-        /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
-        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
-          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
-            ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
-            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
-              if (!nz) z++; }
-            if (now - t0 >= 5000) {
-                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
-                        n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
-                #if AUDIO_BACKEND_WASAPI
-                        (unsigned)s_wasapi_buf_frames, 10);
-#else
-                        0u, 10);
-#endif
-                n = z = 0; d0 = g_audio_dropped; t0 = now; } } }
+        audio_win32_rate_diagnostic();
 
         /* Notify event queues */
         audio_notify_event_queues();
@@ -803,16 +1077,57 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
-    /* Queue-before-consume pacing is adapted from Noah Peterson's
-     * 93aa8dfe536d5f5a5d0630b83e93f3bf47573e28 (upstream PR #213).
-     * Prime at most four blocks with a device, then advance at 48 kHz even
-     * when the backend is absent or rejects submissions. Waiting must not
-     * consume a guest slot or send its period notification. */
+    /* Default: clock-paced guest reads (audio_pace above). Waiting must not
+     * consume a guest slot or send its period notification, and the guest
+     * advances at 48 kHz even when the backend is absent or rejects
+     * submissions.
+     *
+     * PS3RECOMP_AUDIO_PACING=queue keeps the previous queue-before-consume
+     * pacing, adapted from Noah Peterson's
+     * 93aa8dfe536d5f5a5d0630b83e93f3bf47573e28 (upstream PR #213): prime at
+     * most four blocks with a device, reading a guest block whenever the device
+     * queue has room. */
     struct timespec clock;
     clock_gettime(CLOCK_MONOTONIC, &clock);
     u64 epoch_ns = (u64)clock.tv_sec * 1000000000ULL + (u64)clock.tv_nsec;
     u64 blocks = 0;
     const int pace_clock = audio_pace_on_clock();
+    if (!audio_pacing_queue_gated()) {
+        /* About 21 ms of silence absorbs the device's two-block pulls; the queue
+         * then holds 3-5 blocks (16-27 ms) and never grows past 12 (64 ms). */
+        AudioPacer pacer = { 0 };
+        pacer.prime_frames = CELL_AUDIO_BLOCK_SAMPLES * 4;
+        pacer.low_frames = CELL_AUDIO_BLOCK_SAMPLES;
+        pacer.high_frames = CELL_AUDIO_BLOCK_SAMPLES * 12;
+        audio_pace_restart(&pacer, epoch_ns);
+        int had = s_sdl_audio_dev != 0 && !pace_clock;
+        while (s_mix_thread_running) {
+            clock_gettime(CLOCK_MONOTONIC, &clock);
+            const u64 now_ns = (u64)clock.tv_sec * 1000000000ULL + (u64)clock.tv_nsec;
+            const int have_device = s_sdl_audio_dev != 0 && !pace_clock;
+            /* A device that goes away or returns keeps the guest's schedule;
+             * only the device cushion is rebuilt. */
+            if (have_device != had) { pacer.primed = 0; had = have_device; }
+            unsigned silence;
+            if (!audio_pace(&pacer, now_ns, have_device ? audio_backend_queue_frames() : -1, &silence)) {
+                /* Up to 1 ms, ending at the next read when that is sooner. */
+                const u64 next = audio_pace_next_ns(&pacer);
+                u64 wait_us = next > now_ns ? (next - now_ns) / 1000 : 0;
+                if (wait_us < 100) wait_us = 100;
+                if (wait_us > 1000) wait_us = 1000;
+                usleep((useconds_t)wait_us);
+                continue;
+            }
+            while (silence--) audio_backend_submit(s_silence_block, CELL_AUDIO_BLOCK_SAMPLES);
+            audio_mix_one_block();
+            if (have_device) audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+            audio_notify_event_queues();
+            if (s_audio_diag_on) audio_diagnostics_report(audio_diagnostics_now());
+            audio_chronology_poll();
+        }
+        printf("[cellAudio] Mixing thread stopped\n");
+        return NULL;
+    }
     unsigned lead = s_sdl_audio_dev && !pace_clock ? 3 : 0;
     int had_device = s_sdl_audio_dev != 0 && !pace_clock;
     const u64 block_ns = (u64)CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL /
