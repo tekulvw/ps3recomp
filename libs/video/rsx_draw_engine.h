@@ -338,6 +338,9 @@ int rsx_draw_engine_async_available(void);
 /* Texture reads of depth that reached neither a snapshot, a GPU view nor a
  * guest-memory store (see the engine's one-time report). */
 u64 rsx_draw_engine_depth_unstored_count(void);
+/* Repeat texture binds in one frame after a guest-memory write that missed
+ * the texture (no re-check), and those a write may have touched (checked). */
+void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked);
 /* Same-target colour reads the backend could not copy (no color_snapshot). */
 u64 rsx_draw_engine_feedback_unserved_count(void);
 u64 rsx_draw_engine_submit_async(void);

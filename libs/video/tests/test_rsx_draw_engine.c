@@ -1917,6 +1917,47 @@ static void test_immediate_packed_zero_and_inline(void)
 /* ---- PS3RECOMP_RSX_SINGLE_PRESENT: one presenter per flip --------------- */
 
 /* Run in its own process (main's "single" mode): the switch is read once. */
+/* A guest-memory write the engine is told about (an NV0039 copy) re-checks,
+ * within the frame, only the cached textures whose bytes it touched. */
+static void test_texture_dirty_ranges(void)
+{
+    printf("-- texture dirty ranges\n");
+    engine_up();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    memset(vm_base + TEX_OFFSET, 0x31, 4 * 4 * 4);
+    draw_triangle();
+    const int creates = stub.n_texture_create;
+    unsigned long long skip0 = 0, hit0 = 0, skip = 0, hit = 0;
+    rsx_draw_engine_dirty_filter_counts(&skip0, &hit0);
+    /* Bytes change, but the recorded write is elsewhere: this frame keeps the
+     * texture (as with no write at all); the next frame's check sees it. */
+    memset(vm_base + TEX_OFFSET, 0x32, 4 * 4 * 4);
+    rsx_draw_engine_mark_guest_dirty(TEX_OFFSET + 0x10000u, 256);
+    draw_triangle();
+    rsx_draw_engine_dirty_filter_counts(&skip, &hit);
+    CHECK(stub.n_texture_create == creates && skip == skip0 + 1,
+          "a write elsewhere does not re-check the texture this frame");
+    rsx_draw_engine_present();
+    draw_triangle();
+    CHECK(stub.n_texture_create == creates + 1, "the next frame's check sees the new bytes");
+    /* A write over its bytes, even its last one, re-checks it at once. */
+    memset(vm_base + TEX_OFFSET, 0x33, 4 * 4 * 4);
+    rsx_draw_engine_mark_guest_dirty(TEX_OFFSET + 4 * 4 * 4 - 1, 1);
+    draw_triangle();
+    CHECK(stub.n_texture_create == creates + 2, "a write that touches its last byte re-checks it");
+    /* One that ends right before it does not. */
+    memset(vm_base + TEX_OFFSET, 0x34, 4 * 4 * 4);
+    rsx_draw_engine_mark_guest_dirty(TEX_OFFSET - 16, 16);
+    draw_triangle();
+    CHECK(stub.n_texture_create == creates + 2, "a write ending right before it does not");
+    /* More writes than the ring remembers: checked, since one may have hit. */
+    for (u32 i = 0; i < 300; i++) rsx_draw_engine_mark_guest_dirty(TEX_OFFSET + 0x20000u + i * 16u, 16);
+    draw_triangle();
+    rsx_draw_engine_dirty_filter_counts(&skip, &hit);
+    CHECK(stub.n_texture_create == creates + 3 && hit > hit0, "an overflowed ring re-checks");
+    engine_down();
+}
+
 static void test_single_present(void)
 {
     printf("-- single present\n");
@@ -1983,6 +2024,7 @@ int main(int argc, char** argv)
     test_color_read_as_float();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
+    test_texture_dirty_ranges();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
