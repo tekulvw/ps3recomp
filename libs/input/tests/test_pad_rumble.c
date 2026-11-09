@@ -17,6 +17,11 @@ int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
+/* No native window keyboard in this fixture: a neutral state, as test_pad_file_reports.c does. */
+PS3RecompMacOSPadState ps3recomp_pad_macos_state(void)
+{PS3RecompMacOSPadState s={0,128,128,128,128};return s;}
+#endif
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 u32 cellGcm_flip_request_count(void) { return 0; }   /* PAD_CLOCK=flips (#344) */
 void spu_coh_notify_write(uint32_t a) { (void)a; }

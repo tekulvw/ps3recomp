@@ -1,6 +1,10 @@
 #include "../rsx_metal_backend.m"
 float cellAvconfExt_display_gamma(void){return 1.0f;}   /* identity present gamma */
 #include <assert.h>
+/* No GCM consumer or ring-progress observer (test_metal_frame_capture.m reuses these). */
+int cellGcm_native_consumer_enabled(void){return 0;}
+void cellGcm_fifo_kick_notify(void){}
+void rsx_ring_progress_metal_committed(uint64_t ticket,uint64_t records){(void)ticket;(void)records;}
 
 static void expect_file(const char* path, u32 pixels, const u8 rgba[4])
 {

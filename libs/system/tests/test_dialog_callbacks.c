@@ -15,6 +15,8 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void np_psnr_pump(void) {}
 void cellOskDialog_tick(void) {}
+void ps3_np_eula_tick(void) {}     /* cellSysutil pumps these; no NP here */
+void ps3_np_ticket_tick(void) {}
 
 static unsigned calls;
 static int waiting;

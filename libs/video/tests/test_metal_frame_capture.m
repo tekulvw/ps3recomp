@@ -2,9 +2,6 @@
 #define main texture_binding_capture_main
 #include "test_metal_texture_binding_capture.m"
 #undef main
-int cellGcm_native_consumer_enabled(void){return 0;}
-void cellGcm_fifo_kick_notify(void){}
-void rsx_ring_progress_metal_committed(uint64_t ticket,uint64_t records){(void)ticket;(void)records;}
 int main(int argc,char**argv)
 {
  assert(!texture_binding_capture_main(argc,argv));

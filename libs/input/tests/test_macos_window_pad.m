@@ -54,6 +54,8 @@ int main(int argc, char** argv) { @autoreleasepool {
     s_dev = MTLCreateSystemDefaultDevice(); assert(s_dev);
     s_width=320; s_height=180;
     assert(create_window_impl("ps3recomp keyboard regression") == 0);
+    /* Under ARC a closed window must not also release itself (as tests/test_native_osk_macos.m does). */
+    s_window.releasedWhenClosed=NO;
     [NSApp finishLaunching];
     wait_key(s_window);
     NSView* view = s_window.contentView;
@@ -106,6 +108,7 @@ int main(int argc, char** argv) { @autoreleasepool {
     key(view,NSEventTypeKeyDown,123,0); assert(report()==CELL_PAD_CTRL_LEFT);
     assert(vm_read16(0x1000+4+CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X*2)==128);
     NSWindow* other=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,100,80) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    other.releasedWhenClosed=NO;
     [other makeKeyAndOrderFront:nil]; wait_key(other); assert(report()==0);
     key(view,NSEventTypeKeyDown,7,0); assert(report()==0); /* unfocused */
     [s_window makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; wait_key(s_window); [s_window makeFirstResponder:view];

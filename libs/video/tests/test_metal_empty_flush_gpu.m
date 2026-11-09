@@ -1,5 +1,10 @@
 #include "../rsx_metal_backend.m"
 #include <assert.h>
+float cellAvconfExt_display_gamma(void){return 1.0f;}   /* identity present gamma */
+/* No GCM consumer or ring-progress observer in this fixture. */
+int cellGcm_native_consumer_enabled(void){return 0;}
+void cellGcm_fifo_kick_notify(void){assert(!"inactive native consumer must not be kicked");}
+void rsx_ring_progress_metal_committed(uint64_t ticket,uint64_t records){(void)ticket;(void)records;}
 #include <unistd.h>
 int main(void) {
  @autoreleasepool {
