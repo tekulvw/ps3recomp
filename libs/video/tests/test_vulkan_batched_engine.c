@@ -287,6 +287,38 @@ int main(int argc, char** argv)
     FILE* f = fopen(argv[2], "wb");
     assert(f && fwrite(out, 1, sizeof out, f) == sizeof out); fclose(f);
 
+    /* Surface views: one per (surface, crossbar, format), found again without
+     * a table scan, and never a stale handle. A hint pointing at the wrong
+     * object, or at a view released with its surface, falls back to the scan. */
+    {
+        enum { VW = 8, VH = 8 };
+        const u32 xa = 0xAAE4u, xb = 0xAA1Bu, fmt = 0x85u;
+        u32 s = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, VW, VH, NULL, 0);
+        CHECK(s, "views: target");
+        const unsigned long long scans0 = s_eview_scans, hits0 = s_eview_hits;
+        const u32 va = vk_eng_surface_view(NULL, s, xa, fmt);
+        const u32 vb = vk_eng_surface_view(NULL, s, xb, fmt);
+        CHECK(va && vb && va != vb && va != s && vb != s, "views: one per crossbar");
+        CHECK(vk_eng_surface_view(NULL, s, xa, fmt) == va && vk_eng_surface_view(NULL, s, xb, fmt) == vb,
+              "views: the same key answers with the same view");
+        if (vk_eng_view_hint_slot(s, xa, fmt) != vk_eng_view_hint_slot(s, xb, fmt))
+            CHECK(s_eview_hits - hits0 == 2 && s_eview_scans - scans0 == 2, "views: repeats are hint hits, not scans");
+        /* A wrong hint (another object) is checked, not trusted. */
+        u32* hint = &s_eview_hint[vk_eng_view_hint_slot(s, xa, fmt)];
+        *hint = vb;
+        CHECK(vk_eng_surface_view(NULL, s, xa, fmt) == va && *hint == va, "views: a wrong hint falls back to the scan");
+        *hint = t0;
+        CHECK(vk_eng_surface_view(NULL, s, xa, fmt) == va, "views: a hint naming a texture is not a view");
+        /* Released with the target: the hint names a free slot now. */
+        vk_eng_release(NULL, s);
+        CHECK(!vk_eng_view_is(va, s, xa, fmt) && !vk_eng_view_is(vb, s, xb, fmt), "views: released with their target");
+        CHECK(vk_eng_surface_view(NULL, s, xa, fmt) == 0, "views: none for a released target");
+        u32 s2 = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, VW, VH, NULL, 0);
+        const u32 v2 = s2 ? vk_eng_surface_view(NULL, s2, xa, fmt) : 0;
+        CHECK(v2 && s_eobj[v2].kind == VK_ENG_VIEW && s_eobj[v2].surface == s2, "views: a new target gets its own view");
+        if (s2) vk_eng_release(NULL, s2);
+    }
+
     /* A released colour target's image is pooled and a same-sized request
      * takes it back: the new target still starts transparent black, and the
      * release leaves every other target's framebuffer usable. */
