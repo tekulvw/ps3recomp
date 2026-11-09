@@ -881,7 +881,9 @@ extern "C" { uint8_t* vm_base = g_vm_stub; }
 /* The lifter's raw (guest byte order) accessors live in its HEADER preamble,
  * which this driver does not include (it has its own memory): the same
  * accessors over the stub, through the same 64 KiB window as vm_read*. */
-#define VM_RAW_LD(T, ea) ({ T _v; memcpy(&_v, g_vm_stub + VMOFF(ea), sizeof(T)); _v; })
+/* A template, not a statement expression: cl builds this driver on Windows. */
+template <class T> static inline T vm_raw_ld_(uint64_t ea) { T v; memcpy(&v, g_vm_stub + VMOFF(ea), sizeof(T)); return v; }
+#define VM_RAW_LD(T, ea) vm_raw_ld_<T>(ea)
 #define VM_RAW_ST(T, ea, val) do { T _v = (val); memcpy(g_vm_stub + VMOFF(ea), &_v, sizeof(T)); } while (0)
 static inline void vm_raw_ld16(void* dst, uint64_t ea) { memcpy(dst, g_vm_stub + VMOFF(ea), 16); }
 static inline void vm_raw_st16(uint64_t ea, const void* src) { memcpy(g_vm_stub + VMOFF(ea), src, 16); }

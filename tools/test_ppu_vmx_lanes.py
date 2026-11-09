@@ -42,9 +42,18 @@ def _load(name, rel_path):
 L = _load("ppu_lifter", "tools/ppu_lifter.py")
 
 
+# The instruction words, for the fixed operands check_op uses (vD=4, vA=1,
+# vB=2, vC=3): the lifter routes VMX by raw XO (#286), so the test must hand
+# it the same word the disassembler would.
+XO = {"vmulouh": 72, "vadduws": 640, "vsubuws": 1664, "vadduhs": 576,
+      "vpkuwum": 78, "vpkswss": 462, "vsrb": 516, "vsrab": 772,
+      "vmsumuhm": (3 << 6) | 38, "vmsumshm": (3 << 6) | 40}
+
+
 def _lift_one(mnemonic, operands):
-    insns = [SimpleNamespace(addr=0x1000, mnemonic=mnemonic, operands=operands),
-             SimpleNamespace(addr=0x1004, mnemonic="blr", operands="")]
+    raw = (4 << 26) | (4 << 21) | (1 << 16) | (2 << 11) | XO[mnemonic]
+    insns = [SimpleNamespace(addr=0x1000, mnemonic=mnemonic, operands=operands, raw=raw),
+             SimpleNamespace(addr=0x1004, mnemonic="blr", operands="", raw=0x4E800020)]
     func = L.PPULifter().lift_function(insns, 0x1000, 0x1008)
     return "\n".join(ln for ln in func.body_lines if "return" not in ln)
 
@@ -127,7 +136,8 @@ def check_op(cc, mn, rng):
     src = "\n".join([
         "#include <stdint.h>", "#include <string.h>", "#include <stdio.h>",
         _accessors(),
-        "typedef struct { uint8_t vr[32][16]; } ctx_t;",
+        "#include \"ppu_vmx.h\"",   # the helpers #286 lowers VMX to
+        "typedef struct { uint8_t vr[32][16]; uint32_t vscr; } ctx_t;",
         f"static const unsigned char IN[{len(vecs)}][3][16] = {{" +
         ",".join("{" + ",".join(_carr(v) for v in t) + "}" for t in vecs) + "};",
         "int main(void) { static ctx_t c; ctx_t* ctx = &c;",
@@ -142,7 +152,7 @@ def check_op(cc, mn, rng):
         cpath = Path(td) / "t.c"
         exe = Path(td) / ("t.exe" if os.name == "nt" else "t")
         cpath.write_text(src)
-        r = subprocess.run([cc, "-std=c11", "-O1", "-o", str(exe), str(cpath)],
+        r = subprocess.run([cc, "-std=c11", "-O1", "-I" + str(ROOT / "runtime" / "ppu"), "-o", str(exe), str(cpath)],
                            capture_output=True, text=True)
         if r.returncode:
             return f"{mn}: emitted C does not compile: {r.stderr.strip()[:200]}"
