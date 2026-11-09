@@ -347,6 +347,12 @@ u64 rsx_draw_engine_depth_unstored_count(void);
 /* Draws that bound vertex constants, and draws that reused the previous
  * draw's unchanged ones through rebind_vs_constants. */
 void rsx_draw_engine_vs_constant_counts(unsigned long long* binds, unsigned long long* rebinds);
+/* Fragment-program product lookups served from the engine's memo, and the
+ * ones that walked the microcode (a new or changed program). */
+void rsx_draw_engine_fp_memo_counts(unsigned long long* hits, unsigned long long* misses);
+/* Draws whose pipeline-key inputs equaled the previous draw's (no key hash or
+ * table probe), and draws that computed the key. */
+void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned long long* misses);
 /* Same-target colour reads the backend could not copy (no color_snapshot). */
 u64 rsx_draw_engine_feedback_unserved_count(void);
 u64 rsx_draw_engine_submit_async(void);
