@@ -381,7 +381,9 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
  * the SPU is waiting for because it is stuck inside the dispatch. Real SPUs run
  * concurrently with the PPU; a detached host thread models that. The image bytes
  * and args live in the shared guest arena (vm_base), so they stay valid. */
+#include "spu_task_pool.inc"   /* spu_task_start: the host thread each task runs on */
 typedef struct spu_async_job_s {
+    spu_task_item       task;         /* first: the pool hands this back */
     const uint8_t*      image;
     uint32_t            image_size;
     uint32_t            args_ea;
@@ -392,7 +394,6 @@ typedef struct spu_async_job_s {
     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
     uint32_t            taskid;
     int                 lifetime_counted;
-    struct spu_async_job_s* pool_next; /* PS3RECOMP_SPU_TASK_POOL queue link */
 } spu_async_job;
 
 /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
@@ -1011,104 +1012,40 @@ static void spu_async_run(spu_async_job* j)
     if (counted) spu_taskset_lifecycle_leave(finished_ea);
 }
 
-#ifdef _WIN32
-static DWORD WINAPI spu_async_thread(LPVOID p) {
-    /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
-     * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
-     * instead of killing the process silently with 0x80000001. */
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
-    spu_async_run((spu_async_job*)p);
-    /* Nothing on this stack may stay in the lock-line reserver set. */
-    { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
-      extern void spu_coh_forget_range(uintptr_t, uintptr_t);
-      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
-      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
-    return 0;
-}
-#else
-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
-
-/* PS3RECOMP_SPU_TASK_POOL=1 (opt-in, POSIX): run async SPU tasks on reused
- * host threads instead of creating and detaching one thread per task. The
- * game starts several task dispatches per update (about 2,200 thread births in
- * under six seconds), and each new thread pays the creation, its first-touch
- * stack and thread-local state (the SPU decode cache among it) again.
- *
- * Every task still starts at once on a thread of its own: a task is handed to
- * the pool only when a pool thread is idle and waiting for it (more idle
- * threads than queued tasks); otherwise a new pool thread is created for it,
- * exactly as before. So a task that waits for another task can never be stuck
- * behind it, and the number of threads is never below the number of running
- * tasks. An idle pool thread exits after two seconds without work. Threads
- * keep the 256 MB stack reservation of the per-task threads. */
-static struct {
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    spu_async_job* head;
-    spu_async_job* tail;
-    unsigned queued, idle, threads;
-    unsigned long long reused, created, retired;
-} s_task_pool = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0, 0, 0, 0 };
-static int spu_task_pool_enabled(void)
+/* One async task on its host thread (spu_task_pool.inc). With the pool on
+ * (PS3RECOMP_SPU_TASK_POOL=1) the thread is reused, so put back here whatever
+ * a fresh thread would have had for the next task:
+ *  - thread-local state that is per TASK: the cri task's EXIT count and the
+ *    WAIT_SIGNAL ran= stamp. Caches keyed by content or generation (decode,
+ *    dispatch, lookup memo, MFC lookup) stay: that reuse is the point.
+ *  - registrations keyed by an address on this stack. Lock-line reservers and
+ *    MFC engines are keyed by spu_context pointer, and job contexts are stack
+ *    locals that must deregister before they go out of scope. One that leaks
+ *    past that (a halt unwinding a nested context) is dropped by this range
+ *    scrub. A fresh thread got it at exit; a reused one must get it per task,
+ *    because the next task's context lands at the same address and would
+ *    inherit the leaked MFC engine, and a PPU store would write into the next
+ *    task's frames through the stale reserver entry.
+ * Stack bytes are not cleared: nothing reads a frame it did not write. */
+static _Thread_local unsigned long long s_wait_exit_ms;   /* spu_taskset_wait_signal ran= */
+void spu_spurs_task_thread_reset(void);                   /* spu_channels.c */
+static void spu_async_task(spu_task_item* item)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char* e = getenv("PS3RECOMP_SPU_TASK_POOL");
-        on = e && !strcmp(e, "1");
-        if (on) { fprintf(stderr, "[spu_workload] async task thread pool on\n"); fflush(stderr); }
-    }
-    return on;
-}
-static void spu_task_pool_report(void)
-{
-    const unsigned long long n = s_task_pool.reused + s_task_pool.created;
-    if (n <= 2 || n % 2000 == 0)
-        fprintf(stderr, "[spu_workload] task pool: tasks=%llu reused=%llu created=%llu retired=%llu threads=%u\n",
-                n, s_task_pool.reused, s_task_pool.created, s_task_pool.retired, s_task_pool.threads);
-}
-static void* spu_task_pool_thread(void* p)
-{
-    spu_async_job* j = (spu_async_job*)p;
-    for (;;) {
-        spu_async_run(j);
-        pthread_mutex_lock(&s_task_pool.mu);
-        s_task_pool.idle++;
-        int timed_out = 0;
-        while (!s_task_pool.head && !timed_out) {
-            struct timespec until;
-            clock_gettime(CLOCK_REALTIME, &until);
-            until.tv_sec += 2;
-            timed_out = pthread_cond_timedwait(&s_task_pool.cv, &s_task_pool.mu, &until) == ETIMEDOUT;
-        }
-        s_task_pool.idle--;
-        if (!s_task_pool.head) {                 /* idle too long: retire */
-            s_task_pool.threads--; s_task_pool.retired++;
-            pthread_mutex_unlock(&s_task_pool.mu);
-            return NULL;
-        }
-        j = s_task_pool.head;
-        s_task_pool.head = j->pool_next;
-        if (!s_task_pool.head) s_task_pool.tail = NULL;
-        s_task_pool.queued--;
-        pthread_mutex_unlock(&s_task_pool.mu);
+    s_wait_exit_ms = 0;
+    spu_spurs_task_thread_reset();
+    spu_async_run((spu_async_job*)item);   /* frees the job */
+    uintptr_t lo, hi;
+    if (spu_task_thread_stack(&lo, &hi)) {
+        extern void spu_coh_forget_range(uintptr_t, uintptr_t);
+        spu_coh_forget_range(lo, hi);
+        spu_mfc_forget_range(lo, hi);
+    } else {
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 1))
+            fprintf(stderr, "[spu_workload] host stack range unknown: leaked SPU "
+                            "context registrations are not dropped after a task\n");
     }
 }
-/* 1: the task was handed to an idle pool thread. 0: none is free. */
-static int spu_task_pool_hand_off(spu_async_job* j)
-{
-    pthread_mutex_lock(&s_task_pool.mu);
-    if (s_task_pool.idle <= s_task_pool.queued) { pthread_mutex_unlock(&s_task_pool.mu); return 0; }
-    j->pool_next = NULL;
-    if (s_task_pool.tail) s_task_pool.tail->pool_next = j; else s_task_pool.head = j;
-    s_task_pool.tail = j;
-    s_task_pool.queued++;
-    s_task_pool.reused++;
-    spu_task_pool_report();
-    pthread_cond_signal(&s_task_pool.cv);
-    pthread_mutex_unlock(&s_task_pool.mu);
-    return 1;
-}
-#endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size)
@@ -1481,8 +1418,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     if (!taskset_ea || taskId >= 128) return 0;
     /* ran= is the wall time this task spent OUT of the wait (decode/mix work
      * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
-     * task runs on its own host thread. */
-    static _Thread_local unsigned long long s_wait_exit_ms;
+     * task runs on its own host thread (spu_async_task resets it per task). */
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
       static unsigned _n = 0; if (_n++ < 200 || (_n % 500) == 0)   /* unsigned: periodic, wrapping is defined */
@@ -1675,48 +1611,17 @@ int spu_workload_dispatch_async_owned(const uint8_t* image, uint32_t image_size,
                 fprintf(stderr, "\n");
             } } }
 
-#ifdef _WIN32
-    /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
-     * chains are deep host call chains with fat lifted frames -- a 1MB stack
-     * blew the guard page (STATUS_GUARD_PAGE_VIOLATION 0x80000001, silent
-     * process death) the moment the real decode path first executed. */
-    HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
-                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (!th) { if(j->lifetime_counted) spu_taskset_lifecycle_leave(j->taskset_ea); free(j); return 0; }
-    CloseHandle(th);   /* detached */
-#else
-    /* Same 256 MB reservation, for the same reason: pthread stacks are
-     * mmap'd and committed on touch, so this reserves address space rather
-     * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
-     * the guard page above. */
-    const int pooled = spu_task_pool_enabled();
-    if (pooled && spu_task_pool_hand_off(j)) return 1;
-    void* (*thread_fn)(void*) = pooled ? spu_task_pool_thread : spu_async_thread;
-    if (pooled) {   /* counted before it runs, so a hand-off cannot miss it */
-        pthread_mutex_lock(&s_task_pool.mu);
-        s_task_pool.threads++; s_task_pool.created++;
-        spu_task_pool_report();
-        pthread_mutex_unlock(&s_task_pool.mu);
+    j->task.run = spu_async_task;
+    if (!spu_task_start(&j->task)) {
+        if (j->lifetime_counted) spu_taskset_lifecycle_leave(j->taskset_ea);
+        free(j); return 0;
     }
-    pthread_t th;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    int prc = EINVAL;
-    if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
-        prc = ps3_original_pthread_create(&th, &attr, thread_fn, j);
-    pthread_attr_destroy(&attr);
-    /* A host that will not reserve that much still gets the thread, on the
-     * default stack: a shallow SPU job runs there, and a deep one dying
-     * beats never dispatching at all. */
-    if (prc != 0)
-        prc = ps3_original_pthread_create(&th, NULL, thread_fn, j);
-    if (prc != 0) {
-        if (pooled) { pthread_mutex_lock(&s_task_pool.mu); s_task_pool.threads--; s_task_pool.created--; pthread_mutex_unlock(&s_task_pool.mu); }
-        if(j->lifetime_counted) spu_taskset_lifecycle_leave(j->taskset_ea); free(j); return 0;
-    }
-    pthread_detach(th);
-#endif
     return 1;
+}
+
+unsigned spu_workload_async_pool_shutdown(unsigned wait_ms)
+{
+    return spu_task_pool_shutdown(wait_ms);
 }
 
 /* Existing callers supply the selected task through the synchronous bridge. */
