@@ -545,6 +545,12 @@ if(PS3RECOMP_BUILD_TESTS)
             target_compile_options(test_spu_float_convert PRIVATE -msse4.1)
         endif()
     endif()
+    # Halt/restart/iret landing buffers prepared by spu_jmp_no_unwind (no SEH unwind on Win64).
+    add_executable(test_spu_jmp_no_unwind runtime/spu/tests/test_spu_jmp_no_unwind.c)
+    target_include_directories(test_spu_jmp_no_unwind PRIVATE runtime/spu)
+    add_test(NAME spu_jmp_no_unwind COMMAND test_spu_jmp_no_unwind)
+    add_test(NAME spu_jmp_unwind_requested COMMAND test_spu_jmp_no_unwind)
+    set_tests_properties(spu_jmp_unwind_requested PROPERTIES ENVIRONMENT "SPU_LONGJMP_UNWIND=1")
     # The x86 vector forms of the SPU integer/permute helpers against their scalar
     # references, at the ISA the runtime and lifted code are built for (SSSE3 and up).
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
