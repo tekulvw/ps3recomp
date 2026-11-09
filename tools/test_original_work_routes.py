@@ -67,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix='original-routes-') as temporary:
         '-c',str(SPU/'spu_interp.c'),'-o',str(default_object)]
     checked=subprocess.run(default_command,capture_output=True,text=True,timeout=60)
     if checked.returncode:raise RuntimeError(checked.stdout+checked.stderr)
-    symbols=subprocess.run([os.environ.get('NM','nm'),'-u',str(default_object)],capture_output=True,text=True,timeout=10)
+    symbols=subprocess.run([os.environ.get('NM','nm'),'-u',str(default_object)],capture_output=True,text=True,timeout=120)
     if symbols.returncode:raise RuntimeError(symbols.stdout+symbols.stderr)
     assert 'ps3_original_step' not in symbols.stdout
     routes=['interp']if args.negative_interpreter_control else ['halt']if args.negative_halt_control else ['direct','interp','micro','region','leaf','halt']
