@@ -22,11 +22,21 @@ static int checked(void* u,u32 reason) {
 @end
 @interface CheckedBuffer:NSObject
 @property int failed;
+@property(strong) NSMutableArray* fixture_handlers;
 @end
 @implementation CheckedBuffer
 - (id)renderCommandEncoderWithDescriptor:(id)d {(void)d;return nil;}
 - (void)commit {}
-- (void)waitUntilCompleted {}
+/* Every command buffer now gets the commit-sequence handler; completing
+ * the buffer runs it, as Metal would. */
+- (void)addCompletedHandler:(MTLCommandBufferHandler)handler {
+ if(!self.fixture_handlers)self.fixture_handlers=[NSMutableArray new];
+ [self.fixture_handlers addObject:[handler copy]];
+}
+- (void)waitUntilCompleted {
+ NSArray* handlers=self.fixture_handlers;self.fixture_handlers=nil;
+ for(MTLCommandBufferHandler handler in handlers)handler((id<MTLCommandBuffer>)self);
+}
 - (MTLCommandBufferStatus)status {return self.failed?MTLCommandBufferStatusError:MTLCommandBufferStatusCompleted;}
 - (NSError*)error {return self.failed?[NSError errorWithDomain:@"fixture" code:1 userInfo:nil]:nil;}
 @end

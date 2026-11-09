@@ -66,7 +66,9 @@ int main(int argc, char** argv)
     fclose(f);
     printf("header=%u S7=%u P3=%u other=%u\n", header, s7, p3, other);
     const int want_ppu = getenv("PS3_TPROF_PPU") && !strcmp(getenv("PS3_TPROF_PPU"), "1");
-    if (header != 1 || s7 < 100 || (want_ppu ? p3 < 100 : p3 != 0) || other) { printf("FAIL\n"); return 1; }
+    /* 0.3 s at a 1 ms tick is ~300 samples on a quiet machine; a hosted CI VM
+     * delivered 38. Require clear sampling, not a sample rate. */
+    if (header != 1 || s7 < 10 || (want_ppu ? p3 < 10 : p3 != 0) || other) { printf("FAIL\n"); return 1; }
     printf("PASS on\n");
     (void)argc; (void)argv;
 #endif

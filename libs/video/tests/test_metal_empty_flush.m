@@ -1,16 +1,31 @@
 #include "../rsx_metal_backend.m"
 #include <assert.h>
+float cellAvconfExt_display_gamma(void){return 1.0f;}   /* identity present gamma */
+/* No GCM consumer or ring-progress observer in this fixture. */
+int cellGcm_native_consumer_enabled(void){return 0;}
+void cellGcm_fifo_kick_notify(void){assert(!"inactive native consumer must not be kicked");}
+void rsx_ring_progress_metal_committed(uint64_t ticket,uint64_t records){(void)ticket;(void)records;}
 static unsigned allocations,commits,waits;
 static NSMutableArray* pending_fixture;
 @interface EmptyBuffer:NSObject
 @property MTLCommandBufferStatus fixture_status;
 @property int fixture_error;
+@property(strong) NSMutableArray* fixture_handlers;
 @end
 @implementation EmptyBuffer
 - (void)commit {++commits;}
+/* Completion handlers the backend registers run when the fixture completes the buffer. */
+- (void)addCompletedHandler:(MTLCommandBufferHandler)handler {
+ if(!self.fixture_handlers)self.fixture_handlers=[NSMutableArray new];
+ [self.fixture_handlers addObject:[handler copy]];
+}
+- (void)fixture_complete {
+ NSArray* handlers=self.fixture_handlers;self.fixture_handlers=nil;
+ for(MTLCommandBufferHandler handler in handlers)handler((id<MTLCommandBuffer>)self);
+}
 - (void)waitUntilCompleted {
- ++waits;self.fixture_status=MTLCommandBufferStatusCompleted;
- for(EmptyBuffer* cb in pending_fixture)if(!cb.fixture_error)cb.fixture_status=MTLCommandBufferStatusCompleted;
+ ++waits;self.fixture_status=MTLCommandBufferStatusCompleted;[self fixture_complete];
+ for(EmptyBuffer* cb in pending_fixture)if(!cb.fixture_error){cb.fixture_status=MTLCommandBufferStatusCompleted;[cb fixture_complete];}
 }
 - (MTLCommandBufferStatus)status {return self.fixture_status;}
 - (NSError*)error {return self.fixture_error?[NSError errorWithDomain:@"fixture" code:1 userInfo:nil]:nil;}

@@ -69,6 +69,26 @@ jobs:
             exit 1
           fi
 
+      # TEMPORARY (removed before merge): crash reports for fixtures that died by signal.
+      - name: TEMP crash reports
+        if: always()
+        run: |
+          ls -lt ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -20 || true
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -4); do
+            echo "=== $f"; python3 -c "
+import json,sys
+t=open(sys.argv[1]).read().split('\n',1)
+h=json.loads(t[0]);b=json.loads(t[1])
+print(h.get('name'),b.get('exception'),b.get('termination',{}).get('indicator'))
+imgs=b.get('usedImages',[])
+for th in b.get('threads',[]):
+  if not th.get('triggered'):continue
+  for fr in th.get('frames',[])[:40]:
+    im=imgs[fr['imageIndex']].get('name','?') if fr.get('imageIndex') is not None and fr['imageIndex']<len(imgs) else '?'
+    print(' ',im,fr.get('symbol'),fr.get('symbolLocation'),fr.get('sourceFile',''),fr.get('sourceLine',''))
+" "$f" || head -c 4000 "$f"
+          done
+
       # libs/system/tests/ existed and NOTHING ran it -- two suites checked in,
       # both documenting a macOS clang line in their own header comment, neither
       # wired to any job. They need -Wl,-dead_strip (macOS ld) to drop the
