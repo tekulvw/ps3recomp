@@ -116,11 +116,11 @@ otherwise; "mag-recomp" means the downstream port that pins this fork.
 - **Upstream PR title:** "perf(timer): opt-in deadline yield for short sys_timer_usleep on POSIX"
 
 **Q5. SPU task thread pool**
-- **Commit:** c1c07bfe (+98), `runtime/spu/spu_workload.c`.
-- **Value:** `PS3RECOMP_SPU_TASK_POOL=1` reuses host threads for async SPU tasks. A thread is reused only when one is idle, so a task is never queued behind another and there is no deadlock risk. We measured about 2,200 thread births in 6 s on Mac without it.
+- **Commits:** c1c07bfe (+98, POSIX), then the shared `runtime/spu/spu_task_pool.inc` with a Windows pool and per-task thread hygiene.
+- **Value:** `PS3RECOMP_SPU_TASK_POOL=1` reuses host threads for async SPU tasks on Windows and POSIX. A thread is reused only when one is idle, so a task is never queued behind another and there is no deadlock risk. We measured about 2,200 thread births in 6 s on Mac without it. Every task, pooled or not, now drops lock-line and MFC registrations left on its stack (POSIX never did), and a reused thread resets the per-task cri EXIT count.
 - **Risk:** low; off by default.
-- **Missing:** a test. Add a synthetic stress test for reuse and retirement.
-- **Upstream PR title:** "perf(spu): opt-in host thread pool for async SPU tasks (POSIX)"
+- **Tests:** `tools/test_spu_task_pool.py` (Windows and POSIX), `tools/test_spu_async_task_pool.py` (POSIX, real dispatch).
+- **Upstream PR title:** "perf(spu): opt-in host thread pool for async SPU tasks"
 
 **Q6. Single present per flip, plus present-each-executed-flip-once**
 - **Commits:** fork 6e9b9184 (+56, `PS3RECOMP_RSX_SINGLE_PRESENT=1`, `rsx_draw_engine.c` plus a fixture). mag-recomp 59231c2 (#90, `frame_present_policy.h`, 23 lines).
