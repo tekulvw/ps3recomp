@@ -710,6 +710,75 @@ SPU__SF_V2(spu__fm_s, spu__fm_any(x, y))
 SPU__SF_V3(spu__fma_s,  spu__fma_any(x, y, z, 0, 0))
 SPU__SF_V3(spu__fms_s,  spu__fma_any(x, y, z, 0, 0x80000000u))
 SPU__SF_V3(spu__fnms_s, spu__fma_any(x, y, z, 0x80000000u, 0))
+/* SPU_FLOATFIX_STATS=1: count why lanes reach the fix-ups (T-0014) and print the tally every
+ * 2^24 lanes. Only the cold fix-ups count, so it costs nothing on the fast path; the counters
+ * are one merged global (SPU_GATE: weak, or selectany) shared by every TU that includes this
+ * header. The NEON and the x86 (SSE4.1, AVX2) forms count. */
+enum { SPU_FF_ZX, SPU_FF_ZY, SPU_FF_EXT, SPU_FF_GAP, SPU_FF_RANGE, SPU_FF_BOUNDARY, SPU_FF_N };
+SPU_GATE uint64_t spu_floatfix_stats[3][SPU_FF_N];
+SPU_GATE uint64_t spu_floatfix_vectors[3];
+SPU_GATE int spu_floatfix_on = -1;
+SPU_GATE uint64_t spu_floatfix_lanes;
+static __attribute__((cold, noinline, unused)) void spu__ff_count(int op, int why) {
+    static const char* const ops[3] = { "fa/fs", "fm", "fma/fms/fnms" };
+    __atomic_fetch_add(&spu_floatfix_stats[op][why], 1, __ATOMIC_RELAXED);
+    if ((__atomic_add_fetch(&spu_floatfix_lanes, 1, __ATOMIC_RELAXED) & 0xFFFFFF) != 0) return;
+    uint64_t n = 0;
+    for (int o = 0; o < 3; o++) for (int k = 0; k < SPU_FF_N; k++) n += __atomic_load_n(&spu_floatfix_stats[o][k], __ATOMIC_RELAXED);
+    char buf[640]; int p = snprintf(buf, sizeof buf, "[spu-floatfix] %llu lanes:", (unsigned long long)n);
+    for (int o = 0; o < 3; o++)
+        p += snprintf(buf + p, sizeof buf - p, "  %s vec=%llu zero-a=%llu zero-b=%llu ext=%llu gap=%llu range=%llu boundary=%llu;",
+                      ops[o], (unsigned long long)spu_floatfix_vectors[o],
+                      (unsigned long long)spu_floatfix_stats[o][SPU_FF_ZX], (unsigned long long)spu_floatfix_stats[o][SPU_FF_ZY],
+                      (unsigned long long)spu_floatfix_stats[o][SPU_FF_EXT], (unsigned long long)spu_floatfix_stats[o][SPU_FF_GAP],
+                      (unsigned long long)spu_floatfix_stats[o][SPU_FF_RANGE], (unsigned long long)spu_floatfix_stats[o][SPU_FF_BOUNDARY]);
+    fprintf(stderr, "%s\n", buf);
+}
+static inline int spu__ff_enabled(void) {
+    int on = __atomic_load_n(&spu_floatfix_on, __ATOMIC_RELAXED);
+    if (on < 0) { const char* e = getenv("SPU_FLOATFIX_STATS"); on = (e && e[0] == '1');
+                  __atomic_store_n(&spu_floatfix_on, on, __ATOMIC_RELAXED); }
+    return on;
+}
+static inline uint32_t spu__ff_be(uint32_t v) { return (v >> 23) & 0xFFu; }
+/* Why a fa/fs lane failed (y already sign-adjusted). zero-a/zero-b: operand 1/2 is zero;
+ * ext: an operand is extended range; gap: exponents differ by more than 29; range: the
+ * result is not a normal single. */
+static inline int spu__ff_why_fa(uint32_t x, uint32_t y) {
+    const int bx = (int)spu__ff_be(x), by = (int)spu__ff_be(y);
+    if (!bx) return SPU_FF_ZX;
+    if (!by) return SPU_FF_ZY;
+    if (bx == 255 || by == 255) return SPU_FF_EXT;
+    if (bx - by > 29 || by - bx > 29) return SPU_FF_GAP;
+    return SPU_FF_RANGE;
+}
+static inline int spu__ff_why_fm(uint32_t x, uint32_t y) {
+    const int bx = (int)spu__ff_be(x), by = (int)spu__ff_be(y);
+    if (!bx) return SPU_FF_ZX;
+    if (!by) return SPU_FF_ZY;
+    if (bx == 255 || by == 255) return SPU_FF_EXT;
+    return SPU_FF_RANGE;
+}
+/* fma: zero-a = the product is zero (x or y), zero-b = the addend is zero; boundary = the
+ * TwoSum test (rounded onto a 24-bit boundary), told apart from range by redoing the sum. */
+static inline int spu__ff_why_fma(uint32_t x, uint32_t y, uint32_t z, uint32_t negp, uint32_t negc) {
+    const int bx = (int)spu__ff_be(x), by = (int)spu__ff_be(y), bz = (int)spu__ff_be(z);
+    if (!bx || !by) return SPU_FF_ZX;
+    if (!bz) return SPU_FF_ZY;
+    if (bx == 255 || by == 255 || bz == 255) return SPU_FF_EXT;
+    const double s = (double)spu__sf_f(x ^ negp) * (double)spu__sf_f(y) + (double)spu__sf_f(z ^ negc);
+    uint64_t u; memcpy(&u, &s, 8);
+    const int e = (int)((u >> 52) & 0x7FFu) - 1023;
+    return (e < -126 || e > 127) ? SPU_FF_RANGE : SPU_FF_BOUNDARY;
+}
+/* The tally for forms that hold the lanes as words (x86): bit i of ok set = lane i was exact. */
+static __attribute__((cold, noinline, unused)) void spu__ff_tally_w(int op, int ok, const uint32_t* x, const uint32_t* y,
+                                                                     const uint32_t* z, uint32_t negp, uint32_t negc) {
+    __atomic_fetch_add(&spu_floatfix_vectors[op], 1, __ATOMIC_RELAXED);
+    for (int i = 0; i < 4; i++) if (!(ok >> i & 1))
+        spu__ff_count(op, op == 0 ? spu__ff_why_fa(x[i], y[i]) : op == 1 ? spu__ff_why_fm(x[i], y[i])
+                                  : spu__ff_why_fma(x[i], y[i], z[i], negp, negc));
+}
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
 /* Four lanes at a time, every lane exact, with no FPCR change. The host rounds to nearest (the
  * thread's default FPCR: RN, no flush-to-zero -- writing FPCR per op serializes, ~17 ns on an
@@ -754,39 +823,6 @@ SPU__NV_INLINE uint32x4_t spu__nv_u(float32x4_t x) { return vreinterpretq_u32_f3
  * with the fast path's vector result kept every fa/fm/fma result in x-registers, with fmov round
  * trips, on the fast path too (fa 5.3 -> 9.8 ns). */
 #define SPU__NV_LANES(v, m) uint32_t m[4]; vst1q_u32(m, v)
-/* SPU_FLOATFIX_STATS=1: count why lanes reach the fix-ups (T-0014) and print the tally every
- * 2^24 lanes. Only the cold fix-ups count, so it costs nothing on the fast path; the counters
- * are one weak global shared by every TU that includes this header. */
-enum { SPU_FF_ZX, SPU_FF_ZY, SPU_FF_EXT, SPU_FF_GAP, SPU_FF_RANGE, SPU_FF_BOUNDARY, SPU_FF_N };
-__attribute__((weak)) uint64_t spu_floatfix_stats[3][SPU_FF_N];
-__attribute__((weak)) uint64_t spu_floatfix_vectors[3];
-__attribute__((weak)) int spu_floatfix_on = -1;
-__attribute__((weak)) uint64_t spu_floatfix_lanes;
-static inline __attribute__((cold, noinline)) void spu__ff_count(int op, int why) {
-    static const char* const ops[3] = { "fa/fs", "fm", "fma/fms/fnms" };
-    __atomic_fetch_add(&spu_floatfix_stats[op][why], 1, __ATOMIC_RELAXED);
-    if ((__atomic_add_fetch(&spu_floatfix_lanes, 1, __ATOMIC_RELAXED) & 0xFFFFFF) != 0) return;
-    uint64_t n = 0;
-    for (int o = 0; o < 3; o++) for (int k = 0; k < SPU_FF_N; k++) n += __atomic_load_n(&spu_floatfix_stats[o][k], __ATOMIC_RELAXED);
-    char buf[640]; int p = snprintf(buf, sizeof buf, "[spu-floatfix] %llu lanes:", (unsigned long long)n);
-    for (int o = 0; o < 3; o++)
-        p += snprintf(buf + p, sizeof buf - p, "  %s vec=%llu zero-a=%llu zero-b=%llu ext=%llu gap=%llu range=%llu boundary=%llu;",
-                      ops[o], (unsigned long long)spu_floatfix_vectors[o],
-                      (unsigned long long)spu_floatfix_stats[o][SPU_FF_ZX], (unsigned long long)spu_floatfix_stats[o][SPU_FF_ZY],
-                      (unsigned long long)spu_floatfix_stats[o][SPU_FF_EXT], (unsigned long long)spu_floatfix_stats[o][SPU_FF_GAP],
-                      (unsigned long long)spu_floatfix_stats[o][SPU_FF_RANGE], (unsigned long long)spu_floatfix_stats[o][SPU_FF_BOUNDARY]);
-    fprintf(stderr, "%s\n", buf);
-}
-static inline int spu__ff_enabled(void) {
-    int on = __atomic_load_n(&spu_floatfix_on, __ATOMIC_RELAXED);
-    if (on < 0) { const char* e = getenv("SPU_FLOATFIX_STATS"); on = (e && e[0] == '1');
-                  __atomic_store_n(&spu_floatfix_on, on, __ATOMIC_RELAXED); }
-    return on;
-}
-static inline uint32_t spu__ff_be(uint32_t v) { return (v >> 23) & 0xFFu; }
-static inline int spu__ff_why_fa(uint32_t x, uint32_t y);
-static inline int spu__ff_why_fm(uint32_t x, uint32_t y);
-static inline int spu__ff_why_fma(uint32_t x, uint32_t y, uint32_t z, uint32_t negp, uint32_t negc);
 static inline __attribute__((cold, noinline)) void spu__ff_tally(int op, uint32x4_t ok, uint32x4_t a, uint32x4_t b,
                                                                   uint32x4_t c, uint32_t negp, uint32_t negc) {
     SPU__NV_LANES(ok, m); SPU__NV_LANES(a, x); SPU__NV_LANES(b, y); SPU__NV_LANES(c, z);
@@ -794,36 +830,6 @@ static inline __attribute__((cold, noinline)) void spu__ff_tally(int op, uint32x
     for (int i = 0; i < 4; i++) if (!m[i])
         spu__ff_count(op, op == 0 ? spu__ff_why_fa(x[i], y[i]) : op == 1 ? spu__ff_why_fm(x[i], y[i])
                                   : spu__ff_why_fma(x[i], y[i], z[i], negp, negc));
-}
-/* Why a fa/fs lane failed (y already sign-adjusted). zero-a/zero-b: operand 1/2 is zero;
- * ext: an operand is extended range; gap: exponents differ by more than 29; range: the
- * result is not a normal single. */
-static inline int spu__ff_why_fa(uint32_t x, uint32_t y) {
-    const int bx = (int)spu__ff_be(x), by = (int)spu__ff_be(y);
-    if (!bx) return SPU_FF_ZX;
-    if (!by) return SPU_FF_ZY;
-    if (bx == 255 || by == 255) return SPU_FF_EXT;
-    if (bx - by > 29 || by - bx > 29) return SPU_FF_GAP;
-    return SPU_FF_RANGE;
-}
-static inline int spu__ff_why_fm(uint32_t x, uint32_t y) {
-    const int bx = (int)spu__ff_be(x), by = (int)spu__ff_be(y);
-    if (!bx) return SPU_FF_ZX;
-    if (!by) return SPU_FF_ZY;
-    if (bx == 255 || by == 255) return SPU_FF_EXT;
-    return SPU_FF_RANGE;
-}
-/* fma: zero-a = the product is zero (x or y), zero-b = the addend is zero; boundary = the
- * TwoSum test (rounded onto a 24-bit boundary), told apart from range by redoing the sum. */
-static inline int spu__ff_why_fma(uint32_t x, uint32_t y, uint32_t z, uint32_t negp, uint32_t negc) {
-    const int bx = (int)spu__ff_be(x), by = (int)spu__ff_be(y), bz = (int)spu__ff_be(z);
-    if (!bx || !by) return SPU_FF_ZX;
-    if (!bz) return SPU_FF_ZY;
-    if (bx == 255 || by == 255 || bz == 255) return SPU_FF_EXT;
-    const double s = (double)spu__sf_f(x ^ negp) * (double)spu__sf_f(y) + (double)spu__sf_f(z ^ negc);
-    uint64_t u; memcpy(&u, &s, 8);
-    const int e = (int)((u >> 52) & 0x7FFu) - 1023;
-    return (e < -126 || e > 127) ? SPU_FF_RANGE : SPU_FF_BOUNDARY;
 }
 SPU__NV_SLOW uint32x4_t spu__fa_fix(uint32x4_t r, uint32x4_t ok, uint32x4_t a, uint32x4_t b, uint32_t negb) {
     if (spu__ff_enabled()) spu__ff_tally(0, ok, a, veorq_u32(b, vdupq_n_u32(negb)), b, 0, 0);
@@ -956,120 +962,141 @@ SPU__NV_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return SPU__NV_FMA(a, b, 
 SPU__NV_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return SPU__NV_FMA(a, b, c, 0, 0x80000000u); }  /* a*b - c */
 SPU__NV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return SPU__NV_FMA(a, b, c, 0x80000000u, 0); }  /* c - a*b */
 #elif defined(__AVX2__) && !defined(SPU_SCALAR_HELPERS)
-/* The NEON fast path above, on x86 with AVX2: the four lanes widened to one f64x4 (exact),
- * the operation, the 29 low significand bits cleared, narrowed (exact). Same lane rules: an
- * ordinary single or a true +-0 takes the vector result, a zero result loses its sign, fa/fs
- * also needs the exponents within 29 of each other, and fma keeps a lane only if TwoSum says
- * the add did not round onto a 24-bit boundary. Every other lane is redone one by one. The
- * product of two 24-bit significands is exact in double, so a compiler contracting a multiply
- * and an add into an FMA cannot change any rounding here. */
+/* The NEON fast path above, on x86 with AVX2: the four lanes widened to one f64x4 (exact), the
+ * operation in double precision, the 29 low significand bits cleared, narrowed (exact). The rules:
+ *  - a product of two 24-bit significands is exact in double, so fm needs no correction;
+ *  - a sum (fa/fs, and the add of fma) is rounded to nearest once, at 53 bits. TwoSum gives its
+ *    exact error; where the sum was rounded away from zero (error of the opposite sign) it takes
+ *    one step toward zero at bit 53, after which clearing the 29 low bits is the truncation of the
+ *    exact value, also when the rounding landed on a 24-bit boundary (the exact value lies
+ *    strictly between the stepped and the rounded double, and no 24-bit boundary lies above the
+ *    stepped one and at or below the exact value). No exponent gap is too wide for this;
+ *  - an SPU zero (biased exponent 0, any fraction) is made +0 before the op, so the host never
+ *    sees a denormal operand; a zero factor makes the product +0 whatever the other factor is
+ *    (for fma the result is then the addend as it is, extended range too, or +0 for a zero one);
+ *  - a result below 2^-126 in magnitude, an exact zero included, is +0: the SPU flushes it. The
+ *    stepped double is below 2^-126 exactly when the exact result is (2^-126 is a 24-bit value).
+ *    Such lanes are cleared before narrowing, so no denormal single is formed either.
+ * What is left for the per-lane path: an extended-range operand (biased exponent 255, Inf or NaN
+ * on the host) that a zero factor does not absorb, and a result at or above 2^128 (extended range
+ * or saturated on the SPU). The double product is exact, so a compiler contracting a multiply
+ * and an add into an FMA cannot change any rounding. */
 #include <immintrin.h>
 #define SPU__X8_INLINE static inline __attribute__((always_inline))
 #define SPU__X8_SLOW   static __attribute__((noinline, cold, unused))
-SPU__X8_INLINE __m128i spu__x8_bexp(__m128i x) { return _mm_srli_epi32(_mm_slli_epi32(x, 1), 24); }
-SPU__X8_INLINE __m128i spu__x8_zero(__m128i x) { return _mm_cmpeq_epi32(_mm_slli_epi32(x, 1), _mm_setzero_si128()); }
-SPU__X8_INLINE __m128i spu__x8_plain0(__m128i x) {          /* biased exponent 1..254, or +-0 */
-    const __m128i e = spu__x8_bexp(x);
-    return _mm_or_si128(_mm_and_si128(_mm_cmpgt_epi32(e, _mm_setzero_si128()), _mm_cmpgt_epi32(_mm_set1_epi32(255), e)),
-                        spu__x8_zero(x));
+/* all-ones in the lanes the SPU reads as zero: biased exponent 0, any fraction */
+SPU__X8_INLINE __m128i spu__x8_z(__m128i x) {
+    return _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+}
+/* all-ones in the extended-range lanes: biased exponent 255 */
+SPU__X8_INLINE __m128i spu__x8_ext(__m128i x) {
+    const __m128i m = _mm_set1_epi32(0x7F800000);
+    return _mm_cmpeq_epi32(_mm_and_si128(x, m), m);
 }
 SPU__X8_INLINE __m256d spu__x8_wide(__m128i x) { return _mm256_cvtps_pd(_mm_castsi128_ps(x)); }
 /* the low 32 bits of each 64-bit lane: a 64-bit mask narrowed to 32-bit lanes */
 SPU__X8_INLINE __m128i spu__x8_narrow(__m256i m) {
     return _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(m, _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6)));
 }
-/* d truncated to singles. *ok: lanes whose result is a normal single or an exact zero and, when
- * err is given, did not both round and land on a 24-bit boundary. *zm: the zero lanes. */
-SPU__X8_INLINE __m128i spu__x8_trunc0(__m256d d, __m128i* ok, __m128i* zm, const __m256d* err) {
-    const __m256i u = _mm256_castpd_si256(d);
-    const __m256i az = _mm256_cmpeq_epi64(_mm256_slli_epi64(u, 1), _mm256_setzero_si256());
-    const __m256i e = _mm256_sub_epi64(_mm256_and_si256(_mm256_srli_epi64(u, 52), _mm256_set1_epi64x(0x7FF)),
-                                       _mm256_set1_epi64x(1023));
-    __m256i good = _mm256_andnot_si256(_mm256_or_si256(_mm256_cmpgt_epi64(_mm256_set1_epi64x(-126), e),
-                                                       _mm256_cmpgt_epi64(e, _mm256_set1_epi64x(127))),
-                                       _mm256_set1_epi64x(-1));
-    if (err) {
-        const __m256i low = _mm256_and_si256(u, _mm256_set1_epi64x(0x1FFFFFFF));
-        const __m256i bnd = _mm256_cmpeq_epi64(low, _mm256_setzero_si256());
-        const __m256i rnd = _mm256_castpd_si256(_mm256_cmp_pd(*err, _mm256_setzero_pd(), _CMP_NEQ_UQ));
-        good = _mm256_andnot_si256(_mm256_and_si256(bnd, rnd), good);
-    }
-    *ok = spu__x8_narrow(_mm256_or_si256(good, az));
-    *zm = spu__x8_narrow(az);
-    const __m256d t = _mm256_castsi256_pd(_mm256_and_si256(u, _mm256_set1_epi64x(~0x1FFFFFFFll)));
-    return _mm_andnot_si128(_mm_and_si128(*zm, _mm_set1_epi32((int)0x80000000u)), _mm_castps_si128(_mm256_cvtpd_ps(t)));
+/* s = a + b rounded to nearest, and its exact error (TwoSum) */
+SPU__X8_INLINE __m256d spu__x8_twosum(__m256d a, __m256d b, __m256d* err) {
+    const __m256d s = _mm256_add_pd(a, b), bb = _mm256_sub_pd(s, a);
+    *err = _mm256_add_pd(_mm256_sub_pd(a, _mm256_sub_pd(s, bb)), _mm256_sub_pd(b, bb));
+    return s;
 }
-SPU__X8_INLINE int spu__x8_all4(__m128i m) { return _mm_movemask_ps(_mm_castsi128_ps(m)) == 0xF; }
+/* d truncated to singles, a result below 2^-126 in magnitude as +0. With err (d a rounded sum, err
+ * its exact error), d first takes one step toward zero where it was rounded away from zero: d and
+ * err of opposite signs, which d * err < 0 tells (no underflow: both are far above 2^-1022 here).
+ * *bad: the lanes at or above 2^128. */
+SPU__X8_INLINE __m128i spu__x8_trunc0(__m256d d, __m128i* bad, const __m256d* err) {
+    __m256i u = _mm256_castpd_si256(d);
+    if (err) u = _mm256_add_epi64(u, _mm256_castpd_si256(_mm256_cmp_pd(_mm256_mul_pd(d, *err), _mm256_setzero_pd(), _CMP_LT_OQ)));
+    const __m256i be = _mm256_and_si256(_mm256_srli_epi64(u, 52), _mm256_set1_epi64x(0x7FF));   /* biased */
+    const __m256i tiny = _mm256_cmpgt_epi64(_mm256_set1_epi64x(1023 - 126), be);
+    *bad = spu__x8_narrow(_mm256_cmpgt_epi64(be, _mm256_set1_epi64x(1023 + 127)));
+    const __m256d t = _mm256_castsi256_pd(_mm256_andnot_si256(tiny, _mm256_and_si256(u, _mm256_set1_epi64x(~0x1FFFFFFFll))));
+    return _mm_castps_si128(_mm256_cvtpd_ps(t));
+}
+SPU__X8_INLINE int spu__x8_mask(__m128i m) { return _mm_movemask_ps(_mm_castsi128_ps(m)); }
 SPU__X8_INLINE __m128i spu__x8_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
 SPU__X8_INLINE u128 spu__x8_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u32, v); return r; }
-SPU__X8_SLOW u128 spu__x8_fa_fix(u128 r, __m128i ok, u128 a, u128 b, uint32_t negb) {
-    const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
-    for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fa_any(a._u32[i], b._u32[i] ^ negb);
+/* The lanes set in redo (one bit per lane), recomputed one by one (scalar fast path, else exact). */
+SPU__X8_SLOW u128 spu__x8_fa_fix(u128 r, int redo, u128 a, u128 b, uint32_t negb) {
+    if (spu__ff_enabled()) {
+        uint32_t y[4]; for (int i = 0; i < 4; i++) y[i] = b._u32[i] ^ negb;
+        spu__ff_tally_w(0, ~redo, a._u32, y, y, 0, 0);
+    }
+    for (int i = 0; i < 4; i++) if (redo >> i & 1) r._u32[i] = spu__fa_any(a._u32[i], b._u32[i] ^ negb);
     return r;
 }
-SPU__X8_SLOW u128 spu__x8_fm_fix(u128 r, __m128i ok, u128 a, u128 b) {
-    const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
-    for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fm_any(a._u32[i], b._u32[i]);
+SPU__X8_SLOW u128 spu__x8_fm_fix(u128 r, int redo, u128 a, u128 b) {
+    if (spu__ff_enabled()) spu__ff_tally_w(1, ~redo, a._u32, b._u32, b._u32, 0, 0);
+    for (int i = 0; i < 4; i++) if (redo >> i & 1) r._u32[i] = spu__fm_any(a._u32[i], b._u32[i]);
     return r;
 }
-SPU__X8_SLOW u128 spu__x8_fma_fix(u128 r, __m128i ok, u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
-    const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
-    for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], negp, negc);
+SPU__X8_SLOW u128 spu__x8_fma_fix(u128 r, int redo, u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+    if (spu__ff_enabled()) spu__ff_tally_w(2, ~redo, a._u32, b._u32, c._u32, negp, negc);
+    for (int i = 0; i < 4; i++) if (redo >> i & 1) r._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], negp, negc);
     return r;
 }
 SPU__X8_INLINE u128 spu__x8_fa(u128 a, u128 b, uint32_t negb) {
     const __m128i x = spu__x8_ld(a), y = _mm_xor_si128(spu__x8_ld(b), _mm_set1_epi32((int)negb));
-    /* the exponent-gap limit applies only between two nonzero terms */
-    const __m128i gap = _mm_cmpgt_epi32(_mm_set1_epi32(30), _mm_abs_epi32(_mm_sub_epi32(spu__x8_bexp(x), spu__x8_bexp(y))));
-    const __m128i pre = _mm_and_si128(_mm_and_si128(spu__x8_plain0(x), spu__x8_plain0(y)),
-                                      _mm_or_si128(gap, _mm_or_si128(spu__x8_zero(x), spu__x8_zero(y))));
-    __m128i ok, zm;
-    const __m128i r = spu__x8_trunc0(_mm256_add_pd(spu__x8_wide(x), spu__x8_wide(y)), &ok, &zm, NULL);
-    ok = _mm_and_si128(ok, pre);
-    return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fa_fix(spu__x8_st(r), ok, a, b, negb);
+    const __m256d dx = spu__x8_wide(_mm_andnot_si128(spu__x8_z(x), x)), dy = spu__x8_wide(_mm_andnot_si128(spu__x8_z(y), y));
+    __m256d err;
+    const __m256d s = spu__x8_twosum(dx, dy, &err);
+    __m128i bad;
+    const __m128i r = spu__x8_trunc0(s, &bad, &err);
+    const int redo = spu__x8_mask(_mm_or_si128(bad, _mm_or_si128(spu__x8_ext(x), spu__x8_ext(y))));
+    return redo ? spu__x8_fa_fix(spu__x8_st(r), redo, a, b, negb) : spu__x8_st(r);
 }
 SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return spu__x8_fa(a, b, 0); }
 SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return spu__x8_fa(a, b, 0x80000000u); }
 SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) {
-    const __m128i x = spu__x8_ld(a), y = spu__x8_ld(b);
-    __m128i ok, zm;
-    const __m128i r = spu__x8_trunc0(_mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(y)), &ok, &zm, NULL);
-    ok = _mm_and_si128(ok, _mm_and_si128(spu__x8_plain0(x), spu__x8_plain0(y)));
-    return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fm_fix(spu__x8_st(r), ok, a, b);
+    const __m128i x = spu__x8_ld(a), y = spu__x8_ld(b), zx = spu__x8_z(x), zy = spu__x8_z(y);
+    const __m128i zp = _mm_or_si128(zx, zy);                                   /* zero product: +0 */
+    const __m256d p = _mm256_mul_pd(spu__x8_wide(_mm_andnot_si128(zx, x)), spu__x8_wide(_mm_andnot_si128(zy, y)));
+    __m128i bad;
+    const __m128i r = _mm_andnot_si128(zp, spu__x8_trunc0(p, &bad, NULL));
+    const int redo = spu__x8_mask(_mm_andnot_si128(zp, _mm_or_si128(bad, _mm_or_si128(spu__x8_ext(x), spu__x8_ext(y)))));
+    return redo ? spu__x8_fm_fix(spu__x8_st(r), redo, a, b) : spu__x8_st(r);
 }
-/* (+-a*b) + (+-c): the product is exact in double; TwoSum gives the add's exact rounding error. */
+/* (+-a*b) + (+-c): the product is exact in double, the add is a TwoSum. */
 SPU__X8_INLINE u128 spu__x8_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
     const __m128i x = _mm_xor_si128(spu__x8_ld(a), _mm_set1_epi32((int)negp)), y = spu__x8_ld(b);
     const __m128i z = _mm_xor_si128(spu__x8_ld(c), _mm_set1_epi32((int)negc));
-    const __m256d p = _mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(y)), zz = spu__x8_wide(z);
-    const __m256d sum = _mm256_add_pd(p, zz), bb = _mm256_sub_pd(sum, p);
-    const __m256d err = _mm256_add_pd(_mm256_sub_pd(p, _mm256_sub_pd(sum, bb)), _mm256_sub_pd(zz, bb));
-    __m128i ok, zm;
-    const __m128i r = spu__x8_trunc0(sum, &ok, &zm, &err);
-    ok = _mm_and_si128(ok, _mm_and_si128(_mm_and_si128(spu__x8_plain0(x), spu__x8_plain0(y)), spu__x8_plain0(z)));
-    return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fma_fix(spu__x8_st(r), ok, a, b, c, negp, negc);
+    const __m128i zx = spu__x8_z(x), zy = spu__x8_z(y), zp = _mm_or_si128(zx, zy);   /* zero product */
+    const __m128i zi = _mm_andnot_si128(spu__x8_z(z), z);                      /* a zero addend as +0 */
+    const __m256d p = _mm256_mul_pd(spu__x8_wide(_mm_andnot_si128(zx, x)), spu__x8_wide(_mm_andnot_si128(zy, y)));
+    __m256d err;
+    const __m256d s = spu__x8_twosum(p, spu__x8_wide(zi), &err);
+    __m128i bad;
+    const __m128i r = _mm_blendv_epi8(spu__x8_trunc0(s, &bad, &err), zi, zp);
+    const __m128i ext = _mm_or_si128(_mm_or_si128(spu__x8_ext(x), spu__x8_ext(y)), spu__x8_ext(z));
+    const int redo = spu__x8_mask(_mm_andnot_si128(zp, _mm_or_si128(bad, ext)));
+    return redo ? spu__x8_fma_fix(spu__x8_st(r), redo, a, b, c, negp, negc) : spu__x8_st(r);
 }
 SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0); }            /* a*b + c */
 SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
 SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__x8_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
 #elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
 /* The AVX2 form above with SSE4.1 only (the default x86-64 build), each f64x4 step done as two
- * f64x2 halves: lanes 0-1 and lanes 2-3 widened exactly, the same operation, the 29 low
- * significand bits cleared, narrowed exactly. The lane rules are the AVX2 ones word for word, so a
- * lane takes the vector result only where that result is provably the exact truncation, and
- * every other lane is redone by the per-lane path (spu__*_any). There is no FMA instruction here,
- * so nothing can be contracted; the double product of two 24-bit significands is exact anyway.
- * 64-bit compares other than equality are SSE4.2, so exponent range checks narrow the double
- * exponents to 32-bit lanes first. */
+ * f64x2 halves: lanes 0-1 and lanes 2-3 widened exactly, the same operation, the same step toward
+ * zero, the 29 low significand bits cleared, narrowed exactly. The lane rules are the AVX2 ones
+ * word for word. There is no FMA instruction here, so nothing can be contracted; the double
+ * product of two 24-bit significands is exact anyway. 64-bit compares other than equality are
+ * SSE4.2, so the exponent range checks narrow the double exponents to 32-bit lanes first, and
+ * the below-2^-126 test is a double compare. */
 #include <smmintrin.h>
 #define SPU__X4_INLINE static inline __attribute__((always_inline))
 #define SPU__X4_SLOW   static __attribute__((noinline, cold, unused))
-SPU__X4_INLINE __m128i spu__x4_bexp(__m128i x) { return _mm_srli_epi32(_mm_slli_epi32(x, 1), 24); }
-SPU__X4_INLINE __m128i spu__x4_zero(__m128i x) { return _mm_cmpeq_epi32(_mm_slli_epi32(x, 1), _mm_setzero_si128()); }
-SPU__X4_INLINE __m128i spu__x4_plain0(__m128i x) {          /* biased exponent 1..254, or +-0 */
-    const __m128i e = spu__x4_bexp(x);
-    return _mm_or_si128(_mm_and_si128(_mm_cmpgt_epi32(e, _mm_setzero_si128()), _mm_cmpgt_epi32(_mm_set1_epi32(255), e)),
-                        spu__x4_zero(x));
+/* all-ones in the lanes the SPU reads as zero: biased exponent 0, any fraction */
+SPU__X4_INLINE __m128i spu__x4_z(__m128i x) {
+    return _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+}
+/* all-ones in the extended-range lanes: biased exponent 255 */
+SPU__X4_INLINE __m128i spu__x4_ext(__m128i x) {
+    const __m128i m = _mm_set1_epi32(0x7F800000);
+    return _mm_cmpeq_epi32(_mm_and_si128(x, m), m);
 }
 /* the four singles widened to doubles: lanes 0-1 in *lo, lanes 2-3 in *hi (exact) */
 SPU__X4_INLINE void spu__x4_wide(__m128i x, __m128d* lo, __m128d* hi) {
@@ -1080,90 +1107,89 @@ SPU__X4_INLINE void spu__x4_wide(__m128i x, __m128d* lo, __m128d* hi) {
 SPU__X4_INLINE __m128i spu__x4_narrow(__m128i lo, __m128i hi) {
     return _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(lo), _mm_castsi128_ps(hi), _MM_SHUFFLE(2, 0, 2, 0)));
 }
-/* lo:hi truncated to singles. *ok: lanes whose result is a normal single or an exact zero and,
- * when err is given, did not both round and land on a 24-bit boundary. *zm: the zero lanes. */
-SPU__X4_INLINE __m128i spu__x4_trunc0(__m128d dlo, __m128d dhi, __m128i* ok, __m128i* zm,
-                                      const __m128d* elo, const __m128d* ehi) {
-    const __m128i ulo = _mm_castpd_si128(dlo), uhi = _mm_castpd_si128(dhi);
-    const __m128i az = spu__x4_narrow(_mm_cmpeq_epi64(_mm_slli_epi64(ulo, 1), _mm_setzero_si128()),
-                                      _mm_cmpeq_epi64(_mm_slli_epi64(uhi, 1), _mm_setzero_si128()));
-    /* biased double exponent, 0..2047, per lane; a normal single needs it in 1023-126..1023+127 */
-    const __m128i be = _mm_and_si128(spu__x4_narrow(_mm_srli_epi64(ulo, 52), _mm_srli_epi64(uhi, 52)), _mm_set1_epi32(0x7FF));
-    __m128i good = _mm_andnot_si128(_mm_or_si128(_mm_cmpgt_epi32(_mm_set1_epi32(1023 - 126), be),
-                                                 _mm_cmpgt_epi32(be, _mm_set1_epi32(1023 + 127))),
-                                    _mm_set1_epi32(-1));
-    if (elo) {
-        const __m128i low = _mm_set1_epi64x(0x1FFFFFFF);
-        const __m128i bnd = spu__x4_narrow(_mm_cmpeq_epi64(_mm_and_si128(ulo, low), _mm_setzero_si128()),
-                                           _mm_cmpeq_epi64(_mm_and_si128(uhi, low), _mm_setzero_si128()));
-        const __m128i rnd = spu__x4_narrow(_mm_castpd_si128(_mm_cmpneq_pd(*elo, _mm_setzero_pd())),
-                                           _mm_castpd_si128(_mm_cmpneq_pd(*ehi, _mm_setzero_pd())));
-        good = _mm_andnot_si128(_mm_and_si128(bnd, rnd), good);
-    }
-    *ok = _mm_or_si128(good, az);
-    *zm = az;
-    const __m128i keep = _mm_set1_epi64x(~0x1FFFFFFFll);
-    const __m128 t = _mm_movelh_ps(_mm_cvtpd_ps(_mm_castsi128_pd(_mm_and_si128(ulo, keep))),
-                                   _mm_cvtpd_ps(_mm_castsi128_pd(_mm_and_si128(uhi, keep))));
-    return _mm_andnot_si128(_mm_and_si128(az, _mm_set1_epi32((int)0x80000000u)), _mm_castps_si128(t));
+/* s = a + b rounded to nearest, and its exact error (TwoSum) */
+SPU__X4_INLINE __m128d spu__x4_twosum(__m128d a, __m128d b, __m128d* err) {
+    const __m128d s = _mm_add_pd(a, b), bb = _mm_sub_pd(s, a);
+    *err = _mm_add_pd(_mm_sub_pd(a, _mm_sub_pd(s, bb)), _mm_sub_pd(b, bb));
+    return s;
 }
-SPU__X4_INLINE int spu__x4_all4(__m128i m) { return _mm_movemask_ps(_mm_castsi128_ps(m)) == 0xF; }
+/* One f64x2 half: d stepped toward zero where it was rounded away from zero (when err is given),
+ * then +0 where below 2^-126 and the 29 low bits cleared. *u: the stepped bits. */
+SPU__X4_INLINE __m128 spu__x4_half(__m128d d, const __m128d* err, __m128i* u) {
+    __m128i v = _mm_castpd_si128(d);
+    if (err) v = _mm_add_epi64(v, _mm_castpd_si128(_mm_cmplt_pd(_mm_mul_pd(d, *err), _mm_setzero_pd())));
+    *u = v;
+    const __m128d mag = _mm_castsi128_pd(_mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
+    const __m128i tiny = _mm_castpd_si128(_mm_cmplt_pd(_mm_and_pd(_mm_castsi128_pd(v), mag), _mm_set1_pd(0x1p-126)));
+    return _mm_cvtpd_ps(_mm_castsi128_pd(_mm_andnot_si128(tiny, _mm_and_si128(v, _mm_set1_epi64x(~0x1FFFFFFFll)))));
+}
+/* lo:hi truncated to singles, as spu__x8_trunc0 does. *bad: the lanes at or above 2^128. */
+SPU__X4_INLINE __m128i spu__x4_trunc0(__m128d dlo, __m128d dhi, __m128i* bad, const __m128d* elo, const __m128d* ehi) {
+    __m128i ulo, uhi;
+    const __m128 tlo = spu__x4_half(dlo, elo, &ulo), thi = spu__x4_half(dhi, ehi, &uhi);
+    /* biased double exponent, 0..2047, per lane; a normal single needs it at most 1023+127 */
+    const __m128i be = _mm_and_si128(spu__x4_narrow(_mm_srli_epi64(ulo, 52), _mm_srli_epi64(uhi, 52)), _mm_set1_epi32(0x7FF));
+    *bad = _mm_cmpgt_epi32(be, _mm_set1_epi32(1023 + 127));
+    return _mm_castps_si128(_mm_movelh_ps(tlo, thi));
+}
+SPU__X4_INLINE int spu__x4_mask(__m128i m) { return _mm_movemask_ps(_mm_castsi128_ps(m)); }
 SPU__X4_INLINE __m128i spu__x4_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
 SPU__X4_INLINE u128 spu__x4_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u32, v); return r; }
-SPU__X4_SLOW u128 spu__x4_fa_fix(u128 r, __m128i ok, u128 a, u128 b, uint32_t negb) {
-    const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
-    for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fa_any(a._u32[i], b._u32[i] ^ negb);
+/* The lanes set in redo (one bit per lane), recomputed one by one (scalar fast path, else exact). */
+SPU__X4_SLOW u128 spu__x4_fa_fix(u128 r, int redo, u128 a, u128 b, uint32_t negb) {
+    if (spu__ff_enabled()) {
+        uint32_t y[4]; for (int i = 0; i < 4; i++) y[i] = b._u32[i] ^ negb;
+        spu__ff_tally_w(0, ~redo, a._u32, y, y, 0, 0);
+    }
+    for (int i = 0; i < 4; i++) if (redo >> i & 1) r._u32[i] = spu__fa_any(a._u32[i], b._u32[i] ^ negb);
     return r;
 }
-SPU__X4_SLOW u128 spu__x4_fm_fix(u128 r, __m128i ok, u128 a, u128 b) {
-    const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
-    for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fm_any(a._u32[i], b._u32[i]);
+SPU__X4_SLOW u128 spu__x4_fm_fix(u128 r, int redo, u128 a, u128 b) {
+    if (spu__ff_enabled()) spu__ff_tally_w(1, ~redo, a._u32, b._u32, b._u32, 0, 0);
+    for (int i = 0; i < 4; i++) if (redo >> i & 1) r._u32[i] = spu__fm_any(a._u32[i], b._u32[i]);
     return r;
 }
-SPU__X4_SLOW u128 spu__x4_fma_fix(u128 r, __m128i ok, u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
-    const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
-    for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], negp, negc);
+SPU__X4_SLOW u128 spu__x4_fma_fix(u128 r, int redo, u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+    if (spu__ff_enabled()) spu__ff_tally_w(2, ~redo, a._u32, b._u32, c._u32, negp, negc);
+    for (int i = 0; i < 4; i++) if (redo >> i & 1) r._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], negp, negc);
     return r;
 }
 SPU__X4_INLINE u128 spu__x4_fa(u128 a, u128 b, uint32_t negb) {
     const __m128i x = spu__x4_ld(a), y = _mm_xor_si128(spu__x4_ld(b), _mm_set1_epi32((int)negb));
-    /* the exponent-gap limit applies only between two nonzero terms */
-    const __m128i gap = _mm_cmpgt_epi32(_mm_set1_epi32(30), _mm_abs_epi32(_mm_sub_epi32(spu__x4_bexp(x), spu__x4_bexp(y))));
-    const __m128i pre = _mm_and_si128(_mm_and_si128(spu__x4_plain0(x), spu__x4_plain0(y)),
-                                      _mm_or_si128(gap, _mm_or_si128(spu__x4_zero(x), spu__x4_zero(y))));
-    __m128d xl, xh, yl, yh; spu__x4_wide(x, &xl, &xh); spu__x4_wide(y, &yl, &yh);
-    __m128i ok, zm;
-    const __m128i r = spu__x4_trunc0(_mm_add_pd(xl, yl), _mm_add_pd(xh, yh), &ok, &zm, NULL, NULL);
-    ok = _mm_and_si128(ok, pre);
-    return spu__x4_all4(ok) ? spu__x4_st(r) : spu__x4_fa_fix(spu__x4_st(r), ok, a, b, negb);
+    __m128d xl, xh, yl, yh, el, eh;
+    spu__x4_wide(_mm_andnot_si128(spu__x4_z(x), x), &xl, &xh); spu__x4_wide(_mm_andnot_si128(spu__x4_z(y), y), &yl, &yh);
+    const __m128d sl = spu__x4_twosum(xl, yl, &el), sh = spu__x4_twosum(xh, yh, &eh);
+    __m128i bad;
+    const __m128i r = spu__x4_trunc0(sl, sh, &bad, &el, &eh);
+    const int redo = spu__x4_mask(_mm_or_si128(bad, _mm_or_si128(spu__x4_ext(x), spu__x4_ext(y))));
+    return redo ? spu__x4_fa_fix(spu__x4_st(r), redo, a, b, negb) : spu__x4_st(r);
 }
 SPU__X4_INLINE u128 spu_fa(u128 a, u128 b) { return spu__x4_fa(a, b, 0); }
 SPU__X4_INLINE u128 spu_fs(u128 a, u128 b) { return spu__x4_fa(a, b, 0x80000000u); }
 SPU__X4_INLINE u128 spu_fm(u128 a, u128 b) {
-    const __m128i x = spu__x4_ld(a), y = spu__x4_ld(b);
-    __m128d xl, xh, yl, yh; spu__x4_wide(x, &xl, &xh); spu__x4_wide(y, &yl, &yh);
-    __m128i ok, zm;
-    const __m128i r = spu__x4_trunc0(_mm_mul_pd(xl, yl), _mm_mul_pd(xh, yh), &ok, &zm, NULL, NULL);
-    ok = _mm_and_si128(ok, _mm_and_si128(spu__x4_plain0(x), spu__x4_plain0(y)));
-    return spu__x4_all4(ok) ? spu__x4_st(r) : spu__x4_fm_fix(spu__x4_st(r), ok, a, b);
+    const __m128i x = spu__x4_ld(a), y = spu__x4_ld(b), zx = spu__x4_z(x), zy = spu__x4_z(y);
+    const __m128i zp = _mm_or_si128(zx, zy);                                   /* zero product: +0 */
+    __m128d xl, xh, yl, yh;
+    spu__x4_wide(_mm_andnot_si128(zx, x), &xl, &xh); spu__x4_wide(_mm_andnot_si128(zy, y), &yl, &yh);
+    __m128i bad;
+    const __m128i r = _mm_andnot_si128(zp, spu__x4_trunc0(_mm_mul_pd(xl, yl), _mm_mul_pd(xh, yh), &bad, NULL, NULL));
+    const int redo = spu__x4_mask(_mm_andnot_si128(zp, _mm_or_si128(bad, _mm_or_si128(spu__x4_ext(x), spu__x4_ext(y)))));
+    return redo ? spu__x4_fm_fix(spu__x4_st(r), redo, a, b) : spu__x4_st(r);
 }
-/* (+-a*b) + (+-c): the product is exact in double; TwoSum gives the add's exact rounding error. */
-SPU__X4_INLINE void spu__x4_twosum(__m128d p, __m128d zz, __m128d* sum, __m128d* err) {
-    const __m128d s = _mm_add_pd(p, zz), bb = _mm_sub_pd(s, p);
-    *sum = s;
-    *err = _mm_add_pd(_mm_sub_pd(p, _mm_sub_pd(s, bb)), _mm_sub_pd(zz, bb));
-}
+/* (+-a*b) + (+-c): the product is exact in double, the add is a TwoSum. */
 SPU__X4_INLINE u128 spu__x4_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
     const __m128i x = _mm_xor_si128(spu__x4_ld(a), _mm_set1_epi32((int)negp)), y = spu__x4_ld(b);
     const __m128i z = _mm_xor_si128(spu__x4_ld(c), _mm_set1_epi32((int)negc));
-    __m128d xl, xh, yl, yh, zl, zh; spu__x4_wide(x, &xl, &xh); spu__x4_wide(y, &yl, &yh); spu__x4_wide(z, &zl, &zh);
-    __m128d sl, sh, el, eh;
-    spu__x4_twosum(_mm_mul_pd(xl, yl), zl, &sl, &el);
-    spu__x4_twosum(_mm_mul_pd(xh, yh), zh, &sh, &eh);
-    __m128i ok, zm;
-    const __m128i r = spu__x4_trunc0(sl, sh, &ok, &zm, &el, &eh);
-    ok = _mm_and_si128(ok, _mm_and_si128(_mm_and_si128(spu__x4_plain0(x), spu__x4_plain0(y)), spu__x4_plain0(z)));
-    return spu__x4_all4(ok) ? spu__x4_st(r) : spu__x4_fma_fix(spu__x4_st(r), ok, a, b, c, negp, negc);
+    const __m128i zx = spu__x4_z(x), zy = spu__x4_z(y), zp = _mm_or_si128(zx, zy);   /* zero product */
+    const __m128i zi = _mm_andnot_si128(spu__x4_z(z), z);                      /* a zero addend as +0 */
+    __m128d xl, xh, yl, yh, zl, zh, el, eh;
+    spu__x4_wide(_mm_andnot_si128(zx, x), &xl, &xh); spu__x4_wide(_mm_andnot_si128(zy, y), &yl, &yh); spu__x4_wide(zi, &zl, &zh);
+    const __m128d sl = spu__x4_twosum(_mm_mul_pd(xl, yl), zl, &el), sh = spu__x4_twosum(_mm_mul_pd(xh, yh), zh, &eh);
+    __m128i bad;
+    const __m128i r = _mm_blendv_epi8(spu__x4_trunc0(sl, sh, &bad, &el, &eh), zi, zp);
+    const __m128i ext = _mm_or_si128(_mm_or_si128(spu__x4_ext(x), spu__x4_ext(y)), spu__x4_ext(z));
+    const int redo = spu__x4_mask(_mm_andnot_si128(zp, _mm_or_si128(bad, ext)));
+    return redo ? spu__x4_fma_fix(spu__x4_st(r), redo, a, b, c, negp, negc) : spu__x4_st(r);
 }
 SPU__X4_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__x4_fma(a, b, c, 0, 0); }            /* a*b + c */
 SPU__X4_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__x4_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
@@ -1243,6 +1269,11 @@ static inline uint32_t spu__cfl_lane(uint32_t x, int scale, int is_unsigned) {
     return neg ? 0u - v : v;
 }
 static inline u128 spu_cflts_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 0); return r; }
+static inline u128 spu_cfltu_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 1); return r; }
+static inline u128 spu_csflt_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const int32_t v = a._s32[i];
+    r._u32[i] = v ? spu__sf_pack(v < 0 ? 0x80000000u : 0, v < 0 ? 0u - (uint32_t)v : (uint32_t)v, -(155 - (i8 & 0xFF))) : 0; } return r; }
+static inline u128 spu_cuflt_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const uint32_t v = a._u32[i];
+    r._u32[i] = v ? spu__sf_pack(0, v, -(155 - (i8 & 0xFF))) : 0; } return r; }
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
 /* For scales 0..127 the scaling by 2^scale is exact or overflows (an infinity,
  * or FLT_MAX under round-toward-zero, both of which FCVTZS saturates like the
@@ -1263,14 +1294,96 @@ static inline u128 spu_cflts(u128 a, int i8) {
     r = vbicq_u32(r, vceqzq_u32(e));
     u128 out; memcpy(&out, &r, 16); return out;
 }
+static inline u128 spu_cfltu(u128 a, int i8) { return spu_cfltu_ref(a, i8); }
+static inline u128 spu_csflt(u128 a, int i8) { return spu_csflt_ref(a, i8); }
+static inline u128 spu_cuflt(u128 a, int i8) { return spu_cuflt_ref(a, i8); }
+#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
+/* x86 forms (SSE4.1; with AVX the integer-to-single widening takes one f64x4). The immediate is a
+ * constant in lifted code, so every branch on it below folds away.
+ *
+ * Float to integer: x * 2^scale (scale = 173 - i8, -82..173), then CVTTPS2DQ, which truncates
+ * toward zero whatever the MXCSR rounding mode. The multiply by a power of two is exact while the
+ * product stays a normal single; above that range it is Inf (or FLT_MAX in round-toward-zero),
+ * which the conversion treats as out of range like the SPU; below it the product is under 2^-126,
+ * a denormal or 0, which truncates to 0 like the exact value. Out of range -- too large, Inf, and
+ * NaN, i.e. any biased-exponent-255 word whatever the scale -- CVTTPS2DQ returns 0x80000000:
+ * the SPU bound for a negative word, flipped to 0x7FFFFFFF for a nonnegative one. Exponent-0
+ * words are SPU zeros: they are made +0 before the multiply (a denormal operand would cost a
+ * microcode assist) and give 0. */
+#include <smmintrin.h>
+#define SPU__XC_INLINE static inline __attribute__((always_inline))
+SPU__XC_INLINE __m128i spu__xc_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
+SPU__XC_INLINE u128 spu__xc_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u32, v); return r; }
+/* all-ones in the lanes of biased exponent 0 */
+SPU__XC_INLINE __m128i spu__xc_z(__m128i x) {
+    return _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+}
+/* f * 2^scale, scale -126..254: one multiply by a normal power of two, two above 2^127 */
+SPU__XC_INLINE __m128 spu__xc_scale(__m128 f, int scale) {
+    if (scale > 127) { f = _mm_mul_ps(f, _mm_castsi128_ps(_mm_set1_epi32(254 << 23))); scale -= 127; }
+    return _mm_mul_ps(f, _mm_castsi128_ps(_mm_set1_epi32((scale + 127) << 23)));
+}
+SPU__XC_INLINE u128 spu_cflts(u128 a, int i8) {
+    const __m128i x0 = spu__xc_ld(a), x = _mm_andnot_si128(spu__xc_z(x0), x0);  /* SPU zeros as +0 */
+    __m128i r = _mm_cvttps_epi32(spu__xc_scale(_mm_castsi128_ps(x), 173 - (i8 & 0xFF)));
+    /* a set sign bit in the result of a nonnegative word is the out-of-range value: all-ones mask */
+    return spu__xc_st(_mm_xor_si128(r, _mm_srai_epi32(_mm_andnot_si128(x, r), 31)));
+}
+/* Unsigned: values in [2^31, 2^32) are converted less 2^31 (exact there: they are multiples of
+ * 2^8) and get the top bit back; 2^32 and above, Inf and NaN saturate. For a nonnegative single
+ * the bit pattern orders like the value, Inf and NaN above every finite one. Negative words and
+ * exponent-0 words are made +0 first, and give 0. */
+SPU__XC_INLINE u128 spu_cfltu(u128 a, int i8) {
+    const __m128i x0 = spu__xc_ld(a);
+    const __m128i x = _mm_andnot_si128(_mm_or_si128(_mm_srai_epi32(x0, 31), spu__xc_z(x0)), x0);   /* negative, zero: +0 */
+    const __m128 f = spu__xc_scale(_mm_castsi128_ps(x), 173 - (i8 & 0xFF));
+    const __m128i fb = _mm_castps_si128(f);
+    const __m128i big = _mm_cmpgt_epi32(fb, _mm_set1_epi32(0x4EFFFFFF));      /* f >= 2^31 */
+    const __m128i sat = _mm_cmpgt_epi32(fb, _mm_set1_epi32(0x4F7FFFFF));      /* f >= 2^32 */
+    const __m128 g = _mm_sub_ps(f, _mm_and_ps(_mm_castsi128_ps(big), _mm_set1_ps(2147483648.0f)));
+    return spu__xc_st(_mm_or_si128(_mm_xor_si128(_mm_cvttps_epi32(g), _mm_slli_epi32(big, 31)), sat));
+}
+/* Integer to float: the word widened to a double (exact), its 29 low significand bits cleared
+ * (truncation of the magnitude to 24 bits), narrowed (exact: below 2^32, 24 bits). Then the
+ * division by 2^k (k = 155 - i8, -100..155) is done on the exponent field: biased exponent
+ * be - k, saturated to sign | 0x7FFFFFFF above 255 and +0 below 1, as spu__sf_pack does. A
+ * nonzero word has be 127..158, so saturation is possible only for k < -97, and flushing a
+ * nonzero word only for k > 126; a zero word gives 0. */
+SPU__XC_INLINE __m128 spu__xc_trunc24(__m128i v, int is_unsigned) {
+    const __m128i w = is_unsigned ? _mm_xor_si128(v, _mm_set1_epi32((int)0x80000000u)) : v;
+#if defined(__AVX__)
+    __m256d d = _mm256_cvtepi32_pd(w);
+    if (is_unsigned) d = _mm256_add_pd(d, _mm256_set1_pd(2147483648.0));
+    d = _mm256_and_pd(d, _mm256_castsi256_pd(_mm256_set1_epi64x(~0x1FFFFFFFll)));
+    return _mm256_cvtpd_ps(d);
+#else
+    __m128d lo = _mm_cvtepi32_pd(w), hi = _mm_cvtepi32_pd(_mm_shuffle_epi32(w, _MM_SHUFFLE(3, 2, 3, 2)));
+    if (is_unsigned) { lo = _mm_add_pd(lo, _mm_set1_pd(2147483648.0)); hi = _mm_add_pd(hi, _mm_set1_pd(2147483648.0)); }
+    const __m128d keep = _mm_castsi128_pd(_mm_set1_epi64x(~0x1FFFFFFFll));
+    return _mm_movelh_ps(_mm_cvtpd_ps(_mm_and_pd(lo, keep)), _mm_cvtpd_ps(_mm_and_pd(hi, keep)));
+#endif
+}
+SPU__XC_INLINE u128 spu__xc_cvf(__m128i v, int k, int is_unsigned) {
+    const __m128i fb = _mm_castps_si128(spu__xc_trunc24(v, is_unsigned));
+    const __m128i be = _mm_srli_epi32(_mm_slli_epi32(fb, 1), 24);
+    __m128i r = _mm_sub_epi32(fb, _mm_set1_epi32((int)((uint32_t)k << 23)));
+    if (k < -97) {
+        const __m128i sv = is_unsigned ? _mm_set1_epi32(0x7FFFFFFF)
+                                       : _mm_or_si128(_mm_and_si128(v, _mm_set1_epi32((int)0x80000000u)), _mm_set1_epi32(0x7FFFFFFF));
+        r = _mm_blendv_epi8(r, sv, _mm_cmpgt_epi32(be, _mm_set1_epi32(255 + k)));
+    }
+    const __m128i flush = k >= 0 ? _mm_cmpgt_epi32(_mm_set1_epi32(k + 1), be)  /* be - k < 1; a zero word has be 0 */
+                                 : _mm_cmpeq_epi32(v, _mm_setzero_si128());
+    return spu__xc_st(_mm_andnot_si128(flush, r));
+}
+SPU__XC_INLINE u128 spu_csflt(u128 a, int i8) { return spu__xc_cvf(spu__xc_ld(a), 155 - (i8 & 0xFF), 0); }
+SPU__XC_INLINE u128 spu_cuflt(u128 a, int i8) { return spu__xc_cvf(spu__xc_ld(a), 155 - (i8 & 0xFF), 1); }
 #else
 static inline u128 spu_cflts(u128 a, int i8) { return spu_cflts_ref(a, i8); }
+static inline u128 spu_cfltu(u128 a, int i8) { return spu_cfltu_ref(a, i8); }
+static inline u128 spu_csflt(u128 a, int i8) { return spu_csflt_ref(a, i8); }
+static inline u128 spu_cuflt(u128 a, int i8) { return spu_cuflt_ref(a, i8); }
 #endif
-static inline u128 spu_cfltu(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 1); return r; }
-static inline u128 spu_csflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const int32_t v = a._s32[i];
-    r._u32[i] = v ? spu__sf_pack(v < 0 ? 0x80000000u : 0, v < 0 ? 0u - (uint32_t)v : (uint32_t)v, -(155 - (i8 & 0xFF))) : 0; } return r; }
-static inline u128 spu_cuflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const uint32_t v = a._u32[i];
-    r._u32[i] = v ? spu__sf_pack(0, v, -(155 - (i8 & 0xFF))) : 0; } return r; }
 
 /* fi -- Floating Interpolate (SPU ISA v1.2, p. 219; frest/frsqest output
  * format p. 215; single-precision rules section 9.1).
@@ -1328,6 +1441,22 @@ static inline u128 spu_fi(u128 a, u128 b) {
     uint32x4_t r = vorrq_u32(vorrq_u32(vandq_u32(est, vdupq_n_u32(0x80000000u)), vshlq_n_u32(e2, 23)), frac);
     r = vbicq_u32(r, vorrq_u32(vceqzq_u32(exp), vceqzq_u32(e2))); /* zero operand, underflow: +0 */
     u128 out; memcpy(&out, &r, 16); return out;
+}
+#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
+/* The NEON form's arithmetic with SSE4.1: PMULLD for step * y, and the unsigned u0 < t compare
+ * as a signed one on both operands with the top bit flipped. */
+SPU__XC_INLINE u128 spu_fi(u128 a, u128 b) {
+    const __m128i est = spu__xc_ld(b), av = spu__xc_ld(a), sb = _mm_set1_epi32((int)0x80000000u);
+    const __m128i exp  = _mm_srli_epi32(_mm_slli_epi32(est, 1), 24);
+    const __m128i u0   = _mm_slli_epi32(_mm_and_si128(est, _mm_set1_epi32(0x7FFC00)), 9);   /* base << 19 */
+    const __m128i t    = _mm_mullo_epi32(_mm_and_si128(est, _mm_set1_epi32(0x3FF)), _mm_and_si128(av, _mm_set1_epi32(0x7FFFF)));
+    const __m128i u    = _mm_sub_epi32(u0, t);
+    const __m128i brw  = _mm_cmpgt_epi32(_mm_xor_si128(t, sb), _mm_xor_si128(u0, sb));
+    const __m128i frac = _mm_blendv_epi8(_mm_srli_epi32(u, 9), _mm_and_si128(_mm_srli_epi32(u, 8), _mm_set1_epi32(0x7FFFFF)), brw);
+    const __m128i e2   = _mm_add_epi32(exp, brw);                                          /* a borrow lowers it by one */
+    const __m128i r = _mm_or_si128(_mm_or_si128(_mm_and_si128(est, sb), _mm_slli_epi32(e2, 23)), frac);
+    return spu__xc_st(_mm_andnot_si128(_mm_or_si128(_mm_cmpeq_epi32(exp, _mm_setzero_si128()),
+                                                    _mm_cmpeq_epi32(e2, _mm_setzero_si128())), r));  /* zero, underflow: +0 */
 }
 #else
 static inline u128 spu_fi(u128 a, u128 b) { return spu_fi_ref(a, b); }

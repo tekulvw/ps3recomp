@@ -128,6 +128,20 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
 
+      # The x86 single-precision helpers (fa/fm/fma, the float/integer conversions, fi) against
+      # their exact references, at the SSE4.1 and AVX2 levels.
+      - name: Run the SPU x86 float helper tests
+        run: |
+          foreach ($isa in @('-msse4.1', '/clang:-march=x86-64-v3')) {
+            foreach ($t in @('test_spu_float_convert', 'test_spu_float_exact')) {
+              clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /clang:-ffp-contract=off $isa /I include /I runtime/spu /Fe:"$t.exe" "runtime/spu/tests/$t.c"
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+              Write-Output "[$isa] $t"
+              & ".\$t.exe"
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+            }
+          }
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
