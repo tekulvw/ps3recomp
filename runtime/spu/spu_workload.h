@@ -129,6 +129,12 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea);
 
+/* With PS3RECOMP_SPU_TASK_POOL=1 those host threads are reused. Stop reusing
+ * them: idle ones exit, busy ones exit after their task, later tasks get a
+ * thread of their own. Waits up to `wait_ms` for the idle ones; returns the
+ * pool threads still alive. */
+unsigned spu_workload_async_pool_shutdown(unsigned wait_ms);
+
 /* Explicit owner for policy-module dispatch; avoids the selected-task globals. */
 int spu_workload_dispatch_async_owned(const uint8_t* image, uint32_t image_size,
                                       uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
