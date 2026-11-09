@@ -510,10 +510,14 @@ def compute_link_returns(insns, bounds) -> set:
 # Without --promote-regs they are stripped, leaving the text unchanged.
 _F = "@F@"
 _R = "@R@"
+# _X: a host return straight after a stop/halt call that already stored. The
+# call may change ctx->gpr (a serviced stop, a halt that returns), so storing
+# the locals again there would undo it.
+_X = "@X@"
 
 
 def _strip_markers(c: str) -> str:
-    return c.replace(_F, "").replace(_R, "")
+    return c.replace(_F, "").replace(_R, "").replace(_X, "")
 
 
 # ---------------------------------------------------------------------------
@@ -587,8 +591,10 @@ def promote_function(items, suffix, max_regs=0):
         texts.append(suffix)
     for t in texts:
         # Every host return must store first; so must every out-of-line call.
-        if re.search(r"(?<!@F@)(\breturn;|SPU_RET)", t):
+        if re.search(r"(?<!@F@)(?<!@X@)(\breturn;|SPU_RET)", t):
             raise ValueError("promote-regs: unflushed return in: " + t)
+        if re.search(r"(?<!spu_stop\(ctx\); |spu_halt\(ctx\); )@X@", t):
+            raise ValueError("promote-regs: bare return marker in: " + t)
         for m in _PR_CTX_CALL.finditer(t):
             if m.group(1) not in _PR_INLINE_CTX and _F not in t[:m.start()]:
                 raise ValueError("promote-regs: unflushed call in: " + t)
@@ -640,19 +646,61 @@ def promote_function(items, suffix, max_regs=0):
     used_mask = _pr_mask(used)
     regs = sorted(used)
 
+    # Backward liveness, so that a call re-reads only the locals that can still
+    # be read after it (the reload text otherwise dominates large functions,
+    # and their compile time). A store at a sync point reads every register
+    # that may be dirty there: on a path where such a register was not written
+    # since the last reload, its local must still hold the memory value.
+    def reads(text):
+        return _pr_mask(_PR_READ.findall(text))
+
+    def uses(text, dirty):
+        return reads(text) | ((dirty | writes_of(text)) if _F in text else 0)
+
+    def writes_of(text):
+        return _pr_mask(_PR_ASSIGN.findall(text))
+
+    live_out = [0] * n
+    live_in = [0] * n
+    preds = [[] for _ in range(n)]
+    for i in range(n):
+        for j in succs[i]:
+            preds[j].append(i)
+    tail_use = (last_out | reads(texts[-1])) if suffix is not None else 0
+    work = list(range(n))
+    while work:
+        i = work.pop()
+        t = texts[i]
+        out = live_out[i] | (tail_use if i == n - 1 else 0)
+        for j in succs[i]:
+            out |= live_in[j]
+        live_out[i] = out
+        if _R in t:
+            before = t.split(_R)[0]
+            new_in = uses(before, dirty_in[i])
+        else:
+            new_in = uses(t, dirty_in[i]) | (out & ~writes[i])
+        if new_in != live_in[i]:
+            live_in[i] = new_in
+            work.extend(preds[i])
+
     def store(mask):
         return "".join(f"ctx->gpr[{r}] = rg{r}; " for r in _pr_regs(mask & used_mask))
-    reload = "".join(f"rg{r} = ctx->gpr[{r}]; " for r in regs) + "ls = ctx->ls; "
 
-    def expand(t, dirty):
+    def reload(mask):
+        return "".join(f"rg{r} = ctx->gpr[{r}]; " for r in _pr_regs(mask & used_mask)) + "ls = ctx->ls; "
+
+    def expand(t, dirty, after_reload):
         out = []
-        for part in re.split(r"(@F@|@R@)", t):
-            if part == _F:
+        for part in re.split(r"(@F@|@R@|@X@)", t):
+            if part == _X:
+                pass
+            elif part == _F:
                 # Not cleared: a store inside a conditional exit leaves the
                 # path that does not exit as dirty as before it.
                 out.append(store(dirty))
             elif part == _R:
-                out.append(reload)
+                out.append(reload(after_reload))
                 dirty = 0
             else:
                 dirty |= _pr_mask(_PR_ASSIGN.findall(part))
@@ -664,9 +712,10 @@ def promote_function(items, suffix, max_regs=0):
     for i, (insn, label, _) in enumerate(items):
         if label:
             body.append(f"loc_{insn.addr:08X}:")
-        body.append("    " + expand(texts[i], dirty_in[i]).rstrip())
+        after = live_out[i] | (reads(texts[i].split(_R, 1)[1]) if _R in texts[i] else 0)
+        body.append("    " + expand(texts[i], dirty_in[i], after).rstrip())
     if suffix is not None:
-        body.append("    " + expand(texts[-1], last_out))
+        body.append("    " + expand(texts[-1], last_out, 0))
     # The locals are a plain vector type, converted at every use: as the u128
     # union itself, clang splits each local into scalar halves and shuffles
     # them through loop-carried phis (and spills them) instead of keeping one
@@ -990,7 +1039,7 @@ class SPULifter:
                         f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; {_F}spu_stop(ctx); {_R}"
                         f"if (ctx->status != SPU_STATUS_RUNNING) {_F}return;")
             return (f"ctx->stop_code = 0x{code:X}u; "
-                    f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; {_F}spu_stop(ctx); {_F}return;")
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; {_F}spu_stop(ctx); {_X}return;")
 
         # ---- immediate loaders ----
         if mn == "il":
@@ -1034,11 +1083,11 @@ class SPULifter:
                     f"fprintf(stderr, \"[spu] HALT-ASSERT {mn} pc=0x{addr:05X} "
                     f"img=%d\\n\", ctx->image_id); "
                     f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
-                    f"{_F}spu_halt(ctx); {_F}return; }}")
+                    f"{_F}spu_halt(ctx); {_X}return; }}")
         if mn == "stopd":
             # stopd has no code field; the architected stop code it reports is 0x3FFF (RPCS3 STOPD).
             return ("ctx->stop_code = 0x3FFFu; "
-                    f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; {_F}spu_stop(ctx); {_F}return;")
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; {_F}spu_stop(ctx); {_X}return;")
 
         # ---- integer arithmetic (register) ----
         rr_bin = {
@@ -1456,7 +1505,7 @@ class SPULifter:
         lines.append("}")
         lines.append("")
         source = "\n".join(lines)
-        if _F in source or _R in source:
+        if _F in source or _R in source or _X in source:
             raise ValueError("register-promotion marker left in generated source")
         return source
 
