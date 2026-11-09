@@ -440,6 +440,8 @@ void rsx_metal_backend_note_guest_frame(void) {}
 #define MTL_MAX_RECORDS    4096
 #define MTL_MAX_VERTS      (256u * 1024u)
 #define MTL_VB_INDEX       30      /* buffer(0) and buffer(1) are the constant blocks */
+/* Host-format vertex streams (draw_host): slot s reads buffer 14 + s. */
+#define MTL_HOST_VB_INDEX(s) ((NSUInteger)(14u + (s)))
 
 typedef struct { float a[MTL_ATTRIBS][4]; } MtlVertex;
 
@@ -2602,6 +2604,9 @@ typedef struct {
     MTLPrimitiveType topology;
     u32 vb_off, stride, vertex_count;
     u32 ib_off, index_count;
+    u8  index_u16;                      /* 16-bit indices (draw_host) */
+    u8  host_streams;                   /* draw_host: streams at host_off[] */
+    u32 host_off[RSX_DSP_NUM_VERTEX_ATTR];
     u32 vs_cb_off, vs_cb_bytes;
     u32 ps_cb_off, ps_cb_bytes;
     u32 tex[RSX_BE_MAX_TEXTURES];
@@ -3555,6 +3560,49 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     return fn;
 }
 
+static MTLVertexFormat eng_host_vertex_format(u8 f)
+{
+    switch (f) {
+    case RSX_HOST_VF_F32_1: return MTLVertexFormatFloat;
+    case RSX_HOST_VF_F32_2: return MTLVertexFormatFloat2;
+    case RSX_HOST_VF_F32_3: return MTLVertexFormatFloat3;
+    case RSX_HOST_VF_F32_4: return MTLVertexFormatFloat4;
+    case RSX_HOST_VF_F16_4: return MTLVertexFormatHalf4;
+    case RSX_HOST_VF_UN8_4: return MTLVertexFormatUChar4Normalized;
+    case RSX_HOST_VF_SN16_4: return MTLVertexFormatShort4Normalized;
+    default: return MTLVertexFormatInvalid;
+    }
+}
+
+/* The float4 vertex (one buffer, slot s at s * 16) or host-format streams
+ * (slot s from MTL_HOST_VB_INDEX(s), tightly packed). */
+static MTLVertexDescriptor* eng_vertex_descriptor(const rsx_vertex_layout_plan* layout, u32 vertex_stride,
+                                                  const u8* host_formats)
+{
+    MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
+    if (host_formats) {
+        for (u32 slot = 0; slot < layout->count; slot++) {
+            vd.attributes[slot].format      = eng_host_vertex_format(host_formats[slot]);
+            vd.attributes[slot].offset      = 0;
+            vd.attributes[slot].bufferIndex = MTL_HOST_VB_INDEX(slot);
+            vd.layouts[MTL_HOST_VB_INDEX(slot)].stride = rsx_vertex_host_format_bytes(host_formats[slot]);
+        }
+    } else {
+        for (u32 slot = 0; slot < layout->count; slot++) {
+            vd.attributes[slot].format      = MTLVertexFormatFloat4;
+            vd.attributes[slot].offset      = (NSUInteger)(slot * 16u);
+            vd.attributes[slot].bufferIndex = MTL_VB_INDEX;
+        }
+        vd.layouts[MTL_VB_INDEX].stride = vertex_stride;
+    }
+    return vd;
+}
+
+static u32 eng_pipeline_create_vd(const char* vs_hlsl, const char* ps_hlsl,
+                                  const rsx_be_render_state* rs,
+                                  const rsx_vertex_layout_plan* layout,
+                                  u32 vertex_stride, const u8* host_formats,
+                                  rsx_be_format rt_fmt, u32 rt_count);
 static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                const rsx_be_render_state* rs,
                                const rsx_vertex_layout_plan* layout,
@@ -3562,7 +3610,29 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
                                u32 rt_count)
 {
     (void)user;
-    if (!s_dev || !s_guest_shaders || !vertex_stride) return 0;
+    if (!vertex_stride) return 0;
+    return eng_pipeline_create_vd(vs_hlsl, ps_hlsl, rs, layout, vertex_stride, NULL, rt_fmt, rt_count);
+}
+/* pipeline_create with host-format streams: slot s is attribute s, read from
+ * its own buffer (MTL_HOST_VB_INDEX(s)) of tightly packed elements. */
+static u32 eng_pipeline_create_host(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                    const rsx_be_render_state* rs,
+                                    const rsx_vertex_layout_plan* layout,
+                                    const u8* host_formats, rsx_be_format rt_fmt, u32 rt_count)
+{
+    (void)user;
+    if (!layout || !host_formats || !layout->count || layout->count > RSX_DSP_NUM_VERTEX_ATTR) return 0;
+    for (u32 s = 0; s < layout->count; s++)
+        if (eng_host_vertex_format(host_formats[s]) == MTLVertexFormatInvalid) return 0;
+    return eng_pipeline_create_vd(vs_hlsl, ps_hlsl, rs, layout, 0, host_formats, rt_fmt, rt_count);
+}
+static u32 eng_pipeline_create_vd(const char* vs_hlsl, const char* ps_hlsl,
+                                  const rsx_be_render_state* rs,
+                                  const rsx_vertex_layout_plan* layout,
+                                  u32 vertex_stride, const u8* host_formats,
+                                  rsx_be_format rt_fmt, u32 rt_count)
+{
+    if (!s_dev || !s_guest_shaders) return 0;
     if (!rt_count) rt_count = 1;
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
     if (s_eng_pipe_count >= ENG_MAX_PIPES) return 0;
@@ -3577,13 +3647,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
      * and spirv-cross carries those locations into [[attribute(n)]]. The two
      * agree for the all-sixteen layout, where slot is the attribute number,
      * which is why the vtable path above can index by either. */
-    MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
-    for (u32 slot = 0; slot < layout->count; slot++) {
-        vd.attributes[slot].format      = MTLVertexFormatFloat4;
-        vd.attributes[slot].offset      = (NSUInteger)(slot * 16u);
-        vd.attributes[slot].bufferIndex = MTL_VB_INDEX;
-    }
-    vd.layouts[MTL_VB_INDEX].stride = vertex_stride;
+    MTLVertexDescriptor* vd = eng_vertex_descriptor(layout, vertex_stride, host_formats);
 
     MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
     pd.vertexFunction   = vs;
@@ -4074,8 +4138,38 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
     r->vertex_count = vertex_count;
     r->ib_off       = ib_off;
     r->index_count  = indices ? index_count : 0;
+    r->index_u16    = 0;
+    r->host_streams = 0;
     eng_trace_draw(r);
     /* A report flush may submit these records before the next presentation. */
+    s_eng_diag.seen_draw = 1;
+}
+
+/* draw_host: the streams staged in one copy, each bound at its own offset;
+ * 16- or 32-bit indices. */
+static void eng_draw_host(void* user, rsx_topology topology, const void* data, u32 data_bytes,
+                          const u32* offsets, u32 streams, u32 vertex_count,
+                          const void* indices, u32 index_count, u32 index_size)
+{
+    (void)user;
+    if (!data || !data_bytes || !offsets || !streams || streams > RSX_DSP_NUM_VERTEX_ATTR || !vertex_count) return;
+    if (index_size != 2 && index_size != 4) return;
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; eng_checked_fail(); return; }
+    u32 base = 0, ib_off = 0;
+    if (!eng_stage_copy(data, data_bytes, &base)) return;
+    if (indices && index_count && !eng_stage_copy(indices, index_count * index_size, &ib_off)) return;
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    *r = s_eng_pending;
+    r->kind         = ENG_REC_DRAW;
+    r->topology     = topo_to_metal(topology);
+    r->vb_off       = base;
+    r->stride       = 0;
+    r->vertex_count = vertex_count;
+    r->ib_off       = ib_off;
+    r->index_count  = indices ? index_count : 0;
+    r->index_u16    = index_size == 2;
+    r->host_streams = (u8)streams;
+    for (u32 i = 0; i < streams; i++) r->host_off[i] = base + offsets[i];
     s_eng_diag.seen_draw = 1;
 }
 
@@ -4175,10 +4269,16 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     /* The same stage buffer at another offset is an offset change. */
     {
         const void* sb = (__bridge const void*)stage;
-        if (all || s_enc.vb != sb) { [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX]; sent++; }
-        else if (s_enc.vb_off != r->vb_off) { [enc setVertexBufferOffset:r->vb_off atIndex:MTL_VB_INDEX]; sent++; }
-        else skipped++;
-        s_enc.vb = sb; s_enc.vb_off = r->vb_off;
+        if (r->host_streams) {
+            /* Host-format streams: their own buffer indices, set every draw. */
+            for (u32 i = 0; i < r->host_streams; i++, sent++)
+                [enc setVertexBuffer:stage offset:r->host_off[i] atIndex:MTL_HOST_VB_INDEX(i)];
+        } else {
+            if (all || s_enc.vb != sb) { [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX]; sent++; }
+            else if (s_enc.vb_off != r->vb_off) { [enc setVertexBufferOffset:r->vb_off atIndex:MTL_VB_INDEX]; sent++; }
+            else skipped++;
+            s_enc.vb = sb; s_enc.vb_off = r->vb_off;
+        }
         if (r->vs_cb_bytes) {
             if (all || s_enc.vcb != sb) { [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0]; sent++; }
             else if (s_enc.vcb_off != r->vs_cb_off) { [enc setVertexBufferOffset:r->vs_cb_off atIndex:0]; sent++; }
@@ -4225,7 +4325,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     if (r->index_count)
         [enc drawIndexedPrimitives:r->topology
                         indexCount:r->index_count
-                         indexType:MTLIndexTypeUInt32
+                         indexType:(r->index_u16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32)
                        indexBuffer:stage
                  indexBufferOffset:r->ib_off];
     else
@@ -5728,6 +5828,18 @@ static void owner_eng_set_stencil_ref(void* user, u32 ref){
     if(!metal_owner_begin(1)){return;}
     eng_set_stencil_ref(user,ref);metal_owner_finish(0);
 }
+static u32 owner_eng_pipeline_create_host(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                               const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
+                               const u8* host_formats, rsx_be_format rt_fmt, u32 rt_count){
+    if(!metal_owner_begin(1)){return 0;}
+    u32 result=eng_pipeline_create_host(user,vs_hlsl,ps_hlsl,rs,layout,host_formats,rt_fmt,rt_count);metal_owner_finish(0);return result;
+}
+static void owner_eng_draw_host(void* user, rsx_topology topology, const void* data, u32 data_bytes,
+                     const u32* offsets, u32 streams, u32 vertex_count,
+                     const void* indices, u32 index_count, u32 index_size){
+    if(!metal_owner_begin(1)){return;}
+    eng_draw_host(user,topology,data,data_bytes,offsets,streams,vertex_count,indices,index_count,index_size);metal_owner_finish(0);
+}
 static void owner_eng_draw(void* user, rsx_topology topology, const void* vertices,
                      u32 vertex_count, u32 stride, const u32* indices,
                      u32 index_count){
@@ -5794,6 +5906,8 @@ static const rsx_draw_backend s_engine_backend = {
     .set_scissor          = owner_eng_set_scissor,
     .set_stencil_ref      = owner_eng_set_stencil_ref,
     .draw                 = owner_eng_draw,
+    .pipeline_create_host = owner_eng_pipeline_create_host,
+    .draw_host            = owner_eng_draw_host,
     .clear_color          = owner_eng_clear_color,
     .clear_depth_stencil  = owner_eng_clear_depth_stencil,
     .present              = owner_eng_present,

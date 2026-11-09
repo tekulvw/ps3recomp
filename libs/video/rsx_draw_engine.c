@@ -2515,7 +2515,8 @@ void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned lon
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
-                            u32* out_tex_used, u64* out_fp_hash)
+                            u32* out_tex_used, u64* out_fp_hash,
+                            const u8* host_formats)
 {
     *out_fixed = 1;
     *out_tex_used = 0;
@@ -2644,6 +2645,13 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
+    /* Host-format streams are a different vertex input: their formats, one
+     * per slot, are identity. */
+    if (host_formats) {
+        static const u32 host_tag = 0x31465648u;   /* "HVF1" */
+        key = eng_fnv1a(&host_tag, sizeof host_tag, key);
+        key = eng_fnv1a(host_formats, layout->count, key);
+    }
     key = eng_fnv1a(&rt_fmt, sizeof rt_fmt, key);
     /* How many colour attachments the pass will have is pipeline identity:
      * a host API matches the two against each other. */
@@ -2694,8 +2702,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             fi = -1;
     }
     if (vi > 0 && fi > 0)
-        handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
-                                       layout, layout->stride, rt_fmt, rt_count);
+        handle = host_formats
+            ? g.be->pipeline_create_host(g.be->user, s_vs_hlsl, s_ps_hlsl, rs, layout,
+                                         host_formats, rt_fmt, rt_count)
+            : g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
+                                    layout, layout->stride, rt_fmt, rt_count);
     const u64 fp_hash = fixed ? 0 : eng_fp_debug_hash(fp_uc, fp_size);
     /* RSX_ENGINE_SHADER_DUMP=<existing dir>: each new pipeline's two programs
      * as <dir>/pipe<handle>.vs.hlsl and .ps.hlsl, the handle being the one
@@ -2864,25 +2875,11 @@ static int dc_reserve_indices(u32 count)
     return 1;
 }
 
-/* Turn this group's batches into a reference list, recording a CUT rather
- * than fetching a phantom vertex wherever the restart sentinel appears, then
- * collapse repeated references and fetch each unique vertex once.
- * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
-static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+/* The group's batches as one reference list, with a CUT recorded rather than
+ * a phantom vertex fetched wherever the restart sentinel appears; dc.fetch_ok
+ * drops on any failure. */
+static void dc_collect_refs(void)
 {
-    if (dc.n_immediate) {
-        dc.n_source_refs = dc.n_immediate;
-        if (!dc_reserve_verts((u64)dc.n_immediate * layout->stride)) {
-            dc.fetch_ok = 0;
-            return;
-        }
-        for (u32 v = 0; v < dc.n_immediate; v++)
-            for (u32 slot = 0; slot < layout->count; slot++)
-                memcpy(dc.verts + (u64)v * layout->stride + slot * 16u,
-                       dc.immediate[v][layout->attrs[slot]], 16u);
-        dc.n_verts = dc.n_immediate;
-        return;
-    }
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
             if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
@@ -2928,6 +2925,27 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             }
         }
     }
+}
+
+/* Turn this group's batches into a reference list, then collapse repeated
+ * references and fetch each unique vertex once.
+ * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
+static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+{
+    if (dc.n_immediate) {
+        dc.n_source_refs = dc.n_immediate;
+        if (!dc_reserve_verts((u64)dc.n_immediate * layout->stride)) {
+            dc.fetch_ok = 0;
+            return;
+        }
+        for (u32 v = 0; v < dc.n_immediate; v++)
+            for (u32 slot = 0; slot < layout->count; slot++)
+                memcpy(dc.verts + (u64)v * layout->stride + slot * 16u,
+                       dc.immediate[v][layout->attrs[slot]], 16u);
+        dc.n_verts = dc.n_immediate;
+        return;
+    }
+    dc_collect_refs();
     if (!dc.fetch_ok) return;
 
     dc.n_source_refs = dc.n_refs;
@@ -2956,6 +2974,80 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         return;
     }
     dc.n_verts = dc.n_refs;
+}
+
+/* ---- host-format vertex streams ------------------------------------------
+ *
+ * PS3RECOMP_RSX_HOST_VERTEX_FORMATS=1 (default off, read at engine init, and
+ * only with a backend that has pipeline_create_host and draw_host). A
+ * triangle list whose references share one base index and cover a vertex
+ * range at most four times their count is uploaded as host-format streams
+ * (rsx_vertex_host_streams_build): each attribute's elements over that range,
+ * byte-swapped, in a format the host's vertex fetch converts to the same
+ * float4, with u16 indices relative to the range (u32 past 65,536 vertices).
+ * No reference collapse, no float4 decode, no u32 rebuild; the shaders are
+ * the same. Anything that does not qualify -- another topology, a restart
+ * cut, an inline or immediate stream, an attribute type or frequency the
+ * builder refuses, a SNORM16 -32768 -- takes the float4 path, unchanged. */
+static int s_host_vf = -1;
+static unsigned long long s_host_vf_draws, s_host_vf_refused;
+void rsx_draw_engine_host_vertex_counts(unsigned long long* draws, unsigned long long* refused)
+{
+    if (draws) *draws = s_host_vf_draws;
+    if (refused) *refused = s_host_vf_refused;
+}
+
+/* Collect the group's references and, when they qualify, build the streams
+ * into dc.verts and the indices into g.indices. 1 with the counts set; 0
+ * leaves the reference list empty for dc_fetch to collect again. */
+static int dc_fetch_host(const rsx_vertex_layout_plan* layout, rsx_vertex_host_streams* hs,
+                         u32* out_verts, u32* out_indices, u32* out_index_size)
+{
+    dc_collect_refs();
+    const u32 n = dc.n_refs - dc.n_refs % 3u;
+    int ok = dc.fetch_ok && !dc.n_cuts && n >= 3u;
+    u32 lo = 0, hi = 0, base = 0;
+    if (ok) {
+        base = dc.refs[0].base_index;
+        lo = hi = dc.refs[0].vertex_id;
+        for (u32 i = 1; i < dc.n_refs && ok; i++) {
+            const u32 id = dc.refs[i].vertex_id;
+            ok = dc.refs[i].base_index == base;
+            if (id < lo) lo = id;
+            if (id > hi) hi = id;
+        }
+    }
+    /* The 20-bit element index must not wrap inside the range. */
+    const u64 range = (u64)hi - lo + 1u;
+    if (ok) ok = range <= (u64)dc.n_refs * 4u + 64u && (u64)lo + base + range - 1u <= 0xFFFFFu;
+    if (ok) {
+        rsx_vertex_ref ends[2] = { { lo, base }, { hi, base } };
+        rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+        rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, ends, 2);
+        ok = dc_reserve_verts(range * 16u * RSX_DSP_NUM_VERTEX_ATTR) &&
+             rsx_vertex_host_streams_build(&dc.fetch_plan, lo + base, (u32)range, dc.verts,
+                                           (u32)(range * 16u * RSX_DSP_NUM_VERTEX_ATTR), hs);
+    }
+    const u32 isize = range <= 65536u ? 2u : 4u;
+    if (ok) ok = dc_reserve_indices((n * isize + 3u) / 4u);
+    if (!ok) {
+        s_host_vf_refused++;
+        dc.n_refs = 0; dc.n_cuts = 0;
+        return 0;
+    }
+    if (isize == 2u) {
+        u16* idx = (u16*)g.indices;
+        for (u32 i = 0; i < n; i++) idx[i] = (u16)(dc.refs[i].vertex_id - lo);
+    } else {
+        for (u32 i = 0; i < n; i++) g.indices[i] = dc.refs[i].vertex_id - lo;
+    }
+    dc.n_source_refs = dc.n_refs;
+    dc.n_verts = (u32)range;
+    *out_verts = (u32)range;
+    *out_indices = n;
+    *out_index_size = isize;
+    s_host_vf_draws++;
+    return 1;
 }
 
 /* ---- sink ---------------------------------------------------------------- */
@@ -4316,13 +4408,21 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
         if (dc.n_idx && s_external.indices!=3) { (void)eng_external_fail(9,s_external.indices!=1?0x181C:0x1820);return; }
     }
     DRAW_OBSERVER_STAGE("fetch");
-    dc_fetch(&layout, rebuild);
+    rsx_vertex_host_streams hs;
+    u32 host_verts = 0, host_indices = 0, host_isize = 0;
+    const int host = s_host_vf > 0 && prim == RSX_PRIMITIVE_TRIANGLES && !dc.n_immediate &&
+                     !dc.inl_bytes && !s_external.status.active &&
+                     dc_fetch_host(&layout, &hs, &host_verts, &host_indices, &host_isize);
+    if (!host) dc_fetch(&layout, rebuild);
     if (!dc.n_verts || !dc.fetch_ok) {ENG_CHECKED_FAIL();return;}
 
     DRAW_OBSERVER_STAGE("index_topology");
     int indexed = 0;
     u32 n_draw = dc.n_source_refs;
-    if (rebuild) {
+    if (host) {
+        indexed = 1;
+        n_draw = host_indices;
+    } else if (rebuild) {
         if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
         n_draw = indexed
             ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
@@ -4360,7 +4460,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
-                                          &fp_hash);
+                                          &fp_hash, host ? hs.format : NULL);
     if (!pipeline) {ENG_CHECKED_FAIL();return;}
     if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
     if (fp_hash) eng_vtx_probe(fp_hash, pipeline, prim, rs.blend_enable, &layout);
@@ -4386,7 +4486,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
     if(!rsx_picture_ready()){ENG_CHECKED_FAIL();return;}
 
     DRAW_OBSERVER_STAGE("index_allocation");
-    if (indexed) {
+    if (indexed && !host) {
         if (!dc_reserve_indices(n_draw)) {ENG_CHECKED_FAIL();return;}
         rsx_draw_engine_write_topology_indices(
             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
@@ -4513,8 +4613,12 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
         g.be->set_depth_bounds(g.be->user, fmin, fmax);
     }
 
-    g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
-               indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    if (host)
+        g.be->draw_host(g.be->user, topology, dc.verts, hs.bytes, hs.offset, hs.count,
+                        host_verts, g.indices, n_draw, host_isize);
+    else
+        g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+                   indexed ? g.indices : NULL, indexed ? n_draw : 0);
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
@@ -4749,6 +4853,10 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
      * first draw copies all of it into vp_cb. */
     g.vp_cb_serial = 1; g.vs_bound_serial = 0;
     eng_pkm_reset();
+    { const char* e = getenv("PS3RECOMP_RSX_HOST_VERTEX_FORMATS");
+      s_host_vf = e && !strcmp(e, "1") && g.be->pipeline_create_host && g.be->draw_host;
+      if (e && !strcmp(e, "1") && !s_host_vf)
+          fprintf(stderr, "[rsx engine] PS3RECOMP_RSX_HOST_VERTEX_FORMATS: backend has no host-format draws; float4 vertices kept\n"); }
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
         free(g.vp_cb); g.vp_cb = NULL;
         return -1;

@@ -362,6 +362,77 @@ int main(int argc, char** argv)
         if (s2) vk_eng_release(NULL, s2);
     }
 
+    /* Host-format vertex streams: the same triangles drawn from float4
+     * vertices and from host-format streams (FLOAT2 positions; colour as
+     * UNORM8x4, HALF4 and SNORM16x4, each with u16 indices) must land the
+     * same pixels: the host's vertex fetch converts to the float4 the CPU
+     * decode gives. */
+    {
+        enum { HW = 32, HH = 32 };
+        rsx_be_render_state rs; memset(&rs, 0, sizeof rs);
+        rs.color_mask = 0xFFFFFFFFu;
+        rsx_vertex_layout_plan lp; memset(&lp, 0, sizeof lp);
+        lp.mask = 3; lp.stride = 32; lp.count = 2;
+        const u32 p4 = vk_eng_pipeline_create(NULL, VS, PS, &rs, &lp, 32, RSX_BE_FMT_R8G8B8A8, 1);
+        static const u8 colour_formats[3] = { RSX_HOST_VF_UN8_4, RSX_HOST_VF_F16_4, RSX_HOST_VF_SN16_4 };
+        u32 ph[3];
+        for (int k = 0; k < 3; k++) {
+            const u8 f[2] = { RSX_HOST_VF_F32_2, colour_formats[k] };
+            ph[k] = vk_eng_pipeline_create_host(NULL, VS, PS, &rs, &lp, f, RSX_BE_FMT_R8G8B8A8, 1);
+        }
+        CHECK(p4 && ph[0] && ph[1] && ph[2], "host: float4 and host-format pipelines");
+        /* Four vertices, two triangles; colour channels 0 and 1, which all
+         * three formats hold exactly. */
+        const float pos[4][2] = { { -0.9f, -0.8f }, { 0.7f, -0.6f }, { -0.5f, 0.9f }, { 0.8f, 0.6f } };
+        const u8 un8[4][4] = { { 255, 0, 0, 255 }, { 0, 255, 0, 255 }, { 0, 0, 255, 255 }, { 255, 255, 0, 255 } };
+        const u16 indices[6] = { 0, 1, 2, 1, 3, 2 };
+        u32 t[4];
+        for (int k = 0; k < 4; k++) t[k] = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, HW, HH, NULL, 0);
+        CHECK(t[0] && t[1] && t[2] && t[3], "host: targets");
+        const float pcs[8] = { 1, 1, 1, 1, 0, 0, 0, 0 };
+        const float vcs[16] = { 1, 1, 0, 0, 0.5f };
+        for (int k = 0; k < 4; k++) {
+            vk_eng_bind_targets(NULL, &t[k], 1, 0);
+            vk_eng_bind_vs_constants(NULL, vcs, sizeof vcs);
+            vk_eng_bind_ps_constants(NULL, pcs, sizeof pcs);
+            vk_eng_bind_textures(NULL, &t0, samps, 0u);
+            vk_eng_set_viewport(NULL, 0, 0, HW, HH); vk_eng_set_scissor(NULL, 0, 0, HW, HH);
+            if (k == 0) {
+                float v4[4 * 8]; u32 i4[6];
+                for (int v = 0; v < 4; v++) {
+                    v4[v * 8 + 0] = pos[v][0]; v4[v * 8 + 1] = pos[v][1]; v4[v * 8 + 2] = 0; v4[v * 8 + 3] = 1;
+                    for (int c = 0; c < 4; c++) v4[v * 8 + 4 + c] = un8[v][c] / 255.0f;
+                }
+                for (int i = 0; i < 6; i++) i4[i] = indices[i];
+                vk_eng_bind_pipeline(NULL, p4);
+                vk_eng_draw(NULL, RSX_TOPOLOGY_TRIANGLES, v4, 4, 32, i4, 6);
+                continue;
+            }
+            u8 blob[4 * 8 + 4 * 8];
+            u32 offsets[2] = { 0, 4 * 8 };
+            memcpy(blob, pos, sizeof pos);
+            for (int v = 0; v < 4; v++) {
+                u8* c = blob + 32 + v * (k == 1 ? 4 : 8);
+                if (k == 1) memcpy(c, un8[v], 4);
+                else if (k == 2) { u16 h[4]; for (int i = 0; i < 4; i++) h[i] = un8[v][i] ? 0x3C00u : 0; memcpy(c, h, 8); }
+                else { s16 q[4]; for (int i = 0; i < 4; i++) q[i] = un8[v][i] ? 32767 : 0; memcpy(c, q, 8); }
+            }
+            vk_eng_bind_pipeline(NULL, ph[k - 1]);
+            vk_eng_draw_host(NULL, RSX_TOPOLOGY_TRIANGLES, blob, 32 + 4 * (k == 1 ? 4 : 8), offsets, 2, 4, indices, 6, 2);
+        }
+        static u8 px[4][HW * HH * 4];
+        for (int k = 0; k < 4; k++) vk_eng_readback(NULL, t[k], 0, 0, HW, HH, px[k], HW * 4);
+        int lit = 0;
+        for (u32 i = 0; i < HW * HH * 4; i++) lit |= px[0][i];
+        CHECK(lit, "host: the float4 draw landed");
+        CHECK(!memcmp(px[0], px[1], sizeof px[0]), "host: UNORM8x4 streams draw the same pixels");
+        CHECK(!memcmp(px[0], px[2], sizeof px[0]), "host: HALF4 streams draw the same pixels");
+        CHECK(!memcmp(px[0], px[3], sizeof px[0]), "host: SNORM16x4 streams draw the same pixels");
+        for (int k = 0; k < 4; k++) vk_eng_release(NULL, t[k]);
+        vk_eng_pipeline_release(NULL, p4);
+        for (int k = 0; k < 3; k++) vk_eng_pipeline_release(NULL, ph[k]);
+    }
+
     /* A released colour target's image is pooled and a same-sized request
      * takes it back: the new target still starts transparent black, and the
      * release leaves every other target's framebuffer usable. */
