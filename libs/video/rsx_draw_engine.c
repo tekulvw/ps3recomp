@@ -1904,8 +1904,34 @@ static u32 eng_cube_mask(void)
  * layout and by the pipeline, because they must not disagree: the built-in
  * program declares all sixteen inputs, so narrowing the layout for it would
  * leave the pipeline's vertex descriptor short of what the shader reads. */
+/* The program pair one draw resolved, and the vertex layout its program
+ * reads: both are asked for several times while a draw is prepared (layout,
+ * pipeline, external checks) with no register written in between, and each
+ * answer is a walk of the programs. Valid only inside the draw (s_dtex_on);
+ * reset with the texture decodes. */
+static struct {
+    int valid, ok;
+    const u8 *vp, *fp;
+    u32 vp_instrs, fp_size;
+} s_dprog;
+static int eng_guest_programs_core(const u8** out_vp, u32* out_vp_instrs,
+                                   const u8** out_fp, u32* out_fp_size);
 static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
                               const u8** out_fp, u32* out_fp_size)
+{
+    if (!s_dtex_on) return eng_guest_programs_core(out_vp, out_vp_instrs, out_fp, out_fp_size);
+    if (!s_dprog.valid) {
+        s_dprog.ok = eng_guest_programs_core(&s_dprog.vp, &s_dprog.vp_instrs, &s_dprog.fp, &s_dprog.fp_size);
+        s_dprog.valid = 1;
+    }
+    if (out_vp) *out_vp = s_dprog.vp;
+    if (out_vp_instrs) *out_vp_instrs = s_dprog.vp_instrs;
+    if (out_fp) *out_fp = s_dprog.fp;
+    if (out_fp_size) *out_fp_size = s_dprog.fp_size;
+    return s_dprog.ok;
+}
+static int eng_guest_programs_core(const u8** out_vp, u32* out_vp_instrs,
+                                   const u8** out_fp, u32* out_fp_size)
 {
     const u8* vp_uc = NULL;
     u32 vp_instrs = 0;
@@ -1939,16 +1965,33 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
 
 /* The layout the active vertex program actually reads. An uncertain analysis
  * falls back to all sixteen registers (rsx_live_draw.c:3625-3643). */
+/* The input mask of the vertex programs recent draws used: the analysis is
+ * a walk of the program, the check a byte compare of it. */
+#define ENG_VP_LAYOUT_MEMO 4u
+static struct { const u8* uc; u32 instrs, mask; u8 copy[RSX_DSP_VP_INSTR * 16u]; } s_vlm[ENG_VP_LAYOUT_MEMO];
+static u32 s_vlm_next;
 static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
 {
     u32 mask = 0xFFFFu;
     const u8* uc = NULL;
     u32 instrs = 0;
     if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
-        rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
-        if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
-            analysis.exact && analysis.input_mask)
-            mask = analysis.input_mask;
+        const u32 bytes = instrs * 16u;
+        int hit = 0;
+        for (u32 i = 0; i < ENG_VP_LAYOUT_MEMO && !hit; i++)
+            if (s_vlm[i].uc == uc && s_vlm[i].instrs == instrs && bytes <= sizeof s_vlm[i].copy &&
+                !memcmp(s_vlm[i].copy, uc, bytes)) { mask = s_vlm[i].mask; hit = 1; }
+        if (!hit) {
+            rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
+            if (rsx_vp_analyze_inputs(uc, bytes, &analysis) == (int)instrs &&
+                analysis.exact && analysis.input_mask)
+                mask = analysis.input_mask;
+            if (bytes <= sizeof s_vlm[0].copy) {
+                const u32 k = s_vlm_next++ % ENG_VP_LAYOUT_MEMO;
+                s_vlm[k].uc = uc; s_vlm[k].instrs = instrs; s_vlm[k].mask = mask;
+                memcpy(s_vlm[k].copy, uc, bytes);
+            }
+        }
     }
     rsx_vertex_layout_plan_init(layout, mask);
 }
@@ -4484,6 +4527,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAW);
     draw_observer_begin();
     s_dtex_valid = 0; s_dtex_on = 1;
+    s_dprog.valid = 0;
     sink_end_core(user, r);
     s_dtex_on = 0;
     draw_observer_finish();

@@ -79,6 +79,33 @@ int main(void)
           "and restoring it finds the old pipeline again");
     engine_down();
 
+    /* The vertex input layout follows the program's bytes: the same slot
+     * rewritten to read another attribute builds a pipeline for that layout,
+     * and restoring it finds the first again. */
+    {
+        engine_up();
+        rsx_test_fp_instr(vm_base + TEX_OFFSET,
+            RSX_TEST_FP_OPC(0x01) | RSX_TEST_FP_MASK_XYZW | RSX_TEST_FP_INSRC_COL0 | RSX_TEST_FP_END,
+            RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        m(0x8E4, TEX_OFFSET | 2);
+        m(0x1D60, 64);
+        u8 vp[16];
+        for (int pass = 0; pass < 3; pass++) {
+            const u32 input = pass == 1 ? 3u : 0u;
+            rsx_test_vp_mov_out(vp, input, swizzle(0), 0, 1);
+            m(0x1E9C, 0);
+            for (u32 i = 0; i < 4; i++) { u32 w; memcpy(&w, vp + i * 4, 4); m(0xB80 + i * 4, w); }
+            m(0x1EA0, 0);
+            const int before = stub.n_pipeline_create;
+            draw_triangle();
+            if (pass == 0) CHECK(g_pipeline_layout_mask == 1u, "a program reading v0 lays out v0 (0x%X)", g_pipeline_layout_mask);
+            if (pass == 1) CHECK(stub.n_pipeline_create == before + 1 && g_pipeline_layout_mask == 8u,
+                                 "rewritten in place to read v3, it lays out v3 (0x%X)", g_pipeline_layout_mask);
+            if (pass == 2) CHECK(stub.n_pipeline_create == before, "and restored, it finds the v0 pipeline again");
+        }
+        engine_down();
+    }
+
     /* Only the slots a program has are written. */
     static rsx_fp_constant_block block;
     memset(&block, 0xAB, sizeof block);
