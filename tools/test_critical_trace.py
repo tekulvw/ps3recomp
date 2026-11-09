@@ -1,6 +1,9 @@
 """Bounded trace storage and disabled/overflow/concurrent publication fixture."""
-import json,subprocess,tempfile
+import json,os,subprocess,tempfile
 from pathlib import Path
+if os.name=='nt':
+ print('SKIP: the concurrent-publication fixture uses pthreads (POSIX only)')
+ raise SystemExit(0)
 root=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory() as d:
  for mode in ('optimized','ubsan'):

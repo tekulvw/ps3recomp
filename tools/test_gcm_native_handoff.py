@@ -7,7 +7,8 @@ import sys
 import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 if os.name == 'nt':
-    raise SystemExit('POSIX standalone fixture; production API remains portable C')
+    print('SKIP: POSIX standalone fixture; production API remains portable C')
+    raise SystemExit(0)
 with tempfile.TemporaryDirectory(prefix='gcm-native-handoff-') as temp:
     common = [os.environ.get('CC','cc'), '-std=gnu17', '-O1', '-UNDEBUG',
               '-ffunction-sections', '-fdata-sections', '-Iinclude', '-Ilibs/video']

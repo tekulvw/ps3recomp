@@ -74,14 +74,27 @@ jobs:
         shell: bash
         env:
           CI: "1"
+        # Every suite runs and the step fails at the end with the full list, so
+        # one red runner cannot hide the ones after it.
         run: |
-          set -e
+          failed=""
           for t in tools/test_*.py; do
             # Explicit shader-bound native fixtures have dedicated workflows.
             case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py|tools/test_vulkan_present_cost.py) continue ;; esac
+            # Manual Windows GPU/desktop fixtures: they take a /MT runtime
+            # library and need real D3D12 hardware or an interactive desktop
+            # (docs/WINDOWS_REPORT_BATCHING.md, docs/WINDOWS_OSK_DIALOG.md).
+            if grep -q -- "'--runtime-library'" "$t"; then
+              echo "--- $t: SKIP (manual fixture; needs --runtime-library and real hardware)"
+              continue
+            fi
             echo "--- $t"
-            python "$t"
+            python "$t" || failed="$failed $t"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::failed lifter test suites:$failed"
+            exit 1
+          fi
 
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h -- so it was only ever

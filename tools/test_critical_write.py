@@ -1,5 +1,8 @@
-import json,subprocess,tempfile
+import json,os,subprocess,tempfile
 from pathlib import Path
+if os.name=='nt':
+ print('SKIP: the watch fixture configures itself with setenv (POSIX only)')
+ raise SystemExit(0)
 r=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory() as d:
  for mode in ('optimized','ubsan'):
