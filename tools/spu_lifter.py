@@ -648,8 +648,9 @@ def promote_function(items, suffix, max_regs=0):
         out = []
         for part in re.split(r"(@F@|@R@)", t):
             if part == _F:
+                # Not cleared: a store inside a conditional exit leaves the
+                # path that does not exit as dirty as before it.
                 out.append(store(dirty))
-                dirty = 0
             elif part == _R:
                 out.append(reload)
                 dirty = 0
