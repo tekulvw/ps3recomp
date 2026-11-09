@@ -854,10 +854,21 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
  * the frame and the caller gets no slot, as before. What an evicted target
  * held and guest memory never got is gone, as it is for any address the
  * engine never saw. Returns the slot, or ENG_INVALID. */
+/* Bisection switches for upstream engine features (each read once; unset or
+ * any value but "0" keeps the merged behaviour). */
+static int eng_feature_on(int* slot, const char* name)
+{
+    if (*slot < 0) { const char* e = getenv(name); *slot = !(e && e[0] == '0' && !e[1]); }
+    return *slot;
+}
+static int s_sw_poly_offset = -1, s_sw_scissor_clear = -1, s_sw_evict = -1;
+
 #define ENG_EVICT_MIN_AGE 2u
 static u32 eng_oldest_slot(const char* what, const u32* last_use, size_t stride, u32 n, u32 keep)
 {
     u32 best = ENG_INVALID, best_use = 0;
+    /* PS3RECOMP_ENG_EVICT=0: a full table gives no slot, as before 3caa2509. */
+    if (!eng_feature_on(&s_sw_evict, "PS3RECOMP_ENG_EVICT")) n = 0;
     for (u32 i = 0; i < n; i++) {
         const u32 use = *(const u32*)((const u8*)last_use + i * stride);
         if (i == keep || g.frames - use < ENG_EVICT_MIN_AGE) continue;
@@ -5181,7 +5192,8 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
 
     /* Polygon offset: dynamic state, like the stencil reference. The
      * enable that applies is the one for what the primitive rasterises as. */
-    if (g.be->set_depth_bias) {
+    /* PS3RECOMP_ENG_POLY_OFFSET=0: no polygon offset, as before 6aaea446. */
+    if (g.be->set_depth_bias && eng_feature_on(&s_sw_poly_offset, "PS3RECOMP_ENG_POLY_OFFSET")) {
         float slope = 0.0f, units = 0.0f;
         const u32 en = topology == RSX_TOPOLOGY_POINTS ? M_POLY_OFFSET_POINT
                      : (topology == RSX_TOPOLOGY_LINES || topology == RSX_TOPOLOGY_LINE_STRIP)
@@ -5266,7 +5278,10 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         for (u32 i = 0; i < n_targets; i++) {
             eng_surface* s = &g.surfaces[targets[i]];
             u32 rc[4];
-            const int part = eng_clear_rect(&sf, s->w, s->h, rc);
+            int part = eng_clear_rect(&sf, s->w, s->h, rc);
+            /* PS3RECOMP_ENG_SCISSOR_CLEAR=0: CLEAR_SURFACE clears the whole
+             * target whatever the scissor, as before 1c7c1d91. */
+            if (!eng_feature_on(&s_sw_scissor_clear, "PS3RECOMP_ENG_SCISSOR_CLEAR")) part = 1;
             if (!part) continue;
             if (part == 2 && g.be->clear_color_rect) {
                 eng_log_rect_clear("colour", rc, s->w, s->h);
@@ -5290,7 +5305,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
          * which the backend folds into the next pass. */
         const eng_zdepth* z = &g.zdepths[zslot];
         u32 rc[4];
-        const int part = eng_clear_rect(&sf, z->w, z->h, rc);
+        int part = eng_clear_rect(&sf, z->w, z->h, rc);
+        if (!eng_feature_on(&s_sw_scissor_clear, "PS3RECOMP_ENG_SCISSOR_CLEAR")) part = 1;
         if (!part) return;
         const int partial = part == 2 && g.be->clear_depth_stencil_rect &&
                             !(rc[0] == 0 && rc[1] == 0 &&
