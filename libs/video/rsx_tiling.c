@@ -7,6 +7,7 @@
 #include "../../runtime/platform/win32_compat.h"
 #include "ps3emu/log_first.h"
 #include <stdio.h>
+#include <stdlib.h>   /* getenv */
 #include <string.h>
 
 /* The ranges below ask `ptr` for at most one IO page at a time: main memory
@@ -23,9 +24,19 @@ static volatile LONG s_rsx_tiles_bound;
 void rsx_tiling_set(u32 index, u32 location, u32 offset, u32 size, u32 pitch, u32 bank)
 {
     if (index >= RSX_TILE_COUNT) return;
+    /* PS3RECOMP_RSX_TILING=0: ignore tile bindings, so no RSX client tiles or
+     * detiles main memory, as before tiling was modelled (a bisection
+     * switch; on by default). */
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("PS3RECOMP_RSX_TILING"); s_on = !(e && e[0] == '0' && !e[1]); }
     rsx_tile t = { 0, 0, 0, 0 };
-    if (location == RSX_LOCATION_MAIN && size && pitch) {
+    if (s_on && location == RSX_LOCATION_MAIN && size && pitch) {
         t.offset = offset; t.size = size; t.pitch = pitch; t.bank = bank & 3u;
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 8))
+            fprintf(stderr, "[rsx-tiling] tile %u bound over main memory: offset=0x%08X size=0x%X "
+                    "pitch=0x%X bank=%u (RSX accesses there are now tiled)\n",
+                    index, offset, size, pitch, bank & 3u);
     }
     AcquireSRWLockExclusive(&s_rsx_tiles_lock);
     s_rsx_tiles[index] = t;
