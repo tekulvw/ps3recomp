@@ -26,6 +26,7 @@ void spu_coh_watch_remove(spu_coh_watch* w) { (void)w; }
 /* spu_channels.c seams cellSpurs reaches; not linked here, so inert stand-ins. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
 void (*g_host_line_write_hook)(uint32_t line) = 0;
+uint32_t (*g_spurs_module_poll_hook)(uint32_t, uint32_t, uint32_t) = 0;
 int spu_commit_ctx_describe(uint32_t* image, uint32_t* pc, uint32_t* lr, uint32_t* spu, int* code_image)
 { (void)image; (void)pc; (void)lr; (void)spu; (void)code_image; return 0; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
