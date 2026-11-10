@@ -3405,7 +3405,7 @@ enum { SMC_OP_NONE, SMC_OP_STQD, SMC_OP_LQD, SMC_OP_STQA, SMC_OP_LQA, SMC_OP_STQ
        SMC_OP_NOP, SMC_OP_BI_FAMILY, SMC_OP_BR_FAMILY };
 typedef struct { uint8_t kind, rt, ra, rb; uint32_t w; } smc_op;
 #define SMC_TRACE_MAX 256u
-#define SMC_TRACE_WAYS 4u
+#define SMC_TRACE_WAYS 8u
 typedef struct { uint32_t pc, n, state; uint8_t bytes[4 * SMC_TRACE_MAX]; smc_op ops[SMC_TRACE_MAX]; } smc_trace;
 enum { SMC_TRACE_EMPTY, SMC_TRACE_REPLAY, SMC_TRACE_UNCACHEABLE };
 typedef struct { smc_trace way[SMC_TRACE_WAYS]; unsigned next; } smc_trace_cache;
@@ -3459,6 +3459,29 @@ static uint32_t smc_trace_word(const spu_context* ctx, uint32_t pc)
            ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
 }
 
+/* PS3RECOMP_SPU_SMC_TRACE_STATS=1: per thread, every 2^18 microstep entries,
+ * how the cache served them (replayed, decoded anew, stopped at a store into
+ * the run, uncacheable) and the time spent replaying vs in the ordinary
+ * microstep. Off: one test of a cached flag per entry. */
+static int smc_trace_stats_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_SPU_SMC_TRACE_STATS"); on = e && !strcmp(e, "1"); }
+    return on;
+}
+static SPU_THREAD_LOCAL struct { uint64_t n[5], replay_ns, step_ns, entries; } t_smc_stats;
+static void smc_trace_stat(int k) { if (smc_trace_stats_on()) t_smc_stats.n[k]++; }
+static void smc_trace_stats_entry(spu_context* ctx, uint64_t replay_ns, uint64_t step_ns)
+{
+    t_smc_stats.replay_ns += replay_ns; t_smc_stats.step_ns += step_ns;
+    if ((++t_smc_stats.entries & ((1u << 18) - 1u)) == 0)
+        fprintf(stderr, "[spu-smc-trace] spu=%u entries=%llu replayed=%llu decoded=%llu stopped=%llu uncacheable=%llu off=%llu replay_ns=%llu microstep_ns=%llu\n",
+                ctx->spu_id & 7u, (unsigned long long)t_smc_stats.entries, (unsigned long long)t_smc_stats.n[0],
+                (unsigned long long)t_smc_stats.n[1], (unsigned long long)t_smc_stats.n[2],
+                (unsigned long long)t_smc_stats.n[3], (unsigned long long)t_smc_stats.n[4],
+                (unsigned long long)t_smc_stats.replay_ns, (unsigned long long)t_smc_stats.step_ns);
+}
+
 /* Find or build the trace for the run at pc. NULL: run the ordinary path. */
 static const smc_trace* smc_trace_get(spu_context* ctx, uint32_t pc)
 {
@@ -3468,17 +3491,21 @@ static const smc_trace* smc_trace_get(spu_context* ctx, uint32_t pc)
         if (!c) return NULL;
         t_smc_trace = c;
     }
+    /* Several variants of one entry can be live: a stub that toggles its own
+     * words alternates between them. Each keeps its own way; a variant that
+     * matches none is decoded into a free way or the oldest one. */
     for (unsigned i = 0; i < SMC_TRACE_WAYS; i++) {
         smc_trace* t = &c->way[i];
         if (t->state == SMC_TRACE_EMPTY || t->pc != pc) continue;
-        if (pc + 4 * t->n <= SPU_LS_SIZE && !memcmp(ctx->ls + pc, t->bytes, 4 * t->n))
+        if (pc + 4 * t->n <= SPU_LS_SIZE && !memcmp(ctx->ls + pc, t->bytes, 4 * t->n)) {
+            smc_trace_stat(t->state == SMC_TRACE_REPLAY ? 0 : 3);
             return t->state == SMC_TRACE_REPLAY ? t : NULL;
-        t->state = SMC_TRACE_EMPTY;   /* rewritten: decode it again below */
-        break;
+        }
     }
+    smc_trace_stat(1);
     smc_trace* t = NULL;
     for (unsigned i = 0; i < SMC_TRACE_WAYS && !t; i++)
-        if (c->way[i].state == SMC_TRACE_EMPTY || c->way[i].pc == pc) t = &c->way[i];
+        if (c->way[i].state == SMC_TRACE_EMPTY) t = &c->way[i];
     if (!t) { t = &c->way[c->next]; c->next = (c->next + 1) % SMC_TRACE_WAYS; }
     t->pc = pc; t->n = 0; t->state = SMC_TRACE_UNCACHEABLE;
     for (uint32_t a = pc; t->n < SMC_TRACE_MAX && a + 3 < SPU_LS_SIZE; a += 4) {
@@ -3494,6 +3521,7 @@ static const smc_trace* smc_trace_get(spu_context* ctx, uint32_t pc)
 
 /* Replay a trace. 1: it reached its branch (as spu_smc_microstep returns 1).
  * 0: a store landed inside the run; ctx->pc is the next instruction. */
+static int spu_smc_microstep_steps(spu_context* ctx);
 static int smc_trace_replay(spu_context* ctx, const smc_trace* t)
 {
     const uint32_t lo = t->pc, hi = t->pc + 4 * t->n;
@@ -3552,7 +3580,15 @@ static int smc_trace_replay(spu_context* ctx, const smc_trace* t)
             return 1; }
         default: ctx->pc = pc; return 0;
         }
-        if (store < hi && store + 16 > lo) { ctx->pc = pc + 4; return 0; }   /* rewrote the run */
+        if (store < hi && store + 16 > lo) {
+            /* The run rewrote itself. Words already executed do not matter;
+             * stop only if a word still ahead now differs from the decode. */
+            const uint32_t first = store > pc + 4 ? store : pc + 4, last = store + 16 < hi ? store + 16 : hi;
+            if (first < last && memcmp(ctx->ls + first, t->bytes + (first - lo), last - first)) {
+                smc_trace_stat(2);
+                ctx->pc = pc + 4; return 0;
+            }
+        }
     }
     ctx->pc = pc;
     return 0;
@@ -3561,11 +3597,34 @@ static int smc_trace_replay(spu_context* ctx, const smc_trace* t)
 static int spu_smc_microstep(spu_context* ctx)
 {
     if (smc_trace_enabled()) {
+        const int stats = smc_trace_stats_on();
+        const uint64_t t0 = stats ? spu_host_ns() : 0;
         const smc_trace* t = smc_trace_get(ctx, ctx->pc & SPU_LS_MASK & ~3u);
-        if (t && smc_trace_replay(ctx, t)) return 1;
+        if (t && smc_trace_replay(ctx, t)) {
+            if (stats) smc_trace_stats_entry(ctx, spu_host_ns() - t0, 0);
+            return 1;
+        }
         /* Not cached, or stopped at a store into the run: microstep on from
          * ctx->pc, which the replay left at its next instruction. */
+        if (stats) {
+            const uint64_t t1 = spu_host_ns();
+            const int r = spu_smc_microstep_steps(ctx);
+            smc_trace_stats_entry(ctx, t1 - t0, spu_host_ns() - t1);
+            return r;
+        }
+    } else if (smc_trace_stats_on()) {
+        smc_trace_stat(4);
+        const uint64_t t1 = spu_host_ns();
+        const int r = spu_smc_microstep_steps(ctx);
+        smc_trace_stats_entry(ctx, 0, spu_host_ns() - t1);
+        return r;
     }
+    return spu_smc_microstep_steps(ctx);
+}
+
+/* The ordinary micro-interpreter: decode and run the live words. */
+static int spu_smc_microstep_steps(spu_context* ctx)
+{
     int observe = spu_pc_observer_enabled();
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
     for (int steps = 0; steps < 4096; steps++) {
