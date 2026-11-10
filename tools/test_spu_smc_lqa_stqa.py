@@ -35,7 +35,9 @@ i, depth = m.end(), 1
 while depth:
     depth += {'{': 1, '}': -1}.get(src[i], 0)
     i += 1
-func = src[m.start():i]
+# The microstep's decoded-trace cache sits just above it; take both.
+start = src.find('/* ---- Decoded-trace cache for the micro-interpreter')
+func = src[start if 0 <= start < m.start() else m.start():i]
 
 HARNESS = r'''
 #include <stdint.h>
