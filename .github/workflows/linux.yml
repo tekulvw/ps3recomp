@@ -54,8 +54,15 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang \
+          # Minimal runners need compiler-rt explicitly for the UBSan fixtures.
+          sudo apt-get install -y ninja-build libsdl2-dev clang libclang-rt-dev \
             glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
+
+      - name: Verify Clang UBSan runtime
+        run: |
+          printf '%s\n' 'int main(void) { volatile int one = 1; return one + 1 - 2; }' \
+            | clang -x c - -fsanitize=undefined -fno-sanitize-recover=all -o /tmp/ps3recomp-ubsan-smoke
+          /tmp/ps3recomp-ubsan-smoke
 
       - name: Configure
         run: |
