@@ -1257,22 +1257,51 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d, 
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
  * content id (rsx_live_draw.c:2002-2026). */
+/* The texture cache's content hash: compared only with values it made in
+ * this run, never stored. Eight independent chains, each taking every eighth
+ * 8-byte word, so their multiplies overlap instead of each waiting on the one
+ * before (the single chain it replaced was latency-bound, about 4x slower);
+ * each step folds its high bits down so a change anywhere in a word reaches
+ * the whole lane. The lanes, the tail and the length are folded together and
+ * mixed at the end. */
+static inline u64 eng_hash_step(u64 h, u64 word)
+{
+    h = (h ^ word) * 0x9E3779B97F4A7C15ull;
+    return h ^ (h >> 29);
+}
+static u64 eng_hash_bytes(const u8* src, u32 span)
+{
+    u64 h[8] = { 0x243F6A8885A308D3ull, 0x13198A2E03707344ull, 0xA4093822299F31D0ull, 0x082EFA98EC4E6C89ull,
+                 0x452821E638D01377ull, 0xBE5466CF34E90C6Cull, 0xC0AC29B7C97C50DDull, 0x3F84D5B5B5470917ull };
+    u32 i = 0;
+    for (; i + 64 <= span; i += 64) {
+        u64 w[8];
+        memcpy(w, src + i, sizeof w);
+        for (u32 k = 0; k < 8; k++) h[k] = eng_hash_step(h[k], w[k]);
+    }
+    for (; i + 8 <= span; i += 8) {
+        u64 w;
+        memcpy(&w, src + i, sizeof w);
+        h[0] = eng_hash_step(h[0], w);
+    }
+    if (i < span) {
+        u64 w = 0;
+        memcpy(&w, src + i, span - i);
+        h[1] = eng_hash_step(h[1], w ^ ((u64)(span - i) << 56));
+    }
+    u64 x = (u64)span * 0xFF51AFD7ED558CCDull;
+    for (u32 k = 0; k < 8; k++) x ^= (h[k] << (k * 8)) | (k ? h[k] >> (64 - k * 8) : 0);
+    x = (x ^ (x >> 33)) * 0xFF51AFD7ED558CCDull;
+    x = (x ^ (x >> 33)) * 0xC4CEB9FE1A85EC53ull;
+    return x ^ (x >> 33);
+}
 static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span, u64 identity,
                                     int* readable)
 {
     const u8* src = span ? (identity ? rsx_picture_data(identity,location,offset,span) : eng_guest_ptr(NULL, location, offset, span)) : NULL;
     if (!src) { *readable = 0; return 0; }
-    u64 hash = 1469598103934665603ull;
-    u32 i = 0;
-    for (; i + 8 <= span; i += 8) {
-        u64 word;
-        memcpy(&word, src + i, sizeof(word));
-        hash ^= word;
-        hash *= 1099511628211ull;
-    }
-    for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
     *readable = 1;
-    return hash;
+    return eng_hash_bytes(src, span);
 }
 
 /* The cheap per-frame change check: 64 bytes out of every 2 KB, plus the
@@ -3604,11 +3633,8 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
         if (source && decoded) {
             total_bytes+=span+decoded_bytes;
             memcpy(source,guest,span);
-            /* Same word-at-a-time hash used by the upload cache. */
-            current_hash=1469598103934665603ull;
-            u32 i=0;
-            for (;i+8<=span;i+=8) { u64 word;memcpy(&word,source+i,8);current_hash^=word;current_hash*=1099511628211ull; }
-            for (;i<span;++i) { current_hash^=source[i];current_hash*=1099511628211ull; }
+            /* Same hash as the upload cache. */
+            current_hash=eng_hash_bytes(source,span);
             rsx_texture_decode(decoded,lv[0].tl.dst_row_bytes,source,t.width,t.height,&lv[0].tl,rsx_texture_argb_is_rgba());
             bytes_ok=eng_capture_write(prefix,".source.bin",source,span) &&
                 eng_capture_write(prefix,".decoded-mip0.bin",decoded,decoded_bytes);
