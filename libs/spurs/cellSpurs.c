@@ -478,6 +478,10 @@ static struct SpursInst {
     struct SpursPmSlot slots[6];
     u8 active[16], idle[16];
     u32 cursor, pass_no;
+    /* Coherence watch on the request line while the scheduler runs
+     * (spurs_request_line_written). */
+    spu_coh_watch request_watch;
+    int request_watched;
 } s_inst[MAX_SPURS_INST];
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
 
@@ -502,6 +506,29 @@ static void spurs_line_committed(uint32_t line)
         __atomic_store_n(&si->kick, 1, __ATOMIC_RELEASE);
         WakeAllConditionVariable(&si->wake);
     }
+}
+/* A PPU raises a ready count, signal or flag with a plain store or a
+ * store-conditional on the request line, and neither woke the coordinator: the
+ * request waited for its next timed pass, about a millisecond (1-2 ms on
+ * Windows), with every SPU idle. The scheduler therefore keeps a coherence
+ * watch on the line while it runs (spurs_scheduler_start), so every real write
+ * to it -- PPU store or CAS, MFC put, SPU atomic, host store through the
+ * coherent paths, under the default scheme and PS3RECOMP_COH_VERSIONS alike --
+ * calls this. It only sets the kick and wakes the coordinator, which re-reads
+ * the guest bytes as on any pass: a wake hint, no guest state. Called under
+ * the lock-line lock. The scheduler's own bookkeeping writes (the consumed
+ * request, the current contention) are skipped, so a dispatch does not
+ * schedule a second, empty pass. PS3RECOMP_SPURS_STORE_WAKE=0 leaves the line
+ * unwatched. */
+static SPU_THREAD_LOCAL int t_spurs_scheduler_write;
+static void spurs_request_line_written(void* opaque)
+{
+    struct SpursInst* si = (struct SpursInst*)opaque;
+    if (t_spurs_scheduler_write) return;
+    /* A pending kick has its wake already: the coordinator either sleeps
+     * with that wake on its way or checks the kick before it sleeps again. */
+    if (!__atomic_exchange_n(&si->kick, 1, __ATOMIC_ACQ_REL))
+        WakeAllConditionVariable(&si->wake);
 }
 static void spurs_commit_hook(uint32_t line)
 {
@@ -2408,8 +2435,10 @@ static int spurs_dispatch_slot(struct SpursInst* si, struct SpursPmSlot* slot, u
  *       of sleeping up to a millisecond: a guest that raises a ready count or signal
  *       with a plain store wakes nobody, so new work otherwise waits for a pass;
  *   PS3RECOMP_SPURS_SELF_DISPATCH=1 a worker whose PM returns takes the next
- *       requested workload itself (spurs_pm_worker). */
-static struct { int disabled, target_mode, self_dispatch; long poll_us; } s_sched_opt;
+ *       requested workload itself (spurs_pm_worker);
+ *   PS3RECOMP_SPURS_STORE_WAKE=0    no coherence watch on the request line
+ *       (spurs_request_line_written): requests a PPU stores wait for a pass. */
+static struct { int disabled, target_mode, self_dispatch, store_wake; long poll_us; } s_sched_opt;
 static void spurs_sched_options_read(void)
 {
     const char* e;
@@ -2417,6 +2446,7 @@ static void spurs_sched_options_read(void)
     e = getenv("PS3RECOMP_SPURS_READY_TARGET"); s_sched_opt.target_mode = e && !strcmp(e, "1");
     e = getenv("PS3RECOMP_SPURS_POLL_US");      s_sched_opt.poll_us = e ? atol(e) : 0;
     e = getenv("PS3RECOMP_SPURS_SELF_DISPATCH"); s_sched_opt.self_dispatch = e && !strcmp(e, "1");
+    e = getenv("PS3RECOMP_SPURS_STORE_WAKE");    s_sched_opt.store_wake = !(e && !strcmp(e, "0"));
 }
 
 /* One persistent worker for each configured virtual SPU. A waiting policy
@@ -2439,6 +2469,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         while (!slot->busy && !si->stopping)
             SleepConditionVariableSRW(&slot->wake, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
+        t_spurs_scheduler_write = 0;   /* the PM's own writes are requests */
         ReleaseSRWLockExclusive(&si->lock);
         const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         const uint64_t diag_t0 = s_diag_on > 0 ? ps3_ft_now() : 0;
@@ -2452,6 +2483,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
         AcquireSRWLockExclusive(&si->lock);
+        t_spurs_scheduler_write = 1;   /* bookkeeping and self-dispatch below */
         u32 wid = slot->wid;
         if (si->active[wid]) si->active[wid]--;
         spu_lockline_lock();
@@ -2499,6 +2531,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     struct SpursInst* si = (struct SpursInst*)p;
     const int disabled = s_sched_opt.disabled, target_mode = s_sched_opt.target_mode;
     const long poll_us = s_sched_opt.poll_us;
+    t_spurs_scheduler_write = 1;   /* every write this thread makes is bookkeeping */
     AcquireSRWLockExclusive(&si->lock);
     while (!si->stopping) {
         if (__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL)) {
@@ -2538,6 +2571,17 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     return 0;
 }
 
+static void spurs_request_watch(struct SpursInst* si, int on)
+{
+    spu_lockline_lock();
+    if (on && !si->request_watched)
+        spu_coh_watch_add(&si->request_watch, si->ea, spurs_request_line_written, si);
+    else if (!on && si->request_watched)
+        spu_coh_watch_remove(&si->request_watch);
+    si->request_watched = on;
+    spu_lockline_unlock();
+}
+
 static void spurs_wake_all_workers(struct SpursInst* si)
 {
     WakeAllConditionVariable(&si->wake);
@@ -2565,6 +2609,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     }
     si->coordinator = CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     if (!si->coordinator) goto failed;
+    if (s_sched_opt.store_wake) spurs_request_watch(si, 1);
     return CELL_OK;
 failed:
     AcquireSRWLockExclusive(&si->lock);
@@ -2594,6 +2639,7 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
         HANDLE h = si->slots[sn].thread;
         if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
     }
+    spurs_request_watch(si, 0);   /* the callback's instance is about to be reused */
     AcquireSRWLockExclusive(&si->lock);
     si->kernel_live = 0;
     ReleaseSRWLockExclusive(&si->lock);
