@@ -212,6 +212,25 @@ int main(int argc,char**argv) {
         cellGcm_syscall_set_fifo(32,0);cellGcm_rsx_process_fifo();assert(checked_calls==4);
         assert(!cellGcm_set_checked_completion(&external_backend,external_is_ready,external_flush));
         for(unsigned i=0;i<4;i++){assert(peek_ref()==values[i]);assert(s_ref_receipts[i]==i+1);gcm_ref_publish_one();}
+    } else if(!strcmp(argv[1],"unknown_word")) {
+        /* An unknown command word under checked REF stands checked REF down for
+         * the run; the walker skips the word and REF and labels keep advancing. */
+        raw32(0x100000,0x60000000u);                                /* not a command word */
+        raw32(0x100004,0x00040050);raw32(0x100008,0xCAFEBABE);      /* SET_REFERENCE */
+        raw32(0x10000C,0x00040064);raw32(0x100010,0x00000020);      /* SEMAPHORE_OFFSET */
+        raw32(0x100014,0x0004006C);raw32(0x100018,0x12345678);      /* SEMAPHORE_RELEASE */
+        cellGcm_syscall_set_fifo(0x1C,0);cellGcm_rsx_process_fifo();
+        assert(s_fifo_getoff==0x1C);
+        assert(atomic_load(&s_checked_ref_off)&&!atomic_load(&s_checked_ref_failed));
+        assert(!checked_calls);                                       /* plain paced REF from here on */
+        gcm_ref_publish_one();assert(peek_ref()==0xCAFEBABE);
+        assert(vm_read32(GCM_LABEL_GUEST_BASE+0x20)==0x12345678u);
+        /* Later work keeps draining, and a second unknown word reports nothing new. */
+        raw32(0x10001C,0x60000000u);
+        raw32(0x100020,0x00040050);raw32(0x100024,0xBEEF0001u);
+        cellGcm_syscall_set_fifo(0x28,0x1C);cellGcm_rsx_process_fifo();
+        assert(s_fifo_getoff==0x28 && !atomic_load(&s_checked_ref_failed));
+        gcm_ref_publish_one();assert(peek_ref()==0xBEEF0001u);
     } else if(!strcmp(argv[1],"malformed")) {
         raw32(0x100000,0x00080050);raw32(0x100004,0xCAFEBABE);raw32(0x100008,0);
         cellGcm_syscall_set_fifo(12,0);cellGcm_rsx_process_fifo();assert(!checked_calls);assert(peek_ref()==0xA5A5A5A5u);
