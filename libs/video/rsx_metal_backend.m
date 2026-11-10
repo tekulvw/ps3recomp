@@ -3890,12 +3890,22 @@ static struct {
 } s_eng_diag;
 static id<MTLCommandBuffer> s_eng_diag_cb;
 
+/* RSX_ENGINE_FRAME_CAPTURE is set: checked on every present, so read once. */
+static int eng_frame_capture_env(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RSX_ENGINE_FRAME_CAPTURE") ? 1 : 0;
+    return on;
+}
+
 static void eng_diag_begin(u32 surface)
 {
     s_eng_diag.active = 0;
     s_eng_diag_cb = nil;
-    const char* opt = getenv("PS3RECOMP_METAL_PRESENT_DIAGNOSTICS");
-    if (!opt || strcmp(opt, "1")) return;
+    static int s_present_diag = -1;   /* per present: read once */
+    if (s_present_diag < 0) { const char* opt = getenv("PS3RECOMP_METAL_PRESENT_DIAGNOSTICS");
+                              s_present_diag = opt && !strcmp(opt, "1"); }
+    if (!s_present_diag) return;
     unsigned draws = 0, selected = 0;
     for (u32 i = 0; i < s_eng_rec_count; ++i) {
         const EngRecord* r = &s_eng_rec[i];
@@ -4695,7 +4705,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
         const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
         MetalFrameTicket *ticket=drawable?fps_frame_ticket():nil;
         if(ticket){ticket->critical_command_id=critical_id;ticket->critical_capture_id=critical_start?critical_capture:0;}
-        if(present_dst && getenv("RSX_ENGINE_FRAME_CAPTURE")){
+        if(present_dst && eng_frame_capture_env()){
             s_capture_present_cb=cb;s_capture_guest=s_present_guest_id;s_capture_command=critical_id;
             s_capture_submission=ticket?ticket->submission_id:0;
             s_capture_drawable=drawable?drawable.drawableID:0;s_capture_presented=presented;
@@ -5057,7 +5067,7 @@ static int eng_encode_and_stage(id<MTLTexture> src, id<MTLTexture> staging, uint
         s_pt_native[slot] = metal_native_frame_stage(cb, src, staged);
         if (s_eng_diag.active && !staged) s_eng_diag.reason = "blit_skipped";
         const int trace_synced = !trace_count || eng_trace_sync(cb, trace_handles, trace_count);
-        if(getenv("RSX_ENGINE_FRAME_CAPTURE")){
+        if(eng_frame_capture_env()){
             s_capture_present_cb=cb;s_capture_guest=s_present_guest_id;s_capture_command=critical_id;
             s_capture_submission=0;s_capture_drawable=0;s_capture_presented=staged;
         }
@@ -5279,7 +5289,7 @@ static void eng_present_staged(u32 surface)
         eng_diag_end();
         return;
     }
-    if(getenv("RSX_ENGINE_FRAME_CAPTURE")){
+    if(eng_frame_capture_env()){
         s_capture_present_cb=nil;s_capture_guest=s_capture_command=s_capture_submission=s_capture_drawable=0;s_capture_presented=0;
     }
     const int staged = rsx_present_thread_submit(s_pt, surface);
@@ -5299,7 +5309,7 @@ static void eng_present(void* user, u32 surface)
         eng_diag_end();
         return;
     }
-    if(getenv("RSX_ENGINE_FRAME_CAPTURE")){
+    if(eng_frame_capture_env()){
         s_capture_present_cb=nil;s_capture_guest=s_capture_command=s_capture_submission=s_capture_drawable=0;s_capture_presented=0;
     }
     int presented = eng_encode_and_commit(src);

@@ -297,8 +297,10 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     /* SPURS_JOB_DESCDUMP=1: hexdump the guest job descriptor. The SPU derives
      * its DMA and atomic EAs from these words, so when a job spins on a
      * lock-line address that is not backed, this is what to read first. */
-    { static int _d = 0;
-      if (getenv("SPURS_JOB_DESCDUMP") && PS3_LOG_FIRST(_d, 4)) {
+    { static int _d = 0; static int s_descdump = -1;   /* per job: read once */
+      if (s_descdump < 0) { const char* e = getenv("SPURS_JOB_DESCDUMP");
+                            s_descdump = e ? (atoi(e) >= 2 ? 2 : 1) : 0; }
+      if (s_descdump && PS3_LOG_FIRST(_d, 4)) {
           fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
           for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
               if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
@@ -309,7 +311,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
            * data (past JH_SIZE) and dump what they point at. The job reads its
            * parameters from there, so a wild DMA/atomic address usually
            * originates in one of these blocks. */
-          if (atoi(getenv("SPURS_JOB_DESCDUMP")) >= 2) {
+          if (s_descdump >= 2) {
               for (uint32_t o = JH_SIZE; o < dsz && o < 128; o += 4) {
                   uint32_t v = g32(job_ea + o);
                   if (v < 0x10000u || v >= 0xD0000000u) continue;
@@ -328,7 +330,9 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * The header's input-DMA-list/io fields are legitimately zero for it. Dump
      * the user data + that command block so the bail path is attributable. */
     uint32_t dump_cmd = 0;
-    if (getenv("SPURS_JOB_DUMP")) {
+    static int s_job_dump = -1;
+    if (s_job_dump < 0) s_job_dump = getenv("SPURS_JOB_DUMP") ? 1 : 0;
+    if (s_job_dump) {
         uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
         fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
@@ -433,7 +437,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 
-    if (getenv("SPURS_JOB_DUMP")) {
+    if (s_job_dump) {
         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
                 job_ea, ctx.status, ctx.stop_code, ctx.pc);
         /* Post-run view of the same command block: the game polls result/status
