@@ -316,6 +316,13 @@ typedef struct rsx_draw_backend {
     void (*draw_host)(void* user, rsx_topology topology, const void* data, u32 data_bytes,
                       const u32* offsets, u32 streams, u32 vertex_count,
                       const void* indices, u32 index_count, u32 index_size);
+    /* Optional. bind_vs_constants for a program that reads only some rows:
+     * the block is `bytes` long (512 constant rows, then the viewport
+     * transform's two), the program reads rows [first_row, first_row + rows)
+     * and the last two, and the rest may hold anything. The backend may stage
+     * just those. Without it the engine calls bind_vs_constants. */
+    void (*bind_vs_constant_rows)(void* user, const void* data, u32 bytes,
+                                  u32 first_row, u32 rows);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -362,6 +369,9 @@ u64 rsx_draw_engine_depth_unstored_count(void);
 /* Draws that bound vertex constants, and draws that reused the previous
  * draw's unchanged ones through rebind_vs_constants. */
 void rsx_draw_engine_vs_constant_counts(unsigned long long* binds, unsigned long long* rebinds);
+/* Of those binds, the ones made through bind_vs_constant_rows, and the bytes
+ * they asked to be staged (the rows the program reads and the transform's). */
+void rsx_draw_engine_vs_constant_row_counts(unsigned long long* row_binds, unsigned long long* row_bytes);
 /* Fragment-program product lookups served from the engine's memo, and the
  * ones that walked the microcode (a new or changed program). */
 void rsx_draw_engine_fp_memo_counts(unsigned long long* hits, unsigned long long* misses);
