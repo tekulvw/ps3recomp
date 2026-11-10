@@ -57,7 +57,9 @@ static BOOL WINAPI mfc_source_trace_init(PINIT_ONCE once, PVOID arg, PVOID* out)
 static inline void mfc_trace_source_f32be(spu_context* spu, uint32_t lsa,
                                          uint64_t ea, uint32_t size, uint32_t cmd)
 {
-    if (!InterlockedCompareExchange(&mfc_source_trace.ready, 0, 0))
+    /* Every PUT reads this: an acquire load, not a locked compare-exchange
+     * that takes the shared line exclusively from each SPU thread. */
+    if (!ReadAcquire(&mfc_source_trace.ready))
         InitOnceExecuteOnce(&mfc_source_trace.once, mfc_source_trace_init, NULL, NULL);
     if (!mfc_source_trace.enabled) return;
     uint64_t start = (uint32_t)ea, end = start + size;

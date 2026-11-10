@@ -472,6 +472,7 @@ static int spu_step(spu_context* ctx) {
         DST = spu_link((pc + 4) & 0x3FFFC); next = tg; SPU_IED_BITS(); break; }
     case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;   /* branch when an enabled event is pending */
         DST = spu_link((pc + 4) & 0x3FFFC);
+        SPU_LR_POLL(ctx);
         if ((__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
             next = tg;
             SPU_IED_BITS(); }   /* E/D effective when taken, like the lift */

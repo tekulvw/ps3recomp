@@ -119,10 +119,17 @@ typedef struct spu_coh_watch {
     void (*wake)(void* opaque);
     void* opaque;
     struct spu_coh_watch* next;
+    void* cohv[4];   /* PS3RECOMP_COH_VERSIONS: the line's waiter registration */
 } spu_coh_watch;
 void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
                        void (*wake)(void*), void* opaque);
 void spu_coh_watch_remove(spu_coh_watch* watch);
+
+/* PS3RECOMP_COH_VERSIONS=1 (spu_coh_version.inc, spu_coh_ops.h): whether the
+ * per-line version counter scheme is installed, and installing it by hand
+ * (tests; before any reservation). */
+int  spu_coh_versions_on(void);
+void spu_coh_versions_install(int on);
 
 /* Count of LR events delivered. A parked SPURS service that never wakes with
  * this at zero is a coherence miss; nonzero moves the question downstream. */
