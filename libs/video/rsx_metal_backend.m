@@ -2726,6 +2726,10 @@ static uint64_t s_eng_commit_seq;
 static _Atomic(uint64_t) s_eng_commit_done;
 static _Atomic(uint64_t) s_eng_stage_inflight, s_eng_stage_inflight_peak;
 static uint64_t s_eng_bound_waits, s_eng_bound_wait_ns, s_eng_cap_waits;
+/* PS3RECOMP_RSX_INFLIGHT_LOG=1: bytes copied into staging by kind, the draws
+ * recorded and the draws that reused the previous vertex constants. */
+enum { ENG_STAGED_VERTEX, ENG_STAGED_INDEX, ENG_STAGED_VS, ENG_STAGED_PS, ENG_STAGED_KINDS };
+static uint64_t s_eng_staged[ENG_STAGED_KINDS], s_eng_staged_draws, s_eng_vs_reused;
 static uint64_t s_eng_view_made, s_eng_view_reused;
 static int s_eng_bound_log = -1;
 static uint64_t s_eng_stage_limit = UINT64_MAX;
@@ -2750,6 +2754,9 @@ static void eng_bound_report(int waited){
         (unsigned long long)s_eng_bound_waits,s_eng_bound_wait_ns/1e6,(unsigned long long)s_eng_cap_waits,
         (unsigned long long)s_eng_view_made,(unsigned long long)s_eng_view_reused,
         (unsigned long long)(s_dev?[s_dev currentAllocatedSize]>>20:0));
+    fprintf(stderr,"[rsx metal staging] draws=%llu vertex_mb=%.1f index_mb=%.1f vs_constants_mb=%.1f ps_constants_mb=%.1f vs_reused=%llu\n",
+        (unsigned long long)s_eng_staged_draws,s_eng_staged[ENG_STAGED_VERTEX]/1048576.0,s_eng_staged[ENG_STAGED_INDEX]/1048576.0,
+        s_eng_staged[ENG_STAGED_VS]/1048576.0,s_eng_staged[ENG_STAGED_PS]/1048576.0,(unsigned long long)s_eng_vs_reused);
 }
 /* Consumer-owned receipts: GPU status is checked directly, without relying
  * on asynchronous completion-handler delivery ordering. */
@@ -3966,6 +3973,7 @@ static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
     if (!eng_stage_copy(data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
+    s_eng_staged[ENG_STAGED_VS] += bytes;
     s_eng_pending.vs_cb_bytes = bytes;
     s_eng_vs_gen = s_eng_stage_gen;
 }
@@ -3974,13 +3982,16 @@ static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 static int eng_rebind_vs_constants(void* user)
 {
     (void)user;
-    return s_eng_pending.vs_cb_bytes && s_eng_stage && s_eng_vs_gen == s_eng_stage_gen;
+    const int reuse = s_eng_pending.vs_cb_bytes && s_eng_stage && s_eng_vs_gen == s_eng_stage_gen;
+    s_eng_vs_reused += (uint64_t)reuse;
+    return reuse;
 }
 
 static void eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
     if (!eng_stage_copy(data, bytes, &s_eng_pending.ps_cb_off)) bytes = 0;
+    s_eng_staged[ENG_STAGED_PS] += bytes;
     s_eng_pending.ps_cb_bytes = bytes;
 }
 
@@ -4229,6 +4240,9 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
     if (indices && index_count &&
         !eng_stage_copy(indices, index_count * (u32)sizeof(u32), &ib_off))
         return;
+    s_eng_staged[ENG_STAGED_VERTEX] += (uint64_t)vertex_count * stride;
+    s_eng_staged[ENG_STAGED_INDEX] += indices ? (uint64_t)index_count * sizeof(u32) : 0;
+    s_eng_staged_draws++;
 
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     *r = s_eng_pending;
