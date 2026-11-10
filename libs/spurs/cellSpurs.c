@@ -483,7 +483,12 @@ static struct SpursInst {
      * (spurs_request_line_written). */
     spu_coh_watch request_watch;
     int request_watched;
+    /* PS3RECOMP_SPURS_MODULE_POLL_PREEMPT: the workload one running module
+     * was told to switch to, and when (spurs_module_poll). */
+    u32 preempt_wid;
+    uint64_t preempt_ns;
 } s_inst[MAX_SPURS_INST];
+#define SPURS_NO_PREEMPT 0xFFu
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
 
 /* An SPU kicks a workload the way a PPU does, with an atomic on the instance's
@@ -2359,71 +2364,86 @@ static void spurs_diag_scan(struct SpursInst* si, u32 ea, u32 enabled, int targe
     }
 }
 
+/* Hand workload wid to the slot if it may run there and is requested.
+ * Caller holds si->lock and the registry lock. Returns 1 when dispatched. */
+static int spurs_dispatch_wid(struct SpursInst* si, struct SpursPmSlot* slot, u32 ea, u32 enabled,
+                              int target_mode, u32 wid)
+{
+    const u32 sn = slot->spu_num;
+    if (!(enabled & (0x80000000u >> wid)) ||
+        vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
+        !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea ||
+        s_workloads[wid].is_taskset)
+        return 0;
+    if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn))
+        return 0; /* priority zero makes this physical lane ineligible */
+    u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
+    if (!maxcont || si->active[wid] >= maxcont) return 0;
+    WklPm* pm = spurs_resolve_pm(wid);
+    if (!pm) return 0;
+    u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+    u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+    int kicked = spurs_ready_requests(ea, wid, ready, si->active[wid], target_mode) ||
+                 (signal & (0x8000u >> wid)) ||
+                 spurs_flag_status(ea, wid, 0);
+    /* Registration/minimum contention do not request execution.
+     * Unsolicited policy probes make an idle workload appear busy
+     * to GetWorkloadInfo and can send callers into obsolete waits. */
+    if (!kicked) return 0;
+    spu_coh_write_begin(ea, 0x80);
+    spu_coh_host_rmw_mark(ea, 0x80);
+    ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+    signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+    /* Recheck all request sources in the consumption transaction;
+     * a PPU/SPU may have withdrawn a request since the first probe. */
+    if (!spurs_ready_requests(ea, wid, ready, si->active[wid], target_mode) &&
+        !(signal & (0x8000u >> wid)) &&
+        !spurs_flag_status_locked(ea, wid)) {
+        spu_coh_write_end();
+        return 0;
+    }
+    si->idle[wid] = 0;
+    if (ready && !target_mode)
+        vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
+    if (signal & (0x8000u >> wid))
+        ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~(0x8000u >> wid)));
+    ef_line_end(ea);
+    slot->fn = pm->fn; slot->image_id = pm->image_id;
+    slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
+    slot->pm_size = s_workloads[wid].sizePm;
+    slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
+    slot->wid = wid; slot->ea = ea;
+    si->active[wid]++;
+    spu_coh_write_begin(ea, 0x80);
+    vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
+    ef_line_end(ea);
+    slot->busy = 1;
+    if (wid == __atomic_load_n(&si->preempt_wid, __ATOMIC_RELAXED))
+        __atomic_store_n(&si->preempt_wid, SPURS_NO_PREEMPT, __ATOMIC_RELEASE);   /* the switch it asked for happened */
+    if (spurs_diag_active())
+        spurs_diag_line("[spurs-diag] t=%llu inst=%d pass=%u dispatch wid=%u spu=%u ready=%u signal=%u active=%u\n",
+                        (unsigned long long)ps3_ft_now(), (int)(si - s_inst), si->pass_no, wid, sn, ready,
+                        (signal >> (15 - wid)) & 1u, si->active[wid]);
+    return 1;
+}
+
 /* Hand the next requested workload this slot may run to the slot. The
  * coordinator calls it for each idle slot on every pass; with
  * PS3RECOMP_SPURS_SELF_DISPATCH=1 a worker also calls it for its own slot as
  * its policy module returns, the way each SPU's own kernel selects the next
- * workload on hardware. Caller holds si->lock and the registry lock.
- * Returns 1 when the slot was given work (slot->busy is set). */
+ * workload on hardware. A workload a module poll asked a running module to
+ * switch to (spurs_module_poll) is offered the slot first. Caller holds
+ * si->lock and the registry lock. Returns 1 when the slot was given work
+ * (slot->busy is set). */
 static int spurs_dispatch_slot(struct SpursInst* si, struct SpursPmSlot* slot, u32 ea, u32 enabled, int target_mode)
 {
-    const u32 sn = slot->spu_num;
+    const u32 pending = __atomic_load_n(&si->preempt_wid, __ATOMIC_ACQUIRE);
+    if (pending < CELL_SPURS_MAX_WORKLOAD && spurs_dispatch_wid(si, slot, ea, enabled, target_mode, pending))
+        return 1;
     for (u32 checked = 0; checked < 16; checked++) {
         u32 wid = si->cursor;
         si->cursor = (wid + 1) & 15;
-        if (!(enabled & (0x80000000u >> wid)) ||
-            vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
-            !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea ||
-            s_workloads[wid].is_taskset)
-            continue;
-        if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn))
-            continue; /* priority zero makes this physical lane ineligible */
-        u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
-        if (!maxcont || si->active[wid] >= maxcont) continue;
-        WklPm* pm = spurs_resolve_pm(wid);
-        if (!pm) continue;
-        u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
-        u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
-        int kicked = spurs_ready_requests(ea, wid, ready, si->active[wid], target_mode) ||
-                     (signal & (0x8000u >> wid)) ||
-                     spurs_flag_status(ea, wid, 0);
-        /* Registration/minimum contention do not request execution.
-         * Unsolicited policy probes make an idle workload appear busy
-         * to GetWorkloadInfo and can send callers into obsolete waits. */
-        if (!kicked) continue;
-        spu_coh_write_begin(ea, 0x80);
-        spu_coh_host_rmw_mark(ea, 0x80);
-        ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
-        signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
-        /* Recheck all request sources in the consumption transaction;
-         * a PPU/SPU may have withdrawn a request since the first probe. */
-        if (!spurs_ready_requests(ea, wid, ready, si->active[wid], target_mode) &&
-            !(signal & (0x8000u >> wid)) &&
-            !spurs_flag_status_locked(ea, wid)) {
-            spu_coh_write_end();
-            continue;
-        }
-        si->idle[wid] = 0;
-        if (ready && !target_mode)
-            vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
-        if (signal & (0x8000u >> wid))
-            ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~(0x8000u >> wid)));
-        ef_line_end(ea);
-        slot->fn = pm->fn; slot->image_id = pm->image_id;
-        slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
-        slot->pm_size = s_workloads[wid].sizePm;
-        slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
-        slot->wid = wid; slot->ea = ea;
-        si->active[wid]++;
-        spu_coh_write_begin(ea, 0x80);
-        vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
-        ef_line_end(ea);
-        slot->busy = 1;
-        if (spurs_diag_active())
-            spurs_diag_line("[spurs-diag] t=%llu inst=%d pass=%u dispatch wid=%u spu=%u ready=%u signal=%u active=%u\n",
-                            (unsigned long long)ps3_ft_now(), (int)(si - s_inst), si->pass_no, wid, sn, ready,
-                            (signal >> (15 - wid)) & 1u, si->active[wid]);
-        return 1;
+        if (spurs_dispatch_wid(si, slot, ea, enabled, target_mode, wid)) return 1;
     }
     return 0;
 }
@@ -2437,9 +2457,12 @@ static int spurs_dispatch_slot(struct SpursInst* si, struct SpursPmSlot* slot, u
  *       with a plain store wakes nobody, so new work otherwise waits for a pass;
  *   PS3RECOMP_SPURS_SELF_DISPATCH=1 a worker whose PM returns takes the next
  *       requested workload itself (spurs_pm_worker);
+ *   PS3RECOMP_SPURS_MODULE_POLL_PREEMPT=1 a module poll may tell a running
+ *       module to switch to a flagged workload that has no free SPU
+ *       (spurs_module_poll);
  *   PS3RECOMP_SPURS_STORE_WAKE=0    no coherence watch on the request line
  *       (spurs_request_line_written): requests a PPU stores wait for a pass. */
-static struct { int disabled, target_mode, self_dispatch, store_wake; long poll_us; } s_sched_opt;
+static struct { int disabled, target_mode, self_dispatch, store_wake, module_poll_preempt; long poll_us; } s_sched_opt;
 static void spurs_sched_options_read(void)
 {
     const char* e;
@@ -2448,6 +2471,77 @@ static void spurs_sched_options_read(void)
     e = getenv("PS3RECOMP_SPURS_POLL_US");      s_sched_opt.poll_us = e ? atol(e) : 0;
     e = getenv("PS3RECOMP_SPURS_SELF_DISPATCH"); s_sched_opt.self_dispatch = e && !strcmp(e, "1");
     e = getenv("PS3RECOMP_SPURS_STORE_WAKE");    s_sched_opt.store_wake = !(e && !strcmp(e, "0"));
+    e = getenv("PS3RECOMP_SPURS_MODULE_POLL_PREEMPT"); s_sched_opt.module_poll_preempt = e && !strcmp(e, "1");
+}
+
+/* cellSpursModulePoll with preemption (PS3RECOMP_SPURS_MODULE_POLL_PREEMPT=1).
+ *
+ * A running policy module polls the kernel to learn whether it should give
+ * its SPU to another workload. On hardware the kernel answers with the
+ * workload its selection rules would run there now; a module told about a
+ * different one finishes up and exits, and the kernel switches within one
+ * poll interval. The HLE answer used to be "keep running" always, so a
+ * workload requested while every SPU held an idling module waited until one
+ * of those modules happened to exit on its own -- milliseconds, in titles
+ * whose modules poll for minutes.
+ *
+ * The narrow, faithful case implemented here: the workload named by the
+ * instance's workload flag (the flag is pending for its receiver), runnable
+ * on this SPU, below its maximum contention, with no SPU free to take it.
+ * It is compared with the polling module's own workload by the kernel's
+ * selection weight, in decreasing significance: requested (flag, signal, or
+ * ready count above the SPUs it already has), priority on this SPU, being
+ * this SPU's current workload, fewer SPUs in use, lower id. Only a strictly
+ * heavier receiver is named. One module at a time is asked: the request is
+ * recorded (preempt_wid) until the receiver is dispatched -- the freed SPU
+ * offers it first (spurs_dispatch_slot) -- or 2 ms pass without that, when
+ * another poll may ask again. The flag is consumed when the receiver runs,
+ * so a switch is not repeated for the same request. This is a hint: the
+ * module chooses when to exit, and the coordinator's dispatch is unchanged.
+ * Called on the polling SPU's thread with no scheduler lock held. */
+static u32 spurs_select_weight(struct SpursInst* si, u32 ea, u32 wid, u32 sn, u32 current, int flagged)
+{
+    const u32 contention = si->active[wid] - (wid == current && si->active[wid] ? 1u : 0u);
+    const u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+    const u32 signal = (vm_read16(ea + SPURS_WKL_SIGNAL1) >> (15 - wid)) & 1u;
+    const u32 requested = flagged || signal || ready > contention;
+    const u32 priority = vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn) & 0x7Fu;
+    return requested << 31 | priority << 23 | (wid == current) << 22 |
+           ((15u - (contention > 15u ? 15u : contention)) << 4) | (15u - wid);
+}
+static uint32_t spurs_module_poll(uint32_t ea, uint32_t current, uint32_t sn)
+{
+    struct SpursInst* si = spurs_inst_find(ea);
+    if (!si || !__atomic_load_n(&si->kernel_live, __ATOMIC_ACQUIRE) || current >= CELL_SPURS_MAX_WORKLOAD ||
+        sn >= si->nspus)
+        return current;
+    const u32 r = vm_base[ea + SPURS_WKL_FLAG_RECEIVER];
+    if (r >= CELL_SPURS_MAX_WORKLOAD || r == current || spurs_flag_be32(ea + SPURS_WKL_FLAG_VALUE) != 0)
+        return current;
+    for (u32 n = 0; n < si->nspus; n++)
+        if (!__atomic_load_n(&si->slots[n].busy, __ATOMIC_RELAXED)) return current;   /* a free SPU can take it */
+    const u32 pending = __atomic_load_n(&si->preempt_wid, __ATOMIC_ACQUIRE);
+    const uint64_t now = ps3_ft_now();
+    if (pending < CELL_SPURS_MAX_WORKLOAD &&
+        now - __atomic_load_n(&si->preempt_ns, __ATOMIC_RELAXED) < 2000000ull)
+        return current;                                         /* one module at a time */
+    if (!s_workloads[r].in_use || s_workloads[r].spurs_ea != ea || s_workloads[r].is_taskset ||
+        s_wkl_pm[r].resolved <= 0 ||
+        !(vm_read32(ea + SPURS_WKL_ENABLED) & (0x80000000u >> r)) || vm_read8(ea + SPURS_WKL_STATE1 + r) != 2 ||
+        !vm_read8(ea + SPURS_WKL_INFO1 + r * SPURS_WKL_INFO_SZ + 0x18 + sn))
+        return current;
+    const u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + r);
+    if (!maxcont || si->active[r] >= maxcont || !spurs_flag_status(ea, r, 0)) return current;
+    if (spurs_select_weight(si, ea, r, sn, current, 1) <= spurs_select_weight(si, ea, current, sn, current, 0))
+        return current;
+    u32 expect = pending;
+    if (!__atomic_compare_exchange_n(&si->preempt_wid, &expect, r, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return current;                                         /* another poll asked first */
+    __atomic_store_n(&si->preempt_ns, now, __ATOMIC_RELAXED);
+    if (spurs_diag_active())
+        spurs_diag_line("[spurs-diag] t=%llu inst=%d poll-preempt spu=%u current=%u -> wid=%u\n",
+                        (unsigned long long)now, (int)(si - s_inst), sn, current, r);
+    return r;
 }
 
 /* One persistent worker for each configured virtual SPU. A waiting policy
@@ -2599,6 +2693,11 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
     spurs_sched_options_read();
+    __atomic_store_n(&si->preempt_wid, SPURS_NO_PREEMPT, __ATOMIC_RELEASE);
+    if (s_sched_opt.module_poll_preempt) {
+        extern uint32_t (*g_spurs_module_poll_hook)(uint32_t, uint32_t, uint32_t);
+        g_spurs_module_poll_hook = spurs_module_poll;
+    }
     for (u32 sn = 0; sn < si->nspus; sn++) {
         struct SpursPmSlot* slot = &si->slots[sn];
         CONDITION_VARIABLE wake = slot->wake;   /* a POSIX shim object survives a restart */
