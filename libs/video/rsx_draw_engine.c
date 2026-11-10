@@ -193,6 +193,8 @@ static struct {
     u32 width, height;
 
     rsx_dispatch rsx;
+    rsx_dsp_texture decoded_textures[RSX_DSP_NUM_TEXTURES];
+    u32 decoded_textures_valid;
 
     eng_surface surfaces[ENG_MAX_SURFACES];
     u32 n_surfaces;
@@ -1875,25 +1877,32 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
 
 /* ---- pipelines ----------------------------------------------------------- */
 
-/* One draw's texture unit decodes. A draw reads each unit's registers from
- * several places -- the cube, volume and unnormalised masks, the pipeline
- * key's shadow, gamma and sign-expansion masks, the binding -- and no
- * register changes between them, so while a draw is being prepared
- * (s_dtex_on, set around sink_end_core) each unit is decoded once. */
-static rsx_dsp_texture s_dtex[RSX_DSP_NUM_TEXTURES];
-static u32 s_dtex_valid;
 static int s_dtex_on;
-static void eng_get_texture(u32 u, rsx_dsp_texture* out)
+
+/* A texture descriptor depends only on its eight-word register block and
+ * SIZE1 word. Keep this pure decode across draws; guest content, aliases,
+ * uploads and bindings are still checked at every normal consumption point.
+ * All writes to these registers enter through rsx_draw_engine_method. */
+static void eng_texture_decode_invalidate(u32 method, u32 arg)
 {
-    if (s_dtex_on && u < RSX_DSP_NUM_TEXTURES) {
-        if (!((s_dtex_valid >> u) & 1u)) {
-            rsx_dsp_get_texture(&g.rsx, u, &s_dtex[u]);
-            s_dtex_valid |= 1u << u;
-        }
-        *out = s_dtex[u];
+    u32 unit;
+    if (method >= 0x1A00u && method < 0x1C00u)
+        unit = (method - 0x1A00u) >> 5;
+    else if (method >= 0x1840u && method < 0x1880u)
+        unit = (method - 0x1840u) >> 2;
+    else
         return;
+    if (rsx_dsp_reg(&g.rsx, method) != arg)
+        g.decoded_textures_valid &= ~(1u << unit);
+}
+
+static void eng_get_texture(u32 unit, rsx_dsp_texture* out)
+{
+    if (!(g.decoded_textures_valid & (1u << unit))) {
+        rsx_dsp_get_texture(&g.rsx, unit, &g.decoded_textures[unit]);
+        g.decoded_textures_valid |= 1u << unit;
     }
-    rsx_dsp_get_texture(&g.rsx, u, out);
+    *out = g.decoded_textures[unit];
 }
 
 static u32 eng_vtex_mask(void)
@@ -4638,10 +4647,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
     ENG_PH_BEGIN(ph_draw);
     rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAW);
     draw_observer_begin();
-    s_dtex_valid = 0; s_dtex_on = 1;
+    s_dtex_on = 1;
     s_dprog.valid = 0;
     sink_end_core(user, r);
     s_dtex_on = 0;
+
     draw_observer_finish();
     rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAW);
     if (ph_draw) eng_ph_stage(NULL);
@@ -4871,6 +4881,7 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
     sink.immediate_vertex = sink_immediate_vertex;
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
+    g.decoded_textures_valid = 0;
     g.ready = 1;
     memset(&s_external,0,sizeof(s_external));
     atomic_store(&s_checked_failed, 0);
@@ -4961,6 +4972,7 @@ static void eng_method_core(u32 method, u32 arg)
         else if (m==0x1820) s_external.indices|=2;
         else if (m==0x1FC0) s_external.frequency=1;
     }
+    eng_texture_decode_invalidate(m, arg);
     rsx_dispatch_method(&g.rsx, m, arg);
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
 }
