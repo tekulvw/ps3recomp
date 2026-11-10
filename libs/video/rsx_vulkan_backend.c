@@ -4490,6 +4490,10 @@ static struct {
     u32          scratch_w, scratch_h;
     u32          pipeline;
     u32          vs_bytes, ps_bytes;
+    /* bind_vs_constant_rows (batched): only rows [vs_first, vs_first +
+     * vs_rows) and the last two of the shadow are this draw's. */
+    int          vs_spans;
+    u32          vs_first, vs_rows;
     u32          tex[RSX_BE_MAX_TEXTURES];
     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES];
     u32          tex_mask;
@@ -4987,6 +4991,27 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     /* Batched: a shadow the draw copies into its batch's arena. */
     memcpy(s_bat_on ? (void*)vk_bat_shadow(0, cap) : s_g.ubo.ptr, data, bytes);
     s_e2.vs_bytes = bytes;
+    s_e2.vs_spans = 0;
+}
+/* Batched: the shadow takes just the rows the program reads and the
+ * transform's, and the draw copies just those into its arena. Otherwise the
+ * whole block, as bind_vs_constants. */
+static void vk_eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes, u32 first_row, u32 rows)
+{
+    const u32 cap = (u32)s_g.ps_off;
+    if (!s_bat_on || !s_g.on || !data || bytes > cap || bytes < 32u ||
+        (u64)(first_row + rows) * 16u > bytes - 32u) {
+        vk_eng_bind_vs_constants(user, data, bytes);
+        return;
+    }
+    s_e2.vs_rebind = 0;
+    u8* shadow = vk_bat_shadow(0, cap);
+    if (!shadow) { vk_eng_bind_vs_constants(user, data, bytes); return; }
+    const u8* src = (const u8*)data;
+    if (rows) memcpy(shadow + first_row * 16u, src + first_row * 16u, rows * 16u);
+    memcpy(shadow + bytes - 32u, src + bytes - 32u, 32u);
+    s_e2.vs_bytes = bytes;
+    s_e2.vs_spans = 1; s_e2.vs_first = first_row; s_e2.vs_rows = rows;
 }
 /* The engine's constants are byte-for-byte those of the last bind. Batched,
  * the shadow already holds them and the draw may reuse the previous draw's
@@ -5379,7 +5404,12 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
          * empty one is the 16 zero bytes. */
         if (reuse_vs) { cb[0] = s_e2.vs_last; s_e2.vs_reused++; }
         else {
-            if (s_e2.vs_bytes && s_bat.vsc) memcpy(vc, s_bat.vsc, s_e2.vs_bytes); else memset(vc, 0, vsb);
+            if (s_e2.vs_bytes && s_bat.vsc && s_e2.vs_spans) {
+                const u32 a = s_e2.vs_first * 16u, n = s_e2.vs_rows * 16u, t = s_e2.vs_bytes - 32u;
+                if (n) memcpy((u8*)vc + a, s_bat.vsc + a, n);
+                memcpy((u8*)vc + t, s_bat.vsc + t, 32u);
+            } else if (s_e2.vs_bytes && s_bat.vsc) memcpy(vc, s_bat.vsc, s_e2.vs_bytes);
+            else memset(vc, 0, vsb);
             cb[0].range = vsb;
             s_e2.vs_last = cb[0]; s_e2.vs_last_batch = s_bat.batches; s_e2.vs_last_valid = 1;
             s_e2.vs_uploads++;
@@ -6521,6 +6551,10 @@ static void owner_vk_eng_bind_vs_constants(void* user, const void* data, u32 byt
     if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
     vk_eng_bind_vs_constants(user,data,bytes);vulkan_owner_finish(vulkan_owner_boundary(before));
 }
+static void owner_vk_eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes, u32 first_row, u32 rows){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_bind_vs_constant_rows(user,data,bytes,first_row,rows);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
 static int owner_vk_eng_rebind_vs_constants(void* user){
     if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
     const int result=vk_eng_rebind_vs_constants(user);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
@@ -6635,6 +6669,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .bind_pipeline        = owner_vk_eng_bind_pipeline,
     .bind_vs_constants    = owner_vk_eng_bind_vs_constants,
     .rebind_vs_constants  = owner_vk_eng_rebind_vs_constants,
+    .bind_vs_constant_rows = owner_vk_eng_bind_vs_constant_rows,
     .bind_ps_constants    = owner_vk_eng_bind_ps_constants,
     .bind_textures        = owner_vk_eng_bind_textures,
     .bind_vertex_textures = owner_vk_eng_bind_vertex_textures,

@@ -3804,6 +3804,25 @@ static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     s_eng_pending.vs_cb_bytes = bytes;
     s_eng_vs_gen = s_eng_stage_gen;
 }
+/* A program that reads only some constant rows: the block keeps its size
+ * and layout (its last two rows are the viewport transform), but only those
+ * rows and the transform's are copied into staging. */
+static void eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes,
+                                      u32 first_row, u32 rows)
+{
+    (void)user;
+    u32 off = 0;
+    if (bytes < 32u || (u64)(first_row + rows) * 16u > bytes - 32u || !eng_stage_reserve(bytes, &off)) {
+        eng_bind_vs_constants(user, data, bytes);
+        return;
+    }
+    const u8* src = (const u8*)data;
+    if (rows) memcpy(s_eng_stage + off + first_row * 16u, src + first_row * 16u, rows * 16u);
+    memcpy(s_eng_stage + off + bytes - 32u, src + bytes - 32u, 32u);
+    s_eng_pending.vs_cb_off = off;
+    s_eng_pending.vs_cb_bytes = bytes;
+    s_eng_vs_gen = s_eng_stage_gen;
+}
 /* Unchanged constants: the previous draw's staged copy serves this draw too,
  * while those staged bytes have not been handed to a command buffer. */
 static int eng_rebind_vs_constants(void* user)
@@ -5708,6 +5727,10 @@ static void owner_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     if(!metal_owner_begin(1)){return;}
     eng_bind_vs_constants(user,data,bytes);metal_owner_finish(0);
 }
+static void owner_eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes, u32 first_row, u32 rows){
+    if(!metal_owner_begin(1)){return;}
+    eng_bind_vs_constant_rows(user,data,bytes,first_row,rows);metal_owner_finish(0);
+}
 static int owner_eng_rebind_vs_constants(void* user){
     if(!metal_owner_begin(1)){return 0;}
     const int result=eng_rebind_vs_constants(user);metal_owner_finish(0);return result;
@@ -5797,6 +5820,7 @@ static const rsx_draw_backend s_engine_backend = {
     .bind_pipeline        = owner_eng_bind_pipeline,
     .bind_vs_constants    = owner_eng_bind_vs_constants,
     .rebind_vs_constants  = owner_eng_rebind_vs_constants,
+    .bind_vs_constant_rows = owner_eng_bind_vs_constant_rows,
     .bind_ps_constants    = owner_eng_bind_ps_constants,
     .bind_textures        = owner_eng_bind_textures,
     .bind_vertex_textures = owner_eng_bind_vertex_textures,
