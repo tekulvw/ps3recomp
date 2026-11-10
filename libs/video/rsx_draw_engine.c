@@ -224,8 +224,8 @@ static struct {
     u64 vp_cb_serial, vs_bound_serial;
     /* The constant rows the current draw's vertex program reads (vs_all:
      * every row), and the rows the bound copy holds, the transform's two
-     * always included. */
-    u32 vs_first, vs_rows, vs_bound_first, vs_bound_rows;
+     * always included. Bit r of word r / 32. */
+    u32 vs_mask[RSX_DSP_NUM_CONSTANTS / 32u], vs_bound_mask[RSX_DSP_NUM_CONSTANTS / 32u];
     int vs_all, vs_bound_all;
     u8* fp_cb;
     u32 fp_cb_cap;
@@ -2036,7 +2036,7 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
     const u8* uc = NULL;
     u32 instrs = 0;
     /* The built-in program, and any program not analysed, read every row. */
-    rsx_vp_constant_range rows = { 0, RSX_DSP_NUM_CONSTANTS, 1 };
+    rsx_vp_constant_range rows = { 0, RSX_DSP_NUM_CONSTANTS, 1, { 0 } };
     if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
         const u32 bytes = instrs * 16u;
         int hit = 0;
@@ -2057,7 +2057,8 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
             }
         }
     }
-    g.vs_all = rows.all; g.vs_first = rows.first; g.vs_rows = rows.count;
+    g.vs_all = rows.all;
+    memcpy(g.vs_mask, rows.mask, sizeof g.vs_mask);
     rsx_vertex_layout_plan_init(layout, mask);
 }
 
@@ -4559,15 +4560,22 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
     g.be->bind_pipeline(g.be->user, pipeline);
     /* The bound copy serves again only if it holds every row this program
      * reads (a copy staged for another program's rows may not). */
-    const int covered = g.vs_bound_all ||
-        (!g.vs_all && g.vs_first >= g.vs_bound_first &&
-         g.vs_first + g.vs_rows <= g.vs_bound_first + g.vs_bound_rows);
+    int covered = g.vs_bound_all;
+    if (!covered && !g.vs_all) {
+        covered = 1;
+        for (u32 w = 0; w < RSX_DSP_NUM_CONSTANTS / 32u; w++)
+            if (g.vs_mask[w] & ~g.vs_bound_mask[w]) { covered = 0; break; }
+    }
     if (g.vs_bound_serial != g.vp_cb_serial || !covered || !g.be->rebind_vs_constants ||
         !g.be->rebind_vs_constants(g.be->user)) {
         if (!g.vs_all && g.be->bind_vs_constant_rows && eng_vs_constant_rows_enabled()) {
-            g.be->bind_vs_constant_rows(g.be->user, g.vp_cb, ENG_VP_CB_BYTES, g.vs_first, g.vs_rows);
-            g.vs_bound_all = 0; g.vs_bound_first = g.vs_first; g.vs_bound_rows = g.vs_rows;
-            s_vs_row_binds++; s_vs_row_bytes += (unsigned long long)(g.vs_rows + 2u) * 16u;
+            g.be->bind_vs_constant_rows(g.be->user, g.vp_cb, ENG_VP_CB_BYTES, g.vs_mask);
+            g.vs_bound_all = 0;
+            memcpy(g.vs_bound_mask, g.vs_mask, sizeof g.vs_bound_mask);
+            u32 rows = 2u;
+            for (u32 w = 0; w < RSX_DSP_NUM_CONSTANTS / 32u; w++)
+                for (u32 x = g.vs_mask[w]; x; x &= x - 1u) rows++;
+            s_vs_row_binds++; s_vs_row_bytes += (unsigned long long)rows * 16u;
         } else {
             g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
             g.vs_bound_all = 1;
