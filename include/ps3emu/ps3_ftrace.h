@@ -114,8 +114,18 @@ static inline void ps3_ft_dump(void)
     if (n > s->cap) n = s->cap;
     FILE* f = fopen(s->path, "w");
     if (!f) { fprintf(stderr, "[ftrace] cannot write %s\n", s->path); return; }
-    fprintf(f, "# ps3_ftrace start_us=%.3f end_us=%.3f spans=%u dropped=%u\n",
-            (double)(s->start - s->base) / 1e3, (double)(s->end - s->base) / 1e3, n, s->dropped);
+    /* base_ns: the ps3_ft_now() reading every span time is relative to, so a
+     * trace can be aligned with samples taken on the same clock -- Linux
+     * `perf record -k CLOCK_MONOTONIC` (perf script prints seconds), macOS
+     * CLOCK_MONOTONIC, Windows QueryPerformanceCounter scaled to ns. */
+#ifdef _WIN32
+    const char* clock_name = "QPC";
+#else
+    const char* clock_name = "CLOCK_MONOTONIC";
+#endif
+    fprintf(f, "# ps3_ftrace start_us=%.3f end_us=%.3f spans=%u dropped=%u base_ns=%llu clock=%s\n",
+            (double)(s->start - s->base) / 1e3, (double)(s->end - s->base) / 1e3, n, s->dropped,
+            (unsigned long long)s->base, clock_name);
     for (uint32_t t = 0; t < PS3_FT_TIDS; t++)
         if (s->names[t][0]) fprintf(f, "T %u %s\n", t, s->names[t]);
     for (uint32_t i = 0; i < n; i++) {
