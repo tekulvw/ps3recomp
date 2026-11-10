@@ -1223,22 +1223,35 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  */
 /* SPU_DMA_REPEAT_LOG support (see mfc_submit). Per-thread episode clock and
  * counters; the per-image totals are per thread too, so no line is shared. */
+/* QPC / CLOCK_MONOTONIC: GetTickCount64 moves in ~16 ms steps on Windows,
+ * coarser than the episodes and the 1 ms back-off sleeps it would measure. */
 static inline uint64_t spu_dma_repeat_now_us(void)
 {
-#ifdef _WIN32
-    return (uint64_t)GetTickCount64() * 1000u;
-#else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
-#endif
+    return spu_watch_now_ns() / 1000u;
 }
+/* The back-off's own cost is counted too: yields while an episode is
+ * younger than SPU_DMA_REPEAT_BACKOFF_MS, then 1 ms sleeps and the wall time
+ * they actually took (a Windows Sleep(1) is 1-2 ms), per episode and per
+ * thread since start. */
 static SPU_THREAD_LOCAL struct {
     uint64_t start_us, lines, episodes;
+    uint64_t ep_yields, ep_sleeps, ep_sleep_us, yields, sleeps, sleep_us;
     uint32_t start_pc, size;
-    struct { int image; uint64_t n, us; } tot[16];
+    struct { int image; uint64_t n, us, sleep_us; } tot[16];
 } t_dma_repeat_log;
+static inline void spu_dma_repeat_log_wait(const spu_context* spu, int slept, uint64_t us)
+{
+    if (!slept) { t_dma_repeat_log.ep_yields++; t_dma_repeat_log.yields++; return; }
+    t_dma_repeat_log.ep_sleeps++; t_dma_repeat_log.ep_sleep_us += us;
+    t_dma_repeat_log.sleeps++; t_dma_repeat_log.sleep_us += us;
+    if ((t_dma_repeat_log.sleeps % 256u) == 0)
+        fprintf(stderr, "[dma-repeat] spu=%u backoff since start: sleeps=%llu slept_us=%llu yields=%llu\n",
+                spu->spu_id & 7u, (unsigned long long)t_dma_repeat_log.sleeps,
+                (unsigned long long)t_dma_repeat_log.sleep_us, (unsigned long long)t_dma_repeat_log.yields);
+}
 static inline void spu_dma_repeat_log_start(const spu_context* spu)
 {
+    t_dma_repeat_log.ep_yields = t_dma_repeat_log.ep_sleeps = t_dma_repeat_log.ep_sleep_us = 0;
     t_dma_repeat_log.start_us = spu_dma_repeat_now_us();
     t_dma_repeat_log.start_pc = (uint32_t)spu->pc & SPU_LS_MASK;
     t_dma_repeat_log.size = spu->mfc_size;   /* the repeated transfer's, not the one that ends the episode */
@@ -1248,20 +1261,23 @@ static inline void spu_dma_repeat_log_end(const spu_context* spu, uint32_t ea, u
     const uint64_t us = spu_dma_repeat_now_us() - t_dma_repeat_log.start_us;
     if (t_dma_repeat_log.lines < (uint64_t)limit) {
         t_dma_repeat_log.lines++;
-        fprintf(stderr, "[dma-repeat] spu=%u img=%d pc=0x%05X ea=0x%08X lsa=0x%05X size=%u repeats=%u us=%llu\n",
+        fprintf(stderr, "[dma-repeat] spu=%u img=%d pc=0x%05X ea=0x%08X lsa=0x%05X size=%u repeats=%u us=%llu yields=%llu sleeps=%llu slept_us=%llu\n",
                 spu->spu_id & 7u, spu->image_id, t_dma_repeat_log.start_pc, ea, lsa, t_dma_repeat_log.size, reps,
-                (unsigned long long)us);
+                (unsigned long long)us, (unsigned long long)t_dma_repeat_log.ep_yields,
+                (unsigned long long)t_dma_repeat_log.ep_sleeps, (unsigned long long)t_dma_repeat_log.ep_sleep_us);
     }
     for (int i = 0; i < 16; i++) {
         if (t_dma_repeat_log.tot[i].n && t_dma_repeat_log.tot[i].image != spu->image_id) continue;
         t_dma_repeat_log.tot[i].image = spu->image_id; t_dma_repeat_log.tot[i].n++; t_dma_repeat_log.tot[i].us += us;
+        t_dma_repeat_log.tot[i].sleep_us += t_dma_repeat_log.ep_sleep_us;
         break;
     }
     if ((++t_dma_repeat_log.episodes % 4096u) == 0) {
         fprintf(stderr, "[dma-repeat] spu=%u %llu episodes:", spu->spu_id & 7u, (unsigned long long)t_dma_repeat_log.episodes);
         for (int i = 0; i < 16 && t_dma_repeat_log.tot[i].n; i++)
-            fprintf(stderr, " img%d n=%llu us=%llu", t_dma_repeat_log.tot[i].image,
-                    (unsigned long long)t_dma_repeat_log.tot[i].n, (unsigned long long)t_dma_repeat_log.tot[i].us);
+            fprintf(stderr, " img%d n=%llu us=%llu slept_us=%llu", t_dma_repeat_log.tot[i].image,
+                    (unsigned long long)t_dma_repeat_log.tot[i].n, (unsigned long long)t_dma_repeat_log.tot[i].us,
+                    (unsigned long long)t_dma_repeat_log.tot[i].sleep_us);
         fputc(10, stderr);
     }
 }
@@ -1632,8 +1648,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                * poller is the frame's longest job. Yield for the first
                * SPU_DMA_REPEAT_BACKOFF_MS (default 2) of an episode, where a
                * healthy wait ends, and back off 1 ms per repeat after that. */
-              else if (now - s_since < s_backoff_ms) SwitchToThread();
-              else Sleep(1);
+              else if (now - s_since < s_backoff_ms) {
+                  SwitchToThread();
+                  if (s_log) spu_dma_repeat_log_wait(spu, 0, 0);
+              } else if (!s_log) Sleep(1);
+              else {
+                  const uint64_t t0 = spu_dma_repeat_now_us();
+                  Sleep(1);
+                  spu_dma_repeat_log_wait(spu, 1, spu_dma_repeat_now_us() - t0);
+              }
           }
       } else {
           if (s_log && s_rep >= s_limit) spu_dma_repeat_log_end(spu, s_last_ea, s_last_lsa, s_rep, s_log);
