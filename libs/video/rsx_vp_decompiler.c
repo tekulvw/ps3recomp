@@ -267,7 +267,9 @@ int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes, rsx_vp_constant_ran
 {
     if (!range) return -1;
     range->first = 0; range->count = 512; range->all = 1;
+    memset(range->mask, 0xFF, sizeof range->mask);
     if (!ucode) return -1;
+    u32 mask[16] = { 0 };
     u32 lo = 512, hi = 0, off = 0;
     int instrs = 0, all = 0, ended = 0;
     while (off + 16 <= max_bytes) {
@@ -285,6 +287,7 @@ int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes, rsx_vp_constant_ran
             const u32 c = ((d1 >> 12) & 0x3FF) & 511u;
             if (c < lo) lo = c;
             if (c > hi) hi = c;
+            mask[c >> 5] |= 1u << (c & 31u);
         }
         if (d3 & 1u) { ended = 1; break; }
     }
@@ -293,6 +296,7 @@ int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes, rsx_vp_constant_ran
         range->all = 0;
         range->first = lo <= hi ? lo : 0;
         range->count = lo <= hi ? hi - lo + 1u : 0;
+        memcpy(range->mask, mask, sizeof mask);
     }
     return instrs;
 }

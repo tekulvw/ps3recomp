@@ -45,6 +45,17 @@ static void program(u32 reg)
     for (u32 i = 0; i < 8; i++) { u32 w; memcpy(&w, vp + i * 4, 4); method(0xB80 + i * 4, w); }
     method(0x1EA0, 0);
 }
+/* o0 = v0; o1 = c[reg]; o7 (a texture coordinate nothing reads) = c[far] */
+static void program2(u32 reg, u32 far)
+{
+    u8 vp[48];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
+    rsx_test_vp_mov_const_out(vp + 16, reg, 1, 0, 0);
+    rsx_test_vp_mov_const_out(vp + 32, far, 7, 0, 1);
+    method(0x1E9C, 0);
+    for (u32 i = 0; i < 12; i++) { u32 w; memcpy(&w, vp + i * 4, 4); method(0xB80 + i * 4, w); }
+    method(0x1EA0, 0);
+}
 static void draw(void) { method(0x1808, RSX_PRIMITIVE_TRIANGLES); method(0x1814, 2u << 24); method(0x1808, 0); }
 static u32 centre(void)
 {
@@ -96,6 +107,13 @@ int main(void)
         T(is_rgb(centre(), 255, 255, 0), "a rewritten constant is drawn");
         rsx_draw_engine_vs_constant_row_counts(&rb, &bytes);
         T(rb - rb0 == 4 && bytes - bytes0 == 4u * 3u * 16u, "each draw staged one row and the transform's");
+        /* Rows 3 and 500: those two, not the 498 between. */
+        constant(500, 0.25f, 0.25f, 0.25f);
+        program2(500, 3); draw();
+        const u32 grey = centre();
+        T(is_rgb(grey, 64, 64, 64) || is_rgb(grey, 63, 63, 63), "rows 3 and 500 draw constant 500's grey");
+        rsx_draw_engine_vs_constant_row_counts(&rb, &bytes);
+        T(rb - rb0 == 5 && bytes - bytes0 == 4u * 3u * 16u + 4u * 16u, "and staged two rows and the transform's");
         T(!atomic_load(&s_eng_checked_failed), "no backend failure");
         rsx_draw_engine_shutdown();
         rsx_draw_engine_set_backend(NULL);

@@ -57,17 +57,20 @@ static u32 swizzle(u32 i)
 /* Constant rows: what the last bind_vs_constant_rows staged, and a copy of
  * the rows it was told the program reads plus the transform's. */
 static int g_row_binds;
-static u32 g_row_first, g_row_count;
+static u32 g_row_first, g_row_count, g_row_runs;
 static u8 g_row_block[(RSX_DSP_NUM_CONSTANTS + 2) * 16];
-static void stub_bind_vs_rows(void* u, const void* d, u32 n, u32 first, u32 rows)
+static void stub_bind_vs_rows(void* u, const void* d, u32 n, const u32* mask)
 {
     (void)u;
-    g_row_binds++; g_row_first = first; g_row_count = rows;
+    g_row_binds++; g_row_first = 0; g_row_count = 0; g_row_runs = 0;
     memset(g_row_block, 0xEE, sizeof g_row_block);
-    if (d && n <= sizeof g_row_block && (first + rows) * 16u + 32u <= n) {
-        memcpy(g_row_block + first * 16u, (const u8*)d + first * 16u, rows * 16u);
-        memcpy(g_row_block + n - 32u, (const u8*)d + n - 32u, 32u);
+    if (!d || n > sizeof g_row_block || !rsx_be_row_mask_fits(mask, n)) return;
+    for (u32 row = 0, k = 0; rsx_be_row_run(mask, &row, &k); row += k) {
+        if (!g_row_runs++) g_row_first = row;
+        g_row_count += k;
+        memcpy(g_row_block + row * 16u, (const u8*)d + row * 16u, k * 16u);
     }
+    memcpy(g_row_block + n - 32u, (const u8*)d + n - 32u, 32u);
 }
 /* A program of MOVs: o0 from v0, then one constant each into o1, o7, ... */
 static void upload_const_vp(const u32* regs, u32 n, int indexed)
@@ -105,6 +108,23 @@ static void test_constant_rows(void)
         rsx_test_vp_mov_const_out(vp + 32, 7, 8, 0, 1);
         CHECK(rsx_vp_analyze_constants(vp, 48, &r) == 3 && !r.all && r.first == 7 && r.count == 6,
               "constants 12 and 7: rows 7..12 (%u+%u)", r.first, r.count);
+        CHECK(r.mask[0] == ((1u << 7) | (1u << 12)) && !r.mask[1] && !r.mask[15],
+              "and exactly those two rows in the mask (%08X)", r.mask[0]);
+        rsx_test_vp_mov_const_out(vp + 16, 3, 7, 0, 0);
+        rsx_test_vp_mov_const_out(vp + 32, 500, 8, 0, 1);
+        CHECK(rsx_vp_analyze_constants(vp, 48, &r) == 3 && !r.all && r.mask[0] == (1u << 3) &&
+              r.mask[15] == (1u << (500 - 480)) && !r.mask[7],
+              "constants 3 and 500: two rows, not the 498 between");
+        /* The run walker over a mask with runs across word boundaries. */
+        u32 m[16] = { 0 };
+        m[0] = 0x80000001u; m[1] = 0xFFFFFFFFu; m[2] = 0x1u; m[15] = 0x80000000u;
+        u32 runs[4][2], nr = 0;
+        for (u32 row = 0, k = 0; nr < 4 && rsx_be_row_run(m, &row, &k); row += k) { runs[nr][0] = row; runs[nr][1] = k; nr++; }
+        CHECK(nr == 3 && runs[0][0] == 0 && runs[0][1] == 1 && runs[1][0] == 31 && runs[1][1] == 34 &&
+              runs[2][0] == 511 && runs[2][1] == 1, "row runs: 0, 31..64, 511 (%u runs)", nr);
+        CHECK(rsx_be_row_mask_fits(m, 512u * 16u + 32u) && !rsx_be_row_mask_fits(m, 64u * 16u + 32u),
+              "a mask fits a block only when its last row does");
+        rsx_test_vp_mov_const_out(vp + 16, 12, 7, 0, 0);
         rsx_test_vp_mov_const_out(vp + 32, 7, 8, 1, 1);
         CHECK(rsx_vp_analyze_constants(vp, 48, &r) == 3 && r.all, "an indexed constant reads them all");
         rsx_test_vp_mov_const_out(vp + 32, 7, 8, 0, 0);
@@ -126,14 +146,15 @@ static void test_constant_rows(void)
         RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
     m(0x8E4, TEX_OFFSET | 2);
     m(0x1D60, 64);
-    put_constant(7, 0x700); put_constant(12, 0xC00); put_constant(20, 0x1400); put_constant(300, 0x3000);
+    put_constant(7, 0x700); put_constant(9, 0x900); put_constant(12, 0xC00); put_constant(20, 0x1400);
+    put_constant(300, 0x3000);
     const u32 a[2] = { 12, 7 };
     upload_const_vp(a, 2, 0);
     g_row_binds = 0; g_vs_binds = g_vs_rebinds = 0;
     draw_triangle();
-    CHECK(g_row_binds == 1 && g_vs_binds == 0 && g_row_first == 7 && g_row_count == 6,
-          "a program reading constants 7 and 12 stages rows 7..12 (%d binds, %u+%u)",
-          g_row_binds, g_row_first, g_row_count);
+    CHECK(g_row_binds == 1 && g_vs_binds == 0 && g_row_first == 7 && g_row_count == 2 && g_row_runs == 2,
+          "a program reading constants 7 and 12 stages those two rows (%d binds, from %u, %u rows in %u runs)",
+          g_row_binds, g_row_first, g_row_count, g_row_runs);
     CHECK(row_is(7, 0x700) && row_is(12, 0xC00), "with their values");
     { u8 fill[32]; memset(fill, 0xEE, sizeof fill);
       CHECK(memcmp(g_row_block + RSX_DSP_NUM_CONSTANTS * 16u, fill, sizeof fill) != 0,
@@ -152,22 +173,28 @@ static void test_constant_rows(void)
     upload_const_vp(a, 2, 0);
     draw_triangle();
     CHECK(g_row_binds == 3 && g_row_first == 7, "nor one reading rows outside it (%d)", g_row_binds);
+    /* Row 9 lies between the copy's 7 and 12 but is not in it. */
+    const u32 c9[1] = { 9 };
+    upload_const_vp(c9, 1, 0);
+    draw_triangle();
+    CHECK(g_row_binds == 4 && g_row_first == 9 && g_row_count == 1 && row_is(9, 0x900),
+          "nor one reading a row between the copy's rows (%d, %u)", g_row_binds, g_row_first);
     /* Indexed: every row, through bind_vs_constants. */
     upload_const_vp(a, 2, 1);
     const int full = g_vs_binds;
     draw_triangle();
-    CHECK(g_vs_binds == full + 1 && g_row_binds == 3, "an indexed program binds the whole block");
+    CHECK(g_vs_binds == full + 1 && g_row_binds == 4, "an indexed program binds the whole block");
     /* A full copy serves any program after it. */
     upload_const_vp(b, 1, 0);
     draw_triangle();
-    CHECK(g_row_binds == 3 && g_vs_binds == full + 1, "and the whole block serves a narrower program next");
+    CHECK(g_row_binds == 4 && g_vs_binds == full + 1, "and the whole block serves a narrower program next");
     /* A changed constant stages again. */
     put_constant(20, 0x1500);
     draw_triangle();
-    CHECK(g_row_binds == 4 && row_is(20, 0x1500), "a written constant is staged again");
+    CHECK(g_row_binds == 5 && row_is(20, 0x1500), "a written constant is staged again");
     unsigned long long rb = 0, rbytes = 0;
     rsx_draw_engine_vs_constant_row_counts(&rb, &rbytes);
-    CHECK(rb >= 4 && rbytes > 0 && rbytes < rb * 64u * 16u, "row binds are counted (%llu, %llu bytes)", rb, rbytes);
+    CHECK(rb >= 4 && rbytes > 0 && rbytes <= rb * 4u * 16u, "row binds are counted (%llu, %llu bytes)", rb, rbytes);
     engine_down();
     g_stub_backend.bind_vs_constant_rows = NULL;
     g_stub_backend.rebind_vs_constants = NULL;

@@ -37,9 +37,10 @@ typedef struct rsx_vp_input_analysis {
 int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
                           rsx_vp_input_analysis* analysis);
 
-/* The transform constants a program reads: rows [first, first + count) of
- * its 512, or every row (`all`) when it indexes them through an address
- * register or contains flow control. An instruction names one constant for
+/* The transform constants a program reads: exactly the rows set in `mask`
+ * (bit r of mask[r / 32]), which lie in [first, first + count) of its 512, or
+ * every row (`all`) when it indexes them through an address register or
+ * contains flow control. An instruction names one constant for
  * all its sources; it counts when any source field selects the constant bank,
  * whatever its opcode or write masks (a condition-code update may read one
  * without writing a register). Returns the instruction count, or -1 for
@@ -47,6 +48,7 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
 typedef struct rsx_vp_constant_range {
     u32 first, count;
     int all;
+    u32 mask[16];
 } rsx_vp_constant_range;
 int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes, rsx_vp_constant_range* range);
 
