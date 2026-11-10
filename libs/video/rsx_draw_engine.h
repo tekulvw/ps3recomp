@@ -301,6 +301,21 @@ typedef struct rsx_draw_backend {
      * (it may keep the upload it made for the previous draw), 0 to have the
      * engine call bind_vs_constants with the bytes instead. */
     int (*rebind_vs_constants)(void* user);
+    /* Optional pair: host-format vertex streams (rsx_vertex_host_streams_build,
+     * PS3RECOMP_RSX_HOST_VERTEX_FORMATS). pipeline_create_host is
+     * pipeline_create with one RSX_HOST_VF_* format per layout slot instead
+     * of the float4 stride: slot i is attribute location i, read from its own
+     * vertex buffer of tightly packed elements. draw_host draws with those
+     * streams: `data` holds them all (`data_bytes`), slot i at offsets[i],
+     * `vertex_count` elements each; `index_size` is 2 or 4. */
+    u32  (*pipeline_create_host)(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                 const rsx_be_render_state* rs,
+                                 const rsx_vertex_layout_plan* layout,
+                                 const u8* host_formats, rsx_be_format rt_fmt,
+                                 u32 rt_count);
+    void (*draw_host)(void* user, rsx_topology topology, const void* data, u32 data_bytes,
+                      const u32* offsets, u32 streams, u32 vertex_count,
+                      const void* indices, u32 index_count, u32 index_size);
     /* Optional. bind_vs_constants for a program that reads only some rows:
      * the block is `bytes` long (512 constant rows, then the viewport
      * transform's two), the program reads rows [first_row, first_row + rows)
@@ -366,6 +381,9 @@ void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned lon
 /* Repeat texture binds in one frame after a guest-memory write that missed
  * the texture (no re-check), and those a write may have touched (checked). */
 void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked);
+/* Draws uploaded as host-format vertex streams, and triangle lists the
+ * builder refused (they took the float4 path). */
+void rsx_draw_engine_host_vertex_counts(unsigned long long* draws, unsigned long long* refused);
 /* Same-target colour reads the backend could not copy (no color_snapshot). */
 u64 rsx_draw_engine_feedback_unserved_count(void);
 u64 rsx_draw_engine_submit_async(void);

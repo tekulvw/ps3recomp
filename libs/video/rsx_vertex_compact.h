@@ -155,6 +155,61 @@ void rsx_vertex_remap_destroy(rsx_vertex_remap* remap);
 int rsx_vertex_topology_plan(
     u32 primitive, int refs_remapped, int* indexed);
 
+/* Host-format vertex streams (PS3RECOMP_RSX_HOST_VERTEX_FORMATS).
+ *
+ * Instead of decoding every attribute to float4, copy each attribute's
+ * elements in a format a host GPU's vertex fetch converts to the same float4
+ * itself: big-endian components swapped to host order, and for the 8- and
+ * 16-bit types the missing components filled with the defaults (0, 0, 0, 1)
+ * so the host reads four. One stream per layout slot, tightly packed.
+ *
+ *   FLOAT n      RSX_HOST_VF_F32_1..4  n x 32-bit float, the host fills the rest
+ *   HALF n       RSX_HOST_VF_F16_4     4 x 16-bit float; a denormal is flushed to
+ *                                      signed zero, as the CPU decode does
+ *   UNORM8 n     RSX_HOST_VF_UN8_4     4 x unsigned normalised byte
+ *   SNORM16 n    RSX_HOST_VF_SN16_4    4 x signed normalised short; -32768 is
+ *                                      refused (the CPU decode gives
+ *                                      -32768/32767, a host clamps to -1)
+ *
+ * Every other type, a disabled attribute, a divided or modulo frequency and
+ * an element outside the prepared stable range refuse the draw, which then
+ * takes the float4 path. */
+enum {
+    RSX_HOST_VF_NONE = 0,
+    RSX_HOST_VF_F32_1, RSX_HOST_VF_F32_2, RSX_HOST_VF_F32_3, RSX_HOST_VF_F32_4,
+    RSX_HOST_VF_F16_4, RSX_HOST_VF_UN8_4, RSX_HOST_VF_SN16_4
+};
+
+/* Bytes per element of a host format, 0 for none. */
+static inline u32 rsx_vertex_host_format_bytes(u8 format)
+{
+    switch (format) {
+    case RSX_HOST_VF_F32_1: return 4;
+    case RSX_HOST_VF_F32_2: return 8;
+    case RSX_HOST_VF_F32_3: return 12;
+    case RSX_HOST_VF_F32_4: return 16;
+    case RSX_HOST_VF_F16_4: return 8;
+    case RSX_HOST_VF_UN8_4: return 4;
+    case RSX_HOST_VF_SN16_4: return 8;
+    default: return 0;
+    }
+}
+
+typedef struct rsx_vertex_host_streams {
+    u32 count;                                   /* layout slots */
+    u8  format[RSX_DSP_NUM_VERTEX_ATTR];         /* per slot: RSX_HOST_VF_* */
+    u32 offset[RSX_DSP_NUM_VERTEX_ATTR];         /* per slot: byte offset in out */
+    u32 bytes;                                   /* total bytes written */
+} rsx_vertex_host_streams;
+
+/* The elements [first, first + n) of every slot of a prepared plan (one
+ * whose stable ranges cover them) into out as host-format streams. Returns
+ * 1, or 0 when the draw does not qualify or out_cap is too small (nothing
+ * is promised about out then). */
+int rsx_vertex_host_streams_build(
+    const rsx_vertex_fetch_plan* plan, u32 first, u32 n,
+    u8* out, u32 out_cap, rsx_vertex_host_streams* streams);
+
 /* Public for focused format/endian tests. */
 int rsx_vertex_decode_element(
     u32 type, u32 size, const u8* source, float out[4]);
