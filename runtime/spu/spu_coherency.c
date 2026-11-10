@@ -19,6 +19,14 @@ uint64_t g_spu_atomic_observe_state;
 #include <stdint.h>
 #include <stdio.h>
 #include "ps3emu/log_first.h"
+#include "spu_coh_version.h"
+#include "spu_coh_ops.h"
+
+/* PS3RECOMP_COH_VERSIONS: the version counter scheme's side of the entry points
+ * below (defined at the end of this file). */
+static void cohv_notify(uint32_t ea);
+static void cohv_mark(uint32_t ea);
+static inline int cohv_on(void) { return g_spu_coh_ops != 0; }
 
 #ifdef __cplusplus
 extern "C" {
@@ -499,6 +507,9 @@ unsigned long g_spu_lr_raise = 0;
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
+    /* Version counters need no holder list: marking the line routes its
+     * writers through the line's counter. */
+    if (cohv_on()) { (void)ctx; cohv_mark(ea); return; }
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     if (!spu_coh_line_spu(ea)) {
         /* Under the shard: no PPU-only store is mid-flight on this line. */
@@ -531,6 +542,13 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
                        void (*wake)(void*), void* opaque)
 {
+    if (cohv_on()) {
+        /* A waiter on the line: every completed write calls wake. */
+        cohv_mark(ea);
+        watch->line = ea & ~127u; watch->wake = wake; watch->opaque = opaque; watch->next = NULL;
+        spu_cohv_wait_register((spu_cohv_waiter*)(void*)watch->cohv, ea, wake, opaque);
+        return;
+    }
     /* Arming the existing bitmap makes PPU stores/CAS and MFC writes use
      * the same serialized commit/notify path as SPU reservations. */
     spu_coh_reserve(NULL, ea);   /* marks the line never idle, too */
@@ -543,6 +561,7 @@ void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
 
 void spu_coh_watch_remove(spu_coh_watch* watch)
 {
+    if (cohv_on()) { spu_cohv_wait_unregister((spu_cohv_waiter*)(void*)watch->cohv); return; }
     for (spu_coh_watch** link = &s_coh_watches; *link; link = &(*link)->next) {
         if (*link != watch) continue;
         *link = watch->next;
@@ -672,6 +691,7 @@ static inline int spu_coh_holds(const spu_context* c, uint32_t line)
  * caller takes the lock and spu_coh_reserve. */
 int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
 {
+    if (cohv_on()) return 0;
     if (!__atomic_load_n(&ctx->coh_listed, __ATOMIC_ACQUIRE) || !spu_coh_line_spu(ea & ~127u)) return 0;
     __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
@@ -682,6 +702,7 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
 
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
+    if (cohv_on()) { (void)self; cohv_notify(ea); return; }
     uint32_t line = ea & ~127u;
     ppu_resv_break_line(ea);
     epoch_written(line);
@@ -846,6 +867,7 @@ static void spu_coh_line_hist(uint32_t line, uintptr_t site, int held, int live)
 
 void spu_coh_notify_write(uint32_t ea)
 {
+    if (cohv_on()) { cohv_notify(ea); return; }
     uint32_t line = ea & ~127u;
     if (__builtin_expect(s_clh_on != 0, 0)) {
 #if !defined(_WIN32)
@@ -889,8 +911,327 @@ void spu_coh_notify_write(uint32_t ea)
     }
 }
 
+
+/* ===========================================================================
+ * PS3RECOMP_COH_VERSIONS=1: per-line version counters (spu_coh_version.inc)
+ *
+ * The call sites reach this through g_spu_coh_ops (spu_coh_ops.h), installed
+ * below before main when the switch is on. The interest bitmap above keeps its
+ * job -- it decides which stores take the counted path -- and everything else
+ * here (the holder list, live counts, shards, epochs) goes unused.
+ * ===========================================================================*/
+_Static_assert(sizeof(spu_cohv_waiter) <= SPU_COH_WAITER_BYTES, "waiter storage");
+_Static_assert(sizeof(((spu_coh_watch*)0)->cohv) >= sizeof(spu_cohv_waiter), "watch storage");
+
+/* PS3RECOMP_COH_STATS=1: what the scheme did, every two seconds, as counts
+ * since the previous line -- for comparing runs and dividing by frames:
+ *   [coh-stats] t=<s> getllar putllc_ok putllc_fail putlluc lr writes
+ *               load_reserve sc_ok sc_fail sections lock_waits read_fallbacks
+ * lock_waits: writes that found their line owned by another writer;
+ * read_fallbacks: snapshots that stopped retrying and took the line.
+ * Off, each site tests one global. */
+enum { CS_LOCK_WAIT, CS_READ_FALLBACK, CS_GETLLAR, CS_PUTLLC_OK, CS_PUTLLC_FAIL, CS_PUTLLUC, CS_LR,
+       CS_WRITES, CS_LOAD_RESERVE, CS_SC_OK, CS_SC_FAIL, CS_SECTIONS, CS_N };
+static int s_cohv_stats;
+static struct { unsigned long long v; char pad[56]; } s_cs[CS_N];
+static unsigned long long s_cs_last[CS_N];
+static uint64_t cohv_stats_now(void)
+{
+#if defined(_WIN32)
+    return GetTickCount64() * 1000000ull;
+#elif defined(__APPLE__)
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+static __attribute__((noinline)) void cohv_stat_slow(unsigned i)
+{
+    __atomic_fetch_add(&s_cs[i].v, 1ull, __ATOMIC_RELAXED);
+    static SPU_THREAD_LOCAL unsigned t_n;
+    if ((++t_n & 1023u) != 0) return;
+    static uint64_t next, start;
+    const uint64_t now = cohv_stats_now();
+    uint64_t due = __atomic_load_n(&next, __ATOMIC_RELAXED);
+    if (!start) start = now;
+    if (now < due || !__atomic_compare_exchange_n(&next, &due, now + 2000000000ull, 0,
+                                                  __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    unsigned long long d[CS_N];
+    for (unsigned k = 0; k < CS_N; k++) {
+        const unsigned long long v = __atomic_load_n(&s_cs[k].v, __ATOMIC_RELAXED);
+        d[k] = v - s_cs_last[k]; s_cs_last[k] = v;
+    }
+    fprintf(stderr, "[coh-stats] t=%.1f getllar=%llu putllc_ok=%llu putllc_fail=%llu putlluc=%llu lr=%llu "
+                    "writes=%llu load_reserve=%llu sc_ok=%llu sc_fail=%llu sections=%llu lock_waits=%llu "
+                    "read_fallbacks=%llu\n",
+            (double)(now - start) * 1e-9, d[CS_GETLLAR], d[CS_PUTLLC_OK], d[CS_PUTLLC_FAIL], d[CS_PUTLLUC],
+            d[CS_LR], d[CS_WRITES], d[CS_LOAD_RESERVE], d[CS_SC_OK], d[CS_SC_FAIL], d[CS_SECTIONS],
+            d[CS_LOCK_WAIT], d[CS_READ_FALLBACK]);
+}
+#define COHV_STAT(i) do { if (__builtin_expect(s_cohv_stats, 0)) cohv_stat_slow(i); } while (0)
+
+static inline void cohv_old_ppu_break(uint32_t line)
+{
+    if (__builtin_expect(__atomic_load_n(&g_spu_cohv_old_ppu_resv, __ATOMIC_RELAXED) != 0, 0))
+        ppu_resv_break_line(line);
+}
+
+/* Mark the line: from here on its writers advance its count. Seq-cst, then
+ * the caller reads the line, so a store that tested the mark after this sees
+ * it set (the first-reservation window that remains is the one before it). */
+static void cohv_mark(uint32_t ea)
+{
+    const uint32_t l = ea >> SPU_COH_LINE_SHIFT;
+    const unsigned char bit = (unsigned char)(1u << (l & 7));
+    if (__atomic_load_n(&s_coh_bitmap[l >> 3], __ATOMIC_ACQUIRE) & bit) return;
+    spu_cohv_prepare(ea);
+    __atomic_fetch_or(&s_coh_bitmap[l >> 3], bit, __ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&s_coh_armed, __ATOMIC_RELAXED)) __atomic_store_n(&s_coh_armed, 1, __ATOMIC_RELAXED);
+}
+
+/* ---- host sections ------------------------------------------------------ */
+#define COHV_SECTION_MAX 1024u
+static SPU_THREAD_LOCAL struct {
+    uint32_t first, n;
+    int active;
+    uint64_t written[COHV_SECTION_MAX / 64];
+} t_cohv_sec;
+
+static inline int cohv_section_index(uint32_t line, uint32_t* i)
+{
+    if (!t_cohv_sec.active || line < t_cohv_sec.first) return 0;
+    *i = (line - t_cohv_sec.first) >> 7;
+    return *i < t_cohv_sec.n;
+}
+
+static void cohv_section_begin(uint32_t ea, uint32_t len)
+{
+    if (t_cohv_sec.active) {
+        fprintf(stderr, "[spu-coh] nested host line section at 0x%08X\n", ea);
+        abort();
+    }
+    const uint32_t first = ea & ~127u;
+    const uint32_t n = len ? (((ea + len - 1u) & ~127u) - first) / 128u + 1u : 0u;
+    if (n > COHV_SECTION_MAX) {
+        fprintf(stderr, "[spu-coh] host line section 0x%08X+%u spans more than %u lines\n",
+                ea, len, COHV_SECTION_MAX);
+        abort();
+    }
+    COHV_STAT(CS_SECTIONS);
+    for (uint32_t i = 0; i < n; i++) spu_cohv_lock(first + i * 128u);   /* ascending */
+    t_cohv_sec.first = first;
+    t_cohv_sec.n = n;
+    memset(t_cohv_sec.written, 0, ((n + 63u) / 64u) * sizeof(uint64_t));
+    t_cohv_sec.active = 1;
+}
+
+static void cohv_section_end(void)
+{
+    for (uint32_t i = 0; i < t_cohv_sec.n; i++) {
+        const uint32_t line = t_cohv_sec.first + i * 128u;
+        if ((t_cohv_sec.written[i >> 6] >> (i & 63u)) & 1u) {
+            spu_cohv_unlock_written(line);
+            cohv_old_ppu_break(line);
+        } else {
+            spu_cohv_unlock_unchanged(line);
+        }
+    }
+    t_cohv_sec.active = 0;
+    t_cohv_sec.n = 0;
+}
+
+/* A notify names a line as written: inside a section that holds it, the line
+ * is released as written at the end; anywhere else the count is advanced now. */
+static void cohv_notify(uint32_t ea)
+{
+    const uint32_t line = ea & ~127u;
+    uint32_t i;
+    if (cohv_section_index(line, &i)) { t_cohv_sec.written[i >> 6] |= 1ull << (i & 63u); return; }
+    if (t_cohv_sec.active) {
+        static int n;
+        if (PS3_LOG_FIRST(n, 8))
+            fprintf(stderr, "[spu-coh] host section 0x%08X+%u lines wrote line 0x%08X outside its range\n",
+                    t_cohv_sec.first, t_cohv_sec.n, line);
+    }
+    spu_cohv_lock(line);
+    spu_cohv_unlock_written(line);
+    cohv_old_ppu_break(line);
+}
+
+/* ---- SPU reservations --------------------------------------------------- */
+static int cohv_settle(void* p)
+{
+    spu_context* c = (spu_context*)p;
+    if (!spu_cohv_settle(&c->resv_valid, c->resv_ea & ~127u, c->resv_count, &c->event_status)) return 0;
+    __atomic_fetch_add(&g_spu_lr_raise, 1ul, __ATOMIC_RELAXED);
+    COHV_STAT(CS_LR);
+    return 1;
+}
+
+static void cohv_getllar(void* p, uint32_t ea, const void* line, void* ls)
+{
+    spu_context* c = (spu_context*)p;
+    cohv_settle(c);   /* a loss of the reservation being replaced is still an event */
+    cohv_mark(ea);
+    COHV_STAT(CS_GETLLAR);
+    c->resv_count = spu_cohv_read_line(ea, line, ls);
+    memcpy(c->resv_line, ls, 128);
+    c->resv_ea = ea;
+    __atomic_store_n(&c->resv_valid, 1, __ATOMIC_RELAXED);
+}
+
+static int cohv_putllc(void* p, uint32_t ea, void* line, const void* ls)
+{
+    spu_context* c = (spu_context*)p;
+    const int ok = __atomic_load_n(&c->resv_valid, __ATOMIC_RELAXED) && c->resv_ea == ea &&
+                   spu_cohv_putllc(ea, line, c->resv_count, c->resv_line, ls);
+    COHV_STAT(ok ? CS_PUTLLC_OK : CS_PUTLLC_FAIL);
+    if (ok) cohv_old_ppu_break(ea);
+    else cohv_settle(c);   /* failed because the line was written: that is an LR */
+    __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);
+    return ok;
+}
+
+static void cohv_putlluc(void* p, uint32_t ea, void* line, const void* ls)
+{
+    spu_context* c = (spu_context*)p;
+    /* The unconditional write ends every reservation on the line, the
+     * issuer's own included, which the default scheme reports as LR too. */
+    if (__atomic_load_n(&c->resv_valid, __ATOMIC_RELAXED) && (c->resv_ea & ~127u) == ea) {
+        __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);
+        __atomic_fetch_add(&g_spu_lr_raise, 1ul, __ATOMIC_RELAXED);
+    } else {
+        cohv_settle(c);
+    }
+    __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);
+    cohv_mark(ea);
+    COHV_STAT(CS_PUTLLUC);
+    spu_cohv_putlluc(ea, line, ls);
+    cohv_old_ppu_break(ea);
+}
+
+static void cohv_wait_begin(void* p, void* storage, void (*wake)(void*))
+{
+    spu_context* c = (spu_context*)p;
+    spu_cohv_waiter* w = (spu_cohv_waiter*)storage;
+    w->wake = NULL;
+    if (!__atomic_load_n(&c->resv_valid, __ATOMIC_RELAXED)) return;
+    spu_cohv_wait_register(w, c->resv_ea, wake, p);
+}
+
+static void cohv_wait_end(void* storage)
+{
+    spu_cohv_waiter* w = (spu_cohv_waiter*)storage;
+    if (w->wake) spu_cohv_wait_unregister(w);
+}
+
+/* ---- writes of any length ----------------------------------------------- */
+static inline void cohv_copy(void* d, const void* s, uint32_t n)
+{
+    if (!s) memset(d, 0, n);
+    else if (n <= 8u) spu_cohv_store_bytes(d, s, n);
+    else memcpy(d, s, n);
+}
+
+static void cohv_write(uint32_t ea, void* dst, const void* src, uint32_t n, const void* self)
+{
+    const spu_context* me = (const spu_context*)self;
+    for (uint32_t off = 0; off < n;) {
+        const uint32_t a = ea + off, line = a & ~127u;
+        uint32_t chunk = 128u - (a & 127u);
+        if (chunk > n - off) chunk = n - off;
+        uint8_t* d = (uint8_t*)dst + off;
+        const uint8_t* s = src ? (const uint8_t*)src + off : NULL;
+        uint32_t i;
+        if (cohv_section_index(line, &i)) {
+            /* Host code storing into a line its own section holds. */
+            cohv_copy(d, s, chunk);
+            t_cohv_sec.written[i >> 6] |= 1ull << (i & 63u);
+        } else if (spu_coh_is_reserved(line)) {
+            COHV_STAT(CS_WRITES);
+            const uint32_t before = spu_cohv_lock(line);
+            cohv_copy(d, s, chunk);
+            const uint32_t after = spu_cohv_unlock_written(line);
+            /* An SPU's own MFC write does not cost it its reservation. */
+            if (me && me->resv_valid && (me->resv_ea & ~127u) == line && me->resv_count == before)
+                ((spu_context*)me)->resv_count = after;
+            cohv_old_ppu_break(line);
+        } else {
+            cohv_copy(d, s, chunk);
+            /* Marked while we copied: a reservation taken meanwhile may hold
+             * a torn copy, so it must not survive this write. */
+            if (spu_coh_is_reserved(line)) { spu_cohv_lock(line); spu_cohv_unlock_written(line); }
+        }
+        off += chunk;
+    }
+}
+
+/* ---- PPU reservations --------------------------------------------------- */
+static uint32_t cohv_load_reserve(uint32_t ea, const void* p, unsigned size, uint64_t* raw)
+{
+    cohv_mark(ea);
+    COHV_STAT(CS_LOAD_RESERVE);
+    return spu_cohv_read_value(ea, p, size, raw);
+}
+
+static int cohv_store_conditional(uint32_t ea, void* p, unsigned size, uint32_t count,
+                                  uint64_t expected_raw, uint64_t value_raw)
+{
+    const int ok = spu_cohv_store_conditional(ea, p, size, count, expected_raw, value_raw);
+    COHV_STAT(ok ? CS_SC_OK : CS_SC_FAIL);
+    if (ok) cohv_old_ppu_break(ea);
+    return ok;
+}
+
+static int cohv_cas(uint32_t ea, void* p, unsigned size, uint64_t expected_raw, uint64_t value_raw)
+{
+    spu_cohv_lock(ea);
+    int ok;
+    if (size == 8) {
+        uint64_t e = expected_raw;
+        ok = __atomic_compare_exchange_n((uint64_t*)p, &e, value_raw, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    } else {
+        uint32_t e = (uint32_t)expected_raw;
+        ok = __atomic_compare_exchange_n((uint32_t*)p, &e, (uint32_t)value_raw, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    }
+    if (ok) spu_cohv_unlock_written(ea); else spu_cohv_unlock_unchanged(ea);
+    COHV_STAT(ok ? CS_SC_OK : CS_SC_FAIL);
+    return ok;
+}
+
+static const spu_coh_ops s_cohv_ops = {
+    cohv_getllar, cohv_putllc, cohv_putlluc, cohv_settle, cohv_wait_begin, cohv_wait_end,
+    cohv_write, cohv_load_reserve, cohv_store_conditional, cohv_cas,
+    cohv_section_begin, cohv_section_end,
+};
+
+int spu_coh_versions_on(void) { return cohv_on(); }
+
+void spu_coh_versions_install(int on)
+{
+    spu_cohv_force(on);
+    g_spu_coh_ops = on ? &s_cohv_ops : NULL;
+}
+
+/* Before main (mag-recomp sets its switch defaults in an earlier
+ * constructor), and so before any reservation: the scheme never changes
+ * while lines are held. */
+__attribute__((constructor)) static void spu_coh_versions_init(void)
+{
+    if (!spu_cohv_enabled()) return;
+    g_spu_coh_ops = &s_cohv_ops;
+    const char* e = getenv("PS3RECOMP_COH_STATS");
+    s_cohv_stats = e && !strcmp(e, "1");
+    if (s_cohv_stats) { fprintf(stderr, "[coh-stats] on (every 2 s, counts since the previous line)\n"); fflush(stderr); }
+}
+
 #ifdef __cplusplus
 }
 #endif
 
 #include "spu_atomic_observe.inc"
+/* Per-line version counters (PS3RECOMP_COH_VERSIONS): compiled here so that
+ * every target that links coherence links them, with no build changes. */
+#define COHV_STAT_HOOK(which) COHV_STAT((which) == COHV_STAT_LOCK_WAIT ? CS_LOCK_WAIT : CS_READ_FALLBACK)
+#include "spu_coh_version.inc"

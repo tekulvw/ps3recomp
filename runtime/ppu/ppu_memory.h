@@ -13,6 +13,7 @@
 
 #include "../../include/ps3emu/endian.h"
 #include "ppu_context.h"
+#include "../spu/spu_coh_ops.h"   /* PS3RECOMP_COH_VERSIONS (NULL when off) */
 
 #include <stdint.h>
 #include <string.h>
@@ -145,10 +146,16 @@ void        spu_coh_notify_write(uint32_t addr);
 #define VM_WRITE_COH(addr, src, n)                                            \
     do {                                                                      \
         if (spu_coh_is_reserved((uint32_t)(addr))) {                          \
-            spu_lockline_lock();                                              \
-            memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
-            spu_coh_notify_write((uint32_t)(addr));                           \
-            spu_lockline_unlock();                                            \
+            const spu_coh_ops* _coh_ops = g_spu_coh_ops;                      \
+            if (_coh_ops) {                                                   \
+                _coh_ops->write((uint32_t)(addr), vm_ptr8((uint32_t)(addr)),  \
+                                (src), (uint32_t)(n), 0);                     \
+            } else {                                                          \
+                spu_lockline_lock();                                          \
+                memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                \
+                spu_coh_notify_write((uint32_t)(addr));                       \
+                spu_lockline_unlock();                                        \
+            }                                                                 \
         } else {                                                              \
             memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
         }                                                                     \
@@ -257,7 +264,9 @@ static inline void vm_block_notify(uint32_t guest_dst, size_t len)
 
 static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t len)
 {
-    if (vm_block_reserved(guest_dst, len)) {
+    if (vm_block_reserved(guest_dst, len) && g_spu_coh_ops) {
+        g_spu_coh_ops->write(guest_dst, vm_ptr8(guest_dst), host_src, (uint32_t)len, 0);
+    } else if (vm_block_reserved(guest_dst, len)) {
         spu_lockline_lock();
         memcpy(vm_ptr8(guest_dst), host_src, len);
         vm_block_notify(guest_dst, len);
@@ -269,7 +278,16 @@ static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t
 
 static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
 {
-    if (vm_block_reserved(guest_dst, len)) {
+    if (vm_block_reserved(guest_dst, len) && g_spu_coh_ops) {
+        unsigned char fill[128];
+        memset(fill, val, sizeof fill);
+        for (size_t off = 0; off < len;) {
+            size_t chunk = len - off < sizeof fill ? len - off : sizeof fill;
+            g_spu_coh_ops->write(guest_dst + (uint32_t)off, vm_ptr8(guest_dst + (uint32_t)off),
+                                 val ? fill : NULL, (uint32_t)chunk, 0);
+            off += chunk;
+        }
+    } else if (vm_block_reserved(guest_dst, len)) {
         spu_lockline_lock();
         memset(vm_ptr8(guest_dst), val, len);
         vm_block_notify(guest_dst, len);
@@ -322,7 +340,9 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
      * can never land inside an SPU PUTLLC's compare/commit window (nor the
      * reverse), and the reserving SPU gets its lost-reservation event. */
     int ok;
-    if (spu_coh_is_reserved(addr)) {
+    if (spu_coh_is_reserved(addr) && g_spu_coh_ops) {
+        ok = g_spu_coh_ops->cas(addr, (void*)atom, 4, expected, desired);
+    } else if (spu_coh_is_reserved(addr)) {
         spu_lockline_lock();
         ok = atomic_compare_exchange_strong_explicit(
             atom, &expected, desired,
@@ -371,7 +391,9 @@ static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
     _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
 
     int ok;
-    if (spu_coh_is_reserved(addr)) {
+    if (spu_coh_is_reserved(addr) && g_spu_coh_ops) {
+        ok = g_spu_coh_ops->cas(addr, (void*)atom, 8, expected, desired);
+    } else if (spu_coh_is_reserved(addr)) {
         spu_lockline_lock();
         ok = atomic_compare_exchange_strong_explicit(
             atom, &expected, desired,

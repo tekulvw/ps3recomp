@@ -132,10 +132,21 @@ extern "C" void flow_spurs_kernel_spawn_postinit(void) {}
 /* Unknown imports preserve the legacy success default. Diagnostic callers
  * can request a guest error (fail) or stop at the exact missing import (halt).
  * The first-seen set is shared by guest threads; protect it during reporting. */
+/* PS3_HLE_UNRESOLVED, read once: an unresolved import can be called every
+ * frame. 0 legacy success, 1 halt, 2 fail. */
+static int ps3_hle_unresolved_mode()
+{
+    static const int mode = [] {
+        const char* e = getenv("PS3_HLE_UNRESOLVED");
+        if (e && strcmp(e, "halt") == 0) return 1;
+        return e && (e[0] == 'f' || e[0] == 'F') ? 2 : 0;
+    }();
+    return mode;
+}
+
 static bool ps3_hle_should_halt()
 {
-    const char* mode = getenv("PS3_HLE_UNRESOLVED");
-    return mode && strcmp(mode, "halt") == 0;
+    return ps3_hle_unresolved_mode() == 1;
 }
 
 static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
@@ -149,8 +160,7 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
         fflush(stderr);
         _Exit(88);
     }
-    const char* mode = getenv("PS3_HLE_UNRESOLVED");
-    const bool fail = mode && (mode[0] == 'f' || mode[0] == 'F');
+    const bool fail = ps3_hle_unresolved_mode() == 2;
     static std::mutex lock;
     static uint32_t seen[512];
     static uint32_t count = 0;
