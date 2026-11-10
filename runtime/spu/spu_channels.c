@@ -2039,6 +2039,26 @@ typedef struct {
 } spu_verified_image;
 static spu_verified_image s_verified_images[SPU_VERIFIED_IMAGES];
 static unsigned s_verified_count;
+/* One bit per 128-byte LS block that any registered verified segment
+ * covers. Set before the image is published and never cleared (images are
+ * never removed), so a GET touching no set block cannot overlap a segment:
+ * spu_dcache_note_get tests it before walking every image's segments. */
+#define SPU_VERIFIED_COVER_SHIFT 7u
+static uint8_t s_verified_cover[SPU_LS_SIZE >> SPU_VERIFIED_COVER_SHIFT >> 3];
+static void spu_verified_cover_mark(uint32_t lsa, uint32_t size)
+{
+    for (uint32_t b = lsa >> SPU_VERIFIED_COVER_SHIFT; b <= (lsa + size - 1u) >> SPU_VERIFIED_COVER_SHIFT; ++b)
+        __atomic_fetch_or(&s_verified_cover[b >> 3], (uint8_t)(1u << (b & 7u)), __ATOMIC_RELAXED);
+}
+static int spu_verified_cover_any(uint32_t lsa, uint32_t size)
+{
+    if (!size || lsa >= SPU_LS_SIZE) return 0;
+    uint32_t last = lsa + size - 1u;
+    if (last >= SPU_LS_SIZE) last = SPU_LS_SIZE - 1u;
+    for (uint32_t b = lsa >> SPU_VERIFIED_COVER_SHIFT; b <= last >> SPU_VERIFIED_COVER_SHIFT; ++b)
+        if ((__atomic_load_n(&s_verified_cover[b >> 3], __ATOMIC_RELAXED) >> (b & 7u)) & 1u) return 1;
+    return 0;
+}
 /* Serialized registration copies immutable ranges/bytes. Even generations
  * describe complete snapshots; odd means append publication is in progress.
  * Failed validation/allocation and rejected replacements never change it. */
@@ -2079,6 +2099,7 @@ static int spu_verified_register(int policy, int image,
         next.segments[i].bytes = copy + at;
         at += segments[i].size;
     }
+    for (unsigned i = 0; i < count; ++i) spu_verified_cover_mark(segments[i].lsa, segments[i].size);
     __atomic_add_fetch(&s_verified_generation,1,__ATOMIC_ACQ_REL);
     s_verified_images[s_verified_count] = next;
     __atomic_store_n(&s_verified_count, s_verified_count + 1, __ATOMIC_RELEASE);   /* the dispatch cache keys by it */
@@ -2501,6 +2522,40 @@ static int spu_ovl_ea_known(uint32_t ea)
     return 1;   /* full (cannot happen): never filter */
 }
 
+/* The same for content signatures. A GET of 512 bytes or more was compared
+ * against every signature source (16-byte memcmp each, up to
+ * SPU_OVL_SRC_MAX), and most such GETs are data, not code. A signature can
+ * only match when the GET's first 8 bytes equal the first 8 of some
+ * registered signature, so keep those prefixes in an insert-only set, built
+ * and published exactly like the EA set, and run the scan only when the
+ * prefix is present (or the EA is registered). */
+static uint64_t s_ovl_sig_set[SPU_OVL_EA_SET];
+static uint8_t s_ovl_sig_used[SPU_OVL_EA_SET];
+static unsigned spu_ovl_sig_slot(uint64_t prefix) { return (unsigned)((prefix * 0x9E3779B97F4A7C15ull) >> 55); }
+static uint64_t spu_ovl_sig_prefix(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v; }
+static void spu_ovl_sig_add(const uint8_t sig[16])
+{
+    const uint64_t prefix = spu_ovl_sig_prefix(sig);
+    for (unsigned i = spu_ovl_sig_slot(prefix), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
+        if (__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) {
+            if (s_ovl_sig_set[i] == prefix) return;
+            continue;
+        }
+        s_ovl_sig_set[i] = prefix;
+        __atomic_store_n(&s_ovl_sig_used[i], 1, __ATOMIC_RELEASE);
+        return;
+    }
+}
+static int spu_ovl_sig_known(const uint8_t* head)
+{
+    const uint64_t prefix = spu_ovl_sig_prefix(head);
+    for (unsigned i = spu_ovl_sig_slot(prefix), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
+        if (!__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) return 0;
+        if (s_ovl_sig_set[i] == prefix) return 1;
+    }
+    return 1;   /* full (cannot happen): never filter */
+}
+
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
@@ -2763,6 +2818,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
+        spu_ovl_sig_add(sig);
         atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
@@ -2863,7 +2919,8 @@ static int spu_dcache_mode(void)
 }
 static void spu_dcache_note_get(uint32_t lsa, uint32_t size)
 {
-    if (!spu_dcache_mode()) return;
+    /* Every MFC GET lands here; almost none touch verified code. */
+    if (!spu_verified_cover_any(lsa, size) || !spu_dcache_mode()) return;
     spu_dcache_tls* t = &t_dcache;
     for (unsigned i = 0; i < s_verified_count; ++i) {
         const spu_verified_image* v = &s_verified_images[i];
@@ -2998,8 +3055,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      * Acquire count before the signature flag: if this snapshot contains a
      * signature, its earlier flag publication is visible. A racing future
      * signature can only force an unnecessary scan of the older snapshot. */
-    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
-        !spu_ovl_ea_known(ea)) return;
+    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire) ||
+         !spu_ovl_sig_known(ls)) && !spu_ovl_ea_known(ea)) return;
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
