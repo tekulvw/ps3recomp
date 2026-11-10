@@ -71,13 +71,9 @@ static int dma_disp_armed(void) {
     if(exists)InterlockedExchange(&s_dma_disposition.armed,1);
     return exists;
 }
-/* Read on every SPU DMA: a compare-and-swap here took the shared line
- * exclusively from each SPU thread. A plain acquire load suffices. */
-#ifdef _WIN32
-#define DMA_DISP_READY_LOAD(p) InterlockedCompareExchange((p),0,0)
-#else
-#define DMA_DISP_READY_LOAD(p) __atomic_load_n((p),__ATOMIC_ACQUIRE)
-#endif
+/* Read on every SPU DMA while an observer is on: a compare-and-swap here
+ * took the shared line exclusively from each SPU thread, on Windows too. */
+#define DMA_DISP_READY_LOAD(p) ReadAcquire(p)
 /* Alone on its line: every SPU thread reads it on every DMA, and only the
  * first DMA of the run writes it. */
 #if defined(__GNUC__) || defined(__clang__)
