@@ -31,7 +31,9 @@ root = Path(__file__).resolve().parents[1]
 src = (root / 'runtime/spu/spu_channels.c').read_text()
 m = re.search(r'static int spu_smc_microstep\(spu_context\* ctx\)\s*\{', src)
 assert m, 'spu_smc_microstep not found'
-i, depth = m.end(), 1
+# The ordinary steps live in spu_smc_microstep_steps, defined right after it.
+end = re.search(r'static int spu_smc_microstep_steps\(spu_context\* ctx\)\s*\{', src)
+i, depth = (end or m).end(), 1
 while depth:
     depth += {'{': 1, '}': -1}.get(src[i], 0)
     i += 1
@@ -52,6 +54,7 @@ HARNESS = r'''
 #include "diagnostics/original_work_observer.h"   /* PS3_ORIGINAL_STEP in the extracted microstep */
 
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+static uint64_t spu_host_ns(void) { return 0; }   /* the trace cache's opt-in stats clock */
 int g_spu_ls_watch_n = 0;   /* LS watch off */
 void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
 { (void)lsa; (void)is_write; (void)p; (void)pc; (void)lr; }
