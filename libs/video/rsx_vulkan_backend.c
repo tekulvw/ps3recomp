@@ -5778,6 +5778,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     }
     int batched = vk_eb_on() && vbytes <= VK_EB_VB_BYTES && ibytes <= VK_EB_IB_BYTES;
     if (batched && P->cube_mask && !vk_eng_dummy_cube_view()) return;   /* may flush: before any slice */
+    if (batched && !vk_eng_dummy_2d_view()) return;   /* upload may flush/reset the descriptor pool */
     if (batched) {
         /* Slices of the rings and a set from the pool; a full one flushes the
          * batch (which empties them all) and the draw takes its slices again. */
