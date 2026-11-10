@@ -3990,9 +3990,13 @@ static void eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes,
         return;
     }
     const u8* src = (const u8*)data;
-    for (u32 row = 0, n = 0; rsx_be_row_run(row_mask, &row, &n); row += n)
+    u32 staged = 32u;
+    for (u32 row = 0, n = 0; rsx_be_row_run(row_mask, &row, &n); row += n) {
         memcpy(s_eng_stage + off + row * 16u, src + row * 16u, n * 16u);
+        staged += n * 16u;
+    }
     memcpy(s_eng_stage + off + bytes - 32u, src + bytes - 32u, 32u);
+    s_eng_staged[ENG_STAGED_VS] += staged;
     s_eng_pending.vs_cb_off = off;
     s_eng_pending.vs_cb_bytes = bytes;
     s_eng_vs_gen = s_eng_stage_gen;
