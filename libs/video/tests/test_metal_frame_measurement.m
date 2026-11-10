@@ -37,9 +37,14 @@ void rsx_ring_progress_metal_committed(uint64_t ticket, uint64_t records) {
 - (void)setRenderPipelineState:(id)p {(void)p;}
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i {(void)t;(void)i;}
 - (void)setFragmentSamplerState:(id)t atIndex:(NSUInteger)i {(void)t;(void)i;}
+/* The present pass's uniforms: gamma, sharpen, texel size, then vibrance,
+ * contrast and padding (upstream f4e482a5 grew them from 4 to 8 floats). */
 - (void)setFragmentBytes:(const void*)bytes length:(NSUInteger)length atIndex:(NSUInteger)index {
- assert(bytes && length==4*sizeof(float) && index==0);
+ assert(bytes && length==8*sizeof(float) && index==0);
 }
+/* The window blit fits the picture into the drawable (upstream 70ec6a7b);
+ * the 1x1 source fills the 1x1 drawable exactly. */
+- (void)setViewport:(MTLViewport)v {assert(v.originX==0 && v.originY==0 && v.width==1 && v.height==1);}
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n {(void)t;(void)s;assert(n==3);}
 - (void)endEncoding {}
 @end
@@ -79,6 +84,9 @@ void rsx_ring_progress_metal_committed(uint64_t ticket, uint64_t records) {
 @end
 @interface MeasurementLayer : NSObject
 @property CommittingDrawable *drawable;
+/* The present path fits the drawable to the window before taking one
+ * (upstream 70ec6a7b); a zero window size leaves it untouched. */
+@property CGSize drawableSize;
 @end
 @implementation MeasurementLayer
 - (id)nextDrawable {return self.drawable;}

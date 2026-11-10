@@ -1,5 +1,6 @@
 /* Exercise generated NID registration and the real PPU HLE bridge. */
 #include "ppu_context.h"
+#include "../libs/codec/cellSail.h"
 #include "ps3emu/guest_call.h"
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +42,9 @@ extern "C" void ppu_dump_bctrl_ring(uint32_t,const char*) {}
 extern "C" void ppu_guest_callstack(const char*) {}
 uint32_t g_ydkj_real_spurs_ea=0,g_ydkj_real_taskset_ea=0;
 
+static_assert(sizeof(CellSailMemAllocatorFuncs)==8, "guest callback pair");
+// {callbacks table EA, pArg}: the record holds the table pointer, not a copy of it.
+static_assert(sizeof(CellSailMemAllocator)==8, "guest allocator record");
 static unsigned checks;
 #define CHECK(x) do { ++checks; if(!(x)) { std::fprintf(stderr,"FAIL line%d: %s\n",__LINE__,#x);return 1; } } while(0)
 static uint32_t call(uint32_t nid,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0,uint64_t e=0) {

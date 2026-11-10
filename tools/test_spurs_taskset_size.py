@@ -28,6 +28,10 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t ea,uint64_t value,int width) {(void)ea;(void)value;(void)width;}
+void spu_taskset2_register(uint32_t ea) {(void)ea;}
+void spu_taskset_register(uint32_t ea) {(void)ea;}
+int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init) {
+    vm_write32(id_out, 7u); (void)init; return 0; }
 static _Alignas(128) uint8_t memory[0x10000];
 #define PTR(type, ea) ((type*)(uintptr_t)(ea))
 static void expect(int ok, const char* what) {
@@ -73,6 +77,8 @@ int main(void) {
     expect(cellSpursCreateTaskset(spurs,ts,0,NULL,0)==0,"plain creation");
     expect(vm_read32(0x4000+CSTS_SIZE_FIELD)==0x1900,"plain creation uses full default guest size");
     clean(0x1900);
+    /* Taskset2 (the fork's guest-typed API, no HLE event flags) is covered by
+     * tools/test_spurs_taskset2.py; this fixture's lifecycle stub refuses it. */
     puts("PASS: real taskset requested-size retention and initialization");
 }
 '''

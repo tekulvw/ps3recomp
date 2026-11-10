@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # 2026 while the project shipped 0.6.x through 0.8.0, so every build printed
 # "ps3recomp runtime v0.3.0" and was believed. v0.9.0 is the first TAGGED one.
 project(ps3recomp_runtime
-    VERSION 0.11.0
+    VERSION 0.19.0
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )
@@ -85,9 +85,16 @@ endif()
 list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.cpp")
 # cellAtrac decodes with FFmpeg's ATRAC3plus decoder as extracted by PPSSPP
 # (LGPL-2.1, kept separate in third_party/at3_standalone -- see its README).
-file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
-set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
-list(APPEND HLE_SOURCES ${AT3_SOURCES})
+# PS3RECOMP_ATRAC_LGPL=OFF swaps the decoder for a stub that fails every open, which keeps the library and any
+# binary linked from it free of LGPL code (third_party/at3_stub); the title then sees an ATRAC error.
+option(PS3RECOMP_ATRAC_LGPL "Link the LGPL-2.1 ATRAC3plus decoder (cellAtrac)" ON)
+if(PS3RECOMP_ATRAC_LGPL)
+    file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
+    set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
+    list(APPEND HLE_SOURCES ${AT3_SOURCES})
+else()
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/at3_stub/at3_stub.c")
+endif()
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES
@@ -167,7 +174,6 @@ target_include_directories(ps3recomp_runtime PRIVATE
 if(WIN32)
     target_link_libraries(ps3recomp_runtime PRIVATE
         ws2_32      # Winsock for network modules
-        xinput      # XInput for gamepad
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
@@ -204,6 +210,7 @@ if(APPLE)
         "-framework QuartzCore"
         "-framework Foundation"
         "-framework AppKit"
+        "-framework ApplicationServices"
     )
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
@@ -316,6 +323,21 @@ if(UNIX)
                 endif()
             endforeach()
         endif()
+        # The translator's identity in the MSL translation cache: a hash of its
+        # sources, so a rebuild that changes nothing keeps the cached files and
+        # an edit to the translator retires them. (Its build time did the
+        # latter too, and threw the whole cache away on every rebuild.)
+        set(_msl_sources libs/video/rsx_shader_msl.cpp libs/video/rsx_shader_msl.h)
+        set(_msl_text "")
+        foreach(f IN LISTS _msl_sources)
+            file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${f}" _h)
+            string(APPEND _msl_text "${_h}")
+        endforeach()
+        string(SHA256 _msl_id "${_msl_text}")
+        string(SUBSTRING "${_msl_id}" 0 23 _msl_id)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_msl_sources})
+        target_compile_definitions(ps3recomp_msl_translation INTERFACE
+            "PS3RECOMP_MSL_TRANSLATOR_ID=\"${_msl_id}\"")
         target_link_libraries(ps3recomp_runtime PRIVATE ps3recomp_msl_translation)
         set(PS3RECOMP_MSL_TRANSLATION ON)
         message(STATUS "  Shaders:      guest programs translated to MSL (glslang ${glslang_VERSION}, ${SPVC_LIBS})")
@@ -397,7 +419,10 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
-        $<$<CONFIG:Release,RelWithDebInfo>:-O2>
+        # Every configuration but Debug, including none: a port configured
+        # without CMAKE_BUILD_TYPE matched neither name and compiled the whole
+        # runtime -- the FIFO walker, the draw engine, the MFC -- at -O0.
+        $<$<NOT:$<CONFIG:Debug>>:-O2>
     )
     # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
     # hottest SPU op in lifted audio code. Probed rather than assumed: recent
@@ -473,6 +498,10 @@ if(PS3RECOMP_BUILD_TESTS)
     # each report DMA context. Links the runtime like the POSIX host below.
     if(UNIX)
         add_subdirectory(tests/gcm_reports)
+        # The per-call tile and zcull log lines, gated on PS3_VERBOSE.
+        add_subdirectory(tests/gcm_tile_log)
+        # The same walker's JUMP decode: the old and the new form.
+        add_subdirectory(tests/gcm_fifo_jump)
     endif()
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     # The guest write watch (default off) on synthetic guest memory.
@@ -572,6 +601,65 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
 
+    if(NOT WIN32)
+
+        # The interpreter's op/immediate decode at the opcode-width and
+        # immediate-form boundaries, against ISA-layout encodings.
+        add_executable(test_spu_decode
+            runtime/spu/tests/test_spu_decode.c)
+        target_include_directories(test_spu_decode PRIVATE include runtime/spu)
+        target_compile_options(test_spu_decode PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_decode PRIVATE m)
+        add_test(NAME spu_decode COMMAND test_spu_decode)
+        set_tests_properties(spu_decode PROPERTIES TIMEOUT 30)
+
+        # fi and cflts (NEON on ARM64) against their scalar references, in the
+        # default FPCR and under round-toward-zero plus flush-to-zero.
+        add_executable(test_spu_fi_cflts_neon
+            runtime/spu/tests/test_spu_fi_cflts_neon.c)
+        target_include_directories(test_spu_fi_cflts_neon PRIVATE include runtime/spu)
+        target_compile_options(test_spu_fi_cflts_neon PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_fi_cflts_neon PRIVATE m)
+        add_test(NAME spu_fi_cflts_neon COMMAND test_spu_fi_cflts_neon)
+        set_tests_properties(spu_fi_cflts_neon PROPERTIES TIMEOUT 300)
+
+        add_executable(test_spu_lockline_wait
+            runtime/spu/tests/test_spu_lockline_wait.c)
+        target_include_directories(test_spu_lockline_wait PRIVATE include)
+        target_compile_options(test_spu_lockline_wait PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_lockline_wait PRIVATE Threads::Threads)
+        add_test(NAME spu_lockline_wait COMMAND test_spu_lockline_wait)
+        set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
+
+    endif()
+    add_executable(test_rsx_present_policy tests/test_rsx_present_policy.c)
+    target_include_directories(test_rsx_present_policy PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
+
+    # vmx_fmaf (fused multiply-add without a libm call per lane) against fmaf.
+    # Without -mfma it takes the double-rounding path; with it, the builtin.
+    add_executable(test_vmx_fmaf tests/test_vmx_fmaf.c)
+    target_compile_options(test_vmx_fmaf PRIVATE -UNDEBUG)
+    if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        target_compile_options(test_vmx_fmaf PRIVATE -mno-fma)
+    endif()
+    if(NOT WIN32)
+        target_link_libraries(test_vmx_fmaf PRIVATE m)
+    endif()
+    add_test(NAME vmx_fmaf COMMAND test_vmx_fmaf)
+    set_tests_properties(vmx_fmaf PROPERTIES TIMEOUT 120)
+
+    # Current colors are explicit shader inputs even when they equal the
+    # hardware default; exercise both compact fetch entry points without a GPU.
+    add_executable(test_vertex_current_color
+        libs/video/tests/test_vertex_current_color.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_dispatch.c)
+    target_include_directories(test_vertex_current_color PRIVATE include libs/video)
+    add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
+
+
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         if(WIN32)
@@ -639,6 +727,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_sdcrz
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")
+        add_test(NAME spu_dma_repeat
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_repeat.py")
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
@@ -705,6 +796,95 @@ if(UNIX)
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
         )
         target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
+
+        # The polygon offset through the engine and the Metal backend on the
+        # GPU; the guest programs need the translation above.
+        if(APPLE)
+            add_executable(test_metal_poly_offset
+                libs/video/tests/test_metal_poly_offset.m
+                libs/video/rsx_tiling.c
+                libs/video/rsx_shader_msl.cpp
+                libs/video/rsx_dispatch.c
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_poly_offset.m"
+                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+            target_include_directories(test_metal_poly_offset PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            target_link_libraries(test_metal_poly_offset PRIVATE
+                ps3recomp_msl_translation
+                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
+            # Only what the engine and the backend reach; the rest of the
+            # runtime is not linked in.
+            target_link_options(test_metal_poly_offset PRIVATE "-Wl,-dead_strip")
+
+            # The depth-bounds test, which Metal does not have, emulated in
+            # the fragment program; the same way.
+            add_executable(test_metal_depth_bounds
+                libs/video/tests/test_metal_depth_bounds.m
+                libs/video/rsx_shader_msl.cpp
+                libs/video/rsx_dispatch.c
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c
+                libs/video/rsx_tiling.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_depth_bounds.m"
+                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+            target_include_directories(test_metal_depth_bounds PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            target_link_libraries(test_metal_depth_bounds PRIVATE
+                ps3recomp_msl_translation
+                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
+            target_link_options(test_metal_depth_bounds PRIVATE "-Wl,-dead_strip")
+
+            # SET_ZMIN_MAX_CONTROL's depth clamp, the same way.
+            add_executable(test_metal_depth_clamp
+                libs/video/tests/test_metal_depth_clamp.m
+                libs/video/rsx_shader_msl.cpp
+                libs/video/rsx_dispatch.c
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c
+                libs/video/rsx_tiling.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_depth_clamp.m"
+                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+            target_include_directories(test_metal_depth_clamp PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            target_link_libraries(test_metal_depth_clamp PRIVATE
+                ps3recomp_msl_translation
+                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
+            target_link_options(test_metal_depth_clamp PRIVATE "-Wl,-dead_strip")
+            # These include the fork's Metal backend whole, so they also need the
+            # pieces it reaches (FIFO busy counter, render ablation, critical
+            # trace, explicit frontend) and must allow cellGcm's weak seams.
+            foreach(t test_metal_poly_offset test_metal_depth_bounds test_metal_depth_clamp)
+                target_sources(${t} PRIVATE
+                    libs/video/rsx_fifo_busy.c
+                    libs/video/rsx_frontend.c
+                    runtime/diagnostics/render_ablation.c
+                    runtime/diagnostics/critical_trace.c)
+                target_link_options(${t} PRIVATE
+                    "-Wl,-U,_cellGcm_fifo_kick_notify" "-Wl,-U,_cellGcm_native_consumer_enabled"
+                    "-Wl,-U,_cellGcm_rsx_consumer_begin" "-Wl,-U,_cellGcm_rsx_consumer_end"
+                    "-Wl,-U,_rsx_ring_progress_metal_committed" "-Wl,-U,_rsx_ring_progress_metal_completed")
+            endforeach()
+        endif()
     endif()
 
     # The HLSL -> SPIR-V translation cache, memory and disk. Needs glslang

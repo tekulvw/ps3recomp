@@ -35,13 +35,13 @@
 
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 #include <dlfcn.h>
 #include <mach/mach_types.h>
 #include <mach/thread_status.h>
 #include <mach-o/dyld.h>
-#include <mach-o/getsect.h>
-#include <sched.h>
+#include <mach-o/loader.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,6 +68,7 @@ typedef struct {
     int nthreads;                 /* slots claimed; a slot is sampled once ready */
     uint32_t cap, n;
     ps3_tprof_rec* buf;
+    /* ready: 0 not sampled, 1 sampled, 2 being sampled right now */
     struct { mach_port_t port; uintptr_t lo, hi; uint32_t who; uint8_t kind; int ready; } th[PS3_TPROF_THREADS];
 } ps3_tprof_state;
 
@@ -114,9 +115,20 @@ static inline void ps3_tprof_write(const char* out, uint32_t n)
      * dladdr, and the few other addresses go through a small cache: one
      * dladdr per frame made a 40k-sample dump take minutes. */
     const struct mach_header_64* mh = (const struct mach_header_64*)_dyld_get_image_header(0);
-    const struct segment_command_64* text = getsegbyname("__TEXT");
+    uintptr_t text_size = 0;   /* the main image's __TEXT, from its load commands */
+    {
+        const struct load_command* lc = (const struct load_command*)(mh + 1);
+        for (uint32_t i = 0; mh && i < mh->ncmds; i++) {
+            if (lc->cmd == LC_SEGMENT_64 &&
+                !strncmp(((const struct segment_command_64*)lc)->segname, "__TEXT", 16)) {
+                text_size = (uintptr_t)((const struct segment_command_64*)lc)->vmsize;
+                break;
+            }
+            lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+        }
+    }
     const uintptr_t self_lo = (uintptr_t)mh;
-    const uintptr_t self_hi = self_lo + (text ? (uintptr_t)text->vmsize : 0);
+    const uintptr_t self_hi = self_lo + text_size;
     enum { CACHE = 4096 };
     static struct { uintptr_t pc; const char* name; } cache[CACHE];
     const uint64_t base = g_ps3_ft.base;

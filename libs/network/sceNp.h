@@ -128,6 +128,8 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs);
 #define SCE_NP_MANAGER_STATUS_ONLINE            3
 
 typedef void (*SceNpManagerCallback)(s32 event, s32 result, void* arg);
+/* The manager callback's event for a ticket request's answer; result is the
+ * ticket's size, or a negative error. */
 #define SCE_NP_MANAGER_EVENT_GOT_TICKET         255
 typedef struct SceNpTicketVersion { u16 major, minor; } SceNpTicketVersion;
 
@@ -140,18 +142,24 @@ s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId);
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* onlineName);
 s32 sceNpManagerGetAccountAge(s32* age);
 
+/* Tickets, account region and network time. Every pointer is a guest
+ * address. OFFLINE without a psnr server; see sceNp.c.
+ * Optional local development payload, not a signed Sony ticket: enable with
+ * PS3RECOMP_NP_LOCAL_TICKET=1 and configure identity via PS3_NP_ONLINE_ID;
+ * RequestTicket2/GetTicket then serve that payload (version, if given, is a
+ * guest SceNpTicketVersion). */
+s32 sceNpManagerRequestTicket2(u32 npId, u32 version, u32 serviceId, u32 cookie,
+                               u32 cookieSize, u32 entitlementId, u32 consumedCount);
+s32 sceNpManagerGetTicket(u32 buffer, u32 bufferSize);
+s32 sceNpManagerGetTicketParam(s32 paramId, u32 param);
+s32 sceNpManagerGetAccountRegion(u32 countryCode, u32 language);
+s32 sceNpManagerGetNetworkTime(u32 pTick);
+
 /* NPDRM availability checks. The guest passes its klicensee (16 bytes) and the
  * path of an EDAT/SELF; the klicensee is handed to the EDAT reader, which then
  * decrypts that title's files on open. Always CELL_OK (licence present). */
 s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path);
 s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path);
-
-/* Optional local development payload, not a signed Sony ticket. Enable with
- * PS3RECOMP_NP_LOCAL_TICKET=1 and configure identity via PS3_NP_ONLINE_ID. */
-s32 sceNpManagerRequestTicket2(const SceNpId* npId, const SceNpTicketVersion* version,
-    const char* serviceId, const void* cookie, u32 cookieSize,
-    const char* entitlementId, u32 consumedCount);
-s32 sceNpManagerGetTicket(void* buffer, u32* bufferSize);
 
 /* Set the fake PSN username (call before sceNpInit if desired) */
 void sceNpSetFakeUsername(const char* username);

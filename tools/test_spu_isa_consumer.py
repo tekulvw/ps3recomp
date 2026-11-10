@@ -23,7 +23,9 @@ def main():
                          ('cc',os.environ.get('CC') or shutil.which('cc')),
                          ('cxx',os.environ.get('CXX') or shutil.which('c++'))]:
         p.add_argument('--'+name,default=default)
-    a=p.parse_args();assert all((a.cmake,a.ninja,a.cc,a.cxx)),'CMake, Ninja and C/C++ compilers required'
+    a=p.parse_args()
+    if not all((a.cmake,a.ninja,a.cc,a.cxx)):
+        print('SKIP: CMake, Ninja and C/C++ compilers required');return 0
     msvc=Path(a.cxx).name.lower() in ('clang-cl','clang-cl.exe','cl','cl.exe')
     with tempfile.TemporaryDirectory(prefix='spu-isa-consumer-') as directory:
         out=Path(directory);source=ROOT/'runtime/spu/tests/test_spu_isa_consumer.c'

@@ -29,6 +29,15 @@ extern "C" {
 #  define SPU_ALIGN16 __attribute__((aligned(16)))
 #endif
 
+/* Out-of-line debug probes: keep them out of the hot path. MSVC C has no
+ * __attribute__ spelling (CI covers Windows with clang-cl, which accepts
+ * both), so the MSVC dialect is __declspec(noinline) and drops `cold`. */
+#if defined(_MSC_VER)
+#  define SPU_NOINLINE_COLD __declspec(noinline)
+#else
+#  define SPU_NOINLINE_COLD __attribute__((noinline, cold))
+#endif
+
 /* Local store size: 256 KB */
 #define SPU_LS_SIZE         (256 * 1024)
 #define SPU_LS_MASK         (SPU_LS_SIZE - 1)
@@ -294,7 +303,23 @@ typedef struct spu_context {
         /* 0: unchecked legacy region; otherwise SPU_OVERLAY_* state of a
          * region registered with its code bytes (spu_overlay_residency.h). */
         int verify_state, source_index;
+        /* Nonzero for position-independent code lifted once at this canonical LS base
+         * (spu_overlay_register_region_reloc): its functions are registered at
+         * canon + offset, wherever the title placed this copy. 0 = ordinary placed lift. */
+        uint32_t canon;
     } resident_code[4];
+    /* Placement minus canonical base of the relocatable code running now (spu_lifter.py
+     * --reloc): lifted relocatable code adds it to every address it derives from its own
+     * pc. Set by the dispatcher on entry into such code; only that code reads it. */
+    int32_t reloc_delta;
+
+    /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
+     * context's current lifetime: 0 after spu_context_init (or a zeroed
+     * allocation) until its first cached dispatch, so a context reset at the
+     * same address never meets an earlier lifetime's entries. dcache_residency
+     * is bumped on every change to resident_code, dropping the cached
+     * resolutions of this context. */
+    uint32_t dcache_id, dcache_residency;
 
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
      * for co-resident tasks. A taskset may hold several tasks that all lift at the
@@ -399,16 +424,18 @@ typedef struct spu_context {
     uint32_t drain_ret_pc;
     uint32_t region_dispatch_depth, region_return_pc;
     int region_dispatch_valid, region_has_return;
-    /* Nonzero while this context is in the coherence holder list
-     * (spu_coherency.c); lets its GETLLAR skip the lock-line lock. */
+
+    /* Set by another host thread to stop this SPU from outside: a raw SPU's
+     * PPU writing SPU_RunCntl = 0 (spu_raw.c). Lifted code never looks at it;
+     * the channel layer does, at every rdch/rchcnt and inside its blocking
+     * waits, and halts the SPU there (spu_halt). Cleared by spu_context_init. */
+    volatile int stop_request;
+
+    /* Nonzero while this context is in spu_coherency.c's list of reservation
+     * holders, so its GETLLAR can skip the lock-line lock (see
+     * spu_coh_reserve_fast). Written under that lock, read by the context's
+     * own thread. */
     int coh_listed;
-    /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
-     * context's current lifetime: 0 after spu_context_init (or a zeroed
-     * allocation) until its first cached dispatch, so a context reset at the
-     * same address never meets an earlier lifetime's entries. dcache_residency
-     * is bumped on every change to resident_code, dropping the cached
-     * resolutions of this context. */
-    uint32_t dcache_id, dcache_residency;
     /* PS3RECOMP_PPU_STORE_LIVE_SPU (spu_coherency.c): the line this context
      * counts in the live-reservation table, from its GETLLAR until the
      * reservation ends on this thread. Owner thread only. */
@@ -418,6 +445,22 @@ typedef struct spu_context {
      * the reservation was taken under. It is lost when the count moves. */
     uint32_t resv_count;
 } spu_context;
+
+/* event_status is written from more than one host thread: the SPU's own
+ * (Sn from a list stall, Tg, its own Lr poll, WrEventAck) and others (a PPU
+ * store or a peer SPU's PUT/PUTLLC raising Lr through spu_coherency.c). A
+ * plain |= on each side loses bits: the Sn of a stalled DMA list vanished
+ * under a concurrent Lr raise, leaving the list parked (list_stall_stat set)
+ * with Sn clear, and the job manager that armed it waiting for its interrupt
+ * for ever. Every update goes through these. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define SPU_EVENT_SET(c, b)   _InterlockedOr((volatile long*)&(c)->event_status, (long)(uint32_t)(b))
+#define SPU_EVENT_CLEAR(c, b) _InterlockedAnd((volatile long*)&(c)->event_status, (long)~(uint32_t)(b))
+#else
+#define SPU_EVENT_SET(c, b)   __atomic_fetch_or(&(c)->event_status, (uint32_t)(b), __ATOMIC_SEQ_CST)
+#define SPU_EVENT_CLEAR(c, b) __atomic_fetch_and(&(c)->event_status, ~(uint32_t)(b), __ATOMIC_SEQ_CST)
+#endif
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
  * base) that the HLE kernel plants as exitToKernelAddr / selectWorkloadAddr in
@@ -495,9 +538,9 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
  * helpers in `spu_helpers.h` were written against. */
 /* The 128-bit LS accessors are THE hot primitive of lifted SPU execution
  * (every load/store in a Bink movie frame's ~millions of lifted instructions
- * runs through here). On x86 the whole BE<->LE quadword swizzle is one
- * SSSE3 byte-shuffle instead of 16 scalar byte ops -- measured against the
- * scalar path with the same per-lane _u32 semantics. */
+ * runs through here). SPU_LS_FAST swaps each word with a bswap; on an SSSE3
+ * x86 host SPU_LS_VEC (below) does the whole BE<->LE quadword swizzle as one
+ * byte-shuffle, as rev32 does on NEON, with the same per-lane _u32 semantics. */
 #if defined(_MSC_VER)
 #include <stdlib.h>
 #define SPU_BSWAP32(x) _byteswap_ulong(x)
@@ -508,6 +551,20 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>     /* the quadword swap is one rev32 */
+#endif
+/* SPU_LS_VEC: the quadword as one 16-byte load or store and one pshufb that
+ * byte-swaps each word. The four 32-bit stores of the scalar form, read back by
+ * the next 16-byte load of the register, cannot be store-forwarded: a stall on
+ * every lqd/lqx of lifted code. Define SPU_LS_VEC=0 to keep the scalar form. */
+#if !defined(SPU_LS_VEC) && !defined(__ARM_NEON) && defined(__SSSE3__) && \
+    (defined(__x86_64__) || defined(_M_X64))
+#define SPU_LS_VEC 1
+#endif
+#if SPU_LS_VEC
+#include <tmmintrin.h>
+static inline __m128i spu_ls_bswap_words(__m128i x) {
+    return _mm_shuffle_epi8(x, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
+}
 #endif
 
 /* Debug probes of spu_ls_read128/write128, out of line: inlined they kept
@@ -545,7 +602,7 @@ static inline int spu_ls_wws_probe_on(void)
     if (g_spu_wws_probe < 0) g_spu_wws_probe = getenv("SPU_WWS_PROBE") ? 1 : 0;
     return g_spu_wws_probe;
 }
-static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
+static SPU_NOINLINE_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
     /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
@@ -586,7 +643,7 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
 
 /* The read diagnostics, then g_spu_ls_rdiag recomputed: it drops to 0 once
  * none is armed (the first call also settles g_spu_ls_watch_n). */
-static __attribute__((noinline, cold)) void spu_ls_read_diag(const spu_context* ctx, uint32_t lsa)
+static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t lsa)
 {
     spu_ls_read_probe(ctx, lsa);
     const uint32_t a = lsa & SPU_LS_MASK & ~0xFu;
@@ -604,6 +661,8 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     const uint8_t* p = &ctx->ls[lsa];
 #if defined(__ARM_NEON)
     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
+#elif SPU_LS_VEC
+    _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)p)));
 #elif SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -621,7 +680,7 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     return v;
 }
 
-static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, u128 val)
+static SPU_NOINLINE_COLD void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, u128 val)
 {
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode) {
         extern int g_wws_code_probe;   /* defined in spu_channels.c, capped */
@@ -652,7 +711,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* 
 }
 /* SPU_SMC_WATCH, out of line: g_spu_smc_watch is -1 until read, then 0/1. */
 extern int g_spu_smc_watch;
-static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
+static SPU_NOINLINE_COLD void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
 {
     if (g_spu_smc_watch < 0) g_spu_smc_watch = getenv("SPU_SMC_WATCH") ? 1 : 0;
     /* SPU_SMC_WATCH=<img>: self-modification detector. Log any store whose
@@ -675,7 +734,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
 }
 
 /* The write diagnostics, after the store, then g_spu_ls_wdiag recomputed. */
-static __attribute__((noinline, cold)) void spu_ls_write_diag(spu_context* ctx, uint32_t lsa, u128 val)
+static SPU_NOINLINE_COLD void spu_ls_write_diag(spu_context* ctx, uint32_t lsa, u128 val)
 {
     const uint8_t* p = &ctx->ls[lsa];
     /* WWS code-buffer probe (SPU_WWS_PROBE=1): LBP's ChangeLoadToRunJob
@@ -701,6 +760,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
     uint8_t* p = &ctx->ls[lsa];
 #if defined(__ARM_NEON)
     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
+#elif SPU_LS_VEC
+    _mm_storeu_si128((__m128i*)p, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)val._u8)));
 #elif SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
@@ -864,11 +925,12 @@ extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 /* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
 void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
 void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    */
-/* Complete ordered transfer checkpoint; the launch-only ABI remains above. */
+/* Complete ordered hop; the launch-only ABI above does not tick lockstep. */
 void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*));
-extern unsigned g_spu_stack_reset_count;
-static inline int spu_stack_reset_needed(const spu_context* ctx) {
-    unsigned count=__atomic_load_n(&g_spu_stack_reset_count,__ATOMIC_ACQUIRE);
+extern unsigned g_spu_stack_reset_count; /* read-only outside registration */
+static inline int spu_stack_reset_needed(const spu_context* ctx)
+{
+    unsigned count = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
     return count && ctx->host_depth && !ctx->policy_mode;
 }
 /* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
@@ -883,11 +945,13 @@ void spu_ch_wake(spu_context* ctx);
  * SPU code is looping. Report the SPU pc/image once and halt instead.
  * SPU_HOST_DEPTH_MAX overrides the limit. */
 void spu_depth_guard(spu_context* ctx);
-extern uint32_t g_spu_depth_guard_limit;
-static inline void spu_depth_guard_check(spu_context* ctx) {
-    /* Preserve collection throughout the upper half of the depth budget. */
-    uint32_t limit=g_spu_depth_guard_limit;
-    if(!limit || ctx->host_depth>=limit/2)spu_depth_guard(ctx);
+extern uint32_t g_spu_depth_guard_limit; /* initialized by spu_depth_guard */
+static inline void spu_depth_guard_check(spu_context* ctx)
+{
+    /* Zero initializes (and preserves a configured zero); upper-half calls
+     * must still record the same diagnostic ring before the final limit. */
+    uint32_t limit = g_spu_depth_guard_limit;
+    if (!limit || ctx->host_depth >= limit / 2) spu_depth_guard(ctx);
 }
 int  spu_tailret_enabled(void);
 /* Actual native dispatch ownership; nested drains invalidate rather than restore. */
@@ -920,6 +984,13 @@ static inline void spu_region_dispatch_invoke(spu_context* ctx,
  * unchanged (interrupt not taken) if LS 0 holds no branch instruction. */
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*);
+/* SPU_IRQWAIT_DIAG=1 (spu_drain.c): interrupts enabled with nothing pending to
+ * take. A guest that enables interrupts and spins until its handler runs (a
+ * job manager waiting on an event) reports what it is waiting on every 2^22
+ * such dispatches. g_spu_irqwait_diag is -1 until the first call reads the
+ * variable, then 0/1, so with it off the dispatch loop pays one load. */
+SPU_GATE int g_spu_irqwait_diag = -1;
+void spu_irqwait_diag(spu_context* ctx);
 
 /* Drain a translated call up to its explicit architectural return PC. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc);
@@ -999,12 +1070,55 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \
+            else if (__builtin_expect(g_spu_irqwait_diag != 0, 0) && \
+                     (ctx)->int_enable)                         \
+                spu_irqwait_diag(ctx);                         \
             spu_pchist_tick(ctx);                              \
             g_spu_pch[g_spu_pch_n++ & 7u] =                    \
                 (uint32_t)((ctx)->pc & SPU_LS_MASK);           \
             spu_region_dispatch_invoke((ctx),_tf,0,0);                                          \
         }                                                      \
     } while (0)
+
+/* A lifted cross-function branch with a known target (br, the conditional
+ * branches, a fall-through into the next function). It used to set the
+ * trampoline and return, and the enclosing drain loop called the target: a
+ * host return, a loop pass and an indirect call per transfer. SPU_DIRECT
+ * tail-calls the target instead (no host stack growth) when nothing the drain
+ * loop does per step applies: the target is not LS 0 (a job's end), this is
+ * not the run's first transfer (the LS 0 check counts steps from there), the
+ * target is not in the stack-reset hint table, and no interrupt is pending
+ * with interrupts enabled. Anything else takes the trampoline as before. Tail calls need
+ * clang's musttail; other compilers always take the trampoline.
+ * PS3_SPU_DIRECT=0 = always the trampoline; the diagnostics that watch each
+ * drain step (SPU_LOCKSTEP, SPU_STEPTRACE, SPURS_PM_FLOW, ...) turn it off
+ * too (spu_drain.c). */
+extern volatile int g_spu_direct;                /* spu_drain.c: -1 unread, 0 off, 1 on */
+extern uint8_t g_spu_stack_reset_hint[1024];     /* spu_channels.c, by (entry >> 2) & 1023 */
+void spu_direct_init(void);
+#if defined(__clang__) && defined(__has_attribute)
+#  if __has_attribute(musttail)
+#    define SPU_DIRECT_TAILCALLS 1
+#  endif
+#endif
+#ifdef SPU_DIRECT_TAILCALLS
+#define SPU_DIRECT(ctx, PC, FN) do {                                          \
+        const uint32_t _dpc = (uint32_t)(PC);                                 \
+        (ctx)->pc = _dpc;                                                     \
+        if (__builtin_expect(g_spu_direct > 0, 1) && (_dpc & SPU_LS_MASK) &&  \
+            (ctx)->steps && !g_spu_stack_reset_hint[(_dpc >> 2) & 1023u] &&    \
+            !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask))) \
+            __attribute__((musttail)) return FN(ctx);                         \
+        g_spu_trampoline_fn = FN;                                             \
+        return;                                                               \
+    } while (0)
+#else
+#define SPU_DIRECT(ctx, PC, FN) do {                                          \
+        (ctx)->pc = (PC);                                                     \
+        g_spu_trampoline_fn = FN;                                             \
+        return;                                                               \
+    } while (0)
+#endif
 
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task

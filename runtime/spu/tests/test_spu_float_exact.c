@@ -13,6 +13,7 @@
  *   cc -O2 -I runtime/spu -I include runtime/spu/tests/test_spu_float_exact.c -lm -o t && ./t [scale]
  * scale (default 1) multiplies the pass-3 size: 1 = 64M vectors (256M lanes). */
 #include "spu_helpers.h"
+#include "../../../tests/spu_ls_watch_fixture.h"
 #include <stdio.h>
 #include <stdlib.h>
 

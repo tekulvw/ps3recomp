@@ -14,6 +14,7 @@
 #include "gcm_checked_completion.h"
 #include "rsx_deferred_reports.h"
 #include "rsx_ring_progress_observer.h"
+#include "rsx_tiling.h"
 #include "cellGcmSys.h"
 #include "rsx_native_handoff.h"
 #include "rsx_fifo_busy.h"
@@ -54,6 +55,7 @@ static int gcm_checked_backend_flush(void) {
 #include <stdlib.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include "../../runtime/ps3_log.h"   /* ps3_log_verbose: the per-call tile/zcull lines */
 #include <stdatomic.h>
 
 /* Source-qualified, one-shot command publication. No work is done in the
@@ -813,6 +815,33 @@ static void gcm_set_current_display_buffer(u32 bufferId)
 }
 
 
+/* The two JUMP encodings of the RSX FIFO: the old 0x20000000 | offset, and the new offset | 1 (the low two bits are 01
+ * and the top three are 000, so the offset is the whole word with those bits cleared). Returns 1 and the target for
+ * either. A new-style word read as a method header would be a count-0 header, and the walker would run on into the
+ * data after the jump. */
+static inline int gcm_fifo_jump_target(u32 w, u32* tgt)
+{
+    if ((w >> 29) == 1u)                  { *tgt = w & 0x1FFFFFFCu; return 1; }
+    if ((w & 0xE0000003u) == 1u)          { *tgt = w & 0xFFFFFFFCu; return 1; }
+    return 0;
+}
+
+/* The RSX puts its 3D state back to the reset values at a flip, and a title
+ * may count on that: one sets ZSTENCIL_CLEAR_VALUE to 0 for a single clear
+ * and never writes it again, so its later depth clears are to the far plane
+ * only because every flip restored 0xFFFFFF00 (RPCS3's flip_command resets
+ * the whole register file, rsx_state::reset). Here it reaches every consumer
+ * of the method stream, at the flip's place in it.
+ * TODO: the rest of the reset image; this is the one register a title has
+ * been seen to depend on. */
+static void gcm_fifo_flip_resets_state(rsx_state* state)
+{
+    const u32 m = NV4097_SET_ZSTENCIL_CLEAR_VALUE, v = RSX_DSP_ZSTENCIL_CLEAR_RESET;
+    rsx_process_method(state, m, v);
+    if (rsx_live_draw_enabled())   rsx_live_draw_method(m, v);
+    if (rsx_draw_engine_enabled()) rsx_draw_engine_method(m, v);
+}
+
 /* Configuration */
 static CellGcmConfig s_config;
 /* Offset pages (1MB) known to be LOCAL-memory-derived (set by
@@ -995,6 +1024,20 @@ static _Atomic(u64) s_user_pending = 0;
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
 
+/* Every RSX client reads and writes tiled main memory through the tiling
+ * (rsx_tiling.h): publish what is bound. */
+static void gcm_tile_publish(u32 index)
+{
+    const CellGcmTileInfo* t = &s_tiles[index];
+    if (t->bound) rsx_tiling_set(index, t->tile & 1u, t->offset, t->size, t->pitch, t->bank);
+    else          rsx_tiling_set(index, 0, 0, 0, 0, 0);
+}
+
+static void gcm_tiles_publish(void)
+{
+    for (u32 i = 0; i < CELL_GCM_MAX_TILE_COUNT; i++) gcm_tile_publish(i);
+}
+
 /* Zcull configuration (8 zcull regions) */
 static CellGcmZcullInfo s_zcull[CELL_GCM_MAX_ZCULL_COUNT];
 
@@ -1063,6 +1106,25 @@ static int s_gcm_syscall_mode = 0;
  * Internal helpers
  * -----------------------------------------------------------------------*/
 
+/* The guest's copy of the tables is the real thing once cellGcmGetOffsetTable
+ * has handed it out: titles keep the pointers and convert addresses inline
+ * (ioAddress[ea >> 20], 0xFFFF and up meaning unmapped) instead of calling
+ * cellGcmAddressToOffset. Publishing only inside cellGcmGetOffsetTable left
+ * every later map and unmap out of it. God of War: Ascension maps more main
+ * memory after taking the table, converts a command buffer pointer in it to
+ * `put`, gets -1, and the FIFO walker then runs off the end of its commands
+ * into shader microcode. From the first hand-out on, each changed entry is
+ * written through. */
+static int s_offset_tables_published;
+static void gcm_mirror_offset_entry(u32 ea_page, u32 io_page)
+{
+    if (!s_offset_tables_published) return;
+    if (ea_page < GCM_OFFSET_TABLE_PAGES)
+        vm_write16(GCM_OFFSET_TABLE_IO_ADDR + ea_page * 2, s_io_address_table[ea_page]);
+    if (io_page < GCM_OFFSET_TABLE_PAGES)
+        vm_write16(GCM_OFFSET_TABLE_EA_ADDR + io_page * 2, s_ea_address_table[io_page]);
+}
+
 /* Populate the offset table entries for an IO mapping */
 static void populate_offset_table(u32 ea, u32 io, u32 size)
 {
@@ -1083,6 +1145,7 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = (u16)(io_page + i);
         s_ea_address_table[io_page + i] = (u16)(ea_page + i);
+        gcm_mirror_offset_entry(ea_page + i, io_page + i);
     }
 }
 
@@ -1096,6 +1159,7 @@ static void clear_offset_table(u32 ea, u32 io, u32 size)
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = 0xFFFF;
         s_ea_address_table[io_page + i] = 0xFFFF;
+        gcm_mirror_offset_entry(ea_page + i, io_page + i);
     }
 }
 
@@ -1176,6 +1240,7 @@ static s32 cellGcmInit_consumer_body(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(s_io_mappings, 0, sizeof(s_io_mappings));
     __atomic_store_n(&s_io_mapping_hw, 0, __ATOMIC_RELAXED);
     memset(s_tiles, 0, sizeof(s_tiles));
+    gcm_tiles_publish();
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
     s_report_dma = GCM_REPORT_DMA_LOCAL;
@@ -1188,7 +1253,7 @@ static s32 cellGcmInit_consumer_body(u32 cmdSize, u32 ioSize, u32 ioAddress)
      * In a real implementation these would reflect actual allocated memory.
      */
     s_config.localAddress    = 0xC0000000;  /* typical RSX local mem base */
-    s_config.localSize       = 256 * 1024 * 1024;  /* 256 MB */
+    s_config.localSize       = 0x0F900000u;  /* 249 MB: retail PS3 value; 256 MB overflows 28-bit heap size field */
     s_config.ioAddress       = ioAddress;
     s_config.ioSize          = ioSize;
     s_config.memoryFrequency = 650000000;   /* 650 MHz */
@@ -1251,6 +1316,18 @@ static s32 cellGcmInit_consumer_body(u32 cmdSize, u32 ioSize, u32 ioAddress)
     return CELL_OK;
 }
 
+/* GCM_FIFO_SEGMENT=<bytes>: hand the title its command ring a segment at a
+ * time, as libgcm does (RPCS3's _cellGcmInitBody uses 32 KB). The context's
+ * `end` is the end of the current segment, so the title's own reserve calls
+ * the buffer-full callback at every segment; the callback publishes `put`
+ * there and moves on (gcm_fifo_next_segment). The RSX then starts on a frame
+ * while the title is still writing it. With the whole ring as one segment,
+ * as before, `put` moves only when the title flushes: God of War HD flushes
+ * twice a frame, the second time at its flip, so its ~1.2 MB of commands
+ * reached the walker in one go and the title and the walker took turns.
+ * Unset (the default), nothing changes. */
+static u32 s_seg_size = 0, s_ring_begin = 0, s_ring_end = 0;
+
 /* Reusable _cellGcmInitBody core (NID 0x15BAE46B). See cellGcmSys.h for why the
  * guest vm is injected as callbacks. The CellGcmContextData layout here is the
  * one proven in the shipping Simpsons port (begin@0/end@4/current@8/callback@C);
@@ -1273,10 +1350,23 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
     cellGcmInit(cmdSize, ioSize, ioAddress);
 
     u32 cmdbuf = ioAddress;                 /* FIFO lives at the IO region start */
+    {
+        const char* e = getenv("GCM_FIFO_SEGMENT");
+        const u32 seg = e ? (u32)strtoul(e, NULL, 0) : 0;
+        if (seg >= 0x1000 && (seg & 0xFFFu) == 0 && cmdSize >= 2 * seg) {
+            s_seg_size = seg;
+            s_ring_begin = cmdbuf;
+            s_ring_end = cmdbuf + cmdSize - cmdSize % seg;
+            printf("[cellGcmSys] command ring 0x%08X-0x%08X in %u KB segments%c",
+                   s_ring_begin, s_ring_end, seg / 1024, 10);
+        }
+    }
     u32 cdata  = galloc ? galloc(16, 16) : 0;
     if (cdata && gwrite32) {
         gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
-        gwrite32(cdata + 0x4, cmdbuf + cmdSize);    /* end     */
+        /* end: the wrap JUMP's slot, as in the SDK (#648); with GCM_FIFO_SEGMENT
+         * (#566) the first segment less the 4 bytes its closing JUMP needs. */
+        gwrite32(cdata + 0x4, s_seg_size ? cmdbuf + s_seg_size - 4 : cmdbuf + cmdSize - 4);
         gwrite32(cdata + 0x8, cmdbuf);              /* current */
         /* Command-buffer-full callback: a guest OPD {func, toc} routed to
          * hle_gcm_callback -> cellGcm_fifo_recycle. Without a real callback the
@@ -1417,7 +1507,11 @@ u32 cellGcmGetFlipStatus(void)
 #ifdef _WIN32
 #include <windows.h>
 static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
-#define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
+/* Wakes one guest thread blocked in a semaphore wait, which then pumps (see
+ * ppu_gcm_wait_pump). Auto-reset; NULL until the first such wait. */
+static HANDLE s_gcm_pump_ev = NULL;
+static void gcm_pump_wake(void) { if (s_gcm_pump_ev) SetEvent(s_gcm_pump_ev); }
+#define GCM_PENDING_SET(bits)  (InterlockedOr(&s_gcm_pending, (bits)), gcm_pump_wake())
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
 static volatile LONG s_gcm_pumping = 0;
 #define GCM_PUMP_TRY_ENTER() (InterlockedCompareExchange(&s_gcm_pumping, 1, 0) == 0)
@@ -1531,8 +1625,81 @@ void cellGcm_request_tick(void)
  * may both pump, and newer causes must not overtake already claimed callbacks.
  * A nonblocking guard also prevents nested callbacks from reentering. Leave
  * pending notifications untouched when another pump is active. */
+#ifdef _WIN32
+/* For sys_semaphore_wait. A guest thread blocked there also waits on this
+ * event and, when it fires, runs *pump (ppu_gcm_pump) to deliver what is
+ * pending, as a timer sleep or an HLE call does. Without it a flip handler
+ * waits for some guest thread to reach one of those: about 1 ms a frame in
+ * God of War HD, whose main thread sits in a semaphore wait until its flip
+ * handler posts that semaphore. */
+void ppu_gcm_pump(void);
+void* ppu_gcm_wait_pump(void (**pump)(void))
+{
+    if (!s_gcm_pump_ev) {
+        HANDLE e = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (e && InterlockedCompareExchangePointer((PVOID volatile*)&s_gcm_pump_ev, e, NULL) != NULL)
+            CloseHandle(e);
+        if (s_gcm_pending || s_user_pending) gcm_pump_wake();
+    }
+    *pump = ppu_gcm_pump;
+    return (void*)s_gcm_pump_ev;
+}
+#endif
+
+/* GCM_HANDLER_THREAD=1: deliver the guest's vblank/flip/user handlers only on a
+ * dedicated host thread, as the PS3 does on its GCM interrupt thread. Pumped at
+ * an HLE boundary, a handler runs nested in whatever guest thread made the call
+ * and inherits its thread id, so a handler taking a lock that thread already
+ * holds re-enters it instead of waiting. MLB The Show 16's lock wrappers record
+ * the owner id and unlock only for the recorded owner: its flip handler,
+ * delivered inside its DisplayFlip thread, cleared that record, DisplayFlip's
+ * own unlock was skipped and the lock leaked, freezing the game. */
+void ppu_gcm_pump(void);
+static unsigned long s_gcm_intr_tid = 0;
+static int gcm_handler_thread_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_HANDLER_THREAD"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+static DWORD WINAPI gcm_intr_main(LPVOID unused)
+{
+    (void)unused;
+    s_gcm_intr_tid = (unsigned long)GetCurrentThreadId();
+#ifdef _WIN32
+    for (;;) { ppu_gcm_pump(); Sleep(1); }
+#else
+    for (;;) { ppu_gcm_pump(); usleep(250); }
+#endif
+    return 0;
+}
+
+#ifndef _WIN32
+static void* gcm_intr_posix(void* a) { gcm_intr_main(a); return NULL; }
+#endif
+
 void ppu_gcm_pump(void)
 {
+    /* Every HLE call and timer sleep pumps, tens of thousands of times a
+     * second, and almost always nothing is pending. Look before taking the
+     * pump and swapping the pending words out: three atomic operations on
+     * lines the ticker thread writes. A notification posted just after this
+     * read is delivered by the next pump, as one posted while another thread
+     * holds the pump is. */
+    if (!s_gcm_pending && !s_user_pending) return;
+    if (gcm_handler_thread_on() && (unsigned long)GetCurrentThreadId() != s_gcm_intr_tid) {
+        static volatile long started = 0;
+        if (!started && InterlockedCompareExchange(&started, 1, 0) == 0)
+#ifdef _WIN32
+            CreateThread(NULL, 1u << 20, gcm_intr_main, NULL, 0, NULL);
+#else
+        { pthread_t t; if (pthread_create(&t, NULL, gcm_intr_posix, NULL) == 0) pthread_detach(t); }
+#endif
+        return;   /* only the interrupt thread delivers */
+    }
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
     u64 user = GCM_USER_PENDING_TAKE();
@@ -2071,13 +2238,29 @@ unsigned long long ps3_ms_now(void)
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
 static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park */
+static int s_report_hold_pass = 0;    /* this drain stopped on a held GET_REPORT */
+/* The park the walker is waiting on (0 = none), the `put` it saw there, and
+ * since when it has stood with that put: the jump-park grace in the walker. */
+static u32 park_off, park_put;
+static unsigned long long park_since;
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
 /* How long a self-JUMP park may stand with `put` somewhere else before the
- * drain gives up on it being patched and follows `put` instead. */
+ * drain gives up on it being patched and follows `put` instead.
+ * GCM_PARK_GRACE_MS=<ms> sets it. A title that appends after the park, moves
+ * `put` there and patches the park last needs it longer: God of War HD,
+ * loading its menu, has taken more than 50 ms between the two stores, and
+ * following `put` dropped the commands in between, a fence with them, so
+ * the boot stopped. The RSX itself would just wait. */
 #define GCM_PARK_GRACE_MS 50ull
+static unsigned long long gcm_park_grace_ms(void)
+{
+    static long long ms = -1;
+    if (ms < 0) { const char* e = getenv("GCM_PARK_GRACE_MS"); ms = e ? atoll(e) : (long long)GCM_PARK_GRACE_MS; }
+    return (unsigned long long)ms;
+}
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -2107,8 +2290,9 @@ static u32 gcm_fifo_backlog(u32 put, u32 get)
 {
     if (put >= get) return put - get;
     if (!s_gcm_context_ea) return 0;
-    u32 b = gcm_ea2io(vm_read32(s_gcm_context_ea + 0x0));
-    u32 e = gcm_ea2io(vm_read32(s_gcm_context_ea + 0x4));
+    /* In segments the context holds only the current one; the ring is fixed. */
+    u32 b = gcm_ea2io(s_seg_size ? s_ring_begin : vm_read32(s_gcm_context_ea + 0x0));
+    u32 e = gcm_ea2io(s_seg_size ? s_ring_end : vm_read32(s_gcm_context_ea + 0x4));
     if (b == 0xFFFFFFFFu || e == 0xFFFFFFFFu || e <= b) return 0;
     if (get < b || get > e || put < b || put > e) return 0;
     return (e - get) + (put - b);
@@ -2213,18 +2397,68 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
  * pixel: an SPU holding a reservation on a 128-byte line the row overwrites
  * loses it and gets its lost-reservation event. The two byte swaps a
  * vm_read32/vm_write32 pair does cancel, so the bytes move verbatim. */
-static void gcm_row_copy(u32 d, u32 s, u32 n)
+static void gcm_store(u32 d, const u8* src, u32 n)
 {
     extern u8* vm_base;
     const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
     int reserved = 0;
     for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
-    if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
+    if (!reserved) { memmove(vm_base + d, src, n); return; }
     spu_coh_write_begin(d, n);
-    memmove(vm_base + d, vm_base + s, n);
+    memmove(vm_base + d, src, n);
     for (u32 a = l0; a <= l1; a += 128)
         if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
     spu_coh_write_end();
+}
+
+static void gcm_row_copy(u32 d, u32 s, u32 n)
+{
+    extern u8* vm_base;
+    gcm_store(d, vm_base + s, n);
+}
+
+/* Guest memory as the 2D engines reach it, for the tiled range copies
+ * (rsx_tiling.h): a write keeps gcm_store's reservation bookkeeping. */
+static u8* gcm_tiled_ptr(void* user, u32 location, u32 offset, u32 len)
+{
+    extern u8* vm_base;
+    (void)user;
+    const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+    if (!ea || !len || (u64)ea + len > (ppu_vm_size ? ppu_vm_size : VM_TOTAL_SIZE)) return NULL;
+    return vm_base + ea;
+}
+
+static void gcm_tiled_store(void* user, u8* dst, const u8* src, u32 len)
+{
+    extern u8* vm_base;
+    (void)user;
+    gcm_store((u32)(dst - vm_base), src, len);
+}
+
+static const rsx_tiled_mem s_gcm_mem = { gcm_tiled_ptr, gcm_tiled_store, NULL };
+
+/* Whether `rows` rows of `pitch` bytes at `offset` touch a tile bound over
+ * main memory (always 0 for local memory, whose tiles are transparent). */
+static int gcm_rect_tiled(int local, u32 offset, u32 pitch, u32 rows)
+{
+    rsx_tile t;
+    if (local || !rsx_tiling_active()) return 0;
+    const u64 len = (u64)pitch * (rows ? rows : 1u);
+    return rsx_tiling_find(RSX_LOCATION_MAIN, offset, len > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)len, &t);
+}
+
+/* Scratch rows for the copies that go through the tiling; FIFO thread only. */
+static u8* gcm_rows(u32 bytes)
+{
+    static u8* rows;
+    static u32 cap;
+    if (cap < bytes) {
+        u8* n = (u8*)realloc(rows, bytes);
+        if (!n) return NULL;
+        rows = n;
+        cap = bytes;
+    }
+    return rows;
 }
 
 static void nv3089_blit(void)
@@ -2303,6 +2537,12 @@ static void nv3089_blit(void)
         u32 dst2 = cellGcmResolveLocated(1, s_nv309e.offset);
         u32 u0b = s_nv3089.in_uv & 0xFFFF, v0b = s_nv3089.in_uv >> 16;
         nv3089_engine_read(in_pitch, out_w, out_h);
+        /* A source in tiled main memory is read a row at a time through the
+         * tiling, up to the last texel the row samples. */
+        const int stiled = gcm_rect_tiled(sl, s_nv3089.in_off, in_pitch, s_nv3089.in_sz >> 16);
+        const u32 sw = (u32)((nv3089_origin(u0b) + (u64)(out_w - 1u) * s_nv3089.ds_dx) >> 20) + 1u;
+        u8* trow = stiled ? gcm_rows(sw * 4u) : NULL;
+        if (stiled && !trow) return;
         /* Copy words verbatim through raw pointers rather than vm_read32/
          * vm_write32: this moves ~500k pixels per blit and several blits run per
          * frame, and the two byte swaps would cancel anyway. */
@@ -2312,6 +2552,11 @@ static void nv3089_blit(void)
           for (u32 y = 0; y < out_h; y++) {
               u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
               const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
+              if (stiled) {
+                  rsx_tiled_read(&s_gcm_mem, RSX_LOCATION_MAIN, s_nv3089.in_off + (u32)(sv >> 20) * in_pitch,
+                                 trow, sw * 4u);
+                  srow = trow;
+              }
               for (u32 x = 0; x < out_w; x++) {
                   u64 su = nv3089_origin(u0b) + (u64)x * s_nv3089.ds_dx;
                   memcpy(dbase + (u64)nv309e_swz(x, y, l2w, l2h) * 4,
@@ -2382,6 +2627,36 @@ static void nv3089_blit(void)
      * per-pixel copy, which is what the PPU store watches see. */
     static int rowcopy = -1;
     if (rowcopy < 0) { const char* e = getenv("NV3089_ROWCOPY"); rowcopy = e ? atoi(e) : 1; }
+    /* A side in tiled main memory goes through the tiling (rsx_tiling.h).
+     * A retail title downsamples its scene and depth into a tiled main-memory
+     * region for an SPU depth-of-field job while aiming. */
+    const u32 in_w = s_nv3089.in_sz & 0xFFFF;
+    if (in_w && (gcm_rect_tiled(src_local, s_nv3089.in_off, in_pitch, s_nv3089.in_sz >> 16) ||
+                 gcm_rect_tiled(dst_local, s_gcm2d.dst_offset, dst_pitch, out_y + out_h))) {
+        /* Row at a time: the source row read as the RSX sees it, the
+         * destination row built linearly and written the same way. */
+        u8* srow = gcm_rows((in_w + out_w) * bpp);
+        if (!srow) return;
+        u8* drow = srow + in_w * bpp;
+        const u32 sloc = src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        const u32 dloc = dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        u32 xa = 0, xb = out_w;
+        if (out_x < cx0) xa = cx0 - out_x;
+        if ((u64)out_x + xb > cx1) xb = cx1 > out_x ? cx1 - out_x : 0;
+        for (u32 y = 0; y < out_h && xa < xb; y++) {
+            const u32 dy = out_y + y;
+            if (dy < cy0 || dy >= cy1) continue;
+            const u32 sy = (u32)((nv3089_origin(v0) + (u64)y * s_nv3089.dt_dy) >> 20);
+            rsx_tiled_read(&s_gcm_mem, sloc, s_nv3089.in_off + sy * in_pitch, srow, in_w * bpp);
+            for (u32 x = xa; x < xb; x++) {
+                u32 sx = (u32)((nv3089_origin(u0) + (u64)x * s_nv3089.ds_dx) >> 20);
+                if (sx >= in_w) sx = in_w - 1u;
+                memcpy(drow + x * bpp, srow + sx * bpp, bpp);
+            }
+            rsx_tiled_write(&s_gcm_mem, dloc, s_gcm2d.dst_offset + dy * dst_pitch + (out_x + xa) * bpp,
+                            drow + xa * bpp, (xb - xa) * bpp);
+        }
+    } else
     if (rowcopy && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
         /* the source start in whole texels: IMAGE_IN_POINT is 12.4 */
         const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
@@ -2501,6 +2776,12 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                   printf("[GCM2D] inline write dst=0x%08X (off=0x%X dma=0x%X pt=%u,%u pitch=%u) = 0x%08X\n",
                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
+            const u32 at = s_gcm2d.dst_offset + py * dst_pitch + px * 4;
+            if (gcm_rect_tiled(local, at, 4, 1)) {
+                const u8 word[4] = { (u8)(data >> 24), (u8)(data >> 16), (u8)(data >> 8), (u8)data };
+                rsx_tiled_write(&s_gcm_mem, RSX_LOCATION_MAIN, at, word, 4);
+                return;
+            }
             vm_write32(base + py * dst_pitch + px * 4, data);
             return;
         }
@@ -2980,9 +3261,52 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
             gcm_ref_push_at(vm_read32(dea), io);
             rescued++;
         }
-        if (rescued) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
-            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
-                    " 0x%08X..0x%08X\n", rescued, from, land); }
+        /* Fences are not the only sync writes a title waits on. Walk the
+         * skipped range as a command stream (each header and its data; NOPs,
+         * flip markers and self-JUMP parks stepped over, forward JUMPs inside the range
+         * followed; stopping at anything else that is not a method header) and
+         * replay the label releases in it as well: NV406E SEMAPHORE_RELEASE
+         * (0x6C, at the offset 0x64 set) and the NV4097 back-end and
+         * texture-read releases (0x1D70/0x1D74 at the 0x1D6C offset, in the
+         * 0x01A4 context), the latter through rsx_process_method so they land
+         * exactly where the walker would have written them. inFAMOUS 2 waits
+         * on a 0x1D74 release from an SPU-filled command block; a resync that
+         * skipped it left the title waiting for the rest of the run. Draws in
+         * the range are still lost. */
+        static rsx_state s_resync_state;   /* the sync methods do not touch it */
+        unsigned labels = 0;
+        for (u32 io = from; io + 4 <= land; ) {
+            const u32 ea = gcm_io2ea(io); if (!ea) break;
+            const u32 w = vm_read32(ea), type = w >> 29;
+            if (w == 0 || (w & 0xFFFFFF00u) == GCM_FLIP_MARKER) { io += 4; continue; }   /* NOP, flip (counted above) */
+            if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) {   /* JUMP */
+                const u32 tgt = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
+                if (tgt == io) { io += 4; continue; }   /* a park */
+                if (tgt > io && tgt < land) { io = tgt; continue; }
+                break;
+            }
+            if (type != 0 && type != 2) break;          /* CALL, RETURN, or not a header */
+            const u32 count = (w >> 18) & 0x7FFu, method = w & 0x1FFCu, subch = (w >> 13) & 7u;
+            if (!count || io + 4 + count * 4 > land) break;
+            for (u32 i = 0; i < count; i++) {
+                const u32 dea = gcm_io2ea(io + 4 + i * 4); if (!dea) break;
+                const u32 m = (type == 0) ? method + i * 4 : method, v = vm_read32(dea);
+                if (subch != 0) continue;
+                if (m == 0x64u) s_sema_offset = v;
+                else if (m == 0x6Cu) {
+                    atomic_thread_fence(memory_order_release);
+                    vm_write32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu), v);
+                    labels++;
+                } else if (m == 0x01A4u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u) {
+                    rsx_process_method(&s_resync_state, m, v);
+                    labels += (m == 0x1D70u || m == 0x1D74u);
+                }
+            }
+            io += 4 + count * 4;
+        }
+        if (rescued || labels) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
+            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) and %u label"
+                    " write(s) from 0x%08X..0x%08X\n", rescued, labels, from, land); }
     }
     *getoff = land;
 }
@@ -3247,10 +3571,12 @@ static void* wprof_thread(void* arg)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGPROF, &sa, NULL);
     fprintf(stderr, "[walker prof] sampling for %d s\n", secs);
-    for (int k = 0; k < secs * 1000 && atomic_load(&s_wprof_n) < WPROF_MAX; k++) {
+    const u64 deadline = get_timestamp_ns() + (u64)secs * 1000000000ULL;
+    do {
         pthread_kill(s_wprof_target, SIGPROF);
         nanosleep(&tick, NULL);
-    }
+    } while (atomic_load(&s_wprof_n) < WPROF_MAX &&
+             get_timestamp_ns() < deadline);
     nanosleep(&poll, NULL);
     const int n = atomic_load_explicit(&s_wprof_n, memory_order_acquire);
     FILE* f = fopen(out, "w");
@@ -3304,9 +3630,13 @@ static void wprof_note_walker(void)
 static void wprof_note_walker(void) {}
 #endif
 
+/* Host thread that last walked the FIFO, for PS3_SAMPLE_DRAIN. */
+volatile unsigned long g_gcm_drain_tid;
+
 void cellGcm_rsx_process_fifo(void)
 {
     wprof_note_walker();
+    g_gcm_drain_tid = GetCurrentThreadId();
     rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAIN);
     rsx_fifo_busy_pass_stopped(RSX_FIFO_BUSY_STOP_OTHER);   /* a pass that returns early */
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -3330,22 +3660,6 @@ void cellGcm_rsx_process_fifo(void)
     rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAIN);
 }
 
-/* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
-static int gcm_get_eq_put(void)
-{
-    static int eq = -1;
-    if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
-    return eq;
-}
-
-static void gcm_rsx_process_fifo_pass(void);
-static void gcm_rsx_process_fifo_unlocked(void)
-{
-    const char* e = getenv("PS3RECOMP_GCM_CHECKED_REF");
-    s_checked_ref_pass = e && !strcmp(e, "1");
-    gcm_rsx_process_fifo_pass();
-    s_checked_ref_pass = -1;
-}
 
 /* Diagnostic switches the walker tests on every pass or semaphore: read once. */
 static int gcm_env_flag(int* cached, const char* name)
@@ -3419,13 +3733,144 @@ static int gcm_legacy_method_has_effect(u32 m)
     }
 }
 
+/* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
+static int gcm_get_eq_put(void)
+{
+    static int eq = -1;
+    if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
+    return eq;
+}
+
+static void gcm_rsx_process_fifo_pass(void);
+/* Any per-word FIFO switch set, or a mirrored draw engine on. Read once per
+ * drain: the walker hands every data word through these checks, a million a
+ * second in God of War HD gameplay, and it used to test each switch on its
+ * own for every word. */
+static int gcm_word_diag(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = (getenv("GCM_SUBCH7") || getenv("GCM_OBJDBG") || getenv("GCM_SUBCH_GATE") || getenv("GCM_WORD_STATS") ||
+              getenv("GCM_VAL_WATCH") || getenv("GCM_METHOD_HIST") || getenv("RSX_LIVE_FEED_DBG") ||
+              rsx_live_draw_enabled() || rsx_draw_engine_enabled()) ? 1 : 0;
+    return on;
+}
+
+/* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
+ * plus the methods whose answer the walker writes itself. `dea` is the word's
+ * guest address; `method` and `count` are its packet's, for the checked
+ * reference's shape check. Returns 0 once the word is consumed, or -1 when the
+ * pass must stop in front of it, unconsumed, because a report or label it
+ * depends on has not landed yet (deferred reports, checked completion). */
+static int gcm_3d_method(rsx_state* st, u32 m, u32 v, u32 dea, u32 method, u32 count,
+                         int legacy_state_live)
+{
+    extern u32 g_rsx_last_reference;
+    if(m==0x50u && !((s_early_fifo_sync||gcm_checked_ref_mode())?gcm_reports_dependency():gcm_reports_sync_barrier()))return -1;
+    if(m==0x1d6cu)s_backend_label_offset=v;
+    if(m==0x1a4u)s_backend_label_dma=v;
+    if((m==0x1d70u||m==0x1d74u)&&gcm_reports_can_defer()){
+        u32 value=v;
+        if(m==0x1d70u)value=(value&0xff00ff00u)|((value>>16)&0xffu)|((value&0xffu)<<16);
+        u32 label_ea=VM_HLE_INJECT_BASE+(s_backend_label_offset&0xffffffu);
+        if(gcm_reports_live()&&s_backend_label_dma==0xFEED0001u){
+            label_ea=gcm_io2ea(s_backend_label_offset);
+            /* Legacy HOST_BUFFER skips an unmapped write. */
+            if(!label_ea){if(!gcm_reports_sync_barrier())return -1;return 0;}
+        }
+        if(!gcm_defer_label(label_ea,value,m,dea))return -1;
+        return 0;
+    }
+    if((m==0x1d70u||m==0x1d74u)&&!gcm_reports_sync_barrier())return -1;
+    /* #466: rsx_state feeds only the legacy vtable backend. With the draw
+     * engine up and no vtable registered, the state it builds is never read,
+     * so only the methods with effects outside it are worth handing over.
+     * The gate lives here rather than at the call sites because #554 funnelled
+     * every 3D method through this function -- there are two callers, and a
+     * gate at one of them only would be a silent half-measure. */
+    if (legacy_state_live || gcm_legacy_method_has_effect(m))
+    { const uint64_t l0=s_gph_on>0?gph_now():0;
+      rsx_process_method(st, m, v);
+      if(l0){s_gph.legacy_ns+=gph_now()-l0;s_gph.legacy_n++;} }
+    /* NV406E_SET_REFERENCE: queue the fence value for PACED
+     * publication (gcm_ref_publish below) instead of letting a
+     * later fence in the same batch overwrite it. */
+    if (m == 0x50) {
+        if(gcm_checked_ref_mode() && (count!=1 || method!=0x50)){gcm_checked_ref_fail("malformed-reference",s_fifo_getoff);return 0;}
+        if (gcm_checked_ref_mode() &&
+            !(s_early_fifo_sync ? gcm_early_reference_receipt() : gcm_checked_backend_flush()))
+            gcm_checked_ref_fail(s_early_fifo_sync ? "early-reference-receipt" : "backend-completion", s_fifo_getoff);
+        else gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+    }
+    if (m == 0x1A8u)
+        s_report_dma = v == 0xFEED0000u ? GCM_REPORT_DMA_LOCAL : v;
+    if (m == 0x1800u) {
+        gcm_observer_event(s_fifo_getoff,"report",v);
+        gcm_get_report(v);
+    }
+    return 0;
+}
+
+
+/* GCM_REPORT_SPU_HOLD_MS=<ms> (off by default): a GET_REPORT waits, up to <ms>,
+ * while SPU tasks that work in signal-driven rounds are in one
+ * (spu_taskset_round_busy). The real RSX spends a frame's time drawing between
+ * two reports; this walker spends none, so a title that turns reports into
+ * task signals can signal the next round while the last one runs, and a
+ * signal sent to a task that is still busy is taken by whatever wait it
+ * reaches next. God of War: Ascension's RsxSync posts post-process batch N+1
+ * on the next report, and the batch's signal ended batch N's barrier waits:
+ * the tasks then waited for a batch that had already been signalled, and the
+ * RSX waited for their label. Like an ACQUIRE, a held report stops the drain
+ * pass without consuming the method, and the next pass looks again.
+ * After arnaldolima1/gow-ascension-pc (ps3kit patch 0029). */
+static int gcm_report_hold(void)
+{
+    static int ms = -1;
+    if (ms < 0) { const char* e = getenv("GCM_REPORT_SPU_HOLD_MS"); ms = e ? atoi(e) : 0; }
+    if (ms <= 0) return 0;
+    extern int spu_taskset_round_busy(uint32_t*, uint32_t*);
+    extern unsigned long long ps3_ms_now(void);
+    static u32 h_off; static unsigned long long h_t0; static unsigned h_n, h_gaveup;
+    uint32_t ts = 0, tid = 0;
+    const int busy = spu_taskset_round_busy(&ts, &tid);
+    const unsigned long long now = ps3_ms_now();
+    if (busy && (!h_t0 || h_off != s_fifo_getoff)) { h_off = s_fifo_getoff; h_t0 = now; h_n++; }
+    if (busy && now - h_t0 < (unsigned long long)ms) return 1;
+    if (h_t0 && h_off == s_fifo_getoff) {
+        const int gave_up = busy != 0;
+        h_gaveup += (unsigned)gave_up;
+        static int ln = 0;
+        if (gave_up || PS3_LOG_FIRST(ln, 16))
+            fprintf(stderr, "[report-hold] #%u get=0x%08X held %llu ms%s (%u given up so far)\n",
+                    h_n, s_fifo_getoff, now - h_t0,
+                    gave_up ? ", gave up with a task still busy" : "", h_gaveup);
+        if (gave_up)
+            fprintf(stderr, "[report-hold]   busy: %d, first taskset 0x%08X task %u\n", busy, ts, tid);
+    }
+    h_t0 = 0;
+    return 0;
+}
+
+/* The diagnostic switches below are tested on every drain pass, and GCM_RECDBG
+ * on every semaphore method. getenv walks the whole environment and showed in
+ * RSX-thread profiles, so each is read once and cached, like the other knobs. */
+static void gcm_rsx_process_fifo_unlocked(void)
+{
+    const char* e = getenv("PS3RECOMP_GCM_CHECKED_REF");
+    s_checked_ref_pass = e && !strcmp(e, "1");
+    gcm_rsx_process_fifo_pass();
+    s_checked_ref_pass = -1;
+}
+
 static void gcm_rsx_process_fifo_pass(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
-      static int s_rate = -1;
-      if (gcm_env_flag(&s_rate, "GCM_RATE")) {
+      static int rate = -1;
+      if (rate < 0) rate = getenv("GCM_RATE") ? 1 : 0;
+      if (rate) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
@@ -3448,11 +3893,13 @@ static void gcm_rsx_process_fifo_pass(void)
     /* This pass looks at the stream again: a park it ends on is armed anew. */
     if (s_park_kick > 0) atomic_store(&s_park_wait_ea, 0u);
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
+    const int wdiag = gcm_word_diag();
     /* rsx_state feeds only the legacy vtable backend. With the draw engine
-     * up and no vtable registered, the state it builds is never read, and
-     * the only methods worth handing it are the ones with effects outside
-     * it (gcm_legacy_method_has_effect). RSX_TRACE still sees every method. */
+     * up and no vtable registered, the state it builds is never read, and the
+     * only methods worth handing it are the ones with effects outside it
+     * (gcm_legacy_method_has_effect). RSX_TRACE still sees every method. */
     static int s_rsx_trace = -1;
+    if (s_rsx_trace < 0) s_rsx_trace = getenv("RSX_TRACE") ? 1 : 0;
     const int legacy_state_live = rsx_get_backend() != NULL || !rsx_draw_engine_enabled() ||
                                   gcm_env_flag(&s_rsx_trace, "RSX_TRACE");
     const int plain_walk = gcm_plain_walk(legacy_state_live);
@@ -3478,7 +3925,8 @@ static void gcm_rsx_process_fifo_pass(void)
      * its own, every field below moves with it and the FIFO the runtime walks
      * stops being the one the title fills. Reported on change, not per tick. */
     static int s_ctxdbg = -1;
-    if (gcm_env_flag(&s_ctxdbg, "GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+    if (s_ctxdbg < 0) s_ctxdbg = getenv("GCM_CTXDBG") ? 1 : 0;
+    if (s_ctxdbg && s_gcm_ctx_out_ea) {
         static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
         u32 ptr = vm_read32(s_gcm_ctx_out_ea);
         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
@@ -3510,9 +3958,9 @@ static void gcm_rsx_process_fifo_pass(void)
      * present in 0..put. "The title waits for a fence we never published" has
      * two very different causes -- we missed the command, or it was never
      * submitted -- and only a direct scan of the ring separates them. */
-    { static int scanned = 0;
-      static int s_scanref = -1;
-      if (!scanned && gcm_env_flag(&s_scanref, "GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+    { static int scanned = 0, scanref = -1;
+      if (scanref < 0) scanref = getenv("GCM_SCANREF") ? 1 : 0;
+      if (!scanned && scanref && put >= 0x19F0) { scanned = 1;
         unsigned found = 0;
         for (u32 io = 0; io + 8 <= put; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
@@ -3626,9 +4074,42 @@ static void gcm_rsx_process_fifo_pass(void)
                   fprintf(stderr, "\n");
                   nop = hdr = jmp = cal = ret = 0; t0 = now;
               } } }
+        /* A run of NOP words. God of War HD builds command blocks on SPUs into
+         * fixed-size reservations and leaves the rest of each one zero: in
+         * gameplay about 4.6 million NOPs a second against 1.2 million command
+         * headers, and each NOP went through the whole decode below. The RSX
+         * does nothing for them, so the run is passed over at once, up to
+         * `put` or the end of this 1 MB IO page (the next word may map
+         * elsewhere). Each NOP still spends a word of this tick's budget: the
+         * skip is a faster decode, not a bigger tick, and VF5 depends on the
+         * walker yielding at the cap (it lost 7 milestones when a whole run
+         * cost one word). */
+        if (!w && !wdiag) {
+            const u32 page_end = (s_fifo_getoff | 0xFFFFFu) + 1u;
+            const u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
+            u32 off = s_fifo_getoff + 4u, nea = ea + 4u;
+            while (off < lim && budget > 0 && !vm_read32(nea)) { off += 4u; nea += 4u; budget--; }
+            if (s_fifo_getoff < put) s_last_ring_off = off;
+            s_fifo_getoff = off;
+            continue;
+        }
         u32 type = w >> 29;
-        if ((type != 0 && type != 2) || (w & 3u) == 2u || w == 0x00020000u)
-            s_nv0039.active=0; /* Control flow ends contiguous packet inference. */
+        /* The walker is reading something other than the park it waited on:
+         * it has left it, by the patched word (a JUMP elsewhere, or commands
+         * written over the park) or by a resync. Forget the park here. Kept,
+         * its start time survived until the walker next stopped at the same
+         * address with the same put -- a title that reuses its command blocks
+         * does that -- and that park then inherited a grace that had already
+         * run out, so the jump-park resync fired at once and dropped the
+         * commands the title was about to link in. */
+        u32 jump_tgt = 0;
+        const int is_jump = gcm_fifo_jump_target(w, &jump_tgt);
+        if (park_off && (s_fifo_getoff != park_off || !is_jump || jump_tgt != park_off))
+            park_off = 0;
+        /* Control flow (either JUMP encoding included) ends contiguous
+         * packet inference. */
+        if ((type != 0 && type != 2) || is_jump || (w & 3u) == 2u || w == 0x00020000u)
+            s_nv0039.active=0;
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
             if(gcm_reports_live()&&!gcm_reports_dependency())return;
@@ -3640,6 +4121,7 @@ static void gcm_rsx_process_fifo_pass(void)
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
+            gcm_fifo_flip_resets_state(&s_state);
             /* Count the flip WORDS the title actually writes into the FIFO,
              * separately from the presents that result. When a title stops
              * appearing on screen the first question is which side stopped:
@@ -3686,11 +4168,11 @@ static void gcm_rsx_process_fifo_pass(void)
             continue;
         }
 
-        if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+        if (is_jump) {                         /* JUMP: 0x20000000 | offset, or offset | 1 */
             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
-                               s_fifo_getoff, w & 0x1FFFFFFCu, put); }
-            { u32 tgt = w & 0x1FFFFFFCu;
+                               s_fifo_getoff, jump_tgt, put); }
+            { u32 tgt = jump_tgt;
               if (!gcm_io2ea(tgt)) { gcm_observer_branch(s_fifo_getoff,"unmapped-jump",tgt); gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
@@ -3721,12 +4203,17 @@ static void gcm_rsx_process_fifo_pass(void)
                   /* Checked streams must never skip a producer park. */
                   if (put != s_fifo_getoff && !gcm_checked_ref_mode()) {
                       extern unsigned long long ps3_ms_now(void);
-                      static u32 park_off, park_put;
-                      static unsigned long long park_since;
                       const unsigned long long now = ps3_ms_now();
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
-                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                      } else if (now - park_since >= gcm_park_grace_ms() &&
+                                 /* Read the park again before giving up on it.
+                                  * An SPU job that fills a command-buffer hole
+                                  * (Edge geometry reserves them as self-JUMPs)
+                                  * can land between this pass's read and the
+                                  * resync, which would then jump over the
+                                  * commands it just wrote. */
+                                 vm_read32(gcm_io2ea(s_fifo_getoff)) == w) {
                           park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
@@ -3819,6 +4306,10 @@ static void gcm_rsx_process_fifo_pass(void)
              * the method, so the next pass re-reads it -- which is what the hardware does
              * while it waits. Semaphore offsets index the same label window
              * cellGcmGetLabelAddress hands out. */
+            if (subch == 0 && method == 0x1800u && gcm_report_hold()) {
+                s_report_hold_pass = 1;
+                break;
+            }
             if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
                 int sem_blocked = 0;
                 for (u32 i = 0; i < count; i++) {
@@ -3827,7 +4318,8 @@ static void gcm_rsx_process_fifo_pass(void)
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
-                    { static int sn = 0, recdbg = -1; if (gcm_env_flag(&recdbg, "GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
+                    { static int sn = 0, recdbg = -1; if (recdbg < 0) recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+                      if (recdbg && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     /* Early FIFO sync: every release an ACQUIRE can depend on
                      * has already been applied, so no GPU wait is needed. */
@@ -3896,6 +4388,32 @@ static void gcm_rsx_process_fifo_pass(void)
             if(count && (subch==4u||subch==5u) && method<=0x7fcu &&
                (method>=0x400u || (type==0u && (u64)method+(u64)(count-1u)*4u>=0x400u)) &&
                !gcm_inline_image_barrier())return;
+            static int s1_2d = -1;
+            if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+            /* A run of 3D methods inside one 1 MB IO page, with no per-word
+             * diagnostic on (nor the query observer, which the slow path
+             * feeds): its words are contiguous in guest memory, so the
+             * offset is translated once and the per-word checks below, none of
+             * which can match, are skipped. Most of a frame's words come this
+             * way (God of War HD: about five million vertex-program microcode and
+             * constant words a second). */
+            if (!wdiag && !s_query_observe && count && (subch == 0 || (subch == 1 && !s1_2d)) &&
+                ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
+                const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
+                if (dea) {
+                    if (type == 0 && rsx_process_vp_run(&s_state, method, vm_base + dea, count)) {
+                        s_fifo_getoff += 4 + count * 4;
+                        continue;
+                    }
+                    for (u32 i = 0; i < count; i++)
+                        if (gcm_3d_method(&s_state, type == 0 ? method + i * 4 : method,
+                                          vm_read32(dea + i * 4), dea + i * 4, method, count,
+                                          legacy_state_live) < 0)
+                            return;
+                    s_fifo_getoff += 4 + count * 4;
+                    continue;
+                }
+            }
             u32 dea = 0;
             for (u32 i = 0; i < count; i++) {
                 /* Plain walk: within one 1 MB IO page the next word's address
@@ -3923,7 +4441,7 @@ static void gcm_rsx_process_fifo_pass(void)
                  * is not a 2D method at all: it tells the RSX to raise a
                  * USER_CMD interrupt, which is what ps1_netemu's flip path
                  * blocks on. */
-                { static int sd = -1; static unsigned long s7 = 0;
+                if (wdiag) { static int sd = -1; static unsigned long s7 = 0;
                   if (sd < 0) sd = getenv("GCM_SUBCH7") ? 1 : 0;
                   if (sd && subch == 7 && (PS3_LOG_FIRST(s7, 16)))
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
@@ -3950,7 +4468,7 @@ static void gcm_rsx_process_fifo_pass(void)
                  * title binds to a subchannel is what says which engine that
                  * subchannel drives; comparing subchannel 1 against subchannel 0
                  * turns the routing below from a guess into a reading. */
-                { static int od = -1;
+                if (wdiag) { static int od = -1;
                   if (od < 0) { const char* e = getenv("GCM_OBJDBG"); od = e ? 1 : 0; }
                   if (od && m == 0) {
                       static unsigned seen[8]; static int have[8];
@@ -3978,7 +4496,7 @@ static void gcm_rsx_process_fifo_pass(void)
                 const int s1_2d = s_walk_s1_2d;
                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                  * non-zero subchannel -- what each binding slot actually carries. */
-                { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
+                if (wdiag) { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
                   if (sg == (const char*)-1) sg = getenv("GCM_SUBCH_GATE");
                   const u32 cm3 = m & 0x1FFCu;
                   /* GCM_VAL_WATCH=<hex>: every FIFO word carrying that value, any method. */
@@ -4013,7 +4531,7 @@ static void gcm_rsx_process_fifo_pass(void)
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
                  * what a frame is actually made of when nothing draws. */
-                { static int hs = -1; static u32 cnt[8][0x800]; static unsigned long long t0;
+                if (wdiag) { static int hs = -1; static u32 cnt[8][0x800]; static unsigned long long t0;
                   if (hs < 0) { const char* e = getenv("GCM_METHOD_HIST"); hs = e ? atoi(e) : 0; }
                   if (hs > 0) {
                       cnt[subch & 7][(m & 0x1FFCu) >> 2]++;
@@ -4049,7 +4567,7 @@ static void gcm_rsx_process_fifo_pass(void)
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
                  * backend's draw callbacks can be compared in one measurement. */
-                { static int fdbg = -1;
+                if (wdiag) { static int fdbg = -1;
                   if (fdbg < 0) fdbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
                   if (fdbg) {
                       static long long n_be = 0, n_va = 0, n_ia = 0, tick = 0;
@@ -4072,47 +4590,9 @@ static void gcm_rsx_process_fifo_pass(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    /* A method this branch acts on must be in gcm_walk_special
-                     * too, or PS3RECOMP_GCM_FAST_WALK=1 never brings it here. */
-                    if(m==0x50u && !((s_early_fifo_sync||gcm_checked_ref_mode())?gcm_reports_dependency():gcm_reports_sync_barrier()))return;
-                    if(m==0x1d6cu)s_backend_label_offset=vm_read32(dea);
-                    if(m==0x1a4u)s_backend_label_dma=vm_read32(dea);
-                    if((m==0x1d70u||m==0x1d74u)&&gcm_reports_can_defer()){
-                        u32 value=vm_read32(dea);
-                        if(m==0x1d70u)value=(value&0xff00ff00u)|((value>>16)&0xffu)|((value&0xffu)<<16);
-                        u32 label_ea=VM_HLE_INJECT_BASE+(s_backend_label_offset&0xffffffu);
-                        if(gcm_reports_live()&&s_backend_label_dma==0xFEED0001u){
-                            label_ea=gcm_io2ea(s_backend_label_offset);
-                            /* Legacy HOST_BUFFER skips an unmapped write. */
-                            if(!label_ea){if(!gcm_reports_sync_barrier())return;continue;}
-                        }
-                        if(!gcm_defer_label(label_ea,value,m,dea))return;
-                        continue;
-                    }
-                    if((m==0x1d70u||m==0x1d74u)&&!gcm_reports_sync_barrier())return;
-                    if (legacy_state_live || gcm_legacy_method_has_effect(m))
-                    { const uint64_t l0=s_gph_on>0?gph_now():0;
-                      rsx_process_method(&s_state, m, vm_read32(dea));
-                      if(l0){s_gph.legacy_ns+=gph_now()-l0;s_gph.legacy_n++;} }
-                    /* NV406E_SET_REFERENCE: queue the fence value for PACED
-                     * publication (gcm_ref_publish below) instead of letting a
-                     * later fence in the same batch overwrite it. */
-                    if (m == 0x50) {
-                        if(gcm_checked_ref_mode() && (count!=1 || method!=0x50)){gcm_checked_ref_fail("malformed-reference",s_fifo_getoff);continue;}
-                        if (gcm_checked_ref_mode() &&
-                            !(s_early_fifo_sync ? gcm_early_reference_receipt() : gcm_checked_backend_flush()))
-                            gcm_checked_ref_fail(s_early_fifo_sync ? "early-reference-receipt" : "backend-completion", s_fifo_getoff);
-                        else gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
-                    }
-                    if (m == 0x1A8u) {
-                        u32 dma = vm_read32(dea);
-                        s_report_dma = dma == 0xFEED0000u ? GCM_REPORT_DMA_LOCAL : dma;
-                    }
-                    if (m == 0x1800u) {
-                        u32 argument=vm_read32(dea);
-                        gcm_observer_event(s_fifo_getoff,"report",argument);
-                        gcm_get_report(argument);
-                    }
+                    if (gcm_3d_method(&s_state, m, vm_read32(dea), dea, method, count,
+                                      legacy_state_live) < 0)
+                        return;
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
@@ -4194,8 +4674,9 @@ static void gcm_rsx_process_fifo_pass(void)
                                (!s_park_pass && s_fifo_getoff == put) ? RSX_FIFO_BUSY_STOP_PUT :
                                RSX_FIFO_BUSY_STOP_OTHER);
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_sema_blocked_pass || s_park_pass || producer_waiting) {
-          stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
+      if (s_sema_blocked_pass || s_park_pass || s_report_hold_pass || producer_waiting) {
+          stuck = 0; last = s_fifo_getoff;
+          s_sema_blocked_pass = 0; s_park_pass = 0; s_report_hold_pass = 0; }
       else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
@@ -4235,7 +4716,10 @@ static void gcm_rsx_process_fifo_pass(void)
      *
      * ponytail: append the JUMP at `current` the way the SDK's own callback
      * does, rather than tracking a second copy of the ring's geometry. */
-    if (s_gcm_ctx_out_ea && !gcm_checked_ref_mode() && !producer_waiting) {
+    /* Not on a segmented ring: its `begin` is the current segment, and the
+     * segment callback (gcm_fifo_next_segment) keeps the title inside it. */
+    if (s_gcm_ctx_out_ea && !gcm_checked_ref_mode() && !producer_waiting &&
+        !(s_seg_size && vm_read32(s_gcm_ctx_out_ea) == s_gcm_context_ea)) {
         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
@@ -4283,17 +4767,25 @@ static void gcm_rsx_process_fifo_pass(void)
          * and near-end recycling is enabled from then on. */
         static int s_title_overran = 0;
         if (s_fifo_recycle_waiting) head_consumed = 0;   /* its callback is recycling */
-        else if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
+        else if (begin && end > begin && cur > end) { head_consumed = 1; s_title_overran = 1; }   /* `end` is the last word: cur == end is full, not overrun */
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
                 && head_consumed && s_title_overran) {
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
-                u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
+                u32 jmp_at = (cur <= end) ? cur : end;   /* `end` is the JUMP's own slot */
                 vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
                 s_fifo_getoff = io_begin;                          /* get */
                 put = io_begin;
+                /* Count it as the walker taking the JUMP to begin. The title's
+                 * own callback can be recycling at the same moment: it writes
+                 * its JUMP and `put`, and only then marks itself waiting, so a
+                 * pass that read the mark clear can still land here. It then
+                 * waits for a backward JUMP that never comes, because `get` is
+                 * already at begin == put. God of War HD stopped for 2-4 s at
+                 * random points in gameplay this way. */
+                s_fifo_back_jumps++;
                 static int n = 0;
                 if (PS3_LOG_FIRST(n, 8))
                     fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
@@ -4335,9 +4827,59 @@ static u32 gcm_ea2io(u32 ea)
     return ((u32)io_page << 20) | (ea & 0xFFFFFu);
 }
 
+/* The buffer-full callback on a segmented ring (GCM_FIFO_SEGMENT), what
+ * RPCS3's cellGcmCallback does: close the segment with a JUMP to the next one,
+ * publish `put` up to that JUMP so the walker can start, wait while the next
+ * segment still holds commands it has not read (only when the ring is a whole
+ * lap behind), and point the context at the next segment. */
+static void gcm_fifo_next_segment(u32 ctx)
+{
+    const u32 cur = vm_read32(ctx + 0x8), end = vm_read32(ctx + 0x4);
+    u32 next = end + 4;
+    if (next < s_ring_begin || next + s_seg_size > s_ring_end) next = s_ring_begin;
+    const u32 io_cur = gcm_ea2io(cur), io_next = gcm_ea2io(next);
+    if (io_cur == 0xFFFFFFFFu || io_next == 0xFFFFFFFFu || cur > end) return;
+    vm_write32(cur, 0x20000000u | io_next);              /* JUMP -> next segment */
+    /* The JUMP has to be in memory before `put` lets the walker reach it. */
+    atomic_thread_fence(memory_order_release);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_cur);      /* put: up to the JUMP */
+    if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);          /* start the walker now */
+    /* The walker is a whole lap behind only if it is still inside the next
+     * segment. Bounded on no progress, like the recycle wait below. */
+    int idle = 0;
+    u32 last_get = s_fifo_getoff;
+    while (s_fifo_getoff >= io_next && s_fifo_getoff < io_next + s_seg_size && idle < 2000) {
+        Sleep(1);
+        if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
+        else idle++;
+    }
+    if (idle >= 2000) {
+        static int warned = 0;
+        if (PS3_LOG_FIRST(warned, 4))
+            printf("[cellGcmSys] fifo segment: walker stalled in the next segment (get=0x%08X)%c",
+                   s_fifo_getoff, 10);
+    }
+    vm_write32(ctx + 0x0, next);
+    vm_write32(ctx + 0x8, next);
+    vm_write32(ctx + 0x4, next + s_seg_size - 4);
+}
+
+/* Room for `bytes` more at the context's write head. On the segmented ring a
+ * full segment is closed and the next one opened, as the title's own reserve
+ * would; elsewhere this only checks, with the recycle slack. */
+static int gcm_ctx_room(u32 ctx, u32 bytes)
+{
+    if (s_seg_size && ctx == s_gcm_context_ea) {
+        if (vm_read32(ctx + 0x8) + bytes > vm_read32(ctx + 0x4)) gcm_fifo_next_segment(ctx);
+        return vm_read32(ctx + 0x8) + bytes <= vm_read32(ctx + 0x4);
+    }
+    return vm_read32(ctx + 0x8) + bytes + GCM_RECYCLE_SLACK <= vm_read32(ctx + 0x4);
+}
+
 void cellGcm_fifo_recycle(u32 ctx_ea)
 {
     if (!ctx_ea) return;
+    if (s_seg_size && ctx_ea == s_gcm_context_ea) { gcm_fifo_next_segment(ctx_ea); return; }
     u32 begin   = vm_read32(ctx_ea + 0x0);
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
@@ -4469,6 +5011,23 @@ int cellGcmOffsetIsDisplay(u32 offset)
     return 0;
 }
 
+/* Backend query (not a guest API): the display buffer the current flip names,
+ * as offset/pitch/size in RSX local memory. Backs the CPU-blit scanout
+ * fallback -- a software-rendered title writes its display buffer straight
+ * into guest VRAM and never records RSX work, so the D3D12 backend presents
+ * the guest bytes directly. Returns 1 when a buffer is registered. */
+int cellGcm_current_scanout(u32* offset, u32* pitch, u32* width, u32* height)
+{
+    const u32 id = s_current_display_buffer_id & 7u;
+    if (!s_display_buffer_set[id])
+        return 0;
+    if (offset) *offset = s_display_buffers[id].offset;
+    if (pitch)  *pitch  = s_display_buffers[id].pitch;
+    if (width)  *width  = s_display_buffers[id].width;
+    if (height) *height = s_display_buffers[id].height;
+    return 1;
+}
+
 /* NID: 0xEAA52F23 */
 /* How many display buffers the title has actually registered. cellResc needs
  * it to know how far to rotate its flip target; nothing else about the set is
@@ -4582,10 +5141,12 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
 {
     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
         !s_display_buffer_set[bufferId]) return 0;
-    const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
     /* Never near the end: those bytes are the title's reserve before its
-     * ring wraps, and the recycle above keys on them. */
-    if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
+     * ring wraps, and the recycle above keys on them. On a segmented ring a
+     * full segment is closed first instead. */
+    if (!gcm_ctx_room(ctx, 8)) return 0;
+    const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
+    if (gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
     s_fifo_flips_queued++;
     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
@@ -4611,7 +5172,7 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * the previous one. A numerically higher GET outside this ring proves
      * nothing about consumption of its head. Do not rewind that new segment
      * or the closing SET_REFERENCE can be written behind the consumer. */
-    if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+    if (runtime_ring && !s_seg_size && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         io_last != 0xFFFFFFFFu && io_last >= io_begin && cur >= begin &&
         (uint64_t)s_fifo_getoff >= (uint64_t)io_begin + GCM_RECYCLE_MARGIN &&
         (uint64_t)s_fifo_getoff <= io_last) {
@@ -4755,6 +5316,7 @@ static void gcm_publish_offset_tables(void)
         vm_write16(GCM_OFFSET_TABLE_IO_ADDR + i * 2, s_io_address_table[i]);
         vm_write16(GCM_OFFSET_TABLE_EA_ADDR + i * 2, s_ea_address_table[i]);
     }
+    s_offset_tables_published = 1;   /* from here on, gcm_mirror_offset_entry */
 }
 
 s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
@@ -4799,7 +5361,12 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     if (address >= s_config.localAddress &&
         address < s_config.localAddress + s_config.localSize) {
         u32 loff = address - s_config.localAddress;
-        if ((loff >> 20) < sizeof(s_local_offset_page)) s_local_offset_page[loff >> 20] = 1;
+        /* Written only when it changes: this runs for every local address a
+         * title converts (God of War HD: tens of thousands a second), and a
+         * store of the same byte still takes the line from the drain thread,
+         * which reads it in cellGcmResolveLocated. */
+        if ((loff >> 20) < sizeof(s_local_offset_page) && !s_local_offset_page[loff >> 20])
+            s_local_offset_page[loff >> 20] = 1;
         vm_write32(off_ea, loff);
         return CELL_OK;
     }
@@ -5357,8 +5924,9 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetTile(index=%u, loc=%u, offset=0x%X, size=0x%X, pitch=%u)\n",
-           index, location, offset, size, pitch);
+    if (ps3_log_verbose())
+        printf("[cellGcmSys] SetTile(index=%u, loc=%u, offset=0x%X, size=0x%X, pitch=%u)\n",
+               index, location, offset, size, pitch);
 
     s_tiles[index].offset = offset;
     s_tiles[index].size   = size;
@@ -5366,11 +5934,14 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
     s_tiles[index].format = comp;
     s_tiles[index].base   = base;
     s_tiles[index].bank   = bank;
-    s_tiles[index].bound  = 0;
+    /* SetTile binds too (as it does on RPCS3), so a
+     * title that never calls BindTile still has its tiles in force. */
+    s_tiles[index].bound  = pitch > 0;
 
     /* Build tile register value (simplified) */
     s_tiles[index].tile  = (location << 0) | (pitch << 8);
     s_tiles[index].limit = offset + size - 1;
+    gcm_tile_publish(index);
 
     return CELL_OK;
 }
@@ -5384,8 +5955,9 @@ s32 cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height,
     if (index >= CELL_GCM_MAX_ZCULL_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetZcull(index=%u, offset=0x%X, %ux%u)\n",
-           index, offset, width, height);
+    if (ps3_log_verbose())
+        printf("[cellGcmSys] SetZcull(index=%u, offset=0x%X, %ux%u)\n",
+               index, offset, width, height);
 
     s_zcull[index].offset      = offset;
     s_zcull[index].width       = width;
@@ -5409,8 +5981,9 @@ s32 cellGcmBindTile(u8 index)
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] BindTile(index=%u)\n", index);
+    if (ps3_log_verbose()) printf("[cellGcmSys] BindTile(index=%u)\n", index);
     s_tiles[index].bound = 1;
+    gcm_tile_publish(index);
     return CELL_OK;
 }
 
@@ -5420,7 +5993,7 @@ s32 cellGcmBindZcull(u8 index)
     if (index >= CELL_GCM_MAX_ZCULL_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] BindZcull(index=%u)\n", index);
+    if (ps3_log_verbose()) printf("[cellGcmSys] BindZcull(index=%u)\n", index);
     s_zcull[index].bound = 1;
     return CELL_OK;
 }
@@ -5431,8 +6004,9 @@ s32 cellGcmUnbindTile(u8 index)
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] UnbindTile(index=%u)\n", index);
+    if (ps3_log_verbose()) printf("[cellGcmSys] UnbindTile(index=%u)\n", index);
     s_tiles[index].bound = 0;
+    gcm_tile_publish(index);
     return CELL_OK;
 }
 
@@ -5442,7 +6016,7 @@ s32 cellGcmUnbindZcull(u8 index)
     if (index >= CELL_GCM_MAX_ZCULL_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] UnbindZcull(index=%u)\n", index);
+    if (ps3_log_verbose()) printf("[cellGcmSys] UnbindZcull(index=%u)\n", index);
     s_zcull[index].bound = 0;
     return CELL_OK;
 }
@@ -5584,8 +6158,9 @@ s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
     const u32 c = (u32)(uintptr_t)ctx;
     if (c && labelIndex < CELL_GCM_MAX_LABEL_COUNT &&
         bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM && s_display_buffer_set[bufferId]) {
-        const u32 end = vm_read32(c + 4), cur = vm_read32(c + 8);
-        if (cur + 16 + 8 + GCM_RECYCLE_SLACK <= end && gcm_ea2io(cur) != 0xFFFFFFFFu) {
+        const int room = gcm_ctx_room(c, 16 + 8);
+        const u32 cur = vm_read32(c + 8);
+        if (room && gcm_ea2io(cur) != 0xFFFFFFFFu) {
             vm_write32(cur + 0,  0x00040064u);   /* SEMAPHORE_OFFSET  */
             vm_write32(cur + 4,  labelIndex * GCM_LABEL_STRIDE);
             vm_write32(cur + 8,  0x00040068u);   /* SEMAPHORE_ACQUIRE */
@@ -5661,6 +6236,7 @@ static void cellGcmTerminate_consumer_body(void)
     memset(s_io_mappings, 0, sizeof(s_io_mappings));
     __atomic_store_n(&s_io_mapping_hw, 0, __ATOMIC_RELAXED);
     memset(s_tiles, 0, sizeof(s_tiles));
+    gcm_tiles_publish();
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
     s_report_dma = GCM_REPORT_DMA_LOCAL;
@@ -5878,6 +6454,9 @@ void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
     GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
+#ifdef _WIN32
+    gcm_pump_wake();
+#endif
 }
 
 /* Invalidate a tile region (unbind + clear) */

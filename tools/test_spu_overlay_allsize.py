@@ -9,6 +9,9 @@ if os.name == 'nt':
     print('SKIP: POSIX fixture: built with cc and -fsanitize=undefined; MinGW has no UBSan runtime')
     raise SystemExit(0)
 import argparse,json,os,pathlib,subprocess,tempfile
+if os.name == 'nt':
+    print('SKIP: standalone runtime fixture requires a POSIX compiler')
+    raise SystemExit(0)
 ROOT=pathlib.Path(__file__).resolve().parents[1];SPU=ROOT/'runtime/spu'
 parser=argparse.ArgumentParser()
 parser.add_argument('--output-dir',type=pathlib.Path)

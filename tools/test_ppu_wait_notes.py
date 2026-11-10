@@ -7,11 +7,19 @@ if os.name == 'nt':
 from pathlib import Path
 import argparse,subprocess,tempfile,os,json,re
 ROOT=Path(__file__).resolve().parents[1]
-def function(s,name):
- p=s.index('s32 '+name+'(');a=s.index('{',p);d=1;i=a+1
+def function(s,name,kind='s32 '):
+ p=s.index(kind+name+'(');a=s.index('{',p);d=1;i=a+1
  while d:
   d+=(s[i]=='{')-(s[i]=='}');i+=1
  return s[p:i]
+# The workload-info function reads the SPURS2-aware layout helpers next to it
+# (cellSpurs.c); take the actual ones when the source has them.
+HELPERS=[('static u32 ','wkl_ready_off'),('static u32 ','wkl_signal_off'),('static u16 ','wkl_signal_bit'),('static u8 ','wkl_count_get')]
+def helpers(s):
+ found=[(k,n) for k,n in HELPERS if k+n+'(' in s]
+ if not found:return ''
+ m=__import__('re').search(r'#define\s+SPURS_MAX_WID\s+(\d+)',s)
+ return ('#define SPURS_MAX_WID '+m[1]+'\n' if m else '')+'\n'.join(function(s,n,k) for k,n in found)
 def main():
  ap=argparse.ArgumentParser();ap.add_argument('--sanitize',action='store_true');ap.add_argument('--functional-only',action='store_true');ap.add_argument('--source-root',type=Path,default=ROOT);a=ap.parse_args();r=a.source_root
  timer=(r/'runtime/syscalls/sys_timer.c').read_text();start=timer.index('#ifdef _WIN32',timer.index('/* POLLSITE:'));end=timer.index('\n    return CELL_OK;',start);start=timer.rfind('\n',0,start)+1
@@ -19,8 +27,8 @@ def main():
  b=timer.rfind('    audio_chronology_wait_token ',timer.index('/* POLLSITE:'),start)
  if b>=0:start=b
  sleep=timer[start:end]
- spurs=(r/'libs/spurs/cellSpurs.c').read_text();constants='\n'.join('static constexpr u32 '+k+'='+re.search(r'\b'+k+r'\s*=\s*(0x[0-9A-Fa-f]+)',spurs)[1]+';'for k in ['SPURS_WKL_CURCONT','SPURS_WKL_READY1','SPURS_WKL_IDLE2','SPURS_WKL_SIGNAL1'])
- fixture=(ROOT/'runtime/ppu/tests/test_ppu_wait_notes.cpp').read_text().replace('/* ACTUAL_SLEEP */',sleep).replace('/* ACTUAL_CONSTANTS */',constants).replace('/* ACTUAL_WORKLOAD */',function(spurs,'cellSpursGetWorkloadInfo'))
+ spurs=(r/'libs/spurs/cellSpurs.c').read_text();constants='\n'.join('static constexpr u32 '+k+'='+re.search(r'\b'+k+r'\s*=\s*(0x[0-9A-Fa-f]+)',spurs)[1]+';'for k in ['SPURS_WKL_CURCONT','SPURS_WKL_READY1','SPURS_WKL_IDLE2','SPURS_WKL_SIGNAL1','SPURS_WKL_SIGNAL2'] if re.search(r'\b'+k+r'\s*=\s*0x',spurs))
+ fixture=(ROOT/'runtime/ppu/tests/test_ppu_wait_notes.cpp').read_text().replace('/* ACTUAL_SLEEP */',sleep).replace('/* ACTUAL_CONSTANTS */',constants).replace('/* ACTUAL_HELPERS */',helpers(spurs)).replace('/* ACTUAL_WORKLOAD */',function(spurs,'cellSpursGetWorkloadInfo'))
  flags=['-std=c++17','-O2','-pthread','-I'+str(r/'include'),'-I'+str(r/'runtime')]
  if a.functional_only:flags+=['-DWAIT_FUNCTIONAL_ONLY']
  if a.sanitize:flags+=['-fsanitize=undefined','-fno-sanitize-recover=all']

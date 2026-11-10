@@ -445,6 +445,8 @@ void func_00010000(ppu_context* ctx)
         ctx->lr = 0x12345678;
         lv2_syscall(ctx);
         fprintf(stderr, "[smoke] unknown syscall returned %llu\n", (unsigned long long)ctx->gpr[3]);
+        /* ppu_run buffers stderr (ps3_stdio.h); _Exit skips the atexit flush. */
+        fflush(stderr);
         _Exit(ctx->gpr[3] == 0 ? 0 : 1);
     }
     if (getenv("PS3RECOMP_SMOKE_UNKNOWN_HLE")) {

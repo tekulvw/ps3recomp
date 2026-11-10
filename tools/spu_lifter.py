@@ -851,6 +851,12 @@ class SPULifter:
                 f"underscore; using {prefix + chr(95)!r}"+chr(10))
             prefix += "_"
         self.prefix = prefix
+        # --reloc: position-independent code a title copies to a different LS address
+        # at each load (GoW:A's BatchJobList job code). It is lifted once at a canonical
+        # base, and every local-store address the code materializes from its own pc
+        # (links, lqr/stqr, transfer and return pcs) adds ctx->reloc_delta, which the
+        # dispatcher sets to placement - canonical base on entry (spu_overlay_register_region_reloc).
+        self.reloc = False
         # Addresses of `bi/biz/... $r0` that are COMPUTED TAIL JUMPS (r0 reloaded
         # via lqa/lqr), not function returns -- see compute_bi_r0_jumps(). Empty
         # set => every `bi $r0` is a return (the prior behaviour).
@@ -875,25 +881,36 @@ class SPULifter:
             if tgt is not None and start <= tgt < end:
                 internal.add(tgt)
 
+        # Chunks merged into this function (--merge-chunks) are otherwise entered
+        # through the drain loop, which delivers a pending SPU interrupt before
+        # every transfer. As gotos they would not, and a job waiting in a loop
+        # for its interrupt handler (DMA-list stall-and-notify) never wakes. So
+        # each merged chunk entry hands back to the drain when one is pending.
+        merged_starts = {a for a in getattr(self, "func_starts", ()) if start < a < end}
         last_insn = None
         promo_items = []
         for insn in insns:
             if insn.addr < start or insn.addr >= end:
                 continue
-            if insn.addr in internal:
+            if insn.addr in internal or insn.addr in merged_starts:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
             instruction_start = len(func.body_lines)
+            entry_guard = ""
+            if insn.addr in merged_starts:
+                entry_guard = (f"if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) "
+                               f"{{ ctx->pc = {self._pc(insn.addr)}; g_spu_trampoline_fn = "
+                               f"{self.prefix}spu_func_{insn.addr:08X}; {_F}return; }} ")
             if self.promote_regs:
-                marked = self._translate_marked(insn, func)
-                promo_items.append((insn, insn.addr in internal, marked))
-                c = _strip_markers(marked)   # the unpromoted body, if promotion declines
+                marked = entry_guard + self._translate_marked(insn, func)
+                promo_items.append((insn, insn.addr in internal or insn.addr in merged_starts, marked))
+                c = _strip_markers(marked)
             else:
-                c = self._translate(insn, func)
+                c = _strip_markers(entry_guard) + self._translate(insn, func)
             if c:
                 if self.observe_original_work:
                     func.body_lines.append(f"    PS3_ORIGINAL_STEP(ctx, 0x{insn.addr:X}u, PS3_ORIGINAL_LIFTED);")
                 if self.trace:
-                    func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
+                    func.body_lines.append(f"    spu_trace_pc(ctx, {self._pc(insn.addr)});")
                 func.body_lines.append(f"    {c}")
                 if self.trace and insn.mnemonic not in _NO_RT_WRITE:
                     rt_idx = insn.raw & 0x7F
@@ -916,8 +933,7 @@ class SPULifter:
                      or (last_insn.mnemonic == "stop"
                          and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
                 and end in getattr(self, "func_starts", set())):
-            promo_suffix = (f"{{ ctx->pc = 0x{end:X}; "
-                            f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; {_F}return; }}")
+            promo_suffix = f"{{ {self._direct(end)} }}"
             func.body_lines.append("    " + _strip_markers(promo_suffix))
 
         func.region_suffix = func.body_lines[suffix_start:]
@@ -966,6 +982,25 @@ class SPULifter:
                 func.promoted = True
         self.functions.append(func)
         return func
+
+    def _direct(self, tgt: int) -> str:
+        """A known-target cross-function transfer. SPU_DIRECT (spu_context.h)
+        tail-calls the target when the drain has nothing to do on this step.
+        The opt-in verified-image and connected-region lifts keep the explicit
+        trampoline: their bodies are entered through exact guards, every
+        transfer goes back through the drain's checkpoints, and the region
+        emitter (spu_regions.py) localizes exactly this trampoline form."""
+        fn = f"{self.prefix}spu_func_{tgt:08X}"
+        if self.verified_code_image or self.connected_regions:
+            return f"ctx->pc = {self._pc(tgt)}; g_spu_trampoline_fn = {fn}; {_F}return;"
+        return f"{_F}SPU_DIRECT(ctx, {self._pc(tgt)}, {fn});"
+
+    def _pc(self, a: int) -> str:
+        """A local-store address derived from the code's own placement: a constant, or
+        under --reloc the canonical address plus ctx->reloc_delta (wrapped to LS)."""
+        if self.reloc:
+            return f"((0x{a:X}u + (uint32_t)ctx->reloc_delta) & 0x3FFFFu)"
+        return f"0x{a:X}"
 
     @staticmethod
     def _branch_target(insn: SPUInstruction):
@@ -1231,9 +1266,12 @@ class SPULifter:
             if disp is not None:
                 return f"spu_ls_write128(ctx, {g(base)}._u32[0] + {disp}, {g(rt())});"
         if mn in ("lqa", "lqr"):
-            return f"{g(rt())} = spu_ls_read128(ctx, {_imm(ops[1])});"
+            # lqr's address is pc-relative (the disassembler gives it absolute): under --reloc it moves with the code
+            a = self._pc(int(_imm(ops[1]), 0)) if mn == "lqr" and self.reloc else _imm(ops[1])
+            return f"{g(rt())} = spu_ls_read128(ctx, {a});"
         if mn in ("stqa", "stqr"):
-            return f"spu_ls_write128(ctx, {_imm(ops[1])}, {g(rt())});"
+            a = self._pc(int(_imm(ops[1]), 0)) if mn == "stqr" and self.reloc else _imm(ops[1])
+            return f"spu_ls_write128(ctx, {a}, {g(rt())});"
         if mn == "lqx":
             return f"{g(rt())} = spu_ls_read128(ctx, {g(ra())}._u32[0] + {g(rb())}._u32[0]);"
         if mn == "stqx":
@@ -1267,7 +1305,7 @@ class SPULifter:
             tgt = self._branch_target(insn)
             # Link register: preferred word only, other slots ZERO (real HW /
             # RPCS3 v128::from32r) -- splatting corrupts full-quadword link use.
-            link = f"{g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X});"   # wraps at the end of LS
+            link = f"{g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)});"   # wraps at the end of LS
             # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
             # infinite loop on real SPU (re-sets the link each pass, never
             # advances) -- a trap, NOT a call. Emitting a host call recurses
@@ -1292,9 +1330,12 @@ class SPULifter:
                 # `bi $r0` returns via host return) + SPU_DRAIN (drains the
                 # callee's own tail-chains so they don't grow the caller frame)
                 # + image save/restore (adopt-on-serve cannot leak upward).
-                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
+                # --reloc: the callee's drain may dispatch into other placed code, which sets
+                # ctx->reloc_delta for itself; put this placement's back on return.
+                rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
+                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}"
                         f"ctx->host_depth++; {_F}{self.prefix}spu_func_{tgt:08X}(ctx); "
-                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); {_R}}}")
+                        f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; spu_img_restore(ctx, _si);{rr} {_R}}}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -1305,10 +1346,10 @@ class SPULifter:
             if func.start_addr <= tgt < func.end_addr:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
-            # Cross-function conditional branch = conditional tail: hand the
-            # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
-            return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; {_F}return; }}")
+            # Cross-function conditional branch = conditional tail: a direct
+            # tail call when the drain has nothing to do on this step, else
+            # the trampoline and unwind (SPU_DIRECT, spu_context.h).
+            return f"if ({cond}) {{ {self._direct(tgt)} }}"
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -1355,17 +1396,18 @@ class SPULifter:
             # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
             # here and its `bi $r0` returns via host return.
             # read the target BEFORE writing the link: rt may be the same register as ra
-            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
-                    f"int32_t _si = (int32_t)ctx->image_id; "
+            rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
+                    f"int32_t _si = (int32_t)ctx->image_id; {rs}"
                     f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
-                    f"{_F}spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
-                    f"ctx->host_depth--; spu_img_restore(ctx, _si); {_R}}}")
+                    f"{_F}spu_indirect_branch(ctx); spu_drain_call(ctx, {self._pc(addr + 4)}); "
+                    f"ctx->host_depth--; spu_img_restore(ctx, _si);{rr} {_R}}}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link
             tgt_reg = (insn.raw >> 7) & 0x7F     # ra = target (the disassembler's last operand is rb, not the target)
             # read the target before writing the link: rt may alias ra
-            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"{_ied}ctx->pc = _tg; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; {_F}return; }} }}")
@@ -1417,10 +1459,11 @@ class SPULifter:
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
-        # Cross-function unconditional tail: hand the target to the trampoline
-        # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
-        return (f"{{ ctx->pc = 0x{tgt:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; {_F}return; }}")
+        # Cross-function unconditional tail: a direct tail call when the
+        # drain has nothing to do on this step, else hand the target to the
+        # trampoline and unwind so the enclosing SPU_DRAIN re-enters (no
+        # host-stack growth either way; SPU_DIRECT, spu_context.h).
+        return f"{{ {self._direct(tgt)} }}"
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -1479,7 +1522,8 @@ class SPULifter:
             lines.append(" * branches that escape a function's range). */")
             for t in externs:
                 lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
-                lines.append(f"    ctx->pc = 0x{t:X}u; "
+                pc = self._pc(t) if self.reloc else f"0x{t:X}u"
+                lines.append(f"    ctx->pc = {pc}; "
                              f"g_spu_trampoline_fn = spu_indirect_branch; return;")
                 lines.append("}")
             lines.append("")
@@ -1592,6 +1636,11 @@ def main() -> None:
     p.add_argument("--promote-max-regs", type=int, default=0, metavar="N",
                    help="With --promote-regs, leave a function unpromoted when it "
                         "names more than N SPU registers (0 = no limit).")
+    p.add_argument("--reloc", action="store_true",
+                   help="Position-independent code the title places at a different LS "
+                        "address per load: lift once at --base, and offset every "
+                        "pc-derived address by ctx->reloc_delta at run time (register "
+                        "with spu_overlay_register_region_reloc).")
     p.add_argument("--max-group-insns", type=int, default=4000,
                    help="Cap on instructions per merged group (keeps clang fast).")
     p.add_argument("--force-indirect", default="",
@@ -1615,6 +1664,10 @@ def main() -> None:
         p.error("--promote-max-regs requires --promote-regs")
     if args.connected_regions and not (args.verified_code_image and args.verified_code_spans):
         p.error("--connected-regions requires --verified-code-image and --verified-code-spans")
+    if args.reloc and (args.verified_code_image or args.connected_regions):
+        # Verified gates and connected regions compare and enter code at its
+        # absolute lifted LS addresses; relocated placement is not modelled there.
+        p.error("--reloc cannot be combined with --verified-code-image or --connected-regions")
     if args.auto_functions:
         from find_spu_functions import detect_functions, parse_elf, pick_text, text_image
         with open(args.auto_functions, "rb") as f:
@@ -1733,6 +1786,7 @@ def main() -> None:
                       observe_original_work=args.observe_original_work,
                       promote_regs=args.promote_regs,
                       promote_max_regs=args.promote_max_regs)
+    lifter.reloc = args.reloc
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "

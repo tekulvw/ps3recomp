@@ -112,6 +112,7 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
 #include "../spu_helpers.h"
 void spu_wrch(spu_context*, uint32_t, u128);
 void spu_overlay_register_region(uint32_t, uint32_t, int);
+void spu_overlay_register_region_reloc(uint32_t, uint32_t, uint32_t, int);
 void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
 void spu_overlay_register_source(uint32_t, int);
 void spu_overlay_register_sig(const uint8_t sig[16], int);
@@ -121,6 +122,7 @@ typedef void (*test_spu_fn)(spu_context*);
 void spu_begin_image(int image_id);
 void spu_register_function(uint32_t addr, test_spu_fn fn);
 test_spu_fn spu_lookup(uint32_t addr, int image_id);
+test_spu_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
 void spu_stop(spu_context* ctx);
 
 /* ---------------------------------------------------------------------------
@@ -392,6 +394,43 @@ static void test_smc_xori(void)
 static void code_a(spu_context* ctx) { ctx->gpr[3]._u32[0] = 81; }
 static void code_b(spu_context* ctx) { ctx->gpr[3]._u32[0] = 82; }
 static void code_stale(spu_context* ctx) { ctx->gpr[3]._u32[0] = 83; }
+/* Relocatable resident code (spu_overlay_register_region_reloc): one canonical lift
+ * served wherever the title copies the code, with ctx->reloc_delta set. */
+static void rl_fn0(spu_context* c) { c->gpr[9]._u32[0] = 0x40; }
+static void rl_fn1(spu_context* c) { c->gpr[9]._u32[0] = 0x41; }
+static void test_reloc_regions(void)
+{
+    spu_context* c = calloc(1, sizeof *c);
+    if (!c) { check(0, "reloc: allocate"); return; }
+    spu_context_init(c, 0); c->image_id = 121;
+    spu_begin_image(140); spu_register_function(0x10000, rl_fn0); spu_register_function(0x10040, rl_fn1);
+    spu_begin_image(0);
+    spu_overlay_register_region_reloc(0x910000, 0x100, 0, 141);          /* rejected: canon 0 */
+    spu_overlay_register_region_reloc(0x920000, 0x100, 0x3FF80, 142);    /* rejected: past LS */
+    spu_overlay_note_get(c, 0x910000, c->ls + 0x5000, 16);
+    spu_overlay_note_get(c, 0x920000, c->ls + 0x6000, 16);
+    check(!c->resident_code[0].image_id, "reloc: invalid canon registrations are refused");
+    spu_overlay_register_region_reloc(0x900000, 0x100, 0x10000, 140);
+    spu_overlay_note_get(c, 0x900000, c->ls + 0x23450, 16);
+    check(c->resident_code[0].image_id == 140 && c->resident_code[0].canon == 0x10000, "reloc: GET at any LSA makes the copy resident");
+    c->reloc_delta = 0;
+    check(spu_lifted_lookup(c, 0x23450) == rl_fn0, "reloc: placed entry runs the canonical lift");
+    check(c->reloc_delta == 0x13450, "reloc: lookup sets placement - canon");
+    check(spu_lifted_lookup(c, 0x23490) == rl_fn1, "reloc: second function at canon + offset");
+    c->reloc_delta = 0;
+    check(spu_lifted_lookup(c, 0x23450) == rl_fn0, "reloc: repeated lookup (cache hit)");
+    check(c->reloc_delta == 0x13450, "reloc: a cache hit restores the delta");
+    check(spu_lifted_lookup(c, 0x10000) == NULL, "reloc: the canonical address itself is not served");
+    spu_overlay_note_get(c, 0x900000, c->ls + 0x30000, 16);
+    int n = 0; for (unsigned s = 0; s < 4; ++s) n += c->resident_code[s].image_id == 140;
+    check(n == 1, "reloc: a new placement takes over the image's slot");
+    check(spu_lifted_lookup(c, 0x30040) == rl_fn1 && c->reloc_delta == 0x20000, "reloc: new placement, new delta");
+    check(spu_lifted_lookup(c, 0x23450) == NULL, "reloc: the old placement is no longer resident");
+    c->reloc_delta = 7;
+    check(spu_lifted_lookup(c, 0x30000) == rl_fn0 && c->reloc_delta == 0x20000, "reloc: delta after placement change");
+    free(c);
+}
+
 static void test_resident_code_regions(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
@@ -409,6 +448,9 @@ static void test_resident_code_regions(void)
     spu_overlay_note_get(ctx, 0x500000, ctx->ls + a, 0x100);
     spu_overlay_note_get(ctx, 0x600000, ctx->ls + b, 0x100);
     spu_overlay_note_get(ctx, 0x500100, ctx->ls + a + 0x100, 0x100);
+    /* The interpreter's rejoin probe has to agree with the dispatcher. */
+    check(spu_lifted_lookup(ctx, a) == code_a, "interpreter rejoins the first streamed job's code");
+    check(spu_lifted_lookup(ctx, b) == code_b, "interpreter rejoins the second streamed job's code");
     ctx->pc = a; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] == 81, "first streamed job survives second job and continuation DMA");
     ctx->pc = b; spu_indirect_branch(ctx);
@@ -416,6 +458,7 @@ static void test_resident_code_regions(void)
     spu_overlay_note_get(ctx, 0x700000, ctx->ls + a, 0x100);
     ctx->pc = a; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] != 81, "overwriting a code buffer invalidates its old image");
+    check(spu_lifted_lookup(ctx, a) == code_stale, "an overwritten buffer falls back to the base image");
     ctx->pc = b; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] == 82, "overwriting one buffer preserves the other");
     g_spu_trampoline_fn = 0;
@@ -472,6 +515,32 @@ static void test_verified_resident_code_regions(void)
     memcpy(ctx->ls + base + 0x1000, code, sizeof code);
     spu_overlay_note_get(ctx, ea, ctx->ls + base + 0x1000, 0x200);
     check(!ctx->resident_code[0].image_id, "a load at another LS address is not resident");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
+/* Dispatch memoizes registry lookups per host thread, misses included. An
+ * image whose functions register after its address was first dispatched
+ * (and missed) must still be found: registration invalidates the memo. */
+static void test_registry_lookup_memo(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate lookup memo context"); return; }
+    spu_context_init(ctx, 0);
+    const uint32_t a = 0x13000;
+    spu_begin_image(92); spu_register_function(a, code_b);
+    spu_begin_image(0);
+    ctx->image_id = 91;
+    check(spu_lifted_lookup(ctx, a) == NULL, "another image's function is not served");
+    check(spu_lifted_lookup(ctx, a) == NULL, "a repeated miss stays a miss");
+    spu_begin_image(91); spu_register_function(a, code_a);
+    spu_begin_image(0);
+    check(spu_lifted_lookup(ctx, a) == code_a, "registration invalidates a memoized miss");
+    ctx->pc = a; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 81, "indirect dispatch reaches the newly registered function");
+    ctx->image_id = 92;
+    check(spu_lifted_lookup(ctx, a) == code_b, "memo entries are keyed by image");
+
     g_spu_trampoline_fn = 0;
     free(ctx);
 }
@@ -1041,7 +1110,9 @@ int main(void)
     test_smc_branch_hints();
     test_smc_xori();
     test_resident_code_regions();
+    test_reloc_regions();
     test_verified_resident_code_regions();
+    test_registry_lookup_memo();
     test_resident_interpreter_rejoin();
 #ifdef SPU_VERIFIED_OVERLAY_TEST
     test_verified_overlay();

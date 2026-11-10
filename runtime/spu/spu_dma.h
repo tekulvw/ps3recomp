@@ -883,10 +883,18 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * snapshot against a line this copy has already replaced and commits
          * over it, and a peer parked on RdEventStat sleeps through the write.
          *
-         * So when the span touches a reserved line the copy and the notify run
-         * as ONE critical section under the lock-line lock -- the same contract
-         * the PPU store path and the PUTLLC commit keep, and the only way the
-         * copy cannot land inside a peer's compare-and-commit window. Spans
+         * So a reserved line's copy and its notify run as ONE critical section
+         * under the lock-line lock -- the same contract the PPU store path and
+         * the PUTLLC commit keep, and the only way the copy cannot land inside
+         * a peer's compare-and-commit window. Only the reserved lines need it:
+         * in a multi-line span the others are copied first, without the lock,
+         * exactly as an unreserved span is, and the locked pass then copies the
+         * lines it skipped and notifies every reserved one. A line reserved
+         * after its unlocked copy is notified there but NOT copied again: a
+         * peer may already have reserved and committed it on top of our bytes,
+         * and a second copy would write that commit back over. A wide PUT that
+         * touches one queue line no longer holds every other SPU's atomics off
+         * for the whole copy. Spans
          * that touch no reserved line keep the lock-free copy: bulk asset PUTs
          * are large and hot, and the scan is a bitmap bit per 128 bytes against
          * a global that stays zero until an SPU reserves its first line.
@@ -1028,17 +1036,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the
-         * garbage fn-ptr fields that cause the 0xC708C708 vcall crash. */
+         * garbage fn-ptr fields that cause the 0xC708C708 vcall crash.
+         * PUTs outside the region are only scanned for the poison word with
+         * SPU_POISON_DMA_WATCH=1 (see below). */
         { uint32_t e = (uint32_t)ea;
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
-          /* The payload scan is a second pass over every byte of every PUT.
-           * Run it for a PUT into the region (its report line carries the
-           * result) and otherwise only when SPU_POISON_DMA_WATCH=1 arms the
-           * poison-only report. */
-          static int s_poison = -1;
-          if (s_poison < 0) s_poison = getenv("SPU_POISON_DMA_WATCH") ? 1 : 0;
-          if (hitregion || s_poison)
+          static int s_poison_watch = -1;
+          /* SPU_POISON_DMA_WATCH=1 (any value): scan every PUT payload for the
+           * poison word and also log PUTs that carry it outside the region.
+           * Unset, only PUTs into the region are scanned (their lines are
+           * unchanged): the scan is a second pass over every byte of every PUT. */
+          if (s_poison_watch < 0) s_poison_watch = getenv("SPU_POISON_DMA_WATCH") ? 1 : 0;
+          if (hitregion || s_poison_watch)
           for (uint32_t o = 0; o + 4 <= size; o += 4) {
               uint32_t w; memcpy(&w, (const char*)ls_ptr + o, 4);
               if (w == 0x08C708C7u) { haspoison = 1; break; } /* 0xC708C708 BE in LS bytes */
@@ -1102,10 +1112,12 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
             spu->list_stall_cmd[t]       = base_cmd;
             spu->list_stall_mask |= (1u << t);  /* this tag now has a parked list */
             spu->list_stall_stat |= (1u << t);  /* accumulate into the notify mask */
-            /* Reservation invalidation can publish LR from another thread.
-             * An atomic OR, like that writer's and WrEventAck's AND, so none
-             * can replace a freshly raised DMA notification with stale bits. */
-            __atomic_fetch_or(&spu->event_status, 0x2u, __ATOMIC_SEQ_CST);   /* SPU_EVENT_SN stall-and-notify */
+            /* Reservation invalidation can publish LR from another thread, and
+             * WrEventAck clears bits from this one. SPU_EVENT_SET is an atomic
+             * fetch-or (#492), so none of the three can read-modify-write a
+             * freshly raised notification away -- which is what this needed the
+             * lock-line lock for before. */
+            SPU_EVENT_SET(spu, 0x2u);           /* SPU_EVENT_SN stall-and-notify */
             /* Real MFC runs a queued list asynchronously, so the notify lands
              * AFTER the arming code finishes. We run it inline here, so hold the
              * resulting interrupt off for a few drain ticks -- otherwise the WWS

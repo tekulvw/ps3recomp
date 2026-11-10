@@ -106,13 +106,15 @@ int main(void){
  sceNpManagerRegisterCallback((void*)0x1234,(void*)0x5678);
  assert(req()==0);cellSysutilCheckCallback();cellSysutilCheckCallback();assert(callbacks==3);
  setenv("PS3RECOMP_NP_LOCAL_TICKET","0",1);
- assert((u32)get(0,(void*)0x500)==0x8002aa0c);
+ /* Provider off: no ticket, size 0 (the offline answer, as without psnr). */
+ vm_write32(0x500,64);assert(get(0,(void*)0x500)==0);assert(vm_read32(0x500)==0);
  setenv("PS3RECOMP_NP_LOCAL_TICKET","1",1);
  assert((u32)get(0,(void*)0x500)==0x8002aa0a);
  assert(req()==0);
  setenv("PS3RECOMP_NP_LOCAL_TICKET","0",1);
  cellSysutilCheckCallback();assert(callbacks==3);
- assert((u32)req()==0x8002aa0c);assert((u32)get(0,(void*)0x500)==0x8002aa0c);
+ assert((u32)req()==0x8002aa0c);
+ vm_write32(0x500,64);assert(get(0,(void*)0x500)==0);assert(vm_read32(0x500)==0);
  sceNpTerm();free(vm_base);
  puts("NP local ticket: registration, account binding, deferred completion, retrieval and lifecycle PASS");
 }

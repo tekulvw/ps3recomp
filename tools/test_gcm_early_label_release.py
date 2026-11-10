@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix="gcm-early-release-") as tmp:
            "-ffunction-sections", "-fdata-sections", "-I", str(ROOT / "include"),
            str(ROOT / "libs/video/tests/test_gcm_early_label_release.c"),
            "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
-           str(ROOT / "libs/video/tests/gcm_deferred_fixture_stubs.c"),str(ROOT / "libs/video/rsx_fifo_busy.c"),
+           str(ROOT / "libs/video/tests/gcm_deferred_fixture_stubs.c"),str(ROOT / "libs/video/rsx_fifo_busy.c"),str(ROOT / "libs/video/rsx_tiling.c"),
            "-pthread", "-lm", "-o", str(out)]
     subprocess.run(cmd, check=True, timeout=60)
     env = {k: v for k, v in os.environ.items()

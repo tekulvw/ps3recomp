@@ -86,11 +86,21 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref);
 float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 
 /* Scale texel-space (RSX_TEX_FMT_UNNORM) coordinates into HLSL's 0..1 range.
- * unnorm_mask selects the units; dim[u] gives that unit's {width, height};
- * cube units are skipped. Returns the number of Sample sites patched, or -1 if
+ * unnorm_mask selects the units; dim[u] gives that unit's {width, height,
+ * depth}; cube units are skipped and volume_mask units (Texture3D) are divided
+ * by their depth as well. Returns the number of Sample sites patched, or -1 if
  * the buffer would overflow. A no-op when unnorm_mask is 0. */
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
-                              const u32 dim[][2], u32 cube_mask);
+                              const u32 dim[][3], u32 cube_mask, u32 volume_mask);
+
+/* WPOS on an antialiased surface held at its sample resolution (sx x sy
+ * samples a pixel, as in guest memory). The RSX runs the program once a pixel
+ * and WPOS is that pixel's window position; the host shades each sample and
+ * SV_POSITION counts samples. Rewrites the program's WPOS to the centre of the
+ * pixel its sample belongs to. Returns 1 when patched, 0 when there is nothing
+ * to do (a 1x1 grid, or no WPOS read), or -1 without mutation when the entry
+ * point is not found, the grid is already applied, or the buffer is short. */
+int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy);
 
 /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
@@ -164,6 +174,18 @@ u64 rsx_fp_literal_source_hash(
  * against fp_alpha.x from PSConstants instead of embedding a numeric value. */
 int rsx_fp_apply_alpha_test_buffered(
     char* hlsl, u32 out_size, u32 func);
+
+/* The depth-bounds test (NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE 0x0380, MIN
+ * 0x0384, MAX 0x0388) for a host API without one: the program first reads
+ * the depth STORED at its pixel from a float copy of the depth buffer bound
+ * on texture unit `unit` (one the program does not sample, declared
+ * Texture2D), and discards the fragment when it lies outside
+ * [fp_dbounds.x, fp_dbounds.y]. Adds `float4 fp_dbounds;` to PSConstants
+ * after fp_alpha, so the caller passes one more float4 there. For the
+ * buffered decompilers' HLSL, applied after the other wrappers. Returns 1,
+ * or -1 without mutation for an unexpected form, a cube or volume unit, a
+ * second application or insufficient capacity. */
+int rsx_fp_apply_depth_bounds(char* hlsl, u32 capacity, u32 unit);
 
 /* Plan one 256-byte-aligned allocation in a fence-retired PS constant ring.
  * Returns 1 when it fits, 0 when the caller must submit/wait/reset first, and

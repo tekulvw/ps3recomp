@@ -2,16 +2,23 @@
  * something reads that state: the vtable backend, or the walker without the
  * draw engine. With the draw engine up and no vtable, only the methods
  * rsx_process_method acts on beyond its state reach it (cellGcmSys.c,
- * gcm_legacy_method_has_effect).
+ * gcm_legacy_method_has_effect). Subchannel 1 (not 2D by default) reaches
+ * rsx_state the same way and is filtered the same way.
  *
  * cc -std=gnu17 -I include -I libs/video
  *   libs/video/tests/test_gcm_legacy_state_filter.c libs/video/tests/gcm_deferred_fixture_stubs.c
+ *   libs/video/rsx_fifo_busy.c
  *   -ffunction-sections -fdata-sections -Wl,-dead_strip -o /tmp/test_gcm_legacy_state_filter
+ *   (gcc: -Wl,--gc-sections -pthread -lm)
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* GCM_REPORT_SPU_HOLD_MS asks the SPU task layer whether a task round is
+ * running; there are no SPU tasks here. */
+int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;
@@ -38,6 +45,9 @@ int  rsx_process_method(rsx_state* state, u32 method, u32 data)
 { (void)state; (void)data; if (legacy_n < 64) legacy_seen[legacy_n++] = method; return 0; }
 int  rsx_draw_engine_enabled(void) { return engine_on; }
 rsx_backend* rsx_get_backend(void) { return vtable; }
+/* The walker hands vertex-program runs here (#554). */
+int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{ (void)state; (void)method; (void)src; (void)count; return 0; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -80,14 +90,20 @@ static void check(int ok, const char* what)
     fails += !ok;
 }
 
-static const u32 methods[] = { 0x0050u, 0x0A74u, 0x1EFCu, 0x1F00u, 0x0180u, 0x01A4u, 0x1D6Cu, 0x0208u };
+/* (subchannel << 13) | method. The label write (0x1D70) lands in the label
+ * window at offset 0, which the fixture's guest memory covers. */
+static const u32 methods[] = { 0x0050u, 0x0A74u, 0x1EFCu, 0x1F00u, 0x0180u, 0x01A4u, 0x1D6Cu,
+                               0x0208u, 0x1D70u, 0x2000u | 0x0104u, 0x2000u | 0x0300u, 0x1D74u };
 enum { N_METHODS = sizeof methods / sizeof methods[0] };
+/* What rsx_process_method is handed: the method without its subchannel. */
+static u32 bare[N_METHODS];
 
 /* One single-word command per method, walked in one pass. */
 static void walk(u32 ctrl)
 {
     u32 io = 0;
     for (u32 i = 0; i < N_METHODS; i++) {
+        bare[i] = methods[i] & 0x1FFCu;
         gw32(IO_ADDR + io, (1u << 18) | methods[i]);
         gw32(IO_ADDR + io + 4, 0x10u + i);
         io += 8;
@@ -105,8 +121,11 @@ static int seen_exactly(const u32* want, u32 n)
     return 1;
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
+    /* "trace": run under RSX_TRACE, which must keep the full stream. */
+    const int trace = argc > 1 && strcmp(argv[1], "trace") == 0;
+    if (trace) setenv("RSX_TRACE", "1", 1); else unsetenv("RSX_TRACE");
     setvbuf(stdout, NULL, _IONBF, 0);
     const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
     vm_base = (uint8_t*)calloc(1, vm_size);
@@ -117,15 +136,18 @@ int main(void)
     const uint32_t ctrl = (uint32_t)(uintptr_t)cellGcmGetControlRegister();
 
     engine_on = 0; vtable = NULL; walk(ctrl);
-    check(seen_exactly(methods, N_METHODS), "without the draw engine every method reaches rsx_state");
+    check(seen_exactly(bare, N_METHODS), "without the draw engine every method reaches rsx_state");
 
     static rsx_backend dummy;
     engine_on = 1; vtable = &dummy; walk(ctrl);
-    check(seen_exactly(methods, N_METHODS), "with a vtable backend every method reaches rsx_state");
+    check(seen_exactly(bare, N_METHODS), "with a vtable backend every method reaches rsx_state");
 
-    static const u32 effects[] = { 0x0050u, 0x0180u, 0x01A4u, 0x1D6Cu };
+    static const u32 effects[] = { 0x0050u, 0x0180u, 0x01A4u, 0x1D6Cu, 0x1D70u, 0x0104u, 0x1D74u };
     engine_on = 1; vtable = NULL; walk(ctrl);
-    check(seen_exactly(effects, 4), "draw engine without a vtable: only reference, DMA context and label-offset methods");
+    if (trace)
+        check(seen_exactly(bare, N_METHODS), "RSX_TRACE keeps every method with the draw engine and no vtable");
+    else
+        check(seen_exactly(effects, 7), "draw engine without a vtable: only reference, notify, DMA context and label methods");
 
     printf("[gcm_legacy_state_filter] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     free(vm_base);

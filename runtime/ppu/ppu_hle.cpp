@@ -22,6 +22,7 @@
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: spans of HLE import calls */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -54,6 +55,33 @@ typedef void (*hle_ctx_fn)(ppu_context*);
 static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
 static uint32_t g_ctx_count = 0;
 
+/* NID -> handler, per calling thread. Both tables above are searched
+ * linearly, g_ctx with about a hundred entries and g_hle_nids with over a
+ * thousand, and a title calls a few imports tens of thousands of times a
+ * second: God of War HD makes ~95k HLE calls a second in gameplay, most of
+ * them cellGcmAddressToOffset and _sys_memcpy, and the two scans were most of
+ * ps3_hle_call's cost. A slot keeps the indexes and the table sizes it was
+ * filled against, so a registration made after the first call is still
+ * found. Per thread, so no slot is read half-written. */
+struct HleSlot { uint32_t nid, ctx_n, tab_n; int32_t ctx_i, tab_i; };
+static thread_local HleSlot t_hle_slot[1024];
+static const HleSlot* hle_slot(uint32_t nid)
+{
+    HleSlot* s = &t_hle_slot[(nid * 2654435761u) >> 22];
+    const uint32_t ctx_n = g_ctx_count, tab_n = g_hle_inited ? g_hle_nids.count : 0;
+    if (s->nid != nid || s->ctx_n != ctx_n || s->tab_n != tab_n || (!s->ctx_n && !s->tab_n)) {
+        s->ctx_i = s->tab_i = -1;
+        for (uint32_t i = 0; i < ctx_n; i++)
+            if (g_ctx[i].nid == nid) { s->ctx_i = (int32_t)i; break; }
+        if (s->ctx_i < 0 && tab_n) {
+            const ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
+            if (e) s->tab_i = (int32_t)(e - g_hle_nids.entries);
+        }
+        s->nid = nid; s->ctx_n = ctx_n; s->tab_n = tab_n;
+    }
+    return s;
+}
+
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
 {
     if (g_ctx_count < HLE_CTX_CAP) {
@@ -61,6 +89,36 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
         g_ctx[g_ctx_count].name = name ? name : "?";   /* named in the milestone log */
         g_ctx_count++;
     }
+}
+
+/* Leaf imports that can finish without the dispatcher: no guest code, no
+ * change to r2, no blocking. The module that implements one registers a fast
+ * form beside the full handler. ps3_hle_call tries it first, and the fast form
+ * returns 0 to take the full call instead (a contended lock that has to wait,
+ * say). God of War HD takes an lwmutex about 640,000 times in one frame (its
+ * allocator, when a wave spawns), and the dispatcher's guard and bookkeeping
+ * were a large part of each. Registered at init, before guest threads run.
+ * Fast calls do not show in PS3_FTRACE. */
+typedef int (*hle_fast_fn)(ppu_context*);
+#define HLE_FAST_N 64u
+static struct { uint32_t nid; hle_fast_fn fn; } g_hle_fast[HLE_FAST_N];
+extern "C" void ps3_hle_register_fast(uint32_t nid, hle_fast_fn fn)
+{
+    const uint32_t h = (nid * 2654435761u) >> 26;
+    for (uint32_t i = 0; i < HLE_FAST_N; i++) {
+        auto& e = g_hle_fast[(h + i) & (HLE_FAST_N - 1)];
+        if (!e.fn || e.nid == nid) { e.nid = nid; e.fn = fn; return; }
+    }
+}
+static inline hle_fast_fn hle_fast(uint32_t nid)
+{
+    const uint32_t h = (nid * 2654435761u) >> 26;
+    for (uint32_t i = 0; i < HLE_FAST_N; i++) {
+        const auto& e = g_hle_fast[(h + i) & (HLE_FAST_N - 1)];
+        if (!e.fn) return nullptr;
+        if (e.nid == nid) return e.fn;
+    }
+    return nullptr;
 }
 
 /* Is this NID implemented here? Lets a host boot harness that owns its own
@@ -220,6 +278,9 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    if (const hle_fast_fn f = hle_fast(nid))
+        if (f(ctx)) return;
+
     SpursWorkloadInfoTrace _spurs_info_trace(nid, ctx);
     SpursAttributeTrace _spurs_attribute_trace(nid,ctx);
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
@@ -260,11 +321,17 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
     const bool attribute_arg9_enabled=nid==0xEFEB2679u&&[](){static const bool on=[](){const char *v=getenv("PS3RECOMP_SPURS_WORKLOAD_STACK_ARG9");return v&&!strcmp(v,"1");}();return on;}();
     const bool attribute_stack_invalid=attribute_arg9_enabled&&(ctx->gpr[1]>UINT32_MAX-0x70u||!SpursWorkloadInfoTrace::range(ctx->gpr[1]+0x70,8));
-    struct _TocGuard { ppu_context* c; uint64_t toc, sp; bool writeback;
-        ~_TocGuard(){ c->gpr[2] = toc; if(writeback)vm_write64(sp + 0x28, toc);
+    /* It also closes the PS3_FTRACE span of the call: a thread blocked in an
+     * import (a file read, a SPURS wait) shows up nowhere else. */
+    struct _TocGuard { ppu_context* c; uint64_t toc, sp, ft0; uint32_t nid, lr; bool writeback;
+        ~_TocGuard(){ c->gpr[2] = toc; if (writeback) vm_write64(sp + 0x28, toc);
                       unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
-    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1],!attribute_stack_invalid };
+                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr;
+                      if (ft0) { const uint64_t t1 = ps3_ft_now();
+                                 if (t1 - ft0 >= ps3_ft_min_ns())
+                                     ps3_ft_span(PS3_FT_HLE, t, nid, lr, ft0, t1); } }
+    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1], PS3_FT_ON() ? ps3_ft_now() : 0, nid, (uint32_t)ctx->lr,
+           !attribute_stack_invalid };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */
@@ -662,8 +729,9 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         }
     }
 
-    for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) {
+    const HleSlot* hs = hle_slot(nid);
+    if (hs->ctx_i >= 0) {
+            const uint32_t i = (uint32_t)hs->ctx_i;
             ps3_msf("hle:%s", g_ctx[i].name);
             /* Record the name here too. This loop dispatches every
              * ps3_hle_register_ctx handler -- which is the whole sysPrxForUser
@@ -684,7 +752,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             return;
         }
 
-    ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
+    ps3_nid_entry* e = hs->tab_i >= 0 ? &g_hle_nids.entries[hs->tab_i] : nullptr;
     if (!e || !e->handler) {
         /* Recorded before the diagnostic paths below, several of which return
          * early. An import moving between resolved and unresolved is exactly the
@@ -807,8 +875,21 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
 /* Populated by the generated registration unit (gen_hle_nids.py). Weak so a
  * build without it still links (no HLE registered -> imports log + return 0). */
+#if defined(_MSC_VER)
+/* MSVC has no weak functions: /alternatename redirects references to the
+ * default only while the strong definition from the generated unit is absent
+ * -- weak semantics, and ignored when ppu_hle_nids.cpp is linked. */
+extern "C" void ppu_hle_register_all_default(void) {}
+extern "C" void ppu_hle_register_all(void);   /* generated unit; /alternatename falls back */
+#  if defined(_M_IX86)
+#    pragma comment(linker, "/alternatename:_ppu_hle_register_all=_ppu_hle_register_all_default")
+#  else
+#    pragma comment(linker, "/alternatename:ppu_hle_register_all=ppu_hle_register_all_default")
+#  endif
+#else
 extern "C" void ppu_hle_register_all(void) __attribute__((weak));
 extern "C" void ppu_hle_register_all(void) {}
+#endif
 
 extern "C" void ppu_hle_init(void)
 {

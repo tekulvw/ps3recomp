@@ -73,9 +73,10 @@ static void setup(void)
 
 static void test_layout(void)
 {
-    /* Before any window publishes, port 0 is exactly what it was (the
-     * long-standing zeroed host state of a controller-less port). */
-    report("headless port untouched", 0, 0, 0, 0, 0);
+    /* Before any window publishes, port 0 is exactly what the backend made it:
+     * a controller-less port is released each poll, buttons up and sticks
+     * centred (pad_host_release). */
+    report("headless port untouched", 0, 128, 128, 128, 128);
     publish(1, 1, 0);
     report("window, no keys: neutral", 0, 128, 128, 128, 128);
 
@@ -169,11 +170,11 @@ static void test_controller_and_window_loss(void)
     /* The window goes away with X held: released once, then left alone. */
     ps3recomp_pad_sdl_keyboard_sample(NULL, 0);
     report("window loss releases held keys", 0, 128, 128, 128, 128);
-    s_host_state[0].buttons = CELL_PAD_CTRL_TRIANGLE;
-    usleep(6000);
-    pad_poll_backend();
-    assert(s_host_state[0].buttons == CELL_PAD_CTRL_TRIANGLE);   /* no window: untouched */
-    s_host_state[0].buttons = 0;
+    /* No window: keys no longer reach the port, which stays as the backend
+     * left it (a controller-less port is released every poll). */
+    keys[SDL_SCANCODE_X] = 1;
+    ps3recomp_pad_sdl_keyboard_publish(keys, SDL_NUM_SCANCODES, 0, 1, 0);
+    report("no window: keys leave the port alone", 0, 128, 128, 128, 128);
     memset(keys, 0, sizeof keys);
     printf("controller priority and window loss\n");
 }
@@ -203,7 +204,7 @@ int main(int argc, char** argv)
     if (!strcmp(mode, "off")) {
         setenv("PAD_NO_KEYBOARD", "1", 1);
         keys[SDL_SCANCODE_X] = 1; publish(1, 1, 0);
-        report("PAD_NO_KEYBOARD leaves port 0 alone", 0, 0, 0, 0, 0);
+        report("PAD_NO_KEYBOARD leaves port 0 alone", 0, 128, 128, 128, 128);
         printf("PAD_NO_KEYBOARD opt-out\n");
     } else if (!strcmp(mode, "sdl")) {
         test_real_sdl_window();

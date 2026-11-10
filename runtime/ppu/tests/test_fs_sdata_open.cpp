@@ -23,6 +23,7 @@
 #include "ppu_fs.cpp"
 #include "../../../libs/filesystem/edat.c"
 #include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
+#include "../../platform/ps3_dev_flash.c"         /* ps3_dev_flash_path, which host_path calls for /dev_flash */
 
 /* ---- link stubs: nothing on the paths this test drives calls them ---- */
 extern "C" {

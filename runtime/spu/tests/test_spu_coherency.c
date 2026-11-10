@@ -25,6 +25,7 @@
 /* The unit under test, compiled straight in: it is one small file whose only
  * dependency on the rest of the runtime is spu_ch_wake, stubbed below. */
 #include "../spu_coherency.c"
+#include "../../../tests/spu_ls_watch_fixture.h"
 
 /* The real PPU store and store-conditional path the hook lives in. */
 #include "../../ppu/ppu_memory.h"
@@ -479,10 +480,7 @@ static void test_ppu_only_line(void)
  * -----------------------------------------------------------------------*/
 #include <pthread.h>
 #include <unistd.h>
-/* The LS watch lives in spu_channels.c, which this test does not link: disarmed stand-ins. */
-int g_spu_ls_watch_n = 0;
-void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
-{ (void)lsa; (void)is_write; (void)p; (void)pc; (void)lr; }
+/* The disarmed LS-watch stand-ins come from tests/spu_ls_watch_fixture.h (top). */
 
 static void shard_store32(uint32_t ea, uint32_t v)
 {

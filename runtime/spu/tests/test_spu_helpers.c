@@ -9,17 +9,15 @@
  *
  * Build:
  *   gcc -std=c11 -I../.. test_spu_helpers.c -o test_spu_helpers
+ *   (add -mssse3 on x86 to cover the SPU_LS_VEC quadword path of spu_context.h)
  *
  * Exit code: 0 if all passed, 1 if any failed. Final line prints summary.
  */
 
 #include "../spu_helpers.h"
+#include "../../../tests/spu_ls_watch_fixture.h"
 #include <stdio.h>
 #include <string.h>
-/* The LS watch lives in spu_channels.c, which this test does not link: disarmed stand-ins. */
-int g_spu_ls_watch_n = 0;
-void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
-{ (void)lsa; (void)is_write; (void)p; (void)pc; (void)lr; }
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -491,7 +489,25 @@ static void test_float_compares(void) {
 /* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
+static void test_ls_quadwords(void) {
+    static spu_context ctx;
+    ctx.ls = ctx.ls_store;
+    for (unsigned i = 0; i < 16; ++i) ctx.ls[i] = (uint8_t)i;
+    TEST("lqd: big-endian words, aligned and wrapped address");
+    EXPECT_EQ(spu_ls_read128(&ctx, SPU_LS_SIZE + 7),
+              make128_words(0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F));
+    TEST("stqd: big-endian bytes, aligned and wrapped address");
+    spu_ls_write128(&ctx, SPU_LS_SIZE + 23,
+                   make128_words(0x01234567, 0x89ABCDEF, 0x76543210, 0xFEDCBA98));
+    static const uint8_t want[16] = {
+        0x01,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF,
+        0x76,0x54,0x32,0x10,0xFE,0xDC,0xBA,0x98};
+    if (!memcmp(ctx.ls + 16, want, sizeof want)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+}
+
 int main(void) {
+    test_ls_quadwords();
     test_immediate_loaders();
     test_simd_arith();
     test_multiply();

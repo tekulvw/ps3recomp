@@ -33,10 +33,20 @@ using u8=uint8_t;using u32=uint32_t;using u64=uint64_t;using s32=int32_t;
 static constexpr u32 CELL_OK=0,CELL_SPURS_CORE_ERROR_NULL_POINTER=0x80410711,CELL_SPURS_CORE_ERROR_INVAL=0x80410702,CELL_SPURS_MAX_WORKLOAD=16,CELL_SPURS_MAX_SPU=8;
 /* ACTUAL_CONSTANTS */
 struct SpursWorkload{bool in_use;u64 data;u8 priority[8];void*pm;u32 sizePm,name_ea,minContention,maxContention;};
-static SpursWorkload s_workloads[16];static u8 ram[4096],*vm_base=ram;
+using u16=uint16_t;static u8 ram[4096],*vm_base=ram;
 static void vm_write32(u32 a,u32 v){for(unsigned i=0;i<4;i++)ram[a+i]=(u8)(v>>(24-8*i));}
 static void vm_write64(u32 a,u64 v){vm_write32(a,v>>32);vm_write32(a+4,v);}
 static u32 vm_read32(u32 a){return (u32)ram[a]<<24|(u32)ram[a+1]<<16|(u32)ram[a+2]<<8|ram[a+3];}
+static u16 vm_read16(u32 a){return (u16)(ram[a]<<8|ram[a+1]);}
+/* ACTUAL_HELPERS */
+#ifndef SPURS_MAX_WID
+#define SPURS_MAX_WID CELL_SPURS_MAX_WORKLOAD
+#endif
+/* No SPURS instance is registered here: GetWorkloadInfo reads the SPURS1
+ * layout, as for an instance it does not know. */
+struct SpursInst{u32 ea;int is2;};
+[[maybe_unused]] static const SpursInst* spurs_inst_find(u32){return nullptr;}
+static SpursWorkload s_workloads[SPURS_MAX_WID];
 /* ACTUAL_WORKLOAD */
 static void arm(){FILE*f=fopen(getenv("AUDIO_CHRONOLOGY_TRIGGER"),"w");assert(f);fclose(f);tick+=250001;audio_chronology_poll();assert(s_ac.armed);}
 int main(int argc,char**argv){assert(argc==2);const char*m=argv[1];watched=&s_ac.lock;audio_chronology_poll();ppu_context ctx={};ctx.thread_id=99;ctx.gpr[8]=2;
