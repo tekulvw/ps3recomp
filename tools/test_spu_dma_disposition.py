@@ -4,7 +4,7 @@ import os
 if os.name == 'nt':
     print('SKIP: POSIX fixture: stubs Win32 SetLastError, which collides with kernel32 on Windows')
     raise SystemExit(0)
-import os, subprocess, tempfile, re
+import os, subprocess, sys, tempfile, re
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_','LBP_'))}
@@ -50,4 +50,6 @@ with tempfile.TemporaryDirectory(prefix='dma-disposition-') as tmp:
     directory=Path(tmp)/'dir';directory.mkdir()
     assert run(dict(span,SPU_DMA_DISPOSITION_TRIGGER=str(directory)))==[]
     assert run(dict(span,SPU_DMA_DISPOSITION_TRIGGER=str(Path(tmp)/'missing')))==[]
+# The observer stays a pure addition to the DMA code (structure of spu_dma.h).
+subprocess.run([sys.executable,str(root/'tools/check_spu_dma_disposition_preservation.py')],check=True)
 print('PASS: real direct/list copies, malformed rc0 no-copy, validation failures, bounded payload/range, disabled poison, pre-trigger budget, exact concurrent cap')
