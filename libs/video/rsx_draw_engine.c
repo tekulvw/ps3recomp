@@ -5591,6 +5591,7 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
         eng_native_color_attest_publish(p);
         for(u32 i=0;i<p->register_count;++i) {
             const rsx_native_register_write* r=&p->registers[i];
+            eng_texture_decode_invalidate(r->method,r->value);
             g.rsx.regs[r->method>>2]=r->value;
             if(r->method>=0x1A00 && r->method<0x1C00 && ((r->method&31u)==0 || (r->method&31u)==4)) {
                 const u32 unit=(r->method-0x1A00)/32;
