@@ -77,6 +77,10 @@ int main(int argc,char** argv) {
     assert(polls>=1024 && produced && consumer.gpr[10]._u32[0]>=1024);
     assert(consumer.status==SPU_STATUS_RUNNING);
     assert(spu_ls_read32(&consumer,target_lsa)==0xDEADBEEF);
+    /* A different transfer ends the repeat episode (SPU_DMA_REPEAT_LOG line). */
+    spu_wrch(&consumer,MFC_LSA,spu_splat_u32(target_lsa+16));
+    spu_wrch(&consumer,MFC_EAL,spu_splat_u32(source_ea+16));
+    spu_wrch(&consumer,MFC_Cmd,spu_splat_u32(command));
     spu_mfc_release(&consumer);
     puts("PASS: repeated GET observes delayed producer without a synthetic guest halt");
     return 0;
@@ -87,7 +91,12 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {
     (void)a; (void)v; (void)w;
 }
-unsigned long long ps3_ms_now(void)                    { return 0; }
+/* A real clock: the repeat episode starts and ages by it (SPU_DMA_REPEAT_LOG). */
+unsigned long long ps3_ms_now(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return 1000ull + (unsigned long long)t.tv_sec * 1000ull + (unsigned long long)t.tv_nsec / 1000000ull;
+}
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 int      g_resv_store_active = 0;
 uint32_t g_barrier_sync_watch = 0;
