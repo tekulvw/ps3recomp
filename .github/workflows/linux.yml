@@ -53,9 +53,12 @@ jobs:
       # imported target and refuses to load while /usr/bin/glslang is absent.
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang \
-            glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
+          bash .github/scripts/install-linux-dependencies.sh \
+            ninja-build libsdl2-dev clang glslang-dev glslang-tools \
+            spirv-tools libspirv-cross-c-shared-dev
+
+      - name: Test dependency installer
+        run: python3 -m unittest discover -s .github/tests -v
 
       - name: Configure
         run: |

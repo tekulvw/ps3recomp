@@ -50,9 +50,8 @@ jobs:
       # mesa-vulkan-drivers; the validation layer is its own package.
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang \
-            glslang-dev glslang-tools spirv-tools \
+          bash .github/scripts/install-linux-dependencies.sh \
+            ninja-build libsdl2-dev clang glslang-dev glslang-tools spirv-tools \
             libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
 
       - name: Configure
