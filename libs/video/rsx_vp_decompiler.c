@@ -263,6 +263,40 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
     return instrs;
 }
 
+int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes, rsx_vp_constant_range* range)
+{
+    if (!range) return -1;
+    range->first = 0; range->count = 512; range->all = 1;
+    if (!ucode) return -1;
+    u32 lo = 512, hi = 0, off = 0;
+    int instrs = 0, all = 0, ended = 0;
+    while (off + 16 <= max_bytes) {
+        const u32 d1 = rd_le(ucode + off + 4);
+        const u32 d2 = rd_le(ucode + off + 8);
+        const u32 d3 = rd_le(ucode + off + 12);
+        off += 16;
+        instrs++;
+        const u32 src0 = ((d2 >> 23) & 0x1FF) | ((d1 & 0xFF) << 9);
+        const u32 src1 = (d2 >> 6) & 0x1FFFF;
+        const u32 src2 = ((d3 >> 21) & 0x7FF) | ((d2 & 0x3F) << 11);
+        if (vp_is_flow((d1 >> 27) & 0x1F)) all = 1;
+        if ((src0 & 3u) == 3u || (src1 & 3u) == 3u || (src2 & 3u) == 3u) {
+            if ((d3 >> 1) & 1u) all = 1;          /* indexed through a0/a1 */
+            const u32 c = ((d1 >> 12) & 0x3FF) & 511u;
+            if (c < lo) lo = c;
+            if (c > hi) hi = c;
+        }
+        if (d3 & 1u) { ended = 1; break; }
+    }
+    if (!ended) return -1;
+    if (!all) {
+        range->all = 0;
+        range->first = lo <= hi ? lo : 0;
+        range->count = lo <= hi ? hi - lo + 1u : 0;
+    }
+    return instrs;
+}
+
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
     u32 input_mask, char* out, u32 out_size);
