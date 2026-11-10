@@ -34,7 +34,7 @@ jobs:
       - name: Native build and software Vulkan dependencies
         run: |
           bash .github/scripts/install-linux-dependencies.sh \
-            clang pkg-config libsdl2-dev libvulkan-dev mesa-vulkan-drivers \
+            clang libclang-rt-dev pkg-config libsdl2-dev libvulkan-dev mesa-vulkan-drivers \
             vulkan-validationlayers glslang-tools
       - name: CPU-only injected driver-fault contract
         run: python tools/test_frontend_vulkan.py --contract-only

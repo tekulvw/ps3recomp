@@ -51,7 +51,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash .github/scripts/install-linux-dependencies.sh \
-            ninja-build libsdl2-dev clang glslang-dev glslang-tools spirv-tools \
+            ninja-build libsdl2-dev clang libclang-rt-dev glslang-dev glslang-tools spirv-tools \
             libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
 
       - name: Configure

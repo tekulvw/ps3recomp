@@ -54,8 +54,15 @@ jobs:
       - name: Install dependencies
         run: |
           bash .github/scripts/install-linux-dependencies.sh \
-            ninja-build libsdl2-dev clang glslang-dev glslang-tools \
+            ninja-build libsdl2-dev clang libclang-rt-dev glslang-dev glslang-tools \
             spirv-tools libspirv-cross-c-shared-dev
+
+      # Minimal runner images need compiler-rt for the UBSan fixtures.
+      - name: Verify Clang UBSan runtime
+        run: |
+          printf '%s\n' 'int main(void) { volatile int one = 1; return one + 1 - 2; }' \
+            | clang -x c - -fsanitize=undefined -fno-sanitize-recover=all -o /tmp/ps3recomp-ubsan-smoke
+          /tmp/ps3recomp-ubsan-smoke
 
       - name: Test dependency installer
         run: python3 -m unittest discover -s .github/tests -v
