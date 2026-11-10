@@ -115,6 +115,8 @@ static void test_constant_rows(void)
         CHECK(rsx_vp_analyze_constants(vp, 48, &r) == 3 && r.all, "flow control reads them all");
     }
 
+    /* Read once: set before the first draw that could ask. */
+    setenv("PS3RECOMP_RSX_VS_CONSTANT_ROWS", "1", 1);
     g_stub_backend.bind_vs_constant_rows = stub_bind_vs_rows;
     g_stub_backend.rebind_vs_constants = stub_rebind_vs;
     g_rebind_answer = 1;
