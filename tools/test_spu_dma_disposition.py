@@ -27,6 +27,15 @@ with tempfile.TemporaryDirectory(prefix='dma-disposition-') as tmp:
     assert [r['disposition'] for r in zero]==['zeroed-ea','zeroed-ls']
     assert all(r['copied']=='0' and r['words']=='0' for r in zero)
     assert run({},'disabled')==[]
+    def hooks_off(settings):
+        p=subprocess.run([str(binary),'hooks-off'],env=dict(env,**settings),capture_output=True,text=True,check=True,timeout=10)
+        return p.stdout.strip()
+    # Both observers off: every DMA hook after the first is one inline load.
+    quiet={k:v for k,v in env.items() if not k.startswith('AUDIO_CHRONOLOGY')}
+    assert subprocess.run([str(binary),'hooks-off'],env=quiet,capture_output=True,text=True,check=True,timeout=10).stdout.strip()=='hooks_off=1'
+    # Either observer on keeps the out-of-line hooks.
+    assert hooks_off(span)=='hooks_off=0'
+    assert hooks_off({'AUDIO_CHRONOLOGY':'1','AUDIO_CHRONOLOGY_TRIGGER':str(Path(tmp)/'never')})=='hooks_off=0'
     rows=run(span)
     assert [r['disposition'] for r in rows]==['copied-put','copied-get','copied-put','malformed-no-copy','rejected','rejected'],rows
     assert [r['rc'] for r in rows]==['0','0','0','0','-1','-1']
