@@ -232,6 +232,10 @@ int main(int argc, char** argv)
         if (i % 4 == 1) {
             memcpy(vc, prev_vc, sizeof vc);
             if (!vk_eng_rebind_vs_constants(NULL)) vk_eng_bind_vs_constants(NULL, vc, sizeof vc);
+        } else if (i % 4 == 2) {
+            /* The rows the program reads (0 and 1) and the last two, as the
+             * engine stages them for a program that reads only those. */
+            vk_eng_bind_vs_constant_rows(NULL, vc, sizeof vc, 0, 2);
         } else vk_eng_bind_vs_constants(NULL, vc, sizeof vc);
         memcpy(prev_vc, vc, sizeof vc);
         const float pc[8] = { 1, 1, 1, 0.5f + 0.5f * (float)(i % 2), 0.3f, 0.3f, 0.3f, 0.25f };
