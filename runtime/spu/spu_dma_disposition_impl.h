@@ -71,15 +71,18 @@ static int dma_disp_armed(void) {
     if(exists)InterlockedExchange(&s_dma_disposition.armed,1);
     return exists;
 }
-/* Read on every SPU DMA: a compare-and-swap here took the shared line
- * exclusively from each SPU thread. A plain acquire load suffices. */
-#ifdef _WIN32
-#define DMA_DISP_READY_LOAD(p) InterlockedCompareExchange((p),0,0)
-#else
-#define DMA_DISP_READY_LOAD(p) __atomic_load_n((p),__ATOMIC_ACQUIRE)
+/* Read on every SPU DMA while an observer is on: a compare-and-swap here
+ * took the shared line exclusively from each SPU thread, on Windows too. */
+#define DMA_DISP_READY_LOAD(p) ReadAcquire(p)
+/* Alone on its line: every SPU thread reads it on every DMA, and only the
+ * first DMA of the run writes it. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((aligned(64)))
 #endif
-void spu_dma_disposition_begin(spu_dma_disposition_token* t,uint32_t lsa,uint64_t ea,uint32_t size,uint32_t cmd) {
-    /* Runs on every SPU DMA. errno and the last error are preserved across
+volatile int g_spu_dma_hooks_off;
+void spu_dma_disposition_begin_slow(spu_dma_disposition_token* t,uint32_t lsa,uint64_t ea,uint32_t size,uint32_t cmd) {
+    /* Reached until both observers have read their switches, and on every
+     * DMA while either is on. errno and the last error are preserved across
      * the paths that can touch them: the one-time init and the enabled
      * path. The chronology hook preserves them itself, and the disabled
      * path below reads only plain fields, so neither is bracketed. */
@@ -96,6 +99,9 @@ void spu_dma_disposition_begin(spu_dma_disposition_token* t,uint32_t lsa,uint64_
         SetLastError(init_last);
 #endif
     }
+    /* The chronology call above has run its own one-time init, so both
+     * switches are now final. */
+    if(!s_dma_disposition.enabled && !s_ac.enabled && !g_spu_dma_hooks_off)g_spu_dma_hooks_off=1;
     if(!s_dma_disposition.enabled)return;
     int saved=errno;
 #ifdef _WIN32
@@ -117,7 +123,7 @@ void spu_dma_disposition_begin(spu_dma_disposition_token* t,uint32_t lsa,uint64_
 #endif
 }
 static uint32_t dma_disp_read(const uint8_t* p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
-void spu_dma_disposition_before(spu_dma_disposition_token* t,const uint8_t* src,uint64_t ea,uint32_t size) {
+void spu_dma_disposition_before_slow(spu_dma_disposition_token* t,const uint8_t* src,uint64_t ea,uint32_t size) {
     if(!t->seq)return;
     t->count=0;
     if(!size || size>SPU_LS_SIZE || ea>0xFFFFFFFFull || size>0x100000000ull-ea)return;
@@ -129,12 +135,12 @@ void spu_dma_disposition_before(spu_dma_disposition_token* t,const uint8_t* src,
     if(t->count>s_dma_disposition.words)t->count=s_dma_disposition.words;
     for(uint32_t i=0;i<t->count;i++)t->before[i]=dma_disp_read(src+t->offset+i*4);
 }
-void spu_dma_disposition_after(spu_dma_disposition_token* t,const uint8_t* dst) {
+void spu_dma_disposition_after_slow(spu_dma_disposition_token* t,const uint8_t* dst) {
     audio_chronology_dma_after(&t->chronology,dst);
     if(!t->seq)return;
     for(uint32_t i=0;i<t->count;i++)t->after[i]=dma_disp_read(dst+t->offset+i*4);
 }
-int spu_dma_disposition_finish(const spu_dma_disposition_token* t,const spu_context* s,uint32_t lsa,uint64_t ea,uint32_t size,uint32_t cmd,int rc,unsigned outcome) {
+int spu_dma_disposition_finish_slow(const spu_dma_disposition_token* t,const spu_context* s,uint32_t lsa,uint64_t ea,uint32_t size,uint32_t cmd,int rc,unsigned outcome) {
     if(t->chronology.port>=0 && audio_chronology_enabled())audio_chronology_dma_end(&t->chronology,s,s->spu_id,s->pc&SPU_LS_MASK,lsa,cmd,rc,outcome==SPU_DMA_DISPOSITION_PUT);
     if(!t->seq)return rc;
     int saved=errno;

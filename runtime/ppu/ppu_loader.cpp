@@ -786,6 +786,14 @@ extern "C" void spu_coh_line_shard_unlock(uint32_t addr);
 extern "C" int  spu_coh_ppu_live_tracking(void);
 extern "C" void spu_coh_ppu_live_add(uint32_t addr);
 extern "C" void spu_coh_ppu_live_drop(uint32_t addr);
+/* PS3RECOMP_COH_VERSIONS (spu_coh_ops.h): NULL unless per-line version
+ * counters are on; then reservations are a line count, not an epoch. */
+#include "../spu/spu_coh_ops.h"
+extern "C" uint32_t ppu_vm_size;
+static inline bool ppu_cohv_ok(uint32_t addr, unsigned size)
+{
+    return !(addr & (size - 1u)) && (ppu_vm_size == 0 || (uint64_t)addr + size <= ppu_vm_size);
+}
 
 /* The architectural reservation belongs to the executing host thread. No
  * pointers are registered in coherence, so short-lived guest contexts cannot
@@ -794,7 +802,7 @@ extern "C" void spu_coh_ppu_live_drop(uint32_t addr);
 static PPU_THREAD_LOCAL struct {
     ppu_context* ctx;
     uint32_t addr;
-    uint64_t epoch;
+    uint64_t epoch;   /* the line's count under PS3RECOMP_COH_VERSIONS */
     bool valid;
 } g_line_reservation;
 /* Only the new SC entry points require a line token. Older generated loads
@@ -898,6 +906,17 @@ static inline bool ppu_resv_line_clear(uint32_t ea)
 extern "C" uint32_t ppu_load_reserve32(ppu_context* ctx, uint64_t ea)
 {
     uint32_t addr = (uint32_t)ea;
+    if (const spu_coh_ops* cohv = g_spu_coh_ops) {
+        if (ppu_cohv_ok(addr, 4)) {
+            /* A lock-free read under the line's count: the reservation. */
+            uint64_t raw = 0;
+            const uint32_t count = cohv->load_reserve(addr, vm_base + addr, 4, &raw);
+            const uint32_t value = __builtin_bswap32((uint32_t)raw);
+            ctx->reserve_addr = addr; ctx->reserve_value = value; ctx->reserve_valid = 1;
+            g_line_reservation = {ctx, addr, count, true};
+            return value;
+        }
+    }
     spu_lockline_lock();
     ppu_resv_open_begin(addr);
     const bool live = ppu_live_begin(addr);
@@ -912,6 +931,17 @@ extern "C" uint32_t ppu_load_reserve32(ppu_context* ctx, uint64_t ea)
 extern "C" uint64_t ppu_load_reserve64(ppu_context* ctx, uint64_t ea)
 {
     uint32_t addr = (uint32_t)ea;
+    if (const spu_coh_ops* cohv = g_spu_coh_ops) {
+        if (ppu_cohv_ok(addr, 8)) {
+            /* A lock-free read under the line's count: the reservation. */
+            uint64_t raw = 0;
+            const uint32_t count = cohv->load_reserve(addr, vm_base + addr, 8, &raw);
+            const uint64_t value = __builtin_bswap64((uint64_t)raw);
+            ctx->reserve_addr = addr; ctx->reserve_value = value; ctx->reserve_valid = 1;
+            g_line_reservation = {ctx, addr, count, true};
+            return value;
+        }
+    }
     spu_lockline_lock();
     ppu_resv_open_begin(addr);
     const bool live = ppu_live_begin(addr);
@@ -1162,6 +1192,17 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
                         n, (uint32_t)ea & ~127u); } }
     /* The shard excludes PPU-only-line stores, which skip the lock-line lock,
      * across the epoch check and the compare-and-swap. */
+    const spu_coh_ops* cohv = g_spu_coh_ops;
+    if (cohv && !g_line_sc_ctx && !g_spu_cohv_old_ppu_resv) __atomic_store_n(&g_spu_cohv_old_ppu_resv, 1, __ATOMIC_RELAXED);
+    if (coh && cohv) {
+        /* PS3RECOMP_COH_VERSIONS: the compare-and-swap under the line's count. */
+        int ok = cohv->cas((uint32_t)ea, vm_base + (uint32_t)ea, 4, exp_raw, new_raw);
+        if (ok) ppu_resv_break(ea);
+        resv_unlock(L);
+        if (ok && g_ww_lo && (uint32_t)ea >= g_ww_lo && (uint32_t)ea < g_ww_hi)
+            ppu_ww_note_atomic((uint32_t)ea, val, 4, __builtin_return_address(0));
+        return ok;
+    }
     if (coh) { spu_lockline_lock(); spu_coh_line_shard_lock((uint32_t)ea); }
     if (coh && !ppu_reservation_line_check(self, (uint32_t)ea)) {
         spu_coh_line_shard_unlock((uint32_t)ea); spu_lockline_unlock(); resv_unlock(L); return 0;
@@ -1237,6 +1278,19 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
+    const spu_coh_ops* cohv = g_spu_coh_ops;
+    if (cohv && !g_line_sc_ctx && !g_spu_cohv_old_ppu_resv) __atomic_store_n(&g_spu_cohv_old_ppu_resv, 1, __ATOMIC_RELAXED);
+    if (coh && cohv) {
+        /* PS3RECOMP_COH_VERSIONS: the compare-and-swap under the line's count. */
+        int ok = cohv->cas((uint32_t)ea, vm_base + (uint32_t)ea, 8, exp_raw, new_raw);
+        if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }
+        resv_unlock(L);
+        if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {
+            ppu_ww_note_atomic((uint32_t)ea,     (uint32_t)(val >> 32), 4, __builtin_return_address(0));
+            ppu_ww_note_atomic((uint32_t)ea + 4, (uint32_t)val, 4, __builtin_return_address(0));
+        }
+        return ok;
+    }
     if (coh) { spu_lockline_lock(); spu_coh_line_shard_lock((uint32_t)ea); }
     if (coh && !ppu_reservation_line_check(self, (uint32_t)ea)) {
         spu_coh_line_shard_unlock((uint32_t)ea); spu_lockline_unlock(); resv_unlock(L); return 0;
@@ -1265,6 +1319,24 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
  * mistaken for a consumed new reservation on the same host thread. */
 extern "C" int ppu_store_conditional32(ppu_context* ctx, uint64_t ea, uint32_t val)
 {
+    if (const spu_coh_ops* cohv = g_spu_coh_ops) {
+        const uint32_t addr = (uint32_t)ea;
+        if (ppu_cohv_ok(addr, 4)) {
+            /* Store only if the line's count and the value are as reserved. */
+            int ok = 0;
+            if (g_line_reservation.valid && g_line_reservation.ctx == ctx && g_line_reservation.addr == addr)
+                ok = cohv->store_conditional(addr, vm_base + addr, 4, (uint32_t)g_line_reservation.epoch,
+                                             __builtin_bswap32((uint32_t)ctx->reserve_value),
+                                             __builtin_bswap32(val));
+            g_line_reservation.valid = false;
+            ctx->reserve_valid = 0; ctx->reserve_addr = PPU_RESV_INVALID;
+            if (ok && g_ww_lo && addr + 0u >= g_ww_lo && addr < g_ww_hi) {
+                ppu_ww_note_atomic(addr, (uint32_t)(val >> 0), 4, __builtin_return_address(0));
+                
+            }
+            return ok;
+        }
+    }
     ppu_context* saved = g_line_sc_ctx;
     g_line_sc_ctx = ctx;
     int ok = 0;
@@ -1280,6 +1352,24 @@ extern "C" int ppu_store_conditional32(ppu_context* ctx, uint64_t ea, uint32_t v
 }
 extern "C" int ppu_store_conditional64(ppu_context* ctx, uint64_t ea, uint64_t val)
 {
+    if (const spu_coh_ops* cohv = g_spu_coh_ops) {
+        const uint32_t addr = (uint32_t)ea;
+        if (ppu_cohv_ok(addr, 8)) {
+            /* Store only if the line's count and the value are as reserved. */
+            int ok = 0;
+            if (g_line_reservation.valid && g_line_reservation.ctx == ctx && g_line_reservation.addr == addr)
+                ok = cohv->store_conditional(addr, vm_base + addr, 8, (uint32_t)g_line_reservation.epoch,
+                                             __builtin_bswap64((uint64_t)ctx->reserve_value),
+                                             __builtin_bswap64(val));
+            g_line_reservation.valid = false;
+            ctx->reserve_valid = 0; ctx->reserve_addr = PPU_RESV_INVALID;
+            if (ok && g_ww_lo && addr + 4u >= g_ww_lo && addr < g_ww_hi) {
+                ppu_ww_note_atomic(addr, (uint32_t)(val >> 32), 4, __builtin_return_address(0));
+                ppu_ww_note_atomic(addr + 4, (uint32_t)val, 4, __builtin_return_address(0));
+            }
+            return ok;
+        }
+    }
     ppu_context* saved = g_line_sc_ctx;
     g_line_sc_ctx = ctx;
     int ok = 0;
@@ -1707,7 +1797,12 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
         ps3_critical_write_token _critical_write = {0};                      \
-        if (spu_coh_is_reserved((uint32_t)(a))) {                             \
+        if (spu_coh_is_reserved((uint32_t)(a)) && g_spu_coh_ops) {            \
+            /* PS3RECOMP_COH_VERSIONS: the store under the line's count. */  \
+            if(ps3_critical_write_watched((a),(n)))ps3_critical_write_begin(&_critical_write,(uint64_t)(uintptr_t)g_active_ctx,(a),(n),vm_base+(uint32_t)(a),(src),10,0,g_active_ctx?g_active_ctx->cia:0,g_active_ctx?g_active_ctx->lr:0,g_active_ctx?(uint32_t)g_active_ctx->thread_id:0,1); \
+            g_spu_coh_ops->write((uint32_t)(a), vm_base + (uint32_t)(a), (src), (uint32_t)(n), 0); \
+            if(_critical_write.capture)ps3_critical_write_end(&_critical_write,vm_base+(uint32_t)(a)); \
+        } else if (spu_coh_is_reserved((uint32_t)(a))) {                      \
             /* A line no SPU or watch is interested in serializes on its    \
              * own shard (spu_coherency.c), not the lock-line lock. */       \
             const int _ppu_only = spu_coh_ppu_store_lock((uint32_t)(a));      \

@@ -523,7 +523,9 @@ int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*))
         ctx->status != SPU_STATUS_RUNNING || g_spu_trampoline_fn))return spu_region_reject(ctx,5);
     if(framed) {
         static SPU_THREAD_LOCAL int reported;
-        if(!reported && getenv("SPU_REGION_FRAMED_DIAGNOSTICS")) {
+        static int diagnostics = -1;   /* per framed step: read once */
+        if(diagnostics<0)diagnostics=getenv("SPU_REGION_FRAMED_DIAGNOSTICS")!=NULL;
+        if(!reported && diagnostics) {
             reported=1;fprintf(stderr,"[spu-region-framed] accepted depth=%u return=%05X target=%05X\n",
                 ctx->host_depth,ctx->region_return_pc,(unsigned)ctx->pc&SPU_LS_MASK);
         }
@@ -603,6 +605,7 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
             *tramp = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             spu_drain_hop_inline(ctx, fn, recent);
+            SPU_LR_POLL(ctx);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */

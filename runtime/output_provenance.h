@@ -44,7 +44,9 @@ static BOOL WINAPI ps3_output_trace_init(PINIT_ONCE once, PVOID arg, PVOID* out)
 
 static inline int ps3_output_trace_enabled(void)
 {
-    if (!InterlockedCompareExchange(&ps3_output_trace.ready, 0, 0))
+    /* Every SPU PUT reads this: an acquire load, not a locked
+     * compare-exchange that takes the shared line exclusively. */
+    if (!ReadAcquire(&ps3_output_trace.ready))
         InitOnceExecuteOnce(&ps3_output_trace.once, ps3_output_trace_init, NULL, NULL);
     return ps3_output_trace.enabled;
 }

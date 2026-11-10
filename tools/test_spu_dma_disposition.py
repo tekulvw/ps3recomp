@@ -4,7 +4,7 @@ import os
 if os.name == 'nt':
     print('SKIP: POSIX fixture: stubs Win32 SetLastError, which collides with kernel32 on Windows')
     raise SystemExit(0)
-import os, subprocess, tempfile, re
+import os, subprocess, sys, tempfile, re
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_','LBP_'))}
@@ -27,6 +27,15 @@ with tempfile.TemporaryDirectory(prefix='dma-disposition-') as tmp:
     assert [r['disposition'] for r in zero]==['zeroed-ea','zeroed-ls']
     assert all(r['copied']=='0' and r['words']=='0' for r in zero)
     assert run({},'disabled')==[]
+    def hooks_off(settings):
+        p=subprocess.run([str(binary),'hooks-off'],env=dict(env,**settings),capture_output=True,text=True,check=True,timeout=10)
+        return p.stdout.strip()
+    # Both observers off: every DMA hook after the first is one inline load.
+    quiet={k:v for k,v in env.items() if not k.startswith('AUDIO_CHRONOLOGY')}
+    assert subprocess.run([str(binary),'hooks-off'],env=quiet,capture_output=True,text=True,check=True,timeout=10).stdout.strip()=='hooks_off=1'
+    # Either observer on keeps the out-of-line hooks.
+    assert hooks_off(span)=='hooks_off=0'
+    assert hooks_off({'AUDIO_CHRONOLOGY':'1','AUDIO_CHRONOLOGY_TRIGGER':str(Path(tmp)/'never')})=='hooks_off=0'
     rows=run(span)
     assert [r['disposition'] for r in rows]==['copied-put','copied-get','copied-put','malformed-no-copy','rejected','rejected'],rows
     assert [r['rc'] for r in rows]==['0','0','0','0','-1','-1']
@@ -50,4 +59,6 @@ with tempfile.TemporaryDirectory(prefix='dma-disposition-') as tmp:
     directory=Path(tmp)/'dir';directory.mkdir()
     assert run(dict(span,SPU_DMA_DISPOSITION_TRIGGER=str(directory)))==[]
     assert run(dict(span,SPU_DMA_DISPOSITION_TRIGGER=str(Path(tmp)/'missing')))==[]
+# The observer stays a pure addition to the DMA code (structure of spu_dma.h).
+subprocess.run([sys.executable,str(root/'tools/check_spu_dma_disposition_preservation.py')],check=True)
 print('PASS: real direct/list copies, malformed rc0 no-copy, validation failures, bounded payload/range, disabled poison, pre-trigger budget, exact concurrent cap')

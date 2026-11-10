@@ -65,6 +65,20 @@ int main(int argc,char** argv) {
         assert(spu_dma_disposition_finish(&t,(spu_context*)1,0x100,0x12000,32,0x20,0,SPU_DMA_DISPOSITION_PUT)==0);
         return 0;
     }
+    if(argc>1 && !strcmp(argv[1],"hooks-off")) {
+        /* The first DMA reads both observers' switches; with both off, every
+         * later hook is the inline flag test, and the copies are unchanged. */
+        assert(!g_spu_dma_hooks_off);
+        assert(mfc_do_transfer(&s,0x100,0x12000,32,0x20)==0);
+        printf("hooks_off=%d\n",g_spu_dma_hooks_off);
+        spu_dma_disposition_token t; errno=EDOM;
+        spu_dma_disposition_begin(&t,0x100,0x12000,32,0x20); assert(errno==EDOM);
+        assert(g_spu_dma_hooks_off ? t.seq==0 && t.chronology.port==-1 : 1);
+        memset(ls+0x100,0,32);
+        assert(mfc_do_transfer(&s,0x100,0x12000,32,0x40)==0);
+        assert(spu_ls_read32(&s,0x100)==0x3F800000);
+        return 0;
+    }
     if(argc>1 && !strcmp(argv[1],"watch")) {
         /* SPU_DMA_RANGE=watch follows g_ww_lo..g_ww_hi as it stands at each
          * transfer: a PUT outside the window before it is armed, one inside
