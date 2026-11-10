@@ -91,6 +91,59 @@ static void check_recovery_dispatch(int threaded)
     pvkDestroySurfaceKHR = drop;
 }
 
+/* Hold a real queued completion until the synchronous getter actually enters
+ * a queue wait. The existing FIFO-accounting test clock observes that wait
+ * on the producer thread and releases the worker; there is no timed guess
+ * about whether the getter had an opportunity to return stale data. */
+static _Atomic int getter_held, getter_release, getter_wait_armed;
+static uint64_t getter_clock(void)
+{
+    if (recovery_owner && atomic_exchange(&getter_wait_armed, 0)) atomic_store(&getter_release, 1);
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+static void getter_pause(void)
+{
+#ifdef _WIN32
+    Sleep(1);
+#else
+    const struct timespec pause = { 0, 1000000 };
+    nanosleep(&pause, NULL);
+#endif
+}
+static void getter_finish_held(void* unused)
+{
+    (void)unused;
+    atomic_store(&getter_held, 1);
+    const uint64_t deadline = getter_clock() + 2000000000ull;
+    while (!atomic_load(&getter_release) && getter_clock() < deadline) getter_pause();
+    s_vk.last_center = 0x00010203u;
+    s_vk.present_readback_count = 1;
+}
+static void check_presented_getter(int threaded)
+{
+    rsx_encq_drain();
+    if (!threaded) {
+        s_vk.last_center = 0x00010203u; s_vk.present_readback_count = 1;
+        CHECK(rsx_vulkan_backend_presented_center() == 0xFF010203u, "direct presented getter");
+        return;
+    }
+    s_vk.last_center = 0x000A0B0Cu; s_vk.present_readback_count = 1;
+    atomic_store(&getter_held, 0); atomic_store(&getter_release, 0);
+    s_vk.encode_previous_present = rsx_encq_call(getter_finish_held, NULL);
+    const uint64_t deadline = getter_clock() + 2000000000ull;
+    while (!atomic_load(&getter_held) && getter_clock() < deadline) getter_pause();
+    CHECK(atomic_load(&getter_held), "present completion is held on the worker");
+    atomic_store(&getter_wait_armed, 1);
+    const u32 pixel = rsx_vulkan_backend_presented_center();
+    const int waited = !atomic_load(&getter_wait_armed);
+    /* Retire the held call even when the getter incorrectly returns early. */
+    atomic_store(&getter_wait_armed, 0); atomic_store(&getter_release, 1);
+    rsx_encq_drain();
+    CHECK(waited, "presented getter waits for the current queued completion");
+    CHECK(pixel == 0xFF010203u, "presented getter returns the completed frame");
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 3) { fprintf(stderr, "usage: fixture direct|thread OUT\n"); return 2; }
@@ -99,6 +152,8 @@ int main(int argc, char** argv)
     setenv("PS3RECOMP_RSX_ENGINE", "dispatch", 1);
     setenv("PS3RECOMP_VK_WINDOW", "0", 1);
     setenv("PS3RECOMP_VK_GUEST_PROGRAMS", "1", 1);
+    rsx_fifo_busy_test_configure(1, getter_clock, NULL, 2000000000ull);
+    rsx_fifo_busy_idle_begin(); rsx_fifo_busy_idle_end();
     vm_base = calloc(1, GUEST_BYTES); ppu_vm_size = GUEST_BYTES;
     assert(vm_base);
     assert(rsx_vulkan_backend_init(W, H, "encode thread synthetic") == 0 && s_vk.eng_active);
@@ -171,6 +226,7 @@ int main(int argc, char** argv)
     rsx_vulkan_backend_present_begin();
     rsx_vulkan_backend_present_finish();
     check_recovery_dispatch(threaded);
+    check_presented_getter(threaded);
     rsx_vulkan_backend_shutdown();
     CHECK(!rsx_encq_active(), "stopped with the backend");
     CHECK(rsx_vulkan_backend_init(W, H, "encode thread restart") == 0, "backend restarts");

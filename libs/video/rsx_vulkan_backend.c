@@ -7323,6 +7323,9 @@ static void vulkan_original_present_finish(void)
 
 u32 rsx_vulkan_backend_presented_center(void)
 {
+    /* Finish remains asynchronous, but a caller explicitly requesting its
+     * pixel needs the current completion and its CPU readback writes. */
+    if (rsx_encq_active()) rsx_encq_wait_done(s_vk.encode_previous_present);
     /* Only a read-back present keeps the centre pixel. */
     return s_vk.present_readback_count ? (0xFF000000u | s_vk.last_center) : 0u;
 }
