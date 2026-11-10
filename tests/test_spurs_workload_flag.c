@@ -19,6 +19,10 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 void spu_coh_host_rmw_mark(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+/* The scheduler watches its request line (spurs_request_line_written); this
+ * fixture starts no coherence, so the watch is inert. */
+void spu_coh_watch_add(spu_coh_watch* w, uint32_t ea, void (*wake)(void*), void* opaque) { (void)w; (void)ea; (void)wake; (void)opaque; }
+void spu_coh_watch_remove(spu_coh_watch* w) { (void)w; }
 /* spu_channels.c seams cellSpurs reaches; not linked here, so inert stand-ins. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
 void (*g_host_line_write_hook)(uint32_t line) = 0;
