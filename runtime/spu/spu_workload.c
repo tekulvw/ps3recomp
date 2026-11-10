@@ -8,6 +8,7 @@
 #include "spu_workload.h"
 #include "../diagnostics/original_work_threads.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+#include "spu_coh_section.h"   /* host line read-modify-writes */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
 #include <time.h>
@@ -566,14 +567,14 @@ void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint3
     extern void spu_coh_notify_write(uint32_t);
     const uint32_t ea = taskset_ea + 0x1980 + 16u * task;
     uint8_t* e = vm_base + ea;
-    spu_lockline_lock();   /* a joining SPU may hold a reservation on this line */
+    spu_coh_write_begin(ea, 16);   /* a joining SPU may hold a reservation on this line */
     memset(e, 0, 16);
     if (exited) {
         e[8] = (uint8_t)(code >> 24); e[9] = (uint8_t)(code >> 16); e[10] = (uint8_t)(code >> 8); e[11] = (uint8_t)code;
         e[15] = 2;   /* exited, not yet joined; byte 14 must stay 0 or the join reports ESRCH */
     }
     spu_coh_notify_write(ea);
-    spu_lockline_unlock();
+    spu_coh_write_end();
 }
 
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
@@ -595,7 +596,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     uint32_t start_t[128], start_elf[128], start_ctx[128];
     size_t start_sz[128];
     int n_start = 0;
-    spu_lockline_lock();
+    spu_coh_write_begin(taskset_ea, 0x80);
     { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(taskset_ea, 0x80); }   /* the task bit arrays below */
     if (done_task < 128) {
         uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
@@ -626,7 +627,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         start_sz[n_start] = sz; n_start++;
     }
     spu_coh_notify_write(taskset_ea);
-    spu_lockline_unlock();
+    spu_coh_write_end();
     for (int i = 0; i < n_start; i++) {
         if (ps3_log_verbose()) {
             fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
@@ -1314,13 +1315,13 @@ static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
     const uint32_t word = taskset_ea + CSTS_SIGNALLED + (taskId / 32u) * 4u;
     const uint32_t mask = (1u << 31) >> (taskId % 32u);
     uint8_t* p = vm_base + word;
-    spu_lockline_lock();
+    spu_coh_write_begin(word, 4);
     spu_coh_host_rmw_mark(word, 4);
     uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
     v = set ? (v | mask) : (v & ~mask);
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
     spu_coh_notify_write(word);
-    spu_lockline_unlock();
+    spu_coh_write_end();
 }
 
 /* Wake WAIT_SIGNAL sleepers when the signalled line is written, including by

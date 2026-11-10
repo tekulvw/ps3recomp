@@ -8,6 +8,7 @@
  * (the PPU create path) and the PM dispatcher call these.
  */
 #include "spurs_taskset.h"
+#include "../../runtime/spu/spu_coh_section.h"   /* host line read-modify-writes */
 #include <stdint.h>
 
 /* Initialize a fresh taskset: clear all task bitsets and write the header fields.
@@ -44,11 +45,11 @@ void spurs_taskset_bitset_update(uint32_t bitset_ea, uint32_t taskId, int set)
     extern uint8_t* vm_base;
     uint8_t* p = vm_base + bitset_ea + taskId / 8;
     const uint8_t m = (uint8_t)(0x80u >> (taskId % 8));
-    spu_lockline_lock();
+    spu_coh_write_begin(bitset_ea + taskId / 8, 1);
     { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(bitset_ea + taskId / 8, 1); }
     if (set) *p |= m; else *p &= (uint8_t)~m;
     spu_coh_notify_write(bitset_ea);
-    spu_lockline_unlock();
+    spu_coh_write_end();
 }
 
 /* Take the lowest free task id of a taskset: find the first clear bit of the enabled bitset and set it, as one
@@ -61,14 +62,14 @@ uint32_t spurs_taskset_take_slot(uint32_t taskset_ea, uint32_t max_tasks)
     extern uint8_t* vm_base;
     uint8_t* en = vm_base + taskset_ea + CSTS_ENABLED;
     uint32_t slot = max_tasks;
-    spu_lockline_lock();
+    spu_coh_write_begin(taskset_ea + CSTS_ENABLED, (max_tasks + 7) / 8);
     { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(taskset_ea + CSTS_ENABLED, (max_tasks + 7) / 8); }
     for (uint32_t t = 0; t < max_tasks; t++) {
         const uint8_t m = (uint8_t)(0x80u >> (t % 8));
         if (!(en[t / 8] & m)) { en[t / 8] |= m; slot = t; break; }
     }
     if (slot < max_tasks) spu_coh_notify_write(taskset_ea + CSTS_ENABLED);
-    spu_lockline_unlock();
+    spu_coh_write_end();
     return slot;
 }
 

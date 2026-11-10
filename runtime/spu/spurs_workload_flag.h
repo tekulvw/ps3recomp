@@ -2,6 +2,7 @@
 #ifndef SPURS_WORKLOAD_FLAG_H
 #define SPURS_WORKLOAD_FLAG_H
 #include "spu_coherency.h"
+#include "spu_coh_section.h"
 #include <stdint.h>
 #include <string.h>
 #ifdef __cplusplus
@@ -46,7 +47,7 @@ static inline uint32_t spurs_flag_status(uint32_t ea, uint32_t wid, int consume)
 {
     if (wid >= 16 || !spurs_flag_range(ea)) return 0;
     uint32_t status = 0;
-    spu_lockline_lock();
+    spu_coh_write_begin(ea, 0x80);
     { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(ea, 0x80); }
     if (!(vm_base[ea + 0x74] & 0x40) &&
         (spurs_flag_be32(ea + 0xB0) & (0x80000000u >> wid)) &&
@@ -58,7 +59,7 @@ static inline uint32_t spurs_flag_status(uint32_t ea, uint32_t wid, int consume)
             spurs_flag_notify(ea, 0);
         }
     }
-    spu_lockline_unlock();
+    spu_coh_write_end();
     return status;
 }
 #endif

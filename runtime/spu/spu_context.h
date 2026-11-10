@@ -12,6 +12,7 @@
 
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/log_first.h"
+#include "spu_coh_ops.h"   /* PS3RECOMP_COH_VERSIONS hooks (NULL when off) */
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -413,6 +414,9 @@ typedef struct spu_context {
      * reservation ends on this thread. Owner thread only. */
     uint32_t coh_live_line;
     int coh_live_counted;
+    /* PS3RECOMP_COH_VERSIONS (spu_coh_version.inc): the count of resv_ea's line
+     * the reservation was taken under. It is lost when the count moves. */
+    uint32_t resv_count;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -840,6 +844,16 @@ void spu_indirect_branch(spu_context* ctx);
 /* Pending cross-function transfer target; NULL when none. Thread-local: each
  * spu_context is pinned to one host thread for its lifetime. */
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+/* PS3RECOMP_COH_VERSIONS delivers a lost reservation lazily, when the SPU
+ * looks. An SPU with SPU_EVENT_LR in its event mask can look without a channel
+ * read -- an interrupt taken at a hop, a lifted bisled -- so the hops settle it
+ * then. One test of the mask otherwise (and nothing when the scheme is off). */
+#define SPU_LR_POLL(ctx) do {                                                  \
+        if (__builtin_expect(((ctx)->event_mask & 0x400u) != 0, 0)) {         \
+            const spu_coh_ops* _lr_ops = g_spu_coh_ops;                         \
+            if (_lr_ops) _lr_ops->settle(ctx);                                  \
+        }                                                                      \
+    } while (0)
 
 /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
  * report. The dispatcher records indirect branches; SPU_DRAIN records every
@@ -981,6 +995,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
             spu_drain_hop((ctx), _tf);                          \
+            SPU_LR_POLL(ctx);                                   \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \
