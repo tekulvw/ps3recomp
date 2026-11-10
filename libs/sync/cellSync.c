@@ -9,6 +9,7 @@
 #include "cellSync.h"
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+#include "../../runtime/spu/spu_coh_section.h"   /* host line read-modify-writes */
 /* HLE args arrive as guest effective addresses (ps3_hle_call passes raw
  * guest register values); translate to host before dereferencing. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
@@ -75,10 +76,10 @@ extern int  spu_coh_is_reserved(uint32_t ea);
 extern void spu_coh_notify_write(uint32_t ea);
 static int sync_cas(CellSyncMutex* m, uint32_t ea, uint32_t* expected, uint32_t desired)
 {
-    spu_lockline_lock();
+    spu_coh_write_begin(ea, 4);
     int ok = atomic_compare_exchange_strong(&m->lock, expected, desired);
     if (ok && spu_coh_is_reserved(ea)) spu_coh_notify_write(ea);
-    spu_lockline_unlock();
+    spu_coh_write_end();
     return ok;
 }
 
@@ -90,10 +91,10 @@ s32 cellSyncMutexInitialize(CellSyncMutex* mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
     SYNC_WATCH_LOG("INIT", _ea, mutex);
-    spu_lockline_lock();
+    spu_coh_write_begin(_ea, 4);
     atomic_store(&mutex->lock, 0);   /* m_freed = m_order = 0 -> free */
     if (spu_coh_is_reserved(_ea)) spu_coh_notify_write(_ea);
-    spu_lockline_unlock();
+    spu_coh_write_end();
     return CELL_OK;
 }
 
@@ -420,7 +421,7 @@ typedef int (*sq_op)(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos);
 static int sq_apply(uint32_t q, sq_op op, uint32_t* pos)
 {
     uint32_t depth = vm_read32(q + 0x0C);
-    spu_lockline_lock();
+    spu_coh_write_begin(q, 8);
     { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(q, 8); }
     uint32_t x0 = vm_read32(q), x4 = vm_read32(q + 4);
     int ok = op(&x0, &x4, depth, pos);
@@ -429,18 +430,18 @@ static int sq_apply(uint32_t q, sq_op op, uint32_t* pos)
         memcpy(vm_ptr8(q), raw, 8);
         if (spu_coh_is_reserved(q)) spu_coh_notify_write(q);
     }
-    spu_lockline_unlock();
+    spu_coh_write_end();
     return ok;
 }
 
 static void sq_and(uint32_t q, uint32_t m0, uint32_t m4)
 {
-    spu_lockline_lock();
+    spu_coh_write_begin(q, 8);
     { extern void spu_coh_host_rmw_mark(uint32_t, uint32_t); spu_coh_host_rmw_mark(q, 8); }
     uint32_t raw[2] = { ps3_bswap32(vm_read32(q) & m0), ps3_bswap32(vm_read32(q + 4) & m4) };
     memcpy(vm_ptr8(q), raw, 8);
     if (spu_coh_is_reserved(q)) spu_coh_notify_write(q);
-    spu_lockline_unlock();
+    spu_coh_write_end();
 }
 
 static int sq_push_begin(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos)
