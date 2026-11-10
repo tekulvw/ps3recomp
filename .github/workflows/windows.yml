@@ -86,7 +86,7 @@ jobs:
           failed=""
           for t in tools/test_*.py; do
             # Explicit shader-bound native fixtures have dedicated workflows.
-            case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py|tools/test_vulkan_present_cost.py) continue ;; esac
+            case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py|tools/test_vulkan_encode_thread.py|tools/test_vulkan_present_cost.py) continue ;; esac
             # Manual Windows GPU/desktop fixtures: they take a /MT runtime
             # library and need real D3D12 hardware or an interactive desktop
             # (docs/WINDOWS_REPORT_BATCHING.md, docs/WINDOWS_OSK_DIALOG.md).

@@ -72,7 +72,7 @@ def main():
         command = [os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-g", "-UNDEBUG",
                    "-ffunction-sections", "-fdata-sections", "-Iinclude", "-Ilibs/video", "-I" + temporary,
                    "libs/video/tests/test_frontend_vulkan.c", "libs/video/rsx_frontend.c",
-                   "libs/video/rsx_frontend_vulkan.c", "-Wl,--gc-sections", "-pthread", "-ldl", "-lm",
+                   "libs/video/rsx_frontend_vulkan.c", "libs/video/rsx_encode_queue.c", "-Wl,--gc-sections", "-pthread", "-ldl", "-lm",
                    *flags, "-o", str(binary)]
         subprocess.run(command, cwd=ROOT, check=True, timeout=90)
         if not args.build_only:

@@ -73,6 +73,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "rsx_encode_queue.h"
 #include "rsx_present_thread.h"
 #include "metal_frame_rate.h"   /* portable bounded present-rate statistics */
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
@@ -3209,11 +3210,24 @@ static int vk_show_service_locked(void)
 
 /* From the host's message pump: make a pending deferred show. Off, or with
  * nothing pending, it returns at once. */
+static void vk_show_pump_locked(void);
 static void vk_show_pump(void)
 {
     if (!vk_defer_held_present() || !s_vk.device) return;
     if (!__atomic_load_n(&s_show.pending, __ATOMIC_ACQUIRE) &&
         !__atomic_load_n(&s_show.readback_pending, __ATOMIC_ACQUIRE)) return;
+    if (rsx_encq_active()) {
+        /* After everything queued, with the encode thread held off. */
+        rsx_encq_drain();
+        rsx_encq_lock();
+        vk_show_pump_locked();
+        rsx_encq_unlock();
+        return;
+    }
+    vk_show_pump_locked();
+}
+static void vk_show_pump_locked(void)
+{
     if (!vulkan_owner_begin(1)) return;
     const uint64_t before = s_vulkan_commits;
     pthread_mutex_lock(&s_vk.present_mu);
@@ -4284,21 +4298,25 @@ static void vk_eng_snapshot_pool_drain(void)
     s_snap_pool_n = 0;
 }
 
-static u32 vk_eng_color_snapshot(void* user, u32 surface)
+/* In two halves for PS3RECOMP_RSX_ENCODE_THREAD (rsx_encode_queue.h): the
+ * copy object is made when the engine asks, the copy itself recorded in
+ * stream order. `token` says whether the image came from the pool (already
+ * GENERAL) or is new (UNDEFINED). */
+static u32 s_snap_logs;
+#define VK_SNAP_FAIL(surface, why) do { if (s_snap_logs++ < 8) VK_LOG("engine: colour snapshot of %u failed: %s\n", surface, why); } while (0)
+static u32 vk_eng_color_snapshot_alloc(void* user, u32 surface, u32* token)
 {
     (void)user;
-    static u32 logs;
-#define VK_SNAP_FAIL(why) do { if (logs++ < 8) VK_LOG("engine: colour snapshot of %u failed: %s\n", surface, why); } while (0)
     const vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
     if (!t || t->snapshot) {
-        if (logs < 8 && surface < VK_ENG_MAX_OBJ)
+        if (s_snap_logs < 8 && surface < VK_ENG_MAX_OBJ)
             VK_LOG("engine: colour snapshot of %u: kind %d retired %d native pin %d snapshot %d %ux%u\n", surface,
                    (int)s_eobj[surface].kind, (int)s_eobj_retired[surface], (int)s_eobj_native_pins[surface],
                    (int)s_eobj[surface].snapshot, s_eobj[surface].w, s_eobj[surface].h);
-        VK_SNAP_FAIL(!t ? "no colour target" : "target is a snapshot"); return 0;
+        VK_SNAP_FAIL(surface, !t ? "no colour target" : "target is a snapshot"); return 0;
     }
     const u32 hd = vk_eng_alloc();
-    if (!hd) { VK_SNAP_FAIL("no object slot"); return 0; }
+    if (!hd) { VK_SNAP_FAIL(surface, "no object slot"); return 0; }
     vk_eng_obj* o = &s_eobj[hd];
     int reused = 0;
     for (u32 i = 0; i < s_snap_pool_n; i++)
@@ -4313,12 +4331,21 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
                                    VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&o->im);
         memset(o, 0, sizeof *o);
-        VK_SNAP_FAIL("image creation");
+        VK_SNAP_FAIL(surface, "image creation");
         return 0;
     }
     o->kind = VK_ENG_COLOR; o->snapshot = 1;
     o->fmt = t->fmt; o->bpp = t->bpp; o->w = t->w; o->h = t->h;
-    if (vk_begin()) { vk_eng_release(user, hd); VK_SNAP_FAIL("command begin"); return 0; }
+    *token = (u32)reused;
+    return hd;
+}
+/* 0 on success. */
+static int vk_eng_color_snapshot_record(u32 hd, u32 surface, u32 reused)
+{
+    const vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
+    vk_eng_obj* o = hd < VK_ENG_MAX_OBJ ? &s_eobj[hd] : NULL;
+    if (!t || !o || o->kind != VK_ENG_COLOR || !o->snapshot) { VK_SNAP_FAIL(surface, "target or copy gone"); return -1; }
+    if (vk_begin()) { VK_SNAP_FAIL(surface, "command begin"); return -1; }
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
                      reused ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED);
     vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -4331,10 +4358,25 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
                     o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     /* The copy, made visible to whatever samples it next. */
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); VK_SNAP_FAIL("submission"); return 0; }
-    return hd;
-#undef VK_SNAP_FAIL
+    if (vk_submit_and_wait()) { VK_SNAP_FAIL(surface, "submission"); return -1; }
+    return 0;
 }
+/* The queued half: a copy that fails leaves the handle to the engine, which
+ * releases it, and fails the checked state. */
+static void vk_eng_color_snapshot_copy(void* user, u32 hd, u32 surface, u32 reused)
+{
+    (void)user;
+    if (vk_eng_color_snapshot_record(hd, surface, reused)) vk_e5_fail("colour snapshot copy");
+}
+static u32 vk_eng_color_snapshot(void* user, u32 surface)
+{
+    u32 reused = 0;
+    const u32 hd = vk_eng_color_snapshot_alloc(user, surface, &reused);
+    if (!hd) return 0;
+    if (vk_eng_color_snapshot_record(hd, surface, reused)) { vk_eng_release(user, hd); return 0; }
+    return hd;
+}
+#undef VK_SNAP_FAIL
 
 /* ---- E4: depth snapshots --------------------------------------------------
  * A depth target read as a texture, which the engine asks for only after a
@@ -7019,7 +7061,16 @@ static int vulkan_original_init(u32 width, u32 height, const char* title)
      * pipeline from the guest's programs, so without them it has nothing to
      * draw with, and the vtable's fixed-function path stays the default.
      * Either way PS3RECOMP_RSX_ENGINE=dispatch|vtable overrides. */
-    rsx_draw_engine_set_backend(&s_vk_engine_backend);
+    /* PS3RECOMP_RSX_ENCODE_THREAD=1: the engine's calls reach this backend
+     * through a queue and a thread of their own (rsx_encode_queue.h). Not
+     * with an extracted native owner or the render frontend, which share
+     * this backend's queue and locks from other threads. */
+    {
+        static const rsx_encq_hooks hooks = { vk_eng_color_snapshot_alloc, vk_eng_color_snapshot_copy };
+        const rsx_draw_backend* queued = (!vulkan_owner_enabled() && !s_vk.frontend_enabled)
+            ? rsx_encq_wrap(&s_vk_engine_backend, &hooks) : NULL;
+        rsx_draw_engine_set_backend(queued ? queued : &s_vk_engine_backend);
+    }
     rsx_draw_engine_set_default(s_g.on ? 1 : 0);
     if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
         s_vk.eng_active = 1;
@@ -7073,6 +7124,7 @@ static void vulkan_original_shutdown(void)
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
     if (s_vk.eng_active) { rsx_draw_engine_shutdown(); s_vk.eng_active = 0; }
     rsx_draw_engine_set_backend(NULL);
+    rsx_encq_unwrap();
     if (s_vk.windowed && s_vk.swapchain && s_vk.presented && s_vk.hold_seconds > 0.0) {
         VK_LOG("holding the last frame on screen for %.1f s "
                "(Esc or closing the window ends it early)\n", s_vk.hold_seconds);
@@ -7210,9 +7262,18 @@ void rsx_vulkan_backend_present(void)
     rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);
 }
 
+/* Encode thread: the present the engine queues runs there, so the split it
+ * belongs to is queued around it. */
+static void vk_present_split_set(void* on) { s_vk.present_split = on ? 1 : 0; }
 static void vulkan_original_present_begin(void)
 {
     if (!s_vk.device) return;
+    if (s_vk.eng_active && rsx_encq_active()) {
+        rsx_encq_call(vk_present_split_set, (void*)1);
+        rsx_draw_engine_present();
+        rsx_encq_call(vk_present_split_set, NULL);
+        return;
+    }
     s_vk.present_split = 1;
     if (s_vk.eng_active) rsx_draw_engine_present();
     else                 vk_cb_present(&s_vk, 0);
@@ -7279,9 +7340,21 @@ void rsx_vulkan_backend_present_begin(void){
     uint64_t before=s_vulkan_commits;
     vulkan_original_present_begin();vulkan_owner_finish(vulkan_owner_boundary(before));
 }
-void rsx_vulkan_backend_present_finish(void){
+static void vk_present_finish_queued(void* unused){
+    (void)unused;
     if(!vulkan_owner_begin(0))return;
     vulkan_original_present_finish();vulkan_owner_finish(1);
+}
+void rsx_vulkan_backend_present_finish(void){
+    /* Encode thread: the second half follows the first there. The walker
+     * runs at most one present ahead of what the encode thread has shown. */
+    if(rsx_encq_active()){
+        static u64 previous;
+        rsx_encq_wait_done(previous);
+        previous=rsx_encq_call(vk_present_finish_queued,NULL);
+        return;
+    }
+    vk_present_finish_queued(NULL);
 }
 u32 rsx_vulkan_backend_readback_center(void){
     if(!vulkan_owner_begin(1))return 0;
