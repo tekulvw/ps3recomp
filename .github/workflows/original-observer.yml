@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        os: [macos-latest, ps3recomp, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

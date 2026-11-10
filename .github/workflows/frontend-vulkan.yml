@@ -15,7 +15,7 @@ concurrency:
 jobs:
   compute:
     name: Vulkan build and software diagnostics (${{ matrix.compiler }})
-    runs-on: ubuntu-latest
+    runs-on: ps3recomp
     timeout-minutes: 20
     strategy:
       fail-fast: false
