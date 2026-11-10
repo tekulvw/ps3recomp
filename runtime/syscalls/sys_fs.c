@@ -546,7 +546,9 @@ int64_t sys_fs_read(ppu_context* ctx)
     /* FLOW_FSDBG: the lv2 path is what PhyreEngine titles actually use (they do
      * not go through the cellFs HLE), so PS3_FSLOG in ppu_fs.cpp never fires. */
     { extern char* getenv(const char*);
-      if (getenv("FLOW_FSDBG")) {
+      static int s_fsdbg = -1;   /* per read: read once */
+      if (s_fsdbg < 0) s_fsdbg = getenv("FLOW_FSDBG") ? 1 : 0;
+      if (s_fsdbg) {
         const unsigned char* b = (const unsigned char*)buf;
         fprintf(stderr, "[FSDBG] read fd=%d '%s' pos=%ld want=%llu got=%zu"
                         " head=%02X%02X%02X%02X lr=0x%08X\n",
