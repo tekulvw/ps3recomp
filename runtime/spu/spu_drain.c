@@ -75,9 +75,11 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 
 #if defined(_MSC_VER)
 #define SPU_DRAIN_COLD __declspec(noinline)
+#define SPU_DRAIN_NOINLINE __declspec(noinline)
 #define SPU_DRAIN_INLINE static __forceinline
 #else
 #define SPU_DRAIN_COLD __attribute__((noinline, cold))
+#define SPU_DRAIN_NOINLINE __attribute__((noinline))
 #define SPU_DRAIN_INLINE static inline __attribute__((always_inline))
 #endif
 static SPU_DRAIN_COLD void spu_task_launch_slow(spu_context* ctx);
@@ -551,7 +553,28 @@ int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*))
 typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
+static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t return_pc);
+/* Every lifted brsl/bisl ends in this drain, so it runs once per guest call.
+ * Nearly always the callee returned through SPU_RET while its host frame was
+ * live: no transfer is pending and the pc is already the return pc. The loop
+ * below then does nothing but its exit bookkeeping, yet every call paid for
+ * its frame (an interrupt frame with a jmp_buf, the thread-local addresses,
+ * the depth guard). That case is handled here, as a leaf, with the same
+ * effects; anything else -- a pending transfer, another pc, the depth
+ * guard's upper half or first use -- runs the loop. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+{
+    const uint32_t limit = g_spu_depth_guard_limit;
+    if (!g_spu_trampoline_fn && !((ctx->pc ^ return_pc) & SPU_LS_MASK) &&
+        limit && ctx->host_depth < limit / 2) {
+        ctx->region_dispatch_valid = 0;
+        ctx->drain_ret_pc = 0;
+        return;
+    }
+    spu_drain_call_loop(ctx, return_pc);
+}
+
+static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t return_pc)
 {
     ctx->region_dispatch_valid=0;
     spu_depth_guard_check(ctx);
