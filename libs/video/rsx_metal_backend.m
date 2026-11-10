@@ -2494,6 +2494,8 @@ static u32 s_eng_obj_count;
 static u32 s_eng_obj_free[ENG_MAX_OBJECTS];
 static u32 s_eng_obj_free_count;
 static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
+/* The batch recording when the slot was released (PS3RECOMP_RSX_ENCODE_THREAD). */
+static u64 s_eng_obj_retire_batch[ENG_MAX_OBJECTS];
 /* Never reused even across device reinitialization; native image import is
  * scoped by both owner lifetime and this allocation generation. */
 static uint64_t s_eng_obj_generation[ENG_MAX_OBJECTS],s_eng_next_obj_generation;
@@ -2623,9 +2625,67 @@ typedef struct {
     u32   resolve_dst;          /* snapshot/resolve destination texture */
 } EngRecord;
 
-static EngRecord s_eng_rec[ENG_MAX_RECORDS];
+static EngRecord s_eng_rec_store[ENG_MAX_RECORDS];
+/* The records being recorded. With PS3RECOMP_RSX_ENCODE_THREAD=1 a full array
+ * is handed to the encode thread and recording continues in another. */
+static EngRecord* s_eng_rec = s_eng_rec_store;
 static u32 s_eng_rec_count;
-static u32 s_eng_dropped;
+static _Atomic(u32) s_eng_dropped;
+
+/* PS3RECOMP_RSX_ENCODE_THREAD=1 (default off; read at engine init): the
+ * recorded draws are encoded into their command buffer, and it is committed,
+ * on a thread of their own, so the FIFO walker goes on decoding the next ones.
+ *
+ * The walker still decides everything the guest can see: at every point it
+ * would have encoded and committed (a completion ticket, a present, a wait,
+ * a full staging arena) it makes the command buffer, enqueues it -- which
+ * fixes its place on the queue, so every later command buffer, from any
+ * thread, runs after it -- takes its ticket, and hands the buffer, the
+ * records and the staging arena over in one job. Everything else that commit
+ * did (a present's drawable and blit, a wait) then runs on the walker as
+ * before, with nothing left to encode. Inputs were copied into the arena when
+ * recorded; outputs reach the CPU only through waits, which wait for the
+ * GPU and so for the encode thread first.
+ *
+ * A released texture or pipeline keeps its slot until the encode thread has
+ * finished every batch recorded before the release (retire_batch), because a
+ * record names it by number. A wait on a command buffer the walker handed
+ * over first waits for the encode thread to commit it (eng_enc_drain). */
+enum { ENG_ENC_JOBS = 4 };
+typedef struct {
+    id<MTLCommandBuffer> cb;
+    id<MTLBuffer> stage;
+    EngRecord* recs;
+    u32 nrec;
+    void (^tail)(id<MTLCommandBuffer>);
+    u64 batch;
+} EngEncJob;
+static struct {
+    int on;                          /* the switch, read at init */
+    int running, stop, busy;
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t work, done_cv;
+    EngEncJob job[ENG_ENC_JOBS];
+    u32 head, count;
+    EngRecord* spare[ENG_ENC_JOBS + 2];   /* record arrays not in use */
+    u32 nspare, arrays;
+    u64 batch;                       /* walker: the batch being recorded, from 1 */
+    _Atomic(u64) done;               /* every batch up to this one is encoded and committed */
+    /* PS3RECOMP_RSX_INFLIGHT_LOG=1 counters */
+    u64 jobs, records, full_waits, drains;
+    uint64_t full_wait_ns, drain_ns;
+    _Atomic(uint64_t) encode_ns;
+} s_encq = { .mu = PTHREAD_MUTEX_INITIALIZER, .work = PTHREAD_COND_INITIALIZER,
+             .done_cv = PTHREAD_COND_INITIALIZER, .batch = 1 };
+static int eng_enc_on(void) { return s_encq.running; }
+/* The last batch a record naming something released now can be in: the open
+ * one, or with nothing recorded in it yet the one before. */
+static u64 eng_enc_release_batch(void) { return s_eng_rec_count ? s_encq.batch : s_encq.batch - 1u; }
+static void eng_enc_drain(void);
+static int eng_enc_handoff(int async, u64* out_ticket);
+static void eng_enc_start(void);
+static void eng_enc_stop(void);
 /* Async completion handlers only touch this atomic latch. Reset on teardown. */
 static atomic_int s_eng_checked_failed;
 static int s_eng_checked_completed;
@@ -2638,7 +2698,7 @@ static int eng_completion_status(void *user,u64 ticket,int wait){
  (void)user;if(!ticket||ticket>s_eng_fence_next||atomic_load(&s_eng_checked_failed))return -1;
  while([s_eng_fence_cbs count]){
   id<MTLCommandBuffer> cb=s_eng_fence_cbs[0];
-  if(wait&&s_eng_fence_completed<ticket)[cb waitUntilCompleted];
+  if(wait&&s_eng_fence_completed<ticket){eng_enc_drain();[cb waitUntilCompleted];}
   MTLCommandBufferStatus status=cb.status;
   if(status==MTLCommandBufferStatusError||cb.error){eng_checked_fail();return -1;}
   if(status!=MTLCommandBufferStatusCompleted)break;
@@ -2724,6 +2784,7 @@ static void eng_track_submission(id<MTLCommandBuffer> cb)
     if(!s_eng_submitted)s_eng_submitted=[NSMutableArray new];
     while(cb && s_eng_submitted && [s_eng_submitted count]>=64){
         /* Oldest first: one in-order queue completes them in order. */
+        eng_enc_drain();
         [s_eng_submitted[0] waitUntilCompleted];++s_eng_cap_waits;
         eng_check_submissions(0);eng_bound_report(1);
     }
@@ -3031,11 +3092,18 @@ static id<MTLTexture> eng_obj(u32 handle)
 /* Recorded commands resolve numeric handles during encoding. Do not recycle
  * a released slot until those commands have acquired their Metal resources.
  * Submitted command buffers retain the objects for the GPU's remaining work. */
+static void eng_pipe_collect_released(void);
 static void eng_collect_retired_objects(void)
 {
-    if (s_eng_rec_count) return;
+    /* With the encode thread a slot waits instead for the batches recorded up
+     * to its release to be encoded; the batch being recorded is never done. */
+    const int threaded = eng_enc_on();
+    if (s_eng_rec_count && !threaded) return;
+    const u64 done = threaded ? atomic_load(&s_encq.done) : UINT64_MAX;
+    if (threaded) eng_pipe_collect_released();
     for (u32 i = 0; i < s_eng_obj_count; ++i) {
         if (!s_eng_obj_retired[i]||s_eng_obj_native_pins[i]) continue;
+        if (s_eng_obj_retire_batch[i] > done) continue;
         s_eng_obj_retired[i] = 0;
         s_eng_obj[i] = nil;
         s_eng_obj_free[s_eng_obj_free_count++] = i;
@@ -3048,6 +3116,7 @@ static void eng_obj_release(void* user, u32 handle)
     if (!handle || handle > s_eng_obj_count || !s_eng_obj[handle - 1] ||
         s_eng_obj_retired[handle - 1]) return;
     s_eng_obj_retired[handle - 1] = 1;
+    s_eng_obj_retire_batch[handle - 1] = eng_enc_release_batch();
     /* Any view cut from this object stops being valid with it. */
     for (u32 i = 0; i < s_eng_view_count; i++)
         if (s_eng_view[i].surface == handle) {
@@ -3115,8 +3184,10 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
     const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
     if ((u64)start + bytes > ENG_STAGE_MAX) {
         /* Submit and wait rather than drop the rest of the frame; everything
-         * already recorded has been encoded, so the arena is free again. */
-        eng_encode_and_commit(nil);
+         * already recorded has been encoded, so the arena is free again. The
+         * encode thread takes the arena with the records instead. */
+        if (eng_enc_on()) eng_enc_handoff(0, NULL);
+        else eng_encode_and_commit(nil);
         if(atomic_load(&s_eng_checked_failed))return 0;
         return eng_stage_reserve(bytes, out_off);
     }
@@ -3181,6 +3252,7 @@ static int eng_init(void* user, u32 width, u32 height)
     s_eng_linear_sampler = [s_dev newSamplerStateWithDescriptor:sd];
     if (!s_eng_point_sampler || !s_eng_linear_sampler) return -1;
     if (s_eng_pt_start && rsx_present_thread_requested()) s_eng_pt_start();
+    eng_enc_start();
     return 0;
 }
 
@@ -3188,6 +3260,7 @@ static void eng_shutdown(void* user)
 {
     (void)user;
     eng_pt_stop();   /* joins the show thread before anything it uses goes */
+    eng_enc_stop();  /* and the encode thread */
     for (u32 i = 0; i < s_eng_obj_count; i++) s_eng_obj[i] = nil;
     for (u32 i = 0; i < s_eng_pipe_count; i++) {
         s_eng_pipe[i].pso = nil;
@@ -3197,6 +3270,7 @@ static void eng_shutdown(void* user)
     for (u32 i = 0; i < s_eng_samp_count; i++) s_eng_samp[i].samp = nil;
     s_eng_obj_count = s_eng_obj_free_count = 0;
     memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
+    memset(s_eng_obj_retire_batch, 0, sizeof s_eng_obj_retire_batch);
     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
     s_eng_rec_count = 0;
     atomic_store(&s_eng_checked_failed,0);
@@ -3764,13 +3838,40 @@ static u32 eng_pipeline_create_vd(const char* vs_hlsl, const char* ps_hlsl,
     return slot + 1;
 }
 
+/* Pipelines released while the encode thread may still encode a record that
+ * names them: dropped once the batch recording at the release is done. */
+static struct { u32 pipeline; u64 batch; } s_eng_pipe_released[ENG_MAX_PIPES];
+static u32 s_eng_pipe_released_count;
+static void eng_pipe_drop(u32 pipeline)
+{
+    s_eng_pipe[pipeline - 1].pso = nil;
+    s_eng_pipe[pipeline - 1].ds  = nil;
+}
+static void eng_pipe_collect_released(void)
+{
+    const u64 done = atomic_load(&s_encq.done);
+    u32 kept = 0;
+    for (u32 i = 0; i < s_eng_pipe_released_count; i++) {
+        if (s_eng_pipe_released[i].batch <= done) eng_pipe_drop(s_eng_pipe_released[i].pipeline);
+        else s_eng_pipe_released[kept++] = s_eng_pipe_released[i];
+    }
+    s_eng_pipe_released_count = kept;
+}
 static void eng_pipeline_release(void* user, u32 pipeline)
 {
     (void)user;
-    if (pipeline && pipeline <= s_eng_pipe_count) {
-        s_eng_pipe[pipeline - 1].pso = nil;
-        s_eng_pipe[pipeline - 1].ds  = nil;
+    if (!pipeline || pipeline > s_eng_pipe_count) return;
+    if (!eng_enc_on()) { eng_pipe_drop(pipeline); return; }
+    for (u32 i = 0; i < s_eng_pipe_released_count; i++)
+        if (s_eng_pipe_released[i].pipeline == pipeline) return;
+    if (s_eng_pipe_released_count == ENG_MAX_PIPES) {
+        /* Full: finish everything recorded so far, then every entry is done. */
+        eng_enc_handoff(0, NULL);
+        eng_enc_drain();
+        eng_pipe_collect_released();
     }
+    s_eng_pipe_released[s_eng_pipe_released_count].pipeline = pipeline;
+    s_eng_pipe_released[s_eng_pipe_released_count++].batch = eng_enc_release_batch();
 }
 
 /* ---- per-draw binding ---------------------------------------------------- */
@@ -4213,7 +4314,8 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
  * one material changed little more than its buffer offsets, yet sent about
  * fifty messages each. Identity is the object itself (or the offset, or the
  * value); `fresh` until the first draw of each encoder sets everything. */
-static struct {
+/* Per encoding thread: the walker and the encode thread. */
+static _Thread_local struct {
     int fresh;
     const void* pso; const void* ds;
     MTLCullMode cull; MTLWinding winding; u32 stencil_ref;
@@ -4383,14 +4485,15 @@ static int eng_encode_clear(id<MTLCommandBuffer> cb, const EngRecord* r)
  * clears immediately ahead of it folded into its load actions. A clear whose
  * targets the following draw does not share becomes a pass of its own, which
  * is what keeps a mid-frame clear ordered against the draws around it. */
-static u32 s_ft_passes, s_ft_resolves, s_ft_copies;   /* PS3_FTRACE: per command buffer */
-static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+static _Thread_local u32 s_ft_passes, s_ft_resolves, s_ft_copies;   /* PS3_FTRACE: per command buffer */
+static void eng_encode_record_list(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
+                                   const EngRecord* recs, const u32 nrec)
 {
     u32 i = 0;
     s_ft_passes = s_ft_resolves = s_ft_copies = 0;
-    while (i < s_eng_rec_count) {
-        if (s_eng_rec[i].kind == ENG_REC_COLOR_SNAPSHOT) {
-            const EngRecord* r = &s_eng_rec[i++];
+    while (i < nrec) {
+        if (recs[i].kind == ENG_REC_COLOR_SNAPSHOT) {
+            const EngRecord* r = &recs[i++];
             id<MTLTexture> src = eng_obj(r->rt[0]);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
             if (!src || !dst || [src width] != [dst width] ||
@@ -4408,8 +4511,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             [copy endEncoding];
             continue;
         }
-        if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
-            const EngRecord* r = &s_eng_rec[i++];
+        if (recs[i].kind == ENG_REC_DEPTH_RESOLVE) {
+            const EngRecord* r = &recs[i++];
             id<MTLTexture> src = eng_obj(r->depth);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
             if (!src || !dst || !s_eng_depth_pso) {eng_checked_fail();continue;}
@@ -4440,10 +4543,10 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         u32 cd = 0, ds_flags = 0;
         float cdepth = 1.0f;
         u8 cstencil = 0;
-        while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
-               s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE &&
-               s_eng_rec[i].kind != ENG_REC_COLOR_SNAPSHOT) {
-            const EngRecord* r = &s_eng_rec[i];
+        while (i < nrec && recs[i].kind != ENG_REC_DRAW &&
+               recs[i].kind != ENG_REC_DEPTH_RESOLVE &&
+               recs[i].kind != ENG_REC_COLOR_SNAPSHOT) {
+            const EngRecord* r = &recs[i];
             if (r->kind == ENG_REC_CLEAR_COLOR) {
                 u32 k = 0;
                 while (k < n_cc && cc_surf[k] != r->rt[0]) k++;
@@ -4472,9 +4575,9 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         for (u32 k = 0; k < n_cc; k++) rt[k] = cc_surf[k];
         u32 depth = have_clear_ds ? cd : 0;
         int fold_clears = 0;
-        if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
-            (!have_clear_ds || s_eng_rec[i].depth == cd)) {
-            const EngRecord* d = &s_eng_rec[i];
+        if (i < nrec && recs[i].kind == ENG_REC_DRAW &&
+            (!have_clear_ds || recs[i].depth == cd)) {
+            const EngRecord* d = &recs[i];
             int covered = 1;
             for (u32 k = 0; k < n_cc && covered; k++) {
                 int found = 0;
@@ -4495,7 +4598,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          * must each be cleared over their full extent, in record order. */
         if (!fold_clears && i > clear_start) {
             for (u32 c = clear_start; c < i; c++) {
-                if (!eng_encode_clear(cb, &s_eng_rec[c])) return;
+                if (!eng_encode_clear(cb, &recs[c])) return;
             }
             continue;
         }
@@ -4514,7 +4617,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             tex[attach++] = t;
         }
         id<MTLTexture> zbuf = eng_obj(depth);
-        if (!attach && !zbuf) { eng_checked_fail(); if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
+        if (!attach && !zbuf) { eng_checked_fail(); if (i < nrec && recs[i].kind == ENG_REC_DRAW) i++; continue; }
         /* A pipeline always declares the depth attachment, so a draw pass
          * always has to have one; the display's shared buffer is the fallback
          * for a guest that never declared a zeta. */
@@ -4562,21 +4665,25 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         if (!enc || attach != nrt) {
             eng_checked_fail();
             if (enc) [enc endEncoding];
-            while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
-                   eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
+            while (i < nrec && recs[i].kind == ENG_REC_DRAW &&
+                   eng_record_targets_are(&recs[i], rt, nrt)) i++;
             continue;
         }
         s_ft_passes++;
         eng_encode_state_reset();
-        while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
-               eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
-               (s_eng_rec[i].depth == depth ||
-                (!s_eng_rec[i].depth && zbuf == s_depth))) {
-            eng_encode_draw(enc, &s_eng_rec[i], stage);
+        while (i < nrec && recs[i].kind == ENG_REC_DRAW &&
+               eng_record_targets_are(&recs[i], rt, nrt) &&
+               (recs[i].depth == depth ||
+                (!recs[i].depth && zbuf == s_depth))) {
+            eng_encode_draw(enc, &recs[i], stage);
             i++;
         }
         [enc endEncoding];
     }
+}
+static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+{
+    eng_encode_record_list(cb, stage, s_eng_rec, s_eng_rec_count);
 }
 
 /* PS3_AA=fxaa: the display buffer through FXAA into a texture of its own
@@ -4698,6 +4805,211 @@ static void eng_stage_hand_off(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
     s_eng_stage_buf = nil; s_eng_stage = NULL; s_eng_stage_cap = 0;
     s_eng_stage_gen++;
 }
+/* ---- PS3RECOMP_RSX_ENCODE_THREAD ------------------------------------------ */
+
+static void eng_enc_report(void)
+{
+    static uint64_t last;
+    if (s_eng_bound_log <= 0) return;
+    const uint64_t now = eng_now_ns();
+    if (last && now - last < 2000000000ull) return;
+    last = now;
+    fprintf(stderr, "[rsx encode thread] jobs=%llu records=%llu encode_ms=%.1f full_waits=%llu full_wait_ms=%.1f "
+            "drains=%llu drain_ms=%.1f record_arrays=%u\n",
+            (unsigned long long)s_encq.jobs, (unsigned long long)s_encq.records,
+            atomic_load(&s_encq.encode_ns) / 1e6, (unsigned long long)s_encq.full_waits,
+            s_encq.full_wait_ns / 1e6, (unsigned long long)s_encq.drains, s_encq.drain_ns / 1e6,
+            s_encq.arrays);
+}
+
+static void* eng_enc_main(void* arg)
+{
+    (void)arg;
+    pthread_setname_np("rsx metal encode");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    for (;;) {
+        pthread_mutex_lock(&s_encq.mu);
+        while (!s_encq.count && !s_encq.stop) pthread_cond_wait(&s_encq.work, &s_encq.mu);
+        if (!s_encq.count) { pthread_mutex_unlock(&s_encq.mu); break; }
+        EngEncJob job = s_encq.job[s_encq.head];
+        s_encq.job[s_encq.head] = (EngEncJob){ 0 };
+        s_encq.head = (s_encq.head + 1u) % ENG_ENC_JOBS;
+        s_encq.count--;
+        s_encq.busy = 1;
+        pthread_mutex_unlock(&s_encq.mu);
+
+        const uint64_t t0 = eng_now_ns();
+        @autoreleasepool {
+            eng_encode_record_list(job.cb, job.stage, job.recs, job.nrec);
+            if (job.tail) job.tail(job.cb);
+            [job.cb commit];
+        }
+        atomic_fetch_add(&s_encq.encode_ns, eng_now_ns() - t0);
+
+        pthread_mutex_lock(&s_encq.mu);
+        s_encq.spare[s_encq.nspare++] = job.recs;
+        s_encq.busy = 0;
+        atomic_store(&s_encq.done, job.batch);
+        pthread_cond_broadcast(&s_encq.done_cv);
+        pthread_mutex_unlock(&s_encq.mu);
+        job = (EngEncJob){ 0 };   /* drop the command buffer, arena and tail here */
+    }
+    return NULL;
+}
+
+/* PS3RECOMP_RSX_FIFO_BUSY: the walker waiting for the encode thread. */
+static int eng_enc_busy_category(void)
+{
+    static int category = -1;
+    if (category < 0) category = rsx_fifo_busy_category("encode_wait");
+    return category;
+}
+
+/* Wait until every handed-over command buffer is committed. */
+static void eng_enc_drain(void)
+{
+    if (!eng_enc_on()) return;
+    pthread_mutex_lock(&s_encq.mu);
+    if (s_encq.count || s_encq.busy) {
+        const uint64_t t0 = eng_now_ns();
+        rsx_fifo_busy_enter(eng_enc_busy_category());
+        while (s_encq.count || s_encq.busy) pthread_cond_wait(&s_encq.done_cv, &s_encq.mu);
+        rsx_fifo_busy_leave(eng_enc_busy_category());
+        s_encq.drains++; s_encq.drain_ns += eng_now_ns() - t0;
+    }
+    pthread_mutex_unlock(&s_encq.mu);
+}
+
+static void eng_enc_start(void)
+{
+    const char* e = getenv("PS3RECOMP_RSX_ENCODE_THREAD");
+    s_encq.on = e && !strcmp(e, "1");
+    if (!s_encq.on || s_encq.running) return;
+    /* Per-draw diagnostics read the records and the command buffer where they
+     * are encoded; they keep the single-thread path. */
+    if (eng_trace_enabled() || getenv("PS3RECOMP_METAL_PRESENT_DIAGNOSTICS")) {
+        fprintf(stderr, "[rsx engine/metal] PS3RECOMP_RSX_ENCODE_THREAD ignored: draw or present diagnostics are on\n");
+        return;
+    }
+    eng_bound_config();
+    s_encq.stop = 0; s_encq.busy = 0; s_encq.head = s_encq.count = 0;
+    s_encq.batch = 1; atomic_store(&s_encq.done, 0);
+    if (pthread_create(&s_encq.thread, NULL, eng_enc_main, NULL)) {
+        fprintf(stderr, "[rsx engine/metal] PS3RECOMP_RSX_ENCODE_THREAD: no thread; encoding stays on the walker\n");
+        return;
+    }
+    s_encq.running = 1;
+    fprintf(stderr, "[rsx engine/metal] encode thread on\n");
+}
+
+static void eng_enc_stop(void)
+{
+    if (!s_encq.running) return;
+    eng_enc_drain();
+    pthread_mutex_lock(&s_encq.mu);
+    s_encq.stop = 1;
+    pthread_cond_broadcast(&s_encq.work);
+    pthread_mutex_unlock(&s_encq.mu);
+    pthread_join(s_encq.thread, NULL);
+    s_encq.running = 0;
+    /* Recording goes back to the static array; the others are freed. */
+    if (s_eng_rec != s_eng_rec_store) {
+        if (s_eng_rec_count) memcpy(s_eng_rec_store, s_eng_rec, s_eng_rec_count * sizeof *s_eng_rec);
+        s_encq.spare[s_encq.nspare++] = s_eng_rec;
+        s_eng_rec = s_eng_rec_store;
+    }
+    for (u32 i = 0; i < s_encq.nspare; i++)
+        if (s_encq.spare[i] != s_eng_rec_store) free(s_encq.spare[i]);
+    s_encq.nspare = s_encq.arrays = 0;
+    s_eng_pipe_released_count = 0;
+}
+
+/* A record array for the walker to go on recording into. */
+static EngRecord* eng_enc_take_records(void)
+{
+    EngRecord* r = NULL;
+    pthread_mutex_lock(&s_encq.mu);
+    if (s_encq.nspare) r = s_encq.spare[--s_encq.nspare];
+    pthread_mutex_unlock(&s_encq.mu);
+    if (r) return r;
+    if (s_encq.arrays + 1u >= ENG_ENC_JOBS + 2u) return NULL;   /* the static one is the other */
+    s_encq.arrays++;
+    return (EngRecord*)malloc(sizeof(EngRecord) * ENG_MAX_RECORDS);
+}
+
+/* Hand what is recorded to the encode thread: one command buffer, enqueued
+ * here so its queue position is the walker's, tracked like any submission,
+ * and (async) the fence a completion ticket names. 0 on failure. */
+static int eng_enc_handoff(int async, u64* out_ticket)
+{
+    if (out_ticket) *out_ticket = 0;
+    if (!eng_enc_on()) return 0;
+    if (!async && !s_eng_rec_count && !s_eng_stage_used && !s_eng_tail_encode) return 1;
+    if (atomic_load(&s_eng_dropped)) eng_checked_fail();
+    @autoreleasepool {
+        id<MTLBuffer> stage = s_eng_stage_used ? s_eng_stage_buf : nil;
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        if (!cb || (s_eng_stage_used && !stage)) {
+            eng_checked_fail(); fps_note_submission_failure();
+            return 0;
+        }
+        eng_site_tag_bytes(cb, ENG_SITE_COMMAND_BUFFER, 0);
+        const uint64_t seq = ++s_eng_commit_seq;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if ([done status] != MTLCommandBufferStatusCompleted || [done error]) eng_checked_fail();
+            uint64_t prev = atomic_load(&s_eng_commit_done);
+            while (prev < seq && !atomic_compare_exchange_weak(&s_eng_commit_done, &prev, seq)) {}
+        }];
+        [cb enqueue];
+        eng_track_submission(cb);
+        u64 ticket = 0;
+        if (async) {
+            if (!s_eng_fence_cbs) s_eng_fence_cbs = [NSMutableArray new];
+            if (!s_eng_fence_cbs || [s_eng_fence_cbs count] >= 64) eng_checked_fail();
+            else { [s_eng_fence_cbs addObject:cb]; ticket = ++s_eng_fence_next; }
+        }
+        eng_stage_hand_off(cb, stage);
+        metal_owner_committed();
+        if (ticket && rsx_ring_progress_metal_committed)
+            rsx_ring_progress_metal_committed(ticket, s_eng_rec_count);
+
+        EngEncJob job = { cb, stage, s_eng_rec, s_eng_rec_count, s_eng_tail_encode, s_encq.batch };
+        s_eng_tail_encode = nil;
+        pthread_mutex_lock(&s_encq.mu);
+        if (s_encq.count == ENG_ENC_JOBS) {
+            const uint64_t t0 = eng_now_ns();
+            rsx_fifo_busy_enter(eng_enc_busy_category());
+            while (s_encq.count == ENG_ENC_JOBS) pthread_cond_wait(&s_encq.done_cv, &s_encq.mu);
+            rsx_fifo_busy_leave(eng_enc_busy_category());
+            s_encq.full_waits++; s_encq.full_wait_ns += eng_now_ns() - t0;
+        }
+        s_encq.job[(s_encq.head + s_encq.count) % ENG_ENC_JOBS] = job;
+        s_encq.count++;
+        s_encq.jobs++; s_encq.records += job.nrec;
+        pthread_cond_signal(&s_encq.work);
+        pthread_mutex_unlock(&s_encq.mu);
+
+        /* Taken after the job is queued: at most ENG_ENC_JOBS queued, one
+         * encoding and this one, so ENG_ENC_JOBS + 2 arrays ever exist. */
+        EngRecord* next = eng_enc_take_records();
+        if (next) s_eng_rec = next;
+        else {
+            /* No array free (or no memory for one): wait for them back. */
+            eng_enc_drain();
+            pthread_mutex_lock(&s_encq.mu);
+            s_eng_rec = s_encq.spare[--s_encq.nspare];
+            pthread_mutex_unlock(&s_encq.mu);
+        }
+        s_eng_rec_count = 0;
+        s_eng_stage_used = 0;
+        s_encq.batch++;
+        eng_collect_retired_objects();
+        eng_enc_report();
+        if (out_ticket) *out_ticket = ticket;
+        return !atomic_load(&s_eng_checked_failed);
+    }
+}
+
 static id<MTLCommandBuffer> s_capture_present_cb;
 static uint64_t s_capture_guest,s_capture_command,s_capture_submission,s_capture_drawable;
 static int s_capture_presented;
@@ -4713,6 +5025,12 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
     s_eng_checked_completed=0;
     if(!s_dev || !s_queue){eng_checked_fail();return 0;}
     if(s_eng_dropped)eng_checked_fail();
+    /* Encode thread: the records go to it; an async commit is then complete,
+     * and any other goes on below with nothing left to encode. */
+    if(eng_enc_on()){
+        if(async_submit && !present_dst){eng_enc_handoff(1,out_ticket);return 0;}
+        eng_enc_handoff(0,NULL);
+    }
     @autoreleasepool {
         id<CAMetalDrawable> drawable = nil;
         id<MTLTexture> dst = nil;
@@ -4850,7 +5168,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
 
         if (s_eng_dropped) {
             fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
-                    s_eng_dropped, ENG_MAX_RECORDS);
+                    (unsigned)atomic_load(&s_eng_dropped), ENG_MAX_RECORDS);
             s_eng_dropped = 0;
         }
         if(critical_start){uint64_t w[8]={critical_start,critical_size,critical_commit,critical_wait,s_present_guest_id,(uint64_t)([cb status]==MTLCommandBufferStatusCompleted && ![cb error]),critical_double(cb.GPUStartTime),critical_double(cb.GPUEndTime)};ps3_critical_emit_capture(critical_capture,PS3_CRITICAL_FLUSH,critical_id,(uint64_t)(windowed_present?1:async_submit?2:0),w,8);}
@@ -4870,7 +5188,7 @@ static u64 eng_submit_async(void *user,u32 reason){
  if(atomic_load(&s_eng_stage_inflight)>s_eng_stage_limit){
   const uint64_t t0=eng_now_ns();
   while(atomic_load(&s_eng_stage_inflight)>s_eng_stage_limit&&[s_eng_submitted count]){
-   [s_eng_submitted[0] waitUntilCompleted];eng_check_submissions(0);
+   eng_enc_drain();[s_eng_submitted[0] waitUntilCompleted];eng_check_submissions(0);
   }
   ++s_eng_bound_waits;s_eng_bound_wait_ns+=eng_now_ns()-t0;eng_bound_report(1);
  } else eng_bound_report(0);
@@ -5112,6 +5430,7 @@ static int eng_encode_and_stage(id<MTLTexture> src, id<MTLTexture> staging, uint
     s_eng_checked_completed=0;
     if(!s_dev || !s_queue){eng_checked_fail();return 0;}
     if(s_eng_dropped)eng_checked_fail();
+    eng_enc_handoff(0,NULL);   /* encode thread: the records go to it first */
     @autoreleasepool {
         id<MTLBuffer> stage = s_eng_stage_used ? s_eng_stage_buf : nil;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
@@ -5156,7 +5475,7 @@ static int eng_encode_and_stage(id<MTLTexture> src, id<MTLTexture> staging, uint
         }
         if (s_eng_dropped) {
             fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
-                    s_eng_dropped, ENG_MAX_RECORDS);
+                    (unsigned)atomic_load(&s_eng_dropped), ENG_MAX_RECORDS);
             s_eng_dropped = 0;
         }
         /* FLUSH type 3: a staged present (1 is a windowed present, 2 async). */
