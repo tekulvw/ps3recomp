@@ -222,6 +222,11 @@ static struct {
     /* vp_cb's content version, and the version the backend last received
      * through bind_vs_constants (0: none, or a different backend since). */
     u64 vp_cb_serial, vs_bound_serial;
+    /* The constant rows the current draw's vertex program reads (vs_all:
+     * every row), and the rows the bound copy holds, the transform's two
+     * always included. */
+    u32 vs_first, vs_rows, vs_bound_first, vs_bound_rows;
+    int vs_all, vs_bound_all;
     u8* fp_cb;
     u32 fp_cb_cap;
     u32* indices;
@@ -1257,22 +1262,51 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d, 
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
  * content id (rsx_live_draw.c:2002-2026). */
+/* The texture cache's content hash: compared only with values it made in
+ * this run, never stored. Eight independent chains, each taking every eighth
+ * 8-byte word, so their multiplies overlap instead of each waiting on the one
+ * before (the single chain it replaced was latency-bound, about 4x slower);
+ * each step folds its high bits down so a change anywhere in a word reaches
+ * the whole lane. The lanes, the tail and the length are folded together and
+ * mixed at the end. */
+static inline u64 eng_hash_step(u64 h, u64 word)
+{
+    h = (h ^ word) * 0x9E3779B97F4A7C15ull;
+    return h ^ (h >> 29);
+}
+static u64 eng_hash_bytes(const u8* src, u32 span)
+{
+    u64 h[8] = { 0x243F6A8885A308D3ull, 0x13198A2E03707344ull, 0xA4093822299F31D0ull, 0x082EFA98EC4E6C89ull,
+                 0x452821E638D01377ull, 0xBE5466CF34E90C6Cull, 0xC0AC29B7C97C50DDull, 0x3F84D5B5B5470917ull };
+    u32 i = 0;
+    for (; i + 64 <= span; i += 64) {
+        u64 w[8];
+        memcpy(w, src + i, sizeof w);
+        for (u32 k = 0; k < 8; k++) h[k] = eng_hash_step(h[k], w[k]);
+    }
+    for (; i + 8 <= span; i += 8) {
+        u64 w;
+        memcpy(&w, src + i, sizeof w);
+        h[0] = eng_hash_step(h[0], w);
+    }
+    if (i < span) {
+        u64 w = 0;
+        memcpy(&w, src + i, span - i);
+        h[1] = eng_hash_step(h[1], w ^ ((u64)(span - i) << 56));
+    }
+    u64 x = (u64)span * 0xFF51AFD7ED558CCDull;
+    for (u32 k = 0; k < 8; k++) x ^= (h[k] << (k * 8)) | (k ? h[k] >> (64 - k * 8) : 0);
+    x = (x ^ (x >> 33)) * 0xFF51AFD7ED558CCDull;
+    x = (x ^ (x >> 33)) * 0xC4CEB9FE1A85EC53ull;
+    return x ^ (x >> 33);
+}
 static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span, u64 identity,
                                     int* readable)
 {
     const u8* src = span ? (identity ? rsx_picture_data(identity,location,offset,span) : eng_guest_ptr(NULL, location, offset, span)) : NULL;
     if (!src) { *readable = 0; return 0; }
-    u64 hash = 1469598103934665603ull;
-    u32 i = 0;
-    for (; i + 8 <= span; i += 8) {
-        u64 word;
-        memcpy(&word, src + i, sizeof(word));
-        hash ^= word;
-        hash *= 1099511628211ull;
-    }
-    for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
     *readable = 1;
-    return hash;
+    return eng_hash_bytes(src, span);
 }
 
 /* The cheap per-frame change check: 64 bytes out of every 2 KB, plus the
@@ -1994,31 +2028,36 @@ static int eng_guest_programs_core(const u8** out_vp, u32* out_vp_instrs,
 /* The input mask of the vertex programs recent draws used: the analysis is
  * a walk of the program, the check a byte compare of it. */
 #define ENG_VP_LAYOUT_MEMO 4u
-static struct { const u8* uc; u32 instrs, mask; u8 copy[RSX_DSP_VP_INSTR * 16u]; } s_vlm[ENG_VP_LAYOUT_MEMO];
+static struct { const u8* uc; u32 instrs, mask; rsx_vp_constant_range rows; u8 copy[RSX_DSP_VP_INSTR * 16u]; } s_vlm[ENG_VP_LAYOUT_MEMO];
 static u32 s_vlm_next;
 static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
 {
     u32 mask = 0xFFFFu;
     const u8* uc = NULL;
     u32 instrs = 0;
+    /* The built-in program, and any program not analysed, read every row. */
+    rsx_vp_constant_range rows = { 0, RSX_DSP_NUM_CONSTANTS, 1 };
     if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
         const u32 bytes = instrs * 16u;
         int hit = 0;
         for (u32 i = 0; i < ENG_VP_LAYOUT_MEMO && !hit; i++)
             if (s_vlm[i].uc == uc && s_vlm[i].instrs == instrs && bytes <= sizeof s_vlm[i].copy &&
-                !memcmp(s_vlm[i].copy, uc, bytes)) { mask = s_vlm[i].mask; hit = 1; }
+                !memcmp(s_vlm[i].copy, uc, bytes)) { mask = s_vlm[i].mask; rows = s_vlm[i].rows; hit = 1; }
         if (!hit) {
             rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
             if (rsx_vp_analyze_inputs(uc, bytes, &analysis) == (int)instrs &&
                 analysis.exact && analysis.input_mask)
                 mask = analysis.input_mask;
+            rsx_vp_constant_range r;
+            if (rsx_vp_analyze_constants(uc, bytes, &r) == (int)instrs && !r.all) rows = r;
             if (bytes <= sizeof s_vlm[0].copy) {
                 const u32 k = s_vlm_next++ % ENG_VP_LAYOUT_MEMO;
-                s_vlm[k].uc = uc; s_vlm[k].instrs = instrs; s_vlm[k].mask = mask;
+                s_vlm[k].uc = uc; s_vlm[k].instrs = instrs; s_vlm[k].mask = mask; s_vlm[k].rows = rows;
                 memcpy(s_vlm[k].copy, uc, bytes);
             }
         }
     }
+    g.vs_all = rows.all; g.vs_first = rows.first; g.vs_rows = rows.count;
     rsx_vertex_layout_plan_init(layout, mask);
 }
 
@@ -3509,11 +3548,8 @@ static void eng_texture_binding_capture(const u32* textures, u32 mask,
         if (source && decoded) {
             total_bytes+=span+decoded_bytes;
             memcpy(source,guest,span);
-            /* Same word-at-a-time hash used by the upload cache. */
-            current_hash=1469598103934665603ull;
-            u32 i=0;
-            for (;i+8<=span;i+=8) { u64 word;memcpy(&word,source+i,8);current_hash^=word;current_hash*=1099511628211ull; }
-            for (;i<span;++i) { current_hash^=source[i];current_hash*=1099511628211ull; }
+            /* Same hash as the upload cache. */
+            current_hash=eng_hash_bytes(source,span);
             rsx_texture_decode(decoded,lv[0].tl.dst_row_bytes,source,t.width,t.height,&lv[0].tl,rsx_texture_argb_is_rgba());
             bytes_ok=eng_capture_write(prefix,".source.bin",source,span) &&
                 eng_capture_write(prefix,".decoded-mip0.bin",decoded,decoded_bytes);
@@ -4298,11 +4334,24 @@ done:
 
 /* Draws that handed the backend their vertex constants, and draws that
  * reused the previous draw's (rebind_vs_constants). */
-static unsigned long long s_vs_binds, s_vs_rebinds;
+static unsigned long long s_vs_binds, s_vs_rebinds, s_vs_row_binds, s_vs_row_bytes;
+/* PS3RECOMP_RSX_VS_CONSTANT_ROWS=1 (default off; read once): hand a backend
+ * that takes them only the constant rows the program reads. */
+static int eng_vs_constant_rows_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_RSX_VS_CONSTANT_ROWS"); on = e && !strcmp(e, "1"); }
+    return on;
+}
 void rsx_draw_engine_vs_constant_counts(unsigned long long* binds, unsigned long long* rebinds)
 {
     if (binds) *binds = s_vs_binds;
     if (rebinds) *rebinds = s_vs_rebinds;
+}
+void rsx_draw_engine_vs_constant_row_counts(unsigned long long* row_binds, unsigned long long* row_bytes)
+{
+    if (row_binds) *row_binds = s_vs_row_binds;
+    if (row_bytes) *row_bytes = s_vs_row_bytes;
 }
 
 static void sink_end_core(void* user, const rsx_dispatch* r)
@@ -4508,9 +4557,21 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
         uploaded,indexed ? n_draw : 0,fp_bytes,&rs,&sf,&vp);
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
-    if (g.vs_bound_serial != g.vp_cb_serial || !g.be->rebind_vs_constants ||
+    /* The bound copy serves again only if it holds every row this program
+     * reads (a copy staged for another program's rows may not). */
+    const int covered = g.vs_bound_all ||
+        (!g.vs_all && g.vs_first >= g.vs_bound_first &&
+         g.vs_first + g.vs_rows <= g.vs_bound_first + g.vs_bound_rows);
+    if (g.vs_bound_serial != g.vp_cb_serial || !covered || !g.be->rebind_vs_constants ||
         !g.be->rebind_vs_constants(g.be->user)) {
-        g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+        if (!g.vs_all && g.be->bind_vs_constant_rows && eng_vs_constant_rows_enabled()) {
+            g.be->bind_vs_constant_rows(g.be->user, g.vp_cb, ENG_VP_CB_BYTES, g.vs_first, g.vs_rows);
+            g.vs_bound_all = 0; g.vs_bound_first = g.vs_first; g.vs_bound_rows = g.vs_rows;
+            s_vs_row_binds++; s_vs_row_bytes += (unsigned long long)(g.vs_rows + 2u) * 16u;
+        } else {
+            g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+            g.vs_bound_all = 1;
+        }
         g.vs_bound_serial = g.vp_cb_serial;
         s_vs_binds++;
     } else s_vs_rebinds++;

@@ -8,6 +8,7 @@
 #undef main
 #include "rsx_test_programs.h"
 #include "rsx_fp_decompiler.h"
+#include "rsx_vp_decompiler.h"
 
 #define N_PROGRAMS 256u
 
@@ -23,6 +24,137 @@ static void upload_vp(u32 swz)
 static u32 swizzle(u32 i)
 {
     return RSX_TEST_VP_SWZ(i & 3u, (i >> 2) & 3u, (i >> 4) & 3u, (i >> 6) & 3u);
+}
+
+/* Constant rows: what the last bind_vs_constant_rows staged, and a copy of
+ * the rows it was told the program reads plus the transform's. */
+static int g_row_binds;
+static u32 g_row_first, g_row_count;
+static u8 g_row_block[(RSX_DSP_NUM_CONSTANTS + 2) * 16];
+static void stub_bind_vs_rows(void* u, const void* d, u32 n, u32 first, u32 rows)
+{
+    (void)u;
+    g_row_binds++; g_row_first = first; g_row_count = rows;
+    memset(g_row_block, 0xEE, sizeof g_row_block);
+    if (d && n <= sizeof g_row_block && (first + rows) * 16u + 32u <= n) {
+        memcpy(g_row_block + first * 16u, (const u8*)d + first * 16u, rows * 16u);
+        memcpy(g_row_block + n - 32u, (const u8*)d + n - 32u, 32u);
+    }
+}
+/* A program of MOVs: o0 from v0, then one constant each into o1, o7, ... */
+static void upload_const_vp(const u32* regs, u32 n, int indexed)
+{
+    u8 vp[16 * 8];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, n == 0);
+    for (u32 i = 0; i < n; i++)
+        rsx_test_vp_mov_const_out(vp + 16 * (i + 1), regs[i], 7 + i, indexed && i == 0, i + 1 == n);
+    m(0x1E9C, 0);
+    for (u32 i = 0; i < 4 * (n + 1); i++) { u32 w; memcpy(&w, vp + i * 4, 4); m(0xB80 + i * 4, w); }
+    m(0x1EA0, 0);
+}
+static void put_constant(u32 slot, u32 seed)
+{
+    m(0x1EFC, slot);                                  /* TRANSFORM_CONSTANT_LOAD */
+    for (u32 w = 0; w < 4; w++) m(0x1F00 + w * 4, seed + w);
+}
+static int row_is(u32 slot, u32 seed)
+{
+    for (u32 w = 0; w < 4; w++) { u32 v; memcpy(&v, g_row_block + slot * 16u + w * 4u, 4); if (v != seed + w) return 0; }
+    return 1;
+}
+
+static void test_constant_rows(void)
+{
+    /* The analysis on its own. */
+    {
+        u8 vp[16 * 4];
+        rsx_vp_constant_range r;
+        rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
+        CHECK(rsx_vp_analyze_constants(vp, 16, &r) == 1 && !r.all && r.count == 0,
+              "a program without constants reads no rows (%u+%u all %d)", r.first, r.count, r.all);
+        rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
+        rsx_test_vp_mov_const_out(vp + 16, 12, 7, 0, 0);
+        rsx_test_vp_mov_const_out(vp + 32, 7, 8, 0, 1);
+        CHECK(rsx_vp_analyze_constants(vp, 48, &r) == 3 && !r.all && r.first == 7 && r.count == 6,
+              "constants 12 and 7: rows 7..12 (%u+%u)", r.first, r.count);
+        rsx_test_vp_mov_const_out(vp + 32, 7, 8, 1, 1);
+        CHECK(rsx_vp_analyze_constants(vp, 48, &r) == 3 && r.all, "an indexed constant reads them all");
+        rsx_test_vp_mov_const_out(vp + 32, 7, 8, 0, 0);
+        CHECK(rsx_vp_analyze_constants(vp, 48, &r) == -1 && r.all, "an unterminated program reads them all");
+        /* A branch (scalar opcode BRA) anywhere makes the range unknown. */
+        rsx_test_vp_mov_const_out(vp + 32, 7, 8, 0, 1);
+        u32 d1; memcpy(&d1, vp + 20, 4); d1 = (d1 & ~(0x1Fu << 27)) | (0x08u << 27); memcpy(vp + 20, &d1, 4);
+        CHECK(rsx_vp_analyze_constants(vp, 48, &r) == 3 && r.all, "flow control reads them all");
+    }
+
+    /* Read once: set before the first draw that could ask. */
+    setenv("PS3RECOMP_RSX_VS_CONSTANT_ROWS", "1", 1);
+    g_stub_backend.bind_vs_constant_rows = stub_bind_vs_rows;
+    g_stub_backend.rebind_vs_constants = stub_rebind_vs;
+    g_rebind_answer = 1;
+    engine_up();
+    rsx_test_fp_instr(vm_base + TEX_OFFSET,
+        RSX_TEST_FP_OPC(0x01) | RSX_TEST_FP_MASK_XYZW | RSX_TEST_FP_INSRC_COL0 | RSX_TEST_FP_END,
+        RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+    m(0x8E4, TEX_OFFSET | 2);
+    m(0x1D60, 64);
+    put_constant(7, 0x700); put_constant(12, 0xC00); put_constant(20, 0x1400); put_constant(300, 0x3000);
+    const u32 a[2] = { 12, 7 };
+    upload_const_vp(a, 2, 0);
+    g_row_binds = 0; g_vs_binds = g_vs_rebinds = 0;
+    draw_triangle();
+    CHECK(g_row_binds == 1 && g_vs_binds == 0 && g_row_first == 7 && g_row_count == 6,
+          "a program reading constants 7 and 12 stages rows 7..12 (%d binds, %u+%u)",
+          g_row_binds, g_row_first, g_row_count);
+    CHECK(row_is(7, 0x700) && row_is(12, 0xC00), "with their values");
+    { u8 fill[32]; memset(fill, 0xEE, sizeof fill);
+      CHECK(memcmp(g_row_block + RSX_DSP_NUM_CONSTANTS * 16u, fill, sizeof fill) != 0,
+            "and the transform rows"); }
+    draw_triangle();
+    CHECK(g_row_binds == 1 && g_vs_rebinds == 1, "unchanged constants and program: rebound (%d, %d)",
+          g_row_binds, g_vs_rebinds);
+    /* Same constants, a program reading a row the copy does not hold. */
+    const u32 b[1] = { 20 };
+    upload_const_vp(b, 1, 0);
+    draw_triangle();
+    CHECK(g_row_binds == 2 && g_row_first == 20 && g_row_count == 1 && row_is(20, 0x1400),
+          "a program reading other rows is not served the old copy (%d, %u+%u)",
+          g_row_binds, g_row_first, g_row_count);
+    /* Back to rows inside a copy that holds only row 20: staged again. */
+    upload_const_vp(a, 2, 0);
+    draw_triangle();
+    CHECK(g_row_binds == 3 && g_row_first == 7, "nor one reading rows outside it (%d)", g_row_binds);
+    /* Indexed: every row, through bind_vs_constants. */
+    upload_const_vp(a, 2, 1);
+    const int full = g_vs_binds;
+    draw_triangle();
+    CHECK(g_vs_binds == full + 1 && g_row_binds == 3, "an indexed program binds the whole block");
+    /* A full copy serves any program after it. */
+    upload_const_vp(b, 1, 0);
+    draw_triangle();
+    CHECK(g_row_binds == 3 && g_vs_binds == full + 1, "and the whole block serves a narrower program next");
+    /* A changed constant stages again. */
+    put_constant(20, 0x1500);
+    draw_triangle();
+    CHECK(g_row_binds == 4 && row_is(20, 0x1500), "a written constant is staged again");
+    unsigned long long rb = 0, rbytes = 0;
+    rsx_draw_engine_vs_constant_row_counts(&rb, &rbytes);
+    CHECK(rb >= 4 && rbytes > 0 && rbytes < rb * 64u * 16u, "row binds are counted (%llu, %llu bytes)", rb, rbytes);
+    engine_down();
+    g_stub_backend.bind_vs_constant_rows = NULL;
+    g_stub_backend.rebind_vs_constants = NULL;
+    /* Without the hook the whole block is bound, as before. */
+    engine_up();
+    rsx_test_fp_instr(vm_base + TEX_OFFSET,
+        RSX_TEST_FP_OPC(0x01) | RSX_TEST_FP_MASK_XYZW | RSX_TEST_FP_INSRC_COL0 | RSX_TEST_FP_END,
+        RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+    m(0x8E4, TEX_OFFSET | 2);
+    m(0x1D60, 64);
+    upload_const_vp(a, 2, 0);
+    const int before = g_vs_binds, rows_before = g_row_binds;
+    draw_triangle();
+    CHECK(g_vs_binds == before + 1 && g_row_binds == rows_before, "a backend without the hook gets the whole block");
+    engine_down();
 }
 
 int main(void)
@@ -177,6 +309,8 @@ int main(void)
               "and restoring it finds the earlier pipeline");
         engine_down();
     }
+
+    test_constant_rows();
 
     free(vm_base);
     printf("program identity failures: %d\n", g_failures);
