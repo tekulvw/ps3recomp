@@ -125,7 +125,7 @@ jobs:
       # a soft edge by the amount asked, and with both off it is a copy.
       - name: Run the Metal present post-processing test
         run: |
-          clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_present_post.m \
+          clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_present_post.m runtime/diagnostics/render_ablation.c \
             -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
             -o /tmp/test_metal_present_post
           /tmp/test_metal_present_post
