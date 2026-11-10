@@ -124,8 +124,10 @@ static s32 sail_held_start(u32 player, u32 command, u64 token);
 static s32 sail_held_stop(u32 player, u64 token);
 static s32 sail_held_release_locked(u32 player);
 static int sail_held_enabled(void) {
-    const char* value = getenv("PS3RECOMP_SAIL_HELD_FRAME");
-    return value && !strcmp(value, "1");
+    static int on = -1;   /* read once: asked on player polls */
+    if (on < 0) { const char* value = getenv("PS3RECOMP_SAIL_HELD_FRAME");
+                  on = value && !strcmp(value, "1"); }
+    return on;
 
 }
 
@@ -134,8 +136,9 @@ static s32 sail_timed_stop(u32 player,u64 token);
 static s32 sail_timed_release_locked(u32 player);
 static void sail_timed_pump(u32 player);
 static int sail_timed_enabled(void) {
-    const char* value=getenv("PS3RECOMP_SAIL_TIMED_THX");
-    return value && !strcmp(value,"1");
+    static int on=-1;   /* read once: GetState and GetFrame poll every frame */
+    if(on<0){const char* value=getenv("PS3RECOMP_SAIL_TIMED_THX");on=value && !strcmp(value,"1");}
+    return on;
 }
 /* Decoder-enabled builds use the SDK renderer/clock. Disabled builds retain
  * linkable metadata-only Sail with no new renderer dependency. */

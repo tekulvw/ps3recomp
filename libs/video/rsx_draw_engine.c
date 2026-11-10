@@ -4685,7 +4685,9 @@ static void eng_present_core(u32 buffer_id)
     if (!g.ready) return;
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
-    if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
+    static int s_frame_dump = -1;   /* per present: read once */
+    if (s_frame_dump < 0) s_frame_dump = getenv("PS3RECOMP_METAL_FRAME_DUMP") ? 1 : 0;
+    if (s_frame_dump && g.frames % 120 == 0) {
         u32 current = eng_current_surface();
         fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u\n",
                 g.frames, buffer_id, target, current, g.guest_draws, g.n_surfaces);

@@ -349,11 +349,14 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
      * writes, so a port can satisfy them here. Defined weakly below, so this is
      * a no-op for a port that does not need it. */
     { extern void ps3_spu_job_complete_pending(void); ps3_spu_job_complete_pending(); }
-    { static int _n = 0; if (getenv("SEMTID") && PS3_LOG_FIRST(_n, 60000))
+    static int s_semtid = -1, s_semchain = -1;   /* per wait: read once */
+    if (s_semtid < 0) s_semtid = getenv("SEMTID") ? 1 : 0;
+    if (s_semchain < 0) s_semchain = getenv("SEMCHAIN") ? 1 : 0;
+    { static int _n = 0; if (s_semtid && PS3_LOG_FIRST(_n, 60000))
         fprintf(stderr, "[WAIT tid=%llu] semaphore_wait(sem=%u timeout=%llu cia=0x%08X lr=0x%08X)\n",
                 (unsigned long long)ctx->thread_id, sem_id, (unsigned long long)timeout_us,
                 (unsigned)ctx->cia, (unsigned)ctx->lr);
-      else if (!getenv("SEMTID") && ps3_log_verbose())
+      else if (!s_semtid && ps3_log_verbose())
         fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us); }
     /* PS3_BREADCRUMB: every 500th wait, dump the per-tid indirect-call breadcrumb
      * table. Fires reliably DURING the loader hang (respump spins sem16 waits),
@@ -363,7 +366,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
       if(bc){ static long w=0; if((++w % 500)==0){ extern void lbp_breadcrumb_dump(const char*); lbp_breadcrumb_dump("semwait"); } } }
     /* SEMCHAIN: dump the guest call-chain at the main thread's sem=7 poll (the
      * "loading done" wait) to locate its loop -- is it meant to re-post sem=3? */
-    if (getenv("SEMCHAIN") && sem_id == 7 && ctx->thread_id == 0) {
+    if (s_semchain && sem_id == 7 && ctx->thread_id == 0) {
         static int _c = 0;
         if (PS3_LOG_FIRST(_c, 2)) { extern void ppu_log_host_chain(const char*); ppu_log_host_chain("sem7-wait-tid0"); }
     }
@@ -504,15 +507,18 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
 
-    { static int _n=0; if (getenv("SEMTID") && _n < 60000)
+    static int s_semtid = -1, s_semchain = -1;   /* per post: read once */
+    if (s_semtid < 0) s_semtid = getenv("SEMTID") ? 1 : 0;
+    if (s_semchain < 0) s_semchain = getenv("SEMCHAIN") ? 1 : 0;
+    { static int _n=0; if (s_semtid && _n < 60000)
         fprintf(stderr, "[WAKE tid=%llu] semaphore_post(sem=%u count=%d)\n",
                 (unsigned long long)ctx->thread_id, sem_id, count);
-      else if (!getenv("SEMTID") && _n < 40)
+      else if (!s_semtid && _n < 40)
         fprintf(stderr, "[WAKE] semaphore_post(sem=%u count=%d)\n", sem_id, count);
       _n++; }
     /* SEMCHAIN: dump the guest call-chain at every sem=3 post (the sema the main
      * loading thread starves on) -- reveals which thread/loop produces it. */
-    if (getenv("SEMCHAIN") && sem_id == 3) {
+    if (s_semchain && sem_id == 3) {
         static int _c = 0;
         if (PS3_LOG_FIRST(_c, 3)) { extern void ppu_log_host_chain(const char*);
             fprintf(stderr, "[SEMCHAIN] sem=3 post by tid=%llu\n", (unsigned long long)ctx->thread_id);
