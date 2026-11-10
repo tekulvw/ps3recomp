@@ -905,6 +905,15 @@ static int gcm_flipcb_on_tick_only(void)
     return v;
 }
 
+/* FLIP_DBG (set): log flip status traffic. Read once: GetFlipStatus is polled
+ * by every wait-for-flip loop. */
+static int gcm_flip_dbg(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("FLIP_DBG") ? 1 : 0;
+    return v;
+}
+
 static u32 s_vblank_handler_opd   = 0;
 static u32 s_user_handler_opd     = 0;
 static u32 s_second_v_handler_opd = 0;
@@ -917,7 +926,9 @@ extern u32 vm_read32(unsigned int);
 static u32 s_flip_handler_code    = 0;
 static u32 s_vblank_handler_code  = 0;
 static void ydkj_restore_handler_opd(u32 opd, u32 code) {
-    if (!getenv("YDKJ_HANDLERFIX") || !opd || !code) return;
+    static int s_fix = -1;   /* per vblank/flip delivery: read once */
+    if (s_fix < 0) s_fix = getenv("YDKJ_HANDLERFIX") ? 1 : 0;
+    if (!s_fix || !opd || !code) return;
     extern u8* vm_base; if (!vm_base) return;
     if (vm_read32(opd) == 0) {
         u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
@@ -1364,7 +1375,7 @@ void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
 void cellGcmResetFlipStatus(void)
 {
     { static int n = 0;
-      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 12))
+      if (gcm_flip_dbg() && PS3_LOG_FIRST(n, 12))
           fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
     FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
@@ -1383,7 +1394,7 @@ u32 cellGcmGetFlipStatus(void)
      * every wait-for-flip loop exit on its first poll, so titles ran
      * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
     { static int n = 0;
-      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 24))
+      if (gcm_flip_dbg() && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
     if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
@@ -4330,7 +4341,9 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
 
-    if (getenv("CELLMARK_BLINKDBG"))
+    static int s_blinkdbg = -1;   /* per ring wrap: read once */
+    if (s_blinkdbg < 0) s_blinkdbg = getenv("CELLMARK_BLINKDBG") ? 1 : 0;
+    if (s_blinkdbg)
         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
 
     static int s_recdbg = -1;
@@ -4511,7 +4524,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
           }
       } }
 
-    { static int _n=0; if (getenv("FLIP_DBG") && PS3_LOG_FIRST(_n, 20))
+    { static int _n=0; if (gcm_flip_dbg() && PS3_LOG_FIRST(_n, 20))
         fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)

@@ -122,7 +122,8 @@ static void sys_lwmutex_create(ppu_context* ctx)
     uint32_t lwm  = (uint32_t)ctx->gpr[3];
     uint32_t attr = (uint32_t)ctx->gpr[4];
     { static long long _n=0; _n++;
-      if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
+      static const bool s_lwm_count = getenv("LWM_COUNT") != nullptr;   /* per call: read once */
+      if (s_lwm_count && (_n<=24 || (_n%50000)==0))
         fprintf(stderr, "[LWM] create #%lld lwm=0x%08X attr=0x%08X\n", _n, lwm, attr); }
     uint32_t protocol = attr ? vm_read32(attr + 0) : 0;
     vm_write32(lwm + 0x00, 0);          /* owner */
@@ -442,7 +443,8 @@ static void crt_ok(ppu_context* ctx) { ctx->gpr[3] = 0; }
 static void sys_lwmutex_destroy_counted(ppu_context* ctx)
 {
     { static long long _n=0; _n++;
-      if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
+      static const bool s_lwm_count = getenv("LWM_COUNT") != nullptr;   /* per call: read once */
+      if (s_lwm_count && (_n<=24 || (_n%50000)==0))
         fprintf(stderr, "[LWM] destroy #%lld lwm=0x%08X r4=0x%08X r5=0x%08X\n", _n,
                 (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]); }
     ctx->gpr[3] = 0;

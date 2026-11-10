@@ -853,7 +853,9 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
  * and signals completion -- satisfying the PPU's wait. Returns 1 if dispatched. */
 int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
 {
-    if (!getenv("RD_SPU_INTERP")) return 0;
+    static int s_rd_spu_interp = -1;   /* per blocking receive / port send: read once */
+    if (s_rd_spu_interp < 0) s_rd_spu_interp = getenv("RD_SPU_INTERP") ? 1 : 0;
+    if (!s_rd_spu_interp) return 0;
     /* Two callers reach here: an event-port send, which carries the frame's
      * work descriptor in data2, and the blocking-receive path, which has none
      * and passes 0. A worker started without a descriptor reads an empty inbox,
@@ -1833,7 +1835,9 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
     }
     if (!q && t && t->connected_queue) q = t->connected_queue;
     if (!q) { spu_group_t* g = spu_find_group(group_id); if (g) q = g->event_queue_id; }
-    { static int s_d = 0; if (getenv("SPU_MBOXTRACE") && PS3_LOG_FIRST(s_d, 64))
+    { static int s_d = 0; static int s_mt = -1;   /* per out-mbox word: read once */
+      if (s_mt < 0) s_mt = getenv("SPU_MBOXTRACE") ? 1 : 0;
+      if (s_mt && PS3_LOG_FIRST(s_d, 64))
         fprintf(stderr, "[SPU->PPU] deliver? spu=0x%X intr=%d val=0x%08X q=%u (thread %s)\n",
                 spu_id, is_intr, value, q, t ? "found" : "MISSING"); }
     if (!q) return;
