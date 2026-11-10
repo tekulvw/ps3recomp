@@ -303,12 +303,40 @@ typedef struct rsx_draw_backend {
     int (*rebind_vs_constants)(void* user);
     /* Optional. bind_vs_constants for a program that reads only some rows:
      * the block is `bytes` long (512 constant rows, then the viewport
-     * transform's two), the program reads rows [first_row, first_row + rows)
-     * and the last two, and the rest may hold anything. The backend may stage
-     * just those. Without it the engine calls bind_vs_constants. */
+     * transform's two), the program reads the rows set in `row_mask` (bit r
+     * of row_mask[r / 32], 16 words) and the last two, and the rest may hold
+     * anything. The backend may stage just those (rsx_be_row_run walks them).
+     * Without it the engine calls bind_vs_constants. */
     void (*bind_vs_constant_rows)(void* user, const void* data, u32 bytes,
-                                  u32 first_row, u32 rows);
+                                  const u32* row_mask);
 } rsx_draw_backend;
+
+/* The next run of set rows in a 512-row mask at or after *row: its first row
+ * in *row and its length in *count. 0 when none is left. */
+static inline int rsx_be_row_run(const u32* row_mask, u32* row, u32* count)
+{
+    u32 r = *row;
+    while (r < 512u && !(row_mask[r >> 5] >> (r & 31u))) r = (r | 31u) + 1u;
+    while (r < 512u && !((row_mask[r >> 5] >> (r & 31u)) & 1u)) r++;
+    if (r >= 512u) return 0;
+    u32 e = r;
+    while (e < 512u && ((row_mask[e >> 5] >> (e & 31u)) & 1u)) {
+        if ((e & 31u) == 0 && row_mask[e >> 5] == 0xFFFFFFFFu) e += 32u; else e++;
+    }
+    *row = r; *count = e - r;
+    return 1;
+}
+
+/* Does a block of `bytes` (rows, then the transform's two) hold every row
+ * set in the mask? */
+static inline int rsx_be_row_mask_fits(const u32* row_mask, u32 bytes)
+{
+    if (!row_mask || bytes < 32u) return 0;
+    const u32 rows = (bytes - 32u) / 16u;
+    u32 row = 0, n = 0, end = 0;
+    for (; rsx_be_row_run(row_mask, &row, &n); row += n) end = row + n;
+    return end <= rows;
+}
 
 /* ---- the engine --------------------------------------------------------- */
 

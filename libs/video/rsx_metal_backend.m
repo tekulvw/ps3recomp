@@ -3917,16 +3917,17 @@ static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
  * and layout (its last two rows are the viewport transform), but only those
  * rows and the transform's are copied into staging. */
 static void eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes,
-                                      u32 first_row, u32 rows)
+                                      const u32* row_mask)
 {
     (void)user;
     u32 off = 0;
-    if (bytes < 32u || (u64)(first_row + rows) * 16u > bytes - 32u || !eng_stage_reserve(bytes, &off)) {
+    if (!rsx_be_row_mask_fits(row_mask, bytes) || !eng_stage_reserve(bytes, &off)) {
         eng_bind_vs_constants(user, data, bytes);
         return;
     }
     const u8* src = (const u8*)data;
-    if (rows) memcpy(s_eng_stage + off + first_row * 16u, src + first_row * 16u, rows * 16u);
+    for (u32 row = 0, n = 0; rsx_be_row_run(row_mask, &row, &n); row += n)
+        memcpy(s_eng_stage + off + row * 16u, src + row * 16u, n * 16u);
     memcpy(s_eng_stage + off + bytes - 32u, src + bytes - 32u, 32u);
     s_eng_pending.vs_cb_off = off;
     s_eng_pending.vs_cb_bytes = bytes;
@@ -6060,9 +6061,9 @@ static void owner_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     if(!metal_owner_begin(1)){return;}
     eng_bind_vs_constants(user,data,bytes);metal_owner_finish(0);
 }
-static void owner_eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes, u32 first_row, u32 rows){
+static void owner_eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes, const u32* row_mask){
     if(!metal_owner_begin(1)){return;}
-    eng_bind_vs_constant_rows(user,data,bytes,first_row,rows);metal_owner_finish(0);
+    eng_bind_vs_constant_rows(user,data,bytes,row_mask);metal_owner_finish(0);
 }
 static int owner_eng_rebind_vs_constants(void* user){
     if(!metal_owner_begin(1)){return 0;}
