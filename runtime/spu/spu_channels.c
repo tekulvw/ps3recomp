@@ -3570,6 +3570,17 @@ static void spu_ibhist_note(const spu_context* ctx)
 static void spu_ibhist_note(const spu_context* ctx) { (void)ctx; }
 #endif
 
+static int spu_ib_diagnostics_armed(void)
+{
+    static atomic_int armed = ATOMIC_VAR_INIT(-1);
+    int value = atomic_load_explicit(&armed, memory_order_relaxed);
+    if (value < 0) {
+        value = getenv("SPU_IBCOV") || getenv("SPU_POLLTRACE") || getenv("YDKJ_POLTRACE");
+        atomic_store_explicit(&armed, value, memory_order_relaxed);
+    }
+    return value;
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -3584,7 +3595,8 @@ void spu_indirect_branch(spu_context* ctx)
      * enforce the preserve-all-registers hardware contract here -- the first
      * interrupts-enabled dispatch at the saved srr0 is the irete. */
     { extern int spu_irq_regs_maybe_restore(spu_context*);
-      if (spu_irq_regs_maybe_restore(ctx)) {
+      /* Only a context holding saved interrupt registers can restore them. */
+      if (ctx->irq_saved && spu_irq_regs_maybe_restore(ctx)) {
           static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
           static int _r = 0;
           if (s_it && PS3_LOG_FIRST(_r, 200))
@@ -3683,44 +3695,49 @@ void spu_indirect_branch(spu_context* ctx)
                 fprintf(stderr, "[cri-r4] policy entry pc=0xA00: forced ctxt->taskset LS[0x27B8]=0x0F000000\n"); }
         }
     }
-    /* SPU_IBCOV: image-3 (Bink SPU) PC-page coverage. Track which 0x1000-byte LS
-     * pages the task's indirect branches land in; dump the set periodically. If
-     * coverage stays in the kernel/wait region (~0x13xxx) the decode routine never
-     * runs; if it spans a wide high range, decode executes but doesn't output. */
-    { static int s_cov = -1; if (s_cov < 0) s_cov = getenv("SPU_IBCOV") ? 1 : 0;
-      if (s_cov && ctx->image_id == 3) {
-        static uint8_t pages[64] = {0};   /* 64 pages * 0x1000 = 256KB LS */
-        static uint64_t hits = 0;
-        uint32_t pg = (ctx->pc & 0x3FFFF) >> 12;
-        int newp = 0;
-        if (pg < 64 && !pages[pg]) { pages[pg] = 1; newp = 1; }
-        ++hits;
-        if (newp || (hits % 200000) == 0) {
-            char line[400]; int p = snprintf(line, sizeof line, "[ibcov3] hits=%llu tgt=0x%05X pages:", (unsigned long long)hits, ctx->pc & 0x3FFFF);
-            for (int i = 0; i < 64; i++) if (pages[i]) p += snprintf(line+p, sizeof(line)-p, " 0x%X", i<<12);
-            fprintf(stderr, "%s\n", line); }
-      } }
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
-      if (s_t) { static uint64_t s_n = 0; static uint32_t s_last = 0; static uint64_t s_run = 0;
-        if (ctx->pc == s_last) s_run++; else { s_last = ctx->pc; s_run = 1; }
-        if ((++s_n % 2000000) == 0)
-          fprintf(stderr, "[ibranch] %llu indirect branches; current target=0x%05X run=%llu\n",
-                  (unsigned long long)s_n, ctx->pc, (unsigned long long)s_run); } }
-    /* Policy-entry trace: the SPURS policy at LS 0xA00 branches on
-     * r8 = word at LS[r6] (must be 32 for the path that sets the dispatch ptr
-     * LS[0x780]). Log r3..r6 + the word the kernel handed it, to see why the
-     * wrong branch is taken. Env YDKJ_POLTRACE. */
-    if (ctx->pc == 0xA00u) {
-        static int64_t pt=-2; if (pt==-2){ const char* e=getenv("YDKJ_POLTRACE"); pt=e?1:0; }
-        if (pt) { static int _p=0; if (PS3_LOG_FIRST(_p, 8)) {
-            /* re-lifted policy entry uses r80 (kernel-set context base): r44=LS[r80+0xC0] */
-            uint32_t r80=ctx->gpr[80]._u32[0] & SPU_LS_MASK;
-            const uint8_t* q = ctx->ls + ((r80+0xC0)&SPU_LS_MASK);
-            uint32_t ctxw = ((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
-            fprintf(stderr, "[POLTRACE] policy@0xA00 r3=%08X r4=%08X r80=%08X  LS[r80+0xC0]=%08X\n",
-                ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], r80, ctxw);
-            fflush(stderr);
-        } }
+    /* Dispatch diagnostics (SPU_IBCOV, SPU_POLLTRACE, YDKJ_POLTRACE), each
+     * still read once by its own block: one cached test here keeps the
+     * ordinary dispatch from walking every gate. */
+    if (spu_ib_diagnostics_armed()) {
+        /* SPU_IBCOV: image-3 (Bink SPU) PC-page coverage. Track which 0x1000-byte LS
+         * pages the task's indirect branches land in; dump the set periodically. If
+         * coverage stays in the kernel/wait region (~0x13xxx) the decode routine never
+         * runs; if it spans a wide high range, decode executes but doesn't output. */
+        { static int s_cov = -1; if (s_cov < 0) s_cov = getenv("SPU_IBCOV") ? 1 : 0;
+          if (s_cov && ctx->image_id == 3) {
+            static uint8_t pages[64] = {0};   /* 64 pages * 0x1000 = 256KB LS */
+            static uint64_t hits = 0;
+            uint32_t pg = (ctx->pc & 0x3FFFF) >> 12;
+            int newp = 0;
+            if (pg < 64 && !pages[pg]) { pages[pg] = 1; newp = 1; }
+            ++hits;
+            if (newp || (hits % 200000) == 0) {
+                char line[400]; int p = snprintf(line, sizeof line, "[ibcov3] hits=%llu tgt=0x%05X pages:", (unsigned long long)hits, ctx->pc & 0x3FFFF);
+                for (int i = 0; i < 64; i++) if (pages[i]) p += snprintf(line+p, sizeof(line)-p, " 0x%X", i<<12);
+                fprintf(stderr, "%s\n", line); }
+          } }
+        { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
+          if (s_t) { static uint64_t s_n = 0; static uint32_t s_last = 0; static uint64_t s_run = 0;
+            if (ctx->pc == s_last) s_run++; else { s_last = ctx->pc; s_run = 1; }
+            if ((++s_n % 2000000) == 0)
+              fprintf(stderr, "[ibranch] %llu indirect branches; current target=0x%05X run=%llu\n",
+                      (unsigned long long)s_n, ctx->pc, (unsigned long long)s_run); } }
+        /* Policy-entry trace: the SPURS policy at LS 0xA00 branches on
+         * r8 = word at LS[r6] (must be 32 for the path that sets the dispatch ptr
+         * LS[0x780]). Log r3..r6 + the word the kernel handed it, to see why the
+         * wrong branch is taken. Env YDKJ_POLTRACE. */
+        if (ctx->pc == 0xA00u) {
+            static int64_t pt=-2; if (pt==-2){ const char* e=getenv("YDKJ_POLTRACE"); pt=e?1:0; }
+            if (pt) { static int _p=0; if (PS3_LOG_FIRST(_p, 8)) {
+                /* re-lifted policy entry uses r80 (kernel-set context base): r44=LS[r80+0xC0] */
+                uint32_t r80=ctx->gpr[80]._u32[0] & SPU_LS_MASK;
+                const uint8_t* q = ctx->ls + ((r80+0xC0)&SPU_LS_MASK);
+                uint32_t ctxw = ((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
+                fprintf(stderr, "[POLTRACE] policy@0xA00 r3=%08X r4=%08X r80=%08X  LS[r80+0xC0]=%08X\n",
+                    ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], r80, ctxw);
+                fflush(stderr);
+            } }
+        }
     }
     /* Resolve both fresh launches and mid-function resumes from TaskInfo.
      * A scheduler call temporarily leaves the task region, but its return PC
