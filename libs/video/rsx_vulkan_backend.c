@@ -258,6 +258,7 @@ typedef struct vk_state {
     u64              present_direct, present_readback_count;
     int              present_split;   /* inside rsx_vulkan_backend_present_begin */
     u64              encode_previous_present; /* queue place, scoped to this backend lifetime */
+    int              window_recovery_pending; /* atomic: serviced by the window owner's pump */
     int              present_order;   /* the walker's next command buffer waits */
     pthread_mutex_t  queue_mu;
     pthread_mutex_t  present_mu;
@@ -2679,10 +2680,35 @@ static int vk_create_swapchain(void)
     return 0;
 }
 
-static void vk_swapchain_lost(void)
+static void vk_swapchain_recover_now(void)
 {
     vk_device_idle();
     if (vk_create_swapchain()) vk_window_drop("the swapchain could not be recreated");
+}
+
+static void vk_swapchain_lost(void)
+{
+    if (rsx_encq_active()) {
+        /* Encoding presents on a worker does not transfer ownership of the
+         * SDL/Win32 window. Recreation reads the drawable size and its failure
+         * destroys the window, so leave both to the existing owner pump. */
+        __atomic_store_n(&s_vk.window_recovery_pending, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    vk_swapchain_recover_now();
+}
+
+static void vk_window_recovery_pump(void)
+{
+    if (!__atomic_load_n(&s_vk.window_recovery_pending, __ATOMIC_ACQUIRE)) return;
+    /* Finish every queued use of the old swapchain before recreating it or
+     * tearing down the window. The producer pumps and cannot enqueue another
+     * use while it holds the backend lock here. */
+    rsx_encq_drain();
+    rsx_encq_lock();
+    if (__atomic_exchange_n(&s_vk.window_recovery_pending, 0, __ATOMIC_ACQ_REL))
+        vk_swapchain_recover_now();
+    rsx_encq_unlock();
 }
 
 /* Blit the offscreen target into the next swapchain image and present it. */
@@ -7200,6 +7226,7 @@ int rsx_vulkan_backend_pump_messages(void)
 }
 static int vk_pump_messages_core(void)
 {
+    vk_window_recovery_pump();
     vk_show_pump();
 #ifdef _WIN32
     /* The message queue belongs to the thread that created the window: the

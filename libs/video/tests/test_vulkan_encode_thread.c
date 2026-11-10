@@ -48,6 +48,49 @@ static void write_vertices(float r, float g, float b)
 }
 static void draw(void) { m(0x1808, RSX_PRIMITIVE_TRIANGLES); m(0x1814, 2u << 24); m(0x1808, 0); }
 
+/* Exercise the real lost-swapchain dispatch without creating a window. The
+ * synthetic surface fails recreation, so the actual window-drop path must
+ * retire it on the pump's thread, never the encode thread. */
+static _Thread_local int recovery_owner;
+static unsigned recovery_caps_calls, recovery_drop_calls, recovery_wrong_thread;
+static VkResult VKAPI_CALL recovery_caps(VkPhysicalDevice device, VkSurfaceKHR surface,
+                                         VkSurfaceCapabilitiesKHR* caps)
+{
+    (void)device; (void)surface; (void)caps;
+    recovery_caps_calls++;
+    if (!recovery_owner) recovery_wrong_thread++;
+    return VK_ERROR_SURFACE_LOST_KHR;
+}
+static void VKAPI_CALL recovery_drop(VkInstance instance, VkSurfaceKHR surface,
+                                     const VkAllocationCallbacks* allocator)
+{
+    (void)instance; (void)surface; (void)allocator;
+    recovery_drop_calls++;
+    if (!recovery_owner) recovery_wrong_thread++;
+}
+static void request_recovery(void* unused) { (void)unused; vk_swapchain_lost(); }
+static void check_recovery_dispatch(int threaded)
+{
+    rsx_encq_drain();
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR caps = pvkGetPhysicalDeviceSurfaceCapabilitiesKHR;
+    PFN_vkDestroySurfaceKHR drop = pvkDestroySurfaceKHR;
+    recovery_owner = 1;
+    recovery_caps_calls = recovery_drop_calls = recovery_wrong_thread = 0;
+    pvkGetPhysicalDeviceSurfaceCapabilitiesKHR = recovery_caps;
+    pvkDestroySurfaceKHR = recovery_drop;
+    s_vk.surface = (VkSurfaceKHR)(uintptr_t)1;
+    (void)rsx_encq_call(request_recovery, NULL);
+    rsx_encq_drain();
+    CHECK(recovery_caps_calls == (threaded ? 0u : 1u), "worker defers swapchain recreation");
+    CHECK(recovery_drop_calls == (threaded ? 0u : 1u), "worker defers window teardown");
+    CHECK(rsx_vulkan_backend_pump_messages() == 0, "owner pump services recovery");
+    CHECK(recovery_caps_calls == 1 && recovery_drop_calls == 1, "owner pump recreates or drops once");
+    CHECK(recovery_wrong_thread == 0, "recovery and teardown stay on the owner thread");
+    CHECK(s_vk.surface == VK_NULL_HANDLE, "failed recovery retires the synthetic surface");
+    pvkGetPhysicalDeviceSurfaceCapabilitiesKHR = caps;
+    pvkDestroySurfaceKHR = drop;
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 3) { fprintf(stderr, "usage: fixture direct|thread OUT\n"); return 2; }
@@ -127,6 +170,7 @@ int main(int argc, char** argv)
      * never make the second lifetime wait for work it cannot have queued. */
     rsx_vulkan_backend_present_begin();
     rsx_vulkan_backend_present_finish();
+    check_recovery_dispatch(threaded);
     rsx_vulkan_backend_shutdown();
     CHECK(!rsx_encq_active(), "stopped with the backend");
     CHECK(rsx_vulkan_backend_init(W, H, "encode thread restart") == 0, "backend restarts");
