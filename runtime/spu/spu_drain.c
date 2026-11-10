@@ -521,7 +521,9 @@ int spu_region_local_step(spu_context* ctx, void (*target)(spu_context*))
         ctx->status != SPU_STATUS_RUNNING || g_spu_trampoline_fn))return spu_region_reject(ctx,5);
     if(framed) {
         static SPU_THREAD_LOCAL int reported;
-        if(!reported && getenv("SPU_REGION_FRAMED_DIAGNOSTICS")) {
+        static int diagnostics = -1;   /* per framed step: read once */
+        if(diagnostics<0)diagnostics=getenv("SPU_REGION_FRAMED_DIAGNOSTICS")!=NULL;
+        if(!reported && diagnostics) {
             reported=1;fprintf(stderr,"[spu-region-framed] accepted depth=%u return=%05X target=%05X\n",
                 ctx->host_depth,ctx->region_return_pc,(unsigned)ctx->pc&SPU_LS_MASK);
         }

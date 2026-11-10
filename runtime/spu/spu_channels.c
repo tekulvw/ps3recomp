@@ -419,8 +419,9 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * halts (stop -> longjmp) or the trampoline empties. Nested brsl/bisl
          * calls drain inside their own call brackets (see the lifter). */
         entry(ctx);
-        { static int _e = 0;
-          if (getenv("SPU_ARGWATCH") && _e < 8) { _e++;
+        { static int _e = 0; static int s_aw = -1;
+          if (s_aw < 0) s_aw = getenv("SPU_ARGWATCH") ? 1 : 0;
+          if (s_aw && _e < 8) { _e++;
               fprintf(stderr, "[argwatch] after entry(): img=%d pc=0x%05X "
                       "r2=0x%08X r3=0x%08X r4=0x%08X\n", ctx->image_id,
                       (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[2]._u32[0],
@@ -626,8 +627,9 @@ static mfc_engine* mfc_for(spu_context* ctx)
             ctx == s_mfc_recent.ctx)
             return s_mfc_recent.engine;
     }
-    { static volatile LONG started = 0; const char* e;
-      if (!started && (e = getenv("SPU_PCSAMPLE")) && !InterlockedExchange(&started, 1))
+    { static volatile LONG started = 0; static int s_pcsample = -1; const char* e;
+      if (s_pcsample < 0) s_pcsample = getenv("SPU_PCSAMPLE") ? 1 : 0;   /* per MFC op: read once */
+      if (s_pcsample && !started && (e = getenv("SPU_PCSAMPLE")) && !InterlockedExchange(&started, 1))
           CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL); }
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
@@ -3197,7 +3199,9 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * woken). Honour the first call, halt on the rest. Each task runs on its own
      * host thread, so a thread-local count is per task (a reused pool thread
      * clears it between tasks: spu_spurs_task_thread_reset). */
-    if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
+    static int s_cri_exit_halt = -1;
+    if (num == 0 && s_cri_exit_halt < 0) s_cri_exit_halt = getenv("YDKJ_CRI_EXIT_HALT") ? 1 : 0;
+    if (num == 0 && ctx->image_id == 22 && !s_cri_exit_halt) {
         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
         { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
             fprintf(stderr, "[spu] cri task EXIT #%d -- halting (was spinning)\n",
@@ -3206,7 +3210,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
         spu_halt(ctx);
         return;
     }
-    if (num == 0 && (ctx->image_id != 22 || getenv("YDKJ_CRI_EXIT_HALT"))) {
+    if (num == 0 && (ctx->image_id != 22 || s_cri_exit_halt)) {
         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
         spu_halt(ctx);          /* longjmp out to spu_run_with_halt; post-run writes exit code */
         return;
@@ -3643,7 +3647,10 @@ void spu_indirect_branch(spu_context* ctx)
      * the taskset from garbage -> waiting!=0 -> wrong resume path -> savedContextLr=0.
      * Inject r4 = taskset EA (0x0F000000) at the policy entry dispatch (this is the
      * exact point before the entry reads r4, after the kernel's arg setup). */
-    if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID && !getenv("YDKJ_NO_CRI_R4")) {
+    static int s_no_cri_r4 = -1;
+    if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID && s_no_cri_r4 < 0)
+        s_no_cri_r4 = getenv("YDKJ_NO_CRI_R4") ? 1 : 0;
+    if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID && !s_no_cri_r4) {
         static int s_r4 = -1; if (s_r4 < 0) s_r4 = getenv("YDKJ_CRI_CHAIN") ? 1 : 0;
         if (s_r4) {
             /* Force ctxt->taskset @LS 0x27B8 = the REAL game taskset EA on every

@@ -822,7 +822,10 @@ static void spu_async_run(spu_async_job* j)
              * timing bug, fix = defer/re-dispatch on signal); if it still loops on
              * a null base, the buffer is never filled (=> an audio HLE gap). */
             if (j->image_id != 22) {
-                const char* d = getenv("LBP_TASK_DELAY");
+                /* Read once: this runs on every task dispatch. */
+                static const char* s_task_delay = (const char*)1;
+                if (s_task_delay == (const char*)1) s_task_delay = getenv("LBP_TASK_DELAY");
+                const char* d = s_task_delay;
                 if (d && *d) {
 #ifdef _WIN32
                     Sleep((unsigned)(atoi(d) * 1000));
@@ -839,7 +842,9 @@ static void spu_async_run(spu_async_job* j)
              * Planting it makes the mixer read the real FMOD control block
              * (0x0094F5xx) and the EventFlag handshake completes. Default ON;
              * LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
-            if (j->image_id != 22 && !getenv("LBP_NO_TASKSET")) {
+            static int s_no_taskset = -1;
+            if (s_no_taskset < 0) s_no_taskset = getenv("LBP_NO_TASKSET") ? 1 : 0;
+            if (j->image_id != 22 && !s_no_taskset) {
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 /* Use the taskset+taskid captured for THIS job at dispatch (not the
                  * globals, which the next CreateTask clobbers -- the race that made
@@ -896,7 +901,9 @@ static void spu_async_run(spu_async_job* j)
                     }
                     fflush(stderr);
                 }
-                if (getenv("LBP_REAL_POLICY") && j->taskset_ea) {
+                static int s_real_policy = -1;
+                if (s_real_policy < 0) s_real_policy = getenv("LBP_REAL_POLICY") ? 1 : 0;
+                if (s_real_policy && j->taskset_ea) {
                     extern int spurs_run_taskset_policy_probe(uint32_t,uint32_t,uint32_t,
                                                               uint64_t,uint32_t,uint8_t*,uint32_t);
                     /* spurs EA from the taskset header lo32 @ +0x64 (be64 @0x60). */
@@ -983,7 +990,9 @@ static void spu_async_run(spu_async_job* j)
              * ends. A reference dump from real hardware is a full local store,
              * so the only way to ask "what ELSE is different" -- rather than
              * checking one guessed word at a time -- is to diff all 256 KB. */
-            { const char* pfx = getenv("SPU_LS_DUMP");
+            { static const char* s_ls_dump = (const char*)1;
+              if (s_ls_dump == (const char*)1) s_ls_dump = getenv("SPU_LS_DUMP");
+              const char* pfx = s_ls_dump;
               if (pfx) { char path[512];
                   snprintf(path, sizeof path, "%s_img%d.bin", pfx, j->image_id);
                   FILE* f = fopen(path, "wb");
@@ -1434,7 +1443,9 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * forever. A task ENTERING WAIT_SIGNAL has by definition drained all work
      * dispatched to it, so advancing the active lanes to the published ticket
      * here is semantically the PM's bookkeeping, batched. Validation gate. */
-    if (getenv("LBP_SYNC_ACK")) {
+    static int s_sync_ack = -1;   /* per wait: read once */
+    if (s_sync_ack < 0) s_sync_ack = getenv("LBP_SYNC_ACK") ? 1 : 0;
+    if (s_sync_ack) {
         extern uint32_t g_barrier_sync_watch;
         uint32_t b = g_barrier_sync_watch;
         if (b) {
@@ -1464,7 +1475,11 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * kernel resumed the task with "no pending work" -- lets it run its post-wait
      * path (complete its loop / set completion flags) instead of hanging. 0/unset
      * keeps the block-forever behaviour. Reversible, opt-in. */
-    unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
+    static long long s_ws_drain = -1;   /* -1 unread; else the parsed value, 0 unset */
+    if (s_ws_drain < 0) { const char* e = getenv("LBP_WS_DRAIN"); unsigned v = 0;
+                          if (e) { v = (unsigned)atoi(e); if (!v) v = 1; }
+                          s_ws_drain = (long long)v; }
+    unsigned drain = (unsigned)s_ws_drain;
     int drained = 0;
     /* Release the global SPU-serial lock while parked so another SPU task can
      * run (and possibly signal us); re-acquired before returning to resume. */

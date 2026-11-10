@@ -449,7 +449,9 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* Diagnostic: main-thread per-frame poll on q=2/q=3 (timeout ~30us) never
      * advances to content. Dump its guest call chain to identify the frame-loop
      * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
-    if ((queue_id == 2 || queue_id == 3) && getenv("YDKJ_Q23STACK")) {
+    static int s_q23stack = -1;
+    if (s_q23stack < 0) s_q23stack = getenv("YDKJ_Q23STACK") ? 1 : 0;
+    if ((queue_id == 2 || queue_id == 3) && s_q23stack) {
 #ifdef _WIN32
         static int _gs23 = 0; if (PS3_LOG_FIRST(_gs23, 4)) {
             void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
@@ -610,7 +612,9 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     ctx->gpr[5] = evt.data1;
     ctx->gpr[6] = evt.data2;
     ctx->gpr[7] = evt.data3;
-    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && PS3_LOG_FIRST(_r, 60)) fprintf(stderr,
+    { static int _r=0; static int s_rt = -1;
+      if (s_rt < 0) s_rt = getenv("PS3_EVT_RECV_TRACE") ? 1 : 0;
+      if (s_rt && PS3_LOG_FIRST(_r, 60)) fprintf(stderr,
         "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
         (unsigned long long)evt.source, (unsigned long long)evt.data1,
         (unsigned long long)evt.data2); }
