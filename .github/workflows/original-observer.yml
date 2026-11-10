@@ -6,6 +6,12 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# Cancel a pull request's superseded runs; pushes and manual runs each keep
+# their own group and are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   synthetic-original-routes:
     name: Original execution witnesses (${{ matrix.os }})
