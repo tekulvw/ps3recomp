@@ -112,6 +112,11 @@ void spu_decrementer_observer_set(spu_decrementer_observer_fn observer)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* cellSpursModulePoll: the workload a scheduler would have this SPU run now,
+ * given the polling module's own (libs/spurs, PS3RECOMP_SPURS_MODULE_POLL_
+ * PREEMPT). Returning the current workload keeps the module running; NULL
+ * (the default) never preempts. */
+uint32_t (*g_spurs_module_poll_hook)(uint32_t spurs_ea, uint32_t wid, uint32_t spu_num) = 0;
 /* Called by host-side writers of guest memory (an RSX label publication) that
  * opt in to waking line watchers; cellSpurs sets it to its line-commit wake. */
 void (*g_host_line_write_hook)(uint32_t line) = 0;
@@ -3610,7 +3615,12 @@ void spu_indirect_branch(spu_context* ctx)
             uint32_t ea = spu_ls_read32(ctx, 0x1C4);
             uint32_t wid = spu_ls_read32(ctx, 0x1DC);
             uint32_t status = ea_hi ? 0 : spurs_flag_status(ea, wid, 1);
-            ctx->gpr[3] = spu_make_preferred_u32(wid);
+            /* A scheduler may name another workload this SPU should switch
+             * to (g_spurs_module_poll_hook); by default it never does. */
+            uint32_t selected = wid;
+            if (g_spurs_module_poll_hook && !ea_hi)
+                selected = g_spurs_module_poll_hook(ea, wid, spu_ls_read32(ctx, 0x1C8));
+            ctx->gpr[3] = spu_make_preferred_u32(selected);
             ctx->gpr[3]._u32[1] = status;
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
