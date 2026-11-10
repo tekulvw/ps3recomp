@@ -12,6 +12,7 @@ ps3_guest_caller_fn g_ps3_guest_caller; u32 g_rsx_last_reference;
 static unsigned alpha_words,blend_words,shader_words,dirty,flushes,refs,wakes;
 static u32 dst_ea,src_ea,bytes;static int copying;
 void spu_ch_wake(spu_context*c){(void)c;wakes++;}
+static void m2m_parked_woken(void*c){(void)c;wakes++;}
 int spu_raw_reg_load(uint32_t a,uint32_t*v){(void)a;(void)v;abort();}
 void spu_raw_reg_store(uint32_t a,uint32_t v,unsigned n){(void)a;(void)v;(void)n;abort();}
 int rsx_draw_engine_enabled(void){return 1;} int rsx_live_draw_enabled(void){return 1;}
@@ -87,11 +88,18 @@ int main(int argc,char**argv){
   copy_packet(0xfeed0000,0xfeed0000,0xffffffff,0xffffffff,0,0,0,1,0x101);drain();assert(!dirty&&!flushes&&!atomic_load(&s_checked_ref_failed));
  }else if(!strcmp(argv[1],"reservation")){
   /* Real native LL/SC epochs: same bytes, another word, and two granules. */
-  ppu_context c={0};spu_context spe={0};
+  /* The SPU is parked on its events and looks once the copy is done, as the
+   * guest does: per-line version counters (PS3RECOMP_COH_VERSIONS=1) deliver
+   * its loss then and wake only a parked SPU; the default scheme did both at
+   * the write. */
+  ppu_context c={0};static spu_context spe;spu_context_init(&spe,0);
+  const spu_coh_ops*v=g_spu_coh_ops;void*parked[SPU_COH_WAITER_BYTES/sizeof(void*)];
   memset(vm_base+0xc0010000,0xaa,256);memset(vm_base+0x02020000,0xaa,256);
-  spe.resv_valid=1;spe.resv_ea=0x02020080;spu_lockline_lock();spu_coh_reserve(&spe,spe.resv_ea);spu_lockline_unlock();
+  if(v){v->getllar(&spe,0x02020080,vm_base+0x02020080,spe.ls);v->wait_begin(&spe,parked,m2m_parked_woken);}
+  else{spe.resv_valid=1;spe.resv_ea=0x02020080;spu_lockline_lock();spu_coh_reserve(&spe,spe.resv_ea);spu_lockline_unlock();}
   ppu_load_reserve64(&c,0x02020088);
   copy_packet(0xfeed0000,0xfeed0001,0x10000,0x22007f,0,0,4,1,0x101);drain();
+  if(v){v->settle(&spe);v->wait_end(parked);}
   assert(!ppu_store_conditional64(&c,0x02020088,1));assert(!spe.resv_valid&&(spe.event_status&SPU_EVENT_LR)&&wakes==1);
   cursor=0;ppu_load_reserve32(&c,0x02020008);copy_packet(0xfeed0000,0xfeed0001,0x10000,0x220000,0,0,4,1,0x101);drain();
   assert(!ppu_store_conditional32(&c,0x02020008,1));
