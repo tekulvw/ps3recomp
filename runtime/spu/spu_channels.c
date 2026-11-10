@@ -1203,6 +1203,20 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
+    /* The MFC parameter channels and the tag mask only latch a value in the
+     * context (as mfc_channel_write does); nothing reads the engine for them.
+     * A DMA writes five or six of these per command, so they skip the engine
+     * lookup and the command path. */
+    switch (channel) {
+    case MFC_LSA:       ctx->mfc_lsa = v;          return;
+    case MFC_EAH:       ctx->mfc_eah = v;          return;
+    case MFC_EAL:       ctx->mfc_eal = v;          return;
+    case MFC_Size:      ctx->mfc_size = v;         return;
+    case MFC_TagID:     ctx->mfc_tag = v & 0x1F;   return;
+    case MFC_WrTagMask: ctx->mfc_tag_mask = v;     return;
+    default: break;
+    }
+
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
@@ -1468,7 +1482,10 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
             (unsigned long long)s_c[8],(unsigned long long)s_c[9]); } }
 
     if (channel_is_mfc(channel)) {
-        v = mfc_channel_read(mfc_for(ctx), ctx, channel);
+        /* Every MFC read channel is state latched in the context (tag status,
+         * tag mask, stall status, atomic status): mfc_channel_read never uses
+         * the engine, so a tag or atomic-status poll does not look it up. */
+        v = mfc_channel_read(NULL, ctx, channel);
         return spu_make_preferred_u32(v);
     }
 
