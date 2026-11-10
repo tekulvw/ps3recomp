@@ -89,6 +89,22 @@ static inline void rsx_test_vp_vec_out(u8* p, u32 vec_op, u32 input, u32 swz,
     rsx_test_vp_vec_out_tex(p, vec_op, input, swz, 0, out, end);
 }
 
+/* MOV o[out], c[reg] (c[reg + a0.x] when `indexed`): a transform constant
+ * as src0, all four lanes. */
+static inline void rsx_test_vp_mov_const_out(u8* p, u32 reg, u32 out, int indexed, int end)
+{
+    rsx_test_vp_vec_out(p, RSX_TEST_VP_OP_MOV, 0, RSX_TEST_VP_SWZ_IDENT, out, end);
+    u32 d1 = (u32)p[4] | ((u32)p[5] << 8) | ((u32)p[6] << 16) | ((u32)p[7] << 24);
+    u32 d2 = (u32)p[8] | ((u32)p[9] << 8) | ((u32)p[10] << 16) | ((u32)p[11] << 24);
+    u32 d3 = (u32)p[12] | ((u32)p[13] << 8) | ((u32)p[14] << 16) | ((u32)p[15] << 24);
+    /* src0's register type (its low two bits, in D2[23:24]) becomes 3, the
+     * constant bank; D1[12:21] names the constant; D3[1] indexes it. */
+    d2 |= 3u << 23;
+    d1 = (d1 & ~(0x3FFu << 12)) | ((reg & 0x3FFu) << 12);
+    if (indexed) d3 |= 2u;
+    rsx_test_put_le32(p + 4, d1); rsx_test_put_le32(p + 8, d2); rsx_test_put_le32(p + 12, d3);
+}
+
 /* MOV o[out], v[input].swz */
 static inline void rsx_test_vp_mov_out(u8* p, u32 input, u32 swz, u32 out, int end)
 {
