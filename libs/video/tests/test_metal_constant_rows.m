@@ -67,6 +67,7 @@ int main(void)
         if (!s_dev) { puts("SKIP: no Metal device"); return 0; }
         s_queue = [s_dev newCommandQueue]; s_headless = 1; s_guest_shaders = 1;
         vm_base = calloc(1, 1u << 20); ppu_vm_size = 1u << 20;
+        setenv("PS3RECOMP_RSX_VS_CONSTANT_ROWS", "1", 1);
         rsx_draw_engine_set_backend(&s_engine_backend);
         T(rsx_draw_engine_init(W, H) == 0, "initialization");
         method(0x194, 0xFEED0000); method(0x210, 0x40000); method(0x20C, W * 4);

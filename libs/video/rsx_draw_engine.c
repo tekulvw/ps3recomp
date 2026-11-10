@@ -4309,6 +4309,14 @@ done:
 /* Draws that handed the backend their vertex constants, and draws that
  * reused the previous draw's (rebind_vs_constants). */
 static unsigned long long s_vs_binds, s_vs_rebinds, s_vs_row_binds, s_vs_row_bytes;
+/* PS3RECOMP_RSX_VS_CONSTANT_ROWS=1 (default off; read once): hand a backend
+ * that takes them only the constant rows the program reads. */
+static int eng_vs_constant_rows_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_RSX_VS_CONSTANT_ROWS"); on = e && !strcmp(e, "1"); }
+    return on;
+}
 void rsx_draw_engine_vs_constant_counts(unsigned long long* binds, unsigned long long* rebinds)
 {
     if (binds) *binds = s_vs_binds;
@@ -4530,7 +4538,7 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
          g.vs_first + g.vs_rows <= g.vs_bound_first + g.vs_bound_rows);
     if (g.vs_bound_serial != g.vp_cb_serial || !covered || !g.be->rebind_vs_constants ||
         !g.be->rebind_vs_constants(g.be->user)) {
-        if (!g.vs_all && g.be->bind_vs_constant_rows) {
+        if (!g.vs_all && g.be->bind_vs_constant_rows && eng_vs_constant_rows_enabled()) {
             g.be->bind_vs_constant_rows(g.be->user, g.vp_cb, ENG_VP_CB_BYTES, g.vs_first, g.vs_rows);
             g.vs_bound_all = 0; g.vs_bound_first = g.vs_first; g.vs_bound_rows = g.vs_rows;
             s_vs_row_binds++; s_vs_row_bytes += (unsigned long long)(g.vs_rows + 2u) * 16u;
