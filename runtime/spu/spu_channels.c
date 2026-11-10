@@ -3328,8 +3328,187 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
  * the small instruction set such stubs use, and exit back into lifted code at
  * the first branch (trampoline re-dispatch). Returns 1 if it executed to a
  * branch, 0 on an unknown opcode (caller falls through to BRANCH-TO-0). */
+/* ---- Decoded-trace cache for the micro-interpreter -----------------------
+ * The WWS job manager regenerates the same save/restore stub (a straight run
+ * of quadword loads and stores ending in a branch) and calls it on every
+ * interrupt: about 11k times a frame in MAG Training, at ~335 ns a call, most
+ * of it re-decoding the same words. A trace caches the decode of one straight
+ * run, from its entry to its first unconditional branch, together with the
+ * words it was decoded from. An entry replays only while the live words still
+ * equal that snapshot, and stops at the first store that lands inside the
+ * run (the stub may rewrite itself), resuming the ordinary microstep at the
+ * next instruction. Runs holding anything else (a conditional branch, an
+ * instruction outside the set below) are remembered as uncacheable. Each op
+ * does exactly what the corresponding case of spu_smc_microstep does; the
+ * instruction-level observers (PC observer, original-work steps, a critical
+ * arrival PC inside the run) need the ordinary path and get it.
+ * PS3RECOMP_SPU_SMC_TRACE=0 turns the cache off. */
+enum { SMC_OP_NONE, SMC_OP_STQD, SMC_OP_LQD, SMC_OP_STQA, SMC_OP_LQA, SMC_OP_STQR, SMC_OP_LQR,
+       SMC_OP_XORI, SMC_OP_AI, SMC_OP_SF, SMC_OP_A, SMC_OP_IL, SMC_OP_ILHU, SMC_OP_IOHL, SMC_OP_ILA,
+       SMC_OP_NOP, SMC_OP_BI_FAMILY, SMC_OP_BR_FAMILY };
+typedef struct { uint8_t kind, rt, ra, rb; uint32_t w; } smc_op;
+#define SMC_TRACE_MAX 256u
+#define SMC_TRACE_WAYS 4u
+typedef struct { uint32_t pc, n, state; uint8_t bytes[4 * SMC_TRACE_MAX]; smc_op ops[SMC_TRACE_MAX]; } smc_trace;
+enum { SMC_TRACE_EMPTY, SMC_TRACE_REPLAY, SMC_TRACE_UNCACHEABLE };
+typedef struct { smc_trace way[SMC_TRACE_WAYS]; unsigned next; } smc_trace_cache;
+static SPU_THREAD_LOCAL smc_trace_cache* t_smc_trace;
+
+/* Classify one word exactly as spu_smc_microstep's chain does, in its order.
+ * Returns the op kind, SMC_OP_NONE for anything a trace cannot hold
+ * (conditional branches included), or SMC_OP_BI/BR_FAMILY for a terminator. */
+static int smc_trace_decode(uint32_t w, smc_op* o)
+{
+    const uint32_t op11 = w >> 21, op9 = w >> 23, op8 = w >> 24, op7 = w >> 25;
+    o->w = w; o->rt = (uint8_t)(w & 0x7F); o->ra = (uint8_t)((w >> 7) & 0x7F); o->rb = (uint8_t)((w >> 14) & 0x7F);
+    if (op11 == 0x1A8 || op11 == 0x1A9 || op11 == 0x1AA) return o->kind = SMC_OP_BI_FAMILY;
+    if (op11 == 0x1AB) return o->kind = SMC_OP_NONE;                    /* bisled: conditional */
+    if (op11 >= 0x128 && op11 <= 0x12B) return o->kind = SMC_OP_NONE;   /* biz..bihnz */
+    if (op9 == 0x064 || op9 == 0x060 || op9 == 0x066 || op9 == 0x062) return o->kind = SMC_OP_BR_FAMILY;
+    if (op9 == 0x040 || op9 == 0x042 || op9 == 0x044 || op9 == 0x046) return o->kind = SMC_OP_NONE;
+    if (op8 == 0x24) return o->kind = SMC_OP_STQD;
+    if (op8 == 0x34) return o->kind = SMC_OP_LQD;
+    if (op9 == 0x041) return o->kind = SMC_OP_STQA;
+    if (op9 == 0x061) return o->kind = SMC_OP_LQA;
+    if (op9 == 0x047) return o->kind = SMC_OP_STQR;
+    if (op9 == 0x067) return o->kind = SMC_OP_LQR;
+    if (op8 == 0x44) return o->kind = SMC_OP_XORI;
+    if (op8 == 0x1C) return o->kind = SMC_OP_AI;
+    if (op11 == 0x040) return o->kind = SMC_OP_SF;
+    if (op11 == 0x0C0) return o->kind = SMC_OP_A;
+    if (op9 == 0x081) return o->kind = SMC_OP_IL;
+    if (op9 == 0x082) return o->kind = SMC_OP_ILHU;
+    if (op9 == 0x0C1) return o->kind = SMC_OP_IOHL;
+    if (op7 == 0x21) return o->kind = SMC_OP_ILA;
+    if (op11 == 0x201 || op11 == 0x001 || op11 == 0x002 || op11 == 0x003 ||
+        op11 == 0x1AC || op7 == 0x08 || op7 == 0x09) return o->kind = SMC_OP_NOP;
+    return o->kind = SMC_OP_NONE;
+}
+
+static int smc_trace_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_SPU_SMC_TRACE"); on = !(e && !strcmp(e, "0")); }
+#if defined(PS3RECOMP_ORIGINAL_OBSERVER) && PS3RECOMP_ORIGINAL_OBSERVER
+    return 0;   /* every microstep instruction is an original-work step */
+#else
+    return on && !spu_pc_observer_enabled();
+#endif
+}
+
+static uint32_t smc_trace_word(const spu_context* ctx, uint32_t pc)
+{
+    return ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
+           ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
+}
+
+/* Find or build the trace for the run at pc. NULL: run the ordinary path. */
+static const smc_trace* smc_trace_get(spu_context* ctx, uint32_t pc)
+{
+    smc_trace_cache* c = t_smc_trace;
+    if (!c) {
+        c = (smc_trace_cache*)calloc(1, sizeof *c);
+        if (!c) return NULL;
+        t_smc_trace = c;
+    }
+    for (unsigned i = 0; i < SMC_TRACE_WAYS; i++) {
+        smc_trace* t = &c->way[i];
+        if (t->state == SMC_TRACE_EMPTY || t->pc != pc) continue;
+        if (pc + 4 * t->n <= SPU_LS_SIZE && !memcmp(ctx->ls + pc, t->bytes, 4 * t->n))
+            return t->state == SMC_TRACE_REPLAY ? t : NULL;
+        t->state = SMC_TRACE_EMPTY;   /* rewritten: decode it again below */
+        break;
+    }
+    smc_trace* t = NULL;
+    for (unsigned i = 0; i < SMC_TRACE_WAYS && !t; i++)
+        if (c->way[i].state == SMC_TRACE_EMPTY || c->way[i].pc == pc) t = &c->way[i];
+    if (!t) { t = &c->way[c->next]; c->next = (c->next + 1) % SMC_TRACE_WAYS; }
+    t->pc = pc; t->n = 0; t->state = SMC_TRACE_UNCACHEABLE;
+    for (uint32_t a = pc; t->n < SMC_TRACE_MAX && a + 3 < SPU_LS_SIZE; a += 4) {
+        const uint32_t w = smc_trace_word(ctx, a);
+        smc_op* o = &t->ops[t->n];
+        memcpy(t->bytes + 4 * t->n++, ctx->ls + a, 4);
+        const int kind = smc_trace_decode(w, o);
+        if (kind == SMC_OP_NONE) break;   /* stays uncacheable while these words hold */
+        if (kind == SMC_OP_BI_FAMILY || kind == SMC_OP_BR_FAMILY) { t->state = SMC_TRACE_REPLAY; break; }
+    }
+    return t->state == SMC_TRACE_REPLAY ? t : NULL;
+}
+
+/* Replay a trace. 1: it reached its branch (as spu_smc_microstep returns 1).
+ * 0: a store landed inside the run; ctx->pc is the next instruction. */
+static int smc_trace_replay(spu_context* ctx, const smc_trace* t)
+{
+    const uint32_t lo = t->pc, hi = t->pc + 4 * t->n;
+#if defined(PS3RECOMP_CRITICAL_WRITE_AVAILABLE) || defined(PS3_CRITICAL_WRITE_IMPLEMENTATION)
+    { const uint32_t arrive = __atomic_load_n(&ps3_critical_arrival_pc, __ATOMIC_RELAXED);
+      if (arrive >= lo && arrive < hi) { ctx->pc = lo; return 0; } }
+#endif
+    uint32_t pc = lo;
+    for (uint32_t i = 0; i < t->n; i++, pc += 4) {
+        const smc_op* o = &t->ops[i];
+        const uint32_t w = o->w, rt = o->rt, ra = o->ra, rb = o->rb;
+        const int32_t i10 = (int32_t)(w << 8) >> 22;
+        const int32_t i16 = (int32_t)(int16_t)((w >> 7) & 0xFFFF);
+        uint32_t store = 0xFFFFFFFFu;
+        switch (o->kind) {
+        case SMC_OP_STQD: store = (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u;
+                          spu_ls_write128(ctx, store, ctx->gpr[rt]); break;
+        case SMC_OP_LQD:  ctx->gpr[rt] = spu_ls_read128(ctx, (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u); break;
+        case SMC_OP_STQA: store = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u;
+                          spu_ls_write128(ctx, store, ctx->gpr[rt]); break;
+        case SMC_OP_LQA:  ctx->gpr[rt] = spu_ls_read128(ctx, (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u); break;
+        case SMC_OP_STQR: store = (pc + ((uint32_t)i16 << 2)) & SPU_LS_MASK & ~15u;
+                          spu_ls_write128(ctx, store, ctx->gpr[rt]); break;
+        case SMC_OP_LQR:  ctx->gpr[rt] = spu_ls_read128(ctx, (pc + ((uint32_t)i16 << 2)) & SPU_LS_MASK & ~15u); break;
+        case SMC_OP_XORI: ctx->gpr[rt] = spu_xori(ctx->gpr[ra], i10); break;
+        case SMC_OP_AI: { u128 r = ctx->gpr[ra];
+                          for (int k = 0; k < 4; k++) r._u32[k] += (uint32_t)i10;
+                          ctx->gpr[rt] = r; break; }
+        case SMC_OP_SF:
+        case SMC_OP_A:  { u128 x = ctx->gpr[ra], y = ctx->gpr[rb], r;
+                          for (int k = 0; k < 4; k++)
+                              r._u32[k] = o->kind == SMC_OP_SF ? y._u32[k] - x._u32[k] : x._u32[k] + y._u32[k];
+                          ctx->gpr[rt] = r; break; }
+        case SMC_OP_IL:   ctx->gpr[rt] = spu_splat_u32((uint32_t)i16); break;
+        case SMC_OP_ILHU: ctx->gpr[rt] = spu_splat_u32(((w >> 7) & 0xFFFF) << 16); break;
+        case SMC_OP_IOHL: { u128 r = ctx->gpr[rt];
+                            for (int k = 0; k < 4; k++) r._u32[k] |= (w >> 7) & 0xFFFF;
+                            ctx->gpr[rt] = r; break; }
+        case SMC_OP_ILA:  ctx->gpr[rt] = spu_splat_u32((w >> 7) & 0x3FFFF); break;
+        case SMC_OP_NOP:  break;
+        case SMC_OP_BI_FAMILY: {
+            const uint32_t op11 = w >> 21;
+            if (w & 0x40000) ctx->int_enable = 1;
+            else if (w & 0x80000) ctx->int_enable = 0;
+            const uint32_t tgt = op11 == 0x1AA ? ctx->srr0 : ctx->gpr[ra]._u32[0];
+            if (op11 == 0x1A9) ctx->gpr[rt] = spu_splat_u32(pc + 4);
+            ctx->pc = tgt & SPU_LS_MASK & ~3u;
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1; }
+        case SMC_OP_BR_FAMILY: {
+            const uint32_t op9 = w >> 23;
+            const uint32_t tgt = (op9 == 0x060 || op9 == 0x062) ? ((uint32_t)i16 << 2) : (pc + ((uint32_t)i16 << 2));
+            if (op9 == 0x066 || op9 == 0x062) ctx->gpr[rt] = spu_splat_u32(pc + 4);
+            ctx->pc = tgt & SPU_LS_MASK & ~3u;
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1; }
+        default: ctx->pc = pc; return 0;
+        }
+        if (store < hi && store + 16 > lo) { ctx->pc = pc + 4; return 0; }   /* rewrote the run */
+    }
+    ctx->pc = pc;
+    return 0;
+}
+
 static int spu_smc_microstep(spu_context* ctx)
 {
+    if (smc_trace_enabled()) {
+        const smc_trace* t = smc_trace_get(ctx, ctx->pc & SPU_LS_MASK & ~3u);
+        if (t && smc_trace_replay(ctx, t)) return 1;
+        /* Not cached, or stopped at a store into the run: microstep on from
+         * ctx->pc, which the replay left at its next instruction. */
+    }
     int observe = spu_pc_observer_enabled();
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
     for (int steps = 0; steps < 4096; steps++) {
