@@ -257,6 +257,7 @@ typedef struct vk_state {
     int              present_inflight;/* a read-back present awaiting completion */
     u64              present_direct, present_readback_count;
     int              present_split;   /* inside rsx_vulkan_backend_present_begin */
+    u64              encode_previous_present; /* queue place, scoped to this backend lifetime */
     int              present_order;   /* the walker's next command buffer waits */
     pthread_mutex_t  queue_mu;
     pthread_mutex_t  present_mu;
@@ -7349,9 +7350,8 @@ void rsx_vulkan_backend_present_finish(void){
     /* Encode thread: the second half follows the first there. The walker
      * runs at most one present ahead of what the encode thread has shown. */
     if(rsx_encq_active()){
-        static u64 previous;
-        rsx_encq_wait_done(previous);
-        previous=rsx_encq_call(vk_present_finish_queued,NULL);
+        rsx_encq_wait_done(s_vk.encode_previous_present);
+        s_vk.encode_previous_present=rsx_encq_call(vk_present_finish_queued,NULL);
         return;
     }
     vk_present_finish_queued(NULL);

@@ -122,8 +122,19 @@ int main(int argc, char** argv)
                st.ops, st.immediates, st.ordered_calls, st.snapshots_split, st.tickets, st.drains);
         CHECK(st.ops > CELLS && st.tickets == nt, "the queue carried the frame");
     }
+    /* Exercise the host's split-present entry points, then initialize a new
+     * backend in this process. A queue place from the first lifetime must
+     * never make the second lifetime wait for work it cannot have queued. */
+    rsx_vulkan_backend_present_begin();
+    rsx_vulkan_backend_present_finish();
     rsx_vulkan_backend_shutdown();
     CHECK(!rsx_encq_active(), "stopped with the backend");
+    CHECK(rsx_vulkan_backend_init(W, H, "encode thread restart") == 0, "backend restarts");
+    CHECK(rsx_encq_active() == threaded, "restarted encode thread as asked");
+    rsx_vulkan_backend_present_begin();
+    rsx_vulkan_backend_present_finish();
+    rsx_vulkan_backend_shutdown();
+    CHECK(!rsx_encq_active(), "restarted backend stops");
     printf("%s: checks=%d failures=%d\n", argv[1], checks, failures);
     return failures ? 1 : 0;
 }
