@@ -103,8 +103,7 @@ static const char* g_current = "(none)";
 #define LSA_A    0x00001000u
 #define LSA_B    0x00002000u
 
-/* 256 KB of local store each: not on the stack. */
-static spu_context g_a, g_b;
+/* 256 KB of local store each: not on the stack (declared above). */
 
 /* ---------------------------------------------------------------------------
  * Driving the real channel path
@@ -117,12 +116,25 @@ static void wrch(spu_context* ctx, uint32_t channel, uint32_t v)
     spu_wrch(ctx, channel, spu_make_preferred_u32(v));
 }
 
+/* Both SPUs look at their event status after every command, as the guest's
+ * `rchcnt SPU_RdEventStat` does. The default scheme raises LR at the write,
+ * so looking changes nothing there; per-line version counters
+ * (PS3RECOMP_COH_VERSIONS=1) deliver a lost reservation when the SPU looks,
+ * and the assertions below hold for both. */
+static spu_context g_a, g_b;
+static void look(void)
+{
+    (void)spu_rchcnt(&g_a, SPU_RdEventStat);
+    (void)spu_rchcnt(&g_b, SPU_RdEventStat);
+}
+
 static void spu_atomic(spu_context* ctx, uint32_t lsa, uint32_t ea, uint32_t cmd)
 {
     wrch(ctx, MFC_LSA, lsa);
     wrch(ctx, MFC_EAH, 0);
     wrch(ctx, MFC_EAL, ea);
     wrch(ctx, MFC_Cmd, cmd);
+    look();
 }
 
 static void spu_put(spu_context* ctx, uint32_t lsa, uint32_t ea, uint32_t size)
@@ -133,6 +145,7 @@ static void spu_put(spu_context* ctx, uint32_t lsa, uint32_t ea, uint32_t size)
     wrch(ctx, MFC_Size, size);
     wrch(ctx, MFC_TagID, 0);
     wrch(ctx, MFC_Cmd, MFC_PUT_CMD);
+    look();
 }
 
 /* Fill a context's staging buffer with a recognisable pattern, so "the write
@@ -439,6 +452,7 @@ static void test_ack_keeps_a_concurrent_raise(void)
     spu_coh_notify_write(LINE_A);
     spu_lockline_unlock();
     pthread_join(t, NULL);
+    look();
 
     TEST("a raise after the acknowledge is kept");
     CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
@@ -497,6 +511,7 @@ static void test_ack_races_a_raise(void)
         atomic_store(&g_ackr_go, k);
         while (atomic_load(&g_ackr_ack_done) != k ||
                atomic_load(&g_ackr_raise_done) != k) { }
+        look();
         uint32_t s = __atomic_load_n(&g_a.event_status, __ATOMIC_ACQUIRE);
         if (!(s & SPU_EVENT_LR)) lost_raise++;
         if (s & ACK_TAG_EVENT)   kept_ack++;
@@ -554,6 +569,7 @@ static void test_producer_keeps_peer_event(unsigned bit)
     spu_coh_notify_write(LINE_A);
     spu_lockline_unlock();
     pthread_join(t, NULL);
+    look();
     TEST("MFC notification retains the concurrent reservation event");
     CHECK_EQ_U32(g_a.event_status, bit | SPU_EVENT_LR);
     if (bit == 2) {

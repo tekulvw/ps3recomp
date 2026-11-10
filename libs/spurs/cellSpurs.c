@@ -15,6 +15,7 @@
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_workload_flag.h"
+#include "spu_coh_section.h"   /* host line read-modify-writes */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "../../runtime/memory/vm_watch_hooks.h"   /* pin pages the flag guard protects */
@@ -289,12 +290,12 @@ static inline void ef_w16(uint32_t a, u16 v) { uint8_t* p = vm_base + a; p[0] = 
 static inline void ef_line_end(uint32_t ea)
 {
     if (spu_coh_is_reserved(ea & ~127u)) spu_coh_notify_write(ea & ~127u);
-    spu_lockline_unlock();
+    spu_coh_write_end();
 }
 
 static void spurs_ef_set_locked(uint32_t ea, u16 bits)
 {
-    spu_lockline_lock();
+    spu_coh_write_begin(ea, 0x80);
     spu_coh_host_rmw_mark(ea, 0x80);
     u16 events        = ef_r16(ea + EF_EVENTS);
     u16 used          = (u16)(ef_r16(ea + EF_SPU_USED_SLOTS) &
@@ -639,7 +640,7 @@ s32 _cellSpursWorkloadFlagReceiver(CellSpurs* spurs, u32 wid, u32 is_set)
         return CELL_SPURS_POLICY_MODULE_ERROR_NOSYS;
     }
     s32 result = CELL_OK;
-    spu_lockline_lock();
+    spu_coh_write_begin(ea, 0x80);
     /* NULL marks the shared line coherent without registering a fake SPU. */
     spu_coh_reserve(NULL, ea);
     u8 receiver = vm_base[ea + SPURS_WKL_FLAG_RECEIVER];
@@ -652,7 +653,7 @@ s32 _cellSpursWorkloadFlagReceiver(CellSpurs* spurs, u32 wid, u32 is_set)
         vm_base[ea + SPURS_WKL_FLAG_RECEIVER] = is_set ? (u8)wid : 0xFF;
         spurs_flag_notify(ea, 1);
     }
-    spu_lockline_unlock();
+    spu_coh_write_end();
     return result;
 }
 
@@ -1765,7 +1766,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             s_workloads[i].is_taskset = 0;
             spurs_scheduler_forget(i);
             si->idle[i] = 0;
-            spu_lockline_lock();
+            spu_coh_write_begin(spurs_ea, 0x80);
             spu_coh_host_rmw_mark(spurs_ea, 0x80);
             vm_base[spurs_ea + SPURS_WKL_READY1 + i] = 0;
             vm_base[spurs_ea + SPURS_WKL_CURCONT + i] = 0;
@@ -1989,7 +1990,7 @@ static s32 spurs_remove_workload_locked(struct SpursInst* si, CellSpurs* spurs, 
     /* Release receiver ownership before making this workload unavailable.
      * Keep a nonowner's pending flag intact. Publish removal in guest state
      * too, otherwise the removed wid could immediately register again. */
-    spu_lockline_lock();
+    spu_coh_write_begin(ea, 0x100);   /* the flag line and the state line */
     spu_coh_reserve(NULL, ea);
     spu_coh_reserve(NULL, ea + 0x80);
     if (vm_base[ea + SPURS_WKL_FLAG_RECEIVER] == wid) {
@@ -2003,7 +2004,7 @@ static s32 spurs_remove_workload_locked(struct SpursInst* si, CellSpurs* spurs, 
     ppu_resv_break_store(ea + SPURS_WKL_ENABLED);
     ppu_resv_break_store(ea + SPURS_WKL_STATE1 + wid);
     s_workloads[wid].in_use = 0;
-    spu_lockline_unlock();
+    spu_coh_write_end();
     spurs_scheduler_forget(wid);
     printf("[cellSpurs] RemoveWorkload(wid=%u)\n", wid);
     return CELL_OK;
@@ -2363,7 +2364,7 @@ static int spurs_dispatch_slot(struct SpursInst* si, struct SpursPmSlot* slot, u
          * Unsolicited policy probes make an idle workload appear busy
          * to GetWorkloadInfo and can send callers into obsolete waits. */
         if (!kicked) continue;
-        spu_lockline_lock();
+        spu_coh_write_begin(ea, 0x80);
         spu_coh_host_rmw_mark(ea, 0x80);
         ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
         signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
@@ -2372,7 +2373,7 @@ static int spurs_dispatch_slot(struct SpursInst* si, struct SpursPmSlot* slot, u
         if (!spurs_ready_requests(ea, wid, ready, si->active[wid], target_mode) &&
             !(signal & (0x8000u >> wid)) &&
             !spurs_flag_status_locked(ea, wid)) {
-            spu_lockline_unlock();
+            spu_coh_write_end();
             continue;
         }
         si->idle[wid] = 0;
@@ -2387,7 +2388,7 @@ static int spurs_dispatch_slot(struct SpursInst* si, struct SpursPmSlot* slot, u
         slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
         slot->wid = wid; slot->ea = ea;
         si->active[wid]++;
-        spu_lockline_lock();
+        spu_coh_write_begin(ea, 0x80);
         vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
         ef_line_end(ea);
         slot->busy = 1;
@@ -2454,7 +2455,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         AcquireSRWLockExclusive(&si->lock);
         u32 wid = slot->wid;
         if (si->active[wid]) si->active[wid]--;
-        spu_lockline_lock();
+        spu_coh_write_begin(slot->ea, 0x80);
         vm_base[slot->ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
         ef_line_end(slot->ea);
         if (polls) si->idle[wid] = 0;
@@ -2653,14 +2654,14 @@ static s32 spurs_ready_exchange(CellSpurs* spurs, CellSpursWorkloadId wid,
     if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
         spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
     }
-    spu_lockline_lock();
+    spu_coh_write_begin(si->ea, 0x80);
     spu_coh_host_rmw_mark(si->ea, 0x80);
     u8 previous = vm_read8(si->ea + SPURS_WKL_READY1 + wid);
     if (!conditional || previous == compare) {
         vm_base[si->ea + SPURS_WKL_READY1 + wid] = (u8)value;
         s_workloads[wid].readyCount = value;
         ef_line_end(si->ea);
-    } else spu_lockline_unlock();
+    } else spu_coh_write_end();
     vm_write32((u32)(uintptr_t)old, previous);
     spurs_api_unlock(si);
     return CELL_OK;
@@ -2899,7 +2900,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
         /* Clear from the CURRENT word: bits an SPU set since `current` was
          * read must survive. */
-        spu_lockline_lock();
+        spu_coh_write_begin(ea, 0x80);
         spu_coh_host_rmw_mark(ea, 0x80);
         ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
         ef_line_end(ea);
@@ -2944,7 +2945,7 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                        : (u16)(current & pattern);
     if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
-        spu_lockline_lock();
+        spu_coh_write_begin(ea, 0x80);
         spu_coh_host_rmw_mark(ea, 0x80);
         ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
         ef_line_end(ea);
@@ -2965,7 +2966,7 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     ef_lock(sync);
-    spu_lockline_lock();
+    spu_coh_write_begin(ea, 0x80);
     spu_coh_host_rmw_mark(ea, 0x80);
     ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~bits));
     ef_line_end(ea);

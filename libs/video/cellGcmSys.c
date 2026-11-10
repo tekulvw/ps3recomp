@@ -21,6 +21,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
+#include "../../runtime/spu/spu_coh_section.h" /* host line read-modify-writes */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
@@ -905,6 +906,15 @@ static int gcm_flipcb_on_tick_only(void)
     return v;
 }
 
+/* FLIP_DBG (set): log flip status traffic. Read once: GetFlipStatus is polled
+ * by every wait-for-flip loop. */
+static int gcm_flip_dbg(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("FLIP_DBG") ? 1 : 0;
+    return v;
+}
+
 static u32 s_vblank_handler_opd   = 0;
 static u32 s_user_handler_opd     = 0;
 static u32 s_second_v_handler_opd = 0;
@@ -917,7 +927,9 @@ extern u32 vm_read32(unsigned int);
 static u32 s_flip_handler_code    = 0;
 static u32 s_vblank_handler_code  = 0;
 static void ydkj_restore_handler_opd(u32 opd, u32 code) {
-    if (!getenv("YDKJ_HANDLERFIX") || !opd || !code) return;
+    static int s_fix = -1;   /* per vblank/flip delivery: read once */
+    if (s_fix < 0) s_fix = getenv("YDKJ_HANDLERFIX") ? 1 : 0;
+    if (!s_fix || !opd || !code) return;
     extern u8* vm_base; if (!vm_base) return;
     if (vm_read32(opd) == 0) {
         u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
@@ -1364,7 +1376,7 @@ void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
 void cellGcmResetFlipStatus(void)
 {
     { static int n = 0;
-      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 12))
+      if (gcm_flip_dbg() && PS3_LOG_FIRST(n, 12))
           fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
     FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
@@ -1383,7 +1395,7 @@ u32 cellGcmGetFlipStatus(void)
      * every wait-for-flip loop exit on its first poll, so titles ran
      * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
     { static int n = 0;
-      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 24))
+      if (gcm_flip_dbg() && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
     if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
@@ -1707,7 +1719,7 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     u32 value=(r->argument>>24)==1u?0xffffu:0u;
     if(r->index<CELL_GCM_MAX_REPORT_COUNT){s_report_data[r->index].timestamp=timestamp;s_report_data[r->index].value=value;}
     if(r->main_memory){
-        spu_lockline_lock();
+        spu_coh_write_begin(ea, 16);
         const u32 words[4]={(u32)(timestamp>>32),(u32)timestamp,value,0};
         for(u32 i=0;i<4;i++){
             u32 address=ea+i*4u,raw=ps3_bswap32(words[i]);
@@ -1715,7 +1727,7 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
             PS3_WW_CHECK(address,words[i],4);memcpy(vm_base+address,&raw,sizeof(raw));
             if(g_resv_store_active>0)ppu_resv_break_store(address);
         }
-        spu_coh_notify_write(ea);spu_lockline_unlock();
+        spu_coh_notify_write(ea);spu_coh_write_end();
         if(s_lag_ea&&ea<=s_lag_ea&&s_lag_ea-ea<16u){static unsigned rn;if(rn++<20000u)fprintf(stderr,"[label-lag] t=%llu publish ea=0x%08X method=0x1800 value=0x%08X early=%u\n",(unsigned long long)ps3_critical_now_ns(),s_lag_ea,r->argument,(unsigned)r->early);}
     }
     if(r->start_ns){uint64_t w[5]={r->start_ns,ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,PS3_CRITICAL_REPORT,ea,r->index,w,5);}
@@ -2208,11 +2220,11 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
     int reserved = 0;
     for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
     if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
-    spu_lockline_lock();
+    spu_coh_write_begin(d, n);
     memmove(vm_base + d, vm_base + s, n);
     for (u32 a = l0; a <= l1; a += 128)
         if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
-    spu_lockline_unlock();
+    spu_coh_write_end();
 }
 
 static void nv3089_blit(void)
@@ -4330,7 +4342,9 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
 
-    if (getenv("CELLMARK_BLINKDBG"))
+    static int s_blinkdbg = -1;   /* per ring wrap: read once */
+    if (s_blinkdbg < 0) s_blinkdbg = getenv("CELLMARK_BLINKDBG") ? 1 : 0;
+    if (s_blinkdbg)
         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
 
     static int s_recdbg = -1;
@@ -4511,7 +4525,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
           }
       } }
 
-    { static int _n=0; if (getenv("FLIP_DBG") && PS3_LOG_FIRST(_n, 20))
+    { static int _n=0; if (gcm_flip_dbg() && PS3_LOG_FIRST(_n, 20))
         fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
