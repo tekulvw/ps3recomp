@@ -582,6 +582,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             *tramp = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             spu_drain_hop_inline(ctx, fn, recent);
+            SPU_LR_POLL(ctx);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */

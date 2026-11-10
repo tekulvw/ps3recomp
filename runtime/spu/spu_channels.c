@@ -473,6 +473,7 @@ static int spu_native_service_call_impl(spu_context* ctx,uint32_t entry_pc,uint3
              * must not overwrite its architectural link. The native owner
              * remains live below this scope while the genuine handler runs. */
             ctx->pc = return_pc;
+            SPU_LR_POLL(ctx);
             g_spu_trampoline_fn = ctx->int_enable &&
                 (ctx->event_status & ctx->event_mask) ?
                 spu_take_interrupt(ctx, 0) : 0;
@@ -890,6 +891,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
+        /* PS3RECOMP_COH_VERSIONS: a lock-free snapshot under the line's count
+         * (spu_coh_ops.h); no lock, no holder registration. */
+        { const spu_coh_ops* cohv = g_spu_coh_ops;
+          if (cohv) {
+              cohv->getllar(ctx, ea, mem, ls);
+              ctx->atomic_stat = 4;
+              ctx->dbg_getllar++;
+              spu_dma_publication_observe_atomic(ctx, lsa, ea, cmd, SPU_DMA_ATOMIC_GETLLAR_COMPLETE);
+              if(observing)spu_atomic_observe_end(ctx->atomic_stat);
+              return 1;
+          } }
         /* A registered holder re-reading an already reserved line -- every
          * job-manager poll -- publishes its reservation without the lock (see
          * spu_coh_reserve_fast); any write that the copy below misses ends it. */
@@ -1017,6 +1029,23 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
+        /* PS3RECOMP_COH_VERSIONS: commit if the line's count and bytes are
+         * unchanged; peers learn of the commit when they next look. */
+        { const spu_coh_ops* cohv = g_spu_coh_ops;
+          if (cohv) {
+              ctx->atomic_stat = cohv->putllc(ctx, ea, mem, ls) ? 0u : 1u;
+              spu_dma_publication_observe_atomic(ctx, lsa, ea, cmd,
+                  ctx->atomic_stat ? SPU_DMA_ATOMIC_PUTLLC_FAILURE : SPU_DMA_ATOMIC_PUTLLC_SUCCESS);
+              if (ctx->atomic_stat == 0) {
+                  spu_taskset_line_committed(ea & ~127u);
+                  if (s_line_watch) spu_line_watch_commit(ctx, (uint32_t)ea);
+                  if (g_spu_line_commit_hook) {
+                      t_commit_ctx = ctx; g_spu_line_commit_hook(ea & ~127u); t_commit_ctx = NULL;
+                  }
+              }
+              if(observing)spu_atomic_observe_end(ctx->atomic_stat);
+              return 1;
+          } }
         /* A PUTLLC that must fail needs no lock: the reservation is already
          * gone, or the line no longer matches the snapshot -- and every write
          * after the snapshot ends the reservation (spu_coh_reserve_fast), so a
@@ -1144,6 +1173,18 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
+        { const spu_coh_ops* cohv = g_spu_coh_ops;
+          if (cohv) {
+              cohv->putlluc(ctx, ea, mem, ls);
+              ctx->atomic_stat = 2;   /* PUTLLUC complete */
+              spu_taskset_line_committed(ea & ~127u);
+              if (s_line_watch) spu_line_watch_commit(ctx, (uint32_t)ea);
+              if (g_spu_line_commit_hook) {
+                  t_commit_ctx = ctx; g_spu_line_commit_hook(ea & ~127u); t_commit_ctx = NULL;
+              }
+              if(observing)spu_atomic_observe_end(ctx->atomic_stat);
+              return 1;
+          } }
         spu_lockline_lock();
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
@@ -1345,6 +1386,11 @@ static int yz_ch_block(void)
  */
 static void spu_resv_lost_poll(spu_context* ctx)
 {
+    /* PS3RECOMP_COH_VERSIONS: the line's count says whether a write ended the
+     * reservation. The byte compare below stays as the backstop for writers
+     * outside the protocol, as it is for the default scheme. */
+    { const spu_coh_ops* cohv = g_spu_coh_ops;
+      if (cohv && cohv->settle(ctx)) return; }
     if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
     if (!vm_base || ctx->resv_ea == 0) return;
     if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
@@ -1370,6 +1416,17 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
+    WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
+}
+
+/* PS3RECOMP_COH_VERSIONS: a write to the line a parked SPU has reserved. The
+ * waiter checks its predicate and sleeps under ch_wait_lock, so taking it here
+ * means the broadcast cannot fall between that check and the sleep. */
+static void spu_ch_wake_line_written(void* p)
+{
+    spu_context* ctx = (spu_context*)p;
+    AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
     WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
 }
 
@@ -1408,6 +1465,10 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 
     InterlockedExchange((LONG*)&ctx->status, SPU_STATUS_WAITING_CHANNEL);
     yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
+    /* PS3RECOMP_COH_VERSIONS: writers of the reserved line wake this thread. */
+    void* cohv_waiter[SPU_COH_WAITER_BYTES / sizeof(void*)];
+    const spu_coh_ops* cohv = channel == SPU_RdEventStat ? g_spu_coh_ops : NULL;
+    if (cohv) cohv->wait_begin(ctx, cohv_waiter, spu_ch_wake_line_written);
     {
         unsigned long long start = GetTickCount64(), next_hb = 2000;
         while (!spu_ch_ready(ctx, channel)) {
@@ -1427,6 +1488,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             }
         }
     }
+    if (cohv) cohv->wait_end(cohv_waiter);
     yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
     if (ft_t0) spu_ft_wait_span(ctx, channel, ft_t0);
     InterlockedExchange((LONG*)&ctx->status, SPU_STATUS_RUNNING);
