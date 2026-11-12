@@ -48,7 +48,7 @@ def main():
     flags = shlex.split(subprocess.check_output(["pkg-config", "--cflags", "vulkan", "sdl2"], text=True))
     libraries = shlex.split(subprocess.check_output(["pkg-config", "--libs", "sdl2"], text=True))
     sources = ["libs/video/tests/test_vulkan_depth_z24.c"] + ["libs/video/" + name + ".c" for name in
-        ("rsx_draw_engine", "rsx_fifo_busy", "rsx_commands", "rsx_dispatch", "rsx_texture_layout", "rsx_vertex_compact",
+        ("rsx_draw_engine", "rsx_fifo_busy", "rsx_commands", "rsx_dispatch", "rsx_texture_layout", "rsx_tiling", "rsx_vertex_compact",
          "rsx_vertex_fetch", "rsx_vp_decompiler", "rsx_fp_decompiler")] + [
         "runtime/diagnostics/critical_trace.c", "runtime/diagnostics/render_ablation.c",
         "libs/video/rsx_shader_spirv.cpp"]

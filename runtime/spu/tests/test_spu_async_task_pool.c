@@ -74,8 +74,8 @@ static unsigned registered_in(uintptr_t lo, uintptr_t hi)
 {
     unsigned n = 0;
     spu_lockline_lock();
-    for (spu_coh_entry* e = s_coh_ctxs; e; e = e->next)
-        n += (uintptr_t)e->ctx >= lo && (uintptr_t)e->ctx < hi;
+    for (unsigned i = 0; i < s_coh_n; ++i)
+        n += (uintptr_t)s_coh_ctxs[i] >= lo && (uintptr_t)s_coh_ctxs[i] < hi;
     spu_lockline_unlock();
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* s = s_mfc_slots; s; s = s->next)
