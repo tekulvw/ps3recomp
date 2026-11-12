@@ -124,7 +124,7 @@ static struct {
     /* The vertex constants last bound, kept by the consumer for a rebind
      * the backend refuses. */
     u8* vs_keep;
-    u32 vs_bytes, vs_first, vs_rows;
+    u32 vs_bytes, vs_mask[RSX_DSP_NUM_CONSTANTS / 32u];
     int vs_kind;                         /* 0 none, 1 whole block, 2 rows */
     int vs_bound;                        /* producer: a bind was queued since init */
     /* counters */
@@ -227,11 +227,12 @@ static void q_backend_lock(void)
 
 /* ---- consumer side ------------------------------------------------------- */
 
-static void q_vs_keep(const u8* data, u32 bytes, u32 first, u32 rows, int kind)
+static void q_vs_keep(const u8* data, u32 bytes, const u32* mask, int kind)
 {
     if (!Q.vs_keep || bytes > Q_VS_KEEP) { Q.vs_kind = 0; return; }
     if (kind == 1) memcpy(Q.vs_keep, data, bytes);
-    Q.vs_bytes = bytes; Q.vs_first = first; Q.vs_rows = rows; Q.vs_kind = kind;
+    if (mask) memcpy(Q.vs_mask, mask, sizeof Q.vs_mask);
+    Q.vs_bytes = bytes; Q.vs_kind = kind;
 }
 
 static void q_run(const q_op* op)
@@ -248,25 +249,30 @@ static void q_run(const q_op* op)
     case OP_BIND_TARGETS: be->bind_targets(RU, op->a, op->a[5], op->a[4]); break;
     case OP_BIND_PIPELINE: be->bind_pipeline(RU, op->a[0]); break;
     case OP_BIND_VS:
-        q_vs_keep(p0, op->n0, 0, 0, 1);
+        q_vs_keep(p0, op->n0, NULL, 1);
         be->bind_vs_constants(RU, Q.vs_kind == 1 ? Q.vs_keep : p0, op->n0);
         break;
     case OP_BIND_VS_ROWS: {
-        /* The payload holds the rows, then the transform's two; the backend
-         * gets them at their places in a block of the full size. */
-        const u32 bytes = op->a[0], first = op->a[1], rows = op->a[2];
+        /* Compact row runs and the transform are copied by the producer;
+         * the separate mask payload owns the selection until this retires. */
+        const u32 bytes = op->a[0];
+        const u32* mask = (const u32*)p1;
         if (Q.vs_keep && bytes <= Q_VS_KEEP) {
-            memcpy(Q.vs_keep + first * 16u, p0, rows * 16u);
-            memcpy(Q.vs_keep + bytes - 32u, p0 + rows * 16u, 32u);
-            q_vs_keep(NULL, bytes, first, rows, 2);
-            be->bind_vs_constant_rows(RU, Q.vs_keep, bytes, first, rows);
+            u32 row = 0, count = 0, offset = 0;
+            for (; rsx_be_row_run(mask, &row, &count); row += count) {
+                memcpy(Q.vs_keep + row * 16u, p0 + offset, count * 16u);
+                offset += count * 16u;
+            }
+            memcpy(Q.vs_keep + bytes - 32u, p0 + offset, 32u);
+            q_vs_keep(NULL, bytes, mask, 2);
+            be->bind_vs_constant_rows(RU, Q.vs_keep, bytes, Q.vs_mask);
         }
         break;
     }
     case OP_REBIND_VS:
         if (be->rebind_vs_constants && be->rebind_vs_constants(RU)) break;
         if (Q.vs_kind == 1) be->bind_vs_constants(RU, Q.vs_keep, Q.vs_bytes);
-        else if (Q.vs_kind == 2) be->bind_vs_constant_rows(RU, Q.vs_keep, Q.vs_bytes, Q.vs_first, Q.vs_rows);
+        else if (Q.vs_kind == 2) be->bind_vs_constant_rows(RU, Q.vs_keep, Q.vs_bytes, Q.vs_mask);
         break;
     case OP_BIND_PS: be->bind_ps_constants(RU, op->n0 ? p0 : NULL, op->n0); break;
     case OP_BIND_TEXTURES:
@@ -633,20 +639,28 @@ static void p_bind_vs(void* u, const void* data, u32 bytes)
     q_commit();
     Q.vs_bound = data && bytes;
 }
-static void p_bind_vs_rows(void* u, const void* data, u32 bytes, u32 first, u32 rows)
+static void p_bind_vs_rows(void* u, const void* data, u32 bytes, const u32* mask)
 {
     (void)u;
-    if (!Q.running) { Q.real->bind_vs_constant_rows(RU, data, bytes, first, rows); return; }
-    if (!data || bytes < 32u || bytes > Q_VS_KEEP || (u64)(first + rows) * 16u > bytes - 32u) {
+    if (!Q.running) { Q.real->bind_vs_constant_rows(RU, data, bytes, mask); return; }
+    if (!data || bytes > Q_VS_KEEP || !rsx_be_row_mask_fits(mask, bytes)) {
         p_bind_vs(u, data, bytes);
         return;
     }
-    u8* b0 = NULL;
-    q_op* op = q_reserve(rows * 16u + 32u, 0, &b0, NULL);
+    u32 row = 0, count = 0, payload = 32u;
+    for (; rsx_be_row_run(mask, &row, &count); row += count) payload += count * 16u;
+    u8* b0 = NULL; u8* b1 = NULL;
+    q_op* op = q_reserve(payload, sizeof Q.vs_mask, &b0, &b1);
     const u8* src = (const u8*)data;
-    memcpy(b0, src + first * 16u, rows * 16u);
-    memcpy(b0 + rows * 16u, src + bytes - 32u, 32u);
-    op->kind = OP_BIND_VS_ROWS; op->a[0] = bytes; op->a[1] = first; op->a[2] = rows;
+    row = 0;
+    u32 offset = 0;
+    for (; rsx_be_row_run(mask, &row, &count); row += count) {
+        memcpy(b0 + offset, src + row * 16u, count * 16u);
+        offset += count * 16u;
+    }
+    memcpy(b0 + offset, src + bytes - 32u, 32u);
+    memcpy(b1, mask, sizeof Q.vs_mask);
+    op->kind = OP_BIND_VS_ROWS; op->a[0] = bytes;
     q_commit();
     Q.vs_bound = 1;
 }

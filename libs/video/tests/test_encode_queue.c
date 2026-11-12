@@ -67,11 +67,16 @@ static void r_bind_targets(void* u, const u32* s, u32 n, u32 d) { (void)u; note(
 static void r_bind_pipe(void* u, u32 p) { (void)u; note("pipeline", L_QUEUED, p, 0, 0); }
 static void r_bind_vs(void* u, const void* d, u32 n) { (void)u; note("vs", L_QUEUED, n, 0, sum_bytes(d, n)); }
 static int  r_rebind_vs(void* u) { (void)u; note("rebind", L_QUEUED, 0, 0, 0); return !g_refuse_rebind; }
-static void r_bind_vs_rows(void* u, const void* d, u32 n, u32 first, u32 rows)
+static void r_bind_vs_rows(void* u, const void* d, u32 n, const u32* mask)
 {
     (void)u;
     const u8* p = (const u8*)d;
-    note("vs_rows", L_QUEUED, first, rows, sum_bytes(p + first * 16u, rows * 16u) ^ sum_bytes(p + n - 32u, 32u));
+    u64 sum = sum_bytes(mask, (RSX_DSP_NUM_CONSTANTS / 32u) * sizeof *mask);
+    u32 row = 0, count = 0, rows = 0;
+    for (; rsx_be_row_run(mask, &row, &count); row += count) {
+        sum ^= sum_bytes(p + row * 16u, count * 16u); rows += count;
+    }
+    note("vs_rows", L_QUEUED, n, rows, sum ^ sum_bytes(p + n - 32u, 32u));
 }
 static void r_bind_ps(void* u, const void* d, u32 n) { (void)u; note("ps", L_QUEUED, n, 0, sum_bytes(d, n)); }
 static void r_bind_tex(void* u, const u32* t, const rsx_be_sampler_desc* s, u32 m)
@@ -148,7 +153,12 @@ static void script(const rsx_draw_backend* be, int rounds)
         be->bind_targets(u, &rt, 1, z);
         be->bind_pipeline(u, pipe);
         if (r % 3 == 2 && be->rebind_vs_constants && be->rebind_vs_constants(u)) { /* reused */ }
-        else if (r % 3 == 1) be->bind_vs_constant_rows(u, vs, sizeof vs, 3, 5);
+        else if (r % 3 == 1) {
+            u32 mask[RSX_DSP_NUM_CONSTANTS / 32u] = {0};
+            mask[0] = 0xF8u; mask[1] = 0x80000001u; mask[15] = 0xC0000000u;
+            be->bind_vs_constant_rows(u, vs, sizeof vs, mask);
+            memset(mask, 0, sizeof mask);
+        }
         else be->bind_vs_constants(u, vs, sizeof vs);
         be->bind_ps_constants(u, ps, sizeof ps);
         be->bind_textures(u, tex, samp, 1u);
