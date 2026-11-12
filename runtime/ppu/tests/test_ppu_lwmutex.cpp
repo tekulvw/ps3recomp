@@ -10,6 +10,9 @@ extern "C" { uint8_t* vm_base = nullptr; }
 extern "C" { volatile long long g_gcm_ref_pub_count = 0; }
 extern "C" unsigned long long ppu_thread_cpu_us(unsigned) { return 0; }
 extern "C" unsigned ppu_thread_prof_pc(unsigned) { return 0; }
+// A blocking lock tells the PS3_PRIO_START scheduler (sys_ppu_thread.c) its
+// thread blocked; no thread creation is under test here.
+extern "C" void ppu_thread_note_block(uint64_t) {}
 static std::atomic<uint32_t> words[4096];
 extern "C" uint32_t vm_read32(uint64_t a) { return words[a/4].load(); }
 extern "C" uint64_t vm_read64(uint64_t a) { return (uint64_t(vm_read32(a))<<32)|vm_read32(a+4); }

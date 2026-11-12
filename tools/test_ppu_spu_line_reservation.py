@@ -23,6 +23,8 @@ extern "C" void spu_ch_wake(spu_context*) {std::abort();}
 extern "C" int spu_raw_reg_load(uint32_t,uint32_t*) {std::abort();}
 extern "C" void spu_raw_reg_store(uint32_t,uint32_t,unsigned) {std::abort();}
 extern "C" void cellGcm_ref_on_poll(void) {std::abort();}
+// The GCM PUT wake word the inline stores compare against (cellGcmSys.c); no GCM here.
+extern "C" { uint32_t g_gcm_consumer_put_wake_ea=0; }
 static unsigned char arena[0x20000];
 static void publish(uint32_t ea,uint32_t value){spu_lockline_lock();uint32_t raw=__builtin_bswap32(value);memcpy(vm_base+ea,&raw,4);spu_coh_notify_write(ea);spu_lockline_unlock();}
 int main(){vm_base=arena;ppu_vm_size=sizeof(arena);ppu_context c{};g_active_ctx=&c;c.gpr[4]=0x10008;c.gpr[5]=21;vm_write64(0x10008,20);

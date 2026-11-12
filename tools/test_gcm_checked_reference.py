@@ -17,14 +17,14 @@ with tempfile.TemporaryDirectory(prefix="gcm-report-") as tmp:
         cmd=[compiler,'/nologo','/std:c17','/O1','/Gy','/Gw','/MT','/W0','/UNDEBUG',
              '/D_CRT_SECURE_NO_WARNINGS','/D_CRT_NONSTDC_NO_DEPRECATE','/I'+str(ROOT/'include'),
              str(ROOT/'libs/video/tests/test_gcm_checked_reference.c'),
-             str(ROOT/'libs/video/tests/gcm_deferred_fixture_stubs.c'),str(ROOT/'libs/video/rsx_fifo_busy.c'),
+             str(ROOT/'libs/video/tests/gcm_deferred_fixture_stubs.c'),str(ROOT/'libs/video/rsx_fifo_busy.c'),str(ROOT/'libs/video/rsx_tiling.c'),
              '/Fo'+tmp+'\\','/Fe'+str(out),'/link','/OPT:REF']
     else:
         cmd = [compiler, "-std=gnu17", "-O1", "-UNDEBUG",
            "-ffunction-sections", "-fdata-sections", "-I", str(ROOT / "include"),
            str(ROOT / "libs/video/tests/test_gcm_checked_reference.c"),
            "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
-           str(ROOT / "libs/video/tests/gcm_deferred_fixture_stubs.c"),str(ROOT / "libs/video/rsx_fifo_busy.c"),
+           str(ROOT / "libs/video/tests/gcm_deferred_fixture_stubs.c"),str(ROOT / "libs/video/rsx_fifo_busy.c"),str(ROOT / "libs/video/rsx_tiling.c"),
            "-pthread", "-lm", "-o", str(out)]
     subprocess.run(cmd, check=True, timeout=60)
 

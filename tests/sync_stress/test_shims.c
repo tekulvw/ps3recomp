@@ -6,11 +6,7 @@
 #include "../../runtime/platform/win32_compat.h"   /* QueryPerformanceCounter on every host */
 
 #include <stdint.h>
-#include <stdint.h>
-/* The LS watch lives in spu_channels.c, which this test does not link: disarmed stand-ins. */
-int g_spu_ls_watch_n = 0;
-void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
-{ (void)lsa; (void)is_write; (void)p; (void)pc; (void)lr; }
+#include "../spu_ls_watch_fixture.h"
 
 extern uint8_t* vm_base;
 
@@ -31,6 +27,7 @@ int lv2_deadline_passed(int64_t deadline)
 }
 
 void ydkj_release_pending_threads(void) {}
+void ppu_thread_note_block(uint64_t tid) { (void)tid; }   /* sys_ppu_thread.c: PS3_PRIO_START */
 
 uint32_t vm_read32(uint64_t addr)
 {

@@ -94,9 +94,9 @@ static int spu_task_launch_diagnostics(void)
     return s_on;
 }
 
-/* The caller may resolve the history TLS address once for its owning drain.
- * Keep every checkpoint here, in order: a stack reset can unwind before the
- * step increment, and guest calls can change PM-flow/PC/steps at any hop. */
+/* A drain may resolve the history TLS address once for its owning frame.
+ * Keep checkpoint order: stack reset can unwind before steps increment, and
+ * guest calls can change PM-flow, PC and steps before the next hop. */
 SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn,
                                                   spu_recent_history* recent)
 {
@@ -112,6 +112,44 @@ SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn,
     spu_task_launch_slow(ctx);
 }
 
+/* SPU_DIRECT (spu_context.h) skips the per-step work of the drain loops, so
+ * PS3_SPU_DIRECT=0 and the diagnostics that watch every step keep it off:
+ * SPU_LOCKSTEP (the quantum tick), SPU_TAILRET (SPU_DRAIN's return check),
+ * SPU_PCHIST, SPU_NO_LS0_END, SPU_EXITTRACE, SPU_STEPTRACE, SPU_JOBDRAIN,
+ * SPURS_PM_FLOW and the opt-in SPU_REGION_FRAMED. */
+volatile int g_spu_direct = -1;
+void spu_direct_init(void)
+{
+    if (g_spu_direct >= 0) return;
+    static const char* const diag[] = {
+        "SPU_LOCKSTEP", "SPU_TAILRET", "SPU_PCHIST", "SPU_NO_LS0_END", "SPU_EXITTRACE",
+        "SPU_STEPTRACE", "SPU_JOBDRAIN", "SPURS_PM_FLOW",
+        /* The fork's opt-in framed region scope tracks every transfer through
+         * the drain (spu_region_dispatch_invoke); keep its exact behavior. */
+        "SPU_REGION_FRAMED",
+    };
+    const char* e = getenv("PS3_SPU_DIRECT");
+    int on = !(e && e[0] == '0' && !e[1]);
+    const char* why = on ? NULL : "PS3_SPU_DIRECT=0";
+    for (unsigned i = 0; on && i < sizeof diag / sizeof diag[0]; i++) {
+        const char* d = getenv(diag[i]);
+        if (d && *d && strcmp(d, "0")) { on = 0; why = diag[i]; }
+    }
+#ifndef SPU_DIRECT_TAILCALLS
+    on = 0; why = "no musttail in this compiler";
+#endif
+    if (!on) fprintf(stderr, "[spu] direct tail calls off (%s)\n", why);
+    g_spu_direct = on;
+}
+
+static void spu_job_ls0_note(const spu_context* ctx)
+{
+    static int _n = 0;
+    if (PS3_LOG_FIRST(_n, 8))
+        fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
+                ctx->image_id);
+}
+
 /* Public checkpoint for generated, raw/async and region-local callers. */
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
@@ -121,8 +159,8 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
 SPU_DRAIN_INLINE void spu_drain_hop_inline(spu_context* ctx,
     void (*fn)(spu_context*), spu_recent_history* recent)
 {
-    /* Live each hop: a guest call can change the enabled mode. Uninitialized
-     * state still enters the original initialization/full tick routine. */
+    /* Read the live gate each hop. -1 still takes the original initialization
+     * path; a callee can enable lockstep before the next checkpoint. */
     if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx);
     spu_task_launch_check_inline(ctx, (void*)fn, recent);
 }
@@ -155,10 +193,7 @@ static void spu_task_launch_slow(spu_context* ctx)
 
     if (!s_no_ls0 && ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
         !ctx->policy_mode && ctx->image_id > 0) {
-        static int _n = 0;
-        if (PS3_LOG_FIRST(_n, 8))
-            fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
-                    ctx->image_id);
+        spu_job_ls0_note(ctx);
         if (s_et >= 0 && ctx->image_id == s_et) {
             fprintf(stderr, "[spu-exit] img=%d last PCs:", ctx->image_id);
             for (int i = 32; i >= 1; i--)
@@ -343,6 +378,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to the driver (srr0=0x%05X)\n",
                                   ctx->host_depth, ctx->pc & SPU_LS_MASK); }
                     extern void spu_restart_dispatch(spu_context*);
+                    ctx->dbg_reset_reason = 4;   /* [spu-restart]: iret to the driver */
                     spu_restart_dispatch(ctx);
                 }
                 return 1;
@@ -351,6 +387,43 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
         }
     }
     return 0;
+}
+
+/* SPU_IRQWAIT_DIAG=1: an SPU with interrupts enabled and nothing pending to
+ * take, every 2^22 such dispatches on a host thread (24 lines at most): pc,
+ * event status and mask, and the MFC list-stall mask and status, which is
+ * enough to see which event the guest is waiting for and that it never
+ * arrives. SPU_IRQWAIT_LS=<hex LS address> adds the 16 bytes there (the
+ * waiter's own state, once its layout is known). */
+void spu_irqwait_diag(spu_context* ctx)
+{
+    if (g_spu_irqwait_diag < 0) {
+        const char* e = getenv("SPU_IRQWAIT_DIAG");
+        g_spu_irqwait_diag = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (!g_spu_irqwait_diag) return;
+    static _Thread_local unsigned long long s_n = 0;
+    static int s_printed = 0;
+    if ((++s_n & ((1ull << 22) - 1)) != 0 || s_printed >= 24) return;
+    s_printed++;
+    static long s_ls = -2;
+    if (s_ls == -2) {
+        const char* e = getenv("SPU_IRQWAIT_LS");
+        s_ls = e && *e ? (long)(strtoul(e, NULL, 16) & (SPU_LS_SIZE - 16) & ~0xFul) : -1;
+    }
+    char extra[64] = "";
+    if (s_ls >= 0) {
+        const uint8_t* p = ctx->ls + s_ls;
+        snprintf(extra, sizeof extra, " LS[%05lX]=%02X%02X%02X%02X %02X%02X%02X%02X "
+                 "%02X%02X%02X%02X %02X%02X%02X%02X", s_ls,
+                 p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+                 p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+    }
+    fprintf(stderr, "[irq-wait] img=%d pc=0x%05X dispatches=%llu status=0x%X mask=0x%X "
+            "list_stall_mask=0x%X list_stall_stat=0x%X%s\n",
+            ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), s_n, ctx->event_status,
+            ctx->event_mask, ctx->list_stall_mask, ctx->list_stall_stat, extra);
+    fflush(stderr);
 }
 
 void (*spu_take_interrupt(spu_context* ctx,
@@ -413,7 +486,7 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
         g_spu_depth_guard_limit = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
     }
-    const uint32_t s_max=g_spu_depth_guard_limit;
+    const uint32_t s_max = g_spu_depth_guard_limit;
 
     /* Ring of recent drain sites. When the depth trips, the useful question is
      * not "where are we" but "what cycle got us here" -- one pc names a point,
@@ -577,22 +650,29 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t return_pc)
 {
     ctx->region_dispatch_valid=0;
+    if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
     spu_depth_guard_check(ctx);
+    /* On the way out, the enclosing drain's return pc is the innermost one
+     * again. It used to be 0 until that drain's next step re-set it, and with
+     * SPU_DIRECT the code after a call can tail-call on for a long while
+     * before it takes a step. */
+    const uint32_t outer_ret_pc = ctx->drain_ret_pc;
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
      * after the handler's first host function returns -- the handler keeps
      * running as trampolines of this loop -- until its iret fires or the
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
+    /* Nested contexts/drains share this thread's cursor. Only its address is
+     * stable across guest calls and IRQ longjmps, never the stored contents. */
+    spu_recent_history* const recent = &t_recent;
     /* The pending-transfer slot is thread-local, and on Darwin every access
      * to a thread-local is a call to the TLV resolver. The slot's address is
      * fixed for the life of this host thread, and a drain never leaves its
      * thread, so resolve it once per drain instead of once per access. */
     void (**const tramp)(spu_context*) = &g_spu_trampoline_fn;
-    /* Nested contexts/drains share this thread's cursor. Only the object
-     * address is stable across calls and IRQ longjmps, never its contents. */
-    spu_recent_history* const recent = &t_recent;
-#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; ctx->region_dispatch_valid=0; } while (0)
+
+#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = outer_ret_pc; ctx->region_dispatch_valid=0; } while (0)
     for (;;) {
         while (*tramp) {
             if (*tramp == spu_indirect_branch &&
@@ -625,7 +705,7 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
                         /* iret fired deeper: registers restored, pc = srr0 */
                         ctx->host_depth = f.depth;
                         ctx->image_id = f.image_id;
-                        (*tramp) = spu_indirect_branch;
+                        *tramp = spu_indirect_branch;
                         SPU_DRAIN_POP_IRQ();
                     }
                     continue;
@@ -646,12 +726,13 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
                             (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
                             (int)ctx->resident_ovl); }
-                (*tramp) = spu_indirect_branch;
+                *tramp = spu_indirect_branch;
                 continue;
             }
         }
         {
             extern void spu_restart_dispatch(spu_context*);
+            ctx->dbg_reset_inner_ret = return_pc & SPU_LS_MASK;   /* [spu-restart] */
             SPU_DRAIN_POP_IRQ();
             spu_restart_dispatch(ctx);
             return;

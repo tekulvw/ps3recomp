@@ -2,7 +2,10 @@
  * pairs: each distinct transform program gets its own pipeline, revisiting
  * any of them reuses it, and a transform program rewritten in place is a new
  * pipeline. Also the inline-constant collector's slot contract. No title
- * data. */
+ * data.
+ *
+ * Build like test_rsx_draw_engine.c, substituting this file and adding
+ * -I libs/video/tests. */
 #define main old_engine_tests_main
 #include "test_rsx_draw_engine.c"
 #undef main

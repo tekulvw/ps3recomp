@@ -21,12 +21,15 @@ typedef struct { const void* buf; NSUInteger off; } FakeBinding;
 @public
     const void *pso, *ds; MTLCullMode cull; MTLWinding winding; uint32_t stencil;
     MTLViewport vp; MTLScissorRect sc; int have_sc;
+    MTLDepthClipMode clip; float bias, slope, clamp;
     FakeBinding vbuf[32], fbuf[32];
     const void *ftex[32], *fsamp[32], *vtex[32], *vsamp[32];
     unsigned calls, draws;
 }
 - (void)setRenderPipelineState:(id)s { pso = (__bridge const void*)s; calls++; }
 - (void)setDepthStencilState:(id)s { ds = (__bridge const void*)s; calls++; }
+- (void)setDepthClipMode:(MTLDepthClipMode)m { clip = m; calls++; }
+- (void)setDepthBias:(float)b slopeScale:(float)s clamp:(float)c { bias = b; slope = s; clamp = c; calls++; }
 - (void)setCullMode:(MTLCullMode)m { cull = m; calls++; }
 - (void)setFrontFacingWinding:(MTLWinding)w { winding = w; calls++; }
 - (void)setStencilReferenceValue:(uint32_t)v { stencil = v; calls++; }
@@ -57,6 +60,7 @@ static void expect_record(FakeEncoder* e, const EngRecord* r, id<MTLBuffer> stag
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
     CHECK(e->pso == (__bridge const void*)p->pso && e->ds == (__bridge const void*)p->ds &&
           e->cull == p->cull && e->winding == p->winding && e->stencil == r->stencil_ref, "draw %d: pipeline state", n);
+    CHECK(e->clip == p->clip && e->bias == r->depth_bias && e->slope == r->depth_slope && e->clamp == 0.0f, "draw %d: depth clip/bias", n);
     CHECK(e->vp.originX == r->vp[0] && e->vp.originY == r->vp[1] && e->vp.width == r->vp[2] && e->vp.height == r->vp[3],
           "draw %d: viewport", n);
     CHECK(have_sc == e->have_sc && (!have_sc || !memcmp(&e->sc, sc, sizeof *sc)), "draw %d: scissor", n);
@@ -89,6 +93,7 @@ int main(void)
             s_eng_pipe[i].pso = (id<MTLRenderPipelineState>)[NSObject new];
             s_eng_pipe[i].ds = (id<MTLDepthStencilState>)[NSObject new];
             s_eng_pipe[i].cull = i == 2 ? MTLCullModeBack : MTLCullModeNone;
+            s_eng_pipe[i].clip = i == 1 ? MTLDepthClipModeClamp : MTLDepthClipModeClip;
             s_eng_pipe[i].winding = i == 1 ? MTLWindingClockwise : MTLWindingCounterClockwise;
         }
         s_eng_pipe_count = 3;
@@ -113,6 +118,7 @@ int main(void)
             for (int d = 0; d < draws; d++, n++) {
                 /* Mostly repeats, as a material run is. */
                 if (!d || rnd(4) == 0) r.pipeline = 1 + rnd(3);
+                r.depth_bias = (float)(d % 3); r.depth_slope = (float)(d % 2);
                 if (!d || rnd(5) == 0) r.stencil_ref = rnd(2);
                 if (!d || rnd(6) == 0) { r.vp[0] = (float)rnd(2); r.vp[1] = 0; r.vp[2] = 64.0f + (float)rnd(2); r.vp[3] = 32; }
                 if (rnd(5) == 0) { r.sc[0] = rnd(3); r.sc[1] = 0; r.sc[2] = rnd(3) * 8u; r.sc[3] = 16; }
@@ -125,7 +131,7 @@ int main(void)
                 eng_encode_draw(enc, &r, stage);
                 expect_record(fake, &r, stage, &sc, have_sc, n);
                 /* What sending everything would have cost. */
-                unfiltered += 6 + 1 + (r.vs_cb_bytes != 0) + (r.ps_cb_bytes != 0) + (r.sc[2] && r.sc[3]) +
+                unfiltered += 6 + 2 + 1 + (r.vs_cb_bytes != 0) + (r.ps_cb_bytes != 0) + (r.sc[2] && r.sc[3]) +
                               2 * RSX_BE_MAX_TEXTURES + 2 * RSX_BE_MAX_VERTEX_TEXTURES;
             }
             total_calls += fake->calls; total_draws += fake->draws;

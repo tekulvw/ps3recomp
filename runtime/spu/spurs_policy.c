@@ -160,9 +160,9 @@ struct PmSlot { SRWLOCK lock; spu_context* ctx; uint64_t data; struct PmInstance
     const uint8_t* pm; uint32_t size, wid; spu_lifted_entry_fn entry; int image_id; };
 static struct PmInstance {
     int used, retiring;
-    unsigned users, workload_users[16];
+    unsigned users, workload_users[32];   /* a CellSpurs2 has 32 workloads */
     uint32_t ea;
-    struct PmSlot slots[16][6];
+    struct PmSlot slots[32][6];
 } s_pm_instances[SPURS_PM_INSTANCES];
 static SRWLOCK s_pm_directory_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_pm_directory_wake;
@@ -209,7 +209,7 @@ static void policy_slot_release(struct PmSlot* slot)
  * a direct caller that still owns a reference makes removal BUSY instead. */
 int spurs_policy_release_workload(uint32_t ea, uint32_t wid)
 {
-    if (wid >= 16) return -1;
+    if (wid >= 32) return -1;
     AcquireSRWLockExclusive(&s_pm_directory_lock);
     for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++) {
         struct PmInstance* pi = &s_pm_instances[i];
@@ -253,7 +253,7 @@ void spurs_policy_release_instance(uint32_t ea)
         /* The retiring marker prevents new callers; endpoint callbacks do not
          * need this directory lock. Let other instances run while refs drain. */
         ReleaseSRWLockExclusive(&s_pm_directory_lock);
-        for (unsigned w = 0; w < 16; w++) for (unsigned n = 0; n < 6; n++) {
+        for (unsigned w = 0; w < 32; w++) for (unsigned n = 0; n < 6; n++) {
             struct PmSlot* slot = &pi->slots[w][n];
             AcquireSRWLockExclusive(&slot->lock);
             if (slot->ctx) {
@@ -293,7 +293,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * never progress its claim/stage pipeline). Image + context init happen
      * once; re-entries keep LS and only refresh the entry registers and the
      * (possibly game-updated) kernel-context fields. */
-    enum { SPURS_PM_MAX_WKL = 16 };
+    enum { SPURS_PM_MAX_WKL = 32 };   /* a CellSpurs2 has 32 workloads (slots[32][6]) */
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     struct PmSlot* resident = policy_slot(spurs_ea, wid, spu_num);
     if (!resident) return -1;
@@ -380,6 +380,13 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * selectWorkload -- so it called our exit intercept for every poll and
      * branched to 0 for every select. It also tests wklCurrentId (0x1DC) against
      * 1, which only reads sensibly at the correct offset. */
+    /* tempArea (LS 0x100..0x17F): the kernel copies the instance's first line
+     * there when it selects a workload, and policy modules and their jobs read
+     * it rather than DMA the instance again. God of War: Ascension's job code
+     * tests flags1 there (SF1_32_WORKLOADS at 0x174) before it looks up a
+     * workload of the second set; read as zero, the lookup took its error path. */
+    { extern uint8_t* vm_base;
+      if (spurs_ea) memcpy(ls + 0x100, vm_base + spurs_ea, 0x80); }
     KBE32(0x1C0, 0);                    /* spurs EA hi32 (u64 ptr)  */
     KBE32(0x1C4, spurs_ea);             /* spurs EA lo32            */
     KBE32(0x1C8, spu_num);              /* spuNum (virtual SPU / lane row) */
@@ -527,7 +534,33 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                     spu_num, (void*)ctx, pm_halted, ctx->status, (uint32_t)ctx->pc & SPU_LS_MASK,
                     ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], ctx->host_depth);
             for (unsigned k = 0; k < n; k++) fprintf(stderr, " %05X", r[k]);
-            fprintf(stderr, "\n"); fflush(stderr); } }
+            fprintf(stderr, "\n");
+            /* Which workload and code the run was in, the drain/interrupt state
+             * it ended with, and the depth-0 restarts it went through (the
+             * return pc each one found: a stale one stops the interpreter
+             * fallback at a mid-function return address). */
+            fprintf(stderr, "[pm-end]   wid=%u spurs=0x%08X data=0x%llX img=%d ovl=%d task=%d "
+                    "LS1DC=0x%08X drain_ret=0x%05X irq_frame=%d int_en=%u ev=0x%X/0x%X "
+                    "resets=%u last_reset_pc=0x%05X stale_ret=0x%05X\n",
+                    wid, spurs_ea, (unsigned long long)wkl_data, ctx->image_id,
+                    (int)ctx->resident_ovl, (int)ctx->resident_task,
+                    ((uint32_t)ctx->ls[0x1DC] << 24) | ((uint32_t)ctx->ls[0x1DD] << 16) |
+                    ((uint32_t)ctx->ls[0x1DE] << 8) | ctx->ls[0x1DF],
+                    ctx->drain_ret_pc & SPU_LS_MASK, ctx->irq_frame != 0, (unsigned)ctx->int_enable,
+                    ctx->event_status, ctx->event_mask, ctx->dbg_reset_n,
+                    ctx->dbg_reset_pc, ctx->dbg_reset_stale_ret & SPU_LS_MASK);
+            const uint32_t cn = ctx->dbg_chring_n < 16 ? ctx->dbg_chring_n : 16;
+            if (cn) {   /* PS3RECOMP_SPU_CHRING=1: oldest first; op 0 rdch, 1 wrch */
+                fprintf(stderr, "[pm-end]   channels:");
+                for (uint32_t k = 0; k < cn; k++) {
+                    const uint32_t i = (ctx->dbg_chring_n - cn + k) & 15u;
+                    fprintf(stderr, " %s%u@%05X=%08X", (ctx->dbg_chring[i].op_ch >> 16) ? "w" : "r",
+                            ctx->dbg_chring[i].op_ch & 0xFFFFu, ctx->dbg_chring[i].pc,
+                            ctx->dbg_chring[i].value);
+                }
+                fprintf(stderr, "\n");
+            }
+            fflush(stderr); } }
 
     if (s_claimlog) {
         unsigned claims = g_spu_putllc_sync_hit - claim_before;
@@ -554,8 +587,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         /* PER-WID cap: a shared cap gets exhausted by idle wid=0/1 before the
          * jobmanager (wid=12) ever runs in a long/good run. Give each wid its
          * own budget so wid=12's pipeline is always captured. */
-        static SPU_THREAD_LOCAL unsigned long s_pn_wid[16] = {0};
-        unsigned long s_pn = ++s_pn_wid[wid & 15];
+        static SPU_THREAD_LOCAL unsigned long s_pn_wid[32] = {0};
+        unsigned long s_pn = ++s_pn_wid[wid & 31];
         if (s_pn < 300) {
             const uint8_t* L = ctx->ls;
             #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])

@@ -13,7 +13,7 @@ def main():
     if os.name=='nt': print('SKIP standalone POSIX C++ fixture');return
     legacy=function('uint64_t ppu_guest_call_ct(')
     checked=function('int ppu_guest_call_ct_checked(') if 'int ppu_guest_call_ct_checked(' in s else ''
-    begin=s.index('struct ppu_active_context_scope');scope=s[begin:s.index('};',begin)+2]
+    begin=s.find('struct ppu_active_context_scope');scope=s[begin:s.index('};',begin)+2] if begin >= 0 else ''
     baseline="""// Baseline preserves the old ambiguous return contract so RED is behavioral.
 extern "C" int ppu_guest_call_ct_checked(uint32_t c,uint32_t t,uint64_t a,uint64_t b,uint64_t d,uint64_t e,uint64_t f,uint64_t g,uint64_t h,uint64_t i,uint64_t*out){*out=ppu_guest_call_ct(c,t,a,b,d,e,f,g,h,i);return 1;}
 """
@@ -25,6 +25,7 @@ using ppu_fn=void(*)(ppu_context*);
 static ppu_context* g_active_ctx=nullptr;
 static void(*g_trampoline_fn)(void*)=nullptr;
 #define PPU_TLS_TP 0x74000130
+static uint32_t ppu_cb_stack_sp(ppu_context*) { return 0x50000; }
 static unsigned calls=0;static bool throwing=false,trampoline=false;
 static void tail(void*p){auto*c=(ppu_context*)p;c->gpr[3]=0xFEDCBA9876543210ULL;}
 static void guest(ppu_context*c){++calls;assert(c==g_active_ctx);assert(c->gpr[2]==0x12345678);assert(c->thread_id==99);assert(c->gpr[13]==PPU_TLS_TP);for(unsigned i=0;i<8;++i)assert(c->gpr[3+i]==0x100000000ULL+i);if(throwing){g_trampoline_fn=tail;throw std::runtime_error("callback did not complete");}c->gpr[3]=0;if(trampoline)g_trampoline_fn=tail;}

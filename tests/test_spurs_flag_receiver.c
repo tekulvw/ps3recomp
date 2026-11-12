@@ -21,6 +21,14 @@ uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 unsigned long long ps3_ms_now(void) { return 0; }
 void ppu_resv_break_store(uint64_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;}
+/* spu_workload.c's taskset dispatch builds a task context (spurs_pm.c) and
+ * wakes the event-flag waiters (sys_event.c); no taskset runs here. */
+uint64_t spurs_pm_build_context(uint8_t* ls,uint32_t ts,uint32_t id,uint32_t a,uint32_t b)
+{(void)ls;(void)ts;(void)id;(void)a;(void)b;abort();}
+void ydkj_wake_all_event_flags(void){abort();}
+/* spu_workload.c's lifted-job runner publishes its context to the LV2 SPU
+ * thread table (GNU ld keeps the call); no lifted job runs here. */
+void spu_thread_publish_ctx(uint32_t tid,void* c){(void)tid;(void)c;abort();}
 #define S ((CellSpurs*)0x1000)
 #define CALL(w,s) ((u32)_cellSpursWorkloadFlagReceiver(S,w,s))
 static unsigned entries, expected_entry;
@@ -131,11 +139,20 @@ int main(void)
     pthread_join(a,&ar);pthread_join(b,&br);
     assert((!ar && (uintptr_t)br==0x8041080A) || (!br && (uintptr_t)ar==0x8041080A));
     assert(CALL(vm_base[0x1077],0)==0);
-    /* Unsupported SPURS2 cannot silently register a receiver. */
+    /* A CellSpurs2 (32 workload slots) serves its receiver through upstream's
+     * SPURS2 path (42c0471d; the merge routes SPURS2 here instead of the old
+     * NOSYS refusal): wid 32 is still out of range, and a receiver it names
+     * owns the flag until it stops naming itself. */
     vm_base[0x1074]=0x40;
     assert(CALL(32,1)==0x80410802);
-    assert(CALL(4,1)==0x80410803);
     assert(vm_base[0x1077]==0xFF);
+    vm_write32(0x106C,0);
+    assert(CALL(4,1)==0);
+    assert(vm_base[0x1077]==4 && vm_read32(0x106C)==0xFFFFFFFF);
+    assert(CALL(5,1)!=0 && vm_base[0x1077]==4);   /* one receiver at a time */
+    assert(CALL(5,0)!=0 && vm_base[0x1077]==4);   /* only the owner releases */
+    assert(CALL(4,0)==0);
+    assert(vm_base[0x1077]==0xFF && vm_read32(0x106C)==0xFFFFFFFF);
     vm_base[0x1074]=0;
     ppu_vm_size=0x1D6F;
     assert(CALL(4,1)==0x8041080D);

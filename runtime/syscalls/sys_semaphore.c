@@ -3,6 +3,7 @@
  */
 
 #include "sys_semaphore.h"
+#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
 #include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -250,8 +251,10 @@ int64_t sys_semaphore_create(ppu_context* ctx)
                    ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
 #endif
         s->protocol = proto_be;
-        /* name at offset 8 */
-        memcpy(s->name, attr_raw + 8, 8);
+        /* name at offset 0x18: sys_semaphore_attribute_t is protocol, pshared,
+         * ipc_key u64 @0x08, flags @0x10, pad @0x14, name[8] @0x18. Offset 8
+         * logged the ipc_key as the name. */
+        memcpy(s->name, attr_raw + 0x18, 8);
     }
 
 #ifdef _WIN32
@@ -305,10 +308,29 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    /* lv2 refuses to destroy a semaphore threads are blocked on (CELL_EBUSY).
+     * Closing the handle under them turned each waiter's wait into an instant
+     * failure and its loop into a spin on a deleted lock. A waiter a pending
+     * post already covers (waiters <= value) is on its way out; only the ones
+     * left over are blocked, which is lv2's condition. */
 #ifdef _WIN32
+    EnterCriticalSection(&s->value_lock);
+    const int blocked = s->waiters > s->value;
+    LeaveCriticalSection(&s->value_lock);
+    if (blocked) {
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     CloseHandle(s->sem_handle);
     DeleteCriticalSection(&s->value_lock);
 #else
+    pthread_mutex_lock(&s->mtx);
+    const int blocked = s->waiters > s->value;
+    pthread_mutex_unlock(&s->mtx);
+    if (blocked) {
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mtx);
 #endif
@@ -327,8 +349,17 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
 /* SEM_ERRDBG=1: report non-OK returns. PSGL's PlatformDevice asserts on one of
  * these once per frame, and naming the failing call beats inferring it. */
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
+#ifdef _WIN32
+/* libs/video/cellGcmSys.c: an event to wait on besides the semaphore, and the
+ * pump to run when it fires, so a flip handler that posts this semaphore runs
+ * as soon as the flip completes. Weak: the runtime also links without GCM. */
+void* ppu_gcm_wait_pump(void (**pump)(void));
+void* ppu_gcm_wait_pump_absent(void (**pump)(void)) { *pump = NULL; return NULL; }
+#pragma comment(linker, "/alternatename:ppu_gcm_wait_pump=ppu_gcm_wait_pump_absent")
+#endif
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     int64_t r = sys_semaphore_wait_impl(ctx);
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
     if (d && r) { static int n = 0; if (PS3_LOG_FIRST(n, 12))
@@ -344,6 +375,10 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
                   (unsigned long long)ctx->thread_id, 10); } }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    /* lv2_usec_deadline multiplies by the QPC frequency in 64 bits and wraps
+     * for a timeout past about 21 days; 2^63, say, comes out as "already
+     * passed". Beyond 2^40 us (12.7 days) is indistinguishable from forever. */
+    if (timeout_us > (1ull << 40)) timeout_us = 0;
     /* Per-port hook: an engine job manager may spin on sys_semaphore_wait /
      * trywait waiting for SPU-job completions a lifted policy module never
      * writes, so a port can satisfy them here. Defined weakly below, so this is
@@ -404,7 +439,15 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 
         /* Bounded slices keep timed waits on the QPC deadline. */
         DWORD ms = (timeout_us == 0) ? INFINITE : 1;
-        WaitForSingleObject(s->sem_handle, ms);
+        void (*pump)(void) = NULL;
+        HANDLE pump_ev = (HANDLE)ppu_gcm_wait_pump(&pump);
+        if (pump_ev && pump) {
+            HANDLE hs[2] = { s->sem_handle, pump_ev };
+            if (WaitForMultipleObjects(2, hs, FALSE, ms) == WAIT_OBJECT_0 + 1)
+                pump();
+        } else {
+            WaitForSingleObject(s->sem_handle, ms);
+        }
 
         EnterCriticalSection(&s->value_lock);
         if (s->waiters > 0) s->waiters--;

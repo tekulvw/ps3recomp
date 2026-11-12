@@ -18,10 +18,12 @@ int main(int argc, char** argv)
  const u32 normal=stub.bound_pipeline;char original[65536];strcpy(original,captured);
  m(M_SURFACE_FORMAT,8|(3u<<12));draw_triangle();const u32 aa2=stub.bound_pipeline;
  CHECK(aa2!=normal,"WPOS 2x1 chooses a different pipeline from 1x1");
- CHECK(strstr(captured,"input.position.xy * float2(0.5, 1.0)")!=NULL,"2x1 WPOS reads logical coordinates");
+ /* The engine applies rsx_fp_apply_wpos_grid (upstream 301f566e): every
+  * sample reads its logical pixel centre, floor(pos / grid) + 0.5. */
+ CHECK(strstr(captured,"input.position.xy = floor(input.position.xy / float2(2, 1)) + 0.5;")!=NULL,"2x1 WPOS reads logical coordinates");
  m(M_SURFACE_FORMAT,8|(4u<<12));draw_triangle();const u32 aa4=stub.bound_pipeline;
  CHECK(aa4!=aa2&&aa4!=normal,"WPOS 2x2 has its own pipeline");
- CHECK(strstr(captured,"input.position.xy * float2(0.5, 0.5)")!=NULL,"2x2 scales both coordinates");
+ CHECK(strstr(captured,"input.position.xy = floor(input.position.xy / float2(2, 2)) + 0.5;")!=NULL,"2x2 scales both coordinates");
  const int count=stub.n_pipeline_create;m(M_SURFACE_FORMAT,8);draw_triangle();
  CHECK(stub.bound_pipeline==normal&&stub.n_pipeline_create==count,"1x1 switchback reuses original pipeline");
  rsx_test_fp_instr(vm_base+0x60000,RSX_TEST_FP_OPC(1)|RSX_TEST_FP_MASK_XYZW|RSX_TEST_FP_INSRC_TC0|RSX_TEST_FP_END,RSX_TEST_FP_SRC_INPUT|RSX_TEST_FP_SWZ_IDENT);

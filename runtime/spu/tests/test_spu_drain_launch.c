@@ -2,19 +2,37 @@
  * dynamic IRQ delivery and iret unwinding, stack reset and LS0 completion.
  * A skipped checkpoint, cached context field, or stale trampoline must fail.
  * Neutral functions/ISA only; no guest files or substitute runtime hooks. */
-#define main launch_unused_mfc_main
-#include "test_spu_mfc_slots.c"
-#undef main
+#include "../spu_helpers.h"
+#include "../spu_coherency.h"
+#include "../spu_lockstep.h"
+#include "win32_compat.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+uint8_t* vm_base;
+uint32_t ppu_vm_size;
+extern void spu_begin_image(int);
+extern void spu_register_function(uint32_t, void (*)(spu_context*));
+extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+extern void spu_halt(spu_context*);
+extern void spu_mfc_release(spu_context*);
+static int g_pass, g_fail;
+static void check(int ok, const char* what) {
+    if (ok) { ++g_pass; return; }
+    ++g_fail; printf("FAIL: %s\n", what);
+}
+#define CHECK(cond) check((cond), #cond)
 extern unsigned spu_recent_pcs(uint32_t*, unsigned);
 extern uint32_t g_pm_flow_buf[8192];
 extern volatile unsigned g_pm_flow_n;
 extern void* volatile g_pm_flow_ctx;
 extern void spu_register_stack_reset_entry(uint32_t,int);
-extern volatile int g_yz_lockstep_on;
+extern void spu_drain_hop(spu_context*,void (*)(spu_context*));
 
 static void history(const uint32_t* want,unsigned n)
 {
-    uint32_t got[32];
+    uint32_t got[32]={0};
     CHECK(spu_recent_pcs(got,n)==n);
     CHECK(!memcmp(got,want,n*sizeof(*want)));
 }
@@ -61,7 +79,7 @@ static void outer(spu_context* c)
     raw->pc=0x2000;spu_task_launch_check(raw,(void*)to_return);
     CHECK(raw->steps==1);
     c->pc=0x1004;g_spu_trampoline_fn=nested_first;spu_drain_call(c,0x1010);
-    CHECK(!c->region_dispatch_valid && c->drain_ret_pc==0);
+    CHECK(!c->region_dispatch_valid && c->drain_ret_pc==0x101c);   /* #510: the enclosing drain's return pc again */
     raw->pc=0x2004;raw->gpr[6]=spu_link(0x2010);
     g_spu_trampoline_fn=to_return;spu_drain_call(raw,0x2010);CHECK(raw->steps==2);
     free(ls);raw->ls=raw->ls_store;release_context(raw);
@@ -69,9 +87,7 @@ static void outer(spu_context* c)
     CHECK(spu_run_with_halt(async_entry,async)==1);CHECK(async->steps==1);
     release_context(async);
     g_pm_flow_n=0;g_pm_flow_ctx=c;
-    /* A disabled predicate must be read again after the guest enables it.
-     * Stay below one quantum so no synthetic ring membership is needed. */
-    g_yz_lockstep_on=1;
+    g_yz_lockstep_on=1; /* Must be observed on the next hop, not cached off. */
     c->pc=0x1014;g_spu_trampoline_fn=final_leaf;
 }
 static void context_history(void)
@@ -94,9 +110,13 @@ static void checkpoint_paths(void)
     spu_task_launch_check(c,(void*)macro_target);
     CHECK(c->steps==1 && c->lockstep_quantum_ctr==0); /* launch-only ABI */
     c->pc=0x9004;g_spu_trampoline_fn=macro_target;SPU_DRAIN(c);
-    CHECK(spu_region_local_step(c,macro_target)==1);
+    CHECK(c->steps==2 && c->lockstep_quantum_ctr==1);
+    spu_drain_hop(c,macro_target);
     CHECK(c->steps==3 && c->lockstep_quantum_ctr==2);
     const uint32_t want[]={0x9000,0x9004,0x9008};history(want,3);
+    /* The region-local checkpoint (connected regions) runs the same hop. */
+    c->pc=0x900C;CHECK(spu_region_local_step(c,macro_target)==1);
+    CHECK(c->steps==4 && c->lockstep_quantum_ctr==3);
     g_yz_lockstep_on=0;release_context(c);
 }
 static unsigned irq_count,stale_handler,irq_finished;
@@ -153,7 +173,7 @@ static void reset_target(spu_context* c)
 }
 static void reset_bridge(spu_context* c)
 {
-    /* Registration occurs after the owning and nested drains have begun. */
+    /* Late registration while both owning drains are already active. */
     spu_register_stack_reset_entry(0x5004,905);
     c->pc=0x5004;g_spu_trampoline_fn=reset_target;
 }
@@ -190,31 +210,53 @@ static void ls0_completion(void)
     CHECK(zero_entries==1 && zero_later==0 && c->steps==2);
     const uint32_t want[]={0,0};history(want,2);release_context(c);
 }
-static void* thread_history(void* arg)
+static DWORD WINAPI thread_history(LPVOID arg)
 {
     const uint32_t pc=(uint32_t)(uintptr_t)arg;
-    uint32_t got[32];CHECK(spu_recent_pcs(got,32)==0);
+    uint32_t got[32]={0};CHECK(spu_recent_pcs(got,32)==0);
     spu_context* c=make_context(907);c->pc=pc;c->gpr[6]=spu_link(pc+4);
     g_spu_trampoline_fn=to_return;spu_drain_call(c,pc+4);
     CHECK(spu_recent_pcs(got,32)==1 && got[0]==pc && c->steps==1);
-    release_context(c);return NULL;
+    release_context(c);return 0;
 }
+static int armed_lockstep(void)
+{
+    CHECK(yz_lockstep_enabled()==1);
+    spu_context* c=make_context(908);
+    for (unsigned i=0;i<2;++i) {
+        c->pc=0x7100+4*i;c->gpr[6]=spu_link(c->pc+4);
+        g_spu_trampoline_fn=to_return;spu_drain_call(c,c->pc+4);
+        /* Below the quantum: no scheduler participant is needed, but every
+         * real owning-drain hop must advance the enabled lockstep counter. */
+        CHECK(c->lockstep_quantum_ctr==i+1 && c->steps==i+1);
+    }
+    const uint32_t want[]={0x7100,0x7104};history(want,2);
+    release_context(c);
+    printf("DRAIN_LAUNCH lockstep passed=%d failed=%d\n",g_pass,g_fail);
+    return g_fail?1:0;
+}
+static int small_depth;
 static void depth_probe(spu_context* c)
 {
-    const unsigned depths[]={3,4,5,7,8};
-    for(unsigned i=0;i<5;++i){
-        c->host_depth=depths[i];c->pc=0xa000+depths[i]*4;
-        SPU_DRAIN(c);
+    static const unsigned ordinary[]={3,4,5,7,8};
+    static const unsigned small[]={0,1};
+    static const unsigned defaults[]={999,1000,1001,1999,2000};
+    const unsigned* depths=small_depth==1?small:small_depth==2?defaults:ordinary;
+    unsigned count=small_depth==1?2:5;
+    for (unsigned i=0;i<count;++i) {
+        c->host_depth=depths[i];c->pc=0xa000+depths[i]*4;SPU_DRAIN(c);
     }
-    CHECK(0); /* depth 8 must halt through the real owning driver */
+    CHECK(0); /* The real depth guard must halt before the probe returns. */
 }
 int main(int argc,char** argv)
 {
-    if(argc==2 && !strcmp(argv[1],"depth")){
+    if (argc==2 && !strncmp(argv[1],"depth",5)) {
+        small_depth=!strcmp(argv[1],"depth-small")?1:!strcmp(argv[1],"depth-default")?2:0;
         spu_context* c=make_context(908);
         CHECK(spu_run_with_halt(depth_probe,c)==1);release_context(c);
         printf("DEPTH passed=%d failed=%d\n",g_pass,g_fail);return g_fail?1:0;
     }
+    if (argc==2 && !strcmp(argv[1],"lockstep")) return armed_lockstep();
     spu_begin_image(904);spu_register_function(0x8000,irq_handler);
     spu_register_function(0x4104,irq_resume);spu_begin_image(905);
     spu_register_function(0x5004,reset_target);spu_begin_image(0);
@@ -222,7 +264,28 @@ int main(int argc,char** argv)
     uint32_t before[32],after[32];unsigned n=spu_recent_pcs(before,32);
     /* Separate fresh host threads must not inherit the caller's TLS history.
      * Join each before checking so fixture accounting itself has no data race. */
-    for(unsigned i=0;i<2;++i){pthread_t t;CHECK(!pthread_create(&t,NULL,thread_history,(void*)(uintptr_t)(0x7000+4*i)));CHECK(!pthread_join(t,NULL));}
+    for (unsigned i=0;i<2;++i) {
+        HANDLE t=CreateThread(NULL,0,thread_history,(void*)(uintptr_t)(0x7000+4*i),0,NULL);
+        CHECK(t!=NULL);
+        if (t) { CHECK(WaitForSingleObject(t,10000)==WAIT_OBJECT_0); CHECK(CloseHandle(t)); }
+    }
     CHECK(spu_recent_pcs(after,32)==n && !memcmp(before,after,n*sizeof(*before)));
     printf("DRAIN_LAUNCH passed=%d failed=%d\n",g_pass,g_fail);return g_fail?1:0;
 }
+
+/* Interfaces outside this asset-free drain fixture. No PPU store, lv2 SPU
+ * publication or title-specific SPURS entry is expected: crossing one fails. */
+void ppu_resv_break_store(uint64_t ea) { (void)ea; abort(); }
+void ps3_ww_report_inline(uint32_t a,uint64_t v,int w) { (void)a;(void)v;(void)w;abort(); }
+unsigned long long ps3_ms_now(void) { abort(); }
+uint32_t g_ww_lo=0xFFFFFFFFu,g_ww_hi,g_barrier_sync_watch;
+int g_resv_store_active;
+void (*g_spurs_kernel_hook)(uint32_t);
+uint32_t g_ydkj_spurs_ctx_ea,g_ydkj_real_spurs_ea,g_ydkj_real_taskset_ea,g_ydkj_real_taskid;
+uint32_t g_spu_image_src_ea,g_spu_image_ls_start,g_spu_image_span;
+void spurs_ef_set_from_spu(uint32_t ea,uint16_t bits) { (void)ea;(void)bits;abort(); }
+void ydkj_wake_all_event_flags(void) { abort(); }
+void spurs_pm_build_context(spu_context* c,uint32_t a,uint32_t b,uint32_t d) {
+    (void)c;(void)a;(void)b;(void)d;abort();
+}
+void spu_thread_publish_ctx(uint32_t tid,void* c) { (void)tid;(void)c;abort(); }

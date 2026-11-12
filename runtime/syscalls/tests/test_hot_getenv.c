@@ -29,6 +29,7 @@ static char* hot_counting_getenv(const char* name)
 
 /* Symbols the unit references that these calls never reach. */
 uint8_t* vm_base;
+void ppu_thread_note_block(uint64_t tid) { (void)tid; }
 #if defined(HOT_UNIT_SEMAPHORE)
 void lbp_breadcrumb_dump(const char* why) { (void)why; }
 void ppu_log_host_chain(const char* why) { (void)why; }

@@ -41,18 +41,19 @@ extern "C" {
 #define CELL_SPURS_POLICY_MODULE_ERROR_ALIGN         0x80410810
 #define CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER  0x80410811
 
-#define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS | 0x21)
-#define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS | 0x22)
-#define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_ERROR_BASE_SPURS | 0x23)
-#define CELL_SPURS_TASK_ERROR_NOMEM             (CELL_ERROR_BASE_SPURS | 0x24)
-#define CELL_SPURS_TASK_ERROR_SRCH              (CELL_ERROR_BASE_SPURS | 0x25)
-#define CELL_SPURS_TASK_ERROR_NOENT             (CELL_ERROR_BASE_SPURS | 0x26)
-#define CELL_SPURS_TASK_ERROR_BUSY              (CELL_ERROR_BASE_SPURS | 0x2A)
-#define CELL_SPURS_TASK_ERROR_STAT              (CELL_ERROR_BASE_SPURS | 0x2F)
-#define CELL_SPURS_TASK_ERROR_ALIGN             (CELL_ERROR_BASE_SPURS | 0x30)
-#define CELL_SPURS_TASK_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x31)
-#define CELL_SPURS_TASK_ERROR_FAULT             (CELL_ERROR_BASE_SPURS | 0x32)
-#define CELL_SPURS_TASK_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x29)
+/* The task facility is 0x804109xx (SDK cell/spurs/error.h). */
+#define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS_TASK | 0x01)
+#define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS_TASK | 0x02)
+#define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_ERROR_BASE_SPURS_TASK | 0x03)
+#define CELL_SPURS_TASK_ERROR_NOMEM             (CELL_ERROR_BASE_SPURS_TASK | 0x04)
+#define CELL_SPURS_TASK_ERROR_SRCH              (CELL_ERROR_BASE_SPURS_TASK | 0x05)
+#define CELL_SPURS_TASK_ERROR_NOENT             (CELL_ERROR_BASE_SPURS_TASK | 0x06)
+#define CELL_SPURS_TASK_ERROR_BUSY              (CELL_ERROR_BASE_SPURS_TASK | 0x0A)
+#define CELL_SPURS_TASK_ERROR_STAT              (CELL_ERROR_BASE_SPURS_TASK | 0x0F)
+#define CELL_SPURS_TASK_ERROR_ALIGN             (CELL_ERROR_BASE_SPURS_TASK | 0x10)
+#define CELL_SPURS_TASK_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS_TASK | 0x11)
+#define CELL_SPURS_TASK_ERROR_FAULT             (CELL_ERROR_BASE_SPURS_TASK | 0x0D)
+#define CELL_SPURS_TASK_ERROR_PERM              (CELL_ERROR_BASE_SPURS_TASK | 0x09)
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -220,6 +221,8 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
                         s32 ppuPriority, u8 exitIfNoWork);
 s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
                                      const CellSpursAttribute* attr);
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr);
 s32 cellSpursFinalize(CellSpurs* spurs);
 /* Both arguments carry guest EAs through the generic HLE adapter. The output
  * is a guest BE32 pointer to the instance's 16-byte CellSpursWorkloadFlag. */
@@ -234,6 +237,8 @@ s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
 s32 cellSpursAttributeSetSpuThreadGroupType(CellSpursAttribute* attr,
                                             s32 type);
 s32 cellSpursAttributeEnableSpuPrintfIfAvailable(CellSpursAttribute* attr);
+s32 cellSpursAttributeEnableSystemWorkload(u64 attr_ea, u64 priority_ea, u32 maxSpu,
+                                           u64 preemptible_ea);
 
 s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads);
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
@@ -258,6 +263,10 @@ s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset2* taskset,
                            const CellSpursTasksetAttribute2* attr);
 s32 _cellSpursTasksetAttribute2Initialize(CellSpursTasksetAttribute2* attr,
                                          u32 revision);
+s32 cellSpursCreateTask2(CellSpursTaskset* taskset, u64 id_ea, u64 elf_ea,
+                         u64 argument_ea, u64 attr_ea);
+s32 _cellSpursTaskAttribute2Initialize(u64 attr_ea, u32 revision);
+s32 _cellSpursSendSignal(void* taskset, u32 taskId);
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset);
 s32 cellSpursDestroyTaskset2(CellSpursTaskset2* taskset);
 s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset);

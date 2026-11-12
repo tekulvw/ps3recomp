@@ -7,6 +7,8 @@
 #include "win32_compat.h"
 extern "C" {
 uint8_t* vm_base;
+// Buffering is covered by its own fixture; this test owns no logger thread.
+void ps3_stdio_init(void) {}
 uint32_t ppu_hle_inject_base=0x20000000;
 int spu_coh_is_reserved(uint32_t) { return 0; }
 void spu_coh_notify_write(uint32_t) { std::abort(); }

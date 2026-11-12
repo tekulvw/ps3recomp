@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <time.h>
 #include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "np_psnr.h"
@@ -346,23 +347,60 @@ s32 sceNpManagerUnregisterCallback(void)
     return CELL_OK;
 }
 
-s32 sceNpManagerRequestTicket2(const SceNpId* npId, const SceNpTicketVersion* version,
-    const char* serviceId, const void* cookie, u32 cookieSize,
-    const char* entitlementId, u32 consumedCount)
+/* Tickets, the account region and the network time come from the PSN
+ * servers. Unimplemented, these imports answered CELL_OK with nothing
+ * written: a title that requested a ticket waited for a GOT_TICKET event
+ * that never came, and one that read the region or the time used whatever
+ * was in its buffer. Checks and offline answers as RPCS3's sceNp.cpp:
+ * without a psnr server the manager is OFFLINE and so are these. Signed in
+ * to psnr, which issues no tickets, a request gets a failed GOT_TICKET at
+ * once and there is never a ticket to read; the region is the fake
+ * account's (US, English) and the time is the host's.
+ *
+ * The opt-in local provider (PS3RECOMP_NP_LOCAL_TICKET=1) signs the manager
+ * in too: RequestTicket2 then queues a local account payload (not a PSN
+ * ticket) for ps3_np_ticket_tick, GetTicket hands it out, and the region and
+ * the time answer as they do with psnr. */
+#define SCE_NP_COOKIE_MAX_SIZE 1024
+#define SCE_NP_TICKET_PARAM_SERIAL_ID   0
+#define SCE_NP_TICKET_PARAM_SUBJECT_DOB 11
+
+/* Signed in: a psnr server, or the opt-in local ticket provider. */
+static int np_manager_signed_in(void)
+{
+    return np_psnr_enabled() || np_local_ticket_enabled();
+}
+
+s32 sceNpManagerRequestTicket2(u32 npId, u32 version, u32 serviceId, u32 cookie,
+                               u32 cookieSize, u32 entitlementId, u32 consumedCount)
 {
     TICKET_LOCK();
     if (!s_np_initialized) { TICKET_UNLOCK(); return SCE_NP_ERROR_NOT_INITIALIZED; }
     u64 generation = s_np_generation;
     TICKET_UNLOCK();
-    if (!npId || !serviceId || cookieSize > 1024 || (cookieSize && !cookie))
+    if (!npId || !serviceId || cookieSize > SCE_NP_COOKIE_MAX_SIZE || (cookieSize && !cookie))
         return SCE_NP_AUTH_EINVALID_ARGUMENT;
-    if (!np_local_ticket_available()) return SCE_NP_ERROR_OFFLINE;
+    if (!np_local_ticket_available()) {
+        if (!np_psnr_enabled()) {
+            printf("[sceNp] ManagerRequestTicket2() -> OFFLINE\n");
+            return SCE_NP_ERROR_OFFLINE;
+        }
+        TICKET_LOCK();
+        const u32 cb = (u32)(uintptr_t)s_npmgr_cb, cb_arg = (u32)(uintptr_t)s_npmgr_cb_arg;
+        TICKET_UNLOCK();
+        if (cb) {
+            const u64 args[8] = { SCE_NP_MANAGER_EVENT_GOT_TICKET, (u64)(u32)SCE_NP_ERROR_INVALID_STATE,
+                                  (u64)cb_arg, 0, 0, 0, 0, 0 };
+            cellSysutilQueueGuestCallbackArgs(cb, args);
+        }
+        printf("[sceNp] ManagerRequestTicket2() -> GOT_TICKET failed (psnr issues no tickets)\n");
+        return CELL_OK;
+    }
     /* No cookie/entitlement authority exists in this local provider. */
     if (cookieSize || entitlementId || consumedCount) return (s32)CELL_ENOSYS;
-    if (version && (vm_read16((u32)(uintptr_t)version) != 2 ||
-                   vm_read16((u32)(uintptr_t)version + 2) != 1))
+    if (version && (vm_read16(version) != 2 || vm_read16(version + 2) != 1))
         return SCE_NP_AUTH_EINVALID_ARGUMENT;
-    if (!vm_read8((u32)(uintptr_t)serviceId)) return SCE_NP_AUTH_EINVALID_ARGUMENT;
+    if (!vm_read8(serviceId)) return SCE_NP_AUTH_EINVALID_ARGUMENT;
     const SceNpId* id = GUEST_PTR(npId, const SceNpId*);
     char requested[16], configured[16];
     if (id->handle.term) return SCE_NP_AUTH_EINVALID_ARGUMENT;
@@ -411,19 +449,22 @@ void ps3_np_ticket_tick(void)
     TICKET_UNLOCK();
 }
 
-s32 sceNpManagerGetTicket(void* buffer, u32* bufferSize)
+s32 sceNpManagerGetTicket(u32 buffer, u32 bufferSize)
 {
     if (!np_is_initialized()) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!bufferSize) return SCE_NP_ERROR_INVALID_ARGUMENT;
-    if (!np_local_ticket_available()) return SCE_NP_ERROR_OFFLINE;
+    if (!np_local_ticket_available()) {
+        vm_write32(bufferSize, 0);   /* no ticket: nothing to copy */
+        return CELL_OK;
+    }
     TICKET_LOCK();
     if (!s_np_initialized) { TICKET_UNLOCK(); return SCE_NP_ERROR_NOT_INITIALIZED; }
     if (!s_local_ticket_size || s_ticket_pending) { TICKET_UNLOCK(); return SCE_NP_ERROR_INVALID_STATE; }
-    u32 size_ea = (u32)(uintptr_t)bufferSize, size = s_local_ticket_size;
+    u32 size_ea = bufferSize, size = s_local_ticket_size;
     if (buffer && vm_read32(size_ea) < size) {
         vm_write32(size_ea, size); TICKET_UNLOCK(); return SCE_NP_ERROR_INSUFFICIENT_BUFFER;
     }
-    if (buffer) vm_memcpy_to((u32)(uintptr_t)buffer, s_local_ticket, size);
+    if (buffer) vm_memcpy_to(buffer, s_local_ticket, size);
     vm_write32(size_ea, size);
     TICKET_UNLOCK();
     printf("[sceNp] GetTicket: local account payload (%u bytes, not PSN)\n", size);
@@ -450,6 +491,36 @@ s32 sceNpManagerGetChatRestrictionFlag(s32* isRestricted)
 {
     if (!np_is_initialized()) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (isRestricted) vm_write32((u32)(uintptr_t)isRestricted, 0);
+    return CELL_OK;
+}
+
+s32 sceNpManagerGetTicketParam(s32 paramId, u32 param)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!param || paramId < SCE_NP_TICKET_PARAM_SERIAL_ID || paramId > SCE_NP_TICKET_PARAM_SUBJECT_DOB)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+    return SCE_NP_ERROR_INVALID_STATE;   /* no ticket was ever issued */
+}
+
+s32 sceNpManagerGetAccountRegion(u32 countryCode, u32 language)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!countryCode || !language) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (!np_manager_signed_in()) return SCE_NP_ERROR_OFFLINE;
+    vm_write8(countryCode + 0, 'u'); vm_write8(countryCode + 1, 's');   /* SceNpCountryCode */
+    vm_write8(countryCode + 2, 0);   vm_write8(countryCode + 3, 0);
+    vm_write32(language, 1);         /* CELL_SYSUTIL_LANG_ENGLISH_US */
+    return CELL_OK;
+}
+
+s32 sceNpManagerGetNetworkTime(u32 pTick)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!pTick) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (!np_manager_signed_in()) return SCE_NP_ERROR_OFFLINE;
+    /* CellRtcTick: microseconds since 0001-01-01 00:00 UTC. */
+    const u64 unix_us = (u64)time(NULL) * 1000000ull;
+    vm_write64(pTick, unix_us + 62135596800000000ull);
     return CELL_OK;
 }
 

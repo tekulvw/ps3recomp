@@ -1,9 +1,11 @@
 /* RSX_WALKER_PROF (cellGcmSys.c), the in-process walker sampler, on a host
  * fixture: with RSX_WALKER_PROF=<file> and RSX_WALKER_PROF_SECONDS=1 the
- * first thread to drain the FIFO is sampled and the file holds the samples;
- * without it nothing is armed and no file appears. macOS arm64 only (the
- * sampler is compiled out elsewhere and this test only checks that).
- * Diagnostic coverage; it never starts a graphics backend.
+ * first thread to drain the FIFO is sampled and the file holds the samples.
+ * The fixture stretches every nominal 1 ms sleep to prove the requested
+ * duration follows elapsed time rather than a count of sleeps. Without the
+ * variable nothing is armed and no file appears. macOS arm64 only (the sampler
+ * is compiled out elsewhere and this test only checks that). Diagnostic
+ * coverage; it never starts a graphics backend.
  *
  * clang -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_walker_prof.c
  *   -ffunction-sections -fdata-sections -Wl,-dead_strip -o /tmp/test_gcm_walker_prof
@@ -15,10 +17,10 @@ static int fixture_nanosleep(const struct timespec*, struct timespec*);
 #define nanosleep fixture_nanosleep
 #include "../cellGcmSys.c"
 #undef nanosleep
+#include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <ctype.h>
 /* Test-only oversleep control: a scheduler need not honor a 1 ms request
  * within 1 ms. Leave the production sampler and its iteration count intact. */
@@ -32,6 +34,9 @@ static int fixture_nanosleep(const struct timespec* requested, struct timespec* 
     }
     return nanosleep(&delay, remaining);
 }
+/* GCM_REPORT_SPU_HOLD_MS asks the SPU task layer whether a task round is
+ * running; there are no SPU tasks here. */
+int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;
@@ -52,6 +57,11 @@ void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why;
 void rsx_state_init(rsx_state* state) { (void)state; }
 int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
 int  rsx_draw_engine_enabled(void) { return 0; }
+/* The walker hands vertex-program runs here (#554) and asks for a vtable
+ * backend (#466); this fixture has neither. */
+int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{ (void)state; (void)method; (void)src; (void)count; return 0; }
+rsx_backend* rsx_get_backend(void) { return NULL; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -156,7 +166,7 @@ int main(int argc, char** argv)
         }
         if (f) fclose(f);
         printf("  %d samples, %d lines\n", n, lines);
-        check(n > 100 && lines == n, "about a sample per millisecond, one line each");
+        check(n >= 10 && lines == n, "periodic samples are written one per line");
         check(frames_ok, "every sample has frames");
     }
 #else

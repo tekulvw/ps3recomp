@@ -14,6 +14,7 @@
 #include "../../include/ps3emu/endian.h"
 #include "ppu_context.h"
 #include "../spu/spu_coh_ops.h"   /* PS3RECOMP_COH_VERSIONS (NULL when off) */
+#include "../spu/spu_coh_bitmap.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -133,8 +134,9 @@ void        ppu_resv_break_store_range(uint32_t ea, uint64_t bytes);
  * SPURS idle service parked in `rdch SPU_RdEventStat` learns work was posted.
  * Declared here rather than pulling spu_coherency.h into every HLE module.
  *
- * spu_coh_is_reserved is a load of a global that stays zero until an SPU
- * reserves its first line, so the ordinary store pays one predictable branch. */
+ * The stores test the bitmap inline (spu_coh_bitmap.h): a pointer that stays
+ * NULL until an SPU reserves its first line, so the ordinary store pays one
+ * predictable branch. */
 int         spu_coh_is_reserved(uint32_t addr);
 void        spu_lockline_lock(void);
 void        spu_lockline_unlock(void);
@@ -246,7 +248,7 @@ static inline int vm_block_reserved(uint32_t guest_dst, size_t len)
     uint32_t first = guest_dst & ~127u;
     uint32_t last  = (uint32_t)(guest_dst + (len - 1)) & ~127u;
     for (uint32_t line = first; ; line += 128u) {
-        if (spu_coh_is_reserved(line)) return 1;
+        if (spu_coh_line_reserved(line)) return 1;
         if (line == last) break;
     }
     return 0;

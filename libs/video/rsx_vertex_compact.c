@@ -187,7 +187,7 @@ void rsx_vertex_fetch_plan_prepare(
 {
     if (!plan)
         return;
-    /* Ordinary per-vertex attributes (frequency 0/1) all span the same
+    /* Ordinary per-vertex attributes (rsx_vertex_freq_plain) all span the same
      * elements: find them once for the draw instead of once per attribute.
      * The per-attribute walk was 2.2 ms of the RSX thread a frame in
      * inFAMOUS 2's New Marais. */
@@ -228,7 +228,8 @@ void rsx_vertex_fetch_plan_prepare(
 
         u32 first = UINT_MAX;
         u32 last = 0;
-        if (fetch->desc.frequency <= 1) {
+        if (rsx_vertex_freq_plain(fetch->desc.frequency,
+                                  (plan->divider_mask >> attr) & 1u)) {
             if (!plain_known) {
                 plain_known = 1;
                 for (u32 i = 0; i < count; i++) {
@@ -249,8 +250,8 @@ void rsx_vertex_fetch_plan_prepare(
             if (element > last) last = element;
         }
 
-        const u64 prefix =
-            (u64)plan->base_offset + (u64)fetch->desc.offset;
+        const u64 prefix = rsx_dsp_resolve_vertex_offset(
+            plan->base_offset, fetch->desc.offset);
         const u64 start = prefix + (u64)first * fetch->stride;
         const u64 end =
             prefix + (u64)last * fetch->stride + fetch->elem_size;
@@ -297,7 +298,8 @@ static int rsx_vertex_fetch_attr_value(
         source = NULL;
     } else if (plan->guest_ptr) {
         const u32 offset =
-            plan->base_offset + fetch->desc.offset +
+            rsx_dsp_resolve_vertex_offset(plan->base_offset,
+                                          fetch->desc.offset) +
             element * fetch->stride;
         source = plan->guest_ptr(
             plan->guest_user, fetch->desc.location, offset,
@@ -367,8 +369,8 @@ int rsx_vertex_fetch_many(
         const u32 first = fetch->stable_first;
         const u32 span = fetch->stable_last - first;
         const u32 fstride = fetch->stride;
-        const int plain = fetch->desc.frequency <= 1;
         const u32 modulo = (plan->divider_mask >> attr) & 1u;
+        const int plain = rsx_vertex_freq_plain(fetch->desc.frequency, modulo);
         const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
         switch (type) {
         case RSX_VTX_TYPE_FLOAT:

@@ -39,6 +39,12 @@ uint32_t g_barrier_sync_watch, g_spu_image_src_ea, g_spu_image_ls_start, g_spu_i
 int g_resv_store_active;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
+uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t ts, uint32_t id, uint32_t spu, uint32_t tag)
+{
+    (void)ls; (void)ts; (void)id; (void)spu; (void)tag;
+    assert(!"policy hop fixture does not dispatch async tasks"); return 0;
+}
+void ydkj_wake_all_event_flags(void) { assert(!"policy hop fixture does not wake async task flags"); }
 unsigned long long ps3_ms_now(void)
 {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -107,7 +113,7 @@ int main(int argc, char** argv)
     { extern uint8_t g_vm_page_bitmap[65536 / 8]; memset(g_vm_page_bitmap, 255, sizeof g_vm_page_bitmap); }
     add_workload(0, PM_A, pm_a, nspus);
     add_workload(1, PM_B, pm_b, nspus);
-    assert(spurs_initialize_common(SPURS_EA, nspus, "bench") == CELL_OK);
+    assert(spurs_initialize_common(SPURS_EA, nspus, "bench", SPURS_INST_SIZE) == CELL_OK);
     /* initialize zeroed the instance: publish the workloads' guest fields again. */
     add_workload(0, PM_A, pm_a, nspus);
     add_workload(1, PM_B, pm_b, nspus);

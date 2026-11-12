@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the actual guest time import and shared clock against monotonic bounds."""
+"""Exercise the actual guest time import and the runtime's shared host clock against monotonic bounds."""
 import os, subprocess, tempfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
@@ -9,12 +9,23 @@ end=source.index('/* sys_process_is_stack',start)
 body=source[start:end]
 if 'extern "C" uint64_t ppu_system_time_us(' not in body:
     body+='\nextern "C" uint64_t ppu_system_time_us(void){return 0;}\n'
+# The guest clock is the runtime's one host clock (sys_timer.c host_monotonic_ns: mftb, system
+# time and timers share it; mach_absolute_time on macOS, CLOCK_MONOTONIC elsewhere). Build the
+# real one into the fixture and bound the import by it.
+timer=(root/'runtime/syscalls/sys_timer.c').read_text()
+hstart=timer.index('uint64_t host_monotonic_ns(void)\n{')
+hend=timer.index('\n}\n',hstart)+3
 pre='''#include "ppu_context.h"
 #include <time.h>
 #include <stdint.h>
 #include <cassert>
 #include <cstdio>
-static uint64_t monotonic_us(){timespec t{};assert(!clock_gettime(CLOCK_MONOTONIC,&t));return uint64_t(t.tv_sec)*1000000+t.tv_nsec/1000;}
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
+extern "C" {
+'''+timer[hstart:hend]+'''}
+static uint64_t monotonic_us(){return host_monotonic_ns()/1000;}
 '''
 test='''int main(){ppu_context c{};uint64_t previous=0;
 for(unsigned i=0;i<1000;++i){auto before=monotonic_us();auto a=ppu_system_time_us();sys_time_get_system_time(&c);auto b=ppu_system_time_us();auto after=monotonic_us();assert(before<=a && a<=c.gpr[3] && c.gpr[3]<=b && b<=after && a>=previous);previous=b;}

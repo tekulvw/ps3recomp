@@ -3,9 +3,9 @@
 
 The three did not exist, so a title that resets a voice port when a talker
 stops, updates a port, or polls its signal state took the unresolved-NID
-path (MAG halts on cellVoiceResetPort under PS3_HLE_UNRESOLVED=halt minutes
-into a mission). This builds libs/audio/tests/test_voice_port_control.c and
-runs it.
+path (a retail title halted on cellVoiceResetPort under
+PS3_HLE_UNRESOLVED=halt minutes into a mission). This builds
+libs/audio/tests/test_voice_port_control.c and runs it.
 
 It needs a host C compiler (under CI=1 a missing one fails instead of
 skipping).

@@ -10,16 +10,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-static volatile int s_stop;
+static int s_stop, s_ready;
 
 __attribute__((noinline)) static void tprof_test_spin(void)
 {
     volatile unsigned x = 0;
-    while (!s_stop) x++;
+    while (!__atomic_load_n(&s_stop, __ATOMIC_ACQUIRE)) x++;
 }
 static void* spinner(void* arg)
 {
     ps3_tprof_thread('S', 7);
+    __atomic_fetch_add(&s_ready, 1, __ATOMIC_RELEASE);
     tprof_test_spin();
     ps3_tprof_thread_exit();
     return arg;
@@ -27,14 +28,16 @@ static void* spinner(void* arg)
 static void* sleeper(void* arg)
 {
     ps3_tprof_thread('P', 3);
-    while (!s_stop) usleep(1000);
+    __atomic_fetch_add(&s_ready, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&s_stop, __ATOMIC_ACQUIRE)) usleep(1000);
     ps3_tprof_thread_exit();
     return arg;
 }
 static void* stranger(void* arg)
 {
+    __atomic_fetch_add(&s_ready, 1, __ATOMIC_RELEASE);
     volatile unsigned x = 0;
-    while (!s_stop) x++;
+    while (!__atomic_load_n(&s_stop, __ATOMIC_ACQUIRE)) x++;
     return arg;
 }
 
@@ -42,12 +45,29 @@ int main(int argc, char** argv)
 {
 #if defined(__APPLE__) && defined(__aarch64__)
     const char* out = getenv("PS3_TPROF");
+    const char* trigger = getenv("PS3_TPROF_TRIGGER");
+    if (out && trigger) unlink(trigger);
     pthread_t a, b, c;
     pthread_create(&a, NULL, spinner, NULL);
     pthread_create(&b, NULL, sleeper, NULL);
     pthread_create(&c, NULL, stranger, NULL);
-    usleep(700 * 1000);   /* PS3_TPROF_SECONDS=0.3 plus the dump */
-    s_stop = 1;
+    /* Register both kinds before releasing the sampler. Collect to its cap,
+     * rather than requiring a hosted runner to meet a fixed sampling rate. */
+    const uint64_t deadline = ps3_ft_now() + 8000000000ull;
+    while (__atomic_load_n(&s_ready, __ATOMIC_ACQUIRE) != 3) {
+        if (ps3_ft_now() >= deadline) { printf("FAIL: thread registration timeout\n"); return 1; }
+        usleep(1000);
+    }
+    if (out && trigger) {
+        FILE* go = fopen(trigger, "w");
+        if (!go) { printf("FAIL: cannot release sampler\n"); return 1; }
+        fclose(go);
+    }
+    while (out && __atomic_load_n(&g_ps3_tprof.on, __ATOMIC_ACQUIRE) != 3) {
+        if (ps3_ft_now() >= deadline) { printf("FAIL: sampler completion timeout\n"); return 1; }
+        usleep(1000);
+    }
+    __atomic_store_n(&s_stop, 1, __ATOMIC_RELEASE);
     pthread_join(a, NULL); pthread_join(b, NULL); pthread_join(c, NULL);
     if (!out) {
         if (g_ps3_tprof.buf || g_ps3_tprof.nthreads) { printf("FAIL: armed while off\n"); return 1; }

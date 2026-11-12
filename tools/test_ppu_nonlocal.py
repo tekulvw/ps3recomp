@@ -54,6 +54,8 @@ DRIVER = r'''
 #include <thread>
 static unsigned char memory[0x10000];
 extern "C" { uint8_t* vm_base=memory; PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*)=nullptr; }
+// PPU_MM_SNAP (each lifted function) reads these; inline access stays off.
+extern "C" { int vm_inline_ok=0, vm_inline_st_ok=0; uint32_t ppu_vm_size=0, ppu_hle_inject_base=0, g_gcm_consumer_put_wake_ea=0; }
 extern "C" uint64_t vm_read64(uint64_t p){assert(p+8<=sizeof(memory));uint64_t v=0;for(int i=0;i<8;i++)v=v*256+memory[p+i];return v;}
 extern "C" uint32_t vm_read32(uint64_t p){assert(p+4<=sizeof(memory));uint32_t v=0;for(int i=0;i<4;i++)v=v*256+memory[p+i];return v;}
 extern "C" void vm_write64(uint64_t p,uint64_t v){assert(p+8<=sizeof(memory));for(int i=7;i>=0;i--){memory[p+i]=v;v>>=8;}}

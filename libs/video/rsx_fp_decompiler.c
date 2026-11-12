@@ -44,13 +44,6 @@
 #define FP_SRC_NEGATE       (1u << 17)
 #define FP_SRC0_ABS         (1u << 29) /* in DWORD1 */
 #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
-/* Source precision selectors all live in DWORD2, including SRC0/SRC2.
- * Modifier 4 saturates each lane before the source abs/neg modifiers. */
-#define FP_SRC0_PRECISION_SHIFT 19
-#define FP_SRC1_PRECISION_SHIFT 22
-#define FP_SRC2_PRECISION_SHIFT 25
-#define FP_SRC_PRECISION_MASK   7u
-#define FP_SRC_PRECISION_SAT    4u
 #define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
 
 /* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
@@ -322,11 +315,37 @@ typedef struct {
     int half;
     int negate;
     int abs;
-    int saturate;
+    int prec;       /* input precision modifier, 0 = none (see fp_src_prec_clamp) */
     char swz[5];    /* e.g. "xyzw" */
 } Src;
 
-static void decode_src(u32 w, int abs_bit, u32 precision, Src* s)
+/* Each source operand carries a 3-bit input precision modifier in DWORD2:
+ * bits 19-21 for SRC0, 22-24 for SRC1, 25-27 for SRC2. The hardware clamps the
+ * operand to that precision's range after abs and before negate:
+ *   1 half    [-65504, 65504]
+ *   2 fixed12 [-2, 2]
+ *   3 fixed9  [-1, 1]
+ *   4 saturate [0, 1]
+ * 0 (and the values above 4) leave the operand as it is. A soft-particle
+ * program that fades with MUL r, tex, |depth difference| and marks that source
+ * fixed9 relies on it: unclamped, the difference in metres saturates every
+ * fade to full opacity. */
+#define FP_SRC0_PREC_SHIFT  19
+#define FP_SRC1_PREC_SHIFT  22
+#define FP_SRC2_PREC_SHIFT  25
+
+static const char* fp_src_prec_clamp(int prec)
+{
+    switch (prec) {
+    case 1: return "-65504.0, 65504.0";
+    case 2: return "-2.0, 2.0";
+    case 3: return "-1.0, 1.0";
+    case 4: return "0.0, 1.0";
+    default: return NULL;
+    }
+}
+
+static void decode_src(u32 w, int abs_bit, Src* s)
 {
     static const char comp[4] = {'x','y','z','w'};
     s->type   = (w & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT;
@@ -334,7 +353,7 @@ static void decode_src(u32 w, int abs_bit, u32 precision, Src* s)
     s->half   = (w & FP_SRC_HALF) ? 1 : 0;
     s->negate = (w & FP_SRC_NEGATE) ? 1 : 0;
     s->abs    = abs_bit ? 1 : 0;
-    s->saturate = precision == FP_SRC_PRECISION_SAT;
+    s->prec   = 0;
     for (int i = 0; i < 4; i++)
         s->swz[i] = comp[(w >> (FP_SRC_SWZ_SHIFT + 2 * i)) & 3];
     s->swz[4] = '\0';
@@ -349,7 +368,7 @@ static const char* input_expr(u32 input_src)
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
-    case 0x0: return "input.position"; /* WPOS */
+    case 0x0: return "_rsx_wpos(input.position)"; /* WPOS (window origin applied below) */
     /* RSX clamps fragment color-input reads before swizzle/abs/negate.
      * Texture coordinates and the vertex output registers remain unbounded. */
     case 0x1: return "saturate(input.col0)"; /* COL0 */
@@ -398,14 +417,17 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
     }
 
     char swz[160];
-    if (s->saturate)
-        snprintf(swz, sizeof(swz), "saturate((%s).%s)", base, s->swz);
-    else
-        snprintf(swz, sizeof(swz), "(%s).%s", base, s->swz);
+    snprintf(swz, sizeof(swz), "(%s).%s", base, s->swz);
 
     const char* pre = "";
     const char* post = "";
     if (s->abs)    { pre = "abs("; post = ")"; }
+    const char* range = fp_src_prec_clamp(s->prec);
+    if (range) {   /* abs, then the precision clamp, then negate */
+        snprintf(buf, bufsz, s->negate ? "-(clamp(%s%s%s, %s))" : "clamp(%s%s%s, %s)",
+                 pre, swz, post, range);
+        return;
+    }
     if (s->negate) snprintf(buf, bufsz, "-(%s%s%s)", pre, swz, post);
     else           snprintf(buf, bufsz, "%s%s%s", pre, swz, post);
 }
@@ -850,12 +872,14 @@ static int rsx_fp_decompile_internal(
         else                         cmp_op = "==";  /* exec_eq only */
 
         Src s0, s1, s2;
-        decode_src(w1, w1 & FP_SRC0_ABS,
-            (w2 >> FP_SRC0_PRECISION_SHIFT) & FP_SRC_PRECISION_MASK, &s0);
-        decode_src(w2, w2 & FP_SRC1_ABS,
-            (w2 >> FP_SRC1_PRECISION_SHIFT) & FP_SRC_PRECISION_MASK, &s1);
-        decode_src(w3, 0,
-            (w2 >> FP_SRC2_PRECISION_SHIFT) & FP_SRC_PRECISION_MASK, &s2);
+        decode_src(w1, w1 & FP_SRC0_ABS, &s0);
+        decode_src(w2, w2 & FP_SRC1_ABS, &s1);
+        decode_src(w3, 0,                &s2);
+        if (!(w2 & FP_BRANCH)) {   /* a branch's DWORD2 holds other fields */
+            s0.prec = (int)((w2 >> FP_SRC0_PREC_SHIFT) & 7u);
+            s1.prec = (int)((w2 >> FP_SRC1_PREC_SHIFT) & 7u);
+            s2.prec = (int)((w2 >> FP_SRC2_PREC_SHIFT) & 7u);
+        }
 
         /* Inline constant: any CONST source pulls the next 16 bytes as a
          * float4 literal and advances past it. */
@@ -981,6 +1005,11 @@ static int rsx_fp_decompile_internal(
         case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+        /* Screen-space derivatives. God of War: Ascension's font is a distance
+         * field whose edge width is max(|ddx|, |ddy|) of the sampled value; as
+         * an unhandled op the destination kept 0 and every glyph bloated. */
+        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
+        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
         /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
          * builtins): the packed word is a scalar that replicates. */
@@ -1352,6 +1381,18 @@ static int rsx_fp_decompile_internal(
             "#else\n"
             "#define _rsx_inv_w(p) (1.0 / (p).w)\n"
             "#endif\n");
+    /* WPOS in the RSX window convention. The host position has its origin at the
+     * top left; with SET_SHADER_WINDOW origin BOTTOM the RSX counts y up from the
+     * bottom edge. A full-screen pass that builds its UV from it, e.g.
+     * uv = wpos * (1/W, -1/H) + (0, 1), mirrored its source when it read the host y.
+     * The draw engine passes the window height in fp_alpha.y when the origin is
+     * BOTTOM (0 otherwise) and a pixel-center bias in fp_alpha.z (-0.5 for INTEGER
+     * centers, 0 for HALF). A backend that leaves both 0 gets the host position. */
+    if (strstr(o.p, "_rsx_wpos("))
+        out_puts(&p, buffered
+            ? "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
+              "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z, (p).z, (p).w)\n"
+            : "#define _rsx_wpos(p) (p)\n");
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
@@ -1384,8 +1425,13 @@ static int rsx_fp_decompile_internal(
     if (shadow) for (u32 u = 0; u < 16; u++)
         if ((sampled_units & (1u << u)) && shadow[u].enabled)
             fp_shadow_helper(&p, u, tex_sep_mask, &shadow[u]);
-    if (gamma_units) fp_gamma_helper(&p);
-    if (expand_units || bx2_units) fp_expand_helper(&p);
+    /* Also wherever the body calls one: the unit scanners above skip an inline
+     * constant only after a non-branch instruction, the body walk after any,
+     * so a program with branches can desynchronise them. God of War:
+     * Ascension's level had programs that called _rsx_expand_input with no
+     * definition and failed to compile. */
+    if (gamma_units || strstr(o.p, "_rsx_gamma_input(")) fp_gamma_helper(&p);
+    if (expand_units || bx2_units || strstr(o.p, "_rsx_expand_input(")) fp_expand_helper(&p);
     /* NV40 pack/unpack. A packed word travels on in a float's bits, so the
      * packs bitcast and the unpacks bitcast back; the sRGB forms follow
      * RPCS3's _builtin_pkg/_builtin_upg (linear_to_srgb, srgb_to_linear).
@@ -1587,6 +1633,44 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref)
     return 1;
 }
 
+int rsx_fp_apply_depth_bounds(char* hlsl, u32 capacity, u32 unit)
+{
+    if (!hlsl || capacity == 0 || unit >= 16u) return -1;
+    const size_t len = strlen(hlsl);
+    if (len >= capacity || strstr(hlsl, "fp_dbounds")) return -1;
+    /* The units are declared one by one (Texture2D, TextureCube, Texture3D)
+     * or, when none is a cube or a volume, as one Texture2D array. */
+    char decl[64], name[24];
+    snprintf(decl, sizeof decl, "Texture2D   rsx_tex%u : register(t%u);\n", unit, unit);
+    if (strstr(hlsl, decl)) snprintf(name, sizeof name, "rsx_tex%u", unit);
+    else if (strstr(hlsl, "Texture2D    rsx_tex[16] : register(t0);\n"))
+        snprintf(name, sizeof name, "rsx_tex[%u]", unit);
+    else return -1;   /* a cube or volume slot */
+    static const char cb[] = "    float4 fp_alpha;\n";
+    static const char cb_add[] = "    float4 fp_dbounds;\n";
+    char* at_cb = strstr(hlsl, cb);
+    char* at_main = strstr(hlsl, " main(PSInput input)");
+    if (!at_cb || !at_main || at_cb > at_main) return -1;
+    char* body = strstr(at_main, "{\n");
+    if (!body) return -1;
+    body += 2;
+    char test[256];
+    const int tn = snprintf(test, sizeof test,
+        "    { const float _rsx_zs = %s.Load(int3(int2(input.position.xy), 0)).r;\n"
+        "      if (_rsx_zs < fp_dbounds.x || _rsx_zs > fp_dbounds.y) discard; }\n", name);
+    if (tn < 0 || (size_t)tn >= sizeof test) return -1;
+    const size_t add = (sizeof cb_add - 1) + (size_t)tn;
+    if (len + add + 1 > capacity) return -1;
+    const size_t a = (size_t)(at_cb - hlsl) + (sizeof cb - 1);   /* after fp_alpha's line */
+    const size_t b = (size_t)(body - hlsl);                      /* after main's brace    */
+    /* Shift the tail, then the middle, then write the two insertions. */
+    memmove(hlsl + b + add, hlsl + b, len - b + 1);
+    memmove(hlsl + a + (sizeof cb_add - 1), hlsl + a, b - a);
+    memcpy(hlsl + a, cb_add, sizeof cb_add - 1);
+    memcpy(hlsl + b + (sizeof cb_add - 1), test, (size_t)tn);
+    return 1;
+}
+
 int rsx_fp_apply_alpha_test_buffered(
     char* hlsl, u32 out_size, u32 func)
 {
@@ -1733,10 +1817,12 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
  * works this way, and leaves every non-UNNORM program byte-identical.
  *
  * Cube units are skipped: their coordinate is a float3 direction, and
- * RSX_TEX_FMT_UNNORM has no meaning for one.
+ * RSX_TEX_FMT_UNNORM has no meaning for one. A volume unit (Texture3D) is
+ * sampled with three coordinates, all in texels, so it is divided by its depth
+ * too (RPCS3's texture cache scales a 3D texture's r by 1/depth the same way).
  */
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
-                              const u32 dim[][2], u32 cube_mask)
+                              const u32 dim[][3], u32 cube_mask, u32 volume_mask)
 {
     if (!hlsl || !unnorm_mask) return 0;
     int patched = 0;
@@ -1744,8 +1830,9 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
     for (u32 u = 0; u < 16; u++) {
         if (!((unnorm_mask >> u) & 1u)) continue;
         if ((cube_mask >> u) & 1u) continue;
-        const u32 w = dim[u][0], h = dim[u][1];
-        if (!w || !h) continue;
+        const u32 w = dim[u][0], h = dim[u][1], d = dim[u][2];
+        const int volume = (volume_mask >> u) & 1u;
+        if (!w || !h || (volume && !d)) continue;
 
         /* Both spellings the emitter produces for a 2D unit. */
         char needles[2][40];
@@ -1771,8 +1858,12 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                 if (*p != ')') break;
 
                 char scale[80];
-                snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
-                         1.0 / (double)w, 1.0 / (double)h);
+                if (volume)
+                    snprintf(scale, sizeof scale, " * float3(%.9g, %.9g, %.9g)",
+                             1.0 / (double)w, 1.0 / (double)h, 1.0 / (double)d);
+                else
+                    snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
+                             1.0 / (double)w, 1.0 / (double)h);
                 const u32 slen = (u32)strlen(scale);
                 const u32 used = (u32)strlen(hlsl);
                 if (used + slen + 1 > hlsl_size) return -1;
@@ -1792,6 +1883,52 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
             memcpy(q, "rsx_tex", 7);
     }
     return patched;
+}
+
+/*
+ * WPOS on an antialiased surface (see the header).
+ *
+ * A backend that keeps a DIAGONAL_CENTERED_2 or SQUARE_*_4 target at its sample
+ * resolution maps the viewport over the sample grid, so a pixel program runs
+ * once per sample and SV_POSITION.x of a 960-pixel 2x1 target runs to 1920. A
+ * program that addresses a screen-sized texture by WPOS then reads it at twice
+ * the position: Resistance 3's material pass fetches its light and SSAO
+ * buffers that way and drew its lighting shifted on the left half of the frame
+ * and clamped to one edge column, full-width streaks, on the right half.
+ *
+ * Every sample of a pixel gets that pixel's centre, floor(pos / grid) + 0.5,
+ * the half-pixel centre SV_POSITION already gives on a 1x1 grid. The line goes
+ * first in main, before any read; z and w (the _rsx_inv_w source) are kept.
+ * WPOS reaches the body only as the emitter's "_rsx_wpos(input.position)"
+ * source (#589's window convention wraps it; _rsx_inv_w also reads
+ * input.position, so match the wrapper), so a program without it stays
+ * byte-identical. The grid applies first, then _rsx_wpos flips y in pixels.
+ */
+int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy)
+{
+    static const char wpos_read[] = "_rsx_wpos(input.position)";
+    static const char* const entries[] = { "main(PSInput input) : SV_TARGET {\n",
+                                           "main(PSInput input) {\n" };
+    if (!hlsl || !capacity || !sx || !sy) return -1;
+    if (sx == 1 && sy == 1) return 0;
+    size_t len = 0;
+    while (len < capacity && hlsl[len]) ++len;
+    if (len == capacity) return -1;
+    if (!strstr(hlsl, wpos_read)) return 0;
+    if (strstr(hlsl, "input.position.xy = floor(")) return -1;
+    char* body = NULL;
+    for (size_t i = 0; i < sizeof entries / sizeof entries[0] && !body; ++i) {
+        char* at = strstr(hlsl, entries[i]);
+        if (at) body = at + strlen(entries[i]);
+    }
+    if (!body) return -1;
+    char line[128];
+    const int n = snprintf(line, sizeof line,
+        "    input.position.xy = floor(input.position.xy / float2(%u, %u)) + 0.5;\n", sx, sy);
+    if (n < 0 || (size_t)n >= sizeof line || len + (size_t)n + 1 > capacity) return -1;
+    memmove(body + n, body, len - (size_t)(body - hlsl) + 1);
+    memcpy(body, line, (size_t)n);
+    return 1;
 }
 
 /* NV4097_SET_SHADER_PACKER accepts any nonzero value. Floating surfaces and

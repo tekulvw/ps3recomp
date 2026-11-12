@@ -52,8 +52,6 @@ head and middle nodes, with writes after removal. Test processes have a bounded
 deadline. Windows follows the same SRW-lock/condition-variable ordering but the
 POSIX thread fixture is skipped there.
 
-The branch is based on independent context-registry commit
-`383d4413a73b66e9761101ac46f2569853231fb7`, directly above pinned base
-`5244db92669b54831c6d3ebb7a96d58c4dbfa6df`, so its coherency traversal and lifetime
-tests use the intended live-context registry. It carries no other integration
-changes and no title addresses or title-specific workarounds.
+The change sits on upstream's WAIT_SIGNAL structure (#340) and adds only the
+line watch and its wake callback. It carries no other integration changes and
+no title addresses or title-specific workarounds.

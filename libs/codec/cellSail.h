@@ -141,14 +141,17 @@ u32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc);
 /* Memory allocator */
 /* Public 32-bit, big-endian guest records. These declarations describe
  * storage only; C entry points accept guest effective addresses. */
-typedef struct CellSailMemAllocator {
-    u32 callbacks;
-    u32 pArg;
-} CellSailMemAllocator;
 typedef struct CellSailMemAllocatorFuncs {
     u32 pAlloc;
     u32 pFree;
 } CellSailMemAllocatorFuncs;
+
+/* `callbacks` is the guest EA of a CellSailMemAllocatorFuncs table, not an
+ * embedded copy: PlayerInitialize2 follows it (see cellSail.c). */
+typedef struct CellSailMemAllocator {
+    u32 callbacks;
+    u32 pArg;
+} CellSailMemAllocator;
 
 /* Named pFuncs (not "callbacks") so the import-bridge generator's naming
  * heuristic (gen_imports.py param_marshal) treats this as a real guest

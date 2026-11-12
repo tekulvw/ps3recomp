@@ -39,6 +39,9 @@ void ppu_resv_break_store(uint64_t ea) {(void)ea;}
 int spu_coh_is_reserved(uint32_t ea) {(void)ea;return 0;}
 void spu_lockline_lock(void) {} void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t ea) {(void)ea;}
+/* Upstream registration hooks (spu_workload.c); no SPU runs here. */
+void spu_taskset_register(uint32_t ea) {(void)ea;}
+void spu_taskset2_register(uint32_t ea) {(void)ea;}
 void spu_coh_host_rmw_mark(uint32_t ea, uint32_t len) {(void)ea;(void)len;}
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w) {(void)a;(void)v;(void)w;}
 /* This Taskset1-only registration fixture does not dispatch runtime workers.

@@ -21,6 +21,12 @@ WEAK BOOL CloseHandle(HANDLE h){(void)h;abort();}
  * PS3RECOMP_RSX_REPORT_SPURS_KICK calls after a label publication: no SPU
  * side in these fixtures, so no hook. */
 WEAK void (*g_host_line_write_hook)(uint32_t line)=0;
+/* GCM_REPORT_SPU_HOLD_MS asks the SPU task layer whether a task round is
+ * running (runtime/spu/spu_workload.c); these fixtures have no SPU tasks. */
+WEAK int spu_taskset_round_busy(uint32_t* ts,uint32_t* tid){(void)ts;(void)tid;return 0;}
+/* The walker offers whole vertex-program runs to rsx_commands.c first; a
+ * fixture without it lets the walker take them method by method. */
+WEAK int rsx_process_vp_run(rsx_state* state,u32 method,const u8* src,u32 count){(void)state;(void)method;(void)src;(void)count;return 0;}
 WEAK int rsx_draw_engine_async_available(void){return 0;}
 WEAK u64 rsx_draw_engine_submit_async(void){return 0;}
 WEAK int rsx_draw_engine_completion_status(u64 ticket,int wait){(void)ticket;(void)wait;return -1;}

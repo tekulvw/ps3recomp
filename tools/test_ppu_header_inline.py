@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """tools/ppu_header_inline.py: inline guest stores (and loads, for an old header) behave as the out-of-line ones.
 
-Lifts a stub function, then builds the real ppu_loader.cpp and spu_coherency.c with three headers and runs
-tools/test_vm_fast_accessors.py's driver (values at every width and offset, raw SPU registers, the GCM
-ref-poll and PUT wake words, the dropped null-page store, LR on stores to an SPU-reserved line, and the
-diagnostics that must turn the fast paths off) against each:
-  - the lifter's header (inline loads, out-of-line stores): the reference;
-  - that header given inline stores (--stores);
-  - an old-style header without any inline accesses, given loads and stores by the tool.
-The transcripts must be identical. Each also runs with the runtime's fast accessors compiled in.
+The lifter's own header now has inline loads and stores (ppu_mm, PPU_MM_SNAP); the tool is for headers
+generated before that. Lifts a stub function, then builds the real ppu_loader.cpp and spu_coherency.c
+with these and runs tools/test_vm_fast_accessors.py's driver (values at every width and offset, raw SPU
+registers, the GCM ref-poll and PUT wake words, the dropped null-page store, LR on stores to an
+SPU-reserved line, and the diagnostics that must turn the fast paths off) against each:
+  - the lifter's header with PPU_NO_INLINE_STORES (inline loads, out-of-line stores): the reference;
+  - the lifter's header as generated (its own inline stores);
+  - an old-style header and lifted source without any inline accesses, given loads and stores by the tool.
+The transcripts must be identical. Each also runs with the runtime's fast accessors compiled in. The tool
+must refuse a header that already has inline stores, as the lifter's now does.
 """
 import os
 if os.name == 'nt':
@@ -22,35 +24,40 @@ from ppu_disasm import Instruction
 root = Path(__file__).resolve().parents[1]
 driver = re.search(r"driver = r'''(.*?)'''", (root / 'tools/test_vm_fast_accessors.py').read_text(), re.S).group(1)
 LOADS_START = '/* Inline guest-load fast paths.'
-LOADS_END = '#define vm_read64(a) vm_read64_inl(a)\n#endif\n'
+LOADS_END = '#define vm_write64(a, v) vm_write64_inl(a, v)\n#endif\n'   # the header's inline loads and stores
+MM_START = '/* Each lifted function opens with PPU_MM_SNAP;'                 # the source's per-function copy
+MM_END = '#define vm_write64(a, v) vm_write64_mm(&_mm, a, v)\n#endif\n'
 
 with tempfile.TemporaryDirectory(prefix='ppu-header-inline-') as tmp:
     p = Path(tmp); l = L.PPULifter()
     l.lift_function([Instruction(0x1000, 0, 'blr', '')], 0x1000, 0x1004)
     header = l.emit_header()
-    assert 'vm_read32_inl' in header and 'vm_write32_inl' not in header
+    source = l.emit_source()
+    assert 'vm_read32_inl' in header and 'vm_write32_inl' in header and 'PPU_MM_SNAP' in source
     i, j = header.index(LOADS_START), header.index(LOADS_END) + len(LOADS_END)
     old = header[:i] + header[j:]
-    assert 'vm_read32_inl' not in old
+    i, j = source.index(MM_START), source.index(MM_END) + len(MM_END)
+    old_source = '\n'.join(x for x in (source[:i] + source[j:]).split('\n') if x.strip() != 'PPU_MM_SNAP')
+    assert 'vm_read32_inl' not in old and 'vm_write32_inl' not in old and 'PPU_MM_SNAP' not in old_source
     dirs = {}
-    for name, text in (('lifter', header), ('old', old)):
-        d = p / f'src-{name}'; d.mkdir(); (d / 'ppu_recomp.h').write_text(text); (d / 'lifted.cpp').write_text(l.emit_source())
+    for name, text, src in (('lifter', header, source), ('old', old, old_source)):
+        d = p / f'src-{name}'; d.mkdir(); (d / 'ppu_recomp.h').write_text(text); (d / 'lifted.cpp').write_text(src)
         dirs[name] = d
     tool = [sys.executable, str(root / 'tools/ppu_header_inline.py')]
-    subprocess.run(tool + [str(dirs['lifter']), str(p / 'src-stores'), '--stores'], check=True)
     subprocess.run(tool + [str(dirs['old']), str(p / 'src-old-both'), '--stores'], check=True)
-    r = subprocess.run(tool + [str(p / 'src-stores'), str(p / 'src-twice'), '--stores'], capture_output=True, text=True)
-    assert r.returncode != 0, 'a header with inline stores must be refused'
-    variants = {'reference': dirs['lifter'], 'stores': p / 'src-stores', 'old+both': p / 'src-old-both'}
-    for v in variants.values():
+    for already in (dirs['lifter'], p / 'src-old-both'):
+        r = subprocess.run(tool + [str(already), str(p / f'src-twice-{already.name}'), '--stores'], capture_output=True, text=True)
+        assert r.returncode != 0, 'a header with inline stores must be refused'
+    variants = {'reference': (dirs['lifter'], ['-DPPU_NO_INLINE_STORES']), 'lifter': (dirs['lifter'], []),
+                'old+both': (p / 'src-old-both', [])}
+    for v, _ in variants.values():
         assert 'vm_read32_inl' in (v / 'ppu_recomp.h').read_text()
-    assert 'vm_write32_inl' in (variants['stores'] / 'ppu_recomp.h').read_text()
-    assert 'vm_write32_inl' in (variants['old+both'] / 'ppu_recomp.h').read_text()
+        assert 'vm_write32_inl' in (v / 'ppu_recomp.h').read_text()
     common = ['-O2', '-ffunction-sections', '-fdata-sections']
     transcripts = {}
-    for vname, src in variants.items():
+    for vname, (src, vdefines) in variants.items():
         (src / 'driver.cpp').write_text(driver)
-        for fast, defines in (('slow', []), ('fast', ['-DPS3RECOMP_VM_FAST_ACCESSORS=1'])):
+        for fast, defines in (('slow', vdefines), ('fast', vdefines + ['-DPS3RECOMP_VM_FAST_ACCESSORS=1'])):
             b = p / f'b-{vname}-{fast}'; b.mkdir()
             inc = ['-I'+str(root/'runtime/ppu'), '-I'+str(src), '-I'+str(root/'include'), '-I'+str(root/'runtime/spu'), '-I'+str(root/'runtime/platform')]
             subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', *common, '-I'+str(root/'include'), '-c', str(root/'runtime/spu/spu_coherency.c'), '-o', str(b/'coh.o')], check=True)
