@@ -49,7 +49,7 @@ def main():
         glslang_libs.append("-lSPIRV")
     sources = ["libs/video/tests/test_vulkan_present_cost.c"] + ["libs/video/" + name + ".c" for name in
         ("rsx_draw_engine", "rsx_fifo_busy", "rsx_commands", "rsx_dispatch", "rsx_texture_layout", "rsx_vertex_compact",
-         "rsx_vertex_fetch", "rsx_vp_decompiler", "rsx_fp_decompiler")] + [
+         "rsx_vertex_fetch", "rsx_vp_decompiler", "rsx_fp_decompiler", "rsx_encode_queue")] + [
         "runtime/diagnostics/critical_trace.c", "runtime/diagnostics/render_ablation.c",
         "libs/video/rsx_shader_spirv.cpp"]
     with tempfile.TemporaryDirectory(prefix="vulkan-present-cost-") as tmp:

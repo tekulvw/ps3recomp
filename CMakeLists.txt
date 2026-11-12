@@ -64,7 +64,8 @@ if(PS3RECOMP_RSX_VULKAN)
             "libvulkan-dev, Fedora: vulkan-headers -- or pass "
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
     endif()
-    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_encode_queue.c")
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_frontend_vulkan.c")
     # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
