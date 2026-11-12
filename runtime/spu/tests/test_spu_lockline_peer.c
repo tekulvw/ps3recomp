@@ -133,18 +133,26 @@ static void wrch(spu_context* ctx, uint32_t channel, uint32_t v)
  * (PS3RECOMP_COH_VERSIONS=1) deliver a lost reservation when the SPU looks,
  * and the assertions below hold for both. */
 static spu_context g_a, g_b;
+static int versions(void) { return g_spu_coh_ops != NULL; }
 static void look(void)
 {
     (void)spu_rchcnt(&g_a, SPU_RdEventStat);
     (void)spu_rchcnt(&g_b, SPU_RdEventStat);
 }
 
-static void spu_atomic(spu_context* ctx, uint32_t lsa, uint32_t ea, uint32_t cmd)
+/* Concurrent workers issue only their own context's command. Observe events
+ * after both workers finish, so a peer never settles a context mid-GETLLAR. */
+static void spu_atomic_issue(spu_context* ctx, uint32_t lsa, uint32_t ea, uint32_t cmd)
 {
     wrch(ctx, MFC_LSA, lsa);
     wrch(ctx, MFC_EAH, 0);
     wrch(ctx, MFC_EAL, ea);
     wrch(ctx, MFC_Cmd, cmd);
+}
+
+static void spu_atomic(spu_context* ctx, uint32_t lsa, uint32_t ea, uint32_t cmd)
+{
+    spu_atomic_issue(ctx, lsa, ea, cmd);
     look();
 }
 
@@ -355,20 +363,24 @@ static void test_registered_getllar_skips_the_lock(void)
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK(g_a.resv_valid == 0);
 
-    /* LINE_B has never been reserved, so its mark is set by this GETLLAR and
-     * must be set under the lock. */
-    TEST("a GETLLAR of an unmarked line still takes the lock");
-    CHECK(llar_completes_under_held_lock(LINE_B + 0x80) == 0);
+    /* The legacy scheme marks a new line under the lock. Version counters
+     * take a line snapshot without that lock or a holder registration. */
+    TEST(versions() ? "a version GETLLAR of an unmarked line does not need the lock"
+                    : "a GETLLAR of an unmarked line still takes the lock");
+    CHECK(llar_completes_under_held_lock(LINE_B + 0x80) == (versions() ? 1 : 0));
     CHECK(g_a.resv_valid == 1);
     CHECK_EQ_U32(g_a.resv_ea, LINE_B + 0x80);
 
     /* A context the holder list does not know (coh_listed clear) must link
      * itself first, under the lock, or no writer would ever find it. */
-    TEST("an unregistered context's GETLLAR of a marked line still takes the lock");
+    TEST(versions() ? "a version GETLLAR needs no holder registration"
+                    : "an unregistered context's GETLLAR of a marked line still takes the lock");
     spu_coh_unregister(&g_a);
     CHECK(g_a.coh_listed == 0);
-    CHECK(llar_completes_under_held_lock(LINE_A) == 0);
-    CHECK(g_a.coh_listed == 1);
+    CHECK(llar_completes_under_held_lock(LINE_A) == (versions() ? 1 : 0));
+    CHECK(g_a.coh_listed == (versions() ? 0 : 1));
+    CHECK(g_a.resv_valid == 1);
+    CHECK_EQ_U32(g_a.resv_ea, LINE_A);
 }
 
 /* A write racing a lock-free GETLLAR, for real. Two threads are released
@@ -390,7 +402,7 @@ static void* race_reader(void* arg)
     for (int k = 1; k <= RACE_ROUNDS; k++) {
         while (atomic_load(&g_race_go) != k) { }
         race_delay((unsigned)(k * 7) & 31u);
-        spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+        spu_atomic_issue(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
         atomic_store(&g_race_reader_done, k);
     }
     return NULL;
@@ -410,7 +422,7 @@ static void* race_writer(void* arg)
             spu_lockline_unlock();
         } else {
             memset(g_b.ls + LSA_B, v, 128);
-            spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
+            spu_atomic_issue(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
         }
         atomic_store(&g_race_writer_done, k);
     }
@@ -441,6 +453,7 @@ static void test_racing_write_ends_lockfree_reservation(void)
         atomic_store(&g_race_go, k);
         while (atomic_load(&g_race_reader_done) != k ||
                atomic_load(&g_race_writer_done) != k) { }
+        look();   /* Version counters publish a loss when the guest observes it. */
         const uint8_t v = (uint8_t)(k % 255 + 1);
         int whole = 1;
         for (int i = 0; i < 128; i++)
@@ -635,6 +648,7 @@ static void test_ack_keeps_a_concurrent_raise(void)
 
     /* The raise a peer's commit would make, under the lock that peer holds. */
     spu_coh_notify_write(LINE_A);
+    look();   /* The version scheme delivers LR at event observation. */
     CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
 
     spu_lockline_unlock();
