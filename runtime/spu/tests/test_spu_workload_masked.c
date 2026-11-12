@@ -32,6 +32,15 @@ void spu_coh_watch_remove(spu_coh_watch* w) { (void)w; }
 void spu_lockline_lock(void) { }
 void spu_lockline_unlock(void) { }
 void spu_mfc_release(spu_context* c) { (void)c; }
+/* This fixture registers and finds images; it never dispatches a task. Keep
+ * the task-pool lifecycle dependencies linkable, but fail if lookup reaches
+ * one instead of silently substituting task cleanup behavior. */
+void spu_spurs_task_thread_reset(void)
+{ assert(0 && "task execution is outside the masked-image lookup fixture"); }
+void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
+{ (void)lo; (void)hi; assert(0 && "task cleanup is outside the masked-image lookup fixture"); }
+void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
+{ (void)lo; (void)hi; assert(0 && "task cleanup is outside the masked-image lookup fixture"); }
 int spu_run_spurs_job(spu_lifted_entry_fn e, int id, uint32_t ea, uint32_t sz)
 { (void)e; (void)id; (void)ea; (void)sz; return -1; }
 int spu_run_with_halt(void (*f)(spu_context*), spu_context* c) { (void)f; (void)c; return -1; }
