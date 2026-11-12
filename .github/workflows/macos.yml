@@ -785,13 +785,15 @@ jobs:
             -lpthread -lm
           /tmp/test_spurs_job_stack
 
-      # The scheme-agnostic SPU/SPURS coherence suites above again, with
-      # per-line version counters on (PS3RECOMP_COH_VERSIONS, default off).
+      # The scheme-aware SPU/SPURS coherence suites above again, with per-line
+      # version counters on (PS3RECOMP_COH_VERSIONS, default off). The lifter
+      # loop's tools/test_coh_versions_suites.py does the same for the Python
+      # coherence suites.
       - name: Rerun the SPU coherence suites with version counters
         env:
           PS3RECOMP_COH_VERSIONS: "1"
         run: |
-          for t in test_spu_lockline_peer test_spu_taskset_wake test_spurs_signalled_atomic \
+          for t in test_spu_coherency test_spu_lockline_peer test_spu_taskset_wake test_spurs_signalled_atomic \
                    test_spurs_taskset_bits_atomic test_spu_lifted_start test_spu_mfc_slots \
                    test_spurs_job_stack; do
             echo "--- $t"

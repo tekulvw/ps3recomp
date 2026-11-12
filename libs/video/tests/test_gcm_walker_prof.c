@@ -13,27 +13,27 @@
  *      /tmp/test_gcm_walker_prof off <file>  (RSX_WALKER_PROF unset)
  */
 #include <time.h>
-#if defined(__APPLE__) && defined(__aarch64__)
-static int wprof_test_nanosleep(const struct timespec* req, struct timespec* rem);
-#define nanosleep wprof_test_nanosleep
-#endif
+static int fixture_nanosleep(const struct timespec*, struct timespec*);
+#define nanosleep fixture_nanosleep
 #include "../cellGcmSys.c"
-#if defined(__APPLE__) && defined(__aarch64__)
 #undef nanosleep
-/* Model timer coalescing: duration follows wall time, not 1000 sleeps. */
-static int wprof_test_nanosleep(const struct timespec* req, struct timespec* rem)
-{
-    struct timespec delayed = *req;
-    if (delayed.tv_sec == 0 && delayed.tv_nsec == 1000000)
-        delayed.tv_nsec = 5000000;
-    return nanosleep(&delayed, rem);
-}
-#endif
 #include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+/* Test-only oversleep control: a scheduler need not honor a 1 ms request
+ * within 1 ms. Leave the production sampler and its iteration count intact. */
+static int fixture_nanosleep(const struct timespec* requested, struct timespec* remaining)
+{
+    struct timespec delay = *requested;
+    const char* ticks = getenv("GCM_WALKER_FIXTURE_TICK_MS");
+    if (ticks && delay.tv_sec == 0 && delay.tv_nsec == 1000000) {
+        const long ms = strtol(ticks, NULL, 10);
+        if (ms > 1 && ms <= 20) delay.tv_nsec = ms * 1000000;
+    }
+    return nanosleep(&delay, remaining);
+}
 /* GCM_REPORT_SPU_HOLD_MS asks the SPU task layer whether a task round is
  * running; there are no SPU tasks here. */
 int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
@@ -146,8 +146,14 @@ int main(int argc, char** argv)
         check(f == NULL, "without RSX_WALKER_PROF no profile is written");
         if (f) fclose(f);
     } else {
-        walker_loop(4.0);
-        check(atomic_load(&s_wprof_state) == 2, "the sampler finishes after RSX_WALKER_PROF_SECONDS");
+        /* The producer requests one thousand 1 ms sleeps; host scheduling can
+         * stretch those sleeps. Keep the target doing real fixture work and
+         * wait for its explicit completion publication, with a hard bound. */
+        const double deadline = now_s() + 30.0;
+        while (atomic_load_explicit(&s_wprof_state, memory_order_acquire) != 2 && now_s() < deadline)
+            walker_loop(0.05);
+        check(atomic_load_explicit(&s_wprof_state, memory_order_acquire) == 2,
+              "the sampler publishes completion within the fixture deadline");
         FILE* f = fopen(path, "r");
         check(f != NULL, "the profile file is written");
         int n = -1, lines = 0, frames_ok = 1;

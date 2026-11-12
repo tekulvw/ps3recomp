@@ -314,13 +314,29 @@ typedef struct rsx_draw_backend {
      * (it may keep the upload it made for the previous draw), 0 to have the
      * engine call bind_vs_constants with the bytes instead. */
     int (*rebind_vs_constants)(void* user);
+    /* Optional pair: host-format vertex streams (rsx_vertex_host_streams_build,
+     * PS3RECOMP_RSX_HOST_VERTEX_FORMATS). pipeline_create_host is
+     * pipeline_create with one RSX_HOST_VF_* format per layout slot instead
+     * of the float4 stride: slot i is attribute location i, read from its own
+     * vertex buffer of tightly packed elements. draw_host draws with those
+     * streams: `data` holds them all (`data_bytes`), slot i at offsets[i],
+     * `vertex_count` elements each; `index_size` is 2 or 4. */
+    u32  (*pipeline_create_host)(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                 const rsx_be_render_state* rs,
+                                 const rsx_vertex_layout_plan* layout,
+                                 const u8* host_formats, rsx_be_format rt_fmt,
+                                 u32 rt_count);
+    void (*draw_host)(void* user, rsx_topology topology, const void* data, u32 data_bytes,
+                      const u32* offsets, u32 streams, u32 vertex_count,
+                      const void* indices, u32 index_count, u32 index_size);
     /* Optional. bind_vs_constants for a program that reads only some rows:
      * the block is `bytes` long (512 constant rows, then the viewport
-     * transform's two), the program reads rows [first_row, first_row + rows)
-     * and the last two, and the rest may hold anything. The backend may stage
-     * just those. Without it the engine calls bind_vs_constants. */
+     * transform's two), the program reads the rows set in `row_mask` (bit r
+     * of row_mask[r / 32], 16 words) and the last two, and the rest may hold
+     * anything. The backend may stage just those (rsx_be_row_run walks them).
+     * Without it the engine calls bind_vs_constants. */
     void (*bind_vs_constant_rows)(void* user, const void* data, u32 bytes,
-                                  u32 first_row, u32 rows);
+                                  const u32* row_mask);
 
     /* Nonzero when texture_upload is ordered after every draw already handed
      * to the backend, so rewriting a texture those draws sample is safe. The
@@ -364,6 +380,33 @@ typedef struct rsx_draw_backend {
      * snapshot). */
     u32  (*depth_snapshot_into)(void* user, u32 depth, u32 dst);
 } rsx_draw_backend;
+
+/* The next run of set rows in a 512-row mask at or after *row: its first row
+ * in *row and its length in *count. 0 when none is left. */
+static inline int rsx_be_row_run(const u32* row_mask, u32* row, u32* count)
+{
+    u32 r = *row;
+    while (r < 512u && !(row_mask[r >> 5] >> (r & 31u))) r = (r | 31u) + 1u;
+    while (r < 512u && !((row_mask[r >> 5] >> (r & 31u)) & 1u)) r++;
+    if (r >= 512u) return 0;
+    u32 e = r;
+    while (e < 512u && ((row_mask[e >> 5] >> (e & 31u)) & 1u)) {
+        if ((e & 31u) == 0 && row_mask[e >> 5] == 0xFFFFFFFFu) e += 32u; else e++;
+    }
+    *row = r; *count = e - r;
+    return 1;
+}
+
+/* Does a block of `bytes` (rows, then the transform's two) hold every row
+ * set in the mask? */
+static inline int rsx_be_row_mask_fits(const u32* row_mask, u32 bytes)
+{
+    if (!row_mask || bytes < 32u) return 0;
+    const u32 rows = (bytes - 32u) / 16u;
+    u32 row = 0, n = 0, end = 0;
+    for (; rsx_be_row_run(row_mask, &row, &n); row += n) end = row + n;
+    return end <= rows;
+}
 
 /* ---- the engine --------------------------------------------------------- */
 
@@ -421,6 +464,9 @@ void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned lon
 /* Repeat texture binds in one frame after a guest-memory write that missed
  * the texture (no re-check), and those a write may have touched (checked). */
 void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked);
+/* Draws uploaded as host-format vertex streams, and triangle lists the
+ * builder refused (they took the float4 path). */
+void rsx_draw_engine_host_vertex_counts(unsigned long long* draws, unsigned long long* refused);
 /* Same-target colour reads the backend could not copy (no color_snapshot). */
 u64 rsx_draw_engine_feedback_unserved_count(void);
 u64 rsx_draw_engine_submit_async(void);

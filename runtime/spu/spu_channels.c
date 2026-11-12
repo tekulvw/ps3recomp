@@ -2232,6 +2232,26 @@ typedef struct {
 } spu_verified_image;
 static spu_verified_image s_verified_images[SPU_VERIFIED_IMAGES];
 static unsigned s_verified_count;
+/* One bit per 128-byte LS block that any registered verified segment
+ * covers. Set before the image is published and never cleared (images are
+ * never removed), so a GET touching no set block cannot overlap a segment:
+ * spu_dcache_note_get tests it before walking every image's segments. */
+#define SPU_VERIFIED_COVER_SHIFT 7u
+static uint8_t s_verified_cover[SPU_LS_SIZE >> SPU_VERIFIED_COVER_SHIFT >> 3];
+static void spu_verified_cover_mark(uint32_t lsa, uint32_t size)
+{
+    for (uint32_t b = lsa >> SPU_VERIFIED_COVER_SHIFT; b <= (lsa + size - 1u) >> SPU_VERIFIED_COVER_SHIFT; ++b)
+        __atomic_fetch_or(&s_verified_cover[b >> 3], (uint8_t)(1u << (b & 7u)), __ATOMIC_RELAXED);
+}
+static int spu_verified_cover_any(uint32_t lsa, uint32_t size)
+{
+    if (!size || lsa >= SPU_LS_SIZE) return 0;
+    uint32_t last = lsa + size - 1u;
+    if (last >= SPU_LS_SIZE) last = SPU_LS_SIZE - 1u;
+    for (uint32_t b = lsa >> SPU_VERIFIED_COVER_SHIFT; b <= last >> SPU_VERIFIED_COVER_SHIFT; ++b)
+        if ((__atomic_load_n(&s_verified_cover[b >> 3], __ATOMIC_RELAXED) >> (b & 7u)) & 1u) return 1;
+    return 0;
+}
 /* Serialized registration copies immutable ranges/bytes. Even generations
  * describe complete snapshots; odd means append publication is in progress.
  * Failed validation/allocation and rejected replacements never change it. */
@@ -2272,6 +2292,7 @@ static int spu_verified_register(int policy, int image,
         next.segments[i].bytes = copy + at;
         at += segments[i].size;
     }
+    for (unsigned i = 0; i < count; ++i) spu_verified_cover_mark(segments[i].lsa, segments[i].size);
     __atomic_add_fetch(&s_verified_generation,1,__ATOMIC_ACQ_REL);
     s_verified_images[s_verified_count] = next;
     __atomic_store_n(&s_verified_count, s_verified_count + 1, __ATOMIC_RELEASE);   /* the dispatch cache keys by it */
@@ -2719,6 +2740,40 @@ static int spu_ovl_ea_known(uint32_t ea)
     return 1;   /* full (cannot happen): never filter */
 }
 
+/* The same for content signatures. A GET of 512 bytes or more was compared
+ * against every signature source (16-byte memcmp each, up to
+ * SPU_OVL_SRC_MAX), and most such GETs are data, not code. A signature can
+ * only match when the GET's first 8 bytes equal the first 8 of some
+ * registered signature, so keep those prefixes in an insert-only set, built
+ * and published exactly like the EA set, and run the scan only when the
+ * prefix is present (or the EA is registered). */
+static uint64_t s_ovl_sig_set[SPU_OVL_EA_SET];
+static uint8_t s_ovl_sig_used[SPU_OVL_EA_SET];
+static unsigned spu_ovl_sig_slot(uint64_t prefix) { return (unsigned)((prefix * 0x9E3779B97F4A7C15ull) >> 55); }
+static uint64_t spu_ovl_sig_prefix(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v; }
+static void spu_ovl_sig_add(const uint8_t sig[16])
+{
+    const uint64_t prefix = spu_ovl_sig_prefix(sig);
+    for (unsigned i = spu_ovl_sig_slot(prefix), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
+        if (__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) {
+            if (s_ovl_sig_set[i] == prefix) return;
+            continue;
+        }
+        s_ovl_sig_set[i] = prefix;
+        __atomic_store_n(&s_ovl_sig_used[i], 1, __ATOMIC_RELEASE);
+        return;
+    }
+}
+static int spu_ovl_sig_known(const uint8_t* head)
+{
+    const uint64_t prefix = spu_ovl_sig_prefix(head);
+    for (unsigned i = spu_ovl_sig_slot(prefix), n = 0; n < SPU_OVL_EA_SET; ++n, i = (i + 1) & (SPU_OVL_EA_SET - 1)) {
+        if (!__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) return 0;
+        if (s_ovl_sig_set[i] == prefix) return 1;
+    }
+    return 1;   /* full (cannot happen): never filter */
+}
+
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
@@ -3009,6 +3064,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
+        spu_ovl_sig_add(sig);
         atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
@@ -3113,7 +3169,8 @@ static int spu_dcache_mode(void)
 }
 static void spu_dcache_note_get(uint32_t lsa, uint32_t size)
 {
-    if (!spu_dcache_mode()) return;
+    /* Every MFC GET lands here; almost none touch verified code. */
+    if (!spu_verified_cover_any(lsa, size) || !spu_dcache_mode()) return;
     spu_dcache_tls* t = &t_dcache;
     for (unsigned i = 0; i < s_verified_count; ++i) {
         const spu_verified_image* v = &s_verified_images[i];
@@ -3252,8 +3309,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      * Acquire count before the signature flag: if this snapshot contains a
      * signature, its earlier flag publication is visible. A racing future
      * signature can only force an unnecessary scan of the older snapshot. */
-    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
-        !spu_ovl_ea_known(ea)) return;
+    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire) ||
+         !spu_ovl_sig_known(ls)) && !spu_ovl_ea_known(ea)) return;
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
@@ -3505,7 +3562,245 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
  * the small instruction set such stubs use, and exit back into lifted code at
  * the first branch (trampoline re-dispatch). Returns 1 if it executed to a
  * branch, 0 on an unknown opcode (caller falls through to BRANCH-TO-0). */
+/* ---- Decoded-trace cache for the micro-interpreter -----------------------
+ * The WWS job manager regenerates the same save/restore stub (a straight run
+ * of quadword loads and stores ending in a branch) and calls it on every
+ * interrupt: about 11k times a frame in MAG Training, at ~335 ns a call, most
+ * of it re-decoding the same words. A trace caches the decode of one straight
+ * run, from its entry to its first unconditional branch, together with the
+ * words it was decoded from. An entry replays only while the live words still
+ * equal that snapshot, and stops at the first store that lands inside the
+ * run (the stub may rewrite itself), resuming the ordinary microstep at the
+ * next instruction. Runs holding anything else (a conditional branch, an
+ * instruction outside the set below) are remembered as uncacheable. Each op
+ * does exactly what the corresponding case of spu_smc_microstep does; the
+ * instruction-level observers (PC observer, original-work steps, a critical
+ * arrival PC inside the run) need the ordinary path and get it.
+ * PS3RECOMP_SPU_SMC_TRACE=0 turns the cache off. */
+enum { SMC_OP_NONE, SMC_OP_STQD, SMC_OP_LQD, SMC_OP_STQA, SMC_OP_LQA, SMC_OP_STQR, SMC_OP_LQR,
+       SMC_OP_XORI, SMC_OP_AI, SMC_OP_SF, SMC_OP_A, SMC_OP_IL, SMC_OP_ILHU, SMC_OP_IOHL, SMC_OP_ILA,
+       SMC_OP_NOP, SMC_OP_BI_FAMILY, SMC_OP_BR_FAMILY };
+typedef struct { uint8_t kind, rt, ra, rb; uint32_t w; } smc_op;
+#define SMC_TRACE_MAX 256u
+#define SMC_TRACE_WAYS 8u
+typedef struct { uint32_t pc, n, state; uint8_t bytes[4 * SMC_TRACE_MAX]; smc_op ops[SMC_TRACE_MAX]; } smc_trace;
+enum { SMC_TRACE_EMPTY, SMC_TRACE_REPLAY, SMC_TRACE_UNCACHEABLE };
+typedef struct { smc_trace way[SMC_TRACE_WAYS]; unsigned next; } smc_trace_cache;
+static SPU_THREAD_LOCAL smc_trace_cache* t_smc_trace;
+
+/* Classify one word exactly as spu_smc_microstep's chain does, in its order.
+ * Returns the op kind, SMC_OP_NONE for anything a trace cannot hold
+ * (conditional branches included), or SMC_OP_BI/BR_FAMILY for a terminator. */
+static int smc_trace_decode(uint32_t w, smc_op* o)
+{
+    const uint32_t op11 = w >> 21, op9 = w >> 23, op8 = w >> 24, op7 = w >> 25;
+    o->w = w; o->rt = (uint8_t)(w & 0x7F); o->ra = (uint8_t)((w >> 7) & 0x7F); o->rb = (uint8_t)((w >> 14) & 0x7F);
+    if (op11 == 0x1A8 || op11 == 0x1A9 || op11 == 0x1AA) return o->kind = SMC_OP_BI_FAMILY;
+    if (op11 == 0x1AB) return o->kind = SMC_OP_NONE;                    /* bisled: conditional */
+    if (op11 >= 0x128 && op11 <= 0x12B) return o->kind = SMC_OP_NONE;   /* biz..bihnz */
+    if (op9 == 0x064 || op9 == 0x060 || op9 == 0x066 || op9 == 0x062) return o->kind = SMC_OP_BR_FAMILY;
+    if (op9 == 0x040 || op9 == 0x042 || op9 == 0x044 || op9 == 0x046) return o->kind = SMC_OP_NONE;
+    if (op8 == 0x24) return o->kind = SMC_OP_STQD;
+    if (op8 == 0x34) return o->kind = SMC_OP_LQD;
+    if (op9 == 0x041) return o->kind = SMC_OP_STQA;
+    if (op9 == 0x061) return o->kind = SMC_OP_LQA;
+    if (op9 == 0x047) return o->kind = SMC_OP_STQR;
+    if (op9 == 0x067) return o->kind = SMC_OP_LQR;
+    if (op8 == 0x44) return o->kind = SMC_OP_XORI;
+    if (op8 == 0x1C) return o->kind = SMC_OP_AI;
+    if (op11 == 0x040) return o->kind = SMC_OP_SF;
+    if (op11 == 0x0C0) return o->kind = SMC_OP_A;
+    if (op9 == 0x081) return o->kind = SMC_OP_IL;
+    if (op9 == 0x082) return o->kind = SMC_OP_ILHU;
+    if (op9 == 0x0C1) return o->kind = SMC_OP_IOHL;
+    if (op7 == 0x21) return o->kind = SMC_OP_ILA;
+    if (op11 == 0x201 || op11 == 0x001 || op11 == 0x002 || op11 == 0x003 ||
+        op11 == 0x1AC || op7 == 0x08 || op7 == 0x09) return o->kind = SMC_OP_NOP;
+    return o->kind = SMC_OP_NONE;
+}
+
+static int smc_trace_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_SPU_SMC_TRACE"); on = !(e && !strcmp(e, "0")); }
+#if defined(PS3RECOMP_ORIGINAL_OBSERVER) && PS3RECOMP_ORIGINAL_OBSERVER
+    return 0;   /* every microstep instruction is an original-work step */
+#else
+    return on && !spu_pc_observer_enabled();
+#endif
+}
+
+static uint32_t smc_trace_word(const spu_context* ctx, uint32_t pc)
+{
+    return ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
+           ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
+}
+
+/* PS3RECOMP_SPU_SMC_TRACE_STATS=1: per thread, every 2^18 microstep entries,
+ * how the cache served them (replayed, decoded anew, stopped at a store into
+ * the run, uncacheable) and the time spent replaying vs in the ordinary
+ * microstep. Off: one test of a cached flag per entry. */
+static int smc_trace_stats_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_SPU_SMC_TRACE_STATS"); on = e && !strcmp(e, "1"); }
+    return on;
+}
+static SPU_THREAD_LOCAL struct { uint64_t n[5], replay_ns, step_ns, entries; } t_smc_stats;
+static void smc_trace_stat(int k) { if (smc_trace_stats_on()) t_smc_stats.n[k]++; }
+static void smc_trace_stats_entry(spu_context* ctx, uint64_t replay_ns, uint64_t step_ns)
+{
+    t_smc_stats.replay_ns += replay_ns; t_smc_stats.step_ns += step_ns;
+    if ((++t_smc_stats.entries & ((1u << 18) - 1u)) == 0)
+        fprintf(stderr, "[spu-smc-trace] spu=%u entries=%llu replayed=%llu decoded=%llu stopped=%llu uncacheable=%llu off=%llu replay_ns=%llu microstep_ns=%llu\n",
+                ctx->spu_id & 7u, (unsigned long long)t_smc_stats.entries, (unsigned long long)t_smc_stats.n[0],
+                (unsigned long long)t_smc_stats.n[1], (unsigned long long)t_smc_stats.n[2],
+                (unsigned long long)t_smc_stats.n[3], (unsigned long long)t_smc_stats.n[4],
+                (unsigned long long)t_smc_stats.replay_ns, (unsigned long long)t_smc_stats.step_ns);
+}
+
+/* Find or build the trace for the run at pc. NULL: run the ordinary path. */
+static const smc_trace* smc_trace_get(spu_context* ctx, uint32_t pc)
+{
+    smc_trace_cache* c = t_smc_trace;
+    if (!c) {
+        c = (smc_trace_cache*)calloc(1, sizeof *c);
+        if (!c) return NULL;
+        t_smc_trace = c;
+    }
+    /* Several variants of one entry can be live: a stub that toggles its own
+     * words alternates between them. Each keeps its own way; a variant that
+     * matches none is decoded into a free way or the oldest one. */
+    for (unsigned i = 0; i < SMC_TRACE_WAYS; i++) {
+        smc_trace* t = &c->way[i];
+        if (t->state == SMC_TRACE_EMPTY || t->pc != pc) continue;
+        if (pc + 4 * t->n <= SPU_LS_SIZE && !memcmp(ctx->ls + pc, t->bytes, 4 * t->n)) {
+            smc_trace_stat(t->state == SMC_TRACE_REPLAY ? 0 : 3);
+            return t->state == SMC_TRACE_REPLAY ? t : NULL;
+        }
+    }
+    smc_trace_stat(1);
+    smc_trace* t = NULL;
+    for (unsigned i = 0; i < SMC_TRACE_WAYS && !t; i++)
+        if (c->way[i].state == SMC_TRACE_EMPTY) t = &c->way[i];
+    if (!t) { t = &c->way[c->next]; c->next = (c->next + 1) % SMC_TRACE_WAYS; }
+    t->pc = pc; t->n = 0; t->state = SMC_TRACE_UNCACHEABLE;
+    for (uint32_t a = pc; t->n < SMC_TRACE_MAX && a + 3 < SPU_LS_SIZE; a += 4) {
+        const uint32_t w = smc_trace_word(ctx, a);
+        smc_op* o = &t->ops[t->n];
+        memcpy(t->bytes + 4 * t->n++, ctx->ls + a, 4);
+        const int kind = smc_trace_decode(w, o);
+        if (kind == SMC_OP_NONE) break;   /* stays uncacheable while these words hold */
+        if (kind == SMC_OP_BI_FAMILY || kind == SMC_OP_BR_FAMILY) { t->state = SMC_TRACE_REPLAY; break; }
+    }
+    return t->state == SMC_TRACE_REPLAY ? t : NULL;
+}
+
+/* Replay a trace. 1: it reached its branch (as spu_smc_microstep returns 1).
+ * 0: a store landed inside the run; ctx->pc is the next instruction. */
+static int spu_smc_microstep_steps(spu_context* ctx);
+static int smc_trace_replay(spu_context* ctx, const smc_trace* t)
+{
+    const uint32_t lo = t->pc, hi = t->pc + 4 * t->n;
+#if defined(PS3RECOMP_CRITICAL_WRITE_AVAILABLE) || defined(PS3_CRITICAL_WRITE_IMPLEMENTATION)
+    { const uint32_t arrive = __atomic_load_n(&ps3_critical_arrival_pc, __ATOMIC_RELAXED);
+      if (arrive >= lo && arrive < hi) { ctx->pc = lo; return 0; } }
+#endif
+    uint32_t pc = lo;
+    for (uint32_t i = 0; i < t->n; i++, pc += 4) {
+        const smc_op* o = &t->ops[i];
+        const uint32_t w = o->w, rt = o->rt, ra = o->ra, rb = o->rb;
+        const int32_t i10 = (int32_t)(w << 8) >> 22;
+        const int32_t i16 = (int32_t)(int16_t)((w >> 7) & 0xFFFF);
+        uint32_t store = 0xFFFFFFFFu;
+        switch (o->kind) {
+        case SMC_OP_STQD: store = (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u;
+                          spu_ls_write128(ctx, store, ctx->gpr[rt]); break;
+        case SMC_OP_LQD:  ctx->gpr[rt] = spu_ls_read128(ctx, (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u); break;
+        case SMC_OP_STQA: store = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u;
+                          spu_ls_write128(ctx, store, ctx->gpr[rt]); break;
+        case SMC_OP_LQA:  ctx->gpr[rt] = spu_ls_read128(ctx, (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u); break;
+        case SMC_OP_STQR: store = (pc + ((uint32_t)i16 << 2)) & SPU_LS_MASK & ~15u;
+                          spu_ls_write128(ctx, store, ctx->gpr[rt]); break;
+        case SMC_OP_LQR:  ctx->gpr[rt] = spu_ls_read128(ctx, (pc + ((uint32_t)i16 << 2)) & SPU_LS_MASK & ~15u); break;
+        case SMC_OP_XORI: ctx->gpr[rt] = spu_xori(ctx->gpr[ra], i10); break;
+        case SMC_OP_AI: { u128 r = ctx->gpr[ra];
+                          for (int k = 0; k < 4; k++) r._u32[k] += (uint32_t)i10;
+                          ctx->gpr[rt] = r; break; }
+        case SMC_OP_SF:
+        case SMC_OP_A:  { u128 x = ctx->gpr[ra], y = ctx->gpr[rb], r;
+                          for (int k = 0; k < 4; k++)
+                              r._u32[k] = o->kind == SMC_OP_SF ? y._u32[k] - x._u32[k] : x._u32[k] + y._u32[k];
+                          ctx->gpr[rt] = r; break; }
+        case SMC_OP_IL:   ctx->gpr[rt] = spu_splat_u32((uint32_t)i16); break;
+        case SMC_OP_ILHU: ctx->gpr[rt] = spu_splat_u32(((w >> 7) & 0xFFFF) << 16); break;
+        case SMC_OP_IOHL: { u128 r = ctx->gpr[rt];
+                            for (int k = 0; k < 4; k++) r._u32[k] |= (w >> 7) & 0xFFFF;
+                            ctx->gpr[rt] = r; break; }
+        case SMC_OP_ILA:  ctx->gpr[rt] = spu_splat_u32((w >> 7) & 0x3FFFF); break;
+        case SMC_OP_NOP:  break;
+        case SMC_OP_BI_FAMILY: {
+            const uint32_t op11 = w >> 21;
+            if (w & 0x40000) ctx->int_enable = 1;
+            else if (w & 0x80000) ctx->int_enable = 0;
+            const uint32_t tgt = op11 == 0x1AA ? ctx->srr0 : ctx->gpr[ra]._u32[0];
+            if (op11 == 0x1A9) ctx->gpr[rt] = spu_splat_u32(pc + 4);
+            ctx->pc = tgt & SPU_LS_MASK & ~3u;
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1; }
+        case SMC_OP_BR_FAMILY: {
+            const uint32_t op9 = w >> 23;
+            const uint32_t tgt = (op9 == 0x060 || op9 == 0x062) ? ((uint32_t)i16 << 2) : (pc + ((uint32_t)i16 << 2));
+            if (op9 == 0x066 || op9 == 0x062) ctx->gpr[rt] = spu_splat_u32(pc + 4);
+            ctx->pc = tgt & SPU_LS_MASK & ~3u;
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1; }
+        default: ctx->pc = pc; return 0;
+        }
+        if (store < hi && store + 16 > lo) {
+            /* The run rewrote itself. Words already executed do not matter;
+             * stop only if a word still ahead now differs from the decode. */
+            const uint32_t first = store > pc + 4 ? store : pc + 4, last = store + 16 < hi ? store + 16 : hi;
+            if (first < last && memcmp(ctx->ls + first, t->bytes + (first - lo), last - first)) {
+                smc_trace_stat(2);
+                ctx->pc = pc + 4; return 0;
+            }
+        }
+    }
+    ctx->pc = pc;
+    return 0;
+}
+
 static int spu_smc_microstep(spu_context* ctx)
+{
+    if (smc_trace_enabled()) {
+        const int stats = smc_trace_stats_on();
+        const uint64_t t0 = stats ? spu_host_ns() : 0;
+        const smc_trace* t = smc_trace_get(ctx, ctx->pc & SPU_LS_MASK & ~3u);
+        if (t && smc_trace_replay(ctx, t)) {
+            if (stats) smc_trace_stats_entry(ctx, spu_host_ns() - t0, 0);
+            return 1;
+        }
+        /* Not cached, or stopped at a store into the run: microstep on from
+         * ctx->pc, which the replay left at its next instruction. */
+        if (stats) {
+            const uint64_t t1 = spu_host_ns();
+            const int r = spu_smc_microstep_steps(ctx);
+            smc_trace_stats_entry(ctx, t1 - t0, spu_host_ns() - t1);
+            return r;
+        }
+    } else if (smc_trace_stats_on()) {
+        smc_trace_stat(4);
+        const uint64_t t1 = spu_host_ns();
+        const int r = spu_smc_microstep_steps(ctx);
+        smc_trace_stats_entry(ctx, 0, spu_host_ns() - t1);
+        return r;
+    }
+    return spu_smc_microstep_steps(ctx);
+}
+
+/* The ordinary micro-interpreter: decode and run the live words. */
+static int spu_smc_microstep_steps(spu_context* ctx)
 {
     int observe = spu_pc_observer_enabled();
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
@@ -3788,6 +4083,17 @@ static void spu_ibhist_note(const spu_context* ctx)
 static void spu_ibhist_note(const spu_context* ctx) { (void)ctx; }
 #endif
 
+static int spu_ib_diagnostics_armed(void)
+{
+    static atomic_int armed = ATOMIC_VAR_INIT(-1);
+    int value = atomic_load_explicit(&armed, memory_order_relaxed);
+    if (value < 0) {
+        value = getenv("SPU_IBCOV") || getenv("SPU_POLLTRACE") || getenv("YDKJ_POLTRACE");
+        atomic_store_explicit(&armed, value, memory_order_relaxed);
+    }
+    return value;
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -3802,7 +4108,8 @@ void spu_indirect_branch(spu_context* ctx)
      * enforce the preserve-all-registers hardware contract here -- the first
      * interrupts-enabled dispatch at the saved srr0 is the irete. */
     { extern int spu_irq_regs_maybe_restore(spu_context*);
-      if (spu_irq_regs_maybe_restore(ctx)) {
+      /* Only a context holding saved interrupt registers can restore them. */
+      if (ctx->irq_saved && spu_irq_regs_maybe_restore(ctx)) {
           static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
           static int _r = 0;
           if (s_it && PS3_LOG_FIRST(_r, 200))
@@ -3909,44 +4216,49 @@ void spu_indirect_branch(spu_context* ctx)
                 fprintf(stderr, "[cri-r4] policy entry pc=0xA00: forced ctxt->taskset LS[0x27B8]=0x0F000000\n"); }
         }
     }
-    /* SPU_IBCOV: image-3 (Bink SPU) PC-page coverage. Track which 0x1000-byte LS
-     * pages the task's indirect branches land in; dump the set periodically. If
-     * coverage stays in the kernel/wait region (~0x13xxx) the decode routine never
-     * runs; if it spans a wide high range, decode executes but doesn't output. */
-    { static int s_cov = -1; if (s_cov < 0) s_cov = getenv("SPU_IBCOV") ? 1 : 0;
-      if (s_cov && ctx->image_id == 3) {
-        static uint8_t pages[64] = {0};   /* 64 pages * 0x1000 = 256KB LS */
-        static uint64_t hits = 0;
-        uint32_t pg = (ctx->pc & 0x3FFFF) >> 12;
-        int newp = 0;
-        if (pg < 64 && !pages[pg]) { pages[pg] = 1; newp = 1; }
-        ++hits;
-        if (newp || (hits % 200000) == 0) {
-            char line[400]; int p = snprintf(line, sizeof line, "[ibcov3] hits=%llu tgt=0x%05X pages:", (unsigned long long)hits, ctx->pc & 0x3FFFF);
-            for (int i = 0; i < 64; i++) if (pages[i]) p += snprintf(line+p, sizeof(line)-p, " 0x%X", i<<12);
-            fprintf(stderr, "%s\n", line); }
-      } }
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
-      if (s_t) { static uint64_t s_n = 0; static uint32_t s_last = 0; static uint64_t s_run = 0;
-        if (ctx->pc == s_last) s_run++; else { s_last = ctx->pc; s_run = 1; }
-        if ((++s_n % 2000000) == 0)
-          fprintf(stderr, "[ibranch] %llu indirect branches; current target=0x%05X run=%llu\n",
-                  (unsigned long long)s_n, ctx->pc, (unsigned long long)s_run); } }
-    /* Policy-entry trace: the SPURS policy at LS 0xA00 branches on
-     * r8 = word at LS[r6] (must be 32 for the path that sets the dispatch ptr
-     * LS[0x780]). Log r3..r6 + the word the kernel handed it, to see why the
-     * wrong branch is taken. Env YDKJ_POLTRACE. */
-    if (ctx->pc == 0xA00u) {
-        static int64_t pt=-2; if (pt==-2){ const char* e=getenv("YDKJ_POLTRACE"); pt=e?1:0; }
-        if (pt) { static int _p=0; if (PS3_LOG_FIRST(_p, 8)) {
-            /* re-lifted policy entry uses r80 (kernel-set context base): r44=LS[r80+0xC0] */
-            uint32_t r80=ctx->gpr[80]._u32[0] & SPU_LS_MASK;
-            const uint8_t* q = ctx->ls + ((r80+0xC0)&SPU_LS_MASK);
-            uint32_t ctxw = ((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
-            fprintf(stderr, "[POLTRACE] policy@0xA00 r3=%08X r4=%08X r80=%08X  LS[r80+0xC0]=%08X\n",
-                ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], r80, ctxw);
-            fflush(stderr);
-        } }
+    /* Dispatch diagnostics (SPU_IBCOV, SPU_POLLTRACE, YDKJ_POLTRACE), each
+     * still read once by its own block: one cached test here keeps the
+     * ordinary dispatch from walking every gate. */
+    if (spu_ib_diagnostics_armed()) {
+        /* SPU_IBCOV: image-3 (Bink SPU) PC-page coverage. Track which 0x1000-byte LS
+         * pages the task's indirect branches land in; dump the set periodically. If
+         * coverage stays in the kernel/wait region (~0x13xxx) the decode routine never
+         * runs; if it spans a wide high range, decode executes but doesn't output. */
+        { static int s_cov = -1; if (s_cov < 0) s_cov = getenv("SPU_IBCOV") ? 1 : 0;
+          if (s_cov && ctx->image_id == 3) {
+            static uint8_t pages[64] = {0};   /* 64 pages * 0x1000 = 256KB LS */
+            static uint64_t hits = 0;
+            uint32_t pg = (ctx->pc & 0x3FFFF) >> 12;
+            int newp = 0;
+            if (pg < 64 && !pages[pg]) { pages[pg] = 1; newp = 1; }
+            ++hits;
+            if (newp || (hits % 200000) == 0) {
+                char line[400]; int p = snprintf(line, sizeof line, "[ibcov3] hits=%llu tgt=0x%05X pages:", (unsigned long long)hits, ctx->pc & 0x3FFFF);
+                for (int i = 0; i < 64; i++) if (pages[i]) p += snprintf(line+p, sizeof(line)-p, " 0x%X", i<<12);
+                fprintf(stderr, "%s\n", line); }
+          } }
+        { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
+          if (s_t) { static uint64_t s_n = 0; static uint32_t s_last = 0; static uint64_t s_run = 0;
+            if (ctx->pc == s_last) s_run++; else { s_last = ctx->pc; s_run = 1; }
+            if ((++s_n % 2000000) == 0)
+              fprintf(stderr, "[ibranch] %llu indirect branches; current target=0x%05X run=%llu\n",
+                      (unsigned long long)s_n, ctx->pc, (unsigned long long)s_run); } }
+        /* Policy-entry trace: the SPURS policy at LS 0xA00 branches on
+         * r8 = word at LS[r6] (must be 32 for the path that sets the dispatch ptr
+         * LS[0x780]). Log r3..r6 + the word the kernel handed it, to see why the
+         * wrong branch is taken. Env YDKJ_POLTRACE. */
+        if (ctx->pc == 0xA00u) {
+            static int64_t pt=-2; if (pt==-2){ const char* e=getenv("YDKJ_POLTRACE"); pt=e?1:0; }
+            if (pt) { static int _p=0; if (PS3_LOG_FIRST(_p, 8)) {
+                /* re-lifted policy entry uses r80 (kernel-set context base): r44=LS[r80+0xC0] */
+                uint32_t r80=ctx->gpr[80]._u32[0] & SPU_LS_MASK;
+                const uint8_t* q = ctx->ls + ((r80+0xC0)&SPU_LS_MASK);
+                uint32_t ctxw = ((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
+                fprintf(stderr, "[POLTRACE] policy@0xA00 r3=%08X r4=%08X r80=%08X  LS[r80+0xC0]=%08X\n",
+                    ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], r80, ctxw);
+                fflush(stderr);
+            } }
+        }
     }
     /* Resolve both fresh launches and mid-function resumes from TaskInfo.
      * A scheduler call temporarily leaves the task region, but its return PC

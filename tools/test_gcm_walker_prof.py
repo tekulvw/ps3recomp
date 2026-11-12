@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """RSX_WALKER_PROF, the in-process FIFO walker sampler (diagnostic, macOS
-arm64): armed only when set, bounded by RSX_WALKER_PROF_SECONDS even when its
-nominal 1 ms sleeps are coalesced, and writes every sample on its own line
-(libs/video/tests/test_gcm_walker_prof.c compiles cellGcmSys.c in)."""
+arm64): armed only when set, and it writes about a sample per millisecond for
+RSX_WALKER_PROF_SECONDS (libs/video/tests/test_gcm_walker_prof.c, which
+compiles cellGcmSys.c in)."""
+import argparse
 import os
 from pathlib import Path
 import subprocess
@@ -10,6 +11,12 @@ import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser()
+parser.add_argument('--tick-delay-ms', type=int, default=0,
+                    help='fixture-only minimum sampler tick delay (2..20 ms)')
+args = parser.parse_args()
+if args.tick_delay_ms and not 2 <= args.tick_delay_ms <= 20:
+    parser.error('tick delay must be between 2 and 20 ms')
 if os.name == 'nt':
     print('SKIP: the GCM fixture uses POSIX linking')
     raise SystemExit(0)
@@ -23,6 +30,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-walker-prof-') as tmp:
                     str(root / 'libs/video/tests/gcm_deferred_fixture_stubs.c'),str(root / 'libs/video/rsx_fifo_busy.c'), *linker,
                     '-o', str(binary)], check=True)
     base = {k: v for k, v in os.environ.items() if not k.startswith('RSX_WALKER_PROF')}
+    if args.tick_delay_ms:
+        base['GCM_WALKER_FIXTURE_TICK_MS'] = str(args.tick_delay_ms)
     for mode, extra in (('off', {}),
                         ('on', {'RSX_WALKER_PROF': str(Path(tmp) / 'on.txt'),
                                 'RSX_WALKER_PROF_SECONDS': '1'})):

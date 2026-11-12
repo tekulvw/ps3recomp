@@ -31,10 +31,18 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
             command += [str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm']
         subprocess.run(command + ['-o', str(binary)], check=True)
         if name == 'test_spu_registry_allocation':
+            # Per-line version counters keep no holder list: a reservation
+            # allocates nothing there, so it succeeds and says so.
+            versions = os.environ.get('PS3RECOMP_COH_VERSIONS') == '1'
             for mode, diagnostic in [('mfc', 'cannot allocate private MFC engine'),
                                      ('coh', 'cannot register reservation holder')]:
                 result = subprocess.run([str(binary), mode], timeout=10,
                                         capture_output=True, text=True)
+                if mode == 'coh' and versions:
+                    assert result.returncode == 0, result
+                    assert 'needs no allocation under version counters' in result.stderr, result.stderr
+                    print(name + '/' + mode + ': PASS (no holder allocation under version counters)')
+                    continue
                 assert result.returncode == -signal.SIGABRT, result
                 assert diagnostic in result.stderr, result.stderr
                 print(name + '/' + mode + ': PASS (visible allocation failure)')

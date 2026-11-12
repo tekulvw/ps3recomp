@@ -9,6 +9,8 @@
  *  3. random vectors from a mix of generators aimed at the hard spots: results near 2^-126 and
  *     2^128, cancellation in fa/fs and fma (z close to -x*y), fma sums rounded onto a 24-bit
  *     boundary, wide exponent gaps, zeros of every kind, extended-range words, raw words.
+ * On x86 the three passes run a second time through the wide path alone (spu__x8_*_w or
+ * spu__x4_*_w), the exact vector form a vector falls back to, so it too meets every input.
  * Build (arm64; x86 with -msse4.1 for the SSE4.1 form, or -mavx2 -mfma for the AVX2 form):
  *   cc -O2 -I runtime/spu -I include runtime/spu/tests/test_spu_float_exact.c -lm -o t && ./t [scale]
  * scale (default 1) multiplies the pass-3 size: 1 = 64M vectors (256M lanes). */
@@ -31,9 +33,42 @@ static const uint32_t k_frac[] = { 0x000000u, 0x000001u, 0x000002u, 0x400000u, 0
 static long s_bad, s_lanes;
 static const char* const k_ops[6] = { "fa", "fs", "fm", "fma", "fms", "fnms" };
 
+/* x86: the wide path (every lane exact, extended range included) that a vector takes when its
+ * fast path leaves a lane out, called directly so that every lane of every pass goes through it */
+#if !defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && (defined(__AVX2__) || defined(__SSE4_1__))
+#if defined(__AVX2__)
+#define W_FA spu__x8_fa_w
+#define W_FM spu__x8_fm_w
+#define W_FMA spu__x8_fma_w
+#else
+#define W_FA spu__x4_fa_w
+#define W_FM spu__x4_fm_w
+#define W_FMA spu__x4_fma_w
+#endif
+#define HAVE_WIDE 1
+static int s_wide;
+static u128 wide(int op, u128 a, u128 b, u128 c)
+{
+    static const uint32_t negb[6] = { 0, 0x80000000u, 0, 0, 0, 0 }, negp[6] = { 0, 0, 0, 0, 0, 0x80000000u },
+                          negc[6] = { 0, 0, 0, 0, 0x80000000u, 0 };
+    const __m128i x = _mm_xor_si128(_mm_loadu_si128((const __m128i*)a._u32), _mm_set1_epi32((int)negp[op]));
+    const __m128i y = _mm_xor_si128(_mm_loadu_si128((const __m128i*)b._u32), _mm_set1_epi32((int)negb[op]));
+    const __m128i z = _mm_xor_si128(_mm_loadu_si128((const __m128i*)c._u32), _mm_set1_epi32((int)negc[op]));
+    const __m128i r = op < 2 ? W_FA(x, y, 0xF) : op == 2 ? W_FM(x, y, 0xF) : W_FMA(x, y, z, 0xF);
+    u128 out; _mm_storeu_si128((__m128i*)out._u32, r); return out;
+}
+#endif
+
 static void run(int op, u128 a, u128 b, u128 c)
 {
     u128 got, ref;
+#if defined(HAVE_WIDE)
+    if (s_wide) {
+        got = wide(op, a, b, c);
+        ref = op == 0 ? spu_fa_ref(a, b) : op == 1 ? spu_fs_ref(a, b) : op == 2 ? spu_fm_ref(a, b)
+            : op == 3 ? spu_fma_ref(a, b, c) : op == 4 ? spu_fms_ref(a, b, c) : spu_fnms_ref(a, b, c);
+    } else
+#endif
     switch (op) {
     case 0:  got = spu_fa(a, b);      ref = spu_fa_ref(a, b); break;
     case 1:  got = spu_fs(a, b);      ref = spu_fs_ref(a, b); break;
@@ -207,6 +242,12 @@ int main(int argc, char** argv)
 {
     const long scale = argc > 1 ? atol(argv[1]) : 1;
     int rc = all_passes(scale, "default (round to nearest)");
+#if defined(HAVE_WIDE)
+    /* the x86 wide path alone, on every lane */
+    s_wide = 1;
+    rc |= all_passes(scale, "default; x86 wide path alone");
+    s_wide = 0;
+#endif
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     /* SPU_FLOAT_RZ: the same passes on a thread running round toward zero with flush-to-zero,
      * where spu_fa.. take their native form. */

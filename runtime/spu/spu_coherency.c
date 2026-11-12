@@ -523,7 +523,7 @@ uint64_t spu_coh_line_epoch(uint32_t ea)
     uint32_t line = ea & ~127u;
     coh_epoch** bucket = epoch_bucket(line);
     for (coh_epoch* p = __atomic_load_n(bucket, __ATOMIC_ACQUIRE); p; p = p->next)
-        if (p->line == line) return __atomic_load_n(&p->value, __ATOMIC_RELAXED);
+        if (p->line == line) return __atomic_load_n(&p->value, __ATOMIC_ACQUIRE);
     coh_epoch* p = (coh_epoch*)malloc(sizeof(*p));
     if (!p) abort();
     /* Inserted under the lock-line lock only; shard-path stores walk the
@@ -538,7 +538,7 @@ uint64_t spu_coh_line_epoch(uint32_t ea)
 static void epoch_written(uint32_t line)
 {
     for (coh_epoch* p = __atomic_load_n(epoch_bucket(line), __ATOMIC_ACQUIRE); p; p = p->next)
-        if (p->line == line) { __atomic_fetch_add(&p->value, 1u, __ATOMIC_RELAXED); return; }
+        if (p->line == line) { __atomic_fetch_add(&p->value, 1u, __ATOMIC_RELEASE); return; }
 }
 
 unsigned long g_spu_lr_raise = 0;

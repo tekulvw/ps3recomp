@@ -4634,6 +4634,10 @@ typedef struct vk_eng_pipe {
     VkFormat            rt_fmt;          /* picks the render pass it is built against */
     u32                 cube_mask;       /* TextureCube units: the split set layout */
     VkPipeline          variant[VK_ENG_TOPOLOGIES];
+    /* pipeline_create_host: one RSX_HOST_VF_* stream per slot instead of the
+     * float4 vertex (0 = float4). */
+    u8                  host;
+    u8                  host_fmt[RSX_DSP_NUM_VERTEX_ATTR];
 } vk_eng_pipe;
 
 static vk_eng_pipe s_epipe[VK_ENG_MAX_PIPE];
@@ -4646,10 +4650,10 @@ static struct {
     u32          scratch_w, scratch_h;
     u32          pipeline;
     u32          vs_bytes, ps_bytes;
-    /* bind_vs_constant_rows (batched): only rows [vs_first, vs_first +
-     * vs_rows) and the last two of the shadow are this draw's. */
+    /* bind_vs_constant_rows (batched): only the rows set in vs_mask and the
+     * last two of the shadow are this draw's. */
     int          vs_spans;
-    u32          vs_first, vs_rows;
+    u32          vs_mask[16];
 
     u8*          ucpu;                /* the constants, in the shared UBO's layout */
     u32          tex[RSX_BE_MAX_TEXTURES];
@@ -4972,6 +4976,23 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     return slot + 1u;
 }
 
+static VkFormat vk_host_vertex_format(u8 f);
+static u32 vk_eng_pipeline_create_host(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                       const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
+                                       const u8* host_formats, rsx_be_format rt_fmt, u32 rt_count)
+{
+    if (!layout || !host_formats || !layout->count || layout->count > VK_GUEST_ATTRS) return 0;
+    for (u32 s = 0; s < layout->count; s++)
+        if (vk_host_vertex_format(host_formats[s]) == VK_FORMAT_UNDEFINED) return 0;
+    const u32 h = vk_eng_pipeline_create(user, vs_hlsl, ps_hlsl, rs, layout, layout->stride ? layout->stride : 16u,
+                                         rt_fmt, rt_count);
+    if (!h) return 0;
+    vk_eng_pipe* P = &s_epipe[h - 1];
+    P->host = 1;
+    memcpy(P->host_fmt, host_formats, layout->count);
+    return h;
+}
+
 static void vk_eng_pipeline_release(void* user, u32 pipeline)
 {
     (void)user;
@@ -4985,6 +5006,20 @@ static void vk_eng_pipeline_release(void* user, u32 pipeline)
     if (P->fs) pvkDestroyShaderModule(s_vk.device, P->fs, NULL);
     memset(P, 0, sizeof *P);
     if (s_e2.pipeline == pipeline) s_e2.pipeline = 0;
+}
+
+static VkFormat vk_host_vertex_format(u8 f)
+{
+    switch (f) {
+    case RSX_HOST_VF_F32_1: return VK_FORMAT_R32_SFLOAT;
+    case RSX_HOST_VF_F32_2: return VK_FORMAT_R32G32_SFLOAT;
+    case RSX_HOST_VF_F32_3: return VK_FORMAT_R32G32B32_SFLOAT;
+    case RSX_HOST_VF_F32_4: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case RSX_HOST_VF_F16_4: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case RSX_HOST_VF_UN8_4: return VK_FORMAT_R8G8B8A8_UNORM;
+    case RSX_HOST_VF_SN16_4: return VK_FORMAT_R16G16B16A16_SNORM;
+    default: return VK_FORMAT_UNDEFINED;
+    }
 }
 
 static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
@@ -5005,13 +5040,24 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
           .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = P->vs, .pName = "main" },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
           .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = P->fs, .pName = "main" } };
-    VkVertexInputBindingDescription vb = { 0, P->stride, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputBindingDescription vb[VK_GUEST_ATTRS];
     VkVertexInputAttributeDescription va[VK_GUEST_ATTRS];
+    u32 nb = 1;
+    vb[0] = (VkVertexInputBindingDescription){ 0, P->stride, VK_VERTEX_INPUT_RATE_VERTEX };
     for (u32 s = 0; s < P->nslots; s++)
         va[s] = (VkVertexInputAttributeDescription){ s, 0, VK_FORMAT_R32G32B32A32_SFLOAT, s * 16u };
+    if (P->host) {
+        /* Host-format streams: slot s from binding s, tightly packed. */
+        nb = P->nslots;
+        for (u32 s = 0; s < P->nslots; s++) {
+            vb[s] = (VkVertexInputBindingDescription){ s, rsx_vertex_host_format_bytes(P->host_fmt[s]),
+                                                       VK_VERTEX_INPUT_RATE_VERTEX };
+            va[s] = (VkVertexInputAttributeDescription){ s, s, vk_host_vertex_format(P->host_fmt[s]), 0 };
+        }
+    }
     VkPipelineVertexInputStateCreateInfo vi = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &vb,
+        .vertexBindingDescriptionCount = nb, .pVertexBindingDescriptions = vb,
         .vertexAttributeDescriptionCount = P->nslots, .pVertexAttributeDescriptions = va };
     VkPipelineInputAssemblyStateCreateInfo ia = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -5185,11 +5231,10 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 /* Batched: the shadow takes just the rows the program reads and the
  * transform's, and the draw copies just those into its arena. Otherwise the
  * whole block, as bind_vs_constants. */
-static void vk_eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes, u32 first_row, u32 rows)
+static void vk_eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes, const u32* row_mask)
 {
     const u32 cap = (u32)s_g.ps_off;
-    if (!s_bat_on || !s_g.on || !data || bytes > cap || bytes < 32u ||
-        (u64)(first_row + rows) * 16u > bytes - 32u) {
+    if (!s_bat_on || !s_g.on || !data || bytes > cap || !rsx_be_row_mask_fits(row_mask, bytes)) {
         vk_eng_bind_vs_constants(user, data, bytes);
         return;
     }
@@ -5197,10 +5242,12 @@ static void vk_eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes
     u8* shadow = vk_eng_ucpu();
     if (!shadow) { vk_eng_bind_vs_constants(user, data, bytes); return; }
     const u8* src = (const u8*)data;
-    if (rows) memcpy(shadow + first_row * 16u, src + first_row * 16u, rows * 16u);
+    for (u32 row = 0, n = 0; rsx_be_row_run(row_mask, &row, &n); row += n)
+        memcpy(shadow + row * 16u, src + row * 16u, n * 16u);
     memcpy(shadow + bytes - 32u, src + bytes - 32u, 32u);
     s_e2.vs_bytes = bytes;
-    s_e2.vs_spans = 1; s_e2.vs_first = first_row; s_e2.vs_rows = rows;
+    s_e2.vs_spans = 1;
+    memcpy(s_e2.vs_mask, row_mask, sizeof s_e2.vs_mask);
 }
 /* The engine's constants are byte-for-byte those of the last bind. Batched,
  * the shadow already holds them and the draw may reuse the previous draw's
@@ -5679,6 +5726,20 @@ static VkDescriptorSet vk_eng_dyn_set(const vk_eng_pipe* P, const VkDescriptorBu
     return set;
 }
 
+/* What a draw reads from host memory: one blob of vertex bytes bound as
+ * `streams` vertex buffers (the float4 vertex: one; host formats: one per
+ * slot, at offsets[i]) and its indices. */
+typedef struct {
+    const void* data;
+    VkDeviceSize bytes;
+    u32 streams;
+    const u32* offsets;
+    u32 vertex_count;
+    const void* indices;
+    u32 index_count, index_size;
+} vk_eng_vertices;
+static void vk_eng_draw_core(rsx_topology topology, vk_eng_pipe* P, const vk_eng_vertices* V);
+
 /* Does the bound texture set read one of the open pass's colour targets,
  * directly or through a crossbar view of it? */
 static int vk_pass_samples_target(void)
@@ -5698,9 +5759,33 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
 {
     (void)user;
     if (!s_e2.pipeline || !vertices || !vertex_count || !stride) return;
-    if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
     vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
-    if (!P->used || stride != P->stride) return;
+    if (!P->used || P->host || stride != P->stride) return;
+    static const u32 zero = 0;
+    const vk_eng_vertices V = { vertices, (VkDeviceSize)vertex_count * stride, 1, &zero, vertex_count,
+                                indices, indices ? index_count : 0, 4 };
+    vk_eng_draw_core(topology, P, &V);
+}
+
+static void vk_eng_draw_host(void* user, rsx_topology topology, const void* data, u32 data_bytes,
+                             const u32* offsets, u32 streams, u32 vertex_count,
+                             const void* indices, u32 index_count, u32 index_size)
+{
+    (void)user;
+    if (!s_e2.pipeline || !data || !data_bytes || !vertex_count || !offsets) return;
+    if (index_size != 2 && index_size != 4) return;
+    vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
+    if (!P->used || !P->host || streams != P->nslots) return;
+    const vk_eng_vertices V = { data, data_bytes, streams, offsets, vertex_count,
+                                indices, indices ? index_count : 0, index_size };
+    vk_eng_draw_core(topology, P, &V);
+}
+
+static void vk_eng_draw_core(rsx_topology topology, vk_eng_pipe* P, const vk_eng_vertices* V)
+{
+    if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
+    const void* indices = V->indices;
+    const u32 index_count = V->index_count;
 
     /* Targets: every member of a set is target A's size (engine contract). */
     const u32 n = s_eng_bound.nrt;
@@ -5727,8 +5812,10 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkFramebuffer fb = vk_eng_framebuffer(rp, s_eng_bound.rt, n, dview, dkey, w, h);
     if (!pipe || !rp || !fb) return;
 
-    const VkDeviceSize vbytes = (VkDeviceSize)vertex_count * stride;
-    const VkDeviceSize ibytes = (indices && index_count) ? (VkDeviceSize)index_count * 4u : 0;
+    const VkDeviceSize vbytes = V->bytes;
+    const void* vertices = V->data;
+    const VkDeviceSize isz = V->index_size;
+    const VkDeviceSize ibytes = (indices && index_count) ? (VkDeviceSize)index_count * isz : 0;
     VkBuffer vbuf = s_vk.vertices.buf, ibuf = s_e2.indices.buf;
     VkDeviceSize voff = 0, ioff = 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
@@ -5756,8 +5843,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         if (reuse_vs) { cb[0] = s_e2.vs_last; s_e2.vs_reused++; }
         else {
             if (s_e2.vs_bytes && s_e2.ucpu && s_e2.vs_spans) {
-                const u32 a = s_e2.vs_first * 16u, n = s_e2.vs_rows * 16u, t = s_e2.vs_bytes - 32u;
-                if (n) memcpy((u8*)vc + a, s_e2.ucpu + a, n);
+                for (u32 row = 0, n = 0; rsx_be_row_run(s_e2.vs_mask, &row, &n); row += n)
+                    memcpy((u8*)vc + row * 16u, s_e2.ucpu + row * 16u, n * 16u);
+                const u32 t = s_e2.vs_bytes - 32u;
                 memcpy((u8*)vc + t, s_e2.ucpu + t, 32u);
             } else if (s_e2.vs_bytes && s_e2.ucpu) memcpy(vc, s_e2.ucpu, s_e2.vs_bytes);
             else memset(vc, 0, vsb);
@@ -5895,12 +5983,17 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 2, dyn_off);
     else
         pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
-    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &voff);
-    if (ibytes) {
-        pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
+    {
+        VkBuffer bufs[RSX_DSP_NUM_VERTEX_ATTR];
+        VkDeviceSize offs[RSX_DSP_NUM_VERTEX_ATTR];
+        for (u32 b = 0; b < V->streams; b++) { bufs[b] = vbuf; offs[b] = voff + V->offsets[b]; }
+        pvkCmdBindVertexBuffers(s_vk.cmd, 0, V->streams, bufs, offs);
+    }
+    if (indices && index_count) {
+        pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, ioff, isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
     } else {
-        pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+        pvkCmdDraw(s_vk.cmd, V->vertex_count, 1, 0, 0);
     }
     if (merge) {
         s_pass.pipe = pipe; s_pass.layout = layout; s_pass.vp = vp; s_pass.sc = sc;
@@ -6953,9 +7046,9 @@ static void owner_vk_eng_bind_vs_constants(void* user, const void* data, u32 byt
     if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
     vk_eng_bind_vs_constants(user,data,bytes);vulkan_owner_finish(vulkan_owner_boundary(before));
 }
-static void owner_vk_eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes, u32 first_row, u32 rows){
+static void owner_vk_eng_bind_vs_constant_rows(void* user, const void* data, u32 bytes, const u32* row_mask){
     if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
-    vk_eng_bind_vs_constant_rows(user,data,bytes,first_row,rows);vulkan_owner_finish(vulkan_owner_boundary(before));
+    vk_eng_bind_vs_constant_rows(user,data,bytes,row_mask);vulkan_owner_finish(vulkan_owner_boundary(before));
 }
 static int owner_vk_eng_rebind_vs_constants(void* user){
     if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
@@ -6990,6 +7083,18 @@ static void owner_vk_eng_set_stencil_ref(void* user, u32 ref){
 static void owner_vk_eng_set_depth_bounds(void* user, float min, float max){
     if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
     vk_eng_set_depth_bounds(user,min,max);vulkan_owner_finish(vulkan_owner_boundary(before));
+}
+static u32 owner_vk_eng_pipeline_create_host(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                  const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
+                                  const u8* host_formats, rsx_be_format rt_fmt, u32 rt_count){
+    if(!vulkan_owner_begin(1)){return 0;}uint64_t before=s_vulkan_commits;
+    u32 result=vk_eng_pipeline_create_host(user,vs_hlsl,ps_hlsl,rs,layout,host_formats,rt_fmt,rt_count);vulkan_owner_finish(vulkan_owner_boundary(before));return result;
+}
+static void owner_vk_eng_draw_host(void* user, rsx_topology topology, const void* data, u32 data_bytes,
+                        const u32* offsets, u32 streams, u32 vertex_count,
+                        const void* indices, u32 index_count, u32 index_size){
+    if(!vulkan_owner_begin(1)){return;}uint64_t before=s_vulkan_commits;
+    vk_eng_draw_host(user,topology,data,data_bytes,offsets,streams,vertex_count,indices,index_count,index_size);vulkan_owner_finish(vulkan_owner_boundary(before));
 }
 static void owner_vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                         u32 stride, const u32* indices, u32 index_count){
@@ -7080,6 +7185,8 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .set_stencil_ref      = owner_vk_eng_set_stencil_ref,
     .set_depth_bounds     = owner_vk_eng_set_depth_bounds,
     .draw                 = owner_vk_eng_draw,
+    .pipeline_create_host = owner_vk_eng_pipeline_create_host,
+    .draw_host            = owner_vk_eng_draw_host,
     .clear_color          = owner_vk_eng_clear_color,
     .clear_depth_stencil  = owner_vk_eng_clear_depth_stencil,
     .present              = owner_vk_eng_present,

@@ -15,6 +15,34 @@
 
 #define N_PROGRAMS 256u
 
+/* The host-format half of the stub backend. */
+static struct {
+    int creates, draws;
+    u8 formats[16];
+    u32 streams, vertex_count, index_count, index_size;
+    u8 data[256];
+    u16 indices[8];
+} g_host;
+static u32 stub_pipeline_create_host(void* u, const char* vs, const char* ps,
+                                     const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
+                                     const u8* formats, rsx_be_format rt, u32 rt_count)
+{
+    g_host.creates++;
+    memcpy(g_host.formats, formats, layout->count);
+    return stub_pipeline_create(u, vs, ps, rs, layout, 0, rt, rt_count);
+}
+static void stub_draw_host(void* u, rsx_topology topology, const void* data, u32 data_bytes,
+                           const u32* offsets, u32 streams, u32 vertex_count,
+                           const void* indices, u32 index_count, u32 index_size)
+{
+    (void)u; (void)topology; (void)offsets;
+    g_host.draws++;
+    g_host.streams = streams; g_host.vertex_count = vertex_count;
+    g_host.index_count = index_count; g_host.index_size = index_size;
+    memcpy(g_host.data, data, data_bytes < sizeof g_host.data ? data_bytes : sizeof g_host.data);
+    if (index_size == 2) memcpy(g_host.indices, indices, (index_count < 8 ? index_count : 8) * 2u);
+}
+
 static void upload_vp(u32 swz)
 {
     u8 vp[16];
@@ -32,17 +60,20 @@ static u32 swizzle(u32 i)
 /* Constant rows: what the last bind_vs_constant_rows staged, and a copy of
  * the rows it was told the program reads plus the transform's. */
 static int g_row_binds;
-static u32 g_row_first, g_row_count;
+static u32 g_row_first, g_row_count, g_row_runs;
 static u8 g_row_block[(RSX_DSP_NUM_CONSTANTS + 2) * 16];
-static void stub_bind_vs_rows(void* u, const void* d, u32 n, u32 first, u32 rows)
+static void stub_bind_vs_rows(void* u, const void* d, u32 n, const u32* mask)
 {
     (void)u;
-    g_row_binds++; g_row_first = first; g_row_count = rows;
+    g_row_binds++; g_row_first = 0; g_row_count = 0; g_row_runs = 0;
     memset(g_row_block, 0xEE, sizeof g_row_block);
-    if (d && n <= sizeof g_row_block && (first + rows) * 16u + 32u <= n) {
-        memcpy(g_row_block + first * 16u, (const u8*)d + first * 16u, rows * 16u);
-        memcpy(g_row_block + n - 32u, (const u8*)d + n - 32u, 32u);
+    if (!d || n > sizeof g_row_block || !rsx_be_row_mask_fits(mask, n)) return;
+    for (u32 row = 0, k = 0; rsx_be_row_run(mask, &row, &k); row += k) {
+        if (!g_row_runs++) g_row_first = row;
+        g_row_count += k;
+        memcpy(g_row_block + row * 16u, (const u8*)d + row * 16u, k * 16u);
     }
+    memcpy(g_row_block + n - 32u, (const u8*)d + n - 32u, 32u);
 }
 /* A program of MOVs: o0 from v0, then one constant each into o1, o7, ... */
 static void upload_const_vp(const u32* regs, u32 n, int indexed)
@@ -80,6 +111,23 @@ static void test_constant_rows(void)
         rsx_test_vp_mov_const_out(vp + 32, 7, 8, 0, 1);
         CHECK(rsx_vp_analyze_constants(vp, 48, &r) == 3 && !r.all && r.first == 7 && r.count == 6,
               "constants 12 and 7: rows 7..12 (%u+%u)", r.first, r.count);
+        CHECK(r.mask[0] == ((1u << 7) | (1u << 12)) && !r.mask[1] && !r.mask[15],
+              "and exactly those two rows in the mask (%08X)", r.mask[0]);
+        rsx_test_vp_mov_const_out(vp + 16, 3, 7, 0, 0);
+        rsx_test_vp_mov_const_out(vp + 32, 500, 8, 0, 1);
+        CHECK(rsx_vp_analyze_constants(vp, 48, &r) == 3 && !r.all && r.mask[0] == (1u << 3) &&
+              r.mask[15] == (1u << (500 - 480)) && !r.mask[7],
+              "constants 3 and 500: two rows, not the 498 between");
+        /* The run walker over a mask with runs across word boundaries. */
+        u32 m[16] = { 0 };
+        m[0] = 0x80000001u; m[1] = 0xFFFFFFFFu; m[2] = 0x1u; m[15] = 0x80000000u;
+        u32 runs[4][2], nr = 0;
+        for (u32 row = 0, k = 0; nr < 4 && rsx_be_row_run(m, &row, &k); row += k) { runs[nr][0] = row; runs[nr][1] = k; nr++; }
+        CHECK(nr == 3 && runs[0][0] == 0 && runs[0][1] == 1 && runs[1][0] == 31 && runs[1][1] == 34 &&
+              runs[2][0] == 511 && runs[2][1] == 1, "row runs: 0, 31..64, 511 (%u runs)", nr);
+        CHECK(rsx_be_row_mask_fits(m, 512u * 16u + 32u) && !rsx_be_row_mask_fits(m, 64u * 16u + 32u),
+              "a mask fits a block only when its last row does");
+        rsx_test_vp_mov_const_out(vp + 16, 12, 7, 0, 0);
         rsx_test_vp_mov_const_out(vp + 32, 7, 8, 1, 1);
         CHECK(rsx_vp_analyze_constants(vp, 48, &r) == 3 && r.all, "an indexed constant reads them all");
         rsx_test_vp_mov_const_out(vp + 32, 7, 8, 0, 0);
@@ -101,14 +149,15 @@ static void test_constant_rows(void)
         RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
     m(0x8E4, TEX_OFFSET | 2);
     m(0x1D60, 64);
-    put_constant(7, 0x700); put_constant(12, 0xC00); put_constant(20, 0x1400); put_constant(300, 0x3000);
+    put_constant(7, 0x700); put_constant(9, 0x900); put_constant(12, 0xC00); put_constant(20, 0x1400);
+    put_constant(300, 0x3000);
     const u32 a[2] = { 12, 7 };
     upload_const_vp(a, 2, 0);
     g_row_binds = 0; g_vs_binds = g_vs_rebinds = 0;
     draw_triangle();
-    CHECK(g_row_binds == 1 && g_vs_binds == 0 && g_row_first == 7 && g_row_count == 6,
-          "a program reading constants 7 and 12 stages rows 7..12 (%d binds, %u+%u)",
-          g_row_binds, g_row_first, g_row_count);
+    CHECK(g_row_binds == 1 && g_vs_binds == 0 && g_row_first == 7 && g_row_count == 2 && g_row_runs == 2,
+          "a program reading constants 7 and 12 stages those two rows (%d binds, from %u, %u rows in %u runs)",
+          g_row_binds, g_row_first, g_row_count, g_row_runs);
     CHECK(row_is(7, 0x700) && row_is(12, 0xC00), "with their values");
     { u8 fill[32]; memset(fill, 0xEE, sizeof fill);
       CHECK(memcmp(g_row_block + RSX_DSP_NUM_CONSTANTS * 16u, fill, sizeof fill) != 0,
@@ -127,22 +176,28 @@ static void test_constant_rows(void)
     upload_const_vp(a, 2, 0);
     draw_triangle();
     CHECK(g_row_binds == 3 && g_row_first == 7, "nor one reading rows outside it (%d)", g_row_binds);
+    /* Row 9 lies between the copy's 7 and 12 but is not in it. */
+    const u32 c9[1] = { 9 };
+    upload_const_vp(c9, 1, 0);
+    draw_triangle();
+    CHECK(g_row_binds == 4 && g_row_first == 9 && g_row_count == 1 && row_is(9, 0x900),
+          "nor one reading a row between the copy's rows (%d, %u)", g_row_binds, g_row_first);
     /* Indexed: every row, through bind_vs_constants. */
     upload_const_vp(a, 2, 1);
     const int full = g_vs_binds;
     draw_triangle();
-    CHECK(g_vs_binds == full + 1 && g_row_binds == 3, "an indexed program binds the whole block");
+    CHECK(g_vs_binds == full + 1 && g_row_binds == 4, "an indexed program binds the whole block");
     /* A full copy serves any program after it. */
     upload_const_vp(b, 1, 0);
     draw_triangle();
-    CHECK(g_row_binds == 3 && g_vs_binds == full + 1, "and the whole block serves a narrower program next");
+    CHECK(g_row_binds == 4 && g_vs_binds == full + 1, "and the whole block serves a narrower program next");
     /* A changed constant stages again. */
     put_constant(20, 0x1500);
     draw_triangle();
-    CHECK(g_row_binds == 4 && row_is(20, 0x1500), "a written constant is staged again");
+    CHECK(g_row_binds == 5 && row_is(20, 0x1500), "a written constant is staged again");
     unsigned long long rb = 0, rbytes = 0;
     rsx_draw_engine_vs_constant_row_counts(&rb, &rbytes);
-    CHECK(rb >= 4 && rbytes > 0 && rbytes < rb * 64u * 16u, "row binds are counted (%llu, %llu bytes)", rb, rbytes);
+    CHECK(rb >= 4 && rbytes > 0 && rbytes <= rb * 4u * 16u, "row binds are counted (%llu, %llu bytes)", rb, rbytes);
     engine_down();
     g_stub_backend.bind_vs_constant_rows = NULL;
     g_stub_backend.rebind_vs_constants = NULL;
@@ -250,6 +305,81 @@ int main(void)
     CHECK(rsx_fp_collect_constants(fp, sizeof fp, &block) == 0 && block.count == 0,
           "a program without constants has no slots");
     CHECK(block.values[0][0] == 0xABABABABu, "and the unused slots are left alone");
+
+    /* Host-format vertex streams (PS3RECOMP_RSX_HOST_VERTEX_FORMATS=1): a
+     * triangle list over a FLOAT4 array reaches draw_host as byte-swapped
+     * floats over its vertex range with u16 indices, through a pipeline made
+     * by pipeline_create_host; a CMP32 array is refused and takes the float4
+     * path; with the switch off nothing changes. */
+    {
+        g_stub_backend.pipeline_create_host = stub_pipeline_create_host;
+        g_stub_backend.draw_host = stub_draw_host;
+        setenv("PS3RECOMP_RSX_HOST_VERTEX_FORMATS", "1", 1);
+        engine_up();
+        upload_vp(swizzle(0));
+        rsx_test_fp_instr(vm_base + TEX_OFFSET,
+            RSX_TEST_FP_OPC(0x01) | RSX_TEST_FP_MASK_XYZW | RSX_TEST_FP_INSRC_COL0 | RSX_TEST_FP_END,
+            RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        m(0x8E4, TEX_OFFSET | 2);
+        m(0x1D60, 64);
+        /* Six vertices at VTX_OFFSET: x = 10 + i. */
+        for (u32 v = 0; v < 6; v++) for (u32 c = 0; c < 4; c++) {
+            const float f = c ? 0.5f : 10.0f + (float)v;
+            u32 w; memcpy(&w, &f, 4);
+            u8* p = vm_base + VTX_OFFSET + v * 16u + c * 4u;
+            p[0] = (u8)(w >> 24); p[1] = (u8)(w >> 16); p[2] = (u8)(w >> 8); p[3] = (u8)w;
+        }
+        const int draws0 = stub.n_draw, hosts0 = g_host.draws;
+        /* Elements 2, 3, 4 (a range that does not start at 0). */
+        m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+        m(M_DRAW_ARRAYS, 2u | ((3u - 1u) << 24));
+        m(M_BEGIN_END, 0u);
+        CHECK(g_host.draws == hosts0 + 1 && stub.n_draw == draws0, "a plain triangle list is drawn with host streams");
+        CHECK(g_host.creates == 1 && g_host.formats[0] == RSX_HOST_VF_F32_4 && g_host.streams == 1,
+              "through a host-format pipeline with one FLOAT4 stream");
+        float x0 = 0, y0 = 0; memcpy(&x0, g_host.data, 4); memcpy(&y0, g_host.data + 4, 4);
+        CHECK(g_host.vertex_count == 3 && g_host.index_count == 3 && g_host.index_size == 2 &&
+              g_host.indices[0] == 0 && g_host.indices[2] == 2 && x0 == 12.0f && y0 == 0.5f,
+              "three vertices from element 2, byte-swapped, indices relative to the range (x0 %g)", x0);
+        m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+        m(M_DRAW_ARRAYS, 0u | ((3u - 1u) << 24));
+        m(M_BEGIN_END, 0u);
+        CHECK(g_host.creates == 1 && g_host.draws == hosts0 + 2, "the next draw reuses the pipeline");
+        /* A float4 draw with the same program and state, then the host draw
+         * again: each takes its own pipeline, never the other's. */
+        const int creates_before = stub.n_pipeline_create;
+        m(M_VTXFMT, 6u | (1u << 4) | (16u << 8));            /* CMP32: float4 path */
+        draw_triangle();
+        const u32 float4_pipe = stub.bound_pipeline;
+        m(M_VTXFMT, 2u | (4u << 4) | (16u << 8));
+        m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+        m(M_DRAW_ARRAYS, 0u | ((3u - 1u) << 24));
+        m(M_BEGIN_END, 0u);
+        CHECK(stub.n_pipeline_create == creates_before + 1 && stub.bound_pipeline != float4_pipe &&
+              g_host.draws == hosts0 + 3, "float4 and host-format draws of one program keep separate pipelines");
+        /* CMP32 has no host format: refused, drawn as float4. */
+        m(M_VTXFMT, 6u | (1u << 4) | (16u << 8));
+        unsigned long long hd = 0, hr = 0;
+        rsx_draw_engine_host_vertex_counts(&hd, &hr);
+        draw_triangle();
+        unsigned long long hd2 = 0, hr2 = 0;
+        rsx_draw_engine_host_vertex_counts(&hd2, &hr2);
+        CHECK(hr2 == hr + 1 && stub.n_draw == draws0 + 2 && g_host.draws == hosts0 + 3,
+              "an attribute without a host format takes the float4 path");
+        m(M_VTXFMT, 2u | (4u << 4) | (16u << 8));
+        engine_down();
+        unsetenv("PS3RECOMP_RSX_HOST_VERTEX_FORMATS");
+        engine_up();
+        upload_vp(swizzle(0));
+        m(0x8E4, TEX_OFFSET | 2);
+        m(0x1D60, 64);
+        const int before = stub.n_draw;
+        draw_triangle();
+        CHECK(stub.n_draw == before + 1 && g_host.draws == hosts0 + 3, "with the switch off every draw is float4");
+        engine_down();
+        g_stub_backend.pipeline_create_host = NULL;
+        g_stub_backend.draw_host = NULL;
+    }
 
     /* The engine keeps what a fragment program's bytes decide (sampled
      * units, inline constants, structural hash) for the programs recent draws

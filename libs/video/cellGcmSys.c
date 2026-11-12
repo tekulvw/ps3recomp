@@ -2900,12 +2900,44 @@ static u64 s_ref_receipts[GCM_REF_QLEN];
  * at its start (s_checked_ref_pass); outside a pass the environment is read
  * as before, so a caller that changes it between passes still sees the change. */
 static int s_checked_ref_pass = -1;
+/* Set once checked REF has stood down for the rest of the run (see
+ * gcm_checked_ref_stand_down); from then on every path runs as without it. */
+static atomic_int s_checked_ref_off;
 static int gcm_checked_ref_mode(void)
 {
+    if(atomic_load_explicit(&s_checked_ref_off,memory_order_relaxed))return 0;
     if(cellGcm_native_consumer_enabled())return s_native_checked_ref;
     if (s_checked_ref_pass >= 0) return s_checked_ref_pass;
     const char* e = getenv("PS3RECOMP_GCM_CHECKED_REF");
     return e && !strcmp(e, "1");
+}
+/* An unknown command word under checked REF. Failing the mode here froze
+ * reclamation, which stopped every later drain pass: the title then waits on
+ * REF and labels forever and the picture freezes for the rest of the run.
+ * A word the decoder does not know is not proof the queued references are
+ * wrong, so stand checked REF down instead -- the run keeps the plain
+ * paced-REF behaviour from here on -- and let the caller skip the word as it
+ * would without checked REF. Report once, with the words the walker consumed
+ * just before it (from the decode trace) and the raw words just after it, so
+ * the cause can be read from the next occurrence. */
+static void gcm_checked_ref_stand_down(u32 io, u32 word)
+{
+    if (atomic_exchange(&s_checked_ref_off, 1)) return;
+    fprintf(stderr, "[gcm checked REF] unknown word 0x%08X at io %08X: checked REF off for "
+            "the rest of the run; the word is skipped as without it\n", word, io);
+    fprintf(stderr, "[gcm checked REF] consumed before:");
+    for (u32 k = 8; k >= 1; k--) {
+        if (s_tr_i < k + 1) continue;           /* the current word is the newest entry */
+        u32 at = (s_tr_i - 1 - k) % GCM_TRACE_N;
+        fprintf(stderr, " %08X:%08X", s_tr_off[at], s_tr_w[at]);
+    }
+    fprintf(stderr, "\n[gcm checked REF] following:");
+    for (u32 k = 1; k <= 8; k++) {
+        u32 ea = gcm_io2ea(io + 4 * k);
+        if (!ea) break;
+        fprintf(stderr, " %08X:%08X", io + 4 * k, vm_read32(ea));
+    }
+    fprintf(stderr, "\n");
 }
 static void gcm_checked_ref_fail(const char* why, u32 io)
 {
@@ -4602,7 +4634,7 @@ static void gcm_rsx_process_fifo_pass(void)
         }
         { static int _uw = 0; if (PS3_LOG_FIRST(_uw, 16) && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
-        if(gcm_checked_ref_mode()){gcm_checked_ref_fail("unknown-word",s_fifo_getoff);break;}
+        if(gcm_checked_ref_mode())gcm_checked_ref_stand_down(s_fifo_getoff,w);
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
     gcm_observer_flush_zeros();

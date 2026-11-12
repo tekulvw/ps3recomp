@@ -53,9 +53,19 @@ jobs:
       # imported target and refuses to load while /usr/bin/glslang is absent.
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang \
-            glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
+          bash .github/scripts/install-linux-dependencies.sh \
+            ninja-build libsdl2-dev clang libclang-rt-dev glslang-dev glslang-tools \
+            spirv-tools libspirv-cross-c-shared-dev
+
+      # Minimal runner images need compiler-rt for the UBSan fixtures.
+      - name: Verify Clang UBSan runtime
+        run: |
+          printf '%s\n' 'int main(void) { volatile int one = 1; return one + 1 - 2; }' \
+            | clang -x c - -fsanitize=undefined -fno-sanitize-recover=all -o /tmp/ps3recomp-ubsan-smoke
+          /tmp/ps3recomp-ubsan-smoke
+
+      - name: Test dependency installer
+        run: python3 -m unittest discover -s .github/tests -v
 
       - name: Configure
         run: |
@@ -708,13 +718,15 @@ jobs:
             -lpthread -lm
           /tmp/test_spurs_job_stack
 
-      # The scheme-agnostic SPU/SPURS coherence suites above again, with
-      # per-line version counters on (PS3RECOMP_COH_VERSIONS, default off).
+      # The scheme-aware SPU/SPURS coherence suites above again, with per-line
+      # version counters on (PS3RECOMP_COH_VERSIONS, default off). The lifter
+      # loop's tools/test_coh_versions_suites.py does the same for the Python
+      # coherence suites.
       - name: Rerun the SPU coherence suites with version counters
         env:
           PS3RECOMP_COH_VERSIONS: "1"
         run: |
-          for t in test_spu_lockline_peer test_spu_taskset_wake test_spurs_signalled_atomic \
+          for t in test_spu_coherency test_spu_lockline_peer test_spu_taskset_wake test_spurs_signalled_atomic \
                    test_spurs_taskset_bits_atomic test_spu_lifted_start test_spu_mfc_slots \
                    test_spurs_job_stack; do
             echo "--- $t"

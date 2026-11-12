@@ -2,7 +2,11 @@
 """Synthetic SPURS policy-module hop chain through the real scheduler.
 
 Default (CI): short chains, SPU-kicked on 1 and 6 lanes and PPU-kicked on 2,
-with and without PS3RECOMP_SPURS_SELF_DISPATCH=1, each of which must complete.
+with and without PS3RECOMP_SPURS_SELF_DISPATCH=1, each of which must complete;
+and a PPU-kicked chain whose requests are stored while the workers sleep,
+which must start each PM well inside the coordinator's 1 ms timed pass (the
+request line's coherence watch wakes it) and, with PS3RECOMP_SPURS_STORE_WAKE=0,
+waits for that pass.
 --hops N: timed runs; prints per-hop wall time and request-to-start latency.
 Manufactured policy modules only; no game content.
 """
@@ -48,4 +52,15 @@ with tempfile.TemporaryDirectory(prefix='spurs-pm-hop-') as tmp:
             if result.returncode or not line:
                 sys.exit(f'FAIL lanes={lanes} kick={kick} self={self_dispatch}\n{result.stdout}\n{result.stderr[-2000:]}')
             print(f'self_dispatch={self_dispatch} ' + line[0])
+    if not args.hops:
+        def p50(store_wake):
+            result = subprocess.run([str(out), '300', '2', 'ppu-idle=200'], capture_output=True, text=True,
+                                    timeout=120, env=dict(env, PS3RECOMP_SPURS_STORE_WAKE=store_wake))
+            line = [l for l in result.stdout.splitlines() if l.startswith('pm_hop')]
+            if result.returncode or not line:
+                sys.exit(f'FAIL ppu-idle store_wake={store_wake}\n{result.stdout}\n{result.stderr[-2000:]}')
+            print(f'store_wake={store_wake} ' + line[0])
+            return float(line[0].split(' p50=')[1].split()[0])
+        woken, polled = p50('1'), p50('0')
+        assert woken < 500 and polled > woken, (woken, polled)
 print('PASS: SPURS policy-module hop chains completed')

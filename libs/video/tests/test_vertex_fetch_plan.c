@@ -188,6 +188,109 @@ static int test_remap(void)
     return cases > 1000 && dense > 300;
 }
 
+/* A host GPU's conversion of each host format to float, written out: what
+ * the vertex fetch would hand the program. */
+static float host_half(u16 h)
+{
+    const u32 sign = (u32)(h >> 15) << 31, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
+    u32 bits;
+    if (exp == 0) {
+        if (!man) bits = sign;
+        else { float f = (float)man / 16777216.0f; memcpy(&bits, &f, 4); bits |= sign; }
+    } else if (exp == 31) bits = sign | 0x7F800000u | (man << 13);
+    else bits = sign | ((exp + 112u) << 23) | (man << 13);
+    float f; memcpy(&f, &bits, 4); return f;
+}
+static void host_decode(u8 format, const u8* p, float v[4])
+{
+    v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+    switch (format) {
+    case RSX_HOST_VF_F32_1: case RSX_HOST_VF_F32_2: case RSX_HOST_VF_F32_3: case RSX_HOST_VF_F32_4:
+        memcpy(v, p, 4u * (u32)(format - RSX_HOST_VF_F32_1 + 1)); break;
+    case RSX_HOST_VF_F16_4: for (int c = 0; c < 4; c++) { u16 h; memcpy(&h, p + 2 * c, 2); v[c] = host_half(h); } break;
+    case RSX_HOST_VF_UN8_4: for (int c = 0; c < 4; c++) v[c] = p[c] / 255.0f; break;
+    case RSX_HOST_VF_SN16_4: for (int c = 0; c < 4; c++) { s16 x; memcpy(&x, p + 2 * c, 2);
+                                                          v[c] = x / 32767.0f; if (v[c] < -1.0f) v[c] = -1.0f; } break;
+    }
+}
+
+/* rsx_vertex_host_streams_build, decoded the way a host GPU converts each
+ * format, against rsx_vertex_fetch_many over the same elements: bit-equal
+ * float4s, or a refusal. */
+static int test_host_streams(void)
+{
+    enum { MAXN = 96 };
+    static rsx_vertex_ref refs[MAXN];
+    static u8 four[MAXN * 16 * 16], host[MAXN * 16 * 16];
+    int built = 0, refused = 0, snorm_min_refused = 0;
+    for (int n_plan = 0; n_plan < 4000; n_plan++) {
+        mapped_end[0] = mapped_end[1] = GUEST;
+        rsx_vertex_fetch_plan plan;
+        random_plan(&plan, 0, NULL, 0);
+        rsx_vertex_layout_plan_init(&plan.layout, (rnd() & 0x0F0Fu) | 1u);
+        for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {          /* mostly host formats */
+            rsx_vertex_fetch_attr* f = &plan.attr[a];
+            static const u32 types[5] = { RSX_VTX_TYPE_FLOAT, RSX_VTX_TYPE_HALF, RSX_VTX_TYPE_UNORM8,
+                                          RSX_VTX_TYPE_SNORM16, RSX_VTX_TYPE_CMP32 };
+            f->desc.type = types[rnd() % (rnd() % 8 ? 4 : 5)];
+            f->desc.size = 1 + rnd() % 4;
+            if (rnd() % 16 == 0) f->desc.frequency = 2; else f->desc.frequency = 0;
+            f->elem_size = rsx_vertex_attrib_size(f->desc.type, f->desc.size);
+            f->desc.stride = f->elem_size + (rnd() % 3) * 4u;
+            f->stride = f->desc.stride;
+        }
+        const u32 first = rnd() % 64, n = 1 + rnd() % (MAXN - 1);
+        for (u32 i = 0; i < n; i++) { refs[i].vertex_id = first + i; refs[i].base_index = 0; }
+        /* Now and then a SNORM16 component of -32768 in the range. */
+        const int plant = rnd() % 8 == 0;
+        if (plant)
+            for (u32 slot = 0; slot < plan.layout.count; slot++) {
+                rsx_vertex_fetch_attr* f = &plan.attr[plan.layout.attrs[slot]];
+                if (f->desc.type == RSX_VTX_TYPE_SNORM16) {
+                    const u32 offset = (plan.base_offset + f->desc.offset) & 0x0FFFFFFFu;
+                    u8* p = guest[f->desc.location & 1u] + offset + (first + n / 2) * f->stride;
+                    p[0] = 0x80; p[1] = 0x00;
+                }
+            }
+        rsx_vertex_fetch_plan_prepare(&plan, refs, n);
+        rsx_vertex_host_streams hs;
+        if (!rsx_vertex_host_streams_build(&plan, first, n, host, sizeof host, &hs)) {
+            refused++;
+            int has_snorm_min = 0;
+            for (u32 slot = 0; slot < plan.layout.count; slot++) {
+                const rsx_vertex_fetch_attr* f = &plan.attr[plan.layout.attrs[slot]];
+                if (f->desc.type == RSX_VTX_TYPE_SNORM16 && f->stable_base && f->desc.frequency <= 1)
+                    for (u32 i = 0; i < n; i++) for (u32 c = 0; c < f->desc.size; c++) {
+                        const u8* p = f->stable_base + (u64)(first + i - f->stable_first) * f->stride + 2u * c;
+                        has_snorm_min |= p[0] == 0x80 && p[1] == 0x00;
+                    }
+            }
+            snorm_min_refused += has_snorm_min;
+            continue;
+        }
+        built++;
+        CHECK(hs.count == plan.layout.count, "plan %d: stream count", n_plan);
+        CHECK(rsx_vertex_fetch_many(&plan, refs, n, four), "plan %d: float4 fetch", n_plan);
+        for (u32 slot = 0; slot < hs.count; slot++) {
+            const u32 esize = rsx_vertex_host_format_bytes(hs.format[slot]);
+            for (u32 i = 0; i < n; i++) {
+                float v[4];
+                host_decode(hs.format[slot], host + hs.offset[slot] + i * esize, v);
+                const u8* want = four + (size_t)i * plan.layout.stride + slot * 16u;
+                if (memcmp(v, want, 16)) {
+                    float w[4]; memcpy(w, want, 16);
+                    CHECK(0, "plan %d slot %u vertex %u format %u: host %g %g %g %g, float4 %g %g %g %g", n_plan, slot, i,
+                          hs.format[slot], v[0], v[1], v[2], v[3], w[0], w[1], w[2], w[3]);
+                    break;
+                }
+            }
+        }
+    }
+    printf("test_vertex_fetch_plan: host streams %d built, %d refused (%d for SNORM16 -32768), %d failure(s)\n",
+           built, refused, snorm_min_refused, fails);
+    return built > 1000 && snorm_min_refused > 10;
+}
+
 /* Resistance: Fall of Man's world lighting stream (UB256 x4, stride 4) sits
  * at VERTEX_DATA_BASE_OFFSET + array offset = 0x1Fxxxxxx, past the end of
  * local memory; wrapped at 28 bits it is local 0x0Fxxxxxx. Here the sum is
@@ -283,6 +386,7 @@ static void test_modulo_frequency_one(void)
 int main(void)
 {
     if (!test_remap()) { printf("FAIL: too few remap cases\n"); return 1; }
+    if (!test_host_streams()) { printf("FAIL: too few host-stream cases\n"); return 1; }
     test_offset_wraps_at_28_bits();
     test_modulo_frequency_one();
 

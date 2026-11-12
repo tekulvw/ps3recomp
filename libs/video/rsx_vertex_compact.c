@@ -586,3 +586,88 @@ int rsx_vertex_topology_plan(
         return 0;
     }
 }
+
+static int rsx_vertex_host_format_for(u32 type, u32 size, u8* format)
+{
+    if (!size || size > 4) return 0;
+    switch (type) {
+    case RSX_VTX_TYPE_FLOAT:   *format = (u8)(RSX_HOST_VF_F32_1 + size - 1u); return 1;
+    case RSX_VTX_TYPE_HALF:    *format = RSX_HOST_VF_F16_4; return 1;
+    case RSX_VTX_TYPE_UNORM8:  *format = RSX_HOST_VF_UN8_4; return 1;
+    case RSX_VTX_TYPE_SNORM16: *format = RSX_HOST_VF_SN16_4; return 1;
+    default: return 0;
+    }
+}
+
+int rsx_vertex_host_streams_build(
+    const rsx_vertex_fetch_plan* plan, u32 first, u32 n,
+    u8* out, u32 out_cap, rsx_vertex_host_streams* streams)
+{
+    if (!plan || !streams || !n || plan->inline_data)
+        return 0;
+    memset(streams, 0, sizeof(*streams));
+    u32 at = 0;
+    /* Formats and sizes first, so a refusal writes nothing. */
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const rsx_vertex_fetch_attr* fetch = &plan->attr[plan->layout.attrs[slot]];
+        u8 format = 0;
+        if (!fetch->desc.type || !fetch->desc.size || fetch->desc.frequency > 1 ||
+            !fetch->stable_base || !rsx_vertex_host_format_for(fetch->desc.type, fetch->desc.size, &format) ||
+            first < fetch->stable_first || first + n - 1u > fetch->stable_last || first + n - 1u < first)
+            return 0;
+        const u32 esize = rsx_vertex_host_format_bytes(format);
+        if ((u64)at + (u64)esize * n > out_cap) return 0;
+        streams->format[slot] = format;
+        streams->offset[slot] = at;
+        at += esize * n;
+    }
+    streams->count = plan->layout.count;
+    streams->bytes = at;
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const rsx_vertex_fetch_attr* fetch = &plan->attr[plan->layout.attrs[slot]];
+        const u8* src = fetch->stable_base + (u64)(first - fetch->stable_first) * fetch->stride;
+        u8* dst = out + streams->offset[slot];
+        const u32 size = fetch->desc.size, stride = fetch->stride;
+        switch (fetch->desc.type) {
+        case RSX_VTX_TYPE_FLOAT:
+            for (u32 i = 0; i < n; i++, src += stride)
+                for (u32 c = 0; c < size; c++, dst += 4) {
+                    const u8* p = src + c * 4u;
+                    const u32 w = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+                    memcpy(dst, &w, 4);
+                }
+            break;
+        case RSX_VTX_TYPE_HALF:
+            for (u32 i = 0; i < n; i++, src += stride) {
+                u16 h[4] = { 0, 0, 0, 0x3C00u };
+                for (u32 c = 0; c < size; c++) {
+                    u16 v = (u16)((src[c * 2u] << 8) | src[c * 2u + 1u]);
+                    if (!(v & 0x7C00u)) v &= 0x8000u;       /* zero or denormal: signed zero */
+                    h[c] = v;
+                }
+                memcpy(dst, h, 8); dst += 8;
+            }
+            break;
+        case RSX_VTX_TYPE_UNORM8:
+            for (u32 i = 0; i < n; i++, src += stride) {
+                u8 b[4] = { 0, 0, 0, 255 };
+                for (u32 c = 0; c < size; c++) b[c] = src[c];
+                memcpy(dst, b, 4); dst += 4;
+            }
+            break;
+        case RSX_VTX_TYPE_SNORM16:
+            for (u32 i = 0; i < n; i++, src += stride) {
+                s16 v[4] = { 0, 0, 0, 32767 };
+                for (u32 c = 0; c < size; c++) {
+                    v[c] = (s16)((src[c * 2u] << 8) | src[c * 2u + 1u]);
+                    if (v[c] == -32768) return 0;
+                }
+                memcpy(dst, v, 8); dst += 8;
+            }
+            break;
+        default:
+            return 0;
+        }
+    }
+    return 1;
+}

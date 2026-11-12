@@ -10,7 +10,8 @@
  *           coordinator through the line-commit hook).
  * ppu kick: the PM only records that it ran; a host thread standing in for
  *           the PPU raises the next ready count with a plain store once it
- *           sees the hop, as a PPU store does (nothing wakes the coordinator).
+ *           sees the hop, through the coherent store path a PPU store takes
+ *           (vm_write8).
  *           ppu-idle=N waits N us first, so the workers are asleep, as they
  *           are when a PPU tick releases the next work.
  *
@@ -120,14 +121,14 @@ int main(int argc, char** argv)
     g_target = hops;
     const uint64_t t0 = now_ns();
     g_kick_ns[0] = t0;
-    vm_base[SPURS_EA + SPURS_WKL_READY1 + 0] = 1;          /* first request, as the PPU makes it */
+    vm_write8(SPURS_EA + SPURS_WKL_READY1 + 0, 1);         /* first request, as the PPU makes it */
     uint32_t seen = 0;
     while (__atomic_load_n(&g_hops, __ATOMIC_ACQUIRE) < hops) {
         const uint32_t h = __atomic_load_n(&g_hops, __ATOMIC_ACQUIRE);
         if (g_ppu_kick && h != seen) {                         /* PPU stand-in: plain store */
             seen = h;
             if (g_ppu_idle_us) { struct timespec d = {0, (long)g_ppu_idle_us * 1000}; nanosleep(&d, NULL); }
-            if (h < hops) { g_kick_ns[h] = now_ns(); vm_base[SPURS_EA + SPURS_WKL_READY1 + (h & 1)] = 1; }
+            if (h < hops) { g_kick_ns[h] = now_ns(); vm_write8(SPURS_EA + SPURS_WKL_READY1 + (h & 1), 1); }
         }
         if (now_ns() - t0 > 60ull * 1000000000ull) { fprintf(stderr, "FAIL: stalled at hop %u\n", h); return 1; }
     }
