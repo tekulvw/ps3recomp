@@ -13,13 +13,16 @@
  *           sees the hop, through the coherent store path a PPU store takes
  *           (vm_write8).
  *           ppu-idle=N waits N us first, so the workers are asleep, as they
- *           are when a PPU tick releases the next work.
+ *           are when a PPU tick releases the next work. ppu-idle=N~J adds a
+ *           pseudo-random 0..J us per hop, so the store's phase against the
+ *           coordinator's timed pass (which also starts at the hop) varies
+ *           instead of depending on how far the host's sleep overshoots.
  *
  * Reported per hop: the wall time, and the latency from one PM run's request
  * to the next PM run's start (its exit, the worker's bookkeeping, the
  * coordinator's pass and the wake of the worker that runs it).
  *
- * argv: hops (default 2000), lanes (nSpus, default 1), spu | ppu | ppu-idle=N.
+ * argv: hops (default 2000), lanes (nSpus, default 1), spu | ppu | ppu-idle=N[~J].
  * The fixture fails if the chain stalls; every hop must run. */
 #include <assert.h>
 #include <pthread.h>
@@ -46,7 +49,7 @@ unsigned long long ps3_ms_now(void)
 }
 
 enum { GUEST = 16u << 20, SPURS_EA = 0x100000, PM_A = 0x200000, PM_B = 0x201000, PM_SIZE = 0x100 };
-static volatile uint32_t g_hops, g_target, g_ppu_kick, g_ppu_idle_us;
+static volatile uint32_t g_hops, g_target, g_ppu_kick, g_ppu_idle_us, g_ppu_jitter_us;
 static uint64_t g_start_ns[1 << 16], g_kick_ns[1 << 16];
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static u128 u32v(uint32_t v) { u128 r; memset(&r, 0, sizeof r); r._u32[0] = v; return r; }
@@ -101,7 +104,12 @@ int main(int argc, char** argv)
     g_ppu_kick = argc > 3 && !strncmp(argv[3], "ppu", 3);
     /* ppu-idle=N: the stand-in raises the next request N us after the hop, when
      * the workers have gone back to sleep, as a PPU tick does. */
-    if (argc > 3 && !strncmp(argv[3], "ppu-idle=", 9)) g_ppu_idle_us = (uint32_t)strtoul(argv[3] + 9, 0, 0);
+    if (argc > 3 && !strncmp(argv[3], "ppu-idle=", 9)) {
+        char* end = 0;
+        g_ppu_idle_us = (uint32_t)strtoul(argv[3] + 9, &end, 0);
+        if (end && *end == '~') g_ppu_jitter_us = (uint32_t)strtoul(end + 1, 0, 0);
+    }
+    uint32_t lcg = 0x2545F491u;
     assert(hops >= 2 && hops <= (1u << 16) && nspus >= 1 && nspus <= 6);
     vm_base = (uint8_t*)calloc(1, GUEST); ppu_vm_size = GUEST;
     { extern uint8_t g_vm_page_bitmap[65536 / 8]; memset(g_vm_page_bitmap, 255, sizeof g_vm_page_bitmap); }
@@ -121,7 +129,12 @@ int main(int argc, char** argv)
         const uint32_t h = __atomic_load_n(&g_hops, __ATOMIC_ACQUIRE);
         if (g_ppu_kick && h != seen) {                         /* PPU stand-in: plain store */
             seen = h;
-            if (g_ppu_idle_us) { struct timespec d = {0, (long)g_ppu_idle_us * 1000}; nanosleep(&d, NULL); }
+            if (g_ppu_idle_us) {
+                uint32_t us = g_ppu_idle_us;
+                if (g_ppu_jitter_us) { lcg = lcg * 1664525u + 1013904223u; us += (lcg >> 8) % (g_ppu_jitter_us + 1); }
+                struct timespec d = {(time_t)(us / 1000000u), (long)(us % 1000000u) * 1000};
+                nanosleep(&d, NULL);
+            }
             if (h < hops) { g_kick_ns[h] = now_ns(); vm_write8(SPURS_EA + SPURS_WKL_READY1 + (h & 1), 1); }
         }
         if (now_ns() - t0 > 60ull * 1000000000ull) { fprintf(stderr, "FAIL: stalled at hop %u\n", h); return 1; }
@@ -130,8 +143,8 @@ int main(int argc, char** argv)
     uint64_t lat[1 << 16]; uint32_t n = 0;
     for (uint32_t h = 1; h < hops; h++) lat[n++] = g_start_ns[h] - g_kick_ns[h];
     qsort(lat, n, sizeof lat[0], cmp64);
-    printf("pm_hop kick=%s idle_us=%u nspus=%u hops=%u per_hop_us=%.2f request_to_start_us p50=%.2f p90=%.2f p99=%.2f max=%.2f\n",
-           g_ppu_kick ? "ppu" : "spu", g_ppu_idle_us, nspus, hops, (t1 - t0) / 1000.0 / hops,
+    printf("pm_hop kick=%s idle_us=%u jitter_us=%u nspus=%u hops=%u per_hop_us=%.2f request_to_start_us p50=%.2f p90=%.2f p99=%.2f max=%.2f\n",
+           g_ppu_kick ? "ppu" : "spu", g_ppu_idle_us, g_ppu_jitter_us, nspus, hops, (t1 - t0) / 1000.0 / hops,
            lat[n / 2] / 1000.0, lat[n * 9 / 10] / 1000.0, lat[n * 99 / 100] / 1000.0, lat[n - 1] / 1000.0);
     fflush(stdout);
     _exit(0);
