@@ -66,12 +66,22 @@ int main(int argc, char** argv) {
     vm_write32(0x100u, 0xFFFFFFFFu); assert(be(vm_base + 0x100, 4) == 0);
     puts("special: raw SPU registers, GCM ref poll, PUT wake, null page keep their slow paths");
     // An SPU reservation on a line: a PPU store to it raises LR; one to the next line does not.
+    // The SPU is parked on its events and looks at them after each store, as the guest does:
+    // per-line version counters (PS3RECOMP_COH_VERSIONS=1) deliver the loss then, and wake
+    // only a parked SPU; the default scheme raised it at the store.
     const uint32_t line = 0x00300000u;
-    spu_lockline_lock(); spu_coh_reserve(&g_spu, line); g_spu.resv_ea = line; g_spu.resv_valid = 1; spu_lockline_unlock();
-    vm_write32(line + 0x80, 1); assert(g_spu.resv_valid == 1 && !(g_spu.event_status & SPU_EVENT_LR));
-    vm_write64(line + 0x78, 2); assert(g_spu.resv_valid == 0 && (g_spu.event_status & SPU_EVENT_LR) && wakes == 1);
-    g_spu.event_status = 0; g_spu.resv_valid = 1;
-    vm_write8(line + 5, 3); assert(g_spu.resv_valid == 0 && (g_spu.event_status & SPU_EVENT_LR) && wakes == 2);
+    const spu_coh_ops* v = g_spu_coh_ops;
+    static uint8_t snapshot[128]; void* parked[SPU_COH_WAITER_BYTES / sizeof(void*)];
+    auto reserve = [&] {
+      if (v) { v->getllar(&g_spu, line, vm_base + line, snapshot); v->wait_begin(&g_spu, parked, [](void*) { ++wakes; }); return; }
+      spu_lockline_lock(); spu_coh_reserve(&g_spu, line); g_spu.resv_ea = line; g_spu.resv_valid = 1; spu_lockline_unlock(); };
+    auto look = [&] { if (v) v->settle(&g_spu); };
+    auto unpark = [&] { if (v) v->wait_end(parked); };
+    reserve();
+    vm_write32(line + 0x80, 1); look(); assert(g_spu.resv_valid == 1 && !(g_spu.event_status & SPU_EVENT_LR) && wakes == 0);
+    vm_write64(line + 0x78, 2); look(); unpark(); assert(g_spu.resv_valid == 0 && (g_spu.event_status & SPU_EVENT_LR) && wakes == 1);
+    g_spu.event_status = 0; reserve();
+    vm_write8(line + 5, 3); look(); unpark(); assert(g_spu.resv_valid == 0 && (g_spu.event_status & SPU_EVENT_LR) && wakes == 2);
     spu_coh_unregister(&g_spu);
     puts("coherency: stores to a reserved line raise LR, a store to the next line does not");
   } else if (!strcmp(mode, "force-read")) {

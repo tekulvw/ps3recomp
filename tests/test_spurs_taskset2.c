@@ -110,8 +110,12 @@ int main(void) {
     assert(spurs_bitset_test(0x10000+CSTS_ENABLED,0));
     atomic_store(&release_worker,1);
     deadline=ps3_ms_now()+1000;
-    while(spurs_bitset_test(0x10000+CSTS_ENABLED,0) && ps3_ms_now()<deadline) usleep(100);
+    /* Guest task exit clears ENABLED before the worker drops its admitted
+     * reference. Wait for that tail before the later same-address reuse case. */
+    while((spurs_bitset_test(0x10000+CSTS_ENABLED,0) ||
+           spu_taskset_lifecycle_active(0x10000)) && ps3_ms_now()<deadline) usleep(100);
     assert(!spurs_bitset_test(0x10000+CSTS_ENABLED,0));
+    assert(spu_taskset_lifecycle_active(0x10000)==0);
     assert(cellSpursDestroyTaskset((CellSpursTaskset*)TS)==0);
     assert(!(vm_read32(0x1000+SPURS_WKL_ENABLED)&(0x80000000u>>wid)));
     assert(vm_read64(0x1000+SPURS_WKL_INFO1+32*wid+8)==0);

@@ -118,19 +118,24 @@ int main(int argc,char** argv)
     spu_context_init(&a,0);spu_context_init(&b,0);
     a.image_id=209;a.spu_id=3;a.pc=0xC77C;b.image_id=2;b.pc=0x2488;b.spu_id=4;
     spu_coh_watch watch;
+    /* Line epochs are the default scheme's; per-line version counters
+     * (PS3RECOMP_COH_VERSIONS=1) have none and deliver a lost reservation
+     * when the SPU looks at its events, so b looks before it is checked. */
+    const int versions=spu_coh_versions_on();
     spu_lockline_lock();spu_coh_watch_add(&watch,0x20000,watched,NULL);
-    uint64_t epoch=spu_coh_line_epoch(0x20000);spu_lockline_unlock();
+    uint64_t epoch=versions?0:spu_coh_line_epoch(0x20000);spu_lockline_unlock();
     atomic_cmd(&a,MFC_GETLLAR_CMD,0x20017);CHECK(a.atomic_stat==4);
     atomic_cmd(&b,MFC_GETLLAR_CMD,0x20000);CHECK(b.atomic_stat==4);
     memset(a.ls+0x1000,0x53,128);
     atomic_cmd(&a,MFC_PUTLLC_CMD,0x20000);CHECK(a.atomic_stat==0);
+    (void)spu_rchcnt(&b,SPU_RdEventStat);
     CHECK(!b.resv_valid && (b.event_status&SPU_EVENT_LR));
     CHECK(guest_memory[0x20000]==0x53 && watches==1);
     atomic_cmd(&b,MFC_PUTLLC_CMD,0x20000);CHECK(b.atomic_stat==1 && watches==1);
     memset(a.ls+0x1000,0x71,128);
     atomic_cmd(&a,MFC_PUTLLUC_CMD,0x20000);CHECK(a.atomic_stat==2 && watches==2);
     atomic_cmd(&a,MFC_PUTQLLUC_CMD,0x20000);CHECK(a.atomic_stat==2 && watches==3);
-    spu_lockline_lock();CHECK(spu_coh_line_epoch(0x20000)==epoch+3);
+    spu_lockline_lock();CHECK(versions||spu_coh_line_epoch(0x20000)==epoch+3);
     spu_coh_watch_remove(&watch);spu_lockline_unlock();
     if(enabled){CHECK(ps3_spu_atomic_observe_stop(1)==0);}
     /* Post-stop real command supplies safe boundary ACK; not counted. */

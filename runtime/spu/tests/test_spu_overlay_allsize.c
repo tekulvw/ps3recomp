@@ -127,6 +127,16 @@ static void signatures(spu_context* c)
     spu_overlay_note_get(c,0x77000040,c->ls+0x20000,512);
     CHECK(c->resident_ovl==777);
     CHECK(spu_overlay_match_sig(signature)==777);
+    /* A large GET of data (no registered signature prefix, unknown EA)
+     * skips the source scan entirely. */
+    memset(c->ls+0x24000,0x5A,1024);
+    allsize_scans=0;c->resident_ovl=19;
+    spu_overlay_note_get(c,0x78000000,c->ls+0x24000,1024);
+    CHECK(c->resident_ovl==19);CHECK(allsize_scans==0);
+    /* Same prefix, different tail: scanned, but no signature matches. */
+    memcpy(c->ls+0x24000,signature,8);
+    allsize_scans=0;spu_overlay_note_get(c,0x78000000,c->ls+0x24000,1024);
+    CHECK(c->resident_ovl==19);CHECK(allsize_scans>0);
     /* Known EA and signature both match: registration order remains exact. */
     spu_overlay_note_get(c,0x70000000,c->ls+0x20000,512);
     CHECK(c->resident_ovl==600);

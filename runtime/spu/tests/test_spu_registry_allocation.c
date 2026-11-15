@@ -19,6 +19,15 @@ int main(int argc, char** argv)
         spu_lockline_lock();
         spu_coh_reserve(ctx, 0x10000);
         spu_lockline_unlock();
+        /* Per-line version counters (PS3RECOMP_COH_VERSIONS=1) keep no holder
+         * list, so a reservation allocates nothing: it must succeed, with the
+         * line routed through its counter. Their table is reserved up front,
+         * and a failure there aborts with its own diagnostic. */
+        if (spu_coh_versions_on()) {
+            if (!spu_coh_is_reserved(0x10000)) return 3;
+            fprintf(stderr, "reservation holder needs no allocation under version counters\n");
+            return 0;
+        }
     }
     return 0; /* surviving allocation failure would fabricate working state */
 }

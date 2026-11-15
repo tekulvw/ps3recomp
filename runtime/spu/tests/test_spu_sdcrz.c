@@ -70,7 +70,11 @@ int main(void) {
     first_peer.mfc_eal=ea;first_peer.mfc_eah=0;first_peer.mfc_lsa=0x2000;
     assert(spu_mfc_atomic(&first_peer,MFC_GETLLAR_CMD));
     assert(first_peer.resv_valid);first_peer.event_status=0;
-    spu_lockline_lock();uint64_t epoch=spu_coh_line_epoch(ea+128);spu_lockline_unlock();
+    /* Line epochs are the default scheme's (per-line version counters,
+     * PS3RECOMP_COH_VERSIONS=1, have none). Under version counters a peer
+     * learns of the loss when it looks at its events, so both look first. */
+    const int versions=spu_coh_versions_on();
+    spu_lockline_lock();uint64_t epoch=versions?0:spu_coh_line_epoch(ea+128);spu_lockline_unlock();
     uint32_t first=ea,last=ea+1920;spu_coh_watch w1,w2;
     spu_lockline_lock();
     spu_coh_watch_add(&w1,first,notified,&first);
@@ -78,15 +82,17 @@ int main(void) {
     spu_lockline_unlock();
     unsigned long notifications=g_spu_lr_raise;
     assert(mfc_submit(mfc_for(&writer),&writer,0x89)==0);
+    (void)spu_rchcnt(&first_peer,SPU_RdEventStat);(void)spu_rchcnt(&peer,SPU_RdEventStat);
     assert(g_spu_lr_raise==notifications+2);
     assert(wake_count==2);
     spu_lockline_lock();spu_coh_watch_remove(&w1);spu_coh_watch_remove(&w2);
-    assert(spu_coh_line_epoch(ea+128)!=epoch);spu_lockline_unlock();
+    assert(versions||spu_coh_line_epoch(ea+128)!=epoch);spu_lockline_unlock();
     assert(!first_peer.resv_valid && (first_peer.event_status&SPU_EVENT_LR));
     assert(!peer.resv_valid && (peer.event_status&SPU_EVENT_LR));
     be32(peer.ls+0x2000,0xABCDEF01);assert(spu_mfc_atomic(&peer,MFC_PUTLLC_CMD));
     assert(peer.atomic_stat==1 && guest[ea+1920]==0);
     reserve(ea+2048);assert(mfc_submit(mfc_for(&writer),&writer,0x89)==0);
+    (void)spu_rchcnt(&peer,SPU_RdEventStat);
     assert(peer.resv_valid && !(peer.event_status&SPU_EVENT_LR));
     /* Unsupported storage-control forms fail without guest writes or a
      * successful tag receipt, including high EA bits instead of truncation. */

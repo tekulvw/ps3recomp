@@ -52,7 +52,8 @@ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
  * and "the parked host thread was told" are separate failures: the bit alone
  * wakes the SPU only on its next 10 ms re-poll. */
 static int g_wakes;
-void spu_ch_wake(spu_context* ctx) { (void)ctx; g_wakes++; }
+static void woken(void* p);
+void spu_ch_wake(spu_context* ctx) { g_wakes++; woken(ctx); }
 
 /* ---------------------------------------------------------------------------
  * Harness
@@ -91,18 +92,65 @@ static const char* g_current = "(none)";
 static spu_context g_spu_a;   /* 256 KB of local store each: not on the stack */
 static spu_context g_spu_b;
 
-/* What the SPU's GETLLAR does, minus the local-store copy: take the lock-line
- * lock, mark the line, record the reservation. Mirrors spu_channels.c's
- * MFC_GETLLAR_CMD case. */
+/* ---------------------------------------------------------------------------
+ * The two coherence schemes
+ *
+ * spu_coherency.c reads PS3RECOMP_COH_VERSIONS at startup. With it off (the
+ * default) a write ends every holder's reservation and raises SPU_EVENT_LR at
+ * the write, and wakes each holder's host thread (spu_ch_wake). With it on
+ * (per-line version counters) a write only moves the line's count: a holder
+ * learns of the loss when it next looks at its events, and only a holder
+ * parked in a blocking event wait is woken. The guest sees the same thing
+ * either way, because it only learns of events by looking. So every check of
+ * a holder's event bit or reservation below first look()s, as the guest's
+ * `rdch`/`rchcnt SPU_RdEventStat` does, and holders that expect a wake park()
+ * first, as spu_ch_wait does. Checks of the default scheme's own machinery
+ * (wake counts, the holder list, epochs, the PPU store shard) run only under
+ * it.
+ * -----------------------------------------------------------------------*/
+static int versions(void) { return g_spu_coh_ops != NULL; }
+
+/* What the SPU's GETLLAR does to coherence: mark the line, record the
+ * reservation. Mirrors spu_channels.c's MFC_GETLLAR_CMD case (the default
+ * scheme's lock and registration, or the version scheme's snapshot). */
 static void spu_getllar(spu_context* ctx, uint32_t ea)
 {
     ea &= ~127u;
+    if (versions()) {
+        g_spu_coh_ops->getllar(ctx, ea, vm_base + ea, &ctx->ls[0]);
+        return;
+    }
     spu_lockline_lock();
     spu_coh_reserve(ctx, ea);
     ctx->resv_ea = ea;
     ctx->resv_valid = 1;
     spu_lockline_unlock();
 }
+
+/* The SPU reads its event status (spu_resv_lost_poll's first step). */
+static void look(spu_context* ctx)
+{
+    if (versions()) g_spu_coh_ops->settle(ctx);
+}
+
+/* Which holders' host threads were woken, by spu_id: the default scheme's
+ * spu_ch_wake and the version scheme's waiter callback both land here. */
+static uint32_t g_woken;
+static void woken(void* p) { g_woken |= 1u << ((spu_context*)p)->spu_id; }
+
+/* A holder parked in a blocking SPU_RdEventStat wait, and its return. */
+typedef struct { void* w[SPU_COH_WAITER_BYTES / sizeof(void*)]; } parking;
+static void park(spu_context* ctx, parking* p)
+{
+    if (versions()) g_spu_coh_ops->wait_begin(ctx, p->w, woken);
+}
+static void unpark(parking* p)
+{
+    if (versions()) g_spu_coh_ops->wait_end(p->w);
+}
+
+/* The default scheme's wake count: one spu_ch_wake per holder per loss. */
+#define CHECK_WAKES(n) do { if (!versions()) CHECK(g_wakes == (n)); } while (0)
 
 static void spu_reset(spu_context* ctx, uint32_t spu_id)
 {
@@ -143,18 +191,24 @@ static void test_ppu_store_raises_lr(void)
     g_wakes = 0;
     unsigned long raised_before = g_spu_lr_raise;
 
+    parking pk;
     spu_getllar(&g_spu_a, LINE_A);
+    park(&g_spu_a, &pk);
+    g_woken = 0;
 
     TEST("a PPU store into the reserved line raises SPU_EVENT_LR");
     vm_write32(LINE_A + 8, 0xDEADBEEFu);
+    look(&g_spu_a);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
 
     TEST("...and drops the reservation, so the SPU's PUTLLC must fail");
     CHECK(g_spu_a.resv_valid == 0);
 
     TEST("...and wakes the host thread parked on the event channel");
-    CHECK(g_wakes == 1);
+    CHECK_EQ_U32(g_woken, 1u << 0);
+    CHECK_WAKES(1);
     CHECK(g_spu_lr_raise == raised_before + 1);
+    unpark(&pk);
 
     TEST("...and the store itself still lands, big-endian");
     CHECK_EQ_U32(vm_read32(LINE_A + 8), 0xDEADBEEFu);
@@ -163,8 +217,11 @@ static void test_ppu_store_raises_lr(void)
     CHECK(spu_coh_is_reserved(LINE_A) != 0);
 
     TEST("a second store with no live reservation raises nothing more");
+    g_woken = 0;
     vm_write32(LINE_A + 8, 0x11111111u);
-    CHECK(g_wakes == 1);
+    look(&g_spu_a);
+    CHECK_EQ_U32(g_woken, 0);
+    CHECK_WAKES(1);
     CHECK(g_spu_lr_raise == raised_before + 1);
 
     TEST("the SPU acks the event and the bit clears");
@@ -173,9 +230,14 @@ static void test_ppu_store_raises_lr(void)
 
     TEST("re-reserving and storing again raises it a second time");
     spu_getllar(&g_spu_a, LINE_A);
+    park(&g_spu_a, &pk);
+    g_woken = 0;
     vm_write32(LINE_A + 8, 0x22222222u);
+    look(&g_spu_a);
+    unpark(&pk);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_wakes == 2);
+    CHECK_EQ_U32(g_woken, 1u << 0);
+    CHECK_WAKES(2);
 }
 
 /* ===========================================================================
@@ -188,26 +250,43 @@ static void test_no_false_raise(void)
 
     spu_getllar(&g_spu_a, LINE_A);
 
+    parking pa, pb;
+    park(&g_spu_a, &pa);
+    g_woken = 0;
+
     TEST("a store to a DIFFERENT line leaves the reservation alone");
     vm_write32(LINE_B + 8, 0x33333333u);
+    look(&g_spu_a);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
     CHECK(g_spu_a.resv_valid == 1);
     CHECK(g_wakes == 0);
+    CHECK_EQ_U32(g_woken, 0);
 
     TEST("...even when that line is itself reserved by another SPU");
     spu_reset(&g_spu_b, 1);
     spu_getllar(&g_spu_b, LINE_B);
+    park(&g_spu_b, &pb);
     vm_write32(LINE_B + 8, 0x44444444u);
+    look(&g_spu_a);
+    look(&g_spu_b);
+    unpark(&pb);
     CHECK_EQ_U32(g_spu_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
     CHECK(g_spu_a.resv_valid == 1);
+    CHECK_EQ_U32(g_woken, 1u << 1);
+    unpark(&pa);
 
     TEST("an SPU that holds NO reservation is never notified");
     spu_reset(&g_spu_b, 1);            /* registered, but resv_valid = 0 */
+    park(&g_spu_b, &pb);
     g_wakes = 0;
+    g_woken = 0;
     vm_write32(LINE_B + 8, 0x55555555u);
+    look(&g_spu_b);
+    unpark(&pb);
     CHECK_EQ_U32(g_spu_b.event_status, 0);
     CHECK(g_wakes == 0);
+    CHECK_EQ_U32(g_woken, 0);
 }
 
 /* ===========================================================================
@@ -228,6 +307,7 @@ static void test_all_store_widths(void)
         case 2: vm_write32(LINE_C + 16, 0xA5A5A5A5u);              break;
         case 3: vm_write64(LINE_C + 16, 0xA5A5A5A5A5A5A5A5ull);    break;
         }
+        look(&g_spu_a);
         CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
         CHECK(g_spu_a.resv_valid == 0);
     }
@@ -242,16 +322,24 @@ static void test_store_conditional(void)
     spu_reset(&g_spu_a, 0);
     spu_getllar(&g_spu_a, LINE_A);
     vm_write32(LINE_A + 32, 0x1000u);          /* seed, drops the reservation */
+    look(&g_spu_a);
+    g_spu_a.event_status = 0;                  /* the seed's loss, acknowledged */
     spu_getllar(&g_spu_a, LINE_A);             /* reserve again */
+    parking pk;
+    park(&g_spu_a, &pk);
     g_wakes = 0;
+    g_woken = 0;
 
     TEST("a successful stwcx into a reserved line raises SPU_EVENT_LR");
     CHECK_EQ_U32(ppu_lwarx(&ppu, LINE_A + 32), 0x1000u);
     CHECK(ppu_stwcx(&ppu, LINE_A + 32, 0x1001u) == 1);
     CHECK_EQ_U32(vm_read32(LINE_A + 32), 0x1001u);
+    look(&g_spu_a);
+    unpark(&pk);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK(g_spu_a.resv_valid == 0);
-    CHECK(g_wakes == 1);
+    CHECK_EQ_U32(g_woken, 1u << 0);
+    CHECK_WAKES(1);
 
     /* A stwcx that FAILS its compare stored nothing, so there is nothing to
      * report: the SPU's line is untouched and its reservation still good. */
@@ -262,28 +350,41 @@ static void test_store_conditional(void)
     TEST("a failed stwcx raises nothing");
     ppu_lwarx(&ppu, LINE_A + 32);
     vm_write32(LINE_A + 64, 0x9999u);          /* elsewhere in the line */
+    look(&g_spu_a);
     g_spu_a.event_status = 0;                  /* ignore that one */
-    g_spu_a.resv_valid = 1;
+    spu_getllar(&g_spu_a, LINE_A);             /* and reserve the line again */
+    park(&g_spu_a, &pk);
     g_wakes = 0;
+    g_woken = 0;
     ppu.reserve_value = 0xFFFFFFFFu;           /* now the compare cannot match */
     CHECK(ppu_stwcx(&ppu, LINE_A + 32, 0x2002u) == 0);
+    look(&g_spu_a);
+    unpark(&pk);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
     CHECK(g_spu_a.resv_valid == 1);
     CHECK(g_wakes == 0);
+    CHECK_EQ_U32(g_woken, 0);
 
     /* stdcx., the 8-byte commit. */
     spu_reset(&g_spu_a, 0);
     spu_getllar(&g_spu_a, LINE_A);
     vm_write64(LINE_A + 40, 0x0102030405060708ull);
+    look(&g_spu_a);
+    g_spu_a.event_status = 0;
     spu_getllar(&g_spu_a, LINE_A);
+    park(&g_spu_a, &pk);
     g_wakes = 0;
+    g_woken = 0;
 
     TEST("a successful stdcx into a reserved line raises SPU_EVENT_LR");
     CHECK(ppu_ldarx(&ppu, LINE_A + 40) == 0x0102030405060708ull);
     CHECK(ppu_stdcx(&ppu, LINE_A + 40, 0x1112131415161718ull) == 1);
     CHECK(vm_read64(LINE_A + 40) == 0x1112131415161718ull);
+    look(&g_spu_a);
+    unpark(&pk);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_wakes == 1);
+    CHECK_EQ_U32(g_woken, 1u << 0);
+    CHECK_WAKES(1);
 }
 
 /* ===========================================================================
@@ -301,42 +402,63 @@ static void test_block_stores(void)
     spu_reset(&g_spu_b, 1);
     spu_getllar(&g_spu_a, LINE_A);
     spu_getllar(&g_spu_b, LINE_B);
+    parking pa, pb;
+    park(&g_spu_a, &pa);
+    park(&g_spu_b, &pb);
     g_wakes = 0;
+    g_woken = 0;
 
     TEST("a memset spanning two reserved lines breaks both reservations");
     vm_memset(LINE_A + 100, 0x77, (LINE_B + 10) - (LINE_A + 100));
+    look(&g_spu_a);
+    look(&g_spu_b);
+    unpark(&pa);
+    unpark(&pb);
     CHECK(vm_read8(LINE_A + 100) == 0x77u);
     CHECK(vm_read8(LINE_B + 9) == 0x77u);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK_EQ_U32(g_spu_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK(g_spu_a.resv_valid == 0);
     CHECK(g_spu_b.resv_valid == 0);
-    CHECK(g_wakes == 2);
+    CHECK_EQ_U32(g_woken, (1u << 0) | (1u << 1));
+    CHECK_WAKES(2);
 
     TEST("a memcpy into a reserved line breaks it");
     spu_reset(&g_spu_a, 0);
     spu_getllar(&g_spu_a, LINE_C);
+    park(&g_spu_a, &pa);
     g_wakes = 0;
+    g_woken = 0;
     vm_memcpy_to(LINE_C + 120, buf, 16);       /* straddles into the next line */
+    look(&g_spu_a);
+    unpark(&pa);
     CHECK(vm_read8(LINE_C + 120) == 0x5Au);
     CHECK(vm_read8(LINE_C + 135) == 0x5Au);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK(g_spu_a.resv_valid == 0);
-    CHECK(g_wakes == 1);
+    CHECK_EQ_U32(g_woken, 1u << 0);
+    CHECK_WAKES(1);
 
     TEST("a block that touches no reserved line raises nothing");
     spu_reset(&g_spu_a, 0);
     spu_getllar(&g_spu_a, LINE_C);
+    park(&g_spu_a, &pa);
     g_wakes = 0;
+    g_woken = 0;
     vm_memcpy_to(LINE_D, buf, sizeof(buf));
     vm_memset(LINE_D, 0, 300);
+    look(&g_spu_a);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
     CHECK(g_spu_a.resv_valid == 1);
     CHECK(g_wakes == 0);
+    CHECK_EQ_U32(g_woken, 0);
 
     TEST("an empty block is not a store");
     vm_memset(LINE_C, 0, 0);
     vm_memcpy_to(LINE_C, buf, 0);
+    look(&g_spu_a);
+    unpark(&pa);
+    CHECK_EQ_U32(g_woken, 0);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
     CHECK(g_spu_a.resv_valid == 1);
     CHECK(g_wakes == 0);
@@ -347,61 +469,90 @@ static void test_block_stores(void)
 static void test_many_contexts(void)
 {
     enum { N = 20 };
+    const uint32_t ALL = (1u << N) - 1u, EVEN = 0x55555u & ALL;
     spu_context* c[N];
+    static parking pk[N];
     for (unsigned i = 0; i < N; ++i) {
         c[i] = calloc(1, sizeof(*c[i]));
         CHECK(c[i] != NULL);
         spu_reset(c[i], i);
         spu_getllar(c[i], LINE_A);
+        park(c[i], &pk[i]);
     }
     TEST("same-value writes invalidate every registered context, beyond eight");
     g_wakes = 0;
+    g_woken = 0;
     vm_write32(LINE_A, vm_read32(LINE_A));
     for (unsigned i = 0; i < N; ++i) {
+        look(c[i]);
+        unpark(&pk[i]);
         CHECK(c[i]->resv_valid == 0);
         CHECK(c[i]->event_status & SPU_EVENT_LR);
     }
-    CHECK(g_wakes == N);
+    CHECK_EQ_U32(g_woken, ALL);
+    CHECK_WAKES(N);
     TEST("ABA writes also invalidate every context even though bytes match again");
     for (unsigned i = 0; i < N; ++i) {
         c[i]->event_status = 0;
         spu_getllar(c[i], LINE_B);
+        park(c[i], &pk[i]);
     }
     uint32_t old = vm_read32(LINE_B);
     g_wakes = 0;
+    g_woken = 0;
     vm_write32(LINE_B, old ^ 1u);
     vm_write32(LINE_B, old);
     for (unsigned i = 0; i < N; ++i) {
+        look(c[i]);
+        unpark(&pk[i]);
         CHECK(c[i]->resv_valid == 0);
         CHECK(c[i]->event_status & SPU_EVENT_LR);
     }
-    CHECK(g_wakes == N);
+    CHECK_EQ_U32(g_woken, ALL);
+    CHECK_WAKES(N);
+    /* An unregistered context is gone (a job context that returned): no
+     * writer may touch it again. The default scheme drops it from the holder
+     * list; version counters never touch a holder that is not parked, and a
+     * gone context cannot be. Only the current holders learn of the write. */
     TEST("unregister and same-address reuse preserve only current holders");
     for (unsigned i = 0; i < N; ++i) {
         c[i]->event_status = 0;
         spu_getllar(c[i], LINE_C);
         if (i & 1) spu_coh_unregister(c[i]);
+        else park(c[i], &pk[i]);
     }
     g_wakes = 0;
+    g_woken = 0;
     vm_write32(LINE_C, vm_read32(LINE_C));
-    for (unsigned i = 0; i < N; ++i)
-        CHECK(!!(c[i]->event_status & SPU_EVENT_LR) == !(i & 1));
-    CHECK(g_wakes == N / 2);
+    for (unsigned i = 0; i < N; ++i) {
+        if (i & 1) { CHECK_EQ_U32(c[i]->event_status, 0); continue; }
+        look(c[i]);
+        unpark(&pk[i]);
+        CHECK(c[i]->event_status & SPU_EVENT_LR);
+    }
+    CHECK_EQ_U32(g_woken, EVEN);
+    CHECK_WAKES(N / 2);
     for (unsigned i = 0; i < N; ++i) {
         c[i]->event_status = 0;
         spu_getllar(c[i], LINE_B);
+        park(c[i], &pk[i]);
     }
     g_wakes = 0;
+    g_woken = 0;
     vm_write32(LINE_B, vm_read32(LINE_B));
-    CHECK(g_wakes == N);
+    for (unsigned i = 0; i < N; ++i) unpark(&pk[i]);
+    CHECK_EQ_U32(g_woken, ALL);
+    CHECK_WAKES(N);
     for (unsigned i = 0; i < N; ++i) {
         spu_coh_unregister(c[i]);
         spu_coh_unregister(c[i]);
         free(c[i]);
     }
     g_wakes = 0;
+    g_woken = 0;
     vm_write32(LINE_B, vm_read32(LINE_B));
     CHECK(g_wakes == 0);
+    CHECK_EQ_U32(g_woken, 0);
     TEST("range cleanup removes adjacent entries without dropping other holders");
     spu_context* range = calloc(3, sizeof(*range));
     CHECK(range != NULL);
@@ -409,13 +560,20 @@ static void test_many_contexts(void)
         spu_reset(&range[i], i);
         spu_getllar(&range[i], LINE_A);
     }
-    spu_reset(&g_spu_a, 0);
+    spu_reset(&g_spu_a, 31);
     spu_getllar(&g_spu_a, LINE_A);
+    parking pa;
+    park(&g_spu_a, &pa);
     spu_coh_forget_range((uintptr_t)range, (uintptr_t)(range + 3));
     free(range);
     g_wakes = 0;
+    g_woken = 0;
     vm_write32(LINE_A, vm_read32(LINE_A));
-    CHECK(g_wakes == 1 && !g_spu_a.resv_valid);
+    look(&g_spu_a);
+    unpark(&pa);
+    CHECK(!g_spu_a.resv_valid && (g_spu_a.event_status & SPU_EVENT_LR));
+    CHECK_EQ_U32(g_woken, 1u << 31);
+    CHECK_WAKES(1);
     spu_coh_unregister(&g_spu_a);
 }
 
@@ -430,9 +588,43 @@ static void test_many_contexts(void)
  * so its notify does only the PPU bookkeeping -- until an SPU reserves it,
  * after which a store is an SPU event again. The fast GETLLAR must not take
  * such a line: its holder would be invisible to that cheaper notify.
+ *
+ * Version counters have no epoch, fast GETLLAR or PPU store shard: a PPU
+ * load-reserve takes the line's count (ppu_load_reserve32's path), and the
+ * same guest-visible rules are checked through it instead.
  * ===========================================================================*/
+static void test_ppu_only_line_versions(void)
+{
+    const uint32_t LINE_E = 0x00040600u;
+    spu_reset(&g_spu_b, 1);
+    unsigned long raised_before = g_spu_lr_raise;
+    uint64_t raw;
+
+    uint32_t count = g_spu_coh_ops->load_reserve(LINE_E + 4, vm_ptr8(LINE_E + 4), 4, &raw);
+    TEST("a PPU load-reserved line is marked");
+    CHECK(spu_coh_is_reserved(LINE_E) != 0);
+
+    TEST("a store to it ends the PPU reservation and raises nothing");
+    vm_write32(LINE_E + 8, 0x12345678u);
+    uint32_t v = ps3_bswap32(0x11111111u);
+    CHECK(g_spu_coh_ops->store_conditional(LINE_E + 4, vm_ptr8(LINE_E + 4), 4, count,
+                                           raw, v) == 0);
+    look(&g_spu_b);
+    CHECK(g_spu_lr_raise == raised_before);
+    CHECK_EQ_U32(g_spu_b.event_status, 0);
+    CHECK_EQ_U32(vm_read32(LINE_E + 8), 0x12345678u);
+
+    TEST("once an SPU reserves it, a store raises SPU_EVENT_LR");
+    spu_getllar(&g_spu_b, LINE_E);
+    vm_write32(LINE_E + 4, 0x9ABCDEF0u);
+    look(&g_spu_b);
+    CHECK_EQ_U32(g_spu_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_spu_b.resv_valid == 0);
+}
+
 static void test_ppu_only_line(void)
 {
+    if (versions()) { test_ppu_only_line_versions(); return; }
     const uint32_t LINE_E = 0x00040600u;
     spu_reset(&g_spu_b, 1);
     g_wakes = 0;
@@ -532,6 +724,9 @@ static void* shard_race_writer(void* arg)
 
 static void test_ppu_only_shard(void)
 {
+    /* The shard is the default scheme's PPU-only store path; version counters
+     * have none (the version suites cover store-conditional atomicity). */
+    if (versions()) return;
     const uint32_t LINE_F = 0x00040800u;
     pthread_t t;
     spu_lockline_lock();

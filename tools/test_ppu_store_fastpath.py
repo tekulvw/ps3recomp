@@ -48,16 +48,24 @@ static unsigned char arena[0x40000];
 static bool eq(const ppu_context& c){return (c.cr&0x20000000u)!=0;}
 static uint64_t ll(ppu_context& c,uint32_t ea){c.gpr[4]=ea;func_00001000(&c);return c.gpr[3];}
 static bool sc(ppu_context& c,uint32_t ea,uint64_t v){c.gpr[4]=ea;c.gpr[5]=v;func_00002000(&c);return eq(c);}
-static uint64_t epoch(uint32_t ea){spu_lockline_lock();uint64_t e=spu_coh_line_epoch(ea);spu_lockline_unlock();return e;}
+/* PS3RECOMP_COH_VERSIONS=1 (per-line version counters) has no line epochs:
+ * the checks of them are the default scheme's, and the guest-visible outcomes
+ * around them run under both schemes. */
+static bool versions(){return g_spu_coh_ops!=nullptr;}
+static uint64_t epoch(uint32_t ea){if(versions())return 0;spu_lockline_lock();uint64_t e=spu_coh_line_epoch(ea);spu_lockline_unlock();return e;}
+#define ASSERT_EPOCH(cond) assert(versions()||(cond))
 
-/* Emulated SPU atomics, the protocol of spu_channels.c's GETLLAR/PUTLLC. */
+/* Emulated SPU atomics, the protocol of spu_channels.c's GETLLAR/PUTLLC
+ * (under version counters, the scheme's own entry points, as there). */
 static void getllar(spu_context* c,uint32_t ea,uint8_t* ls){
+  if(versions()){g_spu_coh_ops->getllar(c,ea,vm_base+ea,ls);return;}
   const int fast=spu_coh_reserve_fast(c,ea);
   if(!fast){spu_lockline_lock();spu_coh_reserve(c,ea);}
   memcpy(ls,vm_base+ea,128);memcpy(c->resv_line,ls,128);
   if(!fast){c->resv_ea=ea;c->resv_valid=1;spu_lockline_unlock();}
 }
 static bool putllc(spu_context* c,uint32_t ea,const uint8_t* ls){
+  if(versions())return g_spu_coh_ops->putllc(c,ea,vm_base+ea,ls)!=0;
   if(!__atomic_load_n(&c->resv_valid,__ATOMIC_ACQUIRE)||c->resv_ea!=ea||memcmp(vm_base+ea,c->resv_line,128)){
     __atomic_store_n(&c->resv_valid,0,__ATOMIC_RELAXED);return false;}
   spu_lockline_lock();bool ok=false;
@@ -88,7 +96,7 @@ int main(int argc,char** argv){
   // With no reservation live a store leaves the epoch alone only when the switch is on.
   ll(c,0x10008);assert(sc(c,0x10008,21));
   { uint64_t e0=epoch(0x10000);vm_write32(0x10044,5);uint64_t e1=epoch(0x10000);
-    assert(e1==(fast?e0:e0+1)&&"fast path skips only reservation-free lines");
+    ASSERT_EPOCH(e1==(fast?e0:e0+1)&&"fast path skips only reservation-free lines");
     ll(c,0x10008);assert(sc(c,0x10008,22));assert(vm_read64(0x10008)==22); }
   // Another thread's live reservation is broken by this thread's store; an
   // abandoned load-reserve keeps the slow path until that thread replaces it.
@@ -97,15 +105,15 @@ int main(int argc,char** argv){
       step=sc(g_o,0x10008,99)?3:4;while(step!=5){}
       ll(g_o,0x10008);step=6;while(step!=7){}
       ll(g_o,0x10108);step=8;});
-    while(step!=1){} uint64_t e0=epoch(0x10000);vm_write32(0x1004c,7);assert(epoch(0x10000)==e0+1);
+    while(step!=1){} uint64_t e0=epoch(0x10000);vm_write32(0x1004c,7);ASSERT_EPOCH(epoch(0x10000)==e0+1);
     step=2;while(step<3){} assert(step==4&&"store must break another thread's reservation");
     assert(vm_read64(0x10008)==22);
     step=5;while(step!=6){}
     uint64_t e1=epoch(0x10000);vm_write32(0x1004c,8);vm_write32(0x1004c,9);
-    assert(epoch(0x10000)==e1+2&&"an abandoned load-reserve keeps the slow path");
+    ASSERT_EPOCH(epoch(0x10000)==e1+2&&"an abandoned load-reserve keeps the slow path");
     step=7;while(step!=8){}
     uint64_t e2=epoch(0x10000);vm_write32(0x1004c,10);
-    assert(epoch(0x10000)==(fast?e2:e2+1));
+    ASSERT_EPOCH(epoch(0x10000)==(fast?e2:e2+1));
     t.join(); }
   }
   // PPU stress: commits after a store must carry a value at least that new.
@@ -169,6 +177,13 @@ with tempfile.TemporaryDirectory(prefix='ppu-store-fastpath-') as tmp:
         if mode == '1': env['PS3RECOMP_PPU_STORE_FASTPATH'] = '1'
         else: env.pop('PS3RECOMP_PPU_STORE_FASTPATH', None)
         subprocess.run([str(p/'test'), rounds], check=True, timeout=120, env=env)
+    if os.environ.get('PS3RECOMP_COH_VERSIONS') == '1':
+        # PPU_RESV_OFF switches the default scheme's store-conditional to a
+        # plain value CAS; version counters do not read it, so there is no
+        # control to run. test_spu_coh_version.c's torture tests are theirs.
+        print('SKIP sensitivity control: PPU_RESV_OFF is the default scheme\'s switch')
+        print('PASS PPU store fast path: reservations, PPU stress and SPU stress, switch off and on')
+        raise SystemExit(0)
     env = dict(os.environ); env['PPU_RESV_OFF'] = '1'; env['PS3RECOMP_PPU_STORE_FASTPATH'] = '1'
     # The control needs a real race between two threads. A few vCPUs on a hosted
     # VM may never interleave them, so try a few times, and on CI only, say so

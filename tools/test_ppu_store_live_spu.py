@@ -33,6 +33,7 @@ root = Path(__file__).resolve().parents[1]
 driver = r'''
 #include "ppu_recomp.h"
 #include "spu_coherency.h"
+#include "spu_coh_section.h"
 #include <atomic>
 #include <initializer_list>
 #include <cassert>
@@ -53,8 +54,16 @@ static unsigned char arena[0x40000];
 static bool eq(const ppu_context& c){return (c.cr&0x20000000u)!=0;}
 static uint64_t ll(ppu_context& c,uint32_t ea){c.gpr[4]=ea;func_00001000(&c);return c.gpr[3];}
 static bool sc(ppu_context& c,uint32_t ea,uint64_t v){c.gpr[4]=ea;c.gpr[5]=v;func_00002000(&c);return eq(c);}
-/* Emulated SPU atomics: spu_channels.c's GETLLAR/PUTLLC, live tracking included. */
+/* PS3RECOMP_COH_VERSIONS=1 (per-line version counters) has no holder walk,
+ * live count or PPU store shard: checks of those are the default scheme's, and
+ * the guest-visible outcomes run under both. An SPU learns of a lost
+ * reservation when it looks at its events (look). */
+static bool versions(){return g_spu_coh_ops!=nullptr;}
+static void look(spu_context* c){if(versions())g_spu_coh_ops->settle(c);}
+/* Emulated SPU atomics: spu_channels.c's GETLLAR/PUTLLC, live tracking included
+ * (under version counters, the scheme's own entry points, as there). */
 static void getllar(spu_context* c,uint32_t ea,uint8_t* ls){
+  if(versions()){g_spu_coh_ops->getllar(c,ea,vm_base+ea,ls);return;}
   const int fast=spu_coh_reserve_fast(c,ea);
   if(!fast){spu_lockline_lock();spu_coh_reserve(c,ea);}
   spu_coh_live_track(c,ea);
@@ -62,6 +71,7 @@ static void getllar(spu_context* c,uint32_t ea,uint8_t* ls){
   if(!fast){c->resv_ea=ea;c->resv_valid=1;spu_lockline_unlock();}
 }
 static bool putllc(spu_context* c,uint32_t ea,const uint8_t* ls){
+  if(versions())return g_spu_coh_ops->putllc(c,ea,vm_base+ea,ls)!=0;
   if(!__atomic_load_n(&c->resv_valid,__ATOMIC_ACQUIRE)||c->resv_ea!=ea||memcmp(vm_base+ea,c->resv_line,128)){
     __atomic_store_n(&c->resv_valid,0,__ATOMIC_RELAXED);spu_coh_live_untrack(c);return false;}
   spu_lockline_lock();bool ok=false;
@@ -76,7 +86,7 @@ static void put_be32(uint8_t* p,uint32_t v){v=__builtin_bswap32(v);memcpy(p,&v,4
 static spu_context g_spu,g_spu2;
 static ppu_context g_c,g_x,g_y;
 /* 1 when a plain store to ea would take the shard path. */
-static int shard_path(uint32_t ea){int s=spu_coh_ppu_store_lock(ea);if(s)spu_coh_ppu_store_unlock(ea);return s;}
+static int shard_path(uint32_t ea){if(versions())return 0;int s=spu_coh_ppu_store_lock(ea);if(s)spu_coh_ppu_store_unlock(ea);return s;}
 
 int main(int argc,char** argv){
   const bool live=spu_coh_live_spu_enabled()>0;
@@ -88,25 +98,27 @@ int main(int argc,char** argv){
   uint8_t ls[128];
   // A line reserved once walks the holders on every write when off, only while counted when on.
   const uint32_t A=0x10000;
+  // The holder walk, live count and shard below are the default scheme's (k).
+  const bool k=!versions();
   getllar(&g_spu,A,ls);put_be32(ls,1);assert(putllc(&g_spu,A,ls));
-  assert(shard_path(A)==(shard?1:0));                      // idle: the shard path only with SHARD_IDLE
+  assert(!k||shard_path(A)==(shard?1:0));                  // idle: the shard path only with SHARD_IDLE
   { unsigned long k0=g_spu_coh_live_skips,s0=g_spu_coh_shard_idle_stores;vm_write32(A+0x40,1);
-    assert(g_spu_coh_live_skips-k0==(live&&!shard?1u:0u)&&g_spu_coh_shard_idle_stores-s0==(shard?1u:0u)); }
+    assert(!k||(g_spu_coh_live_skips-k0==(live&&!shard?1u:0u)&&g_spu_coh_shard_idle_stores-s0==(shard?1u:0u))); }
   // A counted holder is told, on and off.
   getllar(&g_spu2,A,ls);assert(!shard_path(A));             // counted: the lock-line lock
   { unsigned long k0=g_spu_coh_live_skips;__atomic_store_n(&g_spu2.event_status,0,__ATOMIC_RELAXED);
-    vm_write32(A+0x44,1);assert(g_spu_coh_live_skips==k0);
+    vm_write32(A+0x44,1);assert(g_spu_coh_live_skips==k0);look(&g_spu2);
     assert(!g_spu2.resv_valid&&(g_spu2.event_status&SPU_EVENT_LR)&&"holder must lose its reservation"); }
   getllar(&g_spu2,A+0x80,ls);                               // the count moves with the next GETLLAR
   { unsigned long k0=g_spu_coh_live_skips,s0=g_spu_coh_shard_idle_stores;vm_write32(A+0x48,1);
-    assert(g_spu_coh_live_skips-k0==(live&&!shard?1u:0u)&&g_spu_coh_shard_idle_stores-s0==(shard?1u:0u)); }
+    assert(!k||(g_spu_coh_live_skips-k0==(live&&!shard?1u:0u)&&g_spu_coh_shard_idle_stores-s0==(shard?1u:0u))); }
   putllc(&g_spu2,A+0x80,ls);
   // A context-less interest (a watch, an HLE line) is never skipped.
   { const uint32_t W=0x11000;spu_lockline_lock();spu_coh_reserve(NULL,W);spu_lockline_unlock();
     unsigned long k0=g_spu_coh_live_skips;vm_write32(W,1);assert(g_spu_coh_live_skips==k0);assert(!shard_path(W)); }
   // A line host code read-modify-writes keeps the lock-line lock from then on.
   { const uint32_t H=0x12000;getllar(&g_spu,H,ls);putllc(&g_spu,H,ls);
-    assert(shard_path(H)==(shard?1:0));
+    assert(!k||shard_path(H)==(shard?1:0));
     spu_lockline_lock();spu_coh_host_rmw_mark(H+4,4);spu_lockline_unlock();
     assert(!shard_path(H)&&!shard_path(H+0x7C)&&"the whole line is marked");
   }
@@ -121,9 +133,10 @@ int main(int argc,char** argv){
   // Host read-modify-writes under the lock against PPU stores to the same line: none is lost.
   { const uint32_t C=0x14000;getllar(&g_spu,C,ls);putllc(&g_spu,C,ls);memset(vm_base+C,0,128);
     std::atomic<bool> hdone{false};
-    std::thread h([&]{for(int k=0;k<rounds/4;k++){spu_lockline_lock();spu_coh_host_rmw_mark(C,8);
+    // A host line section (spu_coh_section.h), as the SPURS/Sync/GCM HLE takes one.
+    std::thread h([&]{for(int k=0;k<rounds/4;k++){spu_coh_write_begin(C,8);spu_coh_host_rmw_mark(C,8);
         uint32_t v=be32(vm_base+C);put_be32(vm_base+C,v+1);
-        if(spu_coh_is_reserved(C))spu_coh_notify_write(C);spu_lockline_unlock();}hdone=true;});
+        if(spu_coh_is_reserved(C))spu_coh_notify_write(C);spu_coh_write_end();}hdone=true;});
     g_active_ctx=&g_y;uint32_t k=0;while(!hdone.load()){++k;vm_write32(C+4,k);vm_write32(C+0x40,k);}
     h.join();g_active_ctx=&g_c;
     assert(vm_read32(C)==(uint32_t)(rounds/4)&&"host increments survive");

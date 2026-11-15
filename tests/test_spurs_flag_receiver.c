@@ -54,6 +54,17 @@ static void unrelated(spu_context* ctx)
     assert(vm_read32(0x106C)==0);
     ctx->pc=SPURS_PM_EXIT_TO_KERNEL_LS; spu_indirect_branch(ctx);
 }
+/* A peer SPU on the SPURS line, driven through the real MFC channels. */
+void spu_wrch(spu_context*, uint32_t, u128);
+uint32_t spu_rchcnt(spu_context*, uint32_t);
+static spu_context g_peer;   /* 256 KB of local store: not on the stack */
+static void peer_atomic(uint32_t cmd)
+{
+    spu_wrch(&g_peer,MFC_LSA,spu_make_preferred_u32(0x100));
+    spu_wrch(&g_peer,MFC_EAH,spu_make_preferred_u32(0));
+    spu_wrch(&g_peer,MFC_EAL,spu_make_preferred_u32(0x1000));
+    spu_wrch(&g_peer,MFC_Cmd,spu_make_preferred_u32(cmd));
+}
 static void* compete(void* arg)
 {
     return (void*)(uintptr_t)CALL((u32)(uintptr_t)arg,1);
@@ -71,15 +82,40 @@ int main(void)
     vm_write32(0x1D6C,1);
     assert(CALL(4,1)==0x8041080F);
     vm_write32(0x1D6C,0);
-    /* Coherent registration invalidates an existing SPU reservation. */
-    spu_context peer; memset(&peer,0,sizeof(peer));
+    /* Coherent registration invalidates an existing SPU reservation. The peer
+     * takes it with a real GETLLAR and checks it the way the guest does: its
+     * event status shows SPU_EVENT_LR once it looks, and its PUTLLC fails.
+     * That holds under both coherence schemes (PS3RECOMP_COH_VERSIONS
+     * delivers the loss when the SPU looks, the default one at the write). */
+    spu_context_init(&g_peer,1);
+    g_peer.event_mask=SPU_EVENT_LR;
+    /* Register then release: the line's bytes end as they were (ABA), so only
+     * the writes themselves can tell the peer, not a byte compare. */
+    vm_write32(0x106C,0xFFFFFFFF);
+    assert(vm_base[0x1077]==0xFF);
+    peer_atomic(MFC_GETLLAR_CMD);
+    assert(g_peer.resv_valid);
+    assert(CALL(4,1)==0 && vm_base[0x1077]==4);
+    assert(CALL(4,0)==0 && vm_base[0x1077]==0xFF);
+    assert(!memcmp(g_peer.ls+0x100,vm_base+0x1000,128));
+    assert(spu_rchcnt(&g_peer,SPU_RdEventStat)!=0);
+    assert(g_peer.event_status & SPU_EVENT_LR);
+    peer_atomic(MFC_PUTLLC_CMD);
+    assert(g_peer.atomic_stat==1);
+    g_peer.event_status=0;
+    /* Register over a pending value. */
     vm_write32(0x106C,0x12345678);
-    peer.resv_valid=1; peer.resv_ea=0x1000;
-    spu_lockline_lock(); spu_coh_reserve(&peer,0x1000); spu_lockline_unlock();
+    peer_atomic(MFC_GETLLAR_CMD);
+    assert(g_peer.resv_valid && g_peer.atomic_stat==4);
     assert(CALL(4,7)==0); /* every nonzero is_set means set */
     assert(vm_read32(0x106C)==0xFFFFFFFF && vm_base[0x1077]==4);
-    assert(!peer.resv_valid && (peer.event_status & SPU_EVENT_LR));
-    spu_coh_unregister(&peer);
+    assert(spu_rchcnt(&g_peer,SPU_RdEventStat)!=0);
+    assert(g_peer.event_status & SPU_EVENT_LR);
+    assert(!g_peer.resv_valid);
+    peer_atomic(MFC_PUTLLC_CMD); /* stale snapshot: must not commit */
+    assert(g_peer.atomic_stat==1);
+    assert(vm_read32(0x106C)==0xFFFFFFFF && vm_base[0x1077]==4);
+    spu_coh_unregister(&g_peer);
     vm_write32(0x106C,0);
     unsigned char line[128]; memcpy(line,vm_base+0x1000,128);
     assert(CALL(4,1)==0x8041080A && CALL(5,1)==0x8041080A);
