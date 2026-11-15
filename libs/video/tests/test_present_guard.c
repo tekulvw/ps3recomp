@@ -57,6 +57,20 @@ int main(void)
     rsx_present_guard_presented(&g, at + 7100 * MS, 3 * MS);
     check(!g.present_stalled, "a quick whole frame does");
 
+    /* A presenter that cannot poll (Metal): nextDrawable outcomes. */
+    rsx_present_guard_init(&g, NULL);
+    rsx_present_guard_drawable(&g, 10 * MS, 5 * MS, 1);
+    check(!g.present_stalled && rsx_present_guard_before(&g, 11 * MS, &t), "a drawable within the bound is a frame through");
+    rsx_present_guard_drawable(&g, 1100 * MS, 1000 * MS, 0);
+    check(g.present_stalled && !rsx_present_guard_before(&g, 1200 * MS, &t), "nil after a second's wait skips the window");
+    check(rsx_present_guard_before(&g, 3100 * MS, &t), "with a probe after 2 s");
+    rsx_present_guard_drawable(&g, 3105 * MS, 4 * MS, 1);
+    check(!g.present_stalled, "a quick drawable on the probe ends it");
+    rsx_present_guard_drawable(&g, 3200 * MS, 1 * MS, 0);
+    check(!g.present_stalled, "a quick nil (compositor busy once) is not a stall");
+    check(rsx_present_guard_slot_wait(&g, 150 * MS) && !rsx_present_guard_slot_wait(&g, 20 * MS) && !g.present_stalled,
+          "a long frame-slot wait is reported but never skips the window");
+
     /* Off: the old unbounded acquire, nothing skipped. */
     rsx_present_guard_init(&g, "0");
     rsx_present_guard_set_hidden(&g, 1);
