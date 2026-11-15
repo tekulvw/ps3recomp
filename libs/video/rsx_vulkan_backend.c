@@ -1257,6 +1257,22 @@ static void vk_pg_waited(uint64_t t0, int whole_frame)
     }
 }
 
+/* A frame left out of the window waits for its 60 Hz slot, as the display
+ * would have paced it (counted as "drawable", the wait it stands in for). */
+static void vk_pg_pace(void)
+{
+    const uint64_t wait = rsx_present_guard_pace_ns(&s_pg, vkpt_now());
+    if (!wait) return;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
+#ifdef _WIN32
+    Sleep((DWORD)((wait + 500000ull) / 1000000ull));
+#else
+    const struct timespec ts = { (time_t)(wait / 1000000000ull), (long)(wait % 1000000000ull) };
+    nanosleep(&ts, NULL);
+#endif
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
+}
+
 /* PS3RECOMP_RSX_FIFO_BUSY: swapchain acquire and present block the presenting
  * thread like Metal's drawable wait; both count as "drawable". The present
  * guard may skip the acquire (VK_NOT_READY) or bound it (VK_TIMEOUT); callers
@@ -1267,7 +1283,7 @@ static VkResult vk_busy_acquire(VkDevice device, VkSwapchainKHR swapchain, uint6
     vk_pg_init();
     vk_pg_refresh_hidden();
     uint64_t bound = timeout;
-    if (!rsx_present_guard_before(&s_pg, vkpt_now(), &bound)) return VK_NOT_READY;
+    if (!rsx_present_guard_before(&s_pg, vkpt_now(), &bound)) { vk_pg_pace(); return VK_NOT_READY; }
     if (bound > timeout) bound = timeout;
     rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
     const VkResult r = pvkAcquireNextImageKHR(device, swapchain, bound, semaphore, fence, index);
@@ -1276,6 +1292,7 @@ static VkResult vk_busy_acquire(VkDevice device, VkSwapchainKHR swapchain, uint6
     else if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         const unsigned long long before = __atomic_load_n(&s_pg.stalls, __ATOMIC_RELAXED);
         rsx_present_guard_acquired(&s_pg, 0);
+        vk_pg_pace();
         if (__atomic_load_n(&s_pg.stalls, __ATOMIC_RELAXED) != before && before < 8)
             VK_LOG("swapchain gave no image within %llu ms; frames skip the window until it does\n",
                    (unsigned long long)(s_pg.bound_ns / 1000000ull));
@@ -2533,8 +2550,9 @@ static LRESULT CALLBACK vk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 ps->DataLength >= sizeof(DWORD)) {
                 DWORD state; memcpy(&state, ps->Data, sizeof state);
                 __atomic_store_n(&s_pg_display_off, state == 0 ? 1 : 0, __ATOMIC_RELAXED);
-                VK_LOG("display %s\n", state == 0 ? "off: the window is skipped until it is back" :
-                                         state == 2 ? "dimmed" : "on");
+                VK_LOG("display %s\n", state == 2 ? "dimmed" : state != 0 ? "on" :
+                       s_pg.bound_ns ? "off: the window is skipped until it is back"
+                                     : "off (present guard off: the window is still presented)");
             }
             return TRUE;
         }

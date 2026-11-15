@@ -22,6 +22,10 @@
  *    skipped, with one probe every 2 s, until a probe's frame gets through
  *    within the bound.
  *
+ * A frame left out of the window is held to 60 Hz (rsx_present_guard_pace_ns):
+ * the FIFO swapchain paced the title at the display's rate, and a title whose
+ * flips no longer wait for anything would spin at hundreds of frames a second.
+ *
  * PS3RECOMP_VK_ACQUIRE_BOUND_MS=0 restores the unbounded acquire and turns
  * the guard off. Pure logic, so it is tested without a GPU or window
  * (tools/test_present_guard.py). Fields are touched by the presenting threads
@@ -32,6 +36,7 @@
 #include <stdlib.h>
 
 #define RSX_PRESENT_GUARD_PROBE_NS 2000000000ull
+#define RSX_PRESENT_GUARD_PACE_NS 16666667ull     /* 60 Hz, what FIFO paced at */
 
 typedef struct {
     uint64_t bound_ns;          /* 0: off, acquire unbounded */
@@ -41,6 +46,7 @@ typedef struct {
     uint64_t probe_at_ns;       /* while present_stalled: the next probe */
     unsigned long long skipped; /* frames not shown in the window */
     unsigned long long stalls;  /* times a stall began */
+    uint64_t pace_next_ns;      /* skipped frames: the next 60 Hz slot */
 } rsx_present_guard;
 
 #define RSX_PG_LOAD(p) __atomic_load_n((p), __ATOMIC_RELAXED)
@@ -60,6 +66,7 @@ static inline void rsx_present_guard_init(rsx_present_guard* g, const char* boun
     g->hidden = g->acquire_stalled = g->present_stalled = 0;
     g->probe_at_ns = 0;
     g->skipped = g->stalls = 0;
+    g->pace_next_ns = 0;
 }
 
 static inline void rsx_present_guard_set_hidden(rsx_present_guard* g, int hidden)
@@ -108,5 +115,20 @@ static inline void rsx_present_guard_presented(rsx_present_guard* g, uint64_t no
 {
     if (!rsx_present_guard_waited(g, now_ns, took_ns) && g->bound_ns)
         RSX_PG_STORE(&g->present_stalled, 0);
+}
+/* A frame was left out of the window at now_ns: how long to wait so frames
+ * left out go no faster than 60 Hz, as the display paced them. Returns 0
+ * once the slot is due; a presenter that fell behind by more than a period
+ * starts a new grid rather than catching up. Presenting threads only. */
+static inline uint64_t rsx_present_guard_pace_ns(rsx_present_guard* g, uint64_t now_ns)
+{
+    const uint64_t next = g->pace_next_ns;
+    if (!next || now_ns >= next) {
+        g->pace_next_ns = (next && now_ns - next < RSX_PRESENT_GUARD_PACE_NS ? next : now_ns) +
+                          RSX_PRESENT_GUARD_PACE_NS;
+        return 0;
+    }
+    g->pace_next_ns = next + RSX_PRESENT_GUARD_PACE_NS;
+    return next - now_ns;
 }
 #endif
