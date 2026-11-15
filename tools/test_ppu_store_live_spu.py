@@ -145,23 +145,35 @@ int main(int argc,char** argv){
   const uint32_t B=0x20000;
   getllar(&g_spu,B,ls);putllc(&g_spu,B,ls);                // SPU-marked, idle
   memset(vm_base+B,0,128);
-  std::atomic<bool> pdone{false};std::atomic<unsigned long> sccommits{0};unsigned long spu_commits=0,back=0;
-  std::thread u([&]{uint8_t l[128];uint32_t last=0;unsigned long extra=0;
+  // The stores start once both threads are running, and both keep going for a
+  // quiet tail after the last store: on a loaded host either thread can be off
+  // its core for the whole store phase, which says nothing about coherence.
+  // Attempts and commits during the phase are printed (the stores' rate
+  // leaves a store-conditional a window of a few ns, so many fail).
+  std::atomic<bool> pdone{false};std::atomic<int> started{0};
+  std::atomic<unsigned long> sccommits{0},scphase{0},sctries{0};unsigned long spu_commits=0,spu_phase=0,spu_tries=0,back=0;
+  std::thread u([&]{uint8_t l[128];uint32_t last=0;unsigned long extra=0;started.fetch_add(1);
     while(!pdone.load()||extra<20000){
-      if(pdone.load())++extra;
+      const bool phase=!pdone.load();if(phase)++spu_tries;else ++extra;
       getllar(&g_spu,B,l);uint32_t seen=be32(l+8);if(seen<last)++back;last=seen;
       put_be32(l,be32(l)+1);
-      if(putllc(&g_spu,B,l))++spu_commits;
+      if(putllc(&g_spu,B,l)){++spu_commits;if(phase)++spu_phase;}
       if((spu_commits&255)==0)for(volatile int i=0;i<2000;i=i+1){}   // go idle for a while
     }});
-  std::thread w([&]{g_active_ctx=&g_x;while(!pdone.load()){
-      uint64_t v=ll(g_x,B+16);if(sc(g_x,B+16,v+1))sccommits.fetch_add(1);}});
+  std::thread w([&]{g_active_ctx=&g_x;unsigned long extra=0;started.fetch_add(1);
+    while(!pdone.load()||extra<20000){
+      const bool phase=!pdone.load();if(phase)sctries.fetch_add(1);else ++extra;
+      uint64_t v=ll(g_x,B+16);
+      if(sc(g_x,B+16,v+1)){sccommits.fetch_add(1);if(phase)scphase.fetch_add(1);}}});
+  while(started.load()<2)std::this_thread::yield();
   g_active_ctx=&g_y;
   for(uint32_t k=1;k<=(uint32_t)rounds;++k)vm_write32(B+8,k);
   pdone=true;u.join();w.join();g_active_ctx=&g_c;
-  printf("live=%d shard=%d: %d stores, %lu PUTLLC commits, %lu store-conditional commits, backwards=%lu, shard-path stores=%lu\n",
-         live,shard,rounds,spu_commits,sccommits.load(),back,g_spu_coh_shard_idle_stores);
-  assert(spu_commits>0&&sccommits>0);assert(back==0);
+  printf("live=%d shard=%d: %d stores, %lu PUTLLC commits (%lu of %lu while storing), %lu store-conditional commits (%lu of %lu while storing), backwards=%lu, shard-path stores=%lu\n",
+         live,shard,rounds,spu_commits,spu_phase,spu_tries,sccommits.load(),scphase.load(),sctries.load(),back,g_spu_coh_shard_idle_stores);
+  assert(spu_commits>0&&"an SPU PUTLLC loop must commit once the stores stop");
+  assert(sccommits>0&&"a PPU store-conditional loop must commit once the stores stop");
+  assert(back==0);
   assert(vm_read32(B+8)==(uint32_t)rounds);assert(vm_read32(B)==spu_commits);assert(vm_read64(B+16)==sccommits.load());
   spu_coh_unregister(&g_spu);spu_coh_unregister(&g_spu2);
   // Final memory, for comparison across the switch: the deterministic part.

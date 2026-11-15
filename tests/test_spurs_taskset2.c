@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 /* lv2_register.c publishes lifted-job contexts for thread lookup; not linked here. */
 void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
 uint8_t* vm_base;
@@ -63,6 +64,61 @@ static void rejected(u32 expected, CellSpurs* s, CellSpursTaskset2* t,
     assert(!memcmp(before,vm_base+0x10000,sizeof(before)));
     assert(vm_read32(0x1000+SPURS_WKL_ENABLED)==enabled);
 }
+/* A worker clears ENABLED and drops its admitted reference later. These
+ * cases hold such a reference directly, standing in for that tail, so each
+ * ordering is deterministic. */
+static void* drop_reference_later(void* ms) {
+    usleep((useconds_t)(uintptr_t)ms*1000);
+    spu_taskset_lifecycle_leave(0x10000);
+    return NULL;
+}
+static void drop_reference_after(unsigned ms) {
+    pthread_t t;
+    assert(pthread_create(&t,NULL,drop_reference_later,(void*)(uintptr_t)ms)==0);
+    assert(pthread_detach(t)==0);
+}
+static void held_reference_cases(void) {
+    /* Join waits for the reference, so Destroy and same-address Create work. */
+    assert(CALL(S,TS,NULL)==0);
+    assert(spu_taskset_lifecycle_enter(0x10000)==1);
+    drop_reference_after(50);
+    unsigned long long t0=ps3_ms_now();
+    assert(cellSpursJoinTaskset((CellSpursTaskset*)TS)==0);
+    assert(ps3_ms_now()-t0>=40);
+    assert(spu_taskset_lifecycle_active(0x10000)==0);
+    assert(cellSpursDestroyTaskset((CellSpursTaskset*)TS)==0);
+    assert(CALL(S,TS,NULL)==0);
+    /* Join is bounded and reports BUSY while the reference is still held. */
+    assert(spu_taskset_lifecycle_enter(0x10000)==1);
+    s_taskset_join_timeout_ms=20;
+    t0=ps3_ms_now();
+    assert((u32)cellSpursJoinTaskset((CellSpursTaskset*)TS)==0x8041090A);
+    assert(ps3_ms_now()-t0>=20);
+    s_taskset_join_timeout_ms=10000;
+    spu_taskset_lifecycle_leave(0x10000);
+    assert(cellSpursJoinTaskset((CellSpursTaskset*)TS)==0);
+    /* Without Join, Create over a destroyed generation waits out a short tail. */
+    assert(spu_taskset_lifecycle_enter(0x10000)==1);
+    assert(cellSpursDestroyTaskset((CellSpursTaskset*)TS)==0);
+    drop_reference_after(20);
+    assert(CALL(S,TS,NULL)==0);
+    assert(spu_taskset_lifecycle_active(0x10000)==0);
+    /* A tail longer than the grace period still reports BUSY, unchanged. */
+    assert(spu_taskset_lifecycle_enter(0x10000)==1);
+    assert(cellSpursDestroyTaskset((CellSpursTaskset*)TS)==0);
+    t0=ps3_ms_now();
+    rejected(0x8041090A,S,TS,NULL);
+    assert(ps3_ms_now()-t0>=s_taskset_reuse_grace_ms);
+    spu_taskset_lifecycle_leave(0x10000);
+    /* A live taskset is BUSY at once: the grace period is only for retired ones. */
+    assert(CALL(S,TS,NULL)==0);
+    assert(spu_taskset_lifecycle_enter(0x10000)==1);
+    t0=ps3_ms_now();
+    rejected(0x8041090A,S,TS,NULL);
+    assert(ps3_ms_now()-t0<s_taskset_reuse_grace_ms);
+    spu_taskset_lifecycle_leave(0x10000);
+    assert(cellSpursDestroyTaskset((CellSpursTaskset*)TS)==0);
+}
 int main(void) {
     vm_base=malloc(ppu_vm_size); assert(vm_base);
     memset(vm_base,0xA5,ppu_vm_size);
@@ -109,11 +165,10 @@ int main(void) {
     assert(atomic_load(&entered) && vm_read32(0x8200)==0);
     assert(spurs_bitset_test(0x10000+CSTS_ENABLED,0));
     atomic_store(&release_worker,1);
-    deadline=ps3_ms_now()+1000;
-    /* Guest task exit clears ENABLED before the worker drops its admitted
-     * reference. Wait for that tail before the later same-address reuse case. */
-    while((spurs_bitset_test(0x10000+CSTS_ENABLED,0) ||
-           spu_taskset_lifecycle_active(0x10000)) && ps3_ms_now()<deadline) usleep(100);
+    /* The guest's own sequence: Shutdown, then Join, which returns only once
+     * the task has exited and its worker has dropped its reference. */
+    assert(cellSpursShutdownTaskset((CellSpursTaskset*)TS)==0);
+    assert(cellSpursJoinTaskset((CellSpursTaskset*)TS)==0);
     assert(!spurs_bitset_test(0x10000+CSTS_ENABLED,0));
     assert(spu_taskset_lifecycle_active(0x10000)==0);
     assert(cellSpursDestroyTaskset((CellSpursTaskset*)TS)==0);
@@ -159,6 +214,7 @@ int main(void) {
     assert(cellSpursDestroyTaskset((CellSpursTaskset*)TS)==0);
     assert(vm_read64(0x3000+SPURS_WKL_INFO1+32*other+8)==0x30000);
     assert(cellSpursDestroyTaskset((CellSpursTaskset*)0x30000)==0);
+    held_reference_cases();
     for(unsigned i=0;i<CELL_SPURS_MAX_WORKLOAD;i++) s_workloads[i].in_use=1;
     rejected(CELL_SPURS_CORE_ERROR_NOMEM,S,TS,A);
     puts("Taskset2 BE layout, defaults, validation, registration and real worker PASS");
