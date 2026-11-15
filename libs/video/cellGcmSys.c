@@ -2944,8 +2944,10 @@ static int gcm_spu_put_kick_on(void)
     return s_spu_put_kick;
 }
 
+static void gcm_kick_stats_spu_put(u32 ea, u32 size);
 void gcm_note_spu_put(u32 ea, u32 size)
 {
+    gcm_kick_stats_spu_put(ea, size);   /* PS3RECOMP_RSX_KICK_STATS: before the kick it may make */
     if (size && GCM_CONTROL_GUEST_ADDR - ea < size && gcm_spu_put_kick_on()) {
         atomic_fetch_add_explicit(&s_spu_put_kicks, 1ull, memory_order_relaxed);
         cellGcm_fifo_kick_notify();
@@ -3185,8 +3187,48 @@ void cellGcm_native_consumer_init(void)
     }
     ReleaseSRWLockExclusive(&s_consumer_config_lock);
 }
+/* PS3RECOMP_RSX_KICK_STATS=1 (opt-in diagnostic, read once; printed every
+ * 2 s): how the walker's idle waits end. A wait ends on a kick or on its
+ * timeout; a timed-out wait during which `put` moved was owed a kick. Each
+ * such wait is put down to who moved `put` meanwhile: an SPU DMA over the put
+ * word (which kicks nothing), a kick that was made but did not end the wait,
+ * or neither (another writer). Wait times are summed by kind. */
+static int s_kick_stats = -1;
+static _Atomic(unsigned long long) s_ks_notifies, s_ks_spu_put_writes;
+static unsigned long long s_ks_waits, s_ks_kicked, s_ks_timeouts, s_ks_moved, s_ks_moved_spu,
+                          s_ks_moved_lost_kick, s_ks_moved_other, s_ks_kicked_put_moved;
+static uint64_t s_ks_kicked_us, s_ks_timeout_us, s_ks_last_us;
+static int gcm_kick_stats_on(void)
+{
+    if (s_kick_stats < 0) { const char* e = getenv("PS3RECOMP_RSX_KICK_STATS"); s_kick_stats = e && !strcmp(e, "1"); }
+    return s_kick_stats;
+}
+static void gcm_kick_stats_spu_put(u32 ea, u32 size)
+{
+    if (!size || !gcm_kick_stats_on()) return;
+    if (GCM_CONTROL_GUEST_ADDR - ea < size)
+        atomic_fetch_add_explicit(&s_ks_spu_put_writes, 1ull, memory_order_relaxed);
+}
+static uint64_t gcm_kick_stats_now_us(void)
+{
+    extern unsigned long long ps3_qpc_us(void);
+    return ps3_qpc_us();
+}
+static void gcm_kick_stats_report(uint64_t now)
+{
+    if (s_ks_last_us && now - s_ks_last_us < 2000000ull) return;
+    s_ks_last_us = now;
+    fprintf(stderr, "[gcm kick stats] waits=%llu kicked=%llu kicked_put_moved=%llu timeouts=%llu "
+            "timeout_put_moved=%llu (spu_dma=%llu kick_lost=%llu other=%llu) kicked_ms=%.1f timeout_ms=%.1f "
+            "notifies=%llu spu_put_writes=%llu\n",
+            s_ks_waits, s_ks_kicked, s_ks_kicked_put_moved, s_ks_timeouts, s_ks_moved, s_ks_moved_spu,
+            s_ks_moved_lost_kick, s_ks_moved_other, s_ks_kicked_us / 1000.0, s_ks_timeout_us / 1000.0,
+            atomic_load(&s_ks_notifies), atomic_load(&s_ks_spu_put_writes));
+}
+
 void cellGcm_fifo_kick_notify(void)
 {
+    if (gcm_kick_stats_on()) atomic_fetch_add_explicit(&s_ks_notifies, 1ull, memory_order_relaxed);
     if(!cellGcm_native_consumer_enabled())return;
     HANDLE ev=atomic_load_explicit(&s_gcm_kick_ev,memory_order_acquire);
     if(ev)SetEvent(ev);
@@ -3202,6 +3244,31 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     static int on = -1;
     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+    if (gcm_kick_stats_on()) {
+        const u32 put0 = vm_base ? vm_read32(GCM_CONTROL_GUEST_ADDR + 0) : 0;
+        const unsigned long long n0 = atomic_load(&s_ks_notifies), w0 = atomic_load(&s_ks_spu_put_writes);
+        const uint64_t t0 = gcm_kick_stats_now_us();
+        rsx_fifo_busy_idle_begin();
+        const DWORD r = ev ? WaitForSingleObject(ev, ms) : (Sleep(ms), WAIT_TIMEOUT);
+        rsx_fifo_busy_idle_end();
+        const uint64_t t1 = gcm_kick_stats_now_us();
+        const int moved = vm_base && vm_read32(GCM_CONTROL_GUEST_ADDR + 0) != put0;
+        s_ks_waits++;
+        if (r == WAIT_OBJECT_0) {
+            s_ks_kicked++; s_ks_kicked_us += t1 - t0;
+            s_ks_kicked_put_moved += (unsigned long long)moved;
+        } else {
+            s_ks_timeouts++; s_ks_timeout_us += t1 - t0;
+            if (moved) {
+                s_ks_moved++;
+                if (atomic_load(&s_ks_spu_put_writes) != w0) s_ks_moved_spu++;
+                else if (atomic_load(&s_ks_notifies) != n0) s_ks_moved_lost_kick++;
+                else s_ks_moved_other++;
+            }
+        }
+        gcm_kick_stats_report(t1);
+        return;
+    }
     rsx_fifo_busy_idle_begin();
     if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
