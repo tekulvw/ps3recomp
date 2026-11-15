@@ -19,6 +19,7 @@ static int reject_admission;
 int spu_taskset_lifecycle_create(uint32_t ea,int taskset2) {(void)ea;assert(!taskset2);return 1;}
 int spu_taskset_lifecycle_enter(uint32_t ea) {(void)ea;++entered;return reject_admission ? -1 : 1;}
 void spu_taskset_lifecycle_leave(uint32_t ea) {(void)ea;++left;}
+unsigned spu_taskset_lifecycle_active(uint32_t ea) {(void)ea;return 0;}
 /* No SPU runs in this layout fixture; observer-only services are inert. */
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
