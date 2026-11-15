@@ -2570,6 +2570,7 @@ static LRESULT CALLBACK vk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static void vk_window_open(const char* title)
 {
     if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
+    vk_pg_init();   /* before the window's first visibility or display-state news */
     WNDCLASSEXA wc;
     memset(&wc, 0, sizeof wc);
     wc.cbSize = sizeof wc;
@@ -2638,6 +2639,7 @@ static void vk_window_drawable_size(int* w, int* h)
 static void vk_window_open(const char* title)
 {
     if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
+    vk_pg_init();   /* before the window's first visibility or display-state news */
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
         return;
