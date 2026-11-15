@@ -36,6 +36,8 @@ typedef struct rsx_deferred_report_queue {
  uint64_t applied_early;   /* records applied at their stream position (diagnostic) */
  uint32_t capacity;        /* queued-record bound; 0 = RSX_DEFERRED_REPORT_CAPACITY */
  uint64_t capacity_waits;  /* pushes that waited for completion at the bound (diagnostic) */
+ uint64_t issue_deferrals; /* issues put off while the backend could not take a ticket (diagnostic) */
+ uint64_t recoveries;      /* failures recovered by rsx_reports_recover (diagnostic) */
 } rsx_deferred_report_queue;
 static uint32_t rsx_reports_capacity(const rsx_deferred_report_queue *q){
  return q->capacity&&q->capacity<=RSX_DEFERRED_REPORT_STORAGE?q->capacity:RSX_DEFERRED_REPORT_CAPACITY;
@@ -48,7 +50,13 @@ typedef struct rsx_deferred_report_ops {
  uint64_t (*issue)(void*);
  int (*status)(void*,uint64_t,int); /* -1 failed;0 pending;1 genuine success */
  int (*publish)(void*,const rsx_deferred_report*);
+ /* Optional (NULL: always). 0 while the backend cannot take a completion
+  * ticket at this point of the stream -- the command stream is inside a
+  * primitive, whose draw is not recorded yet. An issue then waits: the
+  * records stay unissued and the next issue tickets them. Not a failure. */
+ int (*issue_ready)(void*);
 } rsx_deferred_report_ops;
+static int rsx_reports_issue_ready(const rsx_deferred_report_ops *o){return !o->issue_ready||o->issue_ready(o->user);}
 /* Consumer-owned, first failure only. Preserve the failing record and all
  * queue progress; this witness must never grant completion or retry effects. */
 static int rsx_reports_fail(rsx_deferred_report_queue *q,const rsx_deferred_report *r,
@@ -65,6 +73,7 @@ static int rsx_reports_fail(rsx_deferred_report_queue *q,const rsx_deferred_repo
 }
 static int rsx_reports_issue(rsx_deferred_report_queue *q,const rsx_deferred_report_ops *o){
  if(q->failed)return 0;if(!q->unissued)return 1;
+ if(!rsx_reports_issue_ready(o)){q->issue_deferrals++;return 1;}
  uint64_t ticket=o->issue(o->user);if(!ticket)return rsx_reports_fail(q,q->count?&q->records[q->head]:NULL,"issue-zero",0,0,0,0);
  /* Only the newest `unissued` records lack a ticket: every issue tickets all. */
  for(uint32_t i=q->count-q->unissued;i<q->count;i++){rsx_deferred_report *r=&q->records[(q->head+i)%RSX_DEFERRED_REPORT_STORAGE];if(!r->ticket){r->ticket=ticket;r->issued_ns=q->clock?q->clock():0;}}
@@ -87,7 +96,10 @@ static int rsx_reports_progress(rsx_deferred_report_queue *q,const rsx_deferred_
 static int rsx_reports_push(rsx_deferred_report_queue *q,const rsx_deferred_report_ops *o,rsx_deferred_report r,int may_apply){
  if(q->failed)return 0;
  if(q->count>=rsx_reports_capacity(q)){q->capacity_waits++;if(!rsx_reports_progress(q,o,RSX_REPORTS_WAIT_ALL,1))return 0;}
- if(q->count>=rsx_reports_capacity(q))return rsx_reports_fail(q,&q->records[q->head],"capacity-after-blocking-progress",q->records[q->head].ticket,0,1,0);
+ /* Inside a primitive the wait could not issue: the storage beyond the bound
+  * takes the records until the primitive ends. */
+ if(q->count>=rsx_reports_capacity(q)&&!(q->count<RSX_DEFERRED_REPORT_STORAGE&&!rsx_reports_issue_ready(o)))
+  return rsx_reports_fail(q,&q->records[q->head],"capacity-after-blocking-progress",q->records[q->head].ticket,0,1,0);
  r.ticket=0;r.generation=q->generation;r.early=0;
  /* Apply now only behind already-applied records: stream order is kept. */
  if(may_apply&&q->early_mode&&!q->gated){
@@ -106,6 +118,23 @@ static int rsx_reports_enqueue(rsx_deferred_report_queue *q,const rsx_deferred_r
  * mode, or behind an unapplied record, this is an ordinary enqueue. */
 static int rsx_reports_enqueue_early(rsx_deferred_report_queue *q,const rsx_deferred_report_ops *o,rsx_deferred_report r){
  return rsx_reports_push(q,o,r,1);
+}
+/* After a failure, once the caller has genuinely completed all work any
+ * queued record depends on (a full, successful wait on the backend): publish
+ * the records not yet applied, in stream order, and resume in a new
+ * generation instead of staying frozen. Returns the number published, or -1
+ * (still failed) when a publish is refused. Completion is the caller's full
+ * wait, never assumed here. */
+static int rsx_reports_recover(rsx_deferred_report_queue *q,const rsx_deferred_report_ops *o){
+ if(!q->failed)return 0;
+ int n=0;
+ while(q->count){
+  const rsx_deferred_report *r=&q->records[q->head];
+  if(!r->early){if(!o->publish(o->user,r))return -1;n++;}
+  q->head=(q->head+1)%RSX_DEFERRED_REPORT_STORAGE;q->count--;q->published++;
+ }
+ q->unissued=0;q->gated=0;q->generation++;q->failed=0;q->recoveries++;
+ return n;
 }
 /* Only effects still to be applied can touch guest memory later. */
 static int rsx_reports_overlap(const rsx_deferred_report_queue *q,uint64_t ea,uint64_t bytes){
