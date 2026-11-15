@@ -988,6 +988,45 @@ static int spurs_guest_range_valid(u32 ea, u32 bytes)
 
 static SRWLOCK s_taskset2_management_lock = SRWLOCK_INIT;
 
+/* Retirement of a taskset generation has two parts: the guest-visible one
+ * (every task's ENABLED bit has cleared) and the host one (each worker that
+ * ran a task has dropped its admitted lifetime reference). A worker clears
+ * ENABLED first and drops its reference after freeing its own state, so for a
+ * short tail the guest sees the taskset as finished while creation at that
+ * address would still report BUSY. Join covers the whole retirement, and
+ * creation over a generation that no live workload owns gives that tail a
+ * brief grace period. Both are bounded and say so when the bound expires. */
+static unsigned s_taskset_join_timeout_ms = 10000;
+static unsigned s_taskset_reuse_grace_ms = 100;
+
+static int spurs_taskset_tasks_enabled(u32 ea)
+{
+    for (u32 off = 0; off < 16; off++)
+        if (__atomic_load_n(vm_base + ea + CSTS_ENABLED + off, __ATOMIC_ACQUIRE)) return 1;
+    return 0;
+}
+
+/* Wait until no task is enabled (when want_tasks_done) and no lifetime
+ * reference is active. Returns 1 once retired, 0 when the bound expires. */
+static int spurs_taskset_wait_retired(u32 ea, int want_tasks_done, unsigned timeout_ms)
+{
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    for (;;) {
+        if ((!want_tasks_done || !spurs_taskset_tasks_enabled(ea)) &&
+            !spu_taskset_lifecycle_active(ea)) return 1;
+        if (GetTickCount64() >= deadline) return 0;
+        Sleep(1);
+    }
+}
+
+static int spurs_taskset_owned_by_live_workload(u32 ea)
+{
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++)
+        if (__atomic_load_n(&s_workloads[i].in_use, __ATOMIC_ACQUIRE) &&
+            s_workloads[i].is_taskset && s_workloads[i].data == ea) return 1;
+    return 0;
+}
+
 static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
                                 const u8* priority, u32 maxContention,
                                 u32 size, int clear_ls, u32 name_ea, int taskset2)
@@ -1005,6 +1044,18 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
     }
 
     if (!spurs_guest_range_valid(taskset_ea, size)) return (s32)0x8041090Du;
+
+    /* An earlier generation at this address that no live workload owns has
+     * already been destroyed; only its worker tail can remain. Let that tail
+     * finish instead of reporting BUSY for it. The authoritative check below
+     * still runs under the instance lock. */
+    if (spu_taskset_lifecycle_active(taskset_ea) &&
+        !spurs_taskset_owned_by_live_workload(taskset_ea) &&
+        !spurs_taskset_wait_retired(taskset_ea, 0, s_taskset_reuse_grace_ms))
+        fprintf(stderr, "[cellSpurs] CreateTaskset%s ea=0x%08X: the destroyed generation still "
+                "holds %u worker reference(s) after %u ms; reporting BUSY\n",
+                taskset2 ? "2" : "", taskset_ea, spu_taskset_lifecycle_active(taskset_ea),
+                s_taskset_reuse_grace_ms);
 
     struct SpursInst* si;
     s32 admission = spurs_api_lock(spurs_ea, &si);
@@ -1262,14 +1313,28 @@ s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
     return CELL_OK;
 }
 
+/* Join returns once the taskset has retired: every task has exited and every
+ * worker has dropped its reference, so Destroy and a same-address Create that
+ * follow it cannot see BUSY. The wait is bounded; on expiry Join reports BUSY
+ * and says what is still outstanding. */
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset)
 {
-    taskset = GUEST_PTR(taskset, CellSpursTaskset*);
-    if (!taskset)
-        return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-
-    printf("[cellSpurs] JoinTaskset()\n");
-    /* In a full implementation, wait for all tasks to complete */
+    u32 ea = (u32)(uintptr_t)taskset;
+    if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!spurs_guest_range_valid(ea, CSTS_TASKINFO)) return (s32)0x8041090Du;
+    u32 wid = vm_read32(ea + CSTS_WID);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use ||
+        !s_workloads[wid].is_taskset || s_workloads[wid].data != ea)
+        fprintf(stderr, "[cellSpurs] JoinTaskset ea=0x%08X wid=%u: no live taskset workload; "
+                "waiting only for worker references\n", ea, wid);
+    printf("[cellSpurs] JoinTaskset() ea=0x%08X\n", ea);
+    if (!spurs_taskset_wait_retired(ea, 1, s_taskset_join_timeout_ms)) {
+        fprintf(stderr, "[cellSpurs] JoinTaskset ea=0x%08X TIMEOUT after %u ms: tasks %s, "
+                "%u worker reference(s) active\n", ea, s_taskset_join_timeout_ms,
+                spurs_taskset_tasks_enabled(ea) ? "still enabled" : "exited",
+                spu_taskset_lifecycle_active(ea));
+        return (s32)0x8041090Au;
+    }
     return CELL_OK;
 }
 

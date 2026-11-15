@@ -46,3 +46,4 @@ void ps3_ww_report_inline(uint32_t a,uint64_t v,int w) {(void)a;(void)v;(void)w;
 int spu_taskset_lifecycle_create(uint32_t ea, int taskset2) {
     (void)ea; assert(!taskset2); return 1;
 }
+unsigned spu_taskset_lifecycle_active(uint32_t ea) { (void)ea; return 0; }
