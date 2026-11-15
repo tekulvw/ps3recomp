@@ -26,8 +26,8 @@
  * the FIFO swapchain paced the title at the display's rate, and a title whose
  * flips no longer wait for anything would spin at hundreds of frames a second.
  *
- * PS3RECOMP_VK_ACQUIRE_BOUND_MS=0 restores the unbounded acquire and turns
- * the guard off. Pure logic, so it is tested without a GPU or window
+ * PS3RECOMP_VK_ACQUIRE_BOUND_MS=0 (Metal: PS3RECOMP_METAL_DRAWABLE_BOUND_MS=0)
+ * restores the unbounded acquire and turns the guard off. Pure logic, so it is tested without a GPU or window
  * (tools/test_present_guard.py). Fields are touched by the presenting threads
  * and, for `hidden`, the window's message pump; all through atomics. */
 #ifndef RSX_PRESENT_GUARD_H
@@ -115,6 +115,23 @@ static inline void rsx_present_guard_presented(rsx_present_guard* g, uint64_t no
 {
     if (!rsx_present_guard_waited(g, now_ns, took_ns) && g->bound_ns)
         RSX_PG_STORE(&g->present_stalled, 0);
+}
+/* A presenter that cannot poll for an image (Metal's nextDrawable blocks, up
+ * to a second, and returns nil when none came) reports each attempt here:
+ * an image within the bound is a frame through; a wait over it, with or
+ * without an image, marks presentation stalled. */
+static inline void rsx_present_guard_drawable(rsx_present_guard* g, uint64_t now_ns, uint64_t took_ns, int got)
+{
+    if (!g->bound_ns) return;
+    if (got) rsx_present_guard_presented(g, now_ns, took_ns);
+    else rsx_present_guard_waited(g, now_ns, took_ns);
+}
+/* A wait for a frame slot (frames in flight on the GPU) took took_ns: it is
+ * the GPU's, not the window's, so it never skips the window; returns 1 when
+ * it overran the bound, for the caller to say so. */
+static inline int rsx_present_guard_slot_wait(const rsx_present_guard* g, uint64_t took_ns)
+{
+    return g->bound_ns && took_ns > g->bound_ns;
 }
 /* A frame was left out of the window at now_ns: how long to wait so frames
  * left out go no faster than 60 Hz, as the display paced them. Returns 0

@@ -68,6 +68,7 @@
 #include "rsx_frontend_internal.h"
 #include "rsx_draw_engine.h"
 #include "rsx_present_thread.h"
+#include "rsx_present_guard.h"
 #define RSX_NATIVE_OWNER_PTHREAD
 #include "rsx_native_owner_gate.h"
 #include "rsx_vertex_fetch.h"
@@ -94,6 +95,68 @@ static int                 s_headless;
 static atomic_int          s_closed;
 #if !TARGET_OS_IPHONE
 static id                  s_window_close_observer;
+/* The window's present guard (rsx_present_guard.h), as the Vulkan backend
+ * has: an occluded or minimized window, or a compositor that stopped handing
+ * out drawables, never paces the presenting thread. nextDrawable cannot be
+ * polled, so a stall is seen by how long it took. */
+static rsx_present_guard   s_pg;
+static atomic_int          s_pg_ready;
+static id                  s_window_occlusion_observer;
+static uint64_t pg_now_ns(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static void pg_init(void)
+{
+    if (atomic_load(&s_pg_ready)) return;
+    rsx_present_guard_init(&s_pg, getenv("PS3RECOMP_METAL_DRAWABLE_BOUND_MS"));
+    atomic_store(&s_pg_ready, 1);
+}
+/* Whether this present asks for a drawable at all. */
+static int pg_show_window(void)
+{
+    pg_init();
+    uint64_t unused;
+    return rsx_present_guard_before(&s_pg, pg_now_ns(), &unused);
+}
+/* A frame left out of the window waits for its 60 Hz slot, as the display
+ * would have paced it: a title whose flips wait for nothing else spins. */
+static void pg_pace(void)
+{
+    const uint64_t wait = rsx_present_guard_pace_ns(&s_pg, pg_now_ns());
+    if (!wait) return;
+    const struct timespec ts = { (time_t)(wait / 1000000000ull), (long)(wait % 1000000000ull) };
+    nanosleep(&ts, NULL);
+}
+/* nextDrawable, timed and reported to the guard. */
+static id<CAMetalDrawable> pg_next_drawable(CAMetalLayer* layer)
+{
+    const uint64_t t0 = pg_now_ns();
+    id<CAMetalDrawable> d = [layer nextDrawable];
+    const uint64_t now = pg_now_ns();
+    const int was = __atomic_load_n(&s_pg.present_stalled, __ATOMIC_RELAXED);
+    rsx_present_guard_drawable(&s_pg, now, now - t0, d != nil);
+    const int is = __atomic_load_n(&s_pg.present_stalled, __ATOMIC_RELAXED);
+    static int logged;
+    if (is && !was && logged++ < 8)
+        fprintf(stderr, "[metal] nextDrawable took %.0f ms%s; the window is shown only on a probe every 2 s until it recovers\n",
+                (double)(now - t0) / 1e6, d ? "" : " and gave none");
+    return d;
+}
+/* The frames-in-flight slot: the GPU's pace, not the window's. Bounded only
+ * to say so; it still waits, so no more frames are ever in flight. */
+static void pg_inflight_wait(dispatch_semaphore_t sem)
+{
+    pg_init();
+    if (!s_pg.bound_ns) { dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER); return; }
+    const uint64_t t0 = pg_now_ns();
+    if (!dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)s_pg.bound_ns))) return;
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    static int logged;
+    if (rsx_present_guard_slot_wait(&s_pg, pg_now_ns() - t0) && logged++ < 8)
+        fprintf(stderr, "[metal] a frame slot took %.0f ms to free (GPU behind)\n", (double)(pg_now_ns() - t0) / 1e6);
+}
 #endif
 static int                 s_ready;
 static rsx_frontend_device *s_frontend;
@@ -841,6 +904,11 @@ static void window_close_observer_stop(void)
         [[NSNotificationCenter defaultCenter] removeObserver:s_window_close_observer];
         s_window_close_observer = nil;
     }
+    if (s_window_occlusion_observer) {
+        [[NSNotificationCenter defaultCenter] removeObserver:s_window_occlusion_observer];
+        s_window_occlusion_observer = nil;
+    }
+    rsx_present_guard_set_hidden(&s_pg, 0);
 }
 
 static void window_close_observer_start(NSWindow* window)
@@ -852,6 +920,20 @@ static void window_close_observer_start(NSWindow* window)
         usingBlock:^(NSNotification* note) {
             (void)note;
             atomic_store(&s_closed, 1);
+        }];
+    /* Occluded, minimized or on a hidden space: nobody sees the window, and
+     * nextDrawable may then block for up to a second per frame. Posted on
+     * the main thread, which owns the window; presenters read only the flag. */
+    pg_init();
+    s_window_occlusion_observer = [[NSNotificationCenter defaultCenter]
+        addObserverForName:NSWindowDidChangeOcclusionStateNotification object:window queue:nil
+        usingBlock:^(NSNotification* note) {
+            NSWindow* w = (NSWindow*)note.object;
+            const int hidden = !([w occlusionState] & NSWindowOcclusionStateVisible);
+            rsx_present_guard_set_hidden(&s_pg, hidden);
+            static int logged;
+            if (logged++ < 16)
+                fprintf(stderr, "[metal] window %s\n", hidden ? "occluded: presents skip it until it is visible" : "visible");
         }];
 }
 
@@ -5084,7 +5166,7 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
           if (windowed_present) {
               if(critical_start)semaphore_start=ps3_critical_now_ns();
               rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
-              dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+              pg_inflight_wait(s_inflight);
               rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
               if(critical_start)semaphore_end=ps3_critical_now_ns();
           }
@@ -5095,12 +5177,23 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
                 dst = s_offscreen;
             } else {
                 if(critical_start)drawable_start=ps3_critical_now_ns();
+                /* The guard may leave the window out: the frame is still
+                 * encoded and committed, into no drawable. */
+                const int show = pg_show_window();
                 rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
-                drawable = [s_layer nextDrawable];
+                if (show) drawable = pg_next_drawable(s_layer);
                 rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
                 if(critical_start)drawable_end=ps3_critical_now_ns();
-                fps_note_drawable(drawable!=nil);
-                if (!drawable) {           /* compositor is busy; skip */
+                if (show) fps_note_drawable(drawable!=nil);
+                if (!show) {
+                    /* Skipped by the guard: encode and commit as usual, so
+                     * recorded work never piles up while the window is out,
+                     * at no more than 60 frames a second. */
+                    if (s_eng_diag.active) s_eng_diag.reason = "window_guarded";
+                    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
+                    pg_pace();
+                    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
+                } else if (!drawable) {    /* compositor is busy; skip */
                     if (s_eng_diag.active) s_eng_diag.reason = "no_drawable";
                     dispatch_semaphore_signal(s_inflight);
                     return 0;
@@ -5600,12 +5693,14 @@ static int eng_pt_show(void *user, uint32_t slot, rsx_present_show_timing *timin
             dst = s_pt_offscreen;
         } else {
             if(critical_start)semaphore_start=ps3_critical_now_ns();
-            dispatch_semaphore_wait(s_pt_inflight, DISPATCH_TIME_FOREVER);
+            pg_inflight_wait(s_pt_inflight);
             if(critical_start)semaphore_end=ps3_critical_now_ns();
             if(critical_start)drawable_start=ps3_critical_now_ns();
-            drawable = [s_pt_layer nextDrawable];
+            const int show = pg_show_window();
+            if (show) drawable = pg_next_drawable(s_pt_layer);
+            else pg_pace();
             if(critical_start)drawable_end=ps3_critical_now_ns();
-            fps_note_drawable(drawable!=nil);
+            if (show) fps_note_drawable(drawable!=nil);
             if (!drawable) {
                 dispatch_semaphore_signal(s_pt_inflight);
                 timing->acquire_ns = rsx_present_thread_now() - t0;
@@ -6496,7 +6591,7 @@ static void metal_original_present(void)
         return;
     }
     /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
-    if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+    if (!s_headless) pg_inflight_wait(s_inflight);
     @autoreleasepool {
         id<MTLTexture> target = nil;
         id<CAMetalDrawable> drawable = nil;
@@ -6504,8 +6599,10 @@ static void metal_original_present(void)
         if (s_headless) {
             target = s_offscreen;
         } else {
-            drawable = [s_layer nextDrawable];
-            fps_note_drawable(drawable!=nil);
+            const int show = pg_show_window();
+            if (show) drawable = pg_next_drawable(s_layer);
+            else pg_pace();
+            if (show) fps_note_drawable(drawable!=nil);
             if (!drawable) {            /* compositor is busy; skip this frame */
                 dispatch_semaphore_signal(s_inflight);
                 return;
