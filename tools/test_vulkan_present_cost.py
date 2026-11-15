@@ -3,7 +3,9 @@
 present (PS3RECOMP_VK_PRESENT_READBACK=1) of the same synthetic frames must
 leave identical bytes, both clean under the Khronos validation layer (with
 synchronization validation); so must a run with the opt-in present thread
-(PS3RECOMP_RSX_PRESENT_THREAD=1), whose shows run beside the recording thread. --timing also reports the present call's CPU
+(PS3RECOMP_RSX_PRESENT_THREAD=1), whose shows run beside the recording thread. A periodic frame
+dump (PS3RECOMP_VK_DUMP) taken with the present thread, from its staging image, must equal the
+same dump taken by a direct run. --timing also reports the present call's CPU
 cost in both modes without the layer; --window presents to an SDL window,
 --batched records the engine in batches.
 Synthetic inputs only.
@@ -94,6 +96,30 @@ def main():
             raise SystemExit("a direct present left different bytes from a read-back present")
         if outputs["direct"] != outputs["thread"]:
             raise SystemExit("a present-thread run left different bytes from a direct present")
+        # A periodic dump: with the present thread it is copied from the staging
+        # image of the dump_every-th staged frame; it must equal a direct run's.
+        every = str(max(1, int(args.frames) // 3))
+        dumps = {}
+        for mode, extra in (("direct", {}), ("thread", MODES["thread"])):
+            out = Path(tmp) / f"{mode}-dumped.bin"
+            ppm = Path(tmp) / f"{mode}.ppm"
+            result = subprocess.run([str(binary), mode, str(out), args.frames, args.draws],
+                                    env=dict(environment, **extra, PS3RECOMP_VK_DUMP=str(ppm), PS3RECOMP_VK_DUMP_EVERY=every),
+                                    capture_output=True, text=True, timeout=1800)
+            print("\n".join(line for line in result.stderr.splitlines() if not line.startswith("[RSX vulkan] device")))
+            result.check_returncode()
+            text = result.stdout + result.stderr
+            if "VUID-" in text or "SYNC-HAZARD" in text or "Validation Error" in text or "THREADING ERROR" in text:
+                raise SystemExit(f"Vulkan validation rejected the {mode} run with a frame dump")
+            if mode == "thread" and "present thread unsupported" in text:
+                raise SystemExit("the present thread refused a run with a frame dump")
+            if not ppm.exists() or ppm.stat().st_size < 16:
+                raise SystemExit(f"the {mode} run with PS3RECOMP_VK_DUMP wrote no frame dump")
+            dumps[mode] = ppm.read_bytes()
+            if out.read_bytes() != outputs["direct"]:
+                raise SystemExit(f"a {mode} run with a frame dump left different bytes from a direct present")
+        if dumps["direct"] != dumps["thread"]:
+            raise SystemExit("the present thread's frame dump differs from a direct run's")
         if args.timing:
             plain = {k: v for k, v in environment.items() if k not in ("VK_INSTANCE_LAYERS", "VK_LAYER_SETTINGS_PATH")}
             for mode, extra in MODES.items():
