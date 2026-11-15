@@ -71,6 +71,20 @@ int main(void)
     check(rsx_present_guard_slot_wait(&g, 150 * MS) && !rsx_present_guard_slot_wait(&g, 20 * MS) && !g.present_stalled,
           "a long frame-slot wait is reported but never skips the window");
 
+    /* Frames left out of the window are held to 60 Hz. */
+    rsx_present_guard_init(&g, NULL);
+    const uint64_t P = RSX_PRESENT_GUARD_PACE_NS;
+    check(rsx_present_guard_pace_ns(&g, 0) == 0, "the first skipped frame goes at once");
+    check(rsx_present_guard_pace_ns(&g, 1 * MS) == P - 1 * MS, "the next waits for its 60 Hz slot");
+    uint64_t now = P;                               /* it slept until its slot */
+    int frames = 1; uint64_t slept = 0;
+    for (int i = 0; i < 59; i++) { const uint64_t w = rsx_present_guard_pace_ns(&g, now); slept += w; now += w; frames++; }
+    check(frames == 60 && now >= 59 * P && now <= 60 * P, "a spinning presenter is held to 60 frames a second");
+    const uint64_t late = now + 5 * P;              /* a slow frame */
+    check(rsx_present_guard_pace_ns(&g, late) == 0 && rsx_present_guard_pace_ns(&g, late + 1 * MS) == P - 1 * MS,
+          "a presenter behind by more than a period starts a new grid, no catch-up burst");
+    (void)slept;
+
     /* Off: the old unbounded acquire, nothing skipped. */
     rsx_present_guard_init(&g, "0");
     rsx_present_guard_set_hidden(&g, 1);

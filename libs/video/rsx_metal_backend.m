@@ -120,6 +120,15 @@ static int pg_show_window(void)
     uint64_t unused;
     return rsx_present_guard_before(&s_pg, pg_now_ns(), &unused);
 }
+/* A frame left out of the window waits for its 60 Hz slot, as the display
+ * would have paced it: a title whose flips wait for nothing else spins. */
+static void pg_pace(void)
+{
+    const uint64_t wait = rsx_present_guard_pace_ns(&s_pg, pg_now_ns());
+    if (!wait) return;
+    const struct timespec ts = { (time_t)(wait / 1000000000ull), (long)(wait % 1000000000ull) };
+    nanosleep(&ts, NULL);
+}
 /* nextDrawable, timed and reported to the guard. */
 static id<CAMetalDrawable> pg_next_drawable(CAMetalLayer* layer)
 {
@@ -5178,8 +5187,12 @@ static int eng_encode_and_commit_mode(id<MTLTexture> present_dst,int async_submi
                 if (show) fps_note_drawable(drawable!=nil);
                 if (!show) {
                     /* Skipped by the guard: encode and commit as usual, so
-                     * recorded work never piles up while the window is out. */
+                     * recorded work never piles up while the window is out,
+                     * at no more than 60 frames a second. */
                     if (s_eng_diag.active) s_eng_diag.reason = "window_guarded";
+                    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
+                    pg_pace();
+                    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
                 } else if (!drawable) {    /* compositor is busy; skip */
                     if (s_eng_diag.active) s_eng_diag.reason = "no_drawable";
                     dispatch_semaphore_signal(s_inflight);
@@ -5685,6 +5698,7 @@ static int eng_pt_show(void *user, uint32_t slot, rsx_present_show_timing *timin
             if(critical_start)drawable_start=ps3_critical_now_ns();
             const int show = pg_show_window();
             if (show) drawable = pg_next_drawable(s_pt_layer);
+            else pg_pace();
             if(critical_start)drawable_end=ps3_critical_now_ns();
             if (show) fps_note_drawable(drawable!=nil);
             if (!drawable) {
@@ -6587,6 +6601,7 @@ static void metal_original_present(void)
         } else {
             const int show = pg_show_window();
             if (show) drawable = pg_next_drawable(s_layer);
+            else pg_pace();
             if (show) fps_note_drawable(drawable!=nil);
             if (!drawable) {            /* compositor is busy; skip this frame */
                 dispatch_semaphore_signal(s_inflight);
