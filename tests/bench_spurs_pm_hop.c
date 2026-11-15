@@ -18,6 +18,11 @@
  *           coordinator's timed pass (which also starts at the hop) varies
  *           instead of depending on how far the host's sleep overshoots.
  *
+ * For the ppu kick the fixture also watches the request line itself and reports
+ * how many host writes reached that watch, and whether the scheduler has its
+ * own request-line watch registered, so the store wake can be checked without
+ * relying on timing.
+ *
  * Reported per hop: the wall time, and the latency from one PM run's request
  * to the next PM run's start (its exit, the worker's bookkeeping, the
  * coordinator's pass and the wake of the worker that runs it).
@@ -95,6 +100,13 @@ static void add_workload(uint32_t wid, uint32_t pm, spu_lifted_entry_fn fn, uint
     for (uint32_t sn = 0; sn < nspus; sn++) vm_base[SPURS_EA + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn] = 1;
 }
 
+/* Counts the PPU stand-in's writes that the coherence layer reports to the
+ * request line's watches. Watches run on the writing thread, so the flag set
+ * around the stand-in's store leaves out the scheduler's own bookkeeping. */
+static volatile uint32_t g_line_fires;
+static _Thread_local int t_ppu_store;
+static void count_line_write(void* unused) { (void)unused; if (t_ppu_store) __atomic_add_fetch(&g_line_fires, 1, __ATOMIC_RELAXED); }
+
 static int cmp64(const void* a, const void* b) { uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b; return x < y ? -1 : x > y; }
 
 int main(int argc, char** argv)
@@ -121,10 +133,16 @@ int main(int argc, char** argv)
     add_workload(1, PM_B, pm_b, nspus);
     vm_write32(SPURS_EA + SPURS_WKL_ENABLED, 0xC0000000u);
     g_target = hops;
+    static spu_coh_watch line_watch;
+    if (g_ppu_kick) {
+        spu_lockline_lock();
+        spu_coh_watch_add(&line_watch, SPURS_EA, count_line_write, NULL);
+        spu_lockline_unlock();
+    }
     const uint64_t t0 = now_ns();
     g_kick_ns[0] = t0;
     vm_write8(SPURS_EA + SPURS_WKL_READY1 + 0, 1);         /* first request, as the PPU makes it */
-    uint32_t seen = 0;
+    uint32_t seen = 0, ppu_stores = 0;
     while (__atomic_load_n(&g_hops, __ATOMIC_ACQUIRE) < hops) {
         const uint32_t h = __atomic_load_n(&g_hops, __ATOMIC_ACQUIRE);
         if (g_ppu_kick && h != seen) {                         /* PPU stand-in: plain store */
@@ -135,7 +153,7 @@ int main(int argc, char** argv)
                 struct timespec d = {(time_t)(us / 1000000u), (long)(us % 1000000u) * 1000};
                 nanosleep(&d, NULL);
             }
-            if (h < hops) { g_kick_ns[h] = now_ns(); vm_write8(SPURS_EA + SPURS_WKL_READY1 + (h & 1), 1); }
+            if (h < hops) { g_kick_ns[h] = now_ns(); t_ppu_store = 1; vm_write8(SPURS_EA + SPURS_WKL_READY1 + (h & 1), 1); t_ppu_store = 0; ppu_stores++; }
         }
         if (now_ns() - t0 > 60ull * 1000000000ull) { fprintf(stderr, "FAIL: stalled at hop %u\n", h); return 1; }
     }
@@ -143,8 +161,11 @@ int main(int argc, char** argv)
     uint64_t lat[1 << 16]; uint32_t n = 0;
     for (uint32_t h = 1; h < hops; h++) lat[n++] = g_start_ns[h] - g_kick_ns[h];
     qsort(lat, n, sizeof lat[0], cmp64);
-    printf("pm_hop kick=%s idle_us=%u jitter_us=%u nspus=%u hops=%u per_hop_us=%.2f request_to_start_us p50=%.2f p90=%.2f p99=%.2f max=%.2f\n",
-           g_ppu_kick ? "ppu" : "spu", g_ppu_idle_us, g_ppu_jitter_us, nspus, hops, (t1 - t0) / 1000.0 / hops,
+    printf("pm_hop kick=%s idle_us=%u jitter_us=%u nspus=%u hops=%u request_watched=%d ppu_stores=%u line_writes=%u "
+           "per_hop_us=%.2f request_to_start_us p50=%.2f p90=%.2f p99=%.2f max=%.2f\n",
+           g_ppu_kick ? "ppu" : "spu", g_ppu_idle_us, g_ppu_jitter_us, nspus, hops,
+           spurs_inst_find(SPURS_EA) ? spurs_inst_find(SPURS_EA)->request_watched : -1, ppu_stores,
+           __atomic_load_n(&g_line_fires, __ATOMIC_RELAXED), (t1 - t0) / 1000.0 / hops,
            lat[n / 2] / 1000.0, lat[n * 9 / 10] / 1000.0, lat[n * 99 / 100] / 1000.0, lat[n - 1] / 1000.0);
     fflush(stdout);
     _exit(0);
