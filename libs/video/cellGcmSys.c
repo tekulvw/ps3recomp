@@ -2926,10 +2926,32 @@ static void gcm_park_kick_arm(u32 ea, u32 word)
     }
 }
 
+/* PS3RECOMP_GCM_SPU_PUT_KICK=1 (default off; read once): an SPU transfer
+ * that writes the control register's put word wakes the FIFO walker, as a PPU
+ * store to it already does. Titles whose SPU jobs advance put by DMA otherwise
+ * leave the walker asleep until its idle-wait timeout with new commands
+ * already in the buffer; the RSX itself sees put whoever writes it. The hook
+ * runs after the transfer has landed, so the woken walker reads the new put. */
+static int s_spu_put_kick = -1;
+static _Atomic unsigned long long s_spu_put_kicks;
+static int gcm_spu_put_kick_on(void)
+{
+    if (s_spu_put_kick < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_SPU_PUT_KICK");
+        s_spu_put_kick = e && !strcmp(e, "1");
+        if (s_spu_put_kick) fprintf(stderr, "[gcm] an SPU DMA over the put word wakes the FIFO walker\n");
+    }
+    return s_spu_put_kick;
+}
+
 static void gcm_kick_stats_spu_put(u32 ea, u32 size);
 void gcm_note_spu_put(u32 ea, u32 size)
 {
-    gcm_kick_stats_spu_put(ea, size);
+    gcm_kick_stats_spu_put(ea, size);   /* PS3RECOMP_RSX_KICK_STATS: before the kick it may make */
+    if (size && GCM_CONTROL_GUEST_ADDR - ea < size && gcm_spu_put_kick_on()) {
+        atomic_fetch_add_explicit(&s_spu_put_kicks, 1ull, memory_order_relaxed);
+        cellGcm_fifo_kick_notify();
+    }
     if (s_park_kick > 0 && size) gcm_park_kick_put(ea, size);
     if (!size || size > 0x40000u) return;
     u32 room = 0;

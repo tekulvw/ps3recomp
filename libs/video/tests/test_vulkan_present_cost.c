@@ -117,7 +117,12 @@ int main(int argc, char** argv)
         CHECK(st.staged == frames && st.stage_failed == 0, "every present staged");
         CHECK(st.presented + st.dropped == frames && st.show_failed == 0, "every staged frame shown or dropped");
         CHECK(st.presented >= 1 && s_vk.presented == st.presented, "the present thread presented");
-        CHECK(s_vk.present_direct == 0 && s_vk.present_readback_count == 0, "no present on the presenting thread");
+        /* A frame dump is copied from the staging image (counted as a read-back),
+         * never presented here. */
+        const u32 thread_dumps = s_vk.dump_path ? frames / s_vk.dump_every : 0;
+        CHECK(s_vk.present_direct == 0 && s_vk.present_readback_count == thread_dumps, "no present on the presenting thread");
+        CHECK(!thread_dumps || (rsx_vulkan_backend_presented_center() & 0xFFFFFFu) == centre,
+              "a dump from the staging image kept the centre pixel");
         /* Each staging image that exists has the view vk_create_image made,
          * so its usage must be one a view may have (VUID-VkImageViewCreateInfo-
          * image-04441), checked here without relying on the validation layer
@@ -141,6 +146,13 @@ int main(int argc, char** argv)
     } else if (readback) {
         CHECK(s_vk.present_readback_count == frames && s_vk.present_direct == 0, "every present read back");
         CHECK((rsx_vulkan_backend_presented_center() & 0xFFFFFFu) == centre, "read-back present kept the centre pixel");
+    } else if (s_vk.dump_path) {
+        /* PS3RECOMP_VK_DUMP: every dump_every-th present is read back. */
+        const u32 dumps = frames / s_vk.dump_every;
+        CHECK(s_vk.present_readback_count == dumps && s_vk.present_direct == frames - dumps,
+              "a frame dump reads back only the presents it writes");
+        CHECK(!dumps || (rsx_vulkan_backend_presented_center() & 0xFFFFFFu) == centre,
+              "a dumped present kept the centre pixel");
     } else {
         CHECK(s_vk.present_direct == frames && s_vk.present_readback_count == 0, "every present direct");
         CHECK(rsx_vulkan_backend_presented_center() == 0, "a direct present keeps no centre pixel");
