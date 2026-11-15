@@ -98,7 +98,8 @@ def main():
             raise SystemExit("a present-thread run left different bytes from a direct present")
         # A periodic dump: with the present thread it is copied from the staging
         # image of the dump_every-th staged frame; it must equal a direct run's.
-        every = str(max(1, int(args.frames) // 3))
+        frames = int(args.frames)
+        every = str(next(n for n in range(max(1, frames // 3), frames + 1) if frames % n == 0))  # the last frame is dumped
         dumps = {}
         for mode, extra in (("direct", {}), ("thread", MODES["thread"])):
             out = Path(tmp) / f"{mode}-dumped.bin"
