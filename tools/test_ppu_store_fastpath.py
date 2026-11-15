@@ -119,13 +119,18 @@ int main(int argc,char** argv){
   // PPU stress: commits after a store must carry a value at least that new.
   const uint32_t W0=0x20000,W1=0x20040;   // one line
   vm_write64(W0,0);vm_write64(W1,0);ll(c,W0);sc(c,W0,0);   // mark the line before racing
-  std::atomic<bool> stop{false};std::atomic<unsigned long> commits{0};
-  std::thread s([&]{ppu_context& x=g_x;g_active_ctx=&x;uint32_t seq=0;
-    while(!stop.load(std::memory_order_relaxed)){
+  // The stores start once the store-conditional thread runs, and it keeps going
+  // for a quiet tail after the last store: on a loaded host it can be off its
+  // core for the whole store phase, which says nothing about coherence.
+  std::atomic<bool> stop{false},started{false};std::atomic<unsigned long> commits{0};
+  std::thread s([&]{ppu_context& x=g_x;g_active_ctx=&x;uint32_t seq=0;unsigned long extra=0;started=true;
+    while(!stop.load(std::memory_order_relaxed)||extra<20000){
+      if(stop.load(std::memory_order_relaxed))++extra;
       ll(x,W0);uint64_t a=vm_read64(W1);
       for(volatile int i=0;i<(int)(seq&63);i=i+1){}
       if(sc(x,W0,(a<<32)|(uint32_t)(seq+1))){++seq;commits.fetch_add(1,std::memory_order_relaxed);}
     }});
+  while(!started.load())std::this_thread::yield();
   unsigned long violations=0;
   { g_active_ctx=&g_y;
     for(uint64_t k=1;k<=(uint64_t)rounds;++k){
