@@ -1565,6 +1565,7 @@ void ppu_gcm_pump(void)
         if (s_flip_tick_seq == s_flip_req_seq)
             s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
         FLIP_UNLOCK();
+        if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_FLIP_DONE, 0, 0, 0, t, t); }
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -1602,7 +1603,10 @@ void cellGcmTickFlip(void)
     const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
     if (waiting) s_flip_tick_seq = s_flip_req_seq;
     FLIP_UNLOCK();
-    if (waiting) GCM_PENDING_SET(2);
+    if (waiting) {
+        if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_FLIP_TICK, 0, 0, 0, t, t); }
+        GCM_PENDING_SET(2);
+    }
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
