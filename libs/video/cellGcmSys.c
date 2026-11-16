@@ -4329,8 +4329,19 @@ static void gcm_rsx_process_fifo_pass(void)
     if (s_lag_ea && s_lag_ea != 1u && s_lag_sampler) {
         static unsigned ln;
         if (ln++ < 60000u)
-            fprintf(stderr, "[label-lag] t=%llu pass why=%s start=0x%08X end=0x%08X put=0x%08X\n",
-                    (unsigned long long)ps3_critical_now_ns(), why, start_off, s_fifo_getoff, put);
+        {
+            /* With PS3RECOMP_RSX_FIFO_BUSY=1 too: the walker's time in each
+             * category so far (us), so the time between a release's put and
+             * its consume can be split by what the walker was doing. */
+            uint64_t tot[RSX_FIFO_BUSY_BUILTIN_COUNT];
+            const int nt = rsx_fifo_busy_totals(tot, RSX_FIFO_BUSY_BUILTIN_COUNT);
+            char cats[512]; int cl = 0; cats[0] = 0;
+            for (int c = 0; c < nt && cl < (int)sizeof cats - 32; c++)
+                cl += snprintf(cats + cl, sizeof cats - (size_t)cl, "%s%llu", c ? "," : " busy_us=",
+                               (unsigned long long)(tot[c] / 1000u));
+            fprintf(stderr, "[label-lag] t=%llu pass why=%s start=0x%08X end=0x%08X put=0x%08X%s\n",
+                    (unsigned long long)ps3_critical_now_ns(), why, start_off, s_fifo_getoff, put, cats);
+        }
     }
     if (gcm_drain_debug()) {
         static int n2 = 0;

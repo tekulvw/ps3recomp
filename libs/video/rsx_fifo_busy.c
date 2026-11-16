@@ -44,6 +44,7 @@ static struct {
     int depth, ignored;          /* ignored: opens past FB_DEPTH, closed silently */
     uint64_t last_ns, period_start_ns, flip_ns, idle_at_flip_ns;
     uint64_t acc_ns[FB_CATEGORIES], spans[FB_CATEGORIES];
+    uint64_t total_ns[FB_CATEGORIES];   /* since enabled; never reset */
     uint64_t updates, unbalanced, overflow;
     uint32_t samples_us[FB_SAMPLES];
     unsigned samples;
@@ -129,7 +130,7 @@ static uint64_t charge(void)
 {
     const uint64_t now = s_clock();
     const int top = s.depth ? s.stack[s.depth - 1] : RSX_FIFO_BUSY_OTHER;
-    if (s.last_ns && now > s.last_ns) s.acc_ns[top] += now - s.last_ns;
+    if (s.last_ns && now > s.last_ns) { s.acc_ns[top] += now - s.last_ns; s.total_ns[top] += now - s.last_ns; }
     s.last_ns = now;
     return now;
 }
@@ -184,6 +185,20 @@ void rsx_fifo_busy_pass_stopped(int stop)
     if (!owner()) return;
     s.stop = (stop >= RSX_FIFO_BUSY_STOP_PUT && stop <= RSX_FIFO_BUSY_STOP_OTHER) ? stop
                                                                                   : RSX_FIFO_BUSY_STOP_OTHER;
+}
+
+int rsx_fifo_busy_totals(uint64_t* out_ns, int max)
+{
+    if (!owner() || !out_ns || max <= 0) return 0;
+    charge();
+    const int n = max < RSX_FIFO_BUSY_BUILTIN_COUNT ? max : RSX_FIFO_BUSY_BUILTIN_COUNT;
+    memcpy(out_ns, s.total_ns, (size_t)n * sizeof *out_ns);
+    return n;
+}
+
+const char* rsx_fifo_busy_builtin_name(int category)
+{
+    return category >= 0 && category < RSX_FIFO_BUSY_BUILTIN_COUNT ? s_builtin_names[category] : "";
 }
 
 void rsx_fifo_busy_flip(void)
