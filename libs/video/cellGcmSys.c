@@ -1769,7 +1769,50 @@ static int gcm_report_status(void *user,uint64_t ticket,int wait){
     if(ready==1)rsx_ring_progress_metal_completed(ticket,UINT64_C(0x8000000000000001));
     return ready;
 }
-static const rsx_deferred_report_ops s_report_ops={NULL,gcm_report_issue,gcm_report_status,gcm_report_publish};
+/* A pass can stop inside a primitive -- put lands between BEGIN and END, the
+ * rest still to be written -- and the engine then takes no ticket: the draw
+ * is not recorded yet. That is "not now", not a failure: the issue waits for
+ * the primitive to end (rsx_deferred_report_ops.issue_ready). Treating it as
+ * a failure froze publication for the rest of the run. */
+static int gcm_report_issue_ready(void *user){
+    (void)user;
+    if(s_report_live_lifetime)return 1;
+    return !rsx_draw_engine_in_primitive();
+}
+static const rsx_deferred_report_ops s_report_ops={NULL,gcm_report_issue,gcm_report_status,gcm_report_publish,gcm_report_issue_ready};
+/* A failed queue no longer stays frozen: once the stream is outside a
+ * primitive, a full checked wait on the backend genuinely completes all
+ * recorded work, and the records not yet applied are published in order
+ * (rsx_reports_recover). 1 recovered (or nothing to do), 0 not yet (inside a
+ * primitive: tried again after the next pass), -1 impossible (the backend
+ * itself failed or the live provider owns the queue): publication stays
+ * stopped, as before, and says so. */
+static int s_reports_recovering;
+/* Failed inside a primitive: the walker keeps walking to reach the END (a
+ * record it meets meanwhile stops it, as before), and recovery runs after. */
+static int s_reports_recover_pending;
+static int gcm_reports_try_recover_core(const char* when);
+static int gcm_reports_try_recover(const char* when){
+    const int r=gcm_reports_try_recover_core(when);
+    s_reports_recover_pending=r==0;
+    return r;
+}
+static int gcm_reports_try_recover_core(const char* when){
+    if(!s_reports.failed)return 1;
+    if(s_report_live_lifetime||gcm_reports_live()||!rsx_draw_engine_async_available())return -1;
+    if(rsx_draw_engine_in_primitive())return 0;
+    s_reports_recovering=1;
+    const int flushed=rsx_draw_engine_flush_checked()==1;
+    s_reports_recovering=0;
+    if(!flushed)return -1;
+    const uint32_t pending=s_reports.count;
+    const int n=rsx_reports_recover(&s_reports,&s_report_ops);
+    if(n<0)return -1;
+    s_report_live_lifetime=0;
+    fprintf(stderr,"[deferred reports] recovered (%s): %d of %u queued records published after a full GPU wait; publication resumes (recoveries=%llu)\n",
+            when,n,pending,(unsigned long long)s_reports.recoveries);
+    return 1;
+}
 static int gcm_reports_progress(int wait,int issue){
     if(!s_deferred_reports)return 1;
     uint32_t target=ring_target();
@@ -1783,11 +1826,24 @@ static int gcm_reports_progress(int wait,int issue){
             }
         }
     }
+    /* A failure from an earlier pass that could not recover then (inside a
+     * primitive) recovers as soon as it can. */
+    int recover=s_reports.failed&&!s_reports_recovering?gcm_reports_try_recover("retry"):1;
     int was_failed=s_reports.failed;
-    int ok=rsx_reports_progress(&s_reports,&s_report_ops,wait,issue);
+    int ok=!s_reports.failed&&rsx_reports_progress(&s_reports,&s_report_ops,wait,issue);
     if(ok&&!s_reports.count)s_report_live_lifetime=0;
-    if(!ok&&!was_failed)fprintf(stderr,"[deferred reports] FAILED; publication stopped pending=%u issued=%llu published=%llu\n",s_reports.count,(unsigned long long)s_reports.issued,(unsigned long long)s_reports.published);
-    if(s_reports.failed&&s_early_fifo_sync&&gcm_checked_ref_mode())gcm_checked_ref_fail("early-release-completion",s_fifo_getoff);
+    if(!ok&&!was_failed){
+        fprintf(stderr,"[deferred reports] FAILED; publication stopped pending=%u issued=%llu published=%llu\n",s_reports.count,(unsigned long long)s_reports.issued,(unsigned long long)s_reports.published);
+        if(!s_reports_recovering){
+            recover=gcm_reports_try_recover("at failure");
+            if(recover>0)ok=rsx_reports_progress(&s_reports,&s_report_ops,wait,issue);
+            else if(recover==0)fprintf(stderr,"[deferred reports] inside a primitive: recovery waits for it to end\n");
+        }
+    }
+    /* Checked REF stops only when publication cannot recover: freezing it
+     * while a recovery is still possible stopped every later pass, so the
+     * recovery never came. */
+    if(s_reports.failed&&recover<0&&s_early_fifo_sync&&gcm_checked_ref_mode())gcm_checked_ref_fail("early-release-completion",s_fifo_getoff);
     return ok;
 }
 static int gcm_reports_can_defer(void){
@@ -1808,6 +1864,8 @@ static int gcm_reports_admit(void){
 }
 static int gcm_reports_dependency(void){
     if(!s_deferred_reports)return 1;
+    /* The recovery's own full wait: it publishes everything right after. */
+    if(s_reports_recovering)return 1;
     cellGcm_rsx_consumer_begin();int ok=gcm_reports_progress(1,1);
     cellGcm_rsx_consumer_end();return ok;
 }
@@ -3436,7 +3494,7 @@ void cellGcm_rsx_process_fifo(void)
     } else {
         cellGcm_rsx_consumer_begin();
         const int ph=gph_enabled();uint64_t p0=ph?gph_now():0,p1=0;const u32 g0=s_fifo_getoff;
-        if(gcm_reports_progress(0,0)){gcm_rsx_process_fifo_unlocked();if(ph)p1=gph_now();
+        if(gcm_reports_progress(0,0)||s_reports_recover_pending){gcm_rsx_process_fifo_unlocked();if(ph)p1=gph_now();
             gcm_reports_progress(0,!(s_lazy_issue&&s_early_release&&!s_reports.gated));}
         if(ph){const uint64_t p2=gph_now();if(p1){s_gph.pass_ns+=p1-p0;s_gph.pass_n++;s_gph.issue_ns+=p2-p1;s_gph.issue_n++;}
                if(s_fifo_getoff>=g0)s_gph.words+=(s_fifo_getoff-g0)/4u;gph_report();}

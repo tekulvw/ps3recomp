@@ -23,6 +23,7 @@ WEAK BOOL CloseHandle(HANDLE h){(void)h;abort();}
 WEAK void (*g_host_line_write_hook)(uint32_t line)=0;
 WEAK int rsx_draw_engine_async_available(void){return 0;}
 WEAK u64 rsx_draw_engine_submit_async(void){return 0;}
+WEAK int rsx_draw_engine_in_primitive(void){return 0;}
 WEAK int rsx_draw_engine_completion_status(u64 ticket,int wait){(void)ticket;(void)wait;return -1;}
 WEAK void rsx_draw_engine_set_report_barrier(int(*barrier)(void)){(void)barrier;}
 WEAK uint64_t rsx_live_draw_report_batch_lifetime(void){return 0;}

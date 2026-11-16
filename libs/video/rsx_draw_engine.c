@@ -5353,6 +5353,7 @@ int rsx_draw_engine_async_available(void){
     if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
     return result;
 }
+int rsx_draw_engine_in_primitive(void){return g.ready&&g.rsx.in_begin_end!=0;}
 u64 rsx_draw_engine_submit_async(void){
     const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
     if(owner && !owner->begin(owner->user,RSX_ORIGINAL_BOUNDARY)){return 0;}
