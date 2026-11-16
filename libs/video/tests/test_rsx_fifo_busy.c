@@ -131,6 +131,21 @@ int main(void)
     CHECK(field("draw") == 400.0);
     CHECK(field("unbalanced") == 1);
 
+    /* Totals since accounting began keep growing across periods: one more
+     * update adds its 3 ms of draw and 5 ms of idle_put, and they are what
+     * the period line just reset. */
+    {
+        uint64_t a[RSX_FIFO_BUSY_BUILTIN_COUNT], b[RSX_FIFO_BUSY_BUILTIN_COUNT];
+        CHECK(rsx_fifo_busy_totals(a, RSX_FIFO_BUSY_BUILTIN_COUNT) == RSX_FIFO_BUSY_BUILTIN_COUNT);
+        one_update(RSX_FIFO_BUSY_DRAW);
+        CHECK(rsx_fifo_busy_totals(b, RSX_FIFO_BUSY_BUILTIN_COUNT) == RSX_FIFO_BUSY_BUILTIN_COUNT);
+        CHECK(b[RSX_FIFO_BUSY_DRAW] >= a[RSX_FIFO_BUSY_DRAW] + 3000000u);
+        CHECK(b[RSX_FIFO_BUSY_IDLE_PUT] - a[RSX_FIFO_BUSY_IDLE_PUT] == 5000000u);
+        CHECK(!strcmp(rsx_fifo_busy_builtin_name(RSX_FIFO_BUSY_DRAW), "draw"));
+        uint64_t c[4];
+        CHECK(rsx_fifo_busy_totals(c, 4) == 4 && c[RSX_FIFO_BUSY_IDLE_PUT] == b[RSX_FIFO_BUSY_IDLE_PUT]);
+    }
+
     if (fails) { fprintf(stderr, "%d failure(s)\n", fails); return 1; }
     printf("rsx_fifo_busy: ok\n");
     return 0;
