@@ -671,6 +671,7 @@ static void test_ppu_only_line(void)
  * -----------------------------------------------------------------------*/
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 /* The LS watch lives in spu_channels.c, which this test does not link: disarmed stand-ins. */
 int g_spu_ls_watch_n = 0;
 void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
@@ -712,13 +713,32 @@ static int wait_flag(int want, int ms)
     return g_shard_flag == want;
 }
 
-#define SHARD_ROUNDS 200000
+/* The race: a writer stores to word 2 of a PPU-only line through the shard
+ * path as fast as it can, while this thread load-reserves word 0 and
+ * store-conditionals it. A commit must never land over a store made after its
+ * load-reserve (word 2 must still hold what the load-reserve read).
+ *
+ * The writer steps aside while the store-conditional waits for the shard. The
+ * shard is a test-and-set spin lock, and a writer that re-takes it the moment it
+ * lets go kept the store-conditional waiting, mostly in sched_yield: a round
+ * took about 30 us on an idle M-series Mac (200,000 rounds in 6-10 s) and far
+ * longer on a loaded Linux runner, where the 30 s limit ran out. It changes
+ * nothing about where the stores land: the writer still stores back to back
+ * while the load-reserve reads, which is the window the check is for. Rounds
+ * are capped by time as well, and the count is reported. */
+#define SHARD_ROUNDS 2000000
+#define SHARD_RACE_SECONDS 5
 static const uint32_t LINE_G = 0x00041000u;
 static volatile int g_race_stop;
+static int g_race_sc_waiting;
 static void* shard_race_writer(void* arg)
 {
     (void)arg;
-    for (uint32_t i = 1; !g_race_stop; ++i) shard_store32(LINE_G + 8, i);
+    for (uint32_t i = 1; !g_race_stop; ++i) {
+        while (__atomic_load_n(&g_race_sc_waiting, __ATOMIC_RELAXED) && !g_race_stop)
+            spu_coh_spin_relax();
+        shard_store32(LINE_G + 8, i);
+    }
     return NULL;
 }
 
@@ -764,13 +784,19 @@ static void test_ppu_only_shard(void)
     g_race_stop = 0;
     pthread_create(&t, NULL, shard_race_writer, NULL);
     unsigned ok = 0, lost = 0;
-    for (int r = 0; r < SHARD_ROUNDS; ++r) {
+    int r = 0;
+    struct timespec race_t0, race_t1;
+    clock_gettime(CLOCK_MONOTONIC, &race_t0);
+    const time_t race_end = time(NULL) + SHARD_RACE_SECONDS;
+    for (; r < SHARD_ROUNDS && ((r & 4095) || time(NULL) < race_end); ++r) {
         spu_lockline_lock();                       /* load-reserve */
         uint64_t e = spu_coh_line_epoch(LINE_G);
         uint32_t w1 = vm_read32(LINE_G), w2 = vm_read32(LINE_G + 8);
         spu_lockline_unlock();
         spu_lockline_lock();                       /* store-conditional */
+        __atomic_store_n(&g_race_sc_waiting, 1, __ATOMIC_RELAXED);
         spu_coh_line_shard_lock(LINE_G);
+        __atomic_store_n(&g_race_sc_waiting, 0, __ATOMIC_RELAXED);
         if (spu_coh_line_epoch(LINE_G) == e) {
             uint32_t exp = ps3_bswap32(w1), des = ps3_bswap32(w1 + 1);
             if (__atomic_compare_exchange_n((uint32_t*)vm_ptr8(LINE_G), &exp, des, 0,
@@ -785,7 +811,10 @@ static void test_ppu_only_shard(void)
     }
     g_race_stop = 1;
     pthread_join(t, NULL);
-    printf("  shard race: %u of %d store-conditionals committed\n", ok, SHARD_ROUNDS);
+    clock_gettime(CLOCK_MONOTONIC, &race_t1);
+    printf("  shard race: %u of %d store-conditionals committed in %ld ms\n", ok, r,
+           (long)((race_t1.tv_sec - race_t0.tv_sec) * 1000 + (race_t1.tv_nsec - race_t0.tv_nsec) / 1000000));
+    CHECK(r >= 10000);
     CHECK(ok > 0);
     CHECK(lost == 0);
 }
