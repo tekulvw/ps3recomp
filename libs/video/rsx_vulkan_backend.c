@@ -5836,6 +5836,9 @@ static struct {
     u32             nretire;
     /* counters for PS3RECOMP_RSX_INFLIGHT_LOG=1 */
     u64             cap_waits, views_made, view_buffers_reused, stores, deferred_destroys;
+    u64             status_known;     /* status answered without a fence query */
+    u64             status_throttled; /* pending answers from PS3RECOMP_VK_STATUS_POLL_US */
+    uint64_t        last_pending_ns;  /* the last fence query that found a ticket pending */
     int             log;
 } s_e5;
 
@@ -6320,11 +6323,13 @@ static void vk_e5_log(void)
     if (last.tv_sec && now.tv_sec - last.tv_sec < 2) return;
     last = now;
     fprintf(stderr, "[rsx inflight vulkan] tickets=%llu completed=%llu outstanding=%u cap_waits=%llu "
-            "views=%llu view_buffers_reused=%llu stores=%llu deferred_destroys=%llu pending_destroys=%u failed=%d\n",
+            "views=%llu view_buffers_reused=%llu stores=%llu deferred_destroys=%llu pending_destroys=%u failed=%d "
+            "status_known=%llu status_throttled=%llu\n",
             (unsigned long long)s_e5.issued, (unsigned long long)s_e5.completed, s_e5.count,
             (unsigned long long)s_e5.cap_waits, (unsigned long long)s_e5.views_made,
             (unsigned long long)s_e5.view_buffers_reused, (unsigned long long)s_e5.stores,
-            (unsigned long long)s_e5.deferred_destroys, s_e5.nretire, vk_e5_failed());
+            (unsigned long long)s_e5.deferred_destroys, s_e5.nretire, vk_e5_failed(),
+            (unsigned long long)s_e5.status_known, (unsigned long long)s_e5.status_throttled);
 }
 
 static u64 vk_eng_submit_async(void* user, u32 reason)
@@ -6342,12 +6347,41 @@ static u64 vk_eng_submit_async(void* user, u32 reason)
     return vk_e5_failed() ? 0 : ticket;
 }
 
+/* PS3RECOMP_VK_STATUS_POLL_US=<n> (default 0, off): a non-blocking query
+ * for a ticket, made less than n microseconds after a fence query found one
+ * pending, answers "pending" without querying again. */
+static int s_vk_status_poll_us = -1;
+static int s_vk_status_known = -1;
 static int vk_eng_completion_status(void* user, u64 ticket, int wait)
 {
     (void)user;
     if (!ticket || ticket > s_e5.issued || vk_e5_failed()) return -1;
+    /* Already seen complete: no fence query. A query is a kernel call on
+     * Windows (vkGetFenceStatus), and the report queue asks about its records
+     * in turn, most of them sharing a ticket that completed long ago. The
+     * slots that query would have retired are retired by the next one that
+     * does look, or by the next acquire. */
+    if (s_vk_status_known < 0) {   /* PS3RECOMP_VK_STATUS_KNOWN=0 queries every time, as before */
+        const char* e = getenv("PS3RECOMP_VK_STATUS_KNOWN");
+        s_vk_status_known = !(e && !strcmp(e, "0"));
+    }
+    if (s_vk_status_known && ticket <= s_e5.completed) { s_e5.status_known++; return 1; }
+    if (!wait) {
+        if (s_vk_status_poll_us < 0) {
+            const char* e = getenv("PS3RECOMP_VK_STATUS_POLL_US");
+            s_vk_status_poll_us = e ? atoi(e) : 0;
+            if (s_vk_status_poll_us < 0 || s_vk_status_poll_us > 100000) s_vk_status_poll_us = 0;
+        }
+        if (s_vk_status_poll_us && s_e5.last_pending_ns &&
+            vkpt_now() - s_e5.last_pending_ns < (uint64_t)s_vk_status_poll_us * 1000u) {
+            s_e5.status_throttled++;
+            return 0;
+        }
+    }
     if (vk_e5_reap(ticket, wait)) return -1;
-    return ticket <= s_e5.completed ? 1 : 0;
+    if (ticket <= s_e5.completed) return 1;
+    if (!wait && s_vk_status_poll_us > 0) s_e5.last_pending_ns = vkpt_now();
+    return 0;
 }
 
 static int vk_eng_submit_and_wait_checked(void* user, u32 reason)

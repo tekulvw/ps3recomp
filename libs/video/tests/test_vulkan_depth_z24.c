@@ -204,6 +204,9 @@ int main(int argc, char** argv)
               "a waited ticket and every earlier one complete");
         CHECK(vk_eng_completion_status(NULL, t2 + 1, 0) == -1 && vk_eng_completion_status(NULL, 0, 0) == -1,
               "unissued tickets are not certificates");
+        const u64 known = s_e5.status_known;
+        CHECK(vk_eng_completion_status(NULL, t1, 0) == 1 && vk_eng_completion_status(NULL, t2, 0) == 1 &&
+              s_e5.status_known == known + 2, "a ticket already seen complete is answered without a fence query");
         const u64 waits = s_e5.cap_waits;
         u64 last = 0;
         for (u32 i = 0; i < 3 * VK_E5_SLOTS; i++) last = vk_eng_submit_async(NULL, RSX_BE_FLUSH_GUEST_REFERENCE);
