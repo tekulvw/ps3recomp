@@ -415,6 +415,9 @@ void rsx_draw_engine_host_vertex_counts(unsigned long long* draws, unsigned long
 /* Same-target colour reads the backend could not copy (no color_snapshot). */
 u64 rsx_draw_engine_feedback_unserved_count(void);
 u64 rsx_draw_engine_submit_async(void);
+/* 1 while the command stream is inside a primitive (between BEGIN and END),
+ * where rsx_draw_engine_submit_async refuses: the draw is not recorded yet. */
+int rsx_draw_engine_in_primitive(void);
 int rsx_draw_engine_completion_status(u64 ticket,int wait);
 void rsx_draw_engine_set_report_barrier(int (*barrier)(void));
 
