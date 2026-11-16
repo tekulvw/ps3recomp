@@ -406,6 +406,10 @@ void rsx_draw_engine_fp_memo_counts(unsigned long long* hits, unsigned long long
 /* Draws whose pipeline-key inputs equaled the previous draw's (no key hash or
  * table probe), and draws that computed the key. */
 void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned long long* misses);
+/* PS3RECOMP_RSX_PIPELINE_REUSE: draws that kept the previous draw's pipeline,
+ * draws that gathered it, and (in verify mode 2) disagreements. */
+void rsx_draw_engine_pipeline_reuse_counts(unsigned long long* hits, unsigned long long* misses,
+                                           unsigned long long* mismatches);
 /* Repeat texture binds in one frame after a guest-memory write that missed
  * the texture (no re-check), and those a write may have touched (checked). */
 void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked);

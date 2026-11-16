@@ -2590,14 +2590,76 @@ static struct {
     unsigned long long hits, misses;
 } s_pkm;
 
-static void eng_pkm_reset(void) { s_pkm.valid = 0; }
+/* PS3RECOMP_RSX_PIPELINE_REUSE (default off; read at the first draw):
+ *   1  a draw whose pipeline inputs cannot have changed since the previous
+ *      draw takes that draw's pipeline without gathering them again;
+ *   2  verify: gather them anyway, compare, use the gathered answer, and
+ *      report any disagreement (a correctness check for test runs).
+ * "Cannot have changed": no register the key is made of was written (a
+ * generation that every register write bumps except the few, listed in
+ * eng_preuse_safe_method, that the key never reads), the same fragment
+ * program bytes at the same address (compared, since the guest may rewrite
+ * them in memory), and the same caller arguments (layout, render state,
+ * target format and count, host formats). Everything gathered is then what
+ * the previous draw gathered, so the answer is too; g.fp_constants, written
+ * only from the fragment program's bytes, is unchanged as well. */
+static int s_preuse_mode = -1;
+static u64 s_preuse_gen = 1;
+static struct {
+    int valid, fixed_now;
+    u64 gen;
+    const u8* fp; u32 fp_size, fp_cap; u8* fp_copy;
+    u32 layout_mask, layout_stride, layout_count, rt_fmt, rt_count, host_on;
+    u8 host_formats[RSX_DSP_NUM_VERTEX_ATTR];
+    rsx_be_render_state rs;
+    u32 handle, tex_used; int fixed; u64 fp_hash;
+    unsigned long long hits, misses, mismatches;
+} s_preuse;
+static void eng_pkm_reset(void) { s_pkm.valid = 0; s_preuse.valid = 0; s_preuse_gen++; }
+/* Methods the pipeline key never reads, so writing them keeps the previous
+ * draw's pipeline: the vertex constant upload (its load slot and 32-word
+ * window; constants are bound, not compiled in), the vertex array offsets
+ * (formats are 0x1740.., read), each texture unit's image offset (its
+ * format, size and sampling words are read), the draw commands themselves,
+ * and the semaphore/label/report methods. Anything else bumps the
+ * generation. */
+static int eng_preuse_safe_method(u32 m)
+{
+    if (m >= 0x1EFCu && m <= 0x1F7Cu) return 1;
+    if (m >= 0x1680u && m < 0x16C0u) return 1;
+    if (m >= 0x1A00u && m < 0x1C00u && !((m - 0x1A00u) & 31u)) return 1;
+    switch (m) {
+    case 0x0100u: case 0x1800u: case 0x1808u: case 0x180Cu: case 0x1810u:
+    case 0x1814u: case 0x1818u: case 0x1824u: case 0x1D6Cu: case 0x1D70u: case 0x1D74u:
+        return 1;
+    }
+    return 0;
+}
+static int eng_preuse_on(void)
+{
+    if (s_preuse_mode < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_PIPELINE_REUSE");
+        s_preuse_mode = e && (!strcmp(e, "1") || !strcmp(e, "2")) ? e[0] - '0' : 0;
+        if (s_preuse_mode)
+            fprintf(stderr, "[rsx engine] PS3RECOMP_RSX_PIPELINE_REUSE=%d: unchanged pipeline inputs keep the previous draw's pipeline%s\n",
+                    s_preuse_mode, s_preuse_mode == 2 ? " (verified against a full gather)" : "");
+    }
+    return s_preuse_mode;
+}
+void rsx_draw_engine_pipeline_reuse_counts(unsigned long long* hits, unsigned long long* misses,
+                                           unsigned long long* mismatches)
+{
+    if (hits) *hits = s_preuse.hits;
+    if (misses) *misses = s_preuse.misses;
+    if (mismatches) *mismatches = s_preuse.mismatches;
+}
 void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned long long* misses)
 {
     if (hits) *hits = s_pkm.hits;
     if (misses) *misses = s_pkm.misses;
 }
 
-static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
                             u32* out_tex_used, u64* out_fp_hash,
@@ -4450,6 +4512,66 @@ void rsx_draw_engine_vs_constant_row_counts(unsigned long long* row_binds, unsig
     if (row_bytes) *row_bytes = s_vs_row_bytes;
 }
 
+static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+                            const rsx_be_render_state* rs,
+                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
+                            u32* out_tex_used, u64* out_fp_hash,
+                            const u8* host_formats)
+{
+    const int mode = eng_preuse_on();
+    if (!mode) return eng_pipeline_get_full(layout, rs, rt_fmt, rt_count, out_fixed, out_tex_used,
+                                            out_fp_hash, host_formats);
+    const u8* vp = NULL; const u8* fp = NULL; u32 vp_instrs = 0, fp_size = 0;
+    const int fixed_now = !eng_guest_programs(&vp, &vp_instrs, &fp, &fp_size);
+    if (fixed_now) { fp = NULL; fp_size = 0; }
+    const u32 host_on = host_formats != NULL;
+    const int same = s_preuse.valid && s_preuse.gen == s_preuse_gen && s_preuse.fixed_now == fixed_now &&
+        s_preuse.fp == fp && s_preuse.fp_size == fp_size && (!fp_size || !memcmp(s_preuse.fp_copy, fp, fp_size)) &&
+        s_preuse.layout_mask == layout->mask && s_preuse.layout_stride == layout->stride &&
+        s_preuse.rt_fmt == (u32)rt_fmt && s_preuse.rt_count == rt_count && s_preuse.host_on == host_on &&
+        (!host_on || (s_preuse.layout_count == layout->count && !memcmp(s_preuse.host_formats, host_formats, layout->count))) &&
+        !memcmp(&s_preuse.rs, rs, sizeof *rs);
+    if (same && mode == 1) {
+        draw_observer_programs(vp, vp_instrs, fp, fp_size);
+        s_preuse.hits++;
+        *out_fixed = s_preuse.fixed; *out_tex_used = s_preuse.tex_used; *out_fp_hash = s_preuse.fp_hash;
+        return s_preuse.handle;
+    }
+    const u32 handle = eng_pipeline_get_full(layout, rs, rt_fmt, rt_count, out_fixed, out_tex_used,
+                                             out_fp_hash, host_formats);
+    if (same) {
+        s_preuse.hits++;
+        if (handle != s_preuse.handle || *out_fixed != s_preuse.fixed ||
+            *out_tex_used != s_preuse.tex_used || *out_fp_hash != s_preuse.fp_hash) {
+            if (s_preuse.mismatches++ < 16)
+                fprintf(stderr, "[rsx engine] pipeline reuse MISMATCH: reused %u (tex %08X) but gathered %u (tex %08X)\n",
+                        s_preuse.handle, s_preuse.tex_used, handle, *out_tex_used);
+        }
+    } else s_preuse.misses++;
+    if (!((s_preuse.hits + s_preuse.misses) % 50000u))
+        fprintf(stderr, "[rsx engine] pipeline reuse: %llu kept, %llu gathered, %llu mismatches\n",
+                s_preuse.hits, s_preuse.misses, s_preuse.mismatches);
+    s_preuse.valid = 0;
+    if (!handle) return handle;
+    if (fp_size > s_preuse.fp_cap) {
+        u8* n = (u8*)realloc(s_preuse.fp_copy, fp_size);
+        if (!n) return handle;
+        s_preuse.fp_copy = n; s_preuse.fp_cap = fp_size;
+    }
+    if (fp_size) memcpy(s_preuse.fp_copy, fp, fp_size);
+    s_preuse.fp = fp; s_preuse.fp_size = fp_size; s_preuse.fixed_now = fixed_now;
+    s_preuse.gen = s_preuse_gen;
+    s_preuse.layout_mask = layout->mask; s_preuse.layout_stride = layout->stride;
+    s_preuse.layout_count = layout->count;
+    s_preuse.rt_fmt = (u32)rt_fmt; s_preuse.rt_count = rt_count; s_preuse.host_on = host_on;
+    if (host_on) memcpy(s_preuse.host_formats, host_formats, layout->count);
+    s_preuse.rs = *rs;
+    s_preuse.handle = handle; s_preuse.tex_used = *out_tex_used;
+    s_preuse.fixed = *out_fixed; s_preuse.fp_hash = *out_fp_hash;
+    s_preuse.valid = 1;
+    return handle;
+}
+
 static void sink_end_core(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -4971,6 +5093,7 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
      * first draw copies all of it into vp_cb. */
     g.vp_cb_serial = 1; g.vs_bound_serial = 0;
     eng_pkm_reset();
+    s_preuse_mode = -1;   /* PS3RECOMP_RSX_PIPELINE_REUSE is read again at the first draw */
     { const char* e = getenv("PS3RECOMP_RSX_HOST_VERTEX_FORMATS");
       s_host_vf = e && !strcmp(e, "1") && g.be->pipeline_create_host && g.be->draw_host;
       if (e && !strcmp(e, "1") && !s_host_vf)
@@ -5080,6 +5203,7 @@ static void eng_method_core(u32 method, u32 arg)
         else if (m==0x1820) s_external.indices|=2;
         else if (m==0x1FC0) s_external.frequency=1;
     }
+    if (!eng_preuse_safe_method(m)) s_preuse_gen++;
     rsx_dispatch_method(&g.rsx, m, arg);
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
 }
@@ -5696,6 +5820,7 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
             }
         }
         eng_native_color_attest_publish(p);
+        s_preuse_gen++;   /* registers written directly: the pipeline inputs may differ */
         for(u32 i=0;i<p->register_count;++i) {
             const rsx_native_register_write* r=&p->registers[i];
             g.rsx.regs[r->method>>2]=r->value;
