@@ -60,6 +60,7 @@
 
 #include "rsx_vulkan_backend.h"
 #include "rsx_fifo_busy.h"
+#include "rsx_ppm.h"
 #include "rsx_present_guard.h"
 #include "rsx_frontend_vulkan.h"
 #include "rsx_frontend_internal.h"
@@ -2873,9 +2874,8 @@ static void vk_dump_ppm(const unsigned char* rgba)
 {
     FILE* f = fopen(s_vk.dump_path, "wb");
     if (!f) { VK_LOG("cannot open %s for the frame dump\n", s_vk.dump_path); return; }
-    fprintf(f, "P6\n%u %u\n255\n", s_vk.width, s_vk.height);
-    for (size_t i = 0; i < (size_t)s_vk.width * s_vk.height; i++)
-        fwrite(rgba + i * 4, 1, 3, f);
+    if (rsx_ppm_write_rgba(f, rgba, s_vk.width, s_vk.height))
+        VK_LOG("frame dump to %s incomplete\n", s_vk.dump_path);
     fclose(f);
 }
 
