@@ -2627,7 +2627,8 @@ static void eng_pkm_reset(void) { s_pkm.valid = 0; s_preuse.valid = 0; s_preuse_
  * draw's pipeline: the vertex constant upload (its load slot and 32-word
  * window; constants are bound, not compiled in), the vertex array offsets
  * (formats are 0x1740.., read), each texture unit's image offset (its
- * format, size and sampling words are read), the draw commands themselves,
+ * format, size and sampling words are read), the index array's address and
+ * format, the draw commands themselves,
  * and the semaphore/label/report methods. Anything else bumps the
  * generation. */
 static int eng_preuse_safe_method(u32 m)
@@ -2638,6 +2639,10 @@ static int eng_preuse_safe_method(u32 m)
     switch (m) {
     case 0x0100u: case 0x1800u: case 0x1808u: case 0x180Cu: case 0x1810u:
     case 0x1814u: case 0x1818u: case 0x1824u: case 0x1D6Cu: case 0x1D70u: case 0x1D74u:
+    /* The index array's address and format (location, 16/32-bit): read by the
+     * draw's vertex fetch, never by the pipeline key. MAG writes the format
+     * between almost every two draws. */
+    case 0x181Cu: case 0x1820u:
         return 1;
     }
     return 0;

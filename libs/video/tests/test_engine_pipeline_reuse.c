@@ -59,7 +59,7 @@ static int run(int mode, draw_rec* rec)
         case 0: m(0x1EFC, rnd() % 8u); m(0x1F00 + (rnd() % 32u) * 4u, rnd()); break;
         case 1: m(M_VTXBUF_OFFSET, 0x80000000u | VTX_OFFSET); break;
         case 2: m(M_TEX_UNIT + 0x00, TEX_OFFSET + (rnd() % 4u) * 0x40u); break;
-        case 3: m(0x1D6C, 0x10u); m(0x1D74, rnd()); break;
+        case 3: m(0x1D6C, 0x10u); m(0x1D74, rnd()); m(0x181C, rnd() & ~3u); m(0x1820, (rnd() & 1u) | ((rnd() & 1u) << 4)); break;
         /* Inputs the key is made of. */
         case 4: upload_vp(RSX_TEST_VP_SWZ(rnd() & 3u, rnd() & 3u, rnd() & 3u, 3)); break;
         case 5: write_fp((int)(rnd() & 1u), 0x3F800000u + (rnd() % 7u)); break;   /* in memory, no method */
