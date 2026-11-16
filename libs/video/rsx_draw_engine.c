@@ -2621,6 +2621,7 @@ static struct {
     unsigned long long why[8];
     u32 last_bump;
     u32 bumps[2048];
+    u32 since[64];      /* methods (by register index) that bumped since the last gather */
 } s_preuse;
 static void eng_pkm_reset(void) { s_pkm.valid = 0; s_preuse.valid = 0; s_preuse_gen++; }
 /* Methods the pipeline key never reads, so writing them keeps the previous
@@ -2643,6 +2644,9 @@ static int eng_preuse_safe_method(u32 m)
      * draw's vertex fetch, never by the pipeline key. MAG writes the format
      * between almost every two draws. */
     case 0x181Cu: case 0x1820u:
+    /* Actions on no state the key reads: the vertex cache invalidates (MAG
+     * issues one before nearly every draw) and clearing a report value. */
+    case 0x1710u: case 0x1714u: case 0x17C8u:
         return 1;
     }
     return 0;
@@ -4564,7 +4568,14 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         /* The first condition that failed. */
         int why = 0;
         if (!s_preuse.valid) why = 0;
-        else if (s_preuse.gen != s_preuse_gen) { why = 1; s_preuse.bumps[(s_preuse.last_bump >> 2) & 2047u]++; }
+        else if (s_preuse.gen != s_preuse_gen) {
+            why = 1;
+            /* Every method written since the previous draw, each once. */
+            for (u32 w = 0; w < 64u; w++)
+                if (s_preuse.since[w])
+                    for (u32 b = 0; b < 32u; b++)
+                        if ((s_preuse.since[w] >> b) & 1u) s_preuse.bumps[w * 32u + b]++;
+        }
         else if (s_preuse.fixed_now != fixed_now || s_preuse.fp != fp || s_preuse.fp_size != fp_size) why = 2;
         else if (fp_size && memcmp(s_preuse.fp_copy, fp, fp_size)) why = 3;
         else if (s_preuse.layout_mask != layout->mask || s_preuse.layout_stride != layout->stride) why = 4;
@@ -4579,8 +4590,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 s_preuse.hits, s_preuse.misses, s_preuse.mismatches, s_preuse.why[0], s_preuse.why[1], s_preuse.why[2],
                 s_preuse.why[3], s_preuse.why[4], s_preuse.why[5], s_preuse.why[6]);
         /* The methods that most often stood between two draws. */
-        fprintf(stderr, "[rsx engine] pipeline reuse: register writes between draws, by method:");
-        for (int k = 0; k < 10; k++) {
+        fprintf(stderr, "[rsx engine] pipeline reuse: methods written between two draws (draws they stood between):");
+        for (int k = 0; k < 16; k++) {
             u32 best = 0, at = 0;
             for (u32 i = 0; i < 2048u; i++) if (s_preuse.bumps[i] > best) { best = s_preuse.bumps[i]; at = i; }
             if (!best) break;
@@ -4590,6 +4601,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         fprintf(stderr, "\n");
     }
     s_preuse.valid = 0;
+    memset(s_preuse.since, 0, sizeof s_preuse.since);
     if (!handle) return handle;
     if (fp_size > s_preuse.fp_cap) {
         u8* n = (u8*)realloc(s_preuse.fp_copy, fp_size);
@@ -5241,7 +5253,10 @@ static void eng_method_core(u32 method, u32 arg)
         else if (m==0x1820) s_external.indices|=2;
         else if (m==0x1FC0) s_external.frequency=1;
     }
-    if (!eng_preuse_safe_method(m)) { s_preuse_gen++; s_preuse.last_bump = m; }
+    if (!eng_preuse_safe_method(m)) {
+        s_preuse_gen++; s_preuse.last_bump = m;
+        const u32 r = (m >> 2) & 2047u; s_preuse.since[r >> 5] |= 1u << (r & 31u);
+    }
     rsx_dispatch_method(&g.rsx, m, arg);
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
 }
