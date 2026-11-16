@@ -14,6 +14,7 @@
 #define DRAWS 3000u
 #define FP_AT (TEX_OFFSET + 0x2000u)
 static u32 g_seed;
+static u32 g_last[3];   /* what the stream last wrote to 0x1D60, unit 0 format, unit 0 size */
 static u32 rnd(void) { g_seed = g_seed * 1664525u + 1013904223u; return g_seed >> 8; }
 
 static void upload_vp(u32 swz)
@@ -52,9 +53,10 @@ static int run(int mode, draw_rec* rec)
     m(0x8E4, FP_AT | 2);
     m(0x1D60, 64);
     bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    g_last[0] = 64; g_last[1] = 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16); g_last[2] = (4u << 16) | 4u;
     u32 draws = 0;
     while (draws < DRAWS) {
-        switch (rnd() % 16u) {
+        switch (rnd() % 17u) {
         /* Methods the key never reads: kept pipelines must survive them. */
         case 0: m(0x1EFC, rnd() % 8u); m(0x1F00 + (rnd() % 32u) * 4u, rnd()); break;
         case 1: m(M_VTXBUF_OFFSET, 0x80000000u | VTX_OFFSET); break;
@@ -64,10 +66,13 @@ static int run(int mode, draw_rec* rec)
         case 4: upload_vp(RSX_TEST_VP_SWZ(rnd() & 3u, rnd() & 3u, rnd() & 3u, 3)); break;
         case 5: write_fp((int)(rnd() & 1u), 0x3F800000u + (rnd() % 7u)); break;   /* in memory, no method */
         case 6: { u8* fp = vm_base + FP_AT; if (!fp[1]) rsx_test_fp_put_word(fp + 16, rnd()); } break; /* constant patch */
-        case 7: m(0x1D60, (rnd() & 1u) ? 64u : 64u | 0x40u); break;
-        case 8: m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16) | ((rnd() & 1u) << 2)); break;
-        case 9: m(M_TEX_UNIT + 0x18, (rnd() & 1u) ? ((4u << 16) | 4u) : ((8u << 16) | 4u)); break;
+        case 7: m(0x1D60, g_last[0] = (rnd() & 1u) ? 64u : 64u | 0x40u); break;
+        case 8: m(M_TEX_UNIT + 0x04, g_last[1] = 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16) | ((rnd() & 1u) << 2)); break;
+        case 9: m(M_TEX_UNIT + 0x18, g_last[2] = (rnd() & 1u) ? ((4u << 16) | 4u) : ((8u << 16) | 4u)); break;
         case 10: m(M_DEPTH_TEST, rnd() & 1u); break;
+        /* The same value again, as MAG rewrites whole units between draws:
+         * nothing changes, so the pipeline may be kept. */
+        case 11: m(0x1D60, g_last[0]); m(M_TEX_UNIT + 0x04, g_last[1]); m(M_TEX_UNIT + 0x18, g_last[2]); break;
         default: {
             draw_triangle();
             rec[draws].pipeline = stub.bound_pipeline;

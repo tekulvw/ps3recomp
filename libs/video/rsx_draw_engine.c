@@ -5253,7 +5253,15 @@ static void eng_method_core(u32 method, u32 arg)
         else if (m==0x1820) s_external.indices|=2;
         else if (m==0x1FC0) s_external.frequency=1;
     }
-    if (!eng_preuse_safe_method(m)) {
+    /* A write that leaves a register as it was changes nothing the key reads:
+     * a register written before (never-written ones read as defaults), not an
+     * execution method, not the transform program upload window (which
+     * writes program memory, not the register). MAG rewrites whole texture
+     * units and vertex formats with the same values between most draws. */
+    const u32 ridx = (m & 0xFFFFCu) >> 2;
+    const int unchanged = ridx < RSX_DSP_NUM_REGS && g.rsx.seen[ridx] && g.rsx.regs[ridx] == arg &&
+                          g.rsx.klass[ridx] != RSX_DSP_CLASS_EXEC && !(m >= 0x0B80u && m < 0x0C00u);
+    if (!unchanged && !eng_preuse_safe_method(m)) {
         s_preuse_gen++; s_preuse.last_bump = m;
         const u32 r = (m >> 2) & 2047u; s_preuse.since[r >> 5] |= 1u << (r & 31u);
     }
