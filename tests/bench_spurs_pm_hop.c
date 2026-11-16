@@ -72,8 +72,17 @@ static void spu_kick(spu_context* c, uint32_t wid)
         if (ch_r(c, MFC_RdAtomicStat) == 0) return;
     }
 }
+/* Each SPURS worker labels its PS3_FTRACE spans with its own SPU number (the
+ * policy-module context's spu_id is 0 on every SPU); the kernel's spuNum at
+ * LS 0x1C8 is that SPU. Counted, and checked at the end. */
+extern int spu_ft_spu(void);
+static volatile uint32_t g_label_bad, g_label_lanes;
 static void pm_run(spu_context* c, uint32_t next)
 {
+    {   const uint32_t sn = ((uint32_t)c->ls[0x1C8] << 24) | ((uint32_t)c->ls[0x1C9] << 16) |
+                            ((uint32_t)c->ls[0x1CA] << 8) | c->ls[0x1CB];
+        if (spu_ft_spu() != (int)sn) __atomic_add_fetch(&g_label_bad, 1, __ATOMIC_RELAXED);
+        __atomic_or_fetch(&g_label_lanes, 1u << (sn & 31), __ATOMIC_RELAXED); }
     const uint64_t t = now_ns();
     const uint32_t h = __atomic_load_n(&g_hops, __ATOMIC_ACQUIRE);
     if (h < (1u << 16)) g_start_ns[h] = t;
@@ -158,12 +167,13 @@ int main(int argc, char** argv)
         if (now_ns() - t0 > 60ull * 1000000000ull) { fprintf(stderr, "FAIL: stalled at hop %u\n", h); return 1; }
     }
     const uint64_t t1 = now_ns();
+    if (g_label_bad) { fprintf(stderr, "FAIL: %u PM runs on a thread not labelled with its SPU\n", g_label_bad); return 1; }
     uint64_t lat[1 << 16]; uint32_t n = 0;
     for (uint32_t h = 1; h < hops; h++) lat[n++] = g_start_ns[h] - g_kick_ns[h];
     qsort(lat, n, sizeof lat[0], cmp64);
-    printf("pm_hop kick=%s idle_us=%u jitter_us=%u nspus=%u hops=%u request_watched=%d ppu_stores=%u line_writes=%u "
+    printf("pm_hop kick=%s idle_us=%u jitter_us=%u nspus=%u hops=%u spu_lanes=0x%x request_watched=%d ppu_stores=%u line_writes=%u "
            "per_hop_us=%.2f request_to_start_us p50=%.2f p90=%.2f p99=%.2f max=%.2f\n",
-           g_ppu_kick ? "ppu" : "spu", g_ppu_idle_us, g_ppu_jitter_us, nspus, hops,
+           g_ppu_kick ? "ppu" : "spu", g_ppu_idle_us, g_ppu_jitter_us, nspus, hops, g_label_lanes,
            spurs_inst_find(SPURS_EA) ? spurs_inst_find(SPURS_EA)->request_watched : -1, ppu_stores,
            __atomic_load_n(&g_line_fires, __ATOMIC_RELAXED), (t1 - t0) / 1000.0 / hops,
            lat[n / 2] / 1000.0, lat[n * 9 / 10] / 1000.0, lat[n * 99 / 100] / 1000.0, lat[n - 1] / 1000.0);

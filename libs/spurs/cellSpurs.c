@@ -2624,6 +2624,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
     ps3_tprof_thread('S', (uint32_t)slot->spu_num);
+    { extern void spu_ft_set_spu(int); spu_ft_set_spu((int)slot->spu_num); }   /* PS3_FTRACE span labels */
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)
