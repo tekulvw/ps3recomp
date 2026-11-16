@@ -2614,6 +2614,13 @@ static struct {
     rsx_be_render_state rs;
     u32 handle, tex_used; int fixed; u64 fp_hash;
     unsigned long long hits, misses, mismatches;
+    /* Why a draw gathered (diagnostic, in the periodic line): the condition
+     * that failed, and for a register write, the method that last bumped the
+     * generation (by register index), so a method the key never reads can be
+     * found and listed. */
+    unsigned long long why[8];
+    u32 last_bump;
+    u32 bumps[2048];
 } s_preuse;
 static void eng_pkm_reset(void) { s_pkm.valid = 0; s_preuse.valid = 0; s_preuse_gen++; }
 /* Methods the pipeline key never reads, so writing them keeps the previous
@@ -4547,10 +4554,36 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 fprintf(stderr, "[rsx engine] pipeline reuse MISMATCH: reused %u (tex %08X) but gathered %u (tex %08X)\n",
                         s_preuse.handle, s_preuse.tex_used, handle, *out_tex_used);
         }
-    } else s_preuse.misses++;
+    } else {
+        s_preuse.misses++;
+        /* The first condition that failed. */
+        int why = 0;
+        if (!s_preuse.valid) why = 0;
+        else if (s_preuse.gen != s_preuse_gen) { why = 1; s_preuse.bumps[(s_preuse.last_bump >> 2) & 2047u]++; }
+        else if (s_preuse.fixed_now != fixed_now || s_preuse.fp != fp || s_preuse.fp_size != fp_size) why = 2;
+        else if (fp_size && memcmp(s_preuse.fp_copy, fp, fp_size)) why = 3;
+        else if (s_preuse.layout_mask != layout->mask || s_preuse.layout_stride != layout->stride) why = 4;
+        else if (memcmp(&s_preuse.rs, rs, sizeof *rs)) why = 5;
+        else why = 6;   /* target format/count or host formats */
+        s_preuse.why[why]++;
+    }
     if (!((s_preuse.hits + s_preuse.misses) % 50000u))
-        fprintf(stderr, "[rsx engine] pipeline reuse: %llu kept, %llu gathered, %llu mismatches\n",
-                s_preuse.hits, s_preuse.misses, s_preuse.mismatches);
+    {
+        fprintf(stderr, "[rsx engine] pipeline reuse: %llu kept, %llu gathered, %llu mismatches; gathered because: "
+                "none-kept %llu, register %llu, program-moved %llu, program-bytes %llu, layout %llu, render-state %llu, target %llu\n",
+                s_preuse.hits, s_preuse.misses, s_preuse.mismatches, s_preuse.why[0], s_preuse.why[1], s_preuse.why[2],
+                s_preuse.why[3], s_preuse.why[4], s_preuse.why[5], s_preuse.why[6]);
+        /* The methods that most often stood between two draws. */
+        fprintf(stderr, "[rsx engine] pipeline reuse: register writes between draws, by method:");
+        for (int k = 0; k < 10; k++) {
+            u32 best = 0, at = 0;
+            for (u32 i = 0; i < 2048u; i++) if (s_preuse.bumps[i] > best) { best = s_preuse.bumps[i]; at = i; }
+            if (!best) break;
+            fprintf(stderr, " %04X=%u", at << 2, best);
+            s_preuse.bumps[at] = 0;
+        }
+        fprintf(stderr, "\n");
+    }
     s_preuse.valid = 0;
     if (!handle) return handle;
     if (fp_size > s_preuse.fp_cap) {
@@ -5203,7 +5236,7 @@ static void eng_method_core(u32 method, u32 arg)
         else if (m==0x1820) s_external.indices|=2;
         else if (m==0x1FC0) s_external.frequency=1;
     }
-    if (!eng_preuse_safe_method(m)) s_preuse_gen++;
+    if (!eng_preuse_safe_method(m)) { s_preuse_gen++; s_preuse.last_bump = m; }
     rsx_dispatch_method(&g.rsx, m, arg);
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
 }
