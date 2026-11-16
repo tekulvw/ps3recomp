@@ -97,12 +97,17 @@ static void held_reference_cases(void) {
     s_taskset_join_timeout_ms=10000;
     spu_taskset_lifecycle_leave(0x10000);
     assert(cellSpursJoinTaskset((CellSpursTaskset*)TS)==0);
-    /* Without Join, Create over a destroyed generation waits out a short tail. */
+    /* Without Join, Create over a destroyed generation waits out a short tail.
+     * The grace is widened here so a slow host's late helper thread cannot
+     * outlast it; the default grace is checked by the BUSY case below. */
+    const unsigned grace=s_taskset_reuse_grace_ms;
+    s_taskset_reuse_grace_ms=10000;
     assert(spu_taskset_lifecycle_enter(0x10000)==1);
     assert(cellSpursDestroyTaskset((CellSpursTaskset*)TS)==0);
     drop_reference_after(20);
     assert(CALL(S,TS,NULL)==0);
     assert(spu_taskset_lifecycle_active(0x10000)==0);
+    s_taskset_reuse_grace_ms=grace;
     /* A tail longer than the grace period still reports BUSY, unchanged. */
     assert(spu_taskset_lifecycle_enter(0x10000)==1);
     assert(cellSpursDestroyTaskset((CellSpursTaskset*)TS)==0);
@@ -110,12 +115,15 @@ static void held_reference_cases(void) {
     rejected(0x8041090A,S,TS,NULL);
     assert(ps3_ms_now()-t0>=s_taskset_reuse_grace_ms);
     spu_taskset_lifecycle_leave(0x10000);
-    /* A live taskset is BUSY at once: the grace period is only for retired ones. */
+    /* A live taskset is BUSY at once: the grace period is only for retired
+     * ones. A wide grace makes "did not wait for it" unmistakable. */
     assert(CALL(S,TS,NULL)==0);
     assert(spu_taskset_lifecycle_enter(0x10000)==1);
+    s_taskset_reuse_grace_ms=10000;
     t0=ps3_ms_now();
     rejected(0x8041090A,S,TS,NULL);
-    assert(ps3_ms_now()-t0<s_taskset_reuse_grace_ms);
+    assert(ps3_ms_now()-t0<5000);
+    s_taskset_reuse_grace_ms=grace;
     spu_taskset_lifecycle_leave(0x10000);
     assert(cellSpursDestroyTaskset((CellSpursTaskset*)TS)==0);
 }
