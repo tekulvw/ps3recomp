@@ -1565,6 +1565,7 @@ void ppu_gcm_pump(void)
         if (s_flip_tick_seq == s_flip_req_seq)
             s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
         FLIP_UNLOCK();
+        if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_FLIP_DONE, 0, 0, 0, t, t); }
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -1602,7 +1603,10 @@ void cellGcmTickFlip(void)
     const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
     if (waiting) s_flip_tick_seq = s_flip_req_seq;
     FLIP_UNLOCK();
-    if (waiting) GCM_PENDING_SET(2);
+    if (waiting) {
+        if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_FLIP_TICK, 0, 0, 0, t, t); }
+        GCM_PENDING_SET(2);
+    }
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -2017,10 +2021,26 @@ static int gcm_early_reference_receipt(void){
  * pointer for 40 s, so the time put passed each release can be found offline. */
 static u32 s_lag_ea=1u;
 static int s_lag_sampler;
+/* PS3RECOMP_RSX_LABEL_LAG_WINDOW=<start_s>,<seconds> (default 0,40): sample
+ * put, and print consume and pass lines, only in that window, counted from
+ * the release's first consume -- so a window in gameplay is not spent on
+ * loading. s_lag_from/s_lag_to: the window on the critical-trace clock. */
+static volatile uint64_t s_lag_from,s_lag_to;
+static int gcm_lag_in_window(void){
+    const uint64_t now=ps3_critical_now_ns();
+    return s_lag_to&&now>=s_lag_from&&now<s_lag_to;
+}
 static DWORD WINAPI gcm_lag_sampler(LPVOID unused){
     (void)unused;u32 last=0xFFFFFFFFu;unsigned lines=0;
-    const uint64_t end=ps3_critical_now_ns()+40ull*1000000000ull;
-    while(ps3_critical_now_ns()<end&&lines<400000u){
+    while(ps3_critical_now_ns()<s_lag_from){
+#ifdef _WIN32
+        Sleep(50);
+#else
+        {const struct timespec ts={0,50000000};nanosleep(&ts,NULL);}
+#endif
+    }
+    const uint64_t end=s_lag_to;
+    while(ps3_critical_now_ns()<end&&lines<2000000u){
         const u32 put=vm_read32(GCM_CONTROL_GUEST_ADDR+0);
         if(put!=last){last=put;lines++;fprintf(stderr,"[label-lag] t=%llu put=0x%08X\n",(unsigned long long)ps3_critical_now_ns(),put);}
 #ifdef _WIN32
@@ -2034,9 +2054,18 @@ static DWORD WINAPI gcm_lag_sampler(LPVOID unused){
 static void gcm_label_lag_note(u32 ea,u32 method,u32 value){
     if(s_lag_ea==1u){const char *e=getenv("PS3RECOMP_RSX_LABEL_LAG");s_lag_ea=e&&*e?(u32)strtoul(e,0,16):0u;}
     if(!s_lag_ea||ea!=s_lag_ea)return;
-    if(!s_lag_sampler){s_lag_sampler=1;HANDLE h=CreateThread(NULL,0,gcm_lag_sampler,NULL,0,NULL);if(h)CloseHandle(h);}
+    if(!s_lag_sampler){
+        double start=0,secs=40;const char*w=getenv("PS3RECOMP_RSX_LABEL_LAG_WINDOW");
+        if(w)sscanf(w,"%lf,%lf",&start,&secs);
+        if(start<0)start=0;if(secs<=0||secs>3600)secs=40;
+        const uint64_t now=ps3_critical_now_ns();
+        s_lag_from=now+(uint64_t)(start*1e9);s_lag_to=s_lag_from+(uint64_t)(secs*1e9);
+        s_lag_sampler=1;HANDLE h=CreateThread(NULL,0,gcm_lag_sampler,NULL,0,NULL);if(h)CloseHandle(h);
+        fprintf(stderr,"[label-lag] window %.1f s after the first consume, %.1f s long\n",start,secs);
+    }
+    if(!gcm_lag_in_window())return;
     static unsigned n;
-    if(n++<20000u)fprintf(stderr,"[label-lag] t=%llu consume ea=0x%08X method=0x%04X value=0x%08X get=0x%08X\n",
+    if(n++<200000u)fprintf(stderr,"[label-lag] t=%llu consume ea=0x%08X method=0x%04X value=0x%08X get=0x%08X\n",
         (unsigned long long)ps3_critical_now_ns(),ea,method,value,s_fifo_getoff);
 }
 /* Label writes retain the existing value/byte-order semantics, but release
@@ -4384,11 +4413,22 @@ static void gcm_rsx_process_fifo_pass(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
-    if (s_lag_ea && s_lag_ea != 1u && s_lag_sampler) {
+    if (s_lag_ea && s_lag_ea != 1u && s_lag_sampler && gcm_lag_in_window()) {
         static unsigned ln;
-        if (ln++ < 60000u)
-            fprintf(stderr, "[label-lag] t=%llu pass why=%s start=0x%08X end=0x%08X put=0x%08X\n",
-                    (unsigned long long)ps3_critical_now_ns(), why, start_off, s_fifo_getoff, put);
+        if (ln++ < 600000u)
+        {
+            /* With PS3RECOMP_RSX_FIFO_BUSY=1 too: the walker's time in each
+             * category so far (us), so the time between a release's put and
+             * its consume can be split by what the walker was doing. */
+            uint64_t tot[RSX_FIFO_BUSY_BUILTIN_COUNT];
+            const int nt = rsx_fifo_busy_totals(tot, RSX_FIFO_BUSY_BUILTIN_COUNT);
+            char cats[512]; int cl = 0; cats[0] = 0;
+            for (int c = 0; c < nt && cl < (int)sizeof cats - 32; c++)
+                cl += snprintf(cats + cl, sizeof cats - (size_t)cl, "%s%llu", c ? "," : " busy_us=",
+                               (unsigned long long)(tot[c] / 1000u));
+            fprintf(stderr, "[label-lag] t=%llu pass why=%s start=0x%08X end=0x%08X put=0x%08X%s\n",
+                    (unsigned long long)ps3_critical_now_ns(), why, start_off, s_fifo_getoff, put, cats);
+        }
     }
     if (gcm_drain_debug()) {
         static int n2 = 0;
