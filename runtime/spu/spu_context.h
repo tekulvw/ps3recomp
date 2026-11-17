@@ -448,13 +448,16 @@ typedef struct spu_context {
 void spu_mfc_release(spu_context* ctx);
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
 
-static inline int spu_fast_path_on(void);   /* below, with the gate block */
+#if defined(_MSC_VER)
+static int spu_fast_path_resolve(void);     /* below, with the gate block */
+#else
+static int spu_fast_path_resolve(void) __attribute__((noinline, cold, unused));
+#endif
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 {
-    /* Resolve the compact-form switch before any channel op: the channel
-     * entries then test the resolved value with one load, never the lazy
-     * resolver (whose inlined body cost them a prologue). */
-    (void)spu_fast_path_on();
+    /* Resolve the compact-form switch once, before any SPU code runs on this
+     * context; every hot site then tests the resolved word with one load. */
+    (void)spu_fast_path_resolve();
     memset(ctx, 0, sizeof(*ctx));
     ctx->ls     = ctx->ls_store;   /* a raw SPU repoints this at guest memory */
     ctx->spu_id = spu_id;
@@ -592,11 +595,20 @@ SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1
  * lists every variable they read), so the diagnostics never go missing:
  * arming any of them keeps the full form. Fixed for the run; read once. */
 #include "spu_fast_path_env.h"
-/* Defined here, not in a runtime unit: the inline users below are compiled
- * into fixtures that link no runtime unit at all. Every copy writes the one
- * shared gate block. */
-static inline int spu_fast_path_resolve(void)
+/* Defined here, not in a runtime unit: the users below are compiled into
+ * fixtures that link no runtime unit at all. Every copy writes the one shared
+ * gate block. Out of line and cold: spu_context_init runs it once per
+ * context, and the hot sites test the resolved word only (below), so the
+ * environment walk and its report never enter the drain loop or the channel
+ * entries. */
+#if defined(_MSC_VER)
+#  define SPU_FAST_PATH_COLD static __declspec(noinline)
+#else
+#  define SPU_FAST_PATH_COLD static __attribute__((noinline, cold, unused))
+#endif
+SPU_FAST_PATH_COLD int spu_fast_path_resolve(void)
 {
+    if (g_spu_dispatch_gates.fast_path >= 0) return g_spu_dispatch_gates.fast_path;
     const char* e = getenv("PS3RECOMP_MFC_FAST");
     int on = e && e[0] == '1' && !e[1];
     if (on)
@@ -609,10 +621,12 @@ static inline int spu_fast_path_resolve(void)
     g_spu_dispatch_gates.fast_path = on;
     return on;
 }
+/* One load and one compare. The switch is resolved by spu_context_init before
+ * any SPU code runs on a context; an unresolved -1 can only select the full
+ * form, which is always correct. */
 static inline int spu_fast_path_on(void)
 {
-    const int f = g_spu_dispatch_gates.fast_path;
-    return f >= 0 ? f : spu_fast_path_resolve();
+    return g_spu_dispatch_gates.fast_path > 0;
 }
 static inline int spu_ls_wws_probe_on(void)
 {
