@@ -107,10 +107,11 @@ int main(int argc, char** argv)
     uint32_t ring[32];
     for (unsigned i = 0; i < 32; i++) ring[i] = g_spu_recent.pc[(ring_n + i) & 31];
     printf("RESULT r40=%u r44=%u mark=%u pc=%05x status=%x stop=%x halted=%d steps=%u depth=%u "
-           "drain_ret=%05x ring_n=%u ring=%016llx regs=%016llx ls=%016llx tail_on=%d tails=%llu failed=%d\n",
+           "drain_ret=%05x region=%u/%05x/%u ring_n=%u ring=%016llx regs=%016llx ls=%016llx tail_on=%d tails=%llu failed=%d\n",
            ctx->gpr[40]._u32[0], ctx->gpr[44]._u32[0], mark, ctx->pc & SPU_LS_MASK, ctx->status,
            ctx->stop_code, halted, (unsigned)ctx->steps, (unsigned)ctx->host_depth,
-           ctx->drain_ret_pc & SPU_LS_MASK, ring_n, (unsigned long long)fnv(ring, sizeof ring),
+           ctx->drain_ret_pc & SPU_LS_MASK, (unsigned)ctx->region_dispatch_depth,
+           ctx->region_return_pc & SPU_LS_MASK, (unsigned)ctx->region_has_return, ring_n, (unsigned long long)fnv(ring, sizeof ring),
            (unsigned long long)fnv(ctx->gpr, sizeof ctx->gpr),
            (unsigned long long)fnv(ctx->ls, SPU_LS_SIZE), g_spu_direct_tail_on, g_spu_direct_tail_count, g_fail);
     return g_fail ? 1 : 0;

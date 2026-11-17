@@ -87,8 +87,13 @@ def program():
            brsl(0xC0C, 0xC40), P.ai(40, 40, 1), ceq(42, 40, 41), rel(0x040, 42, 0xC18, 0xC0C),
            P.stop(0x2015))
     at(0xC40, P.bi(0))
+    # J: a tail transfer inside a call reaches a taken halt: the halt keeps
+    # the region frame the transfer ran under (call depth, return pc).
+    at(0xD00, brsl(0xD00, 0xD40), P.stop(0x2016))
+    at(0xD40, br(0xD40, 0xD80))
+    at(0xD80, P.il(20, 0), P.heqi(20, 0), P.stop(0x2017))
     starts = sorted(set(starts) | {0x7E0, 0x800, 0x840, 0x880, 0x8C0, 0x900, 0x960, 0x980, 0x9A0,
-                                   0xA00, 0xA20, 0xA40, 0xA80, 0xAC0, 0xC00, 0xC40})
+                                   0xA00, 0xA20, 0xA40, 0xA80, 0xAC0, 0xC00, 0xC40, 0xD00, 0xD40, 0xD80})
     # 0xB40 is deliberately not a function: the interpreter runs it.
     return code, starts
 
@@ -153,7 +158,12 @@ SCENARIOS = [
     # without the flag): its transfer to K must take the drain.
     (0xA40, 'unflagged', {}, 'none'),
     (0xC00, 'none', {}, None),
+    (0xD00, 'none', {}, 'some'),
 ]
+# MAG ships SPU_REGION_FRAMED=1: every scenario again with region scope on,
+# where the note must record the region frame exactly as the drain's invoke.
+SCENARIOS += [(e, o, dict(env, SPU_REGION_FRAMED='1'), x) for e, o, env, x in list(SCENARIOS)
+              if 'SPU_REGION_FRAMED' not in env]
 
 def check_all(tmp, plain, variant, label):
     for entry, opts, env, expect in SCENARIOS:
@@ -161,7 +171,9 @@ def check_all(tmp, plain, variant, label):
         got, on, tails = run(variant, entry, opts, env)
         assert got == want, (label, hex(entry), opts, env, want, got)
         if expect == 'all':
-            assert on == 1 and tails >= 2_000_000, (label, hex(entry), on, tails)
+            assert on >= 1 and tails >= 2_000_000, (label, hex(entry), on, tails)
+        elif expect == 'some':
+            assert on >= 1 and tails > 0, (label, hex(entry), on, tails)
         elif expect == 'none':
             assert tails == 0, (label, hex(entry), opts, env, tails)
         print('PASS %s 0x%03X %s %s tails=%d' % (label, entry, opts, env or '', tails), flush=True)
@@ -247,6 +259,13 @@ def main():
             ('note does not set the drain return pc', 'header',
              '    if (ctx->host_depth) ctx->drain_ret_pc = ctx->call_ret_pc;\n', '',
              lambda exe: run(exe, 0xA00)[0], lambda out: out != run(tmp / 'plain.exe', 0xA00)[0]),
+            ('note skips the region frame', 'header',
+             '        ctx->region_dispatch_depth = ctx->host_depth;\n'
+             '        ctx->region_return_pc = ctx->host_depth ? ctx->call_ret_pc : 0;\n'
+             '        ctx->region_has_return = ctx->host_depth ? 1 : 0;\n',
+             '',
+             lambda exe: run(exe, 0xD00, 'none', {'SPU_REGION_FRAMED': '1'})[0],
+             lambda out: out != run(tmp / 'plain.exe', 0xD00, 'none', {'SPU_REGION_FRAMED': '1'})[0]),
             ('guard trusts call_ret from another depth', 'header',
              '(!(ctx)->host_depth || (ctx)->call_ret_depth == (ctx)->host_depth);', '1;',
              lambda exe: run(exe, 0xA40, 'unflagged')[0],
