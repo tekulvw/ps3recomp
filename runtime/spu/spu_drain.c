@@ -554,6 +554,32 @@ typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
 static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t return_pc);
+/* SPU_DISPATCH_KIND_STATS=1 (with spu_channels.c's lookup kinds): what the
+ * call drains do, per thread -- calls that returned natively (leaf), calls
+ * that entered the loop, transfers it ran (to the indirect-branch dispatcher
+ * or straight to a lifted function), transfers it ended because the pc was
+ * already the return pc, and lifted-entry resumes. One cumulative line per
+ * thread at most once a second. */
+static int s_drain_stats = -1;
+static SPU_THREAD_LOCAL struct { unsigned long long leaf, loop, hop_ib, hop_direct, ret_short, resume, next_ms; unsigned id; } t_ds;
+static unsigned s_ds_threads;
+static void spu_drain_stats_tick(void)
+{
+    if (((t_ds.leaf + t_ds.loop) & 4095u) != 0) return;
+    extern unsigned long long ps3_ms_now(void);
+    const unsigned long long now = ps3_ms_now();
+    if (now < t_ds.next_ms) return;
+    t_ds.next_ms = now + 1000;
+    if (!t_ds.id) t_ds.id = __atomic_add_fetch(&s_ds_threads, 1u, __ATOMIC_RELAXED);
+    fprintf(stderr, "[spu-drain-kind] t_ms=%llu thread=%u leaf=%llu loop=%llu hop_ib=%llu hop_direct=%llu "
+            "ret_short=%llu resume=%llu\n", now, t_ds.id, t_ds.leaf, t_ds.loop, t_ds.hop_ib,
+            t_ds.hop_direct, t_ds.ret_short, t_ds.resume);
+}
+static int spu_drain_stats_on(void)
+{
+    if (s_drain_stats < 0) { const char* e = getenv("SPU_DISPATCH_KIND_STATS"); s_drain_stats = e && !strcmp(e, "1"); }
+    return s_drain_stats;
+}
 /* Every lifted brsl/bisl ends in this drain, so it runs once per guest call.
  * Nearly always the callee returned through SPU_RET while its host frame was
  * live: no transfer is pending and the pc is already the return pc. The loop
@@ -569,8 +595,10 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         limit && ctx->host_depth < limit / 2) {
         ctx->region_dispatch_valid = 0;
         ctx->drain_ret_pc = 0;
+        if (__builtin_expect(s_drain_stats != 0, 0) && spu_drain_stats_on()) { t_ds.leaf++; spu_drain_stats_tick(); }
         return;
     }
+    if (__builtin_expect(s_drain_stats != 0, 0) && spu_drain_stats_on()) { t_ds.loop++; spu_drain_stats_tick(); }
     spu_drain_call_loop(ctx, return_pc);
 }
 
@@ -597,12 +625,14 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
         while (*tramp) {
             if (*tramp == spu_indirect_branch &&
                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
+                if (s_drain_stats > 0) t_ds.ret_short++;
                 *tramp = 0;
                 SPU_DRAIN_POP_IRQ();
                 return;
             }
             void (*fn)(spu_context*) = *tramp;
             *tramp = 0;
+            if (s_drain_stats > 0) { if (fn == spu_indirect_branch) t_ds.hop_ib++; else t_ds.hop_direct++; }
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             spu_drain_hop_inline(ctx, fn, recent);
             SPU_LR_POLL(ctx);
@@ -646,6 +676,7 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
                             (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
                             (int)ctx->resident_ovl); }
+                if (s_drain_stats > 0) t_ds.resume++;
                 (*tramp) = spu_indirect_branch;
                 continue;
             }
