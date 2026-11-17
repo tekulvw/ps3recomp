@@ -16,6 +16,9 @@
  *   cc -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video \
  *     -o /tmp/test_vertex_fetch_simd libs/video/tests/test_vertex_fetch_simd.c \
  *     libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+ * or with clang-cl:
+ *   clang-cl /O2 /I include /I libs/video /clang:-msse4.1 /Fe:test_vertex_fetch_simd.exe \
+ *     libs\video\tests\test_vertex_fetch_simd.c libs\video\rsx_vertex_compact.c libs\video\rsx_dispatch.c
  * tools/test_vertex_fetch_simd.py builds and runs it, and its mutants.
  */
 #include "rsx_vertex_compact.h"
@@ -26,8 +29,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <sys/mman.h>
+#  include <unistd.h>
+#endif
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; if (fails <= 20) { \
@@ -52,13 +60,24 @@ static const u8* guest_ptr(void* user, u32 location, u32 offset, u32 min_bytes)
     return guest[loc] + offset;
 }
 
+/* GUEST bytes of guest memory with an inaccessible page right after them. */
 static u8* guarded(void)
 {
+#ifdef _WIN32
+    SYSTEM_INFO info; GetSystemInfo(&info);
+    const size_t page = info.dwPageSize;
+    const size_t bytes = ((GUEST + page - 1) / page) * page;
+    u8* p = (u8*)VirtualAlloc(NULL, bytes + page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) { printf("VirtualAlloc failed\n"); exit(2); }
+    DWORD old;
+    if (!VirtualProtect(p + bytes, page, PAGE_NOACCESS, &old)) { printf("VirtualProtect failed\n"); exit(2); }
+#else
     const long page = sysconf(_SC_PAGESIZE);
     const size_t bytes = ((GUEST + page - 1) / page) * page;
     u8* p = mmap(NULL, bytes + (size_t)page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { perror("mmap"); exit(2); }
     if (mprotect(p + bytes, (size_t)page, PROT_NONE)) { perror("mprotect"); exit(2); }
+#endif
     /* GUEST is a multiple of the page size on every supported host; keep the
      * guard right after the last guest byte regardless. */
     return p + (bytes - GUEST);
