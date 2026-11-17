@@ -325,6 +325,144 @@ int rsx_vertex_fetch_one(
     return 1;
 }
 
+/* ---- PS3RECOMP_RSX_VERTEX_SIMD -------------------------------------------
+ *
+ * PS3RECOMP_RSX_VERTEX_SIMD=1 (default off, read once): the stable-range loop
+ * below decodes one vertex's attribute with one 128-bit operation instead of
+ * one scalar conversion per component. The bytes written are the same:
+ *   - a half is decoded with the same shift/mask/add arithmetic as
+ *     rsx_compact_be_f16, in four lanes, so a denormal half is still flushed
+ *     to its signed zero and a NaN keeps its payload (vcvtph2ps/vcvt_f32_f16
+ *     would do neither);
+ *   - a float is a byte swap;
+ *   - UNORM8 and SNORM16 are the same int-to-float conversion and the same
+ *     IEEE division, which the vector divide rounds identically;
+ *   - components the attribute does not have are (0, 0, 0, 1) as before.
+ * Loads read exactly the element's bytes, never past it. x86 with SSE4.1 and
+ * arm64 with NEON; elsewhere the switch is accepted and the scalar loop runs.
+ * rsx_vertex_fetch_simd_override is for the differential fixture. */
+#if (defined(__SSE4_1__) || defined(__AVX__)) && (defined(__x86_64__) || defined(_M_X64))
+#  include <immintrin.h>
+#  define RSX_VERTEX_SIMD 1
+typedef __m128i rsx_v4;
+static inline rsx_v4 rsx_v4_load(const u8* p, u32 bytes)
+{
+    switch (bytes) {
+    case 16: return _mm_loadu_si128((const __m128i*)p);
+    case 12: { u32 w; memcpy(&w, p + 8, 4);
+               return _mm_insert_epi32(_mm_loadl_epi64((const __m128i*)p), (int)w, 2); }
+    case 8:  return _mm_loadl_epi64((const __m128i*)p);
+    case 6:  { u32 w; u16 h; memcpy(&w, p, 4); memcpy(&h, p + 4, 2);
+               return _mm_insert_epi16(_mm_cvtsi32_si128((int)w), h, 2); }
+    case 4:  { u32 w; memcpy(&w, p, 4); return _mm_cvtsi32_si128((int)w); }
+    case 3:  return _mm_cvtsi32_si128((int)((u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16));
+    case 2:  { u16 h; memcpy(&h, p, 2); return _mm_cvtsi32_si128(h); }
+    default: return _mm_cvtsi32_si128(p[0]);
+    }
+}
+/* Big-endian 32-bit words to host order. */
+static inline rsx_v4 rsx_v4_be32(rsx_v4 v)
+{
+    return _mm_shuffle_epi8(v, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
+}
+/* Four big-endian 16-bit values to four zero-extended 32-bit lanes. */
+static inline rsx_v4 rsx_v4_be16(rsx_v4 v)
+{
+    return _mm_shuffle_epi8(v, _mm_setr_epi8(1, 0, -1, -1, 3, 2, -1, -1, 5, 4, -1, -1, 7, 6, -1, -1));
+}
+static inline rsx_v4 rsx_v4_sext16(rsx_v4 v) { return _mm_srai_epi32(_mm_slli_epi32(v, 16), 16); }
+static inline rsx_v4 rsx_v4_u8(rsx_v4 v) { return _mm_cvtepu8_epi32(v); }
+static inline rsx_v4 rsx_v4_f32(rsx_v4 v) { return _mm_castps_si128(_mm_cvtepi32_ps(v)); }
+static inline rsx_v4 rsx_v4_div(rsx_v4 v, float d)
+{
+    return _mm_castps_si128(_mm_div_ps(_mm_castsi128_ps(v), _mm_set1_ps(d)));
+}
+static inline rsx_v4 rsx_v4_or(rsx_v4 a, rsx_v4 b) { return _mm_or_si128(a, b); }
+static inline rsx_v4 rsx_v4_fill(u32 w) { return _mm_set_epi32((int)w, 0, 0, 0); }
+static inline void rsx_v4_store(float* v, rsx_v4 x) { _mm_storeu_si128((__m128i*)v, x); }
+/* Four halves in 32-bit lanes, decoded as rsx_compact_be_f16 does. */
+static inline rsx_v4 rsx_v4_half(rsx_v4 h)
+{
+    const __m128i sign  = _mm_slli_epi32(_mm_and_si128(h, _mm_set1_epi32(0x8000)), 16);
+    const __m128i exp   = _mm_and_si128(_mm_srli_epi32(h, 10), _mm_set1_epi32(0x1F));
+    const __m128i man13 = _mm_slli_epi32(_mm_and_si128(h, _mm_set1_epi32(0x3FF)), 13);
+    const __m128i norm  = _mm_or_si128(sign, _mm_or_si128(
+        _mm_slli_epi32(_mm_add_epi32(exp, _mm_set1_epi32(112)), 23), man13));
+    const __m128i inf   = _mm_or_si128(sign, _mm_or_si128(_mm_set1_epi32(0x7F800000), man13));
+    const __m128i is0   = _mm_cmpeq_epi32(exp, _mm_setzero_si128());
+    const __m128i is31  = _mm_cmpeq_epi32(exp, _mm_set1_epi32(31));
+    const __m128i r     = _mm_blendv_epi8(norm, inf, is31);
+    return _mm_blendv_epi8(r, sign, is0);   /* exponent 0: the signed zero */
+}
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#  include <arm_neon.h>
+#  define RSX_VERTEX_SIMD 1
+typedef uint32x4_t rsx_v4;
+static inline rsx_v4 rsx_v4_load(const u8* p, u32 bytes)
+{
+    u8 tmp[16] = {0};
+    switch (bytes) {
+    case 16: return vreinterpretq_u32_u8(vld1q_u8(p));
+    case 12: memcpy(tmp, p, 12); break;
+    case 8:  memcpy(tmp, p, 8); break;
+    case 6:  memcpy(tmp, p, 6); break;
+    case 4:  memcpy(tmp, p, 4); break;
+    case 3:  memcpy(tmp, p, 3); break;
+    case 2:  memcpy(tmp, p, 2); break;
+    default: tmp[0] = p[0]; break;
+    }
+    return vreinterpretq_u32_u8(vld1q_u8(tmp));
+}
+static inline rsx_v4 rsx_v4_be32(rsx_v4 v) { return vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(v))); }
+static inline rsx_v4 rsx_v4_be16(rsx_v4 v)
+{
+    static const u8 index[16] = {1, 0, 255, 255, 3, 2, 255, 255, 5, 4, 255, 255, 7, 6, 255, 255};
+    return vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(v), vld1q_u8(index)));
+}
+static inline rsx_v4 rsx_v4_sext16(rsx_v4 v)
+{
+    return vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(vshlq_n_u32(v, 16)), 16));
+}
+static inline rsx_v4 rsx_v4_u8(rsx_v4 v)
+{
+    return vmovl_u16(vget_low_u16(vmovl_u8(vget_low_u8(vreinterpretq_u8_u32(v)))));
+}
+static inline rsx_v4 rsx_v4_f32(rsx_v4 v) { return vreinterpretq_u32_f32(vcvtq_f32_s32(vreinterpretq_s32_u32(v))); }
+static inline rsx_v4 rsx_v4_div(rsx_v4 v, float d)
+{
+    return vreinterpretq_u32_f32(vdivq_f32(vreinterpretq_f32_u32(v), vdupq_n_f32(d)));
+}
+static inline rsx_v4 rsx_v4_or(rsx_v4 a, rsx_v4 b) { return vorrq_u32(a, b); }
+static inline rsx_v4 rsx_v4_fill(u32 w) { return vsetq_lane_u32(w, vdupq_n_u32(0), 3); }
+static inline void rsx_v4_store(float* v, rsx_v4 x) { vst1q_u32((u32*)v, x); }
+static inline rsx_v4 rsx_v4_half(rsx_v4 h)
+{
+    const uint32x4_t sign  = vshlq_n_u32(vandq_u32(h, vdupq_n_u32(0x8000)), 16);
+    const uint32x4_t exp   = vandq_u32(vshrq_n_u32(h, 10), vdupq_n_u32(0x1F));
+    const uint32x4_t man13 = vshlq_n_u32(vandq_u32(h, vdupq_n_u32(0x3FF)), 13);
+    const uint32x4_t norm  = vorrq_u32(sign, vorrq_u32(vshlq_n_u32(vaddq_u32(exp, vdupq_n_u32(112)), 23), man13));
+    const uint32x4_t inf   = vorrq_u32(sign, vorrq_u32(vdupq_n_u32(0x7F800000), man13));
+    const uint32x4_t is0   = vceqq_u32(exp, vdupq_n_u32(0));
+    const uint32x4_t is31  = vceqq_u32(exp, vdupq_n_u32(31));
+    const uint32x4_t r     = vbslq_u32(is31, inf, norm);
+    return vbslq_u32(is0, sign, r);   /* exponent 0: the signed zero */
+}
+#else
+#  define RSX_VERTEX_SIMD 0
+#endif
+
+static int s_vertex_simd = -1;
+static int rsx_vertex_simd_on(void)
+{
+    if (s_vertex_simd < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_VERTEX_SIMD");
+        s_vertex_simd = e && !strcmp(e, "1");
+    }
+    return s_vertex_simd;
+}
+void rsx_vertex_fetch_simd_override(int on) { s_vertex_simd = on ? 1 : 0; }
+int rsx_vertex_fetch_simd_available(void) { return RSX_VERTEX_SIMD; }
+
 /* The stable-range loop for one attribute and one vertex type: `decode`
  * reads `src` into `v` (pre-set to 0,0,0,1) for components c < n. Elements
  * outside the stable range take the one-vertex path. */
@@ -351,6 +489,8 @@ int rsx_vertex_fetch_many(
     if (!plan || (!refs && count) || (!out && plan->layout.stride && count))
         return 0;
     const u32 stride = plan->layout.stride;
+    const int simd = rsx_vertex_simd_on();
+    (void)simd;
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
         const u32 attr = plan->layout.attrs[slot];
         const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
@@ -370,6 +510,51 @@ int rsx_vertex_fetch_many(
         const int plain = fetch->desc.frequency <= 1;
         const u32 modulo = (plan->divider_mask >> attr) & 1u;
         const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
+#if RSX_VERTEX_SIMD
+        if (simd && type != RSX_VTX_TYPE_CMP32) {
+            /* Lanes past n hold zero after the load, and every decode maps a
+             * zero lane to +0.0f, so (0, 0, 0, 1) is the one OR of w. */
+            const rsx_v4 fill = n < 4 ? rsx_v4_fill(0x3F800000u) : rsx_v4_fill(0);
+            const u32 bytes = n * (type == RSX_VTX_TYPE_FLOAT ? 4u :
+                                   type == RSX_VTX_TYPE_UNORM8 || type == RSX_VTX_TYPE_UINT8 ? 1u : 2u);
+#define RSX_FETCH_LOOP_SIMD(decode)                                                 \
+            for (u32 i = 0; i < count; i++) {                                       \
+                float* v = (float*)(out + (size_t)i * stride + slot * 16u);         \
+                const u32 element = plain                                           \
+                    ? ((refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu)      \
+                    : rsx_vertex_element_index(refs[i].vertex_id, refs[i].base_index, \
+                                               fetch->desc.frequency, modulo);      \
+                if (element - first > span) {                                      \
+                    if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v)) return 0; \
+                    continue;                                                       \
+                }                                                                   \
+                const rsx_v4 raw = rsx_v4_load(base + (u64)(element - first) * fstride, bytes); \
+                rsx_v4_store(v, rsx_v4_or(decode, fill));                           \
+            }
+            switch (type) {
+            case RSX_VTX_TYPE_FLOAT:
+                RSX_FETCH_LOOP_SIMD(rsx_v4_be32(raw))
+                break;
+            case RSX_VTX_TYPE_HALF:
+                RSX_FETCH_LOOP_SIMD(rsx_v4_half(rsx_v4_be16(raw)))
+                break;
+            case RSX_VTX_TYPE_UNORM8:
+                RSX_FETCH_LOOP_SIMD(rsx_v4_div(rsx_v4_f32(rsx_v4_u8(raw)), 255.0f))
+                break;
+            case RSX_VTX_TYPE_UINT8:
+                RSX_FETCH_LOOP_SIMD(rsx_v4_f32(rsx_v4_u8(raw)))
+                break;
+            case RSX_VTX_TYPE_SNORM16:
+                RSX_FETCH_LOOP_SIMD(rsx_v4_div(rsx_v4_f32(rsx_v4_sext16(rsx_v4_be16(raw))), 32767.0f))
+                break;
+            default:   /* RSX_VTX_TYPE_SINT16 */
+                RSX_FETCH_LOOP_SIMD(rsx_v4_f32(rsx_v4_sext16(rsx_v4_be16(raw))))
+                break;
+            }
+#undef RSX_FETCH_LOOP_SIMD
+            continue;
+        }
+#endif
         switch (type) {
         case RSX_VTX_TYPE_FLOAT:
             RSX_FETCH_LOOP(v[c] = rsx_compact_be_f32(src + c * 4))
