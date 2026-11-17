@@ -1088,9 +1088,7 @@ SPU__X8_INLINE u128 spu__x8_fa(u128 a, u128 b, uint32_t negb) {
     const int redo = spu__x8_mask(_mm_or_si128(bad, _mm_or_si128(spu__x8_ext(x), spu__x8_ext(y))));
     return spu__x8_st(redo ? spu__x8_fa_w(x, y, redo) : r);
 }
-SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return spu__x8_fa(a, b, 0); }
-SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return spu__x8_fa(a, b, 0x80000000u); }
-SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) {
+SPU__X8_INLINE u128 spu__x8_fm(u128 a, u128 b) {
     const __m128i x = spu__x8_ld(a), y = spu__x8_ld(b), zx = spu__x8_z(x), zy = spu__x8_z(y);
     const __m128i zp = _mm_or_si128(zx, zy);                                   /* zero product: +0 */
     const __m256d p = _mm256_mul_pd(spu__x8_wide(_mm_andnot_si128(zx, x)), spu__x8_wide(_mm_andnot_si128(zy, y)));
@@ -1114,9 +1112,90 @@ SPU__X8_INLINE u128 spu__x8_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t 
     const int redo = spu__x8_mask(_mm_andnot_si128(zp, _mm_or_si128(bad, ext)));
     return spu__x8_st(redo ? spu__x8_fma_w(x, y, z, redo) : r);
 }
+#if defined(SPU_FLOAT_X86_RZ) && SPU_FLOAT_X86_RZ && defined(__AVX512F__) && defined(__AVX512VL__)
+/* SPU_FLOAT_X86_RZ (opt-in, compile time; needs AVX-512 F and VL, e.g. -march=x86-64-v4): the
+ * operation itself in single precision, rounded toward zero by the instruction's own embedded
+ * rounding control (EVEX {rz-sae}), so no thread floating-point state is read or changed. The
+ * x86 counterpart of SPU_FLOAT_RZ on arm64. The rules, which are the SPU's:
+ *  - an SPU zero (biased exponent 0, any fraction) is made +0 before the op, so the host never
+ *    sees a denormal operand;
+ *  - for operands in the host's normal range, one rounding toward zero of the exact sum, product
+ *    or fused a*b+c is the SPU's truncation (fma is fused on the SPU as well);
+ *  - a result below 2^-126 in magnitude (a host denormal or zero, either sign) is +0: the SPU
+ *    flushes it. Rounding toward zero never lifts an exact result below 2^-126 to 2^-126 or
+ *    above, nor drops one at or above 2^-126 below it (2^-126 is a single);
+ *  - a zero factor makes the product +0: fm gives +0, fma the addend as it is (extended range
+ *    too) or +0 for a zero addend.
+ * Left out, exactly as the AVX2 fast path above leaves them out: an extended-range operand
+ * (biased exponent 255, Inf or NaN on the host) that a zero factor does not absorb, and a result
+ * that may be at or above 2^128 -- rounding toward zero turns an exact result at or above the
+ * largest single into the largest single, so any lane whose result is the largest single is
+ * redone. Such a vector goes whole to the exact wide path (spu__x8_*_w).
+ * The 128-bit operands are zero-extended to 512 bits, since embedded rounding exists only on the
+ * 512-bit forms; the upper lanes compute 0 op 0, which raises nothing and costs no assist. */
+#define SPU__XR_RZ (_MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC)
+#define SPU__XR_EXP 0x7F800000
+SPU__X8_INLINE __m512 spu__xr_up(__m128i x) { return _mm512_zextps128_ps512(_mm_castsi128_ps(x)); }
+SPU__X8_INLINE __m128i spu__xr_dn(__m512 v) { return _mm_castps_si128(_mm512_castps512_ps128(v)); }
+/* lanes with a nonzero biased exponent (not an SPU zero), and lanes with biased exponent 255
+ * (extended range); both masks have only the four low bits set */
+SPU__X8_INLINE __mmask8 spu__xr_nz(__m128i x) { return _mm_test_epi32_mask(x, _mm_set1_epi32(SPU__XR_EXP)); }
+SPU__X8_INLINE __mmask8 spu__xr_ext(__m128i x) {
+    return _mm_cmpeq_epi32_mask(_mm_and_si128(x, _mm_set1_epi32(SPU__XR_EXP)), _mm_set1_epi32(SPU__XR_EXP));
+}
+/* r with every lane below 2^-126 in magnitude made +0; *big: the lanes that may be 2^128 or more */
+SPU__X8_INLINE __m128i spu__xr_out(__m512 v, __mmask8* big) {
+    const __m128i r = spu__xr_dn(v);
+    *big = _mm_cmpge_epu32_mask(_mm_and_si128(r, _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(0x7F7FFFFF));
+    return _mm_maskz_mov_epi32(spu__xr_nz(r), r);
+}
+SPU__X8_INLINE u128 spu__xr_fa(u128 a, u128 b, uint32_t negb) {
+    const __m128i x = spu__x8_ld(a), y = _mm_xor_si128(spu__x8_ld(b), _mm_set1_epi32((int)negb));
+    const __m128i xs = _mm_maskz_mov_epi32(spu__xr_nz(x), x), ys = _mm_maskz_mov_epi32(spu__xr_nz(y), y);
+    __mmask8 big;
+    const __m128i r = spu__xr_out(_mm512_add_round_ps(spu__xr_up(xs), spu__xr_up(ys), SPU__XR_RZ), &big);
+    const int redo = (int)(big | spu__xr_ext(x) | spu__xr_ext(y));
+    return spu__x8_st(redo ? spu__x8_fa_w(x, y, redo) : r);
+}
+SPU__X8_INLINE u128 spu__xr_fm(u128 a, u128 b) {
+    const __m128i x = spu__x8_ld(a), y = spu__x8_ld(b);
+    const __mmask8 nzp = spu__xr_nz(x) & spu__xr_nz(y);                      /* nonzero product; else +0 */
+    const __m128i xs = _mm_maskz_mov_epi32(nzp, x), ys = _mm_maskz_mov_epi32(nzp, y);
+    __mmask8 big;
+    const __m128i r = _mm_maskz_mov_epi32(nzp, spu__xr_out(_mm512_mul_round_ps(spu__xr_up(xs), spu__xr_up(ys), SPU__XR_RZ), &big));
+    const int redo = (int)((big | spu__xr_ext(x) | spu__xr_ext(y)) & nzp);
+    return spu__x8_st(redo ? spu__x8_fm_w(x, y, redo) : r);
+}
+SPU__X8_INLINE u128 spu__xr_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+    const __m128i x = _mm_xor_si128(spu__x8_ld(a), _mm_set1_epi32((int)negp)), y = spu__x8_ld(b);
+    const __m128i z = _mm_xor_si128(spu__x8_ld(c), _mm_set1_epi32((int)negc));
+    const __mmask8 nzp = spu__xr_nz(x) & spu__xr_nz(y);                      /* nonzero product */
+    const __m128i zi = _mm_maskz_mov_epi32(spu__xr_nz(z), z);                /* a zero addend as +0 */
+    const __m128i xs = _mm_maskz_mov_epi32(nzp, x), ys = _mm_maskz_mov_epi32(nzp, y);
+    __mmask8 big;
+    const __m128i s = spu__xr_out(_mm512_fmadd_round_ps(spu__xr_up(xs), spu__xr_up(ys), spu__xr_up(zi), SPU__XR_RZ), &big);
+    const __m128i r = _mm_mask_mov_epi32(zi, nzp, s);                         /* zero product: the addend */
+    const int redo = (int)((big | spu__xr_ext(x) | spu__xr_ext(y) | spu__xr_ext(z)) & nzp);
+    return spu__x8_st(redo ? spu__x8_fma_w(x, y, z, redo) : r);
+}
+SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return spu__xr_fa(a, b, 0); }
+SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return spu__xr_fa(a, b, 0x80000000u); }
+SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) { return spu__xr_fm(a, b); }
+SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__xr_fma(a, b, c, 0, 0); }            /* a*b + c */
+SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__xr_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
+SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__xr_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
+#undef SPU__XR_EXP
+#else
+#if defined(SPU_FLOAT_X86_RZ) && SPU_FLOAT_X86_RZ
+#error "SPU_FLOAT_X86_RZ needs AVX-512 F and VL (e.g. -march=x86-64-v4)"
+#endif
+SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return spu__x8_fa(a, b, 0); }
+SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return spu__x8_fa(a, b, 0x80000000u); }
+SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) { return spu__x8_fm(a, b); }
 SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0); }            /* a*b + c */
 SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
 SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__x8_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
+#endif
 #elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
 /* The AVX2 form above with SSE4.1 only (the default x86-64 build), each f64x4 step done as two
  * f64x2 halves: lanes 0-1 and lanes 2-3 widened exactly, the same operation, the same step toward

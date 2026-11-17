@@ -11,7 +11,8 @@
  *     boundary, wide exponent gaps, zeros of every kind, extended-range words, raw words.
  * On x86 the three passes run a second time through the wide path alone (spu__x8_*_w or
  * spu__x4_*_w), the exact vector form a vector falls back to, so it too meets every input.
- * Build (arm64; x86 with -msse4.1 for the SSE4.1 form, or -mavx2 -mfma for the AVX2 form):
+ * Build (arm64; x86 with -msse4.1 for the SSE4.1 form, -mavx2 -mfma for the AVX2 form, or
+ * -march=x86-64-v4 -DSPU_FLOAT_X86_RZ=1 for the AVX-512 embedded-rounding form):
  *   cc -O2 -I runtime/spu -I include runtime/spu/tests/test_spu_float_exact.c -lm -o t && ./t [scale]
  * scale (default 1) multiplies the pass-3 size: 1 = 64M vectors (256M lanes). */
 #include "spu_helpers.h"
