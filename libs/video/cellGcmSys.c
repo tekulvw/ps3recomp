@@ -3616,6 +3616,65 @@ static unsigned long long s_walk_plain_words;
  * and semaphore DMA contexts, the notify write, back-end label writes and
  * SET_REFERENCE (g_rsx_last_reference). Everything else only updates state
  * for a vtable backend. */
+/* PS3RECOMP_GCM_NOP_SKIP=1 (default off; read once): a run of zero words --
+ * NOPs, which MAG's frames are more than half made of (reserved space SPU
+ * jobs fill only partly) -- is stepped over in one go, instead of paying a
+ * header's full decode per word. A NOP does nothing but end NV0039 packet
+ * inference, so the run ends the same way. The run stops before `put`, at
+ * the end of the 1 MB IO page (the next word may be mapped elsewhere), before
+ * the header of any armed native handoff or ring watch (the per-word check
+ * there must still run), and within the pass budget. Off whenever a per-word
+ * diagnostic, the FIFO observer, RSX_TRACE or GCM_WORD_STATS is on. */
+static int s_nop_skip = -1;
+static unsigned long long s_nop_skipped, s_nop_runs;
+static int gcm_nop_skip_on(void)
+{
+    if (s_nop_skip < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_NOP_SKIP");
+        const char* ws = getenv("GCM_WORD_STATS");
+        gcm_observer_init();
+        s_nop_skip = e && !strcmp(e, "1") && !(ws && atoi(ws) > 0) && !s_fifo_observer.enabled &&
+                     !getenv("GCM_SUBCH7") && !getenv("GCM_SUBCH_GATE") && !getenv("GCM_OBJDBG") &&
+                     !getenv("RSX_LIVE_FEED_DBG") && !getenv("TCONST_FIFO") && !getenv("RSX_TRACE");
+        if (s_nop_skip) fprintf(stderr, "[gcm] NOP runs in the FIFO are stepped over in one go (PS3RECOMP_GCM_NOP_SKIP=1)\n");
+    }
+    return s_nop_skip;
+}
+/* Zero words after the one at `ea` (io `io`), at most `max`, stopping as above. */
+static u32 gcm_nop_run(u32 ea, u32 io, u32 put, u32 max)
+{
+    /* How far the run may go: to put when put is ahead in this page, else to
+     * the page end. */
+    const u32 page_end = (io | 0xFFFFFu) + 1u;
+    u32 end_io = (put > io && put < page_end) ? put : page_end;
+    if (!page_end) end_io = put > io ? put : 0xFFFFFFFCu;
+    u32 limit = (end_io - io) / 4u - 1u;        /* words after this one */
+    if (limit > max) limit = max;
+    if (atomic_load_explicit(&s_native_handoff_count, memory_order_acquire)) {
+        AcquireSRWLockExclusive(&s_native_handoff_lock);
+        for (unsigned i = 0; i < GCM_NATIVE_HANDOFF_CAPACITY; ++i) {
+            const u32 h = s_native_handoffs[i].source.header_ea;
+            if (!s_native_handoffs[i].phase || h <= ea) continue;
+            const u32 words = (h - ea) / 4u - 1u;   /* zero words before it */
+            if (words < limit) limit = words;
+        }
+        ReleaseSRWLockExclusive(&s_native_handoff_lock);
+    }
+    const u8* p = vm_base + ea + 4;
+    u32 n = 0;
+    while (n + 2 <= limit) {
+        u64 two; memcpy(&two, p + (size_t)n * 4u, 8);
+        if (two) break;
+        n += 2;
+    }
+    while (n < limit) {
+        u32 one; memcpy(&one, p + (size_t)n * 4u, 4);
+        if (one) break;
+        n++;
+    }
+    return n;
+}
+
 static int gcm_legacy_method_has_effect(u32 m)
 {
     switch (m) {
@@ -3664,6 +3723,7 @@ static void gcm_rsx_process_fifo_pass(void)
     const int legacy_state_live = rsx_get_backend() != NULL || !rsx_draw_engine_enabled() ||
                                   gcm_env_flag(&s_rsx_trace, "RSX_TRACE");
     const int plain_walk = gcm_plain_walk(legacy_state_live);
+    const int s_nop_skip_pass = gcm_nop_skip_on() && !gcm_checked_ref_mode();
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
      * offset in the control register), decoding method headers and following
@@ -3834,6 +3894,17 @@ static void gcm_rsx_process_fifo_pass(void)
                   fprintf(stderr, "\n");
                   nop = hdr = jmp = cal = ret = 0; t0 = now;
               } } }
+        if (!w && s_nop_skip_pass) {
+            /* This NOP and the zero words after it, at once (gcm_nop_run). */
+            const u32 n = gcm_nop_run(ea, s_fifo_getoff, put, budget > 0 ? (u32)budget : 0u);
+            const int below_put = s_fifo_getoff < put;
+            s_nv0039.active = 0;
+            s_fifo_getoff += 4u + 4u * n;
+            budget -= (int)n;
+            if (below_put) s_last_ring_off = s_fifo_getoff;
+            s_nop_skipped += 1u + n; s_nop_runs++;
+            continue;
+        }
         u32 type = w >> 29;
         if ((type != 0 && type != 2) || (w & 3u) == 2u || w == 0x00020000u)
             s_nv0039.active=0; /* Control flow ends contiguous packet inference. */
