@@ -64,6 +64,7 @@ test that passes there; the user opens the upstream PRs.
 | Q25 | A depth-0 SPU restart leaves no drain return point behind | PR open #806 (branch `upstream/spu-restart-drain-return` a5f929fb; from fb89f51e) |
 | Q26 | Window present guard: a window nobody sees never paces the title | PR open #807 (Vulkan, `upstream/vk-present-guard` 073e5dce), #808 (Metal, `upstream/metal-present-guard` 30c61576); fork #104, #105 |
 | Q27 | cellSpursJoinTaskset waits for the taskset's tasks to exit | PR open #809 (branch `upstream/spurs-join-taskset` aee876a9; from fork #98) |
+| Q28 | Weak header-defined globals are misbound in MinGW builds: use selectany on every PE target | not started (fork #127 fixes it for SPU_GATE; upstream has the same pattern) |
 | M1 | Guest write watch and preservation sessions | PR open #727 (write watch), #728 (preservation sessions, stacked on #727); Windows paths not yet run |
 | M2 | Coherence fast paths (series) | PR open #731 (live holder counts only). Shard, interest bitmap and no-LR store fast path dropped: they only pay off with fork-only 91df812a (see M15); 1ef14852 already upstream (#484); 9192f907 dropped (neutral) |
 | M3 | Fast guest accessors, inline stores from the lifter | dropped (superseded by upstream 27745b54, which already inlines stores under its own gate) |
@@ -378,6 +379,24 @@ The user approved sending architectural changes that bring generic performance g
 - **What stays in the fork:** fork #98 also waits for the fork's per-taskset worker lifetime references (`spu_taskset_lifecycle_*`, from c3af35c1's bounded Taskset2 destruction) and gives a same-address Create a 100 ms grace period. Upstream has neither the lifecycle tracking nor the BUSY-on-recreate check that made that necessary, so the upstream port needs no lifecycle tracking.
 - **Upstream branch (2026-11-16):** `upstream/spurs-join-taskset` aee876a9, with `tests/test_spurs_join_taskset.c` and `tools/test_spurs_join_taskset.py` (POSIX; synthetic guest memory).
 - **Upstream PR title:** "fix(spurs): make JoinTaskset wait for the taskset's tasks to exit"
+
+**Q28. Weak header-defined globals are misbound in MinGW builds**
+- **Commit:** fork 4ff2aba2 (fork #127), `runtime/spu/spu_context.h`.
+- **Value:** the runtime defines its read-mostly gates in a header as `__declspec(selectany)` under
+  `_MSC_VER` and `__attribute__((weak))` elsewhere, so single-file tests link without the runtime.
+  GNU ld on PE-COFF does not fold GNU-weak data: every translation unit keeps its own copy and the
+  program's references bind to one address that need not be any of them. In a MinGW build of
+  `tools/test_original_work_routes.py` a gate's reads and writes landed inside another weak object,
+  so a read-once gate saw a stale value and the leaf route was skipped (right guest result, no
+  witness); the older integer gates were misbound the same way and only looked right because a stray
+  0 means "diagnostic off". `__declspec(selectany)` is honoured by MinGW gcc and gives one COMDAT
+  object, so the fix is to select it for every `_WIN32` target. Upstream's CI compiles its Python
+  fixtures with MinGW on Windows, so the same misbinding applies to any weak global it defines in a
+  header (check `git grep -n 'attribute__((weak))' -- '*.h'` on `master` before sending).
+- **Risk:** low; the change is one preprocessor condition.
+- **Missing:** a synthetic test that links two translation units with MinGW and checks the symbol
+  binds once (a `--compile-only` fixture plus `nm`, skipped where no MinGW toolchain exists).
+- **Upstream PR title:** "fix(spu): make header-defined gates selectany on every PE target"
 
 ## 2. Medium (ranked)
 
