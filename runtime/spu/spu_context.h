@@ -448,8 +448,13 @@ typedef struct spu_context {
 void spu_mfc_release(spu_context* ctx);
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
 
+static inline int spu_fast_path_on(void);   /* below, with the gate block */
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 {
+    /* Resolve the compact-form switch before any channel op: the channel
+     * entries then test the resolved value with one load, never the lazy
+     * resolver (whose inlined body cost them a prologue). */
+    (void)spu_fast_path_on();
     memset(ctx, 0, sizeof(*ctx));
     ctx->ls     = ctx->ls_store;   /* a raw SPU repoints this at guest memory */
     ctx->spu_id = spu_id;

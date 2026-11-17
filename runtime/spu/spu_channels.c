@@ -1241,7 +1241,10 @@ static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u
  * latch cases behind the channel histogram so SPU_CHHIST still counts them. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
-    if (spu_fast_path_on()) {
+    /* One load and one predicted branch when the compact form is off: the
+     * switch is resolved by spu_context_init, and an unresolved -1 can only
+     * mean the full form here. */
+    if (g_spu_dispatch_gates.fast_path > 0) {
         const uint32_t v = value._u32[0];
         switch (channel) {
         case MFC_LSA:       ctx->mfc_lsa = v;          return;
@@ -1553,7 +1556,7 @@ static SPU_DMA_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel);
  * and never block; the compact form returns them ahead of the full entry. */
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
-    if (spu_fast_path_on()) {
+    if (g_spu_dispatch_gates.fast_path > 0) {
         if (channel_is_mfc(channel))
             return spu_make_preferred_u32(mfc_channel_read(NULL, ctx, channel));
         if (channel == SPU_RdMachStat)

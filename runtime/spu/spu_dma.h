@@ -2085,8 +2085,8 @@ static inline uint32_t mfc_tag_wait(const mfc_engine* mfc, uint32_t tag_mask,
 /* ---------------------------------------------------------------------------
  * Convenience: process an SPU channel write for MFC-related channels.
  * -----------------------------------------------------------------------*/
-static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
-                                      uint32_t channel, uint32_t value)
+SPU_DMA_BODY void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
+                                    uint32_t channel, uint32_t value)
 {
     switch (channel) {
     case MFC_LSA:
@@ -2117,7 +2117,7 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
          * RdTagStat must equal the mask EXACTLY (mask 2 = tag 1 =
          * kLoadJob_readBuffers). Log the inputs so we can see whether the tag
          * really is reported complete. Env SPU_TAGPROBE=1. */
-        if (!spu_fast_path_on()) { static int s_tp = -1;
+        { static int s_tp = -1;
           if (s_tp < 0) { const char* e = getenv("SPU_TAGPROBE"); s_tp = e ? 1 : 0; }
           if (s_tp && spu->image_id == 2) { static int _n = 0; if (PS3_LOG_FIRST(_n, 40))
               fprintf(stderr, "[tagprobe] img=%d upd=%u mask=0x%X completed=0x%X -> RdTagStat=0x%X%s\n",
