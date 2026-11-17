@@ -562,10 +562,28 @@ typedef struct spu_dispatch_gates {
     int task_diag;                /* spu_task_launch_diagnostics()             */
     unsigned stack_reset_count;   /* g_spu_stack_reset_count                   */
     int ovl_stats;                /* overlay residency statistics wanted       */
-    char pad[64 - 5 * sizeof(int)];
+    int fast_path;                /* spu_fast_path_on() (spu_drain.c)          */
+    char pad[64 - 6 * sizeof(int)];
 } spu_dispatch_gates;
+#ifdef __cplusplus
+static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
+#else
 _Static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
-SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, {0} };
+#endif
+SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, -1, {0} };
+
+/* PS3RECOMP_MFC_FAST=1 (opt-in): the MFC command path, the channel entries,
+ * the overlay note and the drain hop run their compact form, which drops the
+ * environment-armed diagnostics and their per-command gate tests. It is
+ * chosen only while none of those diagnostics is armed (spu_fast_path_env.h
+ * lists every variable they read), so the diagnostics never go missing:
+ * arming any of them keeps the full form. Fixed for the run; read once. */
+int spu_fast_path_resolve(void);
+static inline int spu_fast_path_on(void)
+{
+    const int f = g_spu_dispatch_gates.fast_path;
+    return f >= 0 ? f : spu_fast_path_resolve();
+}
 static inline int spu_ls_wws_probe_on(void)
 {
     if (g_spu_wws_probe < 0) g_spu_wws_probe = getenv("SPU_WWS_PROBE") ? 1 : 0;
@@ -926,13 +944,14 @@ static inline int spu_region_scope_on(void) {
 }
 static inline void spu_region_dispatch_invoke(spu_context* ctx,
     void (*fn)(spu_context*), int has_return, uint32_t return_pc) {
-    ctx->region_dispatch_valid=0;
+    /* With region scope off the flag is only ever written clear, so the
+     * compact form skips the clearing store before the call. */
     if(spu_region_scope_on()) {
         ctx->region_dispatch_depth=ctx->host_depth;
         ctx->region_return_pc=return_pc&SPU_LS_MASK;
         ctx->region_has_return=has_return;
         ctx->region_dispatch_valid=1;
-    }
+    } else if(!spu_fast_path_on()) ctx->region_dispatch_valid=0;
     fn(ctx);
     ctx->region_dispatch_valid=0;
 }
