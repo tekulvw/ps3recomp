@@ -110,13 +110,13 @@ def lift(tmp, image, starts, name, extra=()):
         f.write_text(f.read_text().replace('../../runtime/spu/', ''))
     return out
 
-def build(tmp, src_dir, exe, drain_src=None, first_inc=None):
+def build(tmp, src_dir, exe, drain_src=None, first_inc=None, cflags=()):
     common = [str(SPU / c) for c in P.COMMON]
     if drain_src:
         common = [drain_src if c.endswith('/spu_drain.c') else c for c in common]
     flags = (['-I' + str(first_inc)] if first_inc else []) + ['-std=gnu17', '-O2', '-UNDEBUG', '-I' + str(ROOT / 'include'), '-I' + str(SPU),
              '-I' + str(ROOT / 'runtime/platform'), '-I' + str(tmp),
-             '-DDIRECT_TAIL_REGISTER=dt_test_spu_recomp_register', '-DSPU_DIRECT_TAIL_TEST_COUNT']
+             '-DDIRECT_TAIL_REGISTER=dt_test_spu_recomp_register', '-DSPU_DIRECT_TAIL_TEST_COUNT', *cflags]
     if os.environ.get('UBSAN') == '1':
         flags += ['-fsanitize=undefined', '-fno-sanitize-recover=all']
     r = subprocess.run([CC, *flags, str(SPU / 'tests/test_spu_direct_tail.c'), *common,
@@ -232,7 +232,10 @@ def main():
         build(tmp, plain, tmp / 'plain.exe')
         build(tmp, direct, tmp / 'direct.exe')
         build(tmp, dpromo, tmp / 'dpromo.exe')
+        # Guard and note inline at every site instead of the default out-of-line call.
+        build(tmp, direct, tmp / 'dinline.exe', cflags=['-DSPU_DIRECT_TAIL_INLINE=1'])
         check_all(tmp, tmp / 'plain.exe', tmp / 'direct.exe', 'direct')
+        check_all(tmp, tmp / 'plain.exe', tmp / 'dinline.exe', 'direct-inline')
         check_all(tmp, tmp / 'plain.exe', tmp / 'dpromo.exe', 'direct+promote')
         pp = lift(tmp, image, starts, 'ppromo', ['--promote-regs'])
         build(tmp, pp, tmp / 'ppromo.exe')
@@ -275,7 +278,8 @@ def main():
             exe = tmp / ('mutant_%d.exe' % controls.index((name, where, old, new, probe, bad)))
             if where == 'header':
                 inc = mutant_header(old, new)
-                build(tmp, direct, exe, first_inc=inc)
+                # Inline, so the mutated guard and note are the ones the lifted code runs.
+                build(tmp, direct, exe, first_inc=inc, cflags=['-DSPU_DIRECT_TAIL_INLINE=1'])
             else:
                 assert drain.count(old) == 1, old
                 mdrain = tmp / 'mutant_drain.c'

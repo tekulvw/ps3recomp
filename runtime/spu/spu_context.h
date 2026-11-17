@@ -1091,14 +1091,29 @@ static inline void spu_direct_tail_note(spu_context* ctx) {
 #    define SPU_DIRECT_TAIL_SUPPORTED 1
 #  endif
 #endif
+/* Guard and note out of line by default: one call per transfer, and each of
+ * the many transfer sites stays a call, a test and a jump. Inlining both
+ * (SPU_DIRECT_TAIL_INLINE=1) saves the call but grows every site by the
+ * whole guard and note, which in a large lifted image costs more in code
+ * footprint than the call does. */
+int spu_direct_tail_enter(spu_context* ctx);   /* spu_direct_tail_ok, then the note */
+#ifndef SPU_DIRECT_TAIL_INLINE
+#  define SPU_DIRECT_TAIL_INLINE 0
+#endif
 #ifdef SPU_DIRECT_TAIL_SUPPORTED
 #  define SPU_MUSTTAIL __attribute__((musttail))
-#  define SPU_DIRECT_TAIL_OK(ctx) spu_direct_tail_ok(ctx)
+#  if SPU_DIRECT_TAIL_INLINE
+#    define SPU_DIRECT_TAIL_OK(ctx) spu_direct_tail_ok(ctx)
+#    define SPU_DIRECT_TAIL_NOTE(ctx) spu_direct_tail_note(ctx)
+#  else
+#    define SPU_DIRECT_TAIL_OK(ctx) spu_direct_tail_enter(ctx)
+#    define SPU_DIRECT_TAIL_NOTE(ctx) ((void)0)
+#  endif
 #else
 #  define SPU_MUSTTAIL
 #  define SPU_DIRECT_TAIL_OK(ctx) 0
+#  define SPU_DIRECT_TAIL_NOTE(ctx) ((void)0)
 #endif
-#define SPU_DIRECT_TAIL_NOTE(ctx) spu_direct_tail_note(ctx)
 
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task

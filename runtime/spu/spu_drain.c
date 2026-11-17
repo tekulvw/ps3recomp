@@ -469,6 +469,13 @@ void spu_direct_tail_image(void)
             why ? "off (" : "on", why ? why : "", why ? ")" : "", !why && scope ? " (region scope)" : "");
 }
 
+int spu_direct_tail_enter(spu_context* ctx)
+{
+    if (!spu_direct_tail_ok(ctx)) return 0;
+    spu_direct_tail_note(ctx);
+    return 1;
+}
+
 /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
 int spu_tailret_enabled(void)
 {
