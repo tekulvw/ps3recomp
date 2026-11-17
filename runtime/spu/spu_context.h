@@ -527,8 +527,16 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 /* The diagnostic gates the inline helpers below read. Defined here rather than
  * in spu_channels.c, as one merged definition per program (selectany / weak),
  * so every target that includes this header links whether or not it builds
- * spu_channels.c -- the SPU unit tests and sync_stress do not. */
-#if defined(_MSC_VER)
+ * spu_channels.c -- the SPU unit tests and sync_stress do not.
+ *
+ * Every PE target takes selectany, MinGW included: GNU ld does not fold a
+ * GNU-weak data definition on PE-COFF. Each translation unit keeps its own
+ * copy and the program's references bind to one address that need not be any
+ * of them (the MinGW builds of the Python fixtures showed a gate bound inside
+ * another weak object, so a read-once gate saw a stale value and a first-use
+ * store landed in that object). A selectany COMDAT is one object, as on ELF
+ * and Mach-O with a weak definition. */
+#if defined(_WIN32)
 #  define SPU_GATE __declspec(selectany)
 #else
 #  define SPU_GATE __attribute__((weak))
