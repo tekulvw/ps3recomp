@@ -3005,7 +3005,7 @@ typedef struct {
     uint32_t vepoch[SPU_VERIFIED_IMAGES];
     spu_dcache_ent ent[512];
     /* SPU_DCACHE_MISS_STATS=1: this thread's lookups and misses by reason. */
-    unsigned long long st_hits, st_miss[8];
+    unsigned long long st_hits, st_miss[8], st_next_ms; unsigned st_thread;
     /* Residency epoch bumps by cause: a GET over resident code from another
      * source (slot cleared), a GET re-delivering a slot's own bytes
      * (re-verify), a load into a slot that held the same image from the same
@@ -3109,15 +3109,23 @@ static int spu_dcache_miss_stats(void)
     if (on < 0) { const char* e = getenv("SPU_DCACHE_MISS_STATS"); on = e && !strcmp(e, "1"); }
     return on;
 }
-/* One line per thread every 2^20 lookups: shares stay per thread, so the
- * counting itself never bounces a cache line between SPU threads. */
+/* Cumulative counts, one line per thread at most once a second (checked every
+ * 4096 lookups), tagged with a thread number, the SPU the thread serves as a
+ * SPURS worker (-1 otherwise) and a millisecond clock. Shares stay per thread,
+ * so the counting itself never bounces a cache line between SPU threads. */
+static atomic_uint s_dcache_stat_threads;
 static void spu_dcache_miss_report(spu_dcache_tls* t)
 {
     unsigned long long miss = 0;
     for (int i = 0; i < DCM_N; ++i) miss += t->st_miss[i];
     const unsigned long long n = t->st_hits + miss;
-    if (n & ((1ull << 20) - 1)) return;
-    char line[512]; int k = snprintf(line, sizeof line, "[spu-dcache-miss] lookups=%llu hits=%llu", n, t->st_hits);
+    if (n & 4095u) return;
+    const unsigned long long now = GetTickCount64();
+    if (now < t->st_next_ms) return;
+    t->st_next_ms = now + 1000;
+    if (!t->st_thread) t->st_thread = atomic_fetch_add(&s_dcache_stat_threads, 1u) + 1u;
+    char line[640]; int k = snprintf(line, sizeof line, "[spu-dcache-miss] t_ms=%llu thread=%u spu=%d lookups=%llu hits=%llu",
+                                     now, t->st_thread, t_ft_spu, n, t->st_hits);
     for (int i = 0; i < DCM_N && k > 0 && k < (int)sizeof line; ++i)
         k += snprintf(line + k, sizeof line - (size_t)k, " %s=%llu", s_dcm_name[i], t->st_miss[i]);
     if (k > 0 && k < (int)sizeof line)
