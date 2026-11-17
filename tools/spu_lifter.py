@@ -576,10 +576,10 @@ def promote_function(items, suffix, max_regs=0, split_slots=False):
     tail (or None). Returns the new body lines, or None when the function cannot
     be promoted (it is then emitted unpromoted, which is always correct).
 
-    split_slots (--promote-split-slots): every ctx->gpr slot is loaded and
-    stored on its own, 16 bytes at a time (SPU_PR_LD / SPU_PR_ST, see
-    SPLIT_SLOTS_PREAMBLE), instead of as plain assignments that the C compiler
-    may merge into one 32-byte access over two neighbouring slots. A merged
+    split_slots (--promote-split-slots): every ctx->gpr slot store is a 16-byte
+    volatile store (SPU_PR_ST, see SPLIT_SLOTS_PREAMBLE), and loads are spelled
+    SPU_PR_LD, instead of plain assignments whose stores the C compiler may
+    merge into one 32-byte access over two neighbouring slots. A merged
     access over slots another function wrote, or reads, 16 bytes at a time
     defeats the CPU's store-to-load forwarding at every transfer and call."""
     texts = []
@@ -738,19 +738,14 @@ def promote_function(items, suffix, max_regs=0, split_slots=False):
 
 
 SPLIT_SLOTS_PREAMBLE = """
-/* --promote-split-slots: each ctx->gpr slot is read and written 16 bytes at a
- * time, never merged with its neighbour into one 32-byte access. The store is
- * volatile (it is never dead: it precedes a host return or an out-of-line call
- * that reads ctx->gpr) and the loaded value passes an empty asm, which keeps
- * the load separate but lets the compiler drop it where the value is unused. */
-#if (defined(__clang__) || defined(__GNUC__)) && (defined(__x86_64__) || defined(_M_X64))
-#define SPU_PR_OPAQUE(v) __asm__("" : "+x"(v))
-#elif (defined(__clang__) || defined(__GNUC__)) && defined(__aarch64__)
-#define SPU_PR_OPAQUE(v) __asm__("" : "+w"(v))
-#else
-#define SPU_PR_OPAQUE(v) (void)0
-#endif
-static inline __attribute__((always_inline)) spu_pr_v SPU_PR_LD(const u128* p) { spu_pr_v v; memcpy(&v, p, 16); SPU_PR_OPAQUE(v); return v; }
+/* --promote-split-slots: each ctx->gpr slot is written 16 bytes at a time, never
+ * merged with its neighbour into one 32-byte store that the next function's
+ * 16-byte reads cannot forward from. The store is volatile; it is never dead,
+ * since it precedes a host return or an out-of-line call that reads ctx->gpr.
+ * A load stays an ordinary load, so the compiler keeps narrowing it to the
+ * lanes in use and dropping it where the value is unused; without merged
+ * stores to copy, it no longer merges loads either. */
+static inline __attribute__((always_inline)) spu_pr_v SPU_PR_LD(const u128* p) { spu_pr_v v; memcpy(&v, p, 16); return v; }
 static inline __attribute__((always_inline)) void SPU_PR_ST(u128* p, spu_pr_v v) { *(volatile spu_pr_v*)p = v; }
 """
 
