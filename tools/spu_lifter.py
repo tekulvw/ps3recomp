@@ -1294,9 +1294,10 @@ class SPULifter:
                 # `bi $r0` returns via host return) + SPU_DRAIN (drains the
                 # callee's own tail-chains so they don't grow the caller frame)
                 # + image save/restore (adopt-on-serve cannot leak upward).
-                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
+                cr_set, cr_put = self._call_ret(addr + 4)
+                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {cr_set}"
                         f"ctx->host_depth++; {_F}{self.prefix}spu_func_{tgt:08X}(ctx); "
-                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); {_R}}}")
+                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; {cr_put}spu_img_restore(ctx, _si); {_R}}}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -1356,11 +1357,12 @@ class SPULifter:
             # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
             # here and its `bi $r0` returns via host return.
             # read the target BEFORE writing the link: rt may be the same register as ra
+            cr_set, cr_put = self._call_ret(addr + 4)
             return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
-                    f"int32_t _si = (int32_t)ctx->image_id; "
+                    f"int32_t _si = (int32_t)ctx->image_id; {cr_set}"
                     f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
                     f"{_F}spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
-                    f"ctx->host_depth--; spu_img_restore(ctx, _si); {_R}}}")
+                    f"ctx->host_depth--; {cr_put}spu_img_restore(ctx, _si); {_R}}}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link
@@ -1411,6 +1413,17 @@ class SPULifter:
             "ihz": f"{half} == 0",      "ihnz": f"{half} != 0",
         }
         return table.get(mn, f"{word} != 0")
+
+    def _call_ret(self, ret: int):
+        """--direct-tail call sites keep ctx->call_ret_pc/depth naming the
+        innermost live call (its return pc and the depth inside it), so a tail
+        call in the callee can set drain_ret_pc as the drain hop would. Saved
+        in locals and put back after the callee's drain. Empty otherwise."""
+        if not self.direct_tail:
+            return "", ""
+        return (f"uint32_t _crp = ctx->call_ret_pc, _crd = ctx->call_ret_depth; "
+                f"ctx->call_ret_pc = 0x{ret & 0x3FFFC:X}; ctx->call_ret_depth = ctx->host_depth + 1; ",
+                "ctx->call_ret_pc = _crp; ctx->call_ret_depth = _crd; ")
 
     def _xfer(self, tgt: int) -> str:
         """A transfer to the lifted function at tgt from outside it. Without

@@ -599,6 +599,10 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 
 static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t return_pc)
 {
+    /* Direct tails: this loop owns transfers made at the current depth, and
+     * a tail call needs its return pc (spu_context.call_ret_pc). Set at each
+     * hop, put back on every exit. */
+    const uint32_t outer_call_ret = ctx->call_ret_pc, outer_call_depth = ctx->call_ret_depth;
     ctx->region_dispatch_valid=0;
     spu_depth_guard_check(ctx);
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
@@ -615,7 +619,8 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
     /* Nested contexts/drains share this thread's cursor. Only the object
      * address is stable across calls and IRQ longjmps, never its contents. */
     spu_recent_history* const recent = &t_recent;
-#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; ctx->region_dispatch_valid=0; } while (0)
+#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; ctx->region_dispatch_valid=0; \
+                                 ctx->call_ret_pc = outer_call_ret; ctx->call_ret_depth = outer_call_depth; } while (0)
     for (;;) {
         while (*tramp) {
             if (*tramp == spu_indirect_branch &&
@@ -627,6 +632,7 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
             void (*fn)(spu_context*) = *tramp;
             *tramp = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
+            ctx->call_ret_pc = return_pc & SPU_LS_MASK; ctx->call_ret_depth = ctx->host_depth;
             spu_drain_hop_inline(ctx, fn, recent);
             SPU_LR_POLL(ctx);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {

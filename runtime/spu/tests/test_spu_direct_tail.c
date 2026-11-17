@@ -12,6 +12,9 @@
  *   pmflow  the policy-module flow trace targets this context
  *   reset   a stack-reset entry is registered (an unrelated pc)
  *   raiser  interrupts get an event raised by another thread mid-run
+ *   unflagged  the entry is called from a hand-written call site that, like
+ *           an image lifted without --direct-tail, does not keep call_ret
+ *   bench   time the run and print ns_per_call (call-heavy loop)
  *   none    nothing
  * Prints one RESULT line: pc, status, stop code, steps, host depth, the
  * innermost drain return pc, digests of the register file, local store and
@@ -47,6 +50,19 @@ static void* raiser(void* unused)
     return NULL;
 }
 
+/* A call site of an image lifted without --direct-tail: the drain bracket
+ * only, no call_ret bookkeeping. Calls the lifted function at the entry pc
+ * with return point 0xA08 (G's continuation), as G's own brsl would. */
+static spu_lifted_fn s_unflagged_callee;
+static void unflagged_caller(spu_context* c)
+{
+    c->gpr[0] = spu_link(DIRECT_TAIL_BASE + 0xA08);
+    c->host_depth++;
+    s_unflagged_callee(c);
+    spu_drain_call(c, DIRECT_TAIL_BASE + 0xA08);
+    c->host_depth--;
+}
+
 int main(int argc, char** argv)
 {
     uint32_t entry = argc > 1 ? (uint32_t)strtoul(argv[1], NULL, 0) : DIRECT_TAIL_BASE;
@@ -77,7 +93,13 @@ int main(int argc, char** argv)
     spu_lifted_fn fn = spu_lifted_lookup(ctx, entry);
     CHECK(fn != NULL);
     if (!fn) return 1;
+    if (strstr(opts, "unflagged")) { s_unflagged_callee = fn; fn = unflagged_caller; }
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     int halted = spu_run_with_halt(fn, ctx);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (strstr(opts, "bench"))
+        printf("BENCH ns=%llu\n", (unsigned long long)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec)));
     if (strstr(opts, "raiser")) pthread_join(th, NULL);
     uint32_t mark = (uint32_t)ctx->ls[0x30100] << 24 | (uint32_t)ctx->ls[0x30101] << 16 |
                     (uint32_t)ctx->ls[0x30102] << 8 | ctx->ls[0x30103];
