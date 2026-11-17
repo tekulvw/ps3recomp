@@ -1455,17 +1455,29 @@ static void spu_ch_wake_line_written(void* p)
  * goes idle. Waits shorter than PS3_FTRACE_MIN_US do not split a busy span. */
 static __thread uint64_t t_ft_busy0;
 
+/* The SPU number this host thread's spans carry. A SPURS policy-module
+ * context is initialised with spu_id 0 on every SPU (spurs_policy.c), so
+ * without this every policy-module thread's busy, wait and job spans read as
+ * spu 0. The SPURS worker names its SPU once at start; -1 keeps spu_id. */
+static SPU_TLS int t_ft_spu = -1;
+void spu_ft_set_spu(int spu) { t_ft_spu = spu; }
+int spu_ft_spu(void) { return t_ft_spu; }
+static inline uint32_t spu_ft_who(const spu_context* ctx)
+{
+    return t_ft_spu >= 0 ? (uint32_t)t_ft_spu : ctx->spu_id;
+}
+
 static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
 {
     const uint64_t t1 = ps3_ft_now();
     if (t1 - t0 < ps3_ft_min_ns()) return;
     if (t_ft_busy0 && t0 > t_ft_busy0) {
         const uint8_t* w = ctx->ls + 0x1DC;
-        ps3_ft_span(PS3_FT_SPU_BUSY, ctx->spu_id, (uint32_t)ctx->image_id,
+        ps3_ft_span(PS3_FT_SPU_BUSY, spu_ft_who(ctx), (uint32_t)ctx->image_id,
                     ((uint32_t)w[0] << 24) | ((uint32_t)w[1] << 16) | ((uint32_t)w[2] << 8) | w[3],
                     t_ft_busy0, t0);
     }
-    ps3_ft_span(PS3_FT_SPU_WAIT, ctx->spu_id, channel, ctx->pc & SPU_LS_MASK, t0, t1);
+    ps3_ft_span(PS3_FT_SPU_WAIT, spu_ft_who(ctx), channel, ctx->pc & SPU_LS_MASK, t0, t1);
     t_ft_busy0 = t1;
 }
 
@@ -2758,7 +2770,7 @@ static void spu_ft_job_begin(const spu_context* ctx, int image)
 {
     const uint64_t now = ps3_ft_now();
     if (t_ft_job.image) ps3_ft_span(PS3_FT_SPU_JOB, t_ft_job.spu, t_ft_job.image, 0, t_ft_job.t0, now);
-    t_ft_job.t0 = now; t_ft_job.spu = ctx->spu_id; t_ft_job.image = (uint32_t)image;
+    t_ft_job.t0 = now; t_ft_job.spu = spu_ft_who(ctx); t_ft_job.image = (uint32_t)image;
 }
 void spu_ft_job_end(void)
 {
