@@ -586,7 +586,24 @@ SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1
  * chosen only while none of those diagnostics is armed (spu_fast_path_env.h
  * lists every variable they read), so the diagnostics never go missing:
  * arming any of them keeps the full form. Fixed for the run; read once. */
-int spu_fast_path_resolve(void);
+#include "spu_fast_path_env.h"
+/* Defined here, not in a runtime unit: the inline users below are compiled
+ * into fixtures that link no runtime unit at all. Every copy writes the one
+ * shared gate block. */
+static inline int spu_fast_path_resolve(void)
+{
+    const char* e = getenv("PS3RECOMP_MFC_FAST");
+    int on = e && e[0] == '1' && !e[1];
+    if (on)
+        for (const char* const* n = spu_fast_path_env; *n; ++n)
+            if (getenv(*n)) {
+                fprintf(stderr, "[spu] PS3RECOMP_MFC_FAST=1 ignored: %s is set\n", *n);
+                on = 0;
+                break;
+            }
+    g_spu_dispatch_gates.fast_path = on;
+    return on;
+}
 static inline int spu_fast_path_on(void)
 {
     const int f = g_spu_dispatch_gates.fast_path;

@@ -97,23 +97,6 @@ static int spu_task_launch_diagnostics(void)
     return s_on;
 }
 
-/* See spu_context.h. PS3RECOMP_MFC_FAST=1 asks for the compact form; it is
- * taken only while none of the diagnostics it would drop is armed. */
-#include "spu_fast_path_env.h"
-int spu_fast_path_resolve(void)
-{
-    const char* e = getenv("PS3RECOMP_MFC_FAST");
-    int on = e && e[0] == '1' && !e[1];
-    if (on)
-        for (const char* const* n = spu_fast_path_env; *n; ++n)
-            if (getenv(*n)) {
-                fprintf(stderr, "[spu] PS3RECOMP_MFC_FAST=1 ignored: %s is set\n", *n);
-                on = 0;
-                break;
-            }
-    g_spu_dispatch_gates.fast_path = on;
-    return on;
-}
 
 /* The caller may resolve the history TLS address once for its owning drain.
  * Keep every checkpoint here, in order: a stack reset can unwind before the
