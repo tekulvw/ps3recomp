@@ -561,7 +561,13 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
  * already the return pc, and lifted-entry resumes. One cumulative line per
  * thread at most once a second. */
 static int s_drain_stats = -1;
-static SPU_THREAD_LOCAL struct { unsigned long long leaf, loop, hop_ib, hop_direct, ret_short, resume, next_ms; unsigned id; } t_ds;
+static SPU_THREAD_LOCAL struct { unsigned long long leaf, loop, hop_ib, hop_direct, ret_short, resume, next_ms;
+                                  /* hop_direct by kind: the pending function is the one the context's own
+                                   * image registers at the target pc (same image), the resident overlay's
+                                   * or task's, or none of them (other); and how many were taken with
+                                   * interrupts enabled or a stack-reset entry registered, or deep. */
+                                  unsigned long long d_same, d_ovl, d_other, d_irq, d_reset, d_deep;
+                                  unsigned id; } t_ds;
 static unsigned s_ds_threads;
 static void spu_drain_stats_tick(void)
 {
@@ -572,8 +578,10 @@ static void spu_drain_stats_tick(void)
     t_ds.next_ms = now + 1000;
     if (!t_ds.id) t_ds.id = __atomic_add_fetch(&s_ds_threads, 1u, __ATOMIC_RELAXED);
     fprintf(stderr, "[spu-drain-kind] t_ms=%llu thread=%u leaf=%llu loop=%llu hop_ib=%llu hop_direct=%llu "
-            "ret_short=%llu resume=%llu\n", now, t_ds.id, t_ds.leaf, t_ds.loop, t_ds.hop_ib,
-            t_ds.hop_direct, t_ds.ret_short, t_ds.resume);
+            "ret_short=%llu resume=%llu | direct same_image=%llu ovl_or_task=%llu other=%llu"
+            " int_enabled=%llu stack_reset=%llu deep=%llu\n", now, t_ds.id, t_ds.leaf, t_ds.loop, t_ds.hop_ib,
+            t_ds.hop_direct, t_ds.ret_short, t_ds.resume, t_ds.d_same, t_ds.d_ovl, t_ds.d_other,
+            t_ds.d_irq, t_ds.d_reset, t_ds.d_deep);
 }
 static int spu_drain_stats_on(void)
 {
@@ -632,7 +640,20 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
             }
             void (*fn)(spu_context*) = *tramp;
             *tramp = 0;
-            if (s_drain_stats > 0) { if (fn == spu_indirect_branch) t_ds.hop_ib++; else t_ds.hop_direct++; }
+            if (s_drain_stats > 0) {
+                if (fn == spu_indirect_branch) t_ds.hop_ib++;
+                else {
+                    const uint32_t tpc = (uint32_t)ctx->pc & SPU_LS_MASK;
+                    t_ds.hop_direct++;
+                    if ((void*)spu_lookup(tpc, ctx->image_id) == (void*)fn) t_ds.d_same++;
+                    else if ((ctx->resident_ovl && (void*)spu_lookup(tpc, ctx->resident_ovl) == (void*)fn) ||
+                             (ctx->resident_task && (void*)spu_lookup(tpc, ctx->resident_task) == (void*)fn)) t_ds.d_ovl++;
+                    else t_ds.d_other++;
+                    if (ctx->int_enable) t_ds.d_irq++;
+                    if (spu_stack_reset_needed(ctx)) t_ds.d_reset++;
+                    if (g_spu_depth_guard_limit && ctx->host_depth >= g_spu_depth_guard_limit / 2) t_ds.d_deep++;
+                }
+            }
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             spu_drain_hop_inline(ctx, fn, recent);
             SPU_LR_POLL(ctx);
