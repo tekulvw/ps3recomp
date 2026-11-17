@@ -16,6 +16,15 @@
  *   cc -O2 -I runtime/spu -I include runtime/spu/tests/test_spu_float_exact.c -lm -o t && ./t [scale]
  * scale (default 1) multiplies the pass-3 size: 1 = 64M vectors (256M lanes). */
 #include "spu_helpers.h"
+/* SPU_EXPECT_X86_RZ=0/1: fail the build unless the SPU_FLOAT_X86_RZ form is (1) or is not (0) the
+ * one selected -- CI checks that the switch takes effect only where AVX-512 is targeted. */
+#if defined(SPU_EXPECT_X86_RZ)
+#if SPU_EXPECT_X86_RZ && !defined(SPU_FLOAT_X86_RZ_ACTIVE)
+#error "expected the SPU_FLOAT_X86_RZ form"
+#elif !SPU_EXPECT_X86_RZ && defined(SPU_FLOAT_X86_RZ_ACTIVE)
+#error "SPU_FLOAT_X86_RZ took effect without AVX-512"
+#endif
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 

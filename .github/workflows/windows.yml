@@ -147,8 +147,11 @@ jobs:
               if ($LASTEXITCODE -ne 0) { exit 1 }
             }
           }
-          # The opt-in SPU_FLOAT_X86_RZ form needs AVX-512 to run; here it is only compiled.
-          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /clang:-ffp-contract=off /clang:-march=x86-64-v4 /DSPU_FLOAT_X86_RZ=1 /I include /I runtime/spu /Fe:test_spu_float_exact_rz.exe runtime/spu/tests/test_spu_float_exact.c
+          # The opt-in SPU_FLOAT_X86_RZ switch: compiled only, as the AVX-512 form needs AVX-512 to run.
+          # On v3 it must leave the exact AVX2 form selected, on v4 select the embedded-rounding form.
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /clang:-ffp-contract=off /clang:-march=x86-64-v3 /DSPU_FLOAT_X86_RZ=1 /DSPU_EXPECT_X86_RZ=0 /I include /I runtime/spu /Fe:test_spu_float_exact_v3rz.exe runtime/spu/tests/test_spu_float_exact.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /clang:-ffp-contract=off /clang:-march=x86-64-v4 /DSPU_FLOAT_X86_RZ=1 /DSPU_EXPECT_X86_RZ=1 /I include /I runtime/spu /Fe:test_spu_float_exact_rz.exe runtime/spu/tests/test_spu_float_exact.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every

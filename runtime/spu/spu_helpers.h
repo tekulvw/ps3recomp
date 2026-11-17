@@ -1113,7 +1113,9 @@ SPU__X8_INLINE u128 spu__x8_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t 
     return spu__x8_st(redo ? spu__x8_fma_w(x, y, z, redo) : r);
 }
 #if defined(SPU_FLOAT_X86_RZ) && SPU_FLOAT_X86_RZ && defined(__AVX512F__) && defined(__AVX512VL__)
-/* SPU_FLOAT_X86_RZ (opt-in, compile time; needs AVX-512 F and VL, e.g. -march=x86-64-v4): the
+#define SPU_FLOAT_X86_RZ_ACTIVE 1
+/* SPU_FLOAT_X86_RZ (opt-in, compile time; takes effect only where the build targets AVX-512 F and
+ * VL, e.g. -march=x86-64-v4; an AVX2 build with the switch keeps the exact forms below): the
  * operation itself in single precision, rounded toward zero by the instruction's own embedded
  * rounding control (EVEX {rz-sae}), so no thread floating-point state is read or changed. The
  * x86 counterpart of SPU_FLOAT_RZ on arm64. The rules, which are the SPU's:
@@ -1186,9 +1188,7 @@ SPU__X8_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__xr_fma(a, b, 
 SPU__X8_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__xr_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
 #undef SPU__XR_EXP
 #else
-#if defined(SPU_FLOAT_X86_RZ) && SPU_FLOAT_X86_RZ
-#error "SPU_FLOAT_X86_RZ needs AVX-512 F and VL (e.g. -march=x86-64-v4)"
-#endif
+/* Without AVX-512 (an x86-64-v3 build) SPU_FLOAT_X86_RZ changes nothing: the exact forms. */
 SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return spu__x8_fa(a, b, 0); }
 SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return spu__x8_fa(a, b, 0x80000000u); }
 SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) { return spu__x8_fm(a, b); }
