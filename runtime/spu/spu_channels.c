@@ -1235,7 +1235,30 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);
+/* Three writes in four only latch an MFC parameter. The compact form answers
+ * them here, ahead of the full entry's frame; the full form keeps its own
+ * latch cases behind the channel histogram so SPU_CHHIST still counts them. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    /* One load and one predicted branch when the compact form is off: the
+     * switch is resolved by spu_context_init, and an unresolved -1 can only
+     * mean the full form here. */
+    if (g_spu_dispatch_gates.fast_path > 0) {
+        const uint32_t v = value._u32[0];
+        switch (channel) {
+        case MFC_LSA:       ctx->mfc_lsa = v;          return;
+        case MFC_EAH:       ctx->mfc_eah = v;          return;
+        case MFC_EAL:       ctx->mfc_eal = v;          return;
+        case MFC_Size:      ctx->mfc_size = v;         return;
+        case MFC_TagID:     ctx->mfc_tag = v & 0x1F;   return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = v;     return;
+        default: break;
+        }
+    }
+    spu_wrch_full(ctx, channel, value);
+}
+static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
@@ -1528,7 +1551,20 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
+static SPU_DMA_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel);
+/* The MFC status reads and the machine-status read are latched context state
+ * and never block; the compact form returns them ahead of the full entry. */
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
+{
+    if (g_spu_dispatch_gates.fast_path > 0) {
+        if (channel_is_mfc(channel))
+            return spu_make_preferred_u32(mfc_channel_read(NULL, ctx, channel));
+        if (channel == SPU_RdMachStat)
+            return spu_make_preferred_u32(ctx->int_enable & 1u);
+    }
+    return spu_rdch_full(ctx, channel);
+}
+static SPU_DMA_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel)
 {
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
@@ -2153,7 +2189,20 @@ static int spu_verified_cover_any(uint32_t lsa, uint32_t size)
     if (!size || lsa >= SPU_LS_SIZE) return 0;
     uint32_t last = lsa + size - 1u;
     if (last >= SPU_LS_SIZE) last = SPU_LS_SIZE - 1u;
-    for (uint32_t b = lsa >> SPU_VERIFIED_COVER_SHIFT; b <= last >> SPU_VERIFIED_COVER_SHIFT; ++b)
+    const uint32_t b0 = lsa >> SPU_VERIFIED_COVER_SHIFT, b1 = last >> SPU_VERIFIED_COVER_SHIFT;
+    if (spu_fast_path_on()) {
+        /* The same test a byte at a time: a 16 KiB transfer covers 128 bits
+         * of the map, sixteen bytes, instead of 128 single-bit probes. */
+        for (uint32_t i = b0 >> 3; i <= b1 >> 3; ++i) {
+            uint8_t m = __atomic_load_n(&s_verified_cover[i], __ATOMIC_RELAXED);
+            if (!m) continue;
+            if (i == b0 >> 3) m &= (uint8_t)(0xFFu << (b0 & 7u));
+            if (i == b1 >> 3) m &= (uint8_t)(0xFFu >> (7u - (b1 & 7u)));
+            if (m) return 1;
+        }
+        return 0;
+    }
+    for (uint32_t b = b0; b <= b1; ++b)
         if ((__atomic_load_n(&s_verified_cover[b >> 3], __ATOMIC_RELAXED) >> (b & 7u)) & 1u) return 1;
     return 0;
 }
