@@ -3866,11 +3866,15 @@ static int spu_ibhist_cmp(const void* a, const void* b)
     const uint64_t x = ((const spu_ibhist_ent*)a)->n, y = ((const spu_ibhist_ent*)b)->n;
     return x < y ? 1 : x > y ? -1 : 0;
 }
-static void spu_ibhist_note(const spu_context* ctx)
+static int spu_ibhist_armed(void)
 {
     static int on = -1;
     if (on < 0) { const char* e = getenv("SPU_IBHIST"); on = e && e[0] == '1'; }
-    if (!on) return;
+    return on;
+}
+static void spu_ibhist_note(const spu_context* ctx)
+{
+    if (!spu_ibhist_armed()) return;
     const uint32_t pc = ctx->pc & SPU_LS_MASK;
     const int kind = (pc == (ctx->gpr[0]._u32[0] & SPU_LS_MASK)) | (pc == ctx->drain_ret_pc) << 1;
     const int ovl = ctx->resident_ovl;
@@ -3904,6 +3908,7 @@ static void spu_ibhist_note(const spu_context* ctx)
 }
 #else
 static void spu_ibhist_note(const spu_context* ctx) { (void)ctx; }
+static int spu_ibhist_armed(void) { return 0; }
 #endif
 
 static int spu_ib_diagnostics_armed(void)
@@ -3917,7 +3922,12 @@ static int spu_ib_diagnostics_armed(void)
     return value;
 }
 
-void spu_indirect_branch(spu_context* ctx)
+/* PS3RECOMP_SPU_DISPATCH_FAST: a lookup the fast path below already made for
+ * this context and pc, handed to the full resolver so a miss is not resolved
+ * twice. Set immediately before the tail call into it, taken at its entry. */
+static SPU_TLS struct { const spu_context* ctx; uint32_t pc; spu_fn fn; } t_ib_pre;
+
+static void spu_indirect_branch_full(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
@@ -3925,6 +3935,13 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    spu_fn ib_pre = NULL;
+    int ib_have_pre = 0;
+    if (t_ib_pre.ctx) {
+        ib_have_pre = t_ib_pre.ctx == ctx && t_ib_pre.pc == (uint32_t)(ctx->pc & SPU_LS_MASK);
+        ib_pre = t_ib_pre.fn;
+        t_ib_pre.ctx = NULL;
+    }
     spu_ibhist_note(ctx);
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
@@ -4104,7 +4121,7 @@ void spu_indirect_branch(spu_context* ctx)
         if (ti) ctx->resident_task = ti;
     }
     /* Use the same ownership order as the interpreter's rejoin probe. */
-    spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
+    spu_fn fn = ib_have_pre ? ib_pre : spu_lifted_lookup(ctx, ctx->pc);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
@@ -4558,6 +4575,64 @@ void spu_indirect_branch(spu_context* ctx)
             ctx->ls[0x2d4ec],ctx->ls[0x2d4ed],ctx->ls[0x2d4ee],ctx->ls[0x2d4ef]); }
     } }
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
+}
+
+/* Indirect-branch dispatch. With PS3RECOMP_SPU_DISPATCH_FAST=1 the common
+ * case runs here, short of the full resolver's prologue (a few thousand
+ * instructions of special cases and diagnostics, and the frame they need):
+ * every condition below is one under which the full resolver does nothing
+ * before and after its lookup but mask the pc, settle the resident task and
+ * check for a stack-reset entry. Those are the same steps taken here, so the
+ * resolved function runs on the same state. Anything else -- saved interrupt
+ * registers, a policy-module service address, the taskset syscall address,
+ * the resolver-only image, a task resume that unwinds to depth zero, a miss,
+ * the job-return address, or any diagnostic switch -- goes to the full
+ * resolver, with the lookup already made handed over. */
+void spu_indirect_branch(spu_context* ctx)
+{
+    if (spu_dispatch_fast()) {
+        int plain = g_spu_dispatch_gates.ib_plain;
+        if (plain < 0) {
+            plain = !spu_ibhist_armed() && !spu_ib_diagnostics_armed() &&
+                    !getenv("SPU_JOBTRACE") && !getenv("LBP_HLE_JOBDONE") && !getenv("SPU_JOBEXEC");
+            g_spu_dispatch_gates.ib_plain = plain;
+        }
+        const uint32_t pc = (uint32_t)(ctx->pc & SPU_LS_MASK);
+        if (plain && !ctx->irq_saved && pc != SPURS_TASKSET_PM_SYSCALL_LS &&
+            ctx->image_id != SPU_RESOLVER_ONLY_IMAGE_ID &&
+            !(ctx->policy_mode && (pc == SPURS_PM_EXIT_TO_KERNEL_LS || pc == SPURS_PM_SELECT_WORKLOAD_LS))) {
+            int ti = 0;
+            if (pc >= SPU_TASKSET_TASK_LO) {
+                ti = spu_taskset_resident_image(ctx);
+                if (ti && !ctx->resident_task && ctx->host_depth && s_spu_halt_armed && !ctx->policy_mode)
+                    goto full;   /* the task resume that restarts at depth zero */
+            }
+            ctx->pc = pc;
+            if (pc < SPU_TASKSET_TASK_LO) {
+                ctx->resident_task = 0;
+            } else {
+                if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(pc);
+                if (ti) ctx->resident_task = ti;
+            }
+            spu_fn fn = spu_lifted_lookup(ctx, pc);
+            if (fn && (ctx->policy_mode || pc != SPU_JOB_RETURN_LS)) {
+                spu_check_stack_reset(ctx, fn);
+#if defined(__clang__)
+                __attribute__((musttail)) return fn(ctx);
+#else
+                fn(ctx);
+                return;
+#endif
+            }
+            t_ib_pre.ctx = ctx; t_ib_pre.pc = pc; t_ib_pre.fn = fn;
+        }
+    }
+full:;
+#if defined(__clang__)
+    __attribute__((musttail)) return spu_indirect_branch_full(ctx);
+#else
+    spu_indirect_branch_full(ctx);
+#endif
 }
 
 /* ===========================================================================
