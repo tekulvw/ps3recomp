@@ -37,9 +37,11 @@ with tempfile.TemporaryDirectory(prefix='spu-dcache-coverage-') as td:
         cmd=[os.environ.get('CC','cc'),'-std=gnu17','-O2','-UNDEBUG',*flags,'-I'+str(p),'-I'+str(ROOT/'include'),'-I'+str(SPU),'-I'+str(ROOT/'runtime/platform'),str(SPU/'tests/test_spu_dcache_coverage.c'),*[str(SPU/(u+'.c')) for u in units],str(ROOT/'runtime/platform/win32_compat.c'),str(ROOT/'runtime/diagnostics/job_io_recorder.c'),'-pthread','-lm','-o',str(exe)]
         build=subprocess.run(cmd,capture_output=True,text=True,timeout=60);assert not build.returncode,build.stdout+build.stderr
         results=[]
-        for mode in (['1','shadow'] if midpublication else ['0','1','shadow']):
-            result=subprocess.run([str(exe)],env=dict(env,SPU_DISPATCH_CACHE=mode),capture_output=True,text=True,timeout=10)
-            print(name,mode,result.returncode,result.stdout.strip(),flush=True);results.append(result)
+        for slot in ('0','1'):
+            for mode in (['1','shadow'] if midpublication else ['0','1','shadow']):
+                result=subprocess.run([str(exe)],env=dict(env,SPU_DISPATCH_CACHE=mode,SPU_DCACHE_SLOT_RESIDENCY=slot),
+                                      capture_output=True,text=True,timeout=10)
+                print(name,'slot='+slot,mode,result.returncode,result.stdout.strip(),flush=True);results.append(result)
         return results
     for name,san in [('o2',False),('ubsan',True)]:
         for result in run(name,original,san):assert not result.returncode,result.stdout+result.stderr
@@ -63,6 +65,17 @@ with tempfile.TemporaryDirectory(prefix='spu-dcache-coverage-') as td:
             results=run('mutant-'+name,mutant)
             assert any(r.returncode and 'FAIL:' in r.stdout for r in results),(name,results)
             print('PASS rejected bug control:',name,flush=True)
+        if 'spu_dcache_slot_same' in original:
+            controls={
+                'slot-state':('return (st == 0 || st == SPU_OVERLAY_VERIFIED) && st == e->rstate && same_identity;','return same_identity;'),
+                'slot-identity':('return (st == 0 || st == SPU_OVERLAY_VERIFIED) && st == e->rstate && same_identity;','(void)same_identity; return (st == 0 || st == SPU_OVERLAY_VERIFIED) && st == e->rstate;'),
+                'slot-cover':('if (s != e->rslot) return 0;','/* bug: covering slot not compared */'),
+            }
+            for name,(old,new) in controls.items():
+                assert original.count(old)==1,(name,original.count(old))
+                results=run('mutant-'+name,original.replace(old,new))
+                assert any(r.returncode and 'FAIL:' in r.stdout for r in results),(name,results)
+                print('PASS rejected bug control:',name,flush=True)
         if 'spu_dcache_coverage_mask' in original:
             controls={
                 'overlap-mask':('if(lsa>=s_verified_images[i].lo && lsa<s_verified_images[i].hi)',
