@@ -564,7 +564,11 @@ typedef struct spu_dispatch_gates {
     int ovl_stats;                /* overlay residency statistics wanted       */
     char pad[64 - 5 * sizeof(int)];
 } spu_dispatch_gates;
+#ifdef __cplusplus
+static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
+#else
 _Static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
+#endif
 SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, {0} };
 static inline int spu_ls_wws_probe_on(void)
 {
