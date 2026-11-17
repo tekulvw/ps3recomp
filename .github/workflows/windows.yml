@@ -153,6 +153,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /clang:-ffp-contract=off /clang:-march=x86-64-v4 /DSPU_FLOAT_X86_RZ=1 /DSPU_EXPECT_X86_RZ=1 /I include /I runtime/spu /Fe:test_spu_float_exact_rz.exe runtime/spu/tests/test_spu_float_exact.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /clang:-march=x86-64-v4 /DSPU_FLOAT_X86_RZ=1 /I include /I runtime/spu /Fe:test_spu_float_avx512.exe runtime/spu/tests/test_spu_float_avx512.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.

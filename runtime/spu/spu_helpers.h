@@ -1112,10 +1112,10 @@ SPU__X8_INLINE u128 spu__x8_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t 
     const int redo = spu__x8_mask(_mm_andnot_si128(zp, _mm_or_si128(bad, ext)));
     return spu__x8_st(redo ? spu__x8_fma_w(x, y, z, redo) : r);
 }
-#if defined(SPU_FLOAT_X86_RZ) && SPU_FLOAT_X86_RZ && defined(__AVX512F__) && defined(__AVX512VL__)
+#if defined(SPU_FLOAT_X86_RZ) && SPU_FLOAT_X86_RZ && defined(__AVX512F__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
 #define SPU_FLOAT_X86_RZ_ACTIVE 1
-/* SPU_FLOAT_X86_RZ (opt-in, compile time; takes effect only where the build targets AVX-512 F and
- * VL, e.g. -march=x86-64-v4; an AVX2 build with the switch keeps the exact forms below): the
+/* SPU_FLOAT_X86_RZ (opt-in, compile time; takes effect only where the build targets AVX-512 F,
+ * VL and DQ, e.g. -march=x86-64-v4; an AVX2 build with the switch keeps the exact forms below): the
  * operation itself in single precision, rounded toward zero by the instruction's own embedded
  * rounding control (EVEX {rz-sae}), so no thread floating-point state is read or changed. The
  * x86 counterpart of SPU_FLOAT_RZ on arm64. The rules, which are the SPU's:
@@ -1369,7 +1369,26 @@ SPU__SF_V2(spu_fceq_ref,  spu__sf_key(x) == spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
 SPU__SF_V2(spu_fcgt_ref,  spu__sf_key(x) >  spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
 SPU__SF_V2(spu_fcmeq_ref, spu__sf_mag(x) == spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
 SPU__SF_V2(spu_fcmgt_ref, spu__sf_mag(x) >  spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
-#if (defined(__SSE2__) || defined(_M_X64)) && !defined(SPU_SCALAR_HELPERS)
+#if defined(SPU_FLOAT_X86_RZ_ACTIVE)
+/* SPU_FLOAT_X86_RZ: the AVX-512 forms of the SSE2 compares below (tests/test_spu_float_avx512.c
+ * checks them against the _ref loops). The same keys: an SPU zero has magnitude 0, a magnitude is
+ * the low 31 bits, the key is the magnitude negated for a set sign bit; all fit int32. */
+static inline __attribute__((always_inline)) __m128i spu__xr_mag(__m128i x) {
+    return _mm_maskz_and_epi32(_mm_test_epi32_mask(x, _mm_set1_epi32(0x7F800000)), x, _mm_set1_epi32(0x7FFFFFFF));
+}
+static inline __attribute__((always_inline)) __m128i spu__xr_key(__m128i x) {
+    const __m128i m = spu__xr_mag(x);
+    return _mm_mask_sub_epi32(m, _mm_movepi32_mask(x), _mm_setzero_si128(), m);
+}
+#define SPU__XR_CMP(name, cmp, key) static inline __attribute__((always_inline)) u128 name(u128 a, u128 b) { \
+    __m128i A, B; memcpy(&A, &a, 16); memcpy(&B, &b, 16); \
+    const __m128i r = _mm_movm_epi32(cmp(key(A), key(B))); u128 out; memcpy(&out, &r, 16); return out; }
+SPU__XR_CMP(spu_fceq,  _mm_cmpeq_epi32_mask, spu__xr_key)
+SPU__XR_CMP(spu_fcgt,  _mm_cmpgt_epi32_mask, spu__xr_key)
+SPU__XR_CMP(spu_fcmeq, _mm_cmpeq_epi32_mask, spu__xr_mag)
+SPU__XR_CMP(spu_fcmgt, _mm_cmpgt_epi32_mask, spu__xr_mag)
+#undef SPU__XR_CMP
+#elif (defined(__SSE2__) || defined(_M_X64)) && !defined(SPU_SCALAR_HELPERS)
 #include <emmintrin.h>
 /* SSE2 forms (tests/test_spu_helpers.c checks them against the _ref loops,
  * which compilers leave scalar and branchy). A magnitude is at most
@@ -1881,7 +1900,7 @@ static const uint32_t spu_frsqest_fraction_lut[64] = {
     0x4180D7, 0x4180D7, 0x3E24CC, 0x3E24CC, 0x3AF4C3, 0x3AF4C3, 0x37E8BA, 0x37E8BA
 };
 
-static inline u128 spu_frsqest(u128 a) {
+static inline u128 spu_frsqest_ref(u128 a) {
     u128 r;
     for (int i = 0; i < 4; i++) {
         uint32_t bits = a._u32[i];
@@ -1896,7 +1915,7 @@ static inline u128 spu_frsqest(u128 a) {
 }
 /* frest: reciprocal estimate (refined by the following spu_fi Newton step).
  * Full-precision 1/x is exact after fi and >= HW-estimate accuracy. */
-static inline u128 spu_frest(u128 a) {
+static inline u128 spu_frest_ref(u128 a) {
     u128 r;
     for (int i = 0; i < 4; i++) {
         uint32_t bits = a._u32[i];
@@ -1911,6 +1930,40 @@ static inline u128 spu_frest(u128 a) {
     }
     return r;
 }
+#if defined(SPU_FLOAT_X86_RZ_ACTIVE)
+/* SPU_FLOAT_X86_RZ: the two estimates with the table lookup done by vpermi2d over the whole table
+ * (tests/test_spu_float_avx512.c checks every sign, exponent and table index against the loops
+ * above). Same fields, same table, same exponent rule. */
+static inline __attribute__((always_inline)) __m128i spu__xr_lut32(const uint32_t* t, __m128i idx) {
+    /* 32 entries: index bits 0-4 select across the two 16-entry halves */
+    return _mm512_castsi512_si128(_mm512_permutex2var_epi32(_mm512_loadu_si512((const void*)t),
+        _mm512_zextsi128_si512(idx), _mm512_loadu_si512((const void*)(t + 16))));
+}
+static inline u128 spu_frest(u128 a) {
+    __m128i x; memcpy(&x, &a, 16);
+    const __m128i e = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));
+    __m128i rexp = _mm_sub_epi32(_mm_set1_epi32(253), e);
+    rexp = _mm_maskz_mov_epi32(_mm_cmplt_epi32_mask(e, _mm_set1_epi32(253)), rexp);           /* exp >= 253: 0 */
+    rexp = _mm_mask_mov_epi32(rexp, _mm_testn_epi32_mask(e, e), _mm_set1_epi32(255));         /* exp 0: 255 */
+    const __m128i frac = _mm_and_si128(spu__xr_lut32(spu_frest_fraction_lut, _mm_srli_epi32(x, 18)), _mm_set1_epi32(0x7FFFFF));
+    const __m128i r = _mm_or_si128(_mm_or_si128(_mm_and_si128(x, _mm_set1_epi32((int)0x80000000u)), _mm_slli_epi32(rexp, 23)), frac);
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+static inline u128 spu_frsqest(u128 a) {
+    __m128i x; memcpy(&x, &a, 16);
+    const __m128i e = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));
+    __m128i rexp = _mm_sub_epi32(_mm_set1_epi32(190), _mm_srli_epi32(_mm_add_epi32(e, _mm_set1_epi32(1)), 1));
+    rexp = _mm_mask_mov_epi32(rexp, _mm_testn_epi32_mask(e, e), _mm_set1_epi32(255));         /* exp 0: 255 */
+    const __m128i idx = _mm_srli_epi32(x, 18);                                                 /* bits 0-5 used */
+    const __m128i lo = spu__xr_lut32(spu_frsqest_fraction_lut, idx), hi = spu__xr_lut32(spu_frsqest_fraction_lut + 32, idx);
+    const __m128i frac = _mm_and_si128(_mm_mask_mov_epi32(lo, _mm_test_epi32_mask(idx, _mm_set1_epi32(32)), hi), _mm_set1_epi32(0x7FFFFF));
+    const __m128i r = _mm_or_si128(_mm_slli_epi32(rexp, 23), frac);
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+#else
+static inline u128 spu_frest(u128 a) { return spu_frest_ref(a); }
+static inline u128 spu_frsqest(u128 a) { return spu_frsqest_ref(a); }
+#endif
 
 /* ---- Phase 3: sign extension ----
  * LE host: low sub-lane = _u8[2i] / _s16[2i] / _s32[2i] (the byte/half/word

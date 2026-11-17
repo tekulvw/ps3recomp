@@ -157,7 +157,7 @@ jobs:
           for isa in -msse4.1 -march=x86-64-v3 -march=x86-64-v4 "-march=x86-64-v3 -DSPU_FLOAT_X86_RZ=1 -DSPU_EXPECT_X86_RZ=0" "-march=x86-64-v4 -DSPU_FLOAT_X86_RZ=1 -DSPU_EXPECT_X86_RZ=1"; do
             case "$isa" in -march=x86-64-v3*) if ! grep -q avx2 /proc/cpuinfo; then echo "no AVX2: $isa skipped"; continue; fi;; esac
             case "$isa" in -march=x86-64-v4*) if ! grep -q avx512bw /proc/cpuinfo; then echo "no AVX-512: $isa skipped"; continue; fi;; esac
-            for t in test_spu_float_convert test_spu_float_exact; do
+            for t in test_spu_float_convert test_spu_float_exact test_spu_float_avx512; do
               ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
                 -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off $isa -I include -I runtime/spu \
                 -o /tmp/$t runtime/spu/tests/$t.c -lm
