@@ -64,8 +64,9 @@ extern void spu_halt(spu_context*);
  * ended where it should not have (spurs_policy.c, [pm-end]). */
 /* One thread-local object: every Darwin TLV access is a call, and this runs
  * on every drain transfer. */
-typedef struct spu_recent_history { uint32_t pc[32]; uint32_t n; } spu_recent_history;
-static _Thread_local spu_recent_history t_recent;
+/* Shared with spu_direct_tail_note (spu_context.h), which records the same step. */
+SPU_THREAD_LOCAL spu_recent_history g_spu_recent;
+#define t_recent g_spu_recent
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 {
     unsigned n = t_recent.n < 32 ? t_recent.n : 32, k = n < max ? n : max;
@@ -444,6 +445,28 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
         fflush(stderr);
     }
     { extern void spu_halt(spu_context*); spu_halt(ctx); }
+}
+
+/* spu_context.h, "Direct tail calls": 1 once a --direct-tail image registered
+ * with nothing that needs every transfer in the drain armed process-wide. */
+int g_spu_direct_tail_on;
+void spu_direct_tail_image(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    const char* e = getenv("PS3RECOMP_SPU_DIRECT_TAIL");
+    const char* why = (e && !strcmp(e, "0")) ? "PS3RECOMP_SPU_DIRECT_TAIL=0"
+                    : spu_task_launch_diagnostics() ? "step diagnostics"
+                    : spu_tailret_enabled() ? "SPU_TAILRET"
+                    : spu_region_scope_enabled() ? "region scope"
+                    : getenv("SPU_PCHIST") ? "SPU_PCHIST" : NULL;
+#ifndef SPU_DIRECT_TAIL_SUPPORTED
+    if (!why) why = "not built with clang musttail";
+#endif
+    __atomic_store_n(&g_spu_direct_tail_on, why ? 0 : 1, __ATOMIC_RELAXED);
+    fprintf(stderr, "[spu] direct tail calls between lifted functions: %s%s%s\n",
+            why ? "off (" : "on", why ? why : "", why ? ")" : "");
 }
 
 /* See spu_context.h. Env-gated: SPU_TAILRET=1. */

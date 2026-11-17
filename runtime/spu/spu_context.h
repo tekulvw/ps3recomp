@@ -1006,6 +1006,74 @@ static inline void spu_pchist_tick(const spu_context* ctx)
         }                                                      \
     } while (0)
 
+/* ---- Direct tail calls between lifted functions (spu_lifter.py --direct-tail) ----
+ *
+ * A cross-function transfer to a known lifted function normally sets ctx->pc
+ * and g_spu_trampoline_fn and returns, and the enclosing drain calls the
+ * pointer. A --direct-tail image instead tail-calls the same pointer
+ * (frame replaced, no host-stack growth) when every duty the drain performs
+ * per transfer is a no-op at that moment, and otherwise takes the drain path:
+ *   - interrupt delivery: the drain delivers only when interrupts are enabled
+ *     and an enabled event is pending. The guard reads the same fields the
+ *     same way the drain does (plain loads; raisers on other threads set them
+ *     atomically) and sends exactly that case to the drain. The guard runs at
+ *     every transfer, so an event raised meanwhile is seen at the next one, as
+ *     the drain sees it at the next hop.
+ *   - the reservation-lost poll (event mask bit 0x400), the lockstep tick,
+ *     stack-reset entries and the task-launch checkpoint's slow path: any of
+ *     them armed sends the transfer to the drain.
+ *   - the checkpoint's fast path (steps, recent-pc ring), the drain's pc ring
+ *     and the region-dispatch reset are done by spu_direct_tail_note.
+ * Process-wide modes that cannot change while running (the kill switch
+ * PS3RECOMP_SPU_DIRECT_TAIL=0, step diagnostics, SPU_TAILRET, region scope,
+ * SPU_PCHIST) are folded into g_spu_direct_tail_on when a --direct-tail image
+ * registers (spu_direct_tail_image). With it on, spu_drain_call also keeps
+ * drain_ret_pc naming the innermost live drain across returns, which a drain
+ * otherwise re-establishes at its next hop (see spu_drain.c).
+ * Builds without clang musttail compile the guard to 0: the drain path. */
+typedef struct spu_recent_history { uint32_t pc[32]; uint32_t n; } spu_recent_history;
+extern SPU_THREAD_LOCAL spu_recent_history g_spu_recent;   /* last drain-step pcs, this thread */
+extern int g_spu_direct_tail_on;
+void spu_direct_tail_image(void);
+extern volatile int g_yz_lockstep_on;
+extern void* volatile g_pm_flow_ctx;
+static inline int spu_direct_tail_ok(const spu_context* ctx) {
+    return __atomic_load_n(&g_spu_direct_tail_on, __ATOMIC_RELAXED) == 1 &&
+           !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask)) &&
+           !((ctx)->event_mask & 0x400u) &&
+           g_yz_lockstep_on == 0 && !g_pm_flow_ctx &&
+           !spu_stack_reset_needed(ctx) &&
+           (!(ctx)->steps || ((ctx)->pc & SPU_LS_MASK));
+}
+#ifdef SPU_DIRECT_TAIL_TEST_COUNT
+extern unsigned long long g_spu_direct_tail_count;   /* synthetic tests: tail calls admitted */
+#endif
+static inline void spu_direct_tail_note(spu_context* ctx) {
+    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+#ifdef SPU_DIRECT_TAIL_TEST_COUNT
+    g_spu_direct_tail_count++;
+#endif
+    spu_recent_history* r = &g_spu_recent;
+    r->pc[r->n++ & 31] = pc;
+    ctx->steps++;
+    g_spu_pch[g_spu_pch_n++ & 7u] = pc;
+    ctx->region_dispatch_valid = 0;
+}
+#if defined(__clang__) && defined(__has_attribute)
+#  if __has_attribute(musttail) && (defined(__x86_64__) || defined(_M_X64) || \
+                                    defined(__aarch64__) || defined(_M_ARM64))
+#    define SPU_DIRECT_TAIL_SUPPORTED 1
+#  endif
+#endif
+#ifdef SPU_DIRECT_TAIL_SUPPORTED
+#  define SPU_MUSTTAIL __attribute__((musttail))
+#  define SPU_DIRECT_TAIL_OK(ctx) spu_direct_tail_ok(ctx)
+#else
+#  define SPU_MUSTTAIL
+#  define SPU_DIRECT_TAIL_OK(ctx) 0
+#endif
+#define SPU_DIRECT_TAIL_NOTE(ctx) spu_direct_tail_note(ctx)
+
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
  * resume / restack unwind) so dispatch to the link register instead -- faithful
