@@ -1310,7 +1310,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     { static int s_ds = -1;
       if (s_ds < 0) { const char* e = getenv("SPU_DMA_SHAPE_STATS"); s_ds = e && !strcmp(e, "1"); }
       if (s_ds) {
-          static SPU_THREAD_LOCAL struct { unsigned long long n, c[3][2][5], bytes[3]; } t_ds;
+          static SPU_THREAD_LOCAL struct { unsigned long long n, c[3][2][5], bytes[3], next_ms; unsigned id; } t_ds;
+          static unsigned s_ds_threads;
           const uint32_t fam = cmd & 0xF0u;
           const int kind = fam == 0x40u ? 0 : fam == 0x20u ? 1 : 2;
           const int list = kind < 2 && (cmd & 0x04u);
@@ -1319,9 +1320,13 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                              : (q <= 16 ? 0 : q <= 128 ? 1 : q <= 1024 ? 2 : q <= 4096 ? 3 : 4);
           t_ds.c[kind][list][b]++;
           if (!list) t_ds.bytes[kind] += size;
-          if ((++t_ds.n & ((1ull << 18) - 1)) == 0) {
+          if ((++t_ds.n & 1023u) == 0 && GetTickCount64() >= t_ds.next_ms) {
+              /* Cumulative, at most once a second per thread. */
               static const char* const kn[3] = { "get", "put", "other" };
-              fprintf(stderr, "[dma-shape] spu_thread cmds=%llu", t_ds.n);
+              const unsigned long long now = GetTickCount64();
+              t_ds.next_ms = now + 1000;
+              if (!t_ds.id) t_ds.id = __atomic_add_fetch(&s_ds_threads, 1u, __ATOMIC_RELAXED);
+              fprintf(stderr, "[dma-shape] t_ms=%llu thread=%u cmds=%llu", now, t_ds.id, t_ds.n);
               for (int k = 0; k < 3; ++k) {
                   fprintf(stderr, " | %s bytes=%llu single<=16,128,1K,4K,more=%llu,%llu,%llu,%llu,%llu",
                           kn[k], t_ds.bytes[k], t_ds.c[k][0][0], t_ds.c[k][0][1], t_ds.c[k][0][2],
