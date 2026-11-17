@@ -3,9 +3,9 @@
 its scalar loop (libs/video/tests/test_vertex_fetch_simd.c). Builds and runs
 the fixture for the host; on an arm64 macOS host with Rosetta it also builds
 the x86-64 SSE4.1 form and runs it under `arch -x86_64`, so both vector paths
-are checked from one machine. --mutants also builds each listed mutation of
-the vector code and requires the fixture to catch it. Synthetic inputs only;
-POSIX (the fixture uses mmap guard pages)."""
+are checked from one machine. On Windows it builds with clang-cl (CC
+overrides). --mutants also builds each listed mutation of the vector code and
+requires the fixture to catch it. Synthetic inputs only."""
 from pathlib import Path
 import argparse
 import os
@@ -54,7 +54,9 @@ def targets():
     """(label, extra compile flags, run prefix) for every form this host can run."""
     machine = platform.machine().lower()
     out = []
-    if machine in ("x86_64", "amd64"):
+    if os.name == "nt":
+        out.append(("x86-64 sse4.1 (clang-cl)", ["/clang:-msse4.1"], []))
+    elif machine in ("x86_64", "amd64"):
         out.append(("x86-64 sse4.1", ["-msse4.1"], []))
     else:
         out.append((machine, [], []))
@@ -66,9 +68,15 @@ def targets():
 
 def build_and_run(label, flags, prefix, source, tmp, expect_pass, quiet):
     binary = Path(tmp) / ("fixture-" + label.replace(" ", "-").replace("(", "").replace(")", ""))
-    cc = os.environ.get("CC", "cc")
-    command = [cc, "-std=gnu17", "-O2", "-Wall", "-Wextra", "-Wno-unused-parameter", "-I", str(ROOT / "include"),
-               "-I", str(ROOT / "libs/video"), *flags, "-o", str(binary), str(FIXTURE), str(source), *map(str, OTHER)]
+    if os.name == "nt":
+        binary = binary.with_suffix(".exe")
+        cl = os.environ.get("CC", "clang-cl")
+        command = [cl, "/nologo", "/O2", "/W3", "/I", str(ROOT / "include"), "/I", str(ROOT / "libs/video"), *flags,
+                   f"/Fo{tmp}\\", f"/Fe:{binary}", str(FIXTURE), str(source), *map(str, OTHER)]
+    else:
+        cc = os.environ.get("CC", "cc")
+        command = [cc, "-std=gnu17", "-O2", "-Wall", "-Wextra", "-Wno-unused-parameter", "-I", str(ROOT / "include"),
+                   "-I", str(ROOT / "libs/video"), *flags, "-o", str(binary), str(FIXTURE), str(source), *map(str, OTHER)]
     subprocess.run(command, cwd=ROOT, check=True, timeout=300)
     result = subprocess.run([*prefix, str(binary)], cwd=ROOT, capture_output=True, text=True, timeout=600)
     passed = result.returncode == 0
@@ -83,9 +91,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mutants", action="store_true", help="also build each mutant and require a failure")
     args = parser.parse_args()
-    if os.name != "posix":
-        print("SKIP: POSIX only")
-        return 0
     failures = []
     with tempfile.TemporaryDirectory(prefix="vertex-fetch-simd-") as tmp:
         for label, flags, prefix in targets():
