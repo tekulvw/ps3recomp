@@ -540,6 +540,31 @@ SPU_GATE int g_wws_read_probe = 0;
 SPU_GATE int g_spu_ls_rdiag   = -1;  /* any read diagnostic armed (see above)   */
 SPU_GATE int g_spu_ls_wdiag   = -1;  /* any write diagnostic armed              */
 SPU_GATE int g_spu_wws_probe  = -1;  /* SPU_WWS_PROBE: the WWS buffer/code logs */
+
+/* The read-mostly gates the dispatch path tests on every transfer, lookup and
+ * drain hop, kept in one cache line of their own. The originals are file
+ * statics and globals the linker places where it likes: on both the Linux and
+ * the Windows engine the dispatch cache's mode flag shared a line with the
+ * overlay residency counters every SPU thread incremented, so each lookup
+ * started with a cross-core miss (those counters are now kept only while
+ * their statistics are on, spu_channels.c). Each copy is filled from its
+ * original on first use (-1 = not read yet) and never differs from it
+ * afterwards: the sources are fixed once read, except the stack-reset count,
+ * whose only writer updates both. */
+#if defined(_MSC_VER)
+#  define SPU_LINE_ALIGNED __declspec(align(64))
+#else
+#  define SPU_LINE_ALIGNED __attribute__((aligned(64)))
+#endif
+typedef struct spu_dispatch_gates {
+    int dcache_mode;              /* spu_dcache_mode(): 0 off, 1 on, 2 shadow  */
+    int region_scope;             /* spu_region_scope_enabled()                */
+    int task_diag;                /* spu_task_launch_diagnostics()             */
+    unsigned stack_reset_count;   /* g_spu_stack_reset_count                   */
+    int ovl_stats;                /* overlay residency statistics wanted       */
+    char pad[64 - 5 * sizeof(int)];
+} spu_dispatch_gates;
+SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, {0} };
 static inline int spu_ls_wws_probe_on(void)
 {
     if (g_spu_wws_probe < 0) g_spu_wws_probe = getenv("SPU_WWS_PROBE") ? 1 : 0;
@@ -868,7 +893,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*));
 extern unsigned g_spu_stack_reset_count;
 static inline int spu_stack_reset_needed(const spu_context* ctx) {
-    unsigned count=__atomic_load_n(&g_spu_stack_reset_count,__ATOMIC_ACQUIRE);
+    unsigned count=__atomic_load_n(&g_spu_dispatch_gates.stack_reset_count,__ATOMIC_ACQUIRE);
     return count && ctx->host_depth && !ctx->policy_mode;
 }
 /* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
@@ -894,12 +919,9 @@ int  spu_tailret_enabled(void);
 extern int g_spu_region_scope_mode;
 int spu_region_scope_enabled(void);
 static inline int spu_region_scope_on(void) {
-#if defined(_MSC_VER)
-    return spu_region_scope_enabled();
-#else
-    int mode=__atomic_load_n(&g_spu_region_scope_mode,__ATOMIC_RELAXED);
-    return mode ? mode==2 : spu_region_scope_enabled();
-#endif
+    int r = g_spu_dispatch_gates.region_scope;
+    if (r < 0) g_spu_dispatch_gates.region_scope = r = spu_region_scope_enabled();
+    return r;
 }
 static inline void spu_region_dispatch_invoke(spu_context* ctx,
     void (*fn)(spu_context*), int has_return, uint32_t return_pc) {
