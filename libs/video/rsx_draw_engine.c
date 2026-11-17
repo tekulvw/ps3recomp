@@ -1028,6 +1028,8 @@ static void original_rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pi
     }
 }
 
+/* color_target_write calls so far (PS3RECOMP_RSX_PRESENT_SKIP_UNCHANGED). */
+static u64 s_present_target_writes;
 static void original_rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
 {
     if (!g.ready || !g.be->color_target_write || !pitch || !w || !h) return;
@@ -1056,6 +1058,7 @@ static void original_rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 p
         fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u -> surface 0x%08X at %u,%u:"
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                 eng_nonzero_pixels(rows, w * h, 4u));
+    s_present_target_writes++;
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
 }
 
@@ -4847,6 +4850,26 @@ static u32 eng_present_surface(u32 buffer_id)
     return eng_current_surface();
 }
 
+/* PS3RECOMP_RSX_PRESENT_SKIP_UNCHANGED=1 (default off; read at engine init):
+ * a present of the surface the previous present showed, holding the same
+ * image -- the same surface slot and backend handle, no colour write since
+ * (draws and clears bump its color_serial, native images too) and no guest
+ * pixels written into any colour target since -- is skipped and counted. The
+ * image on screen is the one it would have shown again. Under
+ * PS3RECOMP_RSX_PRESENT_THREAD each present otherwise costs the presenting
+ * thread a staging copy, whether or not the frame changed. Every present,
+ * shown or skipped, is counted by origin. */
+static int s_present_skip = -1;
+static struct { int valid; u32 slot, handle; u64 serial, writes; } s_last_shown;
+static unsigned long long s_present_by[3], s_present_skipped;   /* flip, host, buffer */
+static int s_present_origin;            /* 0 flip (FIFO), 1 host, 2 present_buffer */
+static void eng_present_report(void)
+{
+    const unsigned long long n = s_present_by[0] + s_present_by[1] + s_present_by[2];
+    if (!n || n % 2000ull) return;
+    fprintf(stderr, "[rsx engine] presents: fifo-flip=%llu host=%llu buffer=%llu skipped-unchanged=%llu\n",
+            s_present_by[0], s_present_by[1], s_present_by[2], s_present_skipped);
+}
 static void eng_present_core(u32 buffer_id);
 static void eng_present(u32 buffer_id)
 {
@@ -4872,6 +4895,22 @@ static void eng_present_core(u32 buffer_id)
                     i, g.surfaces[i].location, g.surfaces[i].offset,
                     g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
     }
+    s_present_by[s_present_origin]++;
+    if (s_present_skip < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_PRESENT_SKIP_UNCHANGED");
+        s_present_skip = e && !strcmp(e, "1");
+    }
+    const eng_surface* shown = &g.surfaces[target];
+    if (s_present_skip && s_last_shown.valid && s_last_shown.slot == target &&
+        s_last_shown.handle == shown->handle && s_last_shown.serial == shown->color_serial &&
+        s_last_shown.writes == s_present_target_writes) {
+        s_present_skipped++;
+        eng_present_report();
+        return;
+    }
+    s_last_shown.valid = 1; s_last_shown.slot = target; s_last_shown.handle = shown->handle;
+    s_last_shown.serial = shown->color_serial; s_last_shown.writes = s_present_target_writes;
+    eng_present_report();
     pd_present(target);
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
@@ -4914,6 +4953,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
           fprintf(stderr, "[rsx engine counts] flips=%u surfaces=%u/%u zdepths=%u/%u\n", flips,
                   (unsigned)g.n_surfaces, (unsigned)ENG_MAX_SURFACES,
                   (unsigned)g.n_zdepths, (unsigned)ENG_MAX_ZDEPTHS); }
+    s_present_origin = 0;
     eng_present(g.last_flip_buffer);
     if (eng_single_present()) s_flip_presented = 1;
 }
@@ -4971,6 +5011,7 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
      * first draw copies all of it into vp_cb. */
     g.vp_cb_serial = 1; g.vs_bound_serial = 0;
     eng_pkm_reset();
+    s_present_skip = -1; memset(&s_last_shown, 0, sizeof s_last_shown);   /* re-read per engine */
     { const char* e = getenv("PS3RECOMP_RSX_HOST_VERTEX_FORMATS");
       s_host_vf = e && !strcmp(e, "1") && g.be->pipeline_create_host && g.be->draw_host;
       if (e && !strcmp(e, "1") && !s_host_vf)
@@ -5220,12 +5261,14 @@ static void original_rsx_draw_engine_present(void)
             fprintf(stderr, "[rsx engine] single present: %llu host re-presents skipped\n", s_single_present_skipped);
         return;
     }
+    s_present_origin = 1;
     eng_present(g.last_flip_buffer);
 }
 
 static void original_rsx_draw_engine_present_buffer(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
+    s_present_origin = 2;
     eng_present(g.last_flip_buffer);
 }
 
