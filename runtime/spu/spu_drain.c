@@ -459,14 +459,14 @@ void spu_direct_tail_image(void)
     const char* why = (e && !strcmp(e, "0")) ? "PS3RECOMP_SPU_DIRECT_TAIL=0"
                     : spu_task_launch_diagnostics() ? "step diagnostics"
                     : spu_tailret_enabled() ? "SPU_TAILRET"
-                    : spu_region_scope_enabled() ? "region scope"
                     : getenv("SPU_PCHIST") ? "SPU_PCHIST" : NULL;
 #ifndef SPU_DIRECT_TAIL_SUPPORTED
     if (!why) why = "not built with clang musttail";
 #endif
-    __atomic_store_n(&g_spu_direct_tail_on, why ? 0 : 1, __ATOMIC_RELAXED);
-    fprintf(stderr, "[spu] direct tail calls between lifted functions: %s%s%s\n",
-            why ? "off (" : "on", why ? why : "", why ? ")" : "");
+    const int scope = spu_region_scope_enabled();
+    __atomic_store_n(&g_spu_direct_tail_on, why ? 0 : scope ? 2 : 1, __ATOMIC_RELAXED);
+    fprintf(stderr, "[spu] direct tail calls between lifted functions: %s%s%s%s\n",
+            why ? "off (" : "on", why ? why : "", why ? ")" : "", !why && scope ? " (region scope)" : "");
 }
 
 /* See spu_context.h. Env-gated: SPU_TAILRET=1. */

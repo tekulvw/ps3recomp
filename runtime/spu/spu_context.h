@@ -1031,9 +1031,10 @@ static inline void spu_pchist_tick(const spu_context* ctx)
  *   - the checkpoint's fast path (steps, recent-pc ring), the drain's pc ring
  *     and the region-dispatch reset are done by spu_direct_tail_note.
  * Process-wide modes that cannot change while running (the kill switch
- * PS3RECOMP_SPU_DIRECT_TAIL=0, step diagnostics, SPU_TAILRET, region scope,
- * SPU_PCHIST) are folded into g_spu_direct_tail_on when a --direct-tail image
- * registers (spu_direct_tail_image).
+ * PS3RECOMP_SPU_DIRECT_TAIL=0, step diagnostics, SPU_TAILRET, SPU_PCHIST)
+ * turn it off when a --direct-tail image registers (spu_direct_tail_image);
+ * region scope (SPU_REGION_FRAMED=1) is recorded as g_spu_direct_tail_on == 2
+ * and the note then records the drain's region frame as the invoke would.
  *   - drain_ret_pc: a hop sets it to the owning drain's return pc. A tail call
  *     sets the same value from call_ret_pc (see spu_context), which the
  *     image's call sites and every drain hop keep; when it was not set for the
@@ -1047,7 +1048,7 @@ void spu_direct_tail_image(void);
 extern volatile int g_yz_lockstep_on;
 extern void* volatile g_pm_flow_ctx;
 static inline int spu_direct_tail_ok(const spu_context* ctx) {
-    return __atomic_load_n(&g_spu_direct_tail_on, __ATOMIC_RELAXED) == 1 &&
+    return __atomic_load_n(&g_spu_direct_tail_on, __ATOMIC_RELAXED) > 0 &&
            !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask)) &&
            !((ctx)->event_mask & 0x400u) &&
            g_yz_lockstep_on == 0 && !g_pm_flow_ctx &&
@@ -1068,7 +1069,16 @@ static inline void spu_direct_tail_note(spu_context* ctx) {
     r->pc[r->n++ & 31] = pc;
     ctx->steps++;
     g_spu_pch[g_spu_pch_n++ & 7u] = pc;
-    ctx->region_dispatch_valid = 0;
+    /* The drain invokes each transfer through spu_region_dispatch_invoke,
+     * which with region scope on (g_spu_direct_tail_on == 2) records the
+     * owning drain's frame before the call: a call drain's depth and return
+     * pc, or the top-level drain's depth 0 with none. */
+    if (__atomic_load_n(&g_spu_direct_tail_on, __ATOMIC_RELAXED) == 2) {
+        ctx->region_dispatch_depth = ctx->host_depth;
+        ctx->region_return_pc = ctx->host_depth ? ctx->call_ret_pc : 0;
+        ctx->region_has_return = ctx->host_depth ? 1 : 0;
+        ctx->region_dispatch_valid = 1;
+    } else ctx->region_dispatch_valid = 0;
     /* The drain that would have run this transfer is the innermost live
      * call's spu_drain_call loop, which sets drain_ret_pc to that call's
      * return pc at the hop. At depth 0 it is the top-level drain, which does
