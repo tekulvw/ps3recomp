@@ -87,10 +87,15 @@ static SPU_DRAIN_COLD void spu_task_launch_slow(spu_context* ctx);
 /* Any of the step diagnostics below armed by the environment. */
 static int spu_task_launch_diagnostics(void)
 {
+    if (spu_dispatch_fast()) {
+        int d = g_spu_dispatch_gates.task_diag;
+        if (d >= 0) return d;
+    }
     static int s_on = -1;
     if (s_on < 0)
         s_on = getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
                getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN");
+    if (spu_dispatch_fast()) g_spu_dispatch_gates.task_diag = s_on;
     return s_on;
 }
 

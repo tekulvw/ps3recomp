@@ -2748,6 +2748,22 @@ static void spu_overlay_residency_print(void)
             atomic_load(&s_ovl_res_refused), atomic_load(&s_ovl_res_shadow),
             atomic_load(&s_ovl_res_shadow_bad));
 }
+/* The residency counters are only ever printed by the statistics (and the
+ * shadow check reports through them). With PS3RECOMP_SPU_DISPATCH_FAST they
+ * are kept only while either is on: incremented on every residency dispatch
+ * by every SPU thread, they kept a cache line moving between cores that the
+ * dispatch path reads (spu_context.h, spu_dispatch_gates). */
+static int spu_overlay_residency_counting(void)
+{
+    if (!spu_dispatch_fast()) return 1;
+    int c = g_spu_dispatch_gates.ovl_stats;
+    if (c < 0) {
+        c = spu_overlay_residency_option("SPU_OVERLAY_RESIDENCY_STATS") ||
+            spu_overlay_residency_option("SPU_OVERLAY_RESIDENCY_SHADOW");
+        g_spu_dispatch_gates.ovl_stats = c;
+    }
+    return c;
+}
 static void spu_overlay_residency_stats(void)
 {
     static int on = -1;
@@ -2789,12 +2805,13 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
 {
     int* state = &ctx->resident_code[slot].verify_state;
     const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
+    const int counting = spu_overlay_residency_counting();
     if (*state == SPU_OVERLAY_PENDING) {
-        atomic_fetch_add_explicit(&s_ovl_res_checks, 1, memory_order_relaxed);
+        if (counting) atomic_fetch_add_explicit(&s_ovl_res_checks, 1, memory_order_relaxed);
         *state = spu_overlay_code_matches(ctx, o) ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
         if (*state == SPU_OVERLAY_VERIFIED && PS3_FT_ON())
             spu_ft_job_begin(ctx, ctx->resident_code[slot].image_id);
-        if (*state == SPU_OVERLAY_REJECTED)
+        if (*state == SPU_OVERLAY_REJECTED && counting)
             atomic_fetch_add_explicit(&s_ovl_res_rejects, 1, memory_order_relaxed);
     } else if (*state == SPU_OVERLAY_VERIFIED && spu_overlay_residency_shadow()) {
         atomic_fetch_add_explicit(&s_ovl_res_shadow, 1, memory_order_relaxed);
@@ -2804,7 +2821,7 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
         }
     }
     const int ok = *state == SPU_OVERLAY_VERIFIED;
-    atomic_fetch_add_explicit(ok ? &s_ovl_res_dispatches : &s_ovl_res_refused, 1, memory_order_relaxed);
+    if (counting) atomic_fetch_add_explicit(ok ? &s_ovl_res_dispatches : &s_ovl_res_refused, 1, memory_order_relaxed);
     spu_overlay_residency_stats();
     return ok;
 }
@@ -2821,6 +2838,7 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
         s_stack_reset[n].entry = entry & SPU_LS_MASK;
         s_stack_reset[n].image_id = image_id;
         __atomic_store_n(&g_spu_stack_reset_count,n+1,__ATOMIC_RELEASE);
+        __atomic_store_n(&g_spu_dispatch_gates.stack_reset_count,n+1,__ATOMIC_RELEASE);
     }
 }
 
@@ -3006,6 +3024,10 @@ static atomic_ullong s_dcache_hits, s_dcache_misses, s_dcache_shadow_bad;
 static uint32_t s_dcache_next_id;
 static int spu_dcache_mode(void)
 {
+    if (spu_dispatch_fast()) {
+        const int g = g_spu_dispatch_gates.dcache_mode;
+        if (g >= 0) return g;
+    }
     static atomic_int mode;
     int m = atomic_load_explicit(&mode, memory_order_relaxed);
     if (!m) {
@@ -3013,6 +3035,7 @@ static int spu_dcache_mode(void)
         m = !e ? 1 : !strcmp(e, "1") ? 2 : !strcmp(e, "shadow") ? 3 : 1;
         atomic_store_explicit(&mode, m, memory_order_relaxed);
     }
+    if (spu_dispatch_fast()) g_spu_dispatch_gates.dcache_mode = m - 1;
     return m - 1;   /* 0 off, 1 on, 2 shadow */
 }
 static void spu_dcache_note_get(uint32_t lsa, uint32_t size)
@@ -3172,7 +3195,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].source_ea = ea;
                     ctx->resident_code[slot].image_id = o->image_id;
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
-                    if (o->code) atomic_fetch_add_explicit(&s_ovl_res_loads, 1, memory_order_relaxed);
+                    if (o->code && spu_overlay_residency_counting())
+                        atomic_fetch_add_explicit(&s_ovl_res_loads, 1, memory_order_relaxed);
                     ctx->resident_code[slot].source_index = i;
                     spu_dcache_residency_changed(ctx);
                     return;
