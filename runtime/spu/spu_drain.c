@@ -589,7 +589,7 @@ static SPU_THREAD_LOCAL struct { unsigned long long leaf, loop, hop_ib, hop_dire
                                    * image registers at the target pc (same image), the resident overlay's
                                    * or task's, or none of them (other); and how many were taken with
                                    * interrupts enabled or a stack-reset entry registered, or deep. */
-                                  unsigned long long d_same, d_ovl, d_other, d_irq, d_reset, d_deep;
+                                  unsigned long long d_same, d_ovl, d_other, d_irq, d_reset, d_deep, d_lr, d_pend;
                                   unsigned id; } t_ds;
 static unsigned s_ds_threads;
 static void spu_drain_stats_tick(void)
@@ -602,9 +602,9 @@ static void spu_drain_stats_tick(void)
     if (!t_ds.id) t_ds.id = __atomic_add_fetch(&s_ds_threads, 1u, __ATOMIC_RELAXED);
     fprintf(stderr, "[spu-drain-kind] t_ms=%llu thread=%u leaf=%llu loop=%llu hop_ib=%llu hop_direct=%llu "
             "ret_short=%llu resume=%llu | direct same_image=%llu ovl_or_task=%llu other=%llu"
-            " int_enabled=%llu stack_reset=%llu deep=%llu\n", now, t_ds.id, t_ds.leaf, t_ds.loop, t_ds.hop_ib,
+            " int_enabled=%llu stack_reset=%llu deep=%llu lr_armed=%llu irq_pending=%llu\n", now, t_ds.id, t_ds.leaf, t_ds.loop, t_ds.hop_ib,
             t_ds.hop_direct, t_ds.ret_short, t_ds.resume, t_ds.d_same, t_ds.d_ovl, t_ds.d_other,
-            t_ds.d_irq, t_ds.d_reset, t_ds.d_deep);
+            t_ds.d_irq, t_ds.d_reset, t_ds.d_deep, t_ds.d_lr, t_ds.d_pend);
 }
 static int spu_drain_stats_on(void)
 {
@@ -678,6 +678,8 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
                              (ctx->resident_task && (void*)spu_lookup(tpc, ctx->resident_task) == (void*)fn)) t_ds.d_ovl++;
                     else t_ds.d_other++;
                     if (ctx->int_enable) t_ds.d_irq++;
+                    if (ctx->event_mask & 0x400u) t_ds.d_lr++;
+                    if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) t_ds.d_pend++;
                     if (spu_stack_reset_needed(ctx)) t_ds.d_reset++;
                     if (g_spu_depth_guard_limit && ctx->host_depth >= g_spu_depth_guard_limit / 2) t_ds.d_deep++;
                 }
