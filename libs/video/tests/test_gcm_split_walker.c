@@ -196,11 +196,14 @@ static void test_hook(const u32* r, u64 pos)
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
 static int fails;
+/* GCM_SPLIT_TEST_SCALE=<percent>: the writer iterations and the stress packets (sanitizer builds run a fifth). */
+static int scale_pct = 100;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
 
 int main(int argc, char** argv)
 {
     g_on = argc > 1 && !strcmp(argv[1], "on");
+    { const char* e = getenv("GCM_SPLIT_TEST_SCALE"); if (e && atoi(e) > 0) scale_pct = atoi(e); }
     if (g_on) setenv("PS3RECOMP_RSX_SPLIT_WALKER", "1", 1);
     setenv("PS3RECOMP_GCM_FAST_WALK", "1", 1);
     /* The deferred-report constructor ran before main: set its switches as
@@ -258,7 +261,7 @@ int main(int argc, char** argv)
     u32 seg = 0x100000u;                               /* io page 1 */
     for (int k = 0; k < 4; k++) {
         atomic_store(&g_poison_hits, 0); atomic_store(&g_draws, 0);
-        const int iters = 700;
+        const int iters = 700 * scale_pct / 100;
         for (int i = 1; i <= iters; i++) {
             const u32 pattern = 0x01000000u + (u32)(k << 16) + (u32)i;
             fill_vtx(pattern); atomic_store(&g_expect_pattern, pattern);
@@ -371,7 +374,7 @@ int main(int argc, char** argv)
         const unsigned long long calls0 = g_calls; g_hash = 0;
         u32 p = seg;
         int packets = 0;
-        while (packets < 30000) {
+        while (packets < 30000 * scale_pct / 100) {
             if (p > 0x1F0000u) { walk_to(p); drained(); p = seg = 0x100000u; cellGcm_rsx_consumer_begin(); cellGcm_syscall_set_fifo_consumer_body(seg, seg); cellGcm_rsx_consumer_end(); }
             const unsigned r = rand_r(&seed);
             if (r % 50 == 0) p = draw_words(p);

@@ -458,7 +458,11 @@ static struct {
     _Atomic u64 head, tail;            /* consumed / published word indices (monotone) */
     _Atomic int rec_sleeping, dec_sleeping, stop, started, idle;
     pthread_mutex_t mu; pthread_cond_t cv_rec, cv_dec;
+#ifdef _WIN32
+    HANDLE thread;
+#else
     pthread_t thread;
+#endif
     /* Pending `get` publications: the ring position the decoder was at and
      * the value; the record thread publishes one once head >= pos - lead. */
     struct { u64 pos, draw_fence; u32 value; } getq[64];
@@ -469,7 +473,8 @@ static struct {
     u64 get_pub_pos;                   /* ring position of the newest published entry */
     /* Diagnostics (PS3RECOMP_RSX_SPLIT_WALKER_STATS=1): every 2 s. */
     int stats_on;
-    unsigned long long records, words, full_stops, empty_sleeps, retries, lease_yields, get_pubs, get_holds, get_hold_words_max;
+    unsigned long long records, words, empty_sleeps, retries, lease_yields, get_pubs, get_holds, get_hold_words_max;
+    unsigned long long full_stops;     /* decoder-side: passes ended or waits taken on a full ring */
     uint64_t busy_ns, stats_at;
 } s_rq;
 
@@ -512,6 +517,20 @@ static uint64_t gcm_split_now_ns(void)
 {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static void gcm_split_sleep_us(long us)
+{
+#ifdef _WIN32
+    Sleep(us >= 1000 ? (DWORD)(us / 1000) : 1u);
+#else
+    const struct timespec ts = { 0, us * 1000L }; nanosleep(&ts, NULL);
+#endif
+}
+static inline void gcm_split_pause(void)
+{
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+    __builtin_ia32_pause();
+#endif
 }
 
 /* ---- decoder side ---- */
@@ -681,9 +700,7 @@ static void* gcm_split_record_main(void* unused)
         if (head == tail) {
             int spins = 0;
             while (head == tail && spins++ < 2000) {
-#if defined(__x86_64__) || defined(_M_X64)
-                __builtin_ia32_pause();
-#endif
+                gcm_split_pause();
                 tail = atomic_load_explicit(&s_rq.tail, memory_order_acquire);
             }
             if (head == tail) {
@@ -719,7 +736,7 @@ static void* gcm_split_record_main(void* unused)
                  * next tick: give the lease up and retry in a moment. */
                 s_rq.retries++;
                 cellGcm_rsx_consumer_end();
-                { const struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); }
+                gcm_split_sleep_us(1000);
                 cellGcm_rsx_consumer_begin();
                 /* The pass's tick retried recovery before walking: same here. */
                 if (s_reports.failed || s_reports_recover_pending) (void)gcm_reports_progress(0, 0);
@@ -781,7 +798,7 @@ void gcm_split_drain(void)
         if (atomic_load_explicit(&s_rq.rec_sleeping, memory_order_acquire)) {
             pthread_mutex_lock(&s_rq.mu); pthread_cond_broadcast(&s_rq.cv_rec); pthread_mutex_unlock(&s_rq.mu);
         }
-        { const struct timespec ts = { 0, 100000 }; nanosleep(&ts, NULL); }
+        gcm_split_sleep_us(100);
     }
 }
 
@@ -791,7 +808,7 @@ void gcm_split_stop(void)
     if (s_split != 1 || !atomic_load_explicit(&s_rq.started, memory_order_acquire)) return;
     gcm_split_drain();
     u32* r;
-    while (!(r = gcm_rq_reserve(1))) { const struct timespec ts = { 0, 100000 }; nanosleep(&ts, NULL); }
+    while (!(r = gcm_rq_reserve(1))) gcm_split_sleep_us(100);
     r[0] = GCM_RQ_HDR(GCM_RQ_STOP, 0, 0);
     atomic_store_explicit(&s_rq.stop, 1, memory_order_release);
     gcm_rq_commit(1);
@@ -886,7 +903,7 @@ static void gcm_seam_flips_written_off(int set_all)
 {
     if (s_split != 1) { gcm_fx_flips_written_off(set_all, s_fifo_flips_queued); return; }
     u32* r;
-    while (!(r = gcm_rq_reserve(3))) { s_rq.full_stops++; const struct timespec ts = { 0, 100000 }; nanosleep(&ts, NULL); }
+    while (!(r = gcm_rq_reserve(3))) { s_rq.full_stops++; gcm_split_sleep_us(100); }
     r[0] = GCM_RQ_HDR(GCM_RQ_FLIPS_OFF, 0, 2); r[1] = (u32)set_all; r[2] = s_fifo_flips_queued;
     gcm_rq_commit(3);
 }
@@ -894,7 +911,7 @@ static void gcm_seam_ref_rescue(u32 value, u32 io)
 {
     if (s_split != 1) { gcm_ref_push_at(value, io); return; }
     u32* r;
-    while (!(r = gcm_rq_reserve(3))) { s_rq.full_stops++; const struct timespec ts = { 0, 100000 }; nanosleep(&ts, NULL); }
+    while (!(r = gcm_rq_reserve(3))) { s_rq.full_stops++; gcm_split_sleep_us(100); }
     r[0] = GCM_RQ_HDR(GCM_RQ_REF_RESCUE, gcm_checked_ref_mode() ? GCM_RQ_F_CHECKED : 0, 2); r[1] = value; r[2] = io;
     gcm_rq_commit(3);
 }
@@ -915,7 +932,7 @@ static int gcm_seam_nv0039(u32 io, const u32 v[8])
 static void gcm_seam_publish_get(u32 value)
 {
     if (s_split != 1) { vm_write32(GCM_CONTROL_GUEST_ADDR + 4, value); return; }
-    while (gcm_split_publish_get(value) < 0) { s_rq.full_stops++; const struct timespec ts = { 0, 100000 }; nanosleep(&ts, NULL); }
+    while (gcm_split_publish_get(value) < 0) { s_rq.full_stops++; gcm_split_sleep_us(100); }
 }
 static void gcm_seam_pass_end(int issue)
 {
@@ -924,7 +941,7 @@ static void gcm_seam_pass_end(int issue)
         return;
     }
     u32* r;
-    while (!(r = gcm_rq_reserve(2))) { s_rq.full_stops++; const struct timespec ts = { 0, 100000 }; nanosleep(&ts, NULL); }
+    while (!(r = gcm_rq_reserve(2))) { s_rq.full_stops++; gcm_split_sleep_us(100); }
     r[0] = GCM_RQ_HDR(GCM_RQ_PASS_END, 0, 1); r[1] = (u32)issue;
     gcm_rq_commit(2);
 }

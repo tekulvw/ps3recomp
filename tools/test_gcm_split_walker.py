@@ -48,8 +48,9 @@ def build(tmp, label, include_first=None, defines=(), extra=()):
     return binary
 
 
-def run(binary, form, timeout=240):
+def run(binary, form, timeout=240, scale=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith(('PS3RECOMP_', 'GCM_', 'MAG_', 'RSX_'))}
+    if scale: env['GCM_SPLIT_TEST_SCALE'] = str(scale)
     r = subprocess.run([str(binary), form], capture_output=True, text=True, timeout=timeout, env=env)
     return r.returncode, r.stdout, r.stderr
 
@@ -59,9 +60,9 @@ def log_lines(out):
     return [l for l in out.splitlines() if l.startswith('L ') and not l.startswith('L present-at-flip')]
 
 
-def check(binary, label):
-    rc_off, off, _ = run(binary, 'off')
-    rc_on, on, err_on = run(binary, 'on')
+def check(binary, label, scale=None):
+    rc_off, off, _ = run(binary, 'off', scale=scale)
+    rc_on, on, err_on = run(binary, 'on', scale=scale)
     ok = rc_off == 0 and rc_on == 0 and log_lines(off) == log_lines(on) \
         and '[rsx split walker] on:' in err_on and 'engine calls' in on
     return ok, off, on, err_on
@@ -165,7 +166,7 @@ def main():
         if args.sanitize:
             flag = f'-fsanitize={args.sanitize}'
             sbin = build(tmp, 'san-' + args.sanitize, extra=[flag, '-g', '-O1'])
-            ok, _, on, err_on = check(sbin, 'san')
+            ok, _, on, err_on = check(sbin, 'san', scale=20)   # a fifth of the workload under instrumentation
             bad = 'WARNING: ThreadSanitizer' in err_on or 'ERROR: AddressSanitizer' in err_on
             if not ok or bad:
                 failed += 1

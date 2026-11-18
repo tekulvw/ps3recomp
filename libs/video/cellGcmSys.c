@@ -401,9 +401,19 @@ int cellGcm_native_handoff_cancel(uint64_t cookie)
     return result;
 }
 /* 1 waits for the armed actual writer; 0 allows ordinary decoding. */
+static int gcm_native_handoff_consume_core(u32 ea, u32 get, u32 put);
 static int gcm_native_handoff_consume(u32 ea, u32 get, u32 put)
 {
     if (!atomic_load_explicit(&s_native_handoff_count, memory_order_acquire)) return 0;
+    /* With the split walker the decoder holds no lease; this reads the
+     * engine (the native source target), so take it for the call. */
+    if (s_split == 1) cellGcm_rsx_consumer_begin();
+    const int r = gcm_native_handoff_consume_core(ea, get, put);
+    if (s_split == 1) cellGcm_rsx_consumer_end();
+    return r;
+}
+static int gcm_native_handoff_consume_core(u32 ea, u32 get, u32 put)
+{
     rsx_native_handoff_arm source;
     rsx_native_handoff_ring_arm ring = {0};
     unsigned ring_writer = 0;
@@ -4096,7 +4106,7 @@ static void gcm_rsx_process_fifo_pass(void)
              * references, reports, the 2D engines) go through the seam. */
             { const u32 ea0 = count ? gcm_io2ea(s_fifo_getoff + 4) : 0;
               const int r = gcm_seam_methods(w, s_fifo_getoff, count, ea0, plain_walk, legacy_state_live, checked, diag);
-              if (r) { if (s_split == 1) { why = "ring-full"; producer_waiting = 1; break; } return; } }
+              if (r) { if (s_split == 1) { why = "ring-full"; producer_waiting = 1; s_rq.full_stops++; break; } return; } }
             s_fifo_getoff += 4 + count * 4;
             continue;
         }
