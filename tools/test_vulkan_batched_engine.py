@@ -2,9 +2,10 @@
 """Vulkan engine backend: the same synthetic operation stream recorded per
 operation (default), batched (PS3RECOMP_VK_BATCHED_ENGINE=1) and batched with
 same-target draws merged into one render pass (PS3RECOMP_VK_MERGE_PASSES=1),
-with descriptor sets reused across draws (PS3RECOMP_VK_DESCRIPTOR_REUSE=1), and
-with both, and batched through a pipeline cache saved by one run and loaded by
-the next (PS3RECOMP_VK_PIPELINE_CACHE), must read back identical bytes, every run clean under the Khronos validation layer
+with descriptor sets reused across draws (PS3RECOMP_VK_DESCRIPTOR_REUSE=1), with
+both, with the arena staged through host memory and one GPU copy per batch
+(PS3RECOMP_VK_ARENA_STAGED=1), and batched through a pipeline cache saved by one
+run and loaded by the next (PS3RECOMP_VK_PIPELINE_CACHE), must read back identical bytes, every run clean under the Khronos validation layer
 (with synchronization validation). Synthetic inputs only.
 
 Needs Vulkan/SDL2 development files and glslang (the engine translates its
@@ -95,6 +96,25 @@ def main():
                 diff = sum(a != b for a, b in zip(outputs["sync"], outputs[mode]))
                 raise SystemExit(f"{mode} readback differs from per-operation submission in {diff} bytes")
         print(f"PASS batched, merged, reused and merged+reused recording read back identically ({len(outputs['sync'])} bytes)")
+        # PS3RECOMP_VK_ARENA_STAGED=1: draws write a host staging buffer and one
+        # GPU copy per batch moves the used span into a device-local arena; the
+        # same bytes must read back, per operation and batched, under validation
+        # (synchronization validation covers the copy-before-read ordering).
+        for mode in ("sync", "both"):
+            out = Path(tmp) / f"{mode}-arena-staged.bin"
+            result = subprocess.run([str(binary), mode, str(out), args.draws],
+                                    env=dict(environment, PS3RECOMP_VK_ARENA_STAGED="1"),
+                                    capture_output=True, text=True, timeout=1800)
+            result.check_returncode()
+            text = result.stdout + result.stderr
+            if "VUID-" in text or "SYNC-HAZARD" in text or "Validation Error" in text or "THREADING ERROR" in text:
+                raise SystemExit(f"Vulkan validation rejected the {mode} run with PS3RECOMP_VK_ARENA_STAGED=1")
+            if out.read_bytes() != outputs[mode]:
+                diff = sum(a != b for a, b in zip(out.read_bytes(), outputs[mode]))
+                raise SystemExit(f"{mode} readback with PS3RECOMP_VK_ARENA_STAGED=1 differs in {diff} bytes")
+            if mode == "both" and "arena staged through cached host memory" not in text:
+                raise SystemExit("the batched run did not take PS3RECOMP_VK_ARENA_STAGED=1")
+        print("PASS PS3RECOMP_VK_ARENA_STAGED=1 reads back identically, per operation and batched")
         # PS3RECOMP_VK_PIPELINE_CACHE: the first run fills and saves the cache,
         # the second starts from it; both must read back as the others did.
         cache = Path(tmp) / "pipeline-cache"

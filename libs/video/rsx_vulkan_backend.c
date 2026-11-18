@@ -364,6 +364,11 @@ typedef struct {
     vk_buffer        arena;
     VkDeviceSize     used;
     u64              ticket;    /* the submission that last used this slot */
+    /* PS3RECOMP_VK_ARENA_STAGED=1: the CPU writes `stage` (host memory,
+     * cached when the device has such a type) and `copy_cb` copies the used
+     * span into `arena`, then device-local, ahead of the batch. */
+    vk_buffer        stage;
+    VkCommandBuffer  copy_cb;
 } vk_bat_slot;
 static struct {
     u32 nslots, cur, max_ops, ops;
@@ -388,6 +393,13 @@ static struct {
     /* PS3RECOMP_VK_MERGE_PASSES=1: draws merged into an open render pass */
     int merge;
     u64 passes, merged_draws, feedback_breaks, binds_skipped;
+    /* PS3RECOMP_VK_ARENA_STAGED=1 (read at init): draws write a cached host
+     * staging buffer and one GPU copy per batch moves the used span into a
+     * device-local arena, instead of every draw's few KB going straight into
+     * host-visible memory that is write-combined on most discrete GPUs.
+     * Counters under PS3RECOMP_RSX_INFLIGHT_LOG=1. */
+    int staged;
+    u64 staged_copies, staged_bytes;
 } s_bat;
 
 /* The render pass a merged draw left open in the open batch (only with
@@ -6021,6 +6033,7 @@ static int vk_bat_slot_init(vk_bat_slot* sl)
                                         .commandPool = sl->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                         .commandBufferCount = 1 };
     if (pvkAllocateCommandBuffers(s_vk.device, &cai, &sl->cb) != VK_SUCCESS) return -1;
+    if (s_bat.staged && pvkAllocateCommandBuffers(s_vk.device, &cai, &sl->copy_cb) != VK_SUCCESS) return -1;
     /* A draw's set: two constant buffers, 16 samplers and 16 images (shared
      * or split layout); a GPU depth view's: one storage buffer. */
     VkDescriptorPoolSize ps[5] = {
@@ -6141,9 +6154,36 @@ static int vk_bat_flush(int wait)
     s_vk.frontend_recording = 0;
     s_vk.cmd = s_bat.legacy_cmd;
     if (pvkEndCommandBuffer(bs->cb) != VK_SUCCESS) { vk_e5_fail("batch end"); return -1; }
+    /* Staged: one copy of the span the draws wrote, from the staging buffer
+     * into the device-local arena, submitted ahead of the batch in the same
+     * submission; the barrier orders it before any read of the arena. The
+     * slot's previous batch has completed (vk_bat_open waited for it), so
+     * nothing still reads the arena being overwritten. */
+    VkCommandBuffer cbs[2] = { bs->cb, VK_NULL_HANDLE };
+    u32 ncb = 1;
+    if (s_bat.staged && bs->used) {
+        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        if (pvkResetCommandBuffer(bs->copy_cb, 0) != VK_SUCCESS || pvkBeginCommandBuffer(bs->copy_cb, &bi) != VK_SUCCESS) {
+            vk_e5_fail("staged batch copy begin"); return -1;
+        }
+        const VkBufferCopy region = { 0, 0, bs->used };
+        pvkCmdCopyBuffer(bs->copy_cb, bs->stage.buf, bs->arena.buf, 1, &region);
+        const VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                     .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                     .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                                                      VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT };
+        pvkCmdPipelineBarrier(bs->copy_cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              0, 1, &mb, 0, NULL, 0, NULL);
+        if (pvkEndCommandBuffer(bs->copy_cb) != VK_SUCCESS) { vk_e5_fail("staged batch copy end"); return -1; }
+        cbs[0] = bs->copy_cb; cbs[1] = bs->cb; ncb = 2;
+        s_bat.staged_copies++; s_bat.staged_bytes += bs->used;
+    }
     vk_e5_slot* sl = vk_e5_acquire(0);
     if (!sl) return -1;
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &bs->cb };
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = ncb, .pCommandBuffers = cbs };
     if (vk_queue_submit(&si, sl->fence) != VK_SUCCESS) { vk_e5_fail("vkQueueSubmit (batch)"); return -1; }
     sl->ticket = ++s_e5.issued;
     s_e5.count++;
@@ -6160,6 +6200,50 @@ static int vk_bat_end_op(void)
 {
     if (!s_bat.open) return -1;
     if (++s_bat.ops >= s_bat.max_ops) return vk_bat_flush(0);
+    return 0;
+}
+
+#define VK_BAT_ARENA_USAGE (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | \
+                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+
+/* Staged: the device-local arena (a type without HOST_VISIBLE when there is
+ * one, so the GPU reads its own memory; else any device-local type, as
+ * lavapipe has; else whatever fits) and the host staging buffer the CPU
+ * writes (cached and coherent when the device has such a type, else the
+ * first coherent one). Both are the same size. */
+static int vk_bat_staged_create(vk_bat_slot* sl, VkDeviceSize size)
+{
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                               .usage = VK_BAT_ARENA_USAGE, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    memset(&sl->arena, 0, sizeof sl->arena);
+    if (pvkCreateBuffer(s_vk.device, &bci, NULL, &sl->arena.buf) != VK_SUCCESS) return -1;
+    VkMemoryRequirements req;
+    pvkGetBufferMemoryRequirements(s_vk.device, sl->arena.buf, &req);
+    u32 type = 0, found = 0;
+    for (u32 i = 0; i < s_vk.memprops.memoryTypeCount && !found; i++) {
+        const VkMemoryPropertyFlags f = s_vk.memprops.memoryTypes[i].propertyFlags;
+        if ((req.memoryTypeBits & (1u << i)) && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { type = i; found = 1; }
+    }
+    if (!found && vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type) &&
+        vk_find_memory_type(req.memoryTypeBits, 0, &type)) return -1;
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type };
+    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &sl->arena.mem) != VK_SUCCESS ||
+        pvkBindBufferMemory(s_vk.device, sl->arena.buf, sl->arena.mem, 0) != VK_SUCCESS) return -1;
+    sl->arena.size = size; sl->arena.coherent = 1;   /* nothing maps it */
+
+    VkBufferCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                               .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    memset(&sl->stage, 0, sizeof sl->stage);
+    if (pvkCreateBuffer(s_vk.device, &sci, NULL, &sl->stage.buf) != VK_SUCCESS) return -1;
+    pvkGetBufferMemoryRequirements(s_vk.device, sl->stage.buf, &req);
+    const VkMemoryPropertyFlags coh = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (vk_find_memory_type(req.memoryTypeBits, coh | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &type) &&
+        vk_find_memory_type(req.memoryTypeBits, coh, &type)) return -1;
+    mai.allocationSize = req.size; mai.memoryTypeIndex = type;
+    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &sl->stage.mem) != VK_SUCCESS ||
+        pvkBindBufferMemory(s_vk.device, sl->stage.buf, sl->stage.mem, 0) != VK_SUCCESS ||
+        pvkMapMemory(s_vk.device, sl->stage.mem, 0, VK_WHOLE_SIZE, 0, &sl->stage.ptr) != VK_SUCCESS) return -1;
+    sl->stage.size = size; sl->stage.coherent = 1;
     return 0;
 }
 
@@ -6186,10 +6270,13 @@ static int vk_bat_reserve(VkDeviceSize bytes, u32 sets)
         while (size < need || size < s_bat.arena_want) size *= 2u;
         /* The slot is idle (just opened), but other batches may be pending. */
         if (sl->arena.buf) vk_destroy_buffer(&sl->arena);
-        if (vk_create_host_buffer(&sl->arena, size,
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
-            !sl->arena.coherent) {
+        if (s_bat.staged) {
+            if (sl->stage.buf) vk_destroy_buffer(&sl->stage);
+            if (vk_bat_staged_create(sl, size)) {
+                vk_destroy_buffer_now(&sl->arena); vk_destroy_buffer_now(&sl->stage);
+                vk_e5_fail("staged batch arena allocation"); return -1;
+            }
+        } else if (vk_create_host_buffer(&sl->arena, size, VK_BAT_ARENA_USAGE) || !sl->arena.coherent) {
             vk_destroy_buffer_now(&sl->arena); vk_e5_fail("batch arena allocation"); return -1;
         }
         s_bat.arena_grows++;
@@ -6207,7 +6294,7 @@ static void* vk_bat_alloc(VkDeviceSize bytes, VkBuffer* buf, VkDeviceSize* off)
     if (o + bytes > sl->arena.size) { vk_e5_fail("batch arena overrun"); return NULL; }
     sl->used = o + bytes;
     *buf = sl->arena.buf; *off = o;
-    return (u8*)sl->arena.ptr + o;
+    return (u8*)(s_bat.staged ? sl->stage.ptr : sl->arena.ptr) + o;
 }
 
 static VkDescriptorSet vk_bat_set(VkDescriptorSetLayout layout)
@@ -6251,6 +6338,9 @@ static void vk_bat_log(void)
     if (s_bat.desc_reuse)
         fprintf(stderr, "[rsx inflight vulkan batch] descriptor sets written=%llu reused=%llu\n",
                 (unsigned long long)s_bat.sets_written, (unsigned long long)s_bat.sets_reused);
+    if (s_bat.staged)
+        fprintf(stderr, "[rsx inflight vulkan batch] staged copies=%llu bytes=%llu\n",
+                (unsigned long long)s_bat.staged_copies, (unsigned long long)s_bat.staged_bytes);
 }
 
 static int vk_bat_init(void)
@@ -6265,6 +6355,7 @@ static int vk_bat_init(void)
     { const char* r = getenv("PS3RECOMP_VK_DESCRIPTOR_REUSE"); s_bat.desc_reuse = r && !strcmp(r, "1"); }
     s_e2.dyn_last.valid = 0;
     { const char* m = getenv("PS3RECOMP_VK_MERGE_PASSES"); s_bat.merge = m && !strcmp(m, "1"); }
+    { const char* a = getenv("PS3RECOMP_VK_ARENA_STAGED"); s_bat.staged = a && !strcmp(a, "1"); }
     memset(&s_pass, 0, sizeof s_pass);
     s_e2.vs_last_valid = 0;
     VkPhysicalDeviceProperties p; pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
@@ -6275,9 +6366,10 @@ static int vk_bat_init(void)
     for (u32 i = 0; i < s_bat.nslots; i++) if (vk_bat_slot_init(&s_bat.s[i])) return -1;
     s_bat.legacy_cmd = s_vk.cmd;
     s_bat_on = 1;
-    VK_LOG("engine: batched recording on (%u batches in flight, at most %u operations each%s%s)\n", s_bat.nslots, s_bat.max_ops,
+    VK_LOG("engine: batched recording on (%u batches in flight, at most %u operations each%s%s%s)\n", s_bat.nslots, s_bat.max_ops,
            s_bat.merge ? ", same-target draws merged into one render pass" : "",
-           s_bat.desc_reuse ? ", descriptor sets reused across draws" : "");
+           s_bat.desc_reuse ? ", descriptor sets reused across draws" : "",
+           s_bat.staged ? ", arena staged through cached host memory" : "");
     return 0;
 }
 
@@ -6295,6 +6387,7 @@ static void vk_bat_shutdown(void)
     vk_img_pool_drain();
     for (u32 i = 0; i < s_bat.nslots; i++) {
         vk_destroy_buffer_now(&s_bat.s[i].arena);
+        vk_destroy_buffer_now(&s_bat.s[i].stage);
         if (s_bat.s[i].dpool) pvkDestroyDescriptorPool(s_vk.device, s_bat.s[i].dpool, NULL);
         if (s_bat.s[i].pool) pvkDestroyCommandPool(s_vk.device, s_bat.s[i].pool, NULL);
     }
