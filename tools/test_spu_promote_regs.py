@@ -6,8 +6,12 @@ channels, stop, halt, an interrupt taken and returned through its frame, and a
 depth-0 restart (longjmp) into interpreted code. Every architectural result --
 register file, local store, pc, status, stop code -- must be identical.
 
+--promote-split-slots (each ctx->gpr slot loaded and stored 16 bytes at a time)
+must give the same results too, and leave the output without it unchanged.
+
 Bug controls (--mutants, also run by default): a promoted build with one store
-before a call removed, or one reload after a call removed, must be detected.
+before a call removed, or one reload after a call removed, must be detected,
+with and without --promote-split-slots.
 """
 import os, pathlib, re, struct, subprocess, sys, tempfile, json
 if os.name == 'nt':
@@ -152,6 +156,23 @@ def main():
         build(tmp, plain, tmp / 'plain.exe')
         build(tmp, promoted, tmp / 'promoted.exe')
         build(tmp, promoted, tmp / 'promoted_diag.exe', ['-DSPU_LS_DIAG=1'])
+        assert 'SPU_PR_LD' not in src and 'SPU_PR_ST' not in src, 'split slots leaked into the default output'
+        split = lift(tmp, image, starts, 'split', True, ['--promote-split-slots'])
+        ssrc = (split / 'spu_recomp.c').read_text()
+        assert 'SPU_PR_LD(&ctx->gpr[' in ssrc and 'SPU_PR_ST(&ctx->gpr[' in ssrc, 'split slots not applied'
+        assert not re.search(r'ctx->gpr\[\d+\] = |SPU_PR_V\(ctx->gpr', ssrc), 'an unsplit slot access is left'
+        # Exactly the plain promoted text, with the slot accesses spelled through the helpers.
+        sys.path.insert(0, str(ROOT / 'tools'))
+        from spu_lifter import SPLIT_SLOTS_PREAMBLE
+        assert ssrc.count(SPLIT_SLOTS_PREAMBLE) == 1
+        unsplit = ssrc.replace(SPLIT_SLOTS_PREAMBLE + '\n', '', 1)
+        unsplit = re.sub(r'SPU_PR_LD\(&ctx->gpr\[(\d+)\]\)', r'SPU_PR_V(ctx->gpr[\1])', unsplit)
+        unsplit = re.sub(r'SPU_PR_ST\(&ctx->gpr\[(\d+)\], rg\1\);', r'ctx->gpr[\1] = SPU_PR_U(rg\1);', unsplit)
+        assert unsplit == src, 'split slots changed more than the slot accesses'
+        build(tmp, split, tmp / 'split.exe')
+        r = subprocess.run([sys.executable, str(ROOT / 'tools/spu_lifter.py'), str(tmp / 'program.bin'), '--base', hex(BASE),
+                            '--promote-split-slots', '--output', str(tmp / 'bad')], capture_output=True, text=True)
+        assert r.returncode != 0 and 'requires --promote-regs' in r.stderr, 'split slots accepted without promotion'
         # A register cap mixes promoted and unpromoted functions in one image.
         capped = lift(tmp, image, starts, 'capped', True, ['--promote-max-regs', '4'])
         csrc = (capped / 'spu_recomp.c').read_text()
@@ -162,7 +183,7 @@ def main():
         outcomes = {}
         for entry, irq, oracle in SCENARIOS:
             want = run(tmp / 'plain.exe', entry, 'lift', irq)
-            for exe in ('promoted.exe', 'promoted_diag.exe', 'capped.exe'):
+            for exe in ('promoted.exe', 'promoted_diag.exe', 'capped.exe', 'split.exe'):
                 got = run(tmp / exe, entry, 'lift', irq)
                 assert got == want, (exe, hex(entry), want, got)
             if oracle:
@@ -191,6 +212,19 @@ def main():
             mutant.mkdir()
             (mutant / 'spu_recomp.c').write_text(bad)
             (mutant / 'spu_recomp.h').write_text((promoted / 'spu_recomp.h').read_text())
+            build(tmp, mutant, tmp / (name + '.exe'))
+            detected = any(run(tmp / (name + '.exe'), e, 'lift', irq) != outcomes[e] for e, irq, _ in SCENARIOS)
+            assert detected, 'bug control not detected: missing ' + name
+            print('PASS rejected bug control: missing', name, flush=True)
+        scall = re.search(r'(SPU_PR_ST\(&ctx->gpr\[(\d+)\], rg\2\); )(?=[^\n]*promote_test_spu_func_00010200\(ctx\))', ssrc)
+        sreload = re.search(r'promote_test_spu_func_00010200\(ctx\);[^\n]*?spu_img_restore\(ctx, _si\); [^\n]*?(rg3 = SPU_PR_LD\(&ctx->gpr\[3\]\); )', ssrc)
+        assert scall and sreload, 'split bug-control anchors'
+        for name, bad in (('split_store', ssrc.replace(scall.group(1), '', 1)),
+                          ('split_reload', ssrc[:sreload.start(1)] + ssrc[sreload.end(1):])):
+            mutant = tmp / ('mutant_' + name)
+            mutant.mkdir()
+            (mutant / 'spu_recomp.c').write_text(bad)
+            (mutant / 'spu_recomp.h').write_text((split / 'spu_recomp.h').read_text())
             build(tmp, mutant, tmp / (name + '.exe'))
             detected = any(run(tmp / (name + '.exe'), e, 'lift', irq) != outcomes[e] for e, irq, _ in SCENARIOS)
             assert detected, 'bug control not detected: missing ' + name

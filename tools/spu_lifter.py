@@ -547,6 +547,9 @@ _PR_READ = re.compile(r"\brg(\d+)\b(?! = (?!=))")
 _PR_TO_V = re.compile(r"\b(rg\d+) = (?!=)([^;]*);")
 _PR_GOTO = re.compile(r"goto loc_([0-9A-F]{8});")
 _PR_CTX_CALL = re.compile(r"\b(\w+)\(ctx\b")
+# --promote-split-slots: the slot reloads and stores promote_function emits.
+_PR_SLOT_LD = re.compile(r"SPU_PR_V\(ctx->gpr\[(\d+)\]\)")
+_PR_SLOT_ST = re.compile(r"ctx->gpr\[(\d+)\] = SPU_PR_U\(rg\1\);")
 # Inline helpers that take ctx but never read or write ctx->gpr (outside
 # out-of-line diagnostics) and never longjmp.
 _PR_INLINE_CTX = {"spu_pr_lq", "spu_pr_stq"}
@@ -566,12 +569,19 @@ def _pr_regs(mask: int):
     return [i for i in range(128) if mask >> i & 1]
 
 
-def promote_function(items, suffix, max_regs=0):
+def promote_function(items, suffix, max_regs=0, split_slots=False):
     """Rewrite one function's instructions to keep SPU registers in locals.
 
     `items` is [(insn, has_label, marked_c)], `suffix` the marked fall-through
     tail (or None). Returns the new body lines, or None when the function cannot
-    be promoted (it is then emitted unpromoted, which is always correct)."""
+    be promoted (it is then emitted unpromoted, which is always correct).
+
+    split_slots (--promote-split-slots): every ctx->gpr slot store is a 16-byte
+    volatile store (SPU_PR_ST, see SPLIT_SLOTS_PREAMBLE), and loads are spelled
+    SPU_PR_LD, instead of plain assignments whose stores the C compiler may
+    merge into one 32-byte access over two neighbouring slots. A merged
+    access over slots another function wrote, or reads, 16 bytes at a time
+    defeats the CPU's store-to-load forwarding at every transfer and call."""
     texts = []
     for insn, _, c in items:
         t = _GPR_REF.sub(lambda m: "rg" + m.group(1), c)
@@ -720,8 +730,24 @@ def promote_function(items, suffix, max_regs=0):
     # union itself, clang splits each local into scalar halves and shuffles
     # them through loop-carried phis (and spills them) instead of keeping one
     # vector register per SPU register.
-    return [_PR_TO_V.sub(r"\1 = SPU_PR_V(\2);", _PR_READ.sub(r"SPU_PR_U(rg\1)", line)) for line in body]
+    out = [_PR_TO_V.sub(r"\1 = SPU_PR_V(\2);", _PR_READ.sub(r"SPU_PR_U(rg\1)", line)) for line in body]
+    if split_slots:
+        out = [_PR_SLOT_ST.sub(r"SPU_PR_ST(&ctx->gpr[\1], rg\1);",
+                               _PR_SLOT_LD.sub(r"SPU_PR_LD(&ctx->gpr[\1])", line)) for line in out]
+    return out
 
+
+SPLIT_SLOTS_PREAMBLE = """
+/* --promote-split-slots: each ctx->gpr slot is written 16 bytes at a time, never
+ * merged with its neighbour into one 32-byte store that the next function's
+ * 16-byte reads cannot forward from. The store is volatile; it is never dead,
+ * since it precedes a host return or an out-of-line call that reads ctx->gpr.
+ * A load stays an ordinary load, so the compiler keeps narrowing it to the
+ * lanes in use and dropping it where the value is unused; without merged
+ * stores to copy, it no longer merges loads either. */
+static inline __attribute__((always_inline)) spu_pr_v SPU_PR_LD(const u128* p) { spu_pr_v v; memcpy(&v, p, 16); return v; }
+static inline __attribute__((always_inline)) void SPU_PR_ST(u128* p, spu_pr_v v) { *(volatile spu_pr_v*)p = v; }
+"""
 
 PROMOTE_PREAMBLE = """
 /* --promote-regs: SPU registers live in C locals between sync points (see
@@ -820,12 +846,15 @@ class SPULifter:
     def __init__(self, trace: bool = False, prefix: str = "", verified_code_image: int = 0,
                  verified_code_spans: bool = False, connected_regions: bool = False, region_bytes: int = 1024,
                  observe_original_work: bool = False, promote_regs: bool = False,
-                 promote_max_regs: int = 0):
+                 promote_max_regs: int = 0, promote_split_slots: bool = False):
         if promote_regs and (trace or observe_original_work or connected_regions):
             raise ValueError("--promote-regs cannot be combined with --trace, "
                              "--observe-original-work or --connected-regions")
         self.promote_regs = promote_regs
         self.promote_max_regs = promote_max_regs
+        if promote_split_slots and not promote_regs:
+            raise ValueError("--promote-split-slots requires --promote-regs")
+        self.promote_split_slots = promote_split_slots
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
@@ -960,7 +989,8 @@ class SPULifter:
                     func.body_lines = witnesses + func.body_lines
 
         if self.promote_regs and not halt_idiom:
-            promoted = promote_function(promo_items, promo_suffix, self.promote_max_regs)
+            promoted = promote_function(promo_items, promo_suffix, self.promote_max_regs,
+                                        self.promote_split_slots)
             if promoted is not None:
                 func.body_lines = promoted
                 func.promoted = True
@@ -1452,6 +1482,8 @@ class SPULifter:
         promoted = any(f.promoted for f in self.functions)
         if promoted:
             lines.append(PROMOTE_PREAMBLE)
+            if self.promote_split_slots:
+                lines.append(SPLIT_SLOTS_PREAMBLE)
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         for f in self.functions:
             lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
@@ -1589,6 +1621,11 @@ def main() -> None:
                         "LS access diagnostics then need -DSPU_LS_DIAG=1. Not "
                         "combinable with --trace, --observe-original-work or "
                         "--connected-regions.")
+    p.add_argument("--promote-split-slots", action="store_true",
+                   help="With --promote-regs, read and write each ctx->gpr slot 16 bytes at a "
+                        "time, so the C compiler cannot merge two neighbouring slots into one "
+                        "32-byte access (which defeats store-to-load forwarding across "
+                        "transfers and calls). Same behaviour; off by default.")
     p.add_argument("--promote-max-regs", type=int, default=0, metavar="N",
                    help="With --promote-regs, leave a function unpromoted when it "
                         "names more than N SPU registers (0 = no limit).")
@@ -1611,6 +1648,8 @@ def main() -> None:
 
     if args.promote_regs and (args.trace or args.observe_original_work or args.connected_regions):
         p.error("--promote-regs cannot be combined with --trace, --observe-original-work or --connected-regions")
+    if args.promote_split_slots and not args.promote_regs:
+        p.error("--promote-split-slots requires --promote-regs")
     if args.promote_max_regs and not args.promote_regs:
         p.error("--promote-max-regs requires --promote-regs")
     if args.connected_regions and not (args.verified_code_image and args.verified_code_spans):
@@ -1732,7 +1771,8 @@ def main() -> None:
                       connected_regions=args.connected_regions, region_bytes=args.region_bytes,
                       observe_original_work=args.observe_original_work,
                       promote_regs=args.promote_regs,
-                      promote_max_regs=args.promote_max_regs)
+                      promote_max_regs=args.promote_max_regs,
+                      promote_split_slots=args.promote_split_slots)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
