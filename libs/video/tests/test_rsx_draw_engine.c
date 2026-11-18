@@ -667,6 +667,16 @@ static void test_texture_cache(void)
     CHECK(stub.n_texture_create == 2,
           "unchanged bytes in a later frame do not re-decode");
 
+    /* The FIFO consumer's own flip-time present (the split walker's record
+     * thread) stands in for the host's present of that flip, once. */
+    { const int before = stub.n_present;
+      rsx_draw_engine_present_at_flip(0);
+      rsx_draw_engine_present();
+      CHECK(stub.n_present == before + 1,
+            "a consumer present at the flip replaces the host's present of it (%d)", stub.n_present - before);
+      rsx_draw_engine_present();
+      CHECK(stub.n_present == before + 2, "the host's next present is its own"); }
+
     /* Fill the cache past its capacity with distinct descriptors, then come
      * back to the first: it must have been evicted, not still resident, and
      * the most recent one must still be there. Returning nothing instead of
