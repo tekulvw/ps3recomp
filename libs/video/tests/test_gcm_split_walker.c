@@ -202,6 +202,7 @@ static int scale_pct = 100;
 
 int main(int argc, char** argv)
 {
+    setvbuf(stdout, NULL, _IOLBF, 0);   /* a timed-out run still shows how far it got */
     g_on = argc > 1 && !strcmp(argv[1], "on");
     { const char* e = getenv("GCM_SPLIT_TEST_SCALE"); if (e && atoi(e) > 0) scale_pct = atoi(e); }
     if (g_on) setenv("PS3RECOMP_RSX_SPLIT_WALKER", "1", 1);
