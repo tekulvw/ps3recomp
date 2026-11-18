@@ -5470,18 +5470,17 @@ static int eng_flush_checked_core(void)
 /* A flip-time present made by the FIFO consumer itself (the split walker's
  * record thread): the host's present of the same flip, which follows from
  * the receipt, is then skipped, as PS3RECOMP_RSX_SINGLE_PRESENT skips it. */
-static int s_flip_presented_by_consumer;
+static atomic_int s_flip_presented_by_consumer;   /* set by the consumer, taken by the host's present */
 static unsigned long long s_consumer_present_skipped;
 static void original_rsx_draw_engine_present_at_flip(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
     eng_present(g.last_flip_buffer);
-    s_flip_presented_by_consumer = 1;
+    atomic_store_explicit(&s_flip_presented_by_consumer, 1, memory_order_release);
 }
 static void original_rsx_draw_engine_present(void)
 {
-    if (s_flip_presented_by_consumer) {
-        s_flip_presented_by_consumer = 0;
+    if (atomic_exchange_explicit(&s_flip_presented_by_consumer, 0, memory_order_acq_rel)) {
         if (++s_consumer_present_skipped <= 4ull || s_consumer_present_skipped % 600ull == 0)
             fprintf(stderr, "[rsx engine] consumer presented at the flip: %llu host re-presents skipped\n", s_consumer_present_skipped);
         return;

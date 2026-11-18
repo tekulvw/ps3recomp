@@ -790,16 +790,22 @@ static int gcm_split_start(void)
  * the FIFO position) or end the renderer. No-op with the split off. */
 void gcm_split_drain(void)
 {
-    if (s_split != 1 || !atomic_load_explicit(&s_rq.started, memory_order_acquire)) return;
+    if (s_split != 1 || !atomic_load_explicit(&s_rq.started, memory_order_acquire) || s_on_record_thread) return;
+    /* A caller already holding the lease (a consumer body calling a public
+     * entry, e.g. the flagged map calling the plain one) gives it up for the
+     * wait: the record thread needs it to apply what is queued. */
+    const unsigned held = s_consumer_depth;
+    for (unsigned d = held; d; d--) cellGcm_rsx_consumer_end();
     for (;;) {
         const u64 head = atomic_load_explicit(&s_rq.head, memory_order_acquire);
         const u64 tail = atomic_load_explicit(&s_rq.tail, memory_order_acquire);
-        if (head == tail && atomic_load_explicit(&s_rq.idle, memory_order_acquire)) return;
+        if (head == tail && atomic_load_explicit(&s_rq.idle, memory_order_acquire)) break;
         if (atomic_load_explicit(&s_rq.rec_sleeping, memory_order_acquire)) {
             pthread_mutex_lock(&s_rq.mu); pthread_cond_broadcast(&s_rq.cv_rec); pthread_mutex_unlock(&s_rq.mu);
         }
         gcm_split_sleep_us(100);
     }
+    for (unsigned d = held; d; d--) cellGcm_rsx_consumer_begin();
 }
 
 /* Stop the record thread: drain, queue STOP, join. */
@@ -904,7 +910,7 @@ static void gcm_seam_flips_written_off(int set_all)
     if (s_split != 1) { gcm_fx_flips_written_off(set_all, s_fifo_flips_queued); return; }
     u32* r;
     while (!(r = gcm_rq_reserve(3))) { s_rq.full_stops++; gcm_split_sleep_us(100); }
-    r[0] = GCM_RQ_HDR(GCM_RQ_FLIPS_OFF, 0, 2); r[1] = (u32)set_all; r[2] = s_fifo_flips_queued;
+    r[0] = GCM_RQ_HDR(GCM_RQ_FLIPS_OFF, gcm_checked_ref_mode() ? GCM_RQ_F_CHECKED : 0, 2); r[1] = (u32)set_all; r[2] = s_fifo_flips_queued;
     gcm_rq_commit(3);
 }
 static void gcm_seam_ref_rescue(u32 value, u32 io)
@@ -942,6 +948,6 @@ static void gcm_seam_pass_end(int issue)
     }
     u32* r;
     while (!(r = gcm_rq_reserve(2))) { s_rq.full_stops++; gcm_split_sleep_us(100); }
-    r[0] = GCM_RQ_HDR(GCM_RQ_PASS_END, 0, 1); r[1] = (u32)issue;
+    r[0] = GCM_RQ_HDR(GCM_RQ_PASS_END, gcm_checked_ref_mode() ? GCM_RQ_F_CHECKED : 0, 1); r[1] = (u32)issue;
     gcm_rq_commit(2);
 }

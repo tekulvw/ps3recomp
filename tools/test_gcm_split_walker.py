@@ -107,7 +107,7 @@ MUTANTS = {
          '    r[0] = GCM_RQ_HDR(GCM_RQ_METHODS, (0) | (plain_walk ? GCM_RQ_F_PLAIN : 0) |')]),
     # the pass end not queued: the ref is never published
     'no-pass-end': ('gcm_walker_split.inc', [
-        ('    r[0] = GCM_RQ_HDR(GCM_RQ_PASS_END, 0, 1); r[1] = (u32)issue;\n    gcm_rq_commit(2);',
+        ('    r[0] = GCM_RQ_HDR(GCM_RQ_PASS_END, gcm_checked_ref_mode() ? GCM_RQ_F_CHECKED : 0, 1); r[1] = (u32)issue;\n    gcm_rq_commit(2);',
          '    r[0] = GCM_RQ_HDR(GCM_RQ_PAD, 0, 1); r[1] = (u32)issue;\n    gcm_rq_commit(2);')]),
     # an IO unmap without draining: the record thread meets an unmapped page
     'no-drain-unmap': ('cellGcmSys.c', [
