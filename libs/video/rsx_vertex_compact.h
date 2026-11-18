@@ -136,6 +136,13 @@ int rsx_vertex_fetch_many(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
     u8* out);
 
+/* PS3RECOMP_RSX_VERTEX_SIMD=1 decodes rsx_vertex_fetch_many's stable-range
+ * vertices one 128-bit operation at a time, same bytes out. _available says
+ * whether this build has that path (x86 SSE4.1, arm64 NEON); _override sets
+ * the switch from a fixture instead of the environment. */
+int rsx_vertex_fetch_simd_available(void);
+void rsx_vertex_fetch_simd_override(int on);
+
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
  * remains valid until the next call using the same remap object. */

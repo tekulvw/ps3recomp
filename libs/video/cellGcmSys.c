@@ -1565,6 +1565,7 @@ void ppu_gcm_pump(void)
         if (s_flip_tick_seq == s_flip_req_seq)
             s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
         FLIP_UNLOCK();
+        if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_FLIP_DONE, 0, 0, 0, t, t); }
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -1602,7 +1603,10 @@ void cellGcmTickFlip(void)
     const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
     if (waiting) s_flip_tick_seq = s_flip_req_seq;
     FLIP_UNLOCK();
-    if (waiting) GCM_PENDING_SET(2);
+    if (waiting) {
+        if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_FLIP_TICK, 0, 0, 0, t, t); }
+        GCM_PENDING_SET(2);
+    }
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -1769,7 +1773,50 @@ static int gcm_report_status(void *user,uint64_t ticket,int wait){
     if(ready==1)rsx_ring_progress_metal_completed(ticket,UINT64_C(0x8000000000000001));
     return ready;
 }
-static const rsx_deferred_report_ops s_report_ops={NULL,gcm_report_issue,gcm_report_status,gcm_report_publish};
+/* A pass can stop inside a primitive -- put lands between BEGIN and END, the
+ * rest still to be written -- and the engine then takes no ticket: the draw
+ * is not recorded yet. That is "not now", not a failure: the issue waits for
+ * the primitive to end (rsx_deferred_report_ops.issue_ready). Treating it as
+ * a failure froze publication for the rest of the run. */
+static int gcm_report_issue_ready(void *user){
+    (void)user;
+    if(s_report_live_lifetime)return 1;
+    return !rsx_draw_engine_in_primitive();
+}
+static const rsx_deferred_report_ops s_report_ops={NULL,gcm_report_issue,gcm_report_status,gcm_report_publish,gcm_report_issue_ready};
+/* A failed queue no longer stays frozen: once the stream is outside a
+ * primitive, a full checked wait on the backend genuinely completes all
+ * recorded work, and the records not yet applied are published in order
+ * (rsx_reports_recover). 1 recovered (or nothing to do), 0 not yet (inside a
+ * primitive: tried again after the next pass), -1 impossible (the backend
+ * itself failed or the live provider owns the queue): publication stays
+ * stopped, as before, and says so. */
+static int s_reports_recovering;
+/* Failed inside a primitive: the walker keeps walking to reach the END (a
+ * record it meets meanwhile stops it, as before), and recovery runs after. */
+static int s_reports_recover_pending;
+static int gcm_reports_try_recover_core(const char* when);
+static int gcm_reports_try_recover(const char* when){
+    const int r=gcm_reports_try_recover_core(when);
+    s_reports_recover_pending=r==0;
+    return r;
+}
+static int gcm_reports_try_recover_core(const char* when){
+    if(!s_reports.failed)return 1;
+    if(s_report_live_lifetime||gcm_reports_live()||!rsx_draw_engine_async_available())return -1;
+    if(rsx_draw_engine_in_primitive())return 0;
+    s_reports_recovering=1;
+    const int flushed=rsx_draw_engine_flush_checked()==1;
+    s_reports_recovering=0;
+    if(!flushed)return -1;
+    const uint32_t pending=s_reports.count;
+    const int n=rsx_reports_recover(&s_reports,&s_report_ops);
+    if(n<0)return -1;
+    s_report_live_lifetime=0;
+    fprintf(stderr,"[deferred reports] recovered (%s): %d of %u queued records published after a full GPU wait; publication resumes (recoveries=%llu)\n",
+            when,n,pending,(unsigned long long)s_reports.recoveries);
+    return 1;
+}
 static int gcm_reports_progress(int wait,int issue){
     if(!s_deferred_reports)return 1;
     uint32_t target=ring_target();
@@ -1783,11 +1830,24 @@ static int gcm_reports_progress(int wait,int issue){
             }
         }
     }
+    /* A failure from an earlier pass that could not recover then (inside a
+     * primitive) recovers as soon as it can. */
+    int recover=s_reports.failed&&!s_reports_recovering?gcm_reports_try_recover("retry"):1;
     int was_failed=s_reports.failed;
-    int ok=rsx_reports_progress(&s_reports,&s_report_ops,wait,issue);
+    int ok=!s_reports.failed&&rsx_reports_progress(&s_reports,&s_report_ops,wait,issue);
     if(ok&&!s_reports.count)s_report_live_lifetime=0;
-    if(!ok&&!was_failed)fprintf(stderr,"[deferred reports] FAILED; publication stopped pending=%u issued=%llu published=%llu\n",s_reports.count,(unsigned long long)s_reports.issued,(unsigned long long)s_reports.published);
-    if(s_reports.failed&&s_early_fifo_sync&&gcm_checked_ref_mode())gcm_checked_ref_fail("early-release-completion",s_fifo_getoff);
+    if(!ok&&!was_failed){
+        fprintf(stderr,"[deferred reports] FAILED; publication stopped pending=%u issued=%llu published=%llu\n",s_reports.count,(unsigned long long)s_reports.issued,(unsigned long long)s_reports.published);
+        if(!s_reports_recovering){
+            recover=gcm_reports_try_recover("at failure");
+            if(recover>0)ok=rsx_reports_progress(&s_reports,&s_report_ops,wait,issue);
+            else if(recover==0)fprintf(stderr,"[deferred reports] inside a primitive: recovery waits for it to end\n");
+        }
+    }
+    /* Checked REF stops only when publication cannot recover: freezing it
+     * while a recovery is still possible stopped every later pass, so the
+     * recovery never came. */
+    if(s_reports.failed&&recover<0&&s_early_fifo_sync&&gcm_checked_ref_mode())gcm_checked_ref_fail("early-release-completion",s_fifo_getoff);
     return ok;
 }
 static int gcm_reports_can_defer(void){
@@ -1808,6 +1868,8 @@ static int gcm_reports_admit(void){
 }
 static int gcm_reports_dependency(void){
     if(!s_deferred_reports)return 1;
+    /* The recovery's own full wait: it publishes everything right after. */
+    if(s_reports_recovering)return 1;
     cellGcm_rsx_consumer_begin();int ok=gcm_reports_progress(1,1);
     cellGcm_rsx_consumer_end();return ok;
 }
@@ -1959,10 +2021,26 @@ static int gcm_early_reference_receipt(void){
  * pointer for 40 s, so the time put passed each release can be found offline. */
 static u32 s_lag_ea=1u;
 static int s_lag_sampler;
+/* PS3RECOMP_RSX_LABEL_LAG_WINDOW=<start_s>,<seconds> (default 0,40): sample
+ * put, and print consume and pass lines, only in that window, counted from
+ * the release's first consume -- so a window in gameplay is not spent on
+ * loading. s_lag_from/s_lag_to: the window on the critical-trace clock. */
+static volatile uint64_t s_lag_from,s_lag_to;
+static int gcm_lag_in_window(void){
+    const uint64_t now=ps3_critical_now_ns();
+    return s_lag_to&&now>=s_lag_from&&now<s_lag_to;
+}
 static DWORD WINAPI gcm_lag_sampler(LPVOID unused){
     (void)unused;u32 last=0xFFFFFFFFu;unsigned lines=0;
-    const uint64_t end=ps3_critical_now_ns()+40ull*1000000000ull;
-    while(ps3_critical_now_ns()<end&&lines<400000u){
+    while(ps3_critical_now_ns()<s_lag_from){
+#ifdef _WIN32
+        Sleep(50);
+#else
+        {const struct timespec ts={0,50000000};nanosleep(&ts,NULL);}
+#endif
+    }
+    const uint64_t end=s_lag_to;
+    while(ps3_critical_now_ns()<end&&lines<2000000u){
         const u32 put=vm_read32(GCM_CONTROL_GUEST_ADDR+0);
         if(put!=last){last=put;lines++;fprintf(stderr,"[label-lag] t=%llu put=0x%08X\n",(unsigned long long)ps3_critical_now_ns(),put);}
 #ifdef _WIN32
@@ -1976,9 +2054,18 @@ static DWORD WINAPI gcm_lag_sampler(LPVOID unused){
 static void gcm_label_lag_note(u32 ea,u32 method,u32 value){
     if(s_lag_ea==1u){const char *e=getenv("PS3RECOMP_RSX_LABEL_LAG");s_lag_ea=e&&*e?(u32)strtoul(e,0,16):0u;}
     if(!s_lag_ea||ea!=s_lag_ea)return;
-    if(!s_lag_sampler){s_lag_sampler=1;HANDLE h=CreateThread(NULL,0,gcm_lag_sampler,NULL,0,NULL);if(h)CloseHandle(h);}
+    if(!s_lag_sampler){
+        double start=0,secs=40;const char*w=getenv("PS3RECOMP_RSX_LABEL_LAG_WINDOW");
+        if(w)sscanf(w,"%lf,%lf",&start,&secs);
+        if(start<0)start=0;if(secs<=0||secs>3600)secs=40;
+        const uint64_t now=ps3_critical_now_ns();
+        s_lag_from=now+(uint64_t)(start*1e9);s_lag_to=s_lag_from+(uint64_t)(secs*1e9);
+        s_lag_sampler=1;HANDLE h=CreateThread(NULL,0,gcm_lag_sampler,NULL,0,NULL);if(h)CloseHandle(h);
+        fprintf(stderr,"[label-lag] window %.1f s after the first consume, %.1f s long\n",start,secs);
+    }
+    if(!gcm_lag_in_window())return;
     static unsigned n;
-    if(n++<20000u)fprintf(stderr,"[label-lag] t=%llu consume ea=0x%08X method=0x%04X value=0x%08X get=0x%08X\n",
+    if(n++<200000u)fprintf(stderr,"[label-lag] t=%llu consume ea=0x%08X method=0x%04X value=0x%08X get=0x%08X\n",
         (unsigned long long)ps3_critical_now_ns(),ea,method,value,s_fifo_getoff);
 }
 /* Label writes retain the existing value/byte-order semantics, but release
@@ -2926,8 +3013,32 @@ static void gcm_park_kick_arm(u32 ea, u32 word)
     }
 }
 
+/* PS3RECOMP_GCM_SPU_PUT_KICK=1 (default off; read once): an SPU transfer
+ * that writes the control register's put word wakes the FIFO walker, as a PPU
+ * store to it already does. Titles whose SPU jobs advance put by DMA otherwise
+ * leave the walker asleep until its idle-wait timeout with new commands
+ * already in the buffer; the RSX itself sees put whoever writes it. The hook
+ * runs after the transfer has landed, so the woken walker reads the new put. */
+static int s_spu_put_kick = -1;
+static _Atomic unsigned long long s_spu_put_kicks;
+static int gcm_spu_put_kick_on(void)
+{
+    if (s_spu_put_kick < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_SPU_PUT_KICK");
+        s_spu_put_kick = e && !strcmp(e, "1");
+        if (s_spu_put_kick) fprintf(stderr, "[gcm] an SPU DMA over the put word wakes the FIFO walker\n");
+    }
+    return s_spu_put_kick;
+}
+
+static void gcm_kick_stats_spu_put(u32 ea, u32 size);
 void gcm_note_spu_put(u32 ea, u32 size)
 {
+    gcm_kick_stats_spu_put(ea, size);   /* PS3RECOMP_RSX_KICK_STATS: before the kick it may make */
+    if (size && GCM_CONTROL_GUEST_ADDR - ea < size && gcm_spu_put_kick_on()) {
+        atomic_fetch_add_explicit(&s_spu_put_kicks, 1ull, memory_order_relaxed);
+        cellGcm_fifo_kick_notify();
+    }
     if (s_park_kick > 0 && size) gcm_park_kick_put(ea, size);
     if (!size || size > 0x40000u) return;
     u32 room = 0;
@@ -3163,8 +3274,48 @@ void cellGcm_native_consumer_init(void)
     }
     ReleaseSRWLockExclusive(&s_consumer_config_lock);
 }
+/* PS3RECOMP_RSX_KICK_STATS=1 (opt-in diagnostic, read once; printed every
+ * 2 s): how the walker's idle waits end. A wait ends on a kick or on its
+ * timeout; a timed-out wait during which `put` moved was owed a kick. Each
+ * such wait is put down to who moved `put` meanwhile: an SPU DMA over the put
+ * word (which kicks nothing), a kick that was made but did not end the wait,
+ * or neither (another writer). Wait times are summed by kind. */
+static int s_kick_stats = -1;
+static _Atomic(unsigned long long) s_ks_notifies, s_ks_spu_put_writes;
+static unsigned long long s_ks_waits, s_ks_kicked, s_ks_timeouts, s_ks_moved, s_ks_moved_spu,
+                          s_ks_moved_lost_kick, s_ks_moved_other, s_ks_kicked_put_moved;
+static uint64_t s_ks_kicked_us, s_ks_timeout_us, s_ks_last_us;
+static int gcm_kick_stats_on(void)
+{
+    if (s_kick_stats < 0) { const char* e = getenv("PS3RECOMP_RSX_KICK_STATS"); s_kick_stats = e && !strcmp(e, "1"); }
+    return s_kick_stats;
+}
+static void gcm_kick_stats_spu_put(u32 ea, u32 size)
+{
+    if (!size || !gcm_kick_stats_on()) return;
+    if (GCM_CONTROL_GUEST_ADDR - ea < size)
+        atomic_fetch_add_explicit(&s_ks_spu_put_writes, 1ull, memory_order_relaxed);
+}
+static uint64_t gcm_kick_stats_now_us(void)
+{
+    extern unsigned long long ps3_qpc_us(void);
+    return ps3_qpc_us();
+}
+static void gcm_kick_stats_report(uint64_t now)
+{
+    if (s_ks_last_us && now - s_ks_last_us < 2000000ull) return;
+    s_ks_last_us = now;
+    fprintf(stderr, "[gcm kick stats] waits=%llu kicked=%llu kicked_put_moved=%llu timeouts=%llu "
+            "timeout_put_moved=%llu (spu_dma=%llu kick_lost=%llu other=%llu) kicked_ms=%.1f timeout_ms=%.1f "
+            "notifies=%llu spu_put_writes=%llu\n",
+            s_ks_waits, s_ks_kicked, s_ks_kicked_put_moved, s_ks_timeouts, s_ks_moved, s_ks_moved_spu,
+            s_ks_moved_lost_kick, s_ks_moved_other, s_ks_kicked_us / 1000.0, s_ks_timeout_us / 1000.0,
+            atomic_load(&s_ks_notifies), atomic_load(&s_ks_spu_put_writes));
+}
+
 void cellGcm_fifo_kick_notify(void)
 {
+    if (gcm_kick_stats_on()) atomic_fetch_add_explicit(&s_ks_notifies, 1ull, memory_order_relaxed);
     if(!cellGcm_native_consumer_enabled())return;
     HANDLE ev=atomic_load_explicit(&s_gcm_kick_ev,memory_order_acquire);
     if(ev)SetEvent(ev);
@@ -3180,6 +3331,31 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     static int on = -1;
     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+    if (gcm_kick_stats_on()) {
+        const u32 put0 = vm_base ? vm_read32(GCM_CONTROL_GUEST_ADDR + 0) : 0;
+        const unsigned long long n0 = atomic_load(&s_ks_notifies), w0 = atomic_load(&s_ks_spu_put_writes);
+        const uint64_t t0 = gcm_kick_stats_now_us();
+        rsx_fifo_busy_idle_begin();
+        const DWORD r = ev ? WaitForSingleObject(ev, ms) : (Sleep(ms), WAIT_TIMEOUT);
+        rsx_fifo_busy_idle_end();
+        const uint64_t t1 = gcm_kick_stats_now_us();
+        const int moved = vm_base && vm_read32(GCM_CONTROL_GUEST_ADDR + 0) != put0;
+        s_ks_waits++;
+        if (r == WAIT_OBJECT_0) {
+            s_ks_kicked++; s_ks_kicked_us += t1 - t0;
+            s_ks_kicked_put_moved += (unsigned long long)moved;
+        } else {
+            s_ks_timeouts++; s_ks_timeout_us += t1 - t0;
+            if (moved) {
+                s_ks_moved++;
+                if (atomic_load(&s_ks_spu_put_writes) != w0) s_ks_moved_spu++;
+                else if (atomic_load(&s_ks_notifies) != n0) s_ks_moved_lost_kick++;
+                else s_ks_moved_other++;
+            }
+        }
+        gcm_kick_stats_report(t1);
+        return;
+    }
     rsx_fifo_busy_idle_begin();
     if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
@@ -3347,7 +3523,7 @@ void cellGcm_rsx_process_fifo(void)
     } else {
         cellGcm_rsx_consumer_begin();
         const int ph=gph_enabled();uint64_t p0=ph?gph_now():0,p1=0;const u32 g0=s_fifo_getoff;
-        if(gcm_reports_progress(0,0)){gcm_rsx_process_fifo_unlocked();if(ph)p1=gph_now();
+        if(gcm_reports_progress(0,0)||s_reports_recover_pending){gcm_rsx_process_fifo_unlocked();if(ph)p1=gph_now();
             gcm_reports_progress(0,!(s_lazy_issue&&s_early_release&&!s_reports.gated));}
         if(ph){const uint64_t p2=gph_now();if(p1){s_gph.pass_ns+=p1-p0;s_gph.pass_n++;s_gph.issue_ns+=p2-p1;s_gph.issue_n++;}
                if(s_fifo_getoff>=g0)s_gph.words+=(s_fifo_getoff-g0)/4u;gph_report();}
@@ -4237,11 +4413,22 @@ static void gcm_rsx_process_fifo_pass(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
-    if (s_lag_ea && s_lag_ea != 1u && s_lag_sampler) {
+    if (s_lag_ea && s_lag_ea != 1u && s_lag_sampler && gcm_lag_in_window()) {
         static unsigned ln;
-        if (ln++ < 60000u)
-            fprintf(stderr, "[label-lag] t=%llu pass why=%s start=0x%08X end=0x%08X put=0x%08X\n",
-                    (unsigned long long)ps3_critical_now_ns(), why, start_off, s_fifo_getoff, put);
+        if (ln++ < 600000u)
+        {
+            /* With PS3RECOMP_RSX_FIFO_BUSY=1 too: the walker's time in each
+             * category so far (us), so the time between a release's put and
+             * its consume can be split by what the walker was doing. */
+            uint64_t tot[RSX_FIFO_BUSY_BUILTIN_COUNT];
+            const int nt = rsx_fifo_busy_totals(tot, RSX_FIFO_BUSY_BUILTIN_COUNT);
+            char cats[512]; int cl = 0; cats[0] = 0;
+            for (int c = 0; c < nt && cl < (int)sizeof cats - 32; c++)
+                cl += snprintf(cats + cl, sizeof cats - (size_t)cl, "%s%llu", c ? "," : " busy_us=",
+                               (unsigned long long)(tot[c] / 1000u));
+            fprintf(stderr, "[label-lag] t=%llu pass why=%s start=0x%08X end=0x%08X put=0x%08X%s\n",
+                    (unsigned long long)ps3_critical_now_ns(), why, start_off, s_fifo_getoff, put, cats);
+        }
     }
     if (gcm_drain_debug()) {
         static int n2 = 0;

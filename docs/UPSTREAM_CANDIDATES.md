@@ -12,6 +12,11 @@ and M16–M23, updated Q5, Q15, M6, M15 and A3–A5, and extended sections 4 and
 written "fork #N"; a bare "#N" is upstream. Measured numbers come from the downstream port's title on
 the named host and are only a guide: re-measure against upstream before sending.
 
+A third pass on 2026-11-16 (fork `main` fbe6630a, upstream still de4f0903) covered fork #90–#109,
+added Q26, Q27, A7 and A8, and prepared upstream-ready branches on the fork for Q18, Q24, Q25, Q26
+and Q27. Each `upstream/<topic>` branch is one commit on upstream `master` de4f0903 with a synthetic
+test that passes there; the user opens the upstream PRs.
+
 ## How to update
 
 - Change an item's **Status** in the table below whenever its state changes, in the same fork PR that
@@ -49,19 +54,22 @@ the named host and are only a guide: re-measure against upstream before sending.
 | Q15 | Clock-paced cellAudio block reads | not started (fork #40 merged; upstream's POSIX pacing is still open #710, so rebase onto it first) |
 | Q16 | Metal depth-bounds snapshot reuse and a per-pass mode | PR open #755 |
 | Q17 | Vulkan engine: unbound units read transparent black | PR open #754 (from fork #36; its depth-snapshot half is already upstream as ec5a7a6f, so only its regression test went with it) |
-| Q18 | Event queues published only once initialised | not started (fork #67; upstream has the same race; small rebase of `sys_event.c`) |
+| Q18 | Event queues published only once initialised | PR open #804 (branch `upstream/lv2-event-queue-publish` b074d964; fork #67) |
 | Q19 | Per-task scrub of stack-keyed SPU registrations | not started (from fork #47; a POSIX bug upstream, independent of the pool) |
 | Q20 | Draw-engine CPU wins with no switch | not started (fork #49, #52, #75; three small PRs) |
 | Q21 | Opt-in on-disk Vulkan pipeline cache | not started (fork #62) |
-| Q22 | SPU per-call and per-DMA fast paths | not started (fork #77, #82, the signature-prefix half of #83) |
+| Q22 | SPU per-call and per-DMA fast paths | not started (fork #77, #82, the signature-prefix half of #83, #92) |
 | Q23 | Small diagnostics and hygiene | not started (fork #84, #76, #61, the getenv sites of fork #74 that upstream still reads per call) |
-| Q24 | HLE fast path writes the caller's TOC slot | not started (9a53e1f9, on fork #34's branch only) |
-| Q25 | A depth-0 SPU restart leaves no drain return point behind | not started (fb89f51e, on fork #34's branch only) |
+| Q24 | HLE fast path writes the caller's TOC slot | PR open #805 (branch `upstream/ppu-hle-fast-toc` 61978373; from 9a53e1f9) |
+| Q25 | A depth-0 SPU restart leaves no drain return point behind | PR open #806 (branch `upstream/spu-restart-drain-return` a5f929fb; from fb89f51e) |
+| Q26 | Window present guard: a window nobody sees never paces the title | PR open #807 (Vulkan, `upstream/vk-present-guard` 073e5dce), #808 (Metal, `upstream/metal-present-guard` 30c61576); fork #104, #105 |
+| Q27 | cellSpursJoinTaskset waits for the taskset's tasks to exit | PR open #809 (branch `upstream/spurs-join-taskset` aee876a9; from fork #98) |
+| Q28 | Weak header-defined globals are misbound in MinGW builds: use selectany on every PE target | not started (fork #127 fixes it for SPU_GATE; upstream has the same pattern) |
 | M1 | Guest write watch and preservation sessions | PR open #727 (write watch), #728 (preservation sessions, stacked on #727); Windows paths not yet run |
 | M2 | Coherence fast paths (series) | PR open #731 (live holder counts only). Shard, interest bitmap and no-LR store fast path dropped: they only pay off with fork-only 91df812a (see M15); 1ef14852 already upstream (#484); 9192f907 dropped (neutral) |
 | M3 | Fast guest accessors, inline stores from the lifter | dropped (superseded by upstream 27745b54, which already inlines stores under its own gate) |
 | M4 | Direct Vulkan present | PR open #738 (opt-in `PS3RECOMP_VK_DIRECT_PRESENT`; read-back stays the default) |
-| M5 | RSX present thread | PR open #741 (ring + Metal), #752 (Vulkan half, stacked on #738 and #741) |
+| M5 | RSX present thread | PR open #741 (ring + Metal), #752 (Vulkan half, stacked on #738 and #741). Fork #106 is ready as `upstream/vk-present-thread-dumps` 0a0c31e2, stacked on #752. Measured +12.8% on Linux (Vulkan) in the downstream title |
 | M6 | FIFO consumer busy accounting | PR open #745 (header-only; owner/handoff categories dropped). Fork #66 (Vulkan pump and host-present spans) is a follow-up commit for it |
 | M7 | Guest longjmp: PPU nonlocal control flow | PR open #735 (`/EHsc-` behind an OFF-by-default CMake option) |
 | M8 | Range-based PPU reservation invalidation | dropped (upstream bulk writes do not break PPU reservations word by word, so there is nothing to speed up; revisit only if upstream wants `PPU_RESV_STORE` to cover bulk and DMA writes) |
@@ -75,17 +83,19 @@ the named host and are only a guide: re-measure against upstream before sending.
 | M16 | Exact x86 single-precision paths and SSE4.1 conversions | not started (fork #48, #64; reconcile with upstream #500 and #683 first) |
 | M17 | x86 SPU integer and permute helpers, residual | not started (fork #41, #43 are mostly covered by upstream #512; re-measure the remainder first) |
 | M18 | SPU lifter register promotion (`--promote-regs`) | not started (fork #46; adapt to upstream's SPU_DIRECT tail calls and relocatable lifts) |
-| M19 | SPURS per-worker wake and request-line store wake | not started (fork #80, #81) |
-| M20 | SPU micro-interpreter decoded-run cache | not started (fork #85) |
+| M19 | SPURS per-worker wake and request-line store wake | in progress (branches `upstream/spurs-worker-wake` fcfc3054 and `upstream/spurs-store-wake` fb7da2bf, the second stacked on the first; both opt-in, with `bench_spurs_pm_hop`) |
+| M20 | SPU micro-interpreter decoded-run cache | dropped (no gain on upstream, whose microstep now has a quadword load/store fast loop; evaluation branch `eval/upstream-spu-smc-run-cache` 64ba10b3) |
 | M21 | Delta-driven draw engine (constants, fragment-program memo, Metal encoder filter) | not started (fork #51, #53, #55) |
 | M22 | Vulkan engine driver-cost series | not started (fork #39, #50, #57, #60; needs the batched recorder reconciled with upstream #532 first) |
 | M23 | Opt-in plain-method FIFO walk | not started (fork #54, #70; re-seat on upstream's walker) |
-| A1 | RFC: checked GPU completion for RSX reports and labels | not started (discussion first) |
+| A1 | RFC: checked GPU completion for RSX reports and labels | not started (no performance case upstream, which already publishes at FIFO position; offer only if a backend starts writing GPU-produced results) |
 | A2 | RFC: native-owner seam | not started (discussion first) |
-| A3 | Design note: decoupled RSX consumer | not started (discussion first; now has fork #58's encode-thread note and fork #73's Metal encode thread) |
-| A4 | Coherence model next steps | not started (discussion first; fork #78 implements version counters, opt-in) |
+| A3 | Design note: decoupled RSX consumer | not started (discussion first; now has fork #58's encode-thread note, fork #73's Metal encode thread and fork #93's Vulkan one, which measured negative) |
+| A4 | Coherence model next steps | in progress (RFC with a design note and a five-PR series plan drafted; fork #78 and #87) |
 | A5 | Lifter performance passes | not started (measure first; SPU register promotion is now measured and moved to M18) |
 | A6 | Porting workflow: installer framework and clean-room method | not started (discussion first) |
+| A7 | Event-driven FIFO walker: wake on every writer of put | PR open #816 (SPU put kick and the template kick wait, `upstream/gcm-spu-put-kick` 4129537f), #817 (PPU put-store kick, stacked, `upstream/gcm-ppu-put-kick` 2904a768) |
+| A8 | SPURS module-poll preemption | not started (discussion first; fork #91, opt-in, measured neutral) |
 
 ## Executive summary
 
@@ -95,6 +105,8 @@ the named host and are only a guide: re-measure against upstream before sending.
 4. **Upstream has no equivalent of the fork's checked-completion RSX report subsystem** (deferred reports with GPU tickets; early label release and the inline-image no-wait barrier sit on top of it), nor of the native-owner/handoff seam. Both are architectural: open a discussion, not a PR. The coherence series also touches an area you put on hold ("after the reset").
 5. **Already superseded.** Upstream now has its own Vulkan draw batching (#532), keyboard-to-pad fallback, POSIX audio pacing (#710, open), the unresolved-HLE policy (#697, open), the interpreter decode table (#688) and the 64-bit CTR fix. Drop or reconcile our versions of those rather than submitting them.
 6. **2026-11-09 inventory (fork #34–#89).** 17 new items (Q17–Q25, M16–M23), drawn from about 35 fork PRs, can go upstream. Propose these first: the three bug fixes upstream also has, Q18 (event-queue publish race, a startup crash), Q24 (TOC slot on the HLE fast path, a boot failure) and Q25 (stale drain return point after a depth-0 restart, a freeze); then Q19 (per-task scrub of stack-keyed SPU registrations, which also makes our open #733 safe); then M16 (exact x86 single-precision paths, the largest measured x86 win that upstream lacks at its default `-msse4.1`). Most RSX-thread work (M21–M23) needs re-implementing on upstream's diverged draw engine and walker, and the Vulkan series (M22) waits on the batched-recorder question. Fork #41/#43, #59 and most of #74 are already covered upstream (section 5).
+7. **2026-11-16: five upstream-ready branches.** Q18, Q24, Q25, Q26 (two branches) and Q27 are each one commit on upstream `master` with a passing synthetic test, waiting only for the user to open the PRs. Q18, Q24 and Q25 are bugs upstream has; Q26 stops a hidden window or sleeping display from pacing a title; Q27 replaces a no-op stub. The SPU put kick (A7, +16.6% Windows and +6.5% Linux in the downstream title) needs a discussion first, because it is one piece of an event-driven walker.
+8. **2026-11-16: architectural changes approved.** The user now wants architectural changes that bring generic performance gains sent upstream too. The ordered plan, with dependencies, sizes, risks and how to show each gain synthetically, is in "Architectural upstream plan" below. Theme 1 (an event-driven FIFO walker, A7) has two review-ready branches.
 
 **Conventions.**
 - Size is the diff including tests.
@@ -103,6 +115,48 @@ the named host and are only a guide: re-measure against upstream before sending.
 - Most fork commits do not apply cleanly to upstream: of the 548, a `git apply --check` showed only 18 apply cleanly. Plan a rebase for each item.
 
 ---
+
+## Architectural upstream plan (2026-11-16)
+
+The user approved sending architectural changes that bring generic performance gains (2026-11-16). Upstream `master` is still de4f0903 (v0.19.0, 2026-11-06); it merges in batches, and 49 of our PRs are open there, including #804–#809 (Q18, Q24–Q27). Every change below is opt-in first, and each states how to show its gain without a game.
+
+| Theme | Fork work | Upstream base | Port size | Risk | Generic gain and how to show it | Default |
+|---|---|---|---|---|---|---|
+| 1. Event-driven FIFO walker (A7) | #107 SPU put kick; the native-consumer PPU put wake; #101 kick statistics | Upstream has the kick event and `gcm_note_spu_put`. Nothing kicks on an SPU write of put or a PPU store of it, and the project template's frame clock does a flat `Sleep(4)`, so even existing kicks are lost there | Small: +30 and +40 runtime lines, plus a one-compare lifter change | Low. Only extra `SetEvent` calls on the existing event | Up to one idle-wait timeout (4 ms) off each fence round trip that starts with the walker idle. Synthetic: the real `cellGcm_fifo_kick_wait(400)` with a put write 20 ms in returns in about 25 ms instead of 400. Downstream: +16.6% Windows, +6.5% Linux | Opt-in (`PS3RECOMP_GCM_SPU_PUT_KICK`, `PS3RECOMP_GCM_PPU_PUT_KICK`); the template wait is the one default change |
+| 2. Present off the walker (M4, M5) | Direct Vulkan present, the present ring and threads, #106 | Already open: #738, #741, #752 | Done; #106 becomes a follow-up commit | Medium (present ordering), opt-in | The walker no longer waits on the swapchain. Synthetic: the present-cost fixtures. Downstream: Vulkan present thread +12.8% Linux | Opt-in |
+| 3. SPURS wake-ups (M19) | #80 per-worker wake, #81 request-line store wake | Upstream has the same one-condition-variable herd and `spu_coh_watch_add`; its coordinator already wakes on SPU commits (#478) | Medium: about +60 and +50 runtime lines, plus the synthetic hop bench | Medium (scheduler wake-ups); admission unchanged | Measured on upstream: request to next module start at 6 lanes, 29–35 to 11 µs (about 8,300 idle worker wakes to 0); a PPU store to the next start, 556–640 to 12–13 µs. `bench_spurs_pm_hop` shows both | Opt-in (`PS3RECOMP_SPURS_WORKER_WAKE`, `PS3RECOMP_SPURS_STORE_WAKE`) |
+| 4. SPU micro-interpreter run cache (M20) | #85 | Upstream's `spu_smc_microstep` now has a quadword load/store fast loop for these stubs | Small | — | **None on upstream:** a 121-instruction save stub runs in 260–290 ns per call with or without the cache (the fork's 226 to 145 ns was measured on a base without the fast loop) | Not proposed; evaluation branch only |
+| 5. Coherence version counters (A4) | #78, #87 | Upstream has the default lock-line scheme (holder array #672); no per-line versions | Large: about 2.7k lines, about 65 HLE read-modify-write sites | High (memory model) | Removes the global lock-line lock and holder walks from every coherent write. Synthetic: `bench_spu_coherence`. Downstream: +12.6% Linux, +10.2% Mac, +8.3% Windows | Opt-in (`PS3RECOMP_COH_VERSIONS`); RFC and design note first |
+| 6. Checked completion for reports and labels (A1) | Deferred reports, early label release, #68, #109 | Upstream already publishes labels, reports and references at FIFO position, without waiting for the GPU | Very large (thousands of lines in `cellGcmSys.c` plus backend tickets) | High (guest-visible label semantics) | **None on upstream:** deferred reports add completion checks and early release gives that latency back, which nets out to upstream's current behaviour. The fork's gains here came from the batched Vulkan recorder those tickets enabled (M21, M22). It is a correctness feature only if a backend ever writes GPU-produced results into guest memory | Dropped from the performance plan; A1 stays a design note |
+
+**Order (2026-11-16, updated).** The user dropped the pacing rule: the maintainer merges large batches every couple of weeks, and stacked PRs are fine. Everything below can be opened now. Each stacked PR says what it is stacked on.
+
+| # | PR | Upstream branch on the fork | Commit | Base | State |
+|---|---|---|---|---|---|
+| 1 | Event-driven walker: SPU put kick, and the template waits on the kick | `upstream/gcm-spu-put-kick` | 4129537f | master | **PR open #816** |
+| 2 | Event-driven walker: PPU put-store kick | `upstream/gcm-ppu-put-kick` | 2904a768 | #816 | **PR open #817** |
+| 3 | Vulkan present thread keeps periodic frame dumps (fork #106) | `upstream/vk-present-thread-dumps` | 0a0c31e2 | #752 | ready to open |
+| 4 | SPURS per-worker wake, with `bench_spurs_pm_hop` | `upstream/spurs-worker-wake` | fcfc3054 | master | ready to open |
+| 5 | SPURS request-line store wake | `upstream/spurs-store-wake` | fb7da2bf | PR 4 | ready to open |
+| 6 | RFC: per-line coherence version counters, with a design note and a five-PR series plan | — | — | — | ready to open as a discussion |
+
+**Not proposed, and why:**
+- Theme 4 has no gain on upstream. The evaluation port is `eval/upstream-spu-smc-run-cache` 64ba10b3, with its bench.
+- Theme 6 has no performance gain on upstream (see the table).
+- Theme 5 is too large and central for one PR. It goes as an RFC, then a stacked series:
+  1. name the host read-modify-write sections;
+  2. the version core and its tests;
+  3. the SPU side;
+  4. the PPU side and lifter;
+  5. CI under both schemes.
+
+  Each step is opt-in and leaves the default path's code unchanged.
+
+**Not in the plan:**
+- fork #102 (vblank thread): not yet measured.
+- fork #103 (NOP-run skip): upstream already steps over NOP runs (`test_gcm_nop_runs`), so it is superseded.
+- fork #93 (Vulkan encode thread): measured negative.
+- fork #91 (module-poll preemption): measured neutral; A8.
 
 ## 1. Quick wins (ranked)
 
@@ -242,6 +296,7 @@ the named host and are only a guide: re-measure against upstream before sending.
 - **Value:** high. It crashed the downstream title on about 1 in 6 Windows engine starts (a write near address 0x24 inside `EnterCriticalSection`). POSIX only works by accident on glibc.
 - **Risk:** low. The synthetic test faults on the old file on its first run on Windows and passes with the fix.
 - **Prerequisites:** none. The patch needs a small rebase: one hunk of `sys_event.c` does not apply to upstream as is.
+- **Upstream branch (2026-11-16):** `upstream/lv2-event-queue-publish` b074d964. Upstream's destroy already keeps the queue's primitives alive and holds the table lock, so only create, lookup, push-by-id and the Windows table-lock initialisation change. The test needed one more stub for upstream. It passes on macOS and on Windows (clang-cl); on Windows the unmodified upstream `sys_event.c` fails it on the first run (0xC0000264).
 - **Upstream PR title:** "fix(lv2): publish event queues only once initialised; push under the table lock"
 
 **Q19. Per-task scrub of stack-keyed SPU registrations**
@@ -275,6 +330,7 @@ the named host and are only a guide: re-measure against upstream before sending.
   - fork #77: the MFC parameter channels, the tag mask and every MFC read channel skip the `mfc_for()` engine lookup; they only latch or return context state. Fixed overhead per small synthetic job: 324 to 245 ns (−24%).
   - fork #82: `spu_drain_call` returns at once as a leaf when nothing is pending and the pc is already the return pc; the loop moves to `spu_drain_call_loop`. A direct-call bracket went from 3.4 to 2.0 ns. `spu_drain_call` was the largest runtime symbol in a Linux profile (about 7 ms of SPU-thread CPU per frame).
   - fork #83, signature-prefix half: an insert-only set of the first 8 bytes of every content signature lets `spu_overlay_note_get` skip the signature scan for data GETs. With 90 sources registered, a small job went from about 475 to 377 ns.
+  - fork #92: the full indirect-branch resolver rejects the interrupt-restore helper when the context has no saved interrupt registers, and tests one cached gate before its three optional dispatch diagnostics (which upstream has too). Synthetic only: 13.6 to 12.6 ns per call.
 - **Value:** medium for titles that stream many small SPU jobs. In the downstream title, fork #77 together with the SPURS wake work (M19) added +2.9% on Windows.
 - **Risk:** low; behaviour is unchanged.
 - **Prerequisites:** fork #82 also clears the fork-only `region_dispatch_valid`; drop that. The verified-coverage half of fork #83 is for fork-only verified overlays; leave it out.
@@ -292,6 +348,7 @@ the named host and are only a guide: re-measure against upstream before sending.
 - **Source:** 9a53e1f9 on fork #34's branch (`integ/upstream-merge`): `runtime/ppu/ppu_hle.cpp` and `tests/test_ppu_hle_toc.cpp`, +47/−3. Not on fork `main` yet.
 - **The bug, present upstream:** upstream 9a3fbffd lets `ps3_hle_call` finish registered fast forms (lwmutex lock and unlock) before `_TocGuard`, whose destructor is what stores the caller's TOC at `0x28(r1)`. Lifted import stubs don't save r2, and their callers reload it from that slot. A fast call on a stack slot nothing has written yet leaves the caller with r2 = 0, so every TOC-relative global reads the null page. It usually goes unnoticed because an earlier full HLE call at the same stack depth left the TOC there.
 - **Fix:** the fast path restores r2 and stores it to the slot, as the guard does. The test covers a fast form that completes and one that declines.
+- **Upstream branch (2026-11-16):** `upstream/ppu-hle-fast-toc` 61978373. Its fixture is a new `tests/test_ppu_hle_fast_toc.cpp` with `tools/test_ppu_hle_fast_toc.py` (the fast cases only), so it does not collide with the TOC fixture in our open #722. The completing cases fail on unmodified upstream.
 - **Value:** high; it stopped a title booting after the v0.19 merge.
 - **Risk:** low.
 - **Upstream PR title:** "fix(ppu): write the caller's TOC slot on the HLE fast path"
@@ -303,7 +360,43 @@ the named host and are only a guide: re-measure against upstream before sending.
 - **Value:** high; a freeze about a second into gameplay in the downstream title.
 - **Risk:** low.
 - **Prerequisites:** send the clear and its test alone. The richer `[pm-end]` report and `PS3RECOMP_SPU_CHRING` in the same commit are optional diagnostics.
+- **Upstream branch (2026-11-16):** `upstream/spu-restart-drain-return` a5f929fb: the clear alone (no A/B switch), with the check added to `test_spu_lifted_start`'s stack-reset case (165/165; the new check fails on unmodified upstream).
 - **Upstream PR title:** "fix(spu): a depth-0 restart leaves no drain return point behind"
+
+**Q26. Window present guard: a window nobody sees never paces the title**
+- **Sources:** fork #104 (Vulkan) and #105 (Metal), with the shared pure-logic header `libs/video/rsx_present_guard.h` and `tools/test_present_guard.py`.
+- **The problem, present upstream:** a FIFO swapchain hands images back only as the compositor takes frames, and upstream's Vulkan backend acquires with `UINT64_MAX` on the presenting thread. With the display asleep (X11 with DPMS fakes vblanks at about 1 Hz; on a Windows host the fork saw frames quantized to about 264 ms and a launcher's network login time out) or on Wayland, which withholds frame callbacks from hidden surfaces, the compositor paces the whole title. Upstream's Metal backend waits forever for a frames-in-flight slot and then calls `nextDrawable`, which blocks up to a second while the window is occluded. Upstream already skips a minimized Vulkan window.
+- **Contents:** per present, the guard decides whether the frame also goes to the window (every frame is still rendered). A hidden or occluded window is skipped; the Vulkan acquire is bounded (`PS3RECOMP_VK_ACQUIRE_BOUND_MS`, default 100), and after one times out later acquires don't wait until an image comes back; a window frame whose waits overrun the bound (Metal: a `nextDrawable` that overruns it) skips the window, with a probe every 2 s, until a frame gets through; frames left out are held to 60 Hz. Metal's frames-in-flight wait still waits and only says when it overran. `0` turns either guard off.
+- **Value:** high for players: a hang-class fix on every host. A visible window on a healthy compositor never reaches any of it.
+- **Risk:** low to medium; default on. The PR text offers default off if upstream prefers.
+- **Upstream branches (2026-11-16):** `upstream/vk-present-guard` 073e5dce (SDL path only, since upstream's Vulkan is Linux-only) and `upstream/metal-present-guard` 30c61576 (engine and legacy presents; upstream has no present thread). Both are on upstream `master` and add the identical header and test, so they merge in either order. The guard test passes on macOS and Windows; both backends compile warning-free, and `test_metal_present_post` passes on the Metal branch. Not yet run with a real hidden window.
+- **Upstream PR titles:** "fix(vulkan): bound the swapchain acquire so a window nobody sees can't pace the title", "fix(metal): never let a window nobody can see pace the presenter"
+
+**Q27. cellSpursJoinTaskset waits for the taskset's tasks to exit**
+- **Source:** fork #98.
+- **Where upstream is:** `cellSpursJoinTaskset` is the same no-op stub ("In a full implementation, wait for all tasks to complete"). Upstream's task-exit path already clears a task's ENABLED bit, as the real policy does.
+- **Contents:** Join waits, bounded at 10 s, until the taskset's ENABLED bitset reads zero; on expiry it says so and returns BUSY; null is NULL_POINTER and an out-of-range taskset FAULT. Behaviour change: a guest that joins a taskset whose tasks never exit waits 10 s and gets BUSY instead of OK at once.
+- **What stays in the fork:** fork #98 also waits for the fork's per-taskset worker lifetime references (`spu_taskset_lifecycle_*`, from c3af35c1's bounded Taskset2 destruction) and gives a same-address Create a 100 ms grace period. Upstream has neither the lifecycle tracking nor the BUSY-on-recreate check that made that necessary, so the upstream port needs no lifecycle tracking.
+- **Upstream branch (2026-11-16):** `upstream/spurs-join-taskset` aee876a9, with `tests/test_spurs_join_taskset.c` and `tools/test_spurs_join_taskset.py` (POSIX; synthetic guest memory).
+- **Upstream PR title:** "fix(spurs): make JoinTaskset wait for the taskset's tasks to exit"
+
+**Q28. Weak header-defined globals are misbound in MinGW builds**
+- **Commit:** fork 4ff2aba2 (fork #127), `runtime/spu/spu_context.h`.
+- **Value:** the runtime defines its read-mostly gates in a header as `__declspec(selectany)` under
+  `_MSC_VER` and `__attribute__((weak))` elsewhere, so single-file tests link without the runtime.
+  GNU ld on PE-COFF does not fold GNU-weak data: every translation unit keeps its own copy and the
+  program's references bind to one address that need not be any of them. In a MinGW build of
+  `tools/test_original_work_routes.py` a gate's reads and writes landed inside another weak object,
+  so a read-once gate saw a stale value and the leaf route was skipped (right guest result, no
+  witness); the older integer gates were misbound the same way and only looked right because a stray
+  0 means "diagnostic off". `__declspec(selectany)` is honoured by MinGW gcc and gives one COMDAT
+  object, so the fix is to select it for every `_WIN32` target. Upstream's CI compiles its Python
+  fixtures with MinGW on Windows, so the same misbinding applies to any weak global it defines in a
+  header (check `git grep -n 'attribute__((weak))' -- '*.h'` on `master` before sending).
+- **Risk:** low; the change is one preprocessor condition.
+- **Missing:** a synthetic test that links two translation units with MinGW and checks the symbol
+  binds once (a `--compile-only` fixture plus `nm`, skipped where no MinGW toolchain exists).
+- **Upstream PR title:** "fix(spu): make header-defined gates selectany on every PE target"
 
 ## 2. Medium (ranked)
 
@@ -554,6 +647,7 @@ the named host and are only a guide: re-measure against upstream before sending.
   - Together these turn the walker into a thread that never blocks on the display or the GPU.
   - Worth one design note upstream, so the PRs land in a coherent order and don't trickle in one at a time.
 - **New fork material (2026-11-09):** fork #58 (design notes for a second RSX encode thread and host-format vertex streams); fork #73 (opt-in `PS3RECOMP_RSX_ENCODE_THREAD`: the Metal record replay moves to its own thread, ordered by enqueueing each command buffer on the walker; +9.8% in game on Metal); a Vulkan encode thread on the same design is in progress. Both depend on the fork's completion tickets (A1) and staging arenas, so they belong in this design note, not a cold PR.
+- **Update 2026-11-16:** the Vulkan encode thread (fork #93, opt-in, draft) measured no gain on Linux and −3.9% on Windows, with about 10% more process CPU. Its correctness and lifetime work is kept; the measurement argues against proposing it.
 
 **A4. Coherence model next steps**
 - **Covers:** M2 plus the deferred redesign (per-line version counters and lazy delivery of lost reservations).
@@ -576,6 +670,26 @@ the named host and are only a guide: re-measure against upstream before sending.
   - mag_decomp's single-function replay harness design.
 - **Pitch:** a reusable source-kit installer, plus a documented spec-then-implement method with a black-box SPU job recorder. Today every port reinvents these.
 
+**A7. Event-driven FIFO walker: wake on every writer of put**
+- **Fork work:**
+  - fork #107 (`PS3RECOMP_GCM_SPU_PUT_KICK=1`): an SPU transfer that writes the GCM control register's put word wakes the walker, as a PPU store to it already does. The check runs in `gcm_note_spu_put`, after the transfer has landed.
+  - fork #101 (`PS3RECOMP_RSX_KICK_STATS=1`): counts how the walker's idle waits end (a kick or the timeout) and, for a timeout during which put moved, which writer moved it.
+  - Open: fork #102 (the vblank beat on a thread of its own) and #103 (step over NOP runs in one go).
+- **Where upstream is:** it has the kick event (`cellGcm_fifo_kick_wait`) and `gcm_note_spu_put`, and kicks on a dry fence queue and a ring recycle. Nothing kicks when an SPU job or a PPU store advances put, so the walker sleeps out its idle timeout with commands already queued. The project template's frame clock does a flat `Sleep(4)` and loses even the existing kicks (only `ps3recomp_boot_smoke` waits on them). The fork's PPU put-store wake is part of its native-consumer mode (`g_gcm_consumer_put_wake_ea`).
+- **Upstream branches (2026-11-16):**
+  - `upstream/gcm-spu-put-kick` 4129537f: the SPU put kick (`PS3RECOMP_GCM_SPU_PUT_KICK`), plus the template frame clock waiting on the kick event.
+  - `upstream/gcm-ppu-put-kick` 2904a768, stacked on it: `PS3RECOMP_GCM_PPU_PUT_KICK`. The lifter's inline 32-bit store leaves the put word to the out-of-line `vm_write32`, as the inline load leaves the ref-poll word to `vm_read32`, and `vm_write32` then calls `cellGcm_put_on_store()`.
+  - Tests: `test_gcm_spu_put_kick` (an idle wait of 400 ms ends in about 25 ms when either writer stores put 20 ms in) and `test_ppu_put_store_kick` (real lifter output and the real loader).
+- **Measured in the downstream title:** before, every walker wait that timed out while put moved was put down to SPU DMA (about 110 per 2 s on Windows, about 210 ms/s of walker sleep). With the kick: 0, and +16.6% on Windows (36.56 to 42.62 guest flips/s) and +6.5% on Linux.
+- **Pitch:** the kick is hardware-faithful (the RSX sees put whoever writes it) and small (+121 with a test). But it is one piece of a walker that wakes on every event instead of polling. Propose that framing, the kick statistics as the evidence tool, and the kick itself as the first PR, after a discussion of the walker's wake model.
+- **Upstream issue title:** "RFC: wake the FIFO walker on every writer of put (SPU DMA first)"
+
+**A8. SPURS module-poll preemption**
+- **Fork work:** fork #91 (`PS3RECOMP_SPURS_MODULE_POLL_PREEMPT=1`, +333/−58). The HLE answer to `cellSpursModulePoll` always said "keep running". With the switch on, it names a different workload in the narrow case where that workload's flag is pending for its receiver, the receiver is runnable on this SPU and outweighs the poller by the kernel's selection weight, and no SPU of the instance is free. One module is told at a time.
+- **Where upstream is:** the same "keep running" answer.
+- **Value:** faithful to the kernel's selection rules, but measured neutral in game; the earlier estimate of its gain was withdrawn.
+- **Pitch:** a discussion about how faithful the HLE scheduler should be, with this as a worked example. Not a PR on its own.
+
 ## 4. Not upstream material
 
 - **Sail, PAMF and THX playback specifics:** f9ccab6b, 6786a944, e1216e7f, the immutable picture identities, the audio chronology. Tuned to one title's intro; the generic parts already went upstream (#252, #653, #663).
@@ -591,7 +705,10 @@ the named host and are only a guide: re-measure against upstream before sending.
 - **Fork-only DMA observers (fork #71, #72):** the disposition and audio-chronology hooks and their structural check exist only in the fork. Fork #71 makes them free when off; there is nothing equivalent upstream to speed up.
 - **Checked-completion machinery (A1):** fork #35 (checked REF stands down on an unknown FIFO word), #63 (re-check only textures an NV0039 write touched; the global dirty generation it narrows is fork-only, and upstream re-hashes once per frame) and #68 (lazy issue of applied report records under early release). They go with A1, if ever.
 - **Measured neutral or negative, kept in the fork:** fork #56 (`PS3RECOMP_GCM_PARK_KICK`, −4.6% on Linux), #65 (host-format vertex streams, no gain on Linux or Windows), #79 and #86 (staging only the constant rows a program reads, +0 on Metal), the SPURS self-dispatch switch in fork #80, and changing the DMA repeat back-off default (fork #76's counters are Q23). Revisit only with a new measurement.
-- **Fork CI and tracker housekeeping:** fork #42, #44, #45, #69, #88 and #89. Fork #37 proposed Q15 for upstream #754 after Q15 was taken; that entry is now Q17.
+- **Fork CI and tracker housekeeping:** fork #42, #44, #45, #69, #88 and #89. Fork #37 proposed Q15 for upstream #754 after Q15 was taken; that entry is now Q17 (fork #37 is closed).
+- **Deferred-report machinery (A1), 2026-11-16:** fork #109 (a FIFO pass that stops inside a primitive no longer freezes report publication). The deferred reports and checked REF it repairs exist only in the fork.
+- **Fork-only test repairs, 2026-11-16:** fork #94, #96, #99, #100 and #108. They fix flakes in fixtures that upstream doesn't have (walker sampler, musttail dispatch, the SPURS hop bench, the PPU store-phase stress tests).
+- **Placed elsewhere, 2026-11-16:** fork #101, #102 and #103 belong to A7; fork #106 is a follow-up for M5's #752; fork #93 is recorded under A3; fork #92 is in Q22.
 
 ## 5. Already upstream or superseded
 

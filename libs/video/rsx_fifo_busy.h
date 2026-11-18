@@ -69,6 +69,11 @@ void rsx_fifo_busy_idle_begin(void);
 void rsx_fifo_busy_idle_end(void);
 void rsx_fifo_busy_pass_stopped(int stop);
 /* One update boundary, counted on the consumer thread. */
+/* Owner thread only: each built-in category's time since accounting began
+ * (never reset), up to max values; returns how many were written (0 when
+ * off or not the owner). For lining walker time up with other timestamps. */
+int rsx_fifo_busy_totals(uint64_t* out_ns, int max);
+const char* rsx_fifo_busy_builtin_name(int category);
 void rsx_fifo_busy_flip(void);
 
 /* Tests only: replace the clock and the line sink, and force enablement

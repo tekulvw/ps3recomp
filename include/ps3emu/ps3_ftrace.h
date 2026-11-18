@@ -59,6 +59,8 @@ enum ps3_ft_kind {
                               * b = 1 present / 0 flush */
     PS3_FT_SPU_JOB     = 15, /* who = SPU id, a = streamed job image, from its first verified
                               * dispatch to the next job's or the end of the policy-module run */
+    PS3_FT_FLIP_TICK   = 16, /* instant: a flip the RSX executed completes on the beat */
+    PS3_FT_FLIP_DONE   = 17, /* instant: that completion delivered to the guest (status DONE, handler) */
 };
 
 #if defined(_MSC_VER)

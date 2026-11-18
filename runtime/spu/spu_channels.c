@@ -112,6 +112,11 @@ void spu_decrementer_observer_set(spu_decrementer_observer_fn observer)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* cellSpursModulePoll: the workload a scheduler would have this SPU run now,
+ * given the polling module's own (libs/spurs, PS3RECOMP_SPURS_MODULE_POLL_
+ * PREEMPT). Returning the current workload keeps the module running; NULL
+ * (the default) never preempts. */
+uint32_t (*g_spurs_module_poll_hook)(uint32_t spurs_ea, uint32_t wid, uint32_t spu_num) = 0;
 /* Called by host-side writers of guest memory (an RSX label publication) that
  * opt in to waking line watchers; cellSpurs sets it to its line-commit wake. */
 void (*g_host_line_write_hook)(uint32_t line) = 0;
@@ -1230,7 +1235,30 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);
+/* Three writes in four only latch an MFC parameter. The compact form answers
+ * them here, ahead of the full entry's frame; the full form keeps its own
+ * latch cases behind the channel histogram so SPU_CHHIST still counts them. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    /* One load and one predicted branch when the compact form is off: the
+     * switch is resolved by spu_context_init, and an unresolved -1 can only
+     * mean the full form here. */
+    if (g_spu_dispatch_gates.fast_path > 0) {
+        const uint32_t v = value._u32[0];
+        switch (channel) {
+        case MFC_LSA:       ctx->mfc_lsa = v;          return;
+        case MFC_EAH:       ctx->mfc_eah = v;          return;
+        case MFC_EAL:       ctx->mfc_eal = v;          return;
+        case MFC_Size:      ctx->mfc_size = v;         return;
+        case MFC_TagID:     ctx->mfc_tag = v & 0x1F;   return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = v;     return;
+        default: break;
+        }
+    }
+    spu_wrch_full(ctx, channel, value);
+}
+static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
@@ -1450,17 +1478,29 @@ static void spu_ch_wake_line_written(void* p)
  * goes idle. Waits shorter than PS3_FTRACE_MIN_US do not split a busy span. */
 static __thread uint64_t t_ft_busy0;
 
+/* The SPU number this host thread's spans carry. A SPURS policy-module
+ * context is initialised with spu_id 0 on every SPU (spurs_policy.c), so
+ * without this every policy-module thread's busy, wait and job spans read as
+ * spu 0. The SPURS worker names its SPU once at start; -1 keeps spu_id. */
+static SPU_TLS int t_ft_spu = -1;
+void spu_ft_set_spu(int spu) { t_ft_spu = spu; }
+int spu_ft_spu(void) { return t_ft_spu; }
+static inline uint32_t spu_ft_who(const spu_context* ctx)
+{
+    return t_ft_spu >= 0 ? (uint32_t)t_ft_spu : ctx->spu_id;
+}
+
 static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
 {
     const uint64_t t1 = ps3_ft_now();
     if (t1 - t0 < ps3_ft_min_ns()) return;
     if (t_ft_busy0 && t0 > t_ft_busy0) {
         const uint8_t* w = ctx->ls + 0x1DC;
-        ps3_ft_span(PS3_FT_SPU_BUSY, ctx->spu_id, (uint32_t)ctx->image_id,
+        ps3_ft_span(PS3_FT_SPU_BUSY, spu_ft_who(ctx), (uint32_t)ctx->image_id,
                     ((uint32_t)w[0] << 24) | ((uint32_t)w[1] << 16) | ((uint32_t)w[2] << 8) | w[3],
                     t_ft_busy0, t0);
     }
-    ps3_ft_span(PS3_FT_SPU_WAIT, ctx->spu_id, channel, ctx->pc & SPU_LS_MASK, t0, t1);
+    ps3_ft_span(PS3_FT_SPU_WAIT, spu_ft_who(ctx), channel, ctx->pc & SPU_LS_MASK, t0, t1);
     t_ft_busy0 = t1;
 }
 
@@ -1511,7 +1551,20 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
+static SPU_DMA_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel);
+/* The MFC status reads and the machine-status read are latched context state
+ * and never block; the compact form returns them ahead of the full entry. */
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
+{
+    if (g_spu_dispatch_gates.fast_path > 0) {
+        if (channel_is_mfc(channel))
+            return spu_make_preferred_u32(mfc_channel_read(NULL, ctx, channel));
+        if (channel == SPU_RdMachStat)
+            return spu_make_preferred_u32(ctx->int_enable & 1u);
+    }
+    return spu_rdch_full(ctx, channel);
+}
+static SPU_DMA_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel)
 {
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
@@ -2136,7 +2189,20 @@ static int spu_verified_cover_any(uint32_t lsa, uint32_t size)
     if (!size || lsa >= SPU_LS_SIZE) return 0;
     uint32_t last = lsa + size - 1u;
     if (last >= SPU_LS_SIZE) last = SPU_LS_SIZE - 1u;
-    for (uint32_t b = lsa >> SPU_VERIFIED_COVER_SHIFT; b <= last >> SPU_VERIFIED_COVER_SHIFT; ++b)
+    const uint32_t b0 = lsa >> SPU_VERIFIED_COVER_SHIFT, b1 = last >> SPU_VERIFIED_COVER_SHIFT;
+    if (spu_fast_path_on()) {
+        /* The same test a byte at a time: a 16 KiB transfer covers 128 bits
+         * of the map, sixteen bytes, instead of 128 single-bit probes. */
+        for (uint32_t i = b0 >> 3; i <= b1 >> 3; ++i) {
+            uint8_t m = __atomic_load_n(&s_verified_cover[i], __ATOMIC_RELAXED);
+            if (!m) continue;
+            if (i == b0 >> 3) m &= (uint8_t)(0xFFu << (b0 & 7u));
+            if (i == b1 >> 3) m &= (uint8_t)(0xFFu >> (7u - (b1 & 7u)));
+            if (m) return 1;
+        }
+        return 0;
+    }
+    for (uint32_t b = b0; b <= b1; ++b)
         if ((__atomic_load_n(&s_verified_cover[b >> 3], __ATOMIC_RELAXED) >> (b & 7u)) & 1u) return 1;
     return 0;
 }
@@ -2731,6 +2797,21 @@ static void spu_overlay_residency_print(void)
             atomic_load(&s_ovl_res_refused), atomic_load(&s_ovl_res_shadow),
             atomic_load(&s_ovl_res_shadow_bad));
 }
+/* The residency counters are only ever printed by the statistics (and the
+ * shadow check reports through them), so they are kept only while either is
+ * on: incremented on every residency dispatch by every SPU thread, they kept
+ * a cache line moving between cores that the dispatch path reads
+ * (spu_context.h, spu_dispatch_gates). */
+static int spu_overlay_residency_counting(void)
+{
+    int c = g_spu_dispatch_gates.ovl_stats;
+    if (c < 0) {
+        c = spu_overlay_residency_option("SPU_OVERLAY_RESIDENCY_STATS") ||
+            spu_overlay_residency_option("SPU_OVERLAY_RESIDENCY_SHADOW");
+        g_spu_dispatch_gates.ovl_stats = c;
+    }
+    return c;
+}
 static void spu_overlay_residency_stats(void)
 {
     static int on = -1;
@@ -2753,7 +2834,7 @@ static void spu_ft_job_begin(const spu_context* ctx, int image)
 {
     const uint64_t now = ps3_ft_now();
     if (t_ft_job.image) ps3_ft_span(PS3_FT_SPU_JOB, t_ft_job.spu, t_ft_job.image, 0, t_ft_job.t0, now);
-    t_ft_job.t0 = now; t_ft_job.spu = ctx->spu_id; t_ft_job.image = (uint32_t)image;
+    t_ft_job.t0 = now; t_ft_job.spu = spu_ft_who(ctx); t_ft_job.image = (uint32_t)image;
 }
 void spu_ft_job_end(void)
 {
@@ -2772,12 +2853,13 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
 {
     int* state = &ctx->resident_code[slot].verify_state;
     const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
+    const int counting = spu_overlay_residency_counting();
     if (*state == SPU_OVERLAY_PENDING) {
-        atomic_fetch_add_explicit(&s_ovl_res_checks, 1, memory_order_relaxed);
+        if (counting) atomic_fetch_add_explicit(&s_ovl_res_checks, 1, memory_order_relaxed);
         *state = spu_overlay_code_matches(ctx, o) ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
         if (*state == SPU_OVERLAY_VERIFIED && PS3_FT_ON())
             spu_ft_job_begin(ctx, ctx->resident_code[slot].image_id);
-        if (*state == SPU_OVERLAY_REJECTED)
+        if (*state == SPU_OVERLAY_REJECTED && counting)
             atomic_fetch_add_explicit(&s_ovl_res_rejects, 1, memory_order_relaxed);
     } else if (*state == SPU_OVERLAY_VERIFIED && spu_overlay_residency_shadow()) {
         atomic_fetch_add_explicit(&s_ovl_res_shadow, 1, memory_order_relaxed);
@@ -2787,7 +2869,7 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
         }
     }
     const int ok = *state == SPU_OVERLAY_VERIFIED;
-    atomic_fetch_add_explicit(ok ? &s_ovl_res_dispatches : &s_ovl_res_refused, 1, memory_order_relaxed);
+    if (counting) atomic_fetch_add_explicit(ok ? &s_ovl_res_dispatches : &s_ovl_res_refused, 1, memory_order_relaxed);
     spu_overlay_residency_stats();
     return ok;
 }
@@ -2804,6 +2886,7 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
         s_stack_reset[n].entry = entry & SPU_LS_MASK;
         s_stack_reset[n].image_id = image_id;
         __atomic_store_n(&g_spu_stack_reset_count,n+1,__ATOMIC_RELEASE);
+        __atomic_store_n(&g_spu_dispatch_gates.stack_reset_count,n+1,__ATOMIC_RELEASE);
     }
 }
 
@@ -2989,6 +3072,8 @@ static atomic_ullong s_dcache_hits, s_dcache_misses, s_dcache_shadow_bad;
 static uint32_t s_dcache_next_id;
 static int spu_dcache_mode(void)
 {
+    const int g = g_spu_dispatch_gates.dcache_mode;
+    if (g >= 0) return g;
     static atomic_int mode;
     int m = atomic_load_explicit(&mode, memory_order_relaxed);
     if (!m) {
@@ -2996,6 +3081,7 @@ static int spu_dcache_mode(void)
         m = !e ? 1 : !strcmp(e, "1") ? 2 : !strcmp(e, "shadow") ? 3 : 1;
         atomic_store_explicit(&mode, m, memory_order_relaxed);
     }
+    g_spu_dispatch_gates.dcache_mode = m - 1;
     return m - 1;   /* 0 off, 1 on, 2 shadow */
 }
 static void spu_dcache_note_get(uint32_t lsa, uint32_t size)
@@ -3155,7 +3241,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].source_ea = ea;
                     ctx->resident_code[slot].image_id = o->image_id;
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
-                    if (o->code) atomic_fetch_add_explicit(&s_ovl_res_loads, 1, memory_order_relaxed);
+                    if (o->code && spu_overlay_residency_counting())
+                        atomic_fetch_add_explicit(&s_ovl_res_loads, 1, memory_order_relaxed);
                     ctx->resident_code[slot].source_index = i;
                     spu_dcache_residency_changed(ctx);
                     return;
@@ -3934,7 +4021,12 @@ void spu_indirect_branch(spu_context* ctx)
             uint32_t ea = spu_ls_read32(ctx, 0x1C4);
             uint32_t wid = spu_ls_read32(ctx, 0x1DC);
             uint32_t status = ea_hi ? 0 : spurs_flag_status(ea, wid, 1);
-            ctx->gpr[3] = spu_make_preferred_u32(wid);
+            /* A scheduler may name another workload this SPU should switch
+             * to (g_spurs_module_poll_hook); by default it never does. */
+            uint32_t selected = wid;
+            if (g_spurs_module_poll_hook && !ea_hi)
+                selected = g_spurs_module_poll_hook(ea, wid, spu_ls_read32(ctx, 0x1C8));
+            ctx->gpr[3] = spu_make_preferred_u32(selected);
             ctx->gpr[3]._u32[1] = status;
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;

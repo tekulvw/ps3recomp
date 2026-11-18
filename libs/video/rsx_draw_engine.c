@@ -2590,14 +2590,123 @@ static struct {
     unsigned long long hits, misses;
 } s_pkm;
 
-static void eng_pkm_reset(void) { s_pkm.valid = 0; }
+/* PS3RECOMP_RSX_PIPELINE_REUSE (default off; read at the first draw):
+ *   1  a draw whose pipeline inputs cannot have changed since the previous
+ *      draw takes that draw's pipeline without gathering them again;
+ *   2  verify: gather them anyway, compare, use the gathered answer, and
+ *      report any disagreement (a correctness check for test runs).
+ * "Cannot have changed": no register the key is made of was written (a
+ * generation that every register write bumps except the few, listed in
+ * eng_preuse_safe_method, that the key never reads), the same fragment
+ * program bytes at the same address (compared, since the guest may rewrite
+ * them in memory), and the same caller arguments (layout, render state,
+ * target format and count, host formats). Everything gathered is then what
+ * the previous draw gathered, so the answer is too; g.fp_constants, written
+ * only from the fragment program's bytes, is unchanged as well. */
+static int s_preuse_mode = -1;
+static u64 s_preuse_gen = 1;
+static struct {
+    int valid, fixed_now;
+    u64 gen;
+    const u8* fp; u32 fp_size, fp_cap; u8* fp_copy;
+    u32 layout_mask, layout_stride, layout_count, rt_fmt, rt_count, host_on;
+    u8 host_formats[RSX_DSP_NUM_VERTEX_ATTR];
+    rsx_be_render_state rs;
+    u32 handle, tex_used; int fixed; u64 fp_hash;
+    unsigned long long hits, misses, mismatches;
+    /* Why a draw gathered (diagnostic, in the periodic line): the condition
+     * that failed, and for a register write, the method that last bumped the
+     * generation (by register index), so a method the key never reads can be
+     * found and listed. */
+    unsigned long long why[8];
+    u32 last_bump;
+    u32 bumps[2048];
+    u32 since[64];      /* methods (by register index) that bumped since the last gather */
+} s_preuse;
+static void eng_pkm_reset(void) { s_pkm.valid = 0; s_preuse.valid = 0; s_preuse_gen++; }
+/* Methods the pipeline key never reads, so writing them keeps the previous
+ * draw's pipeline: the vertex constant upload (its load slot and 32-word
+ * window; constants are bound, not compiled in), the vertex array offsets
+ * (formats are 0x1740.., read), each texture unit's image offset (its
+ * format, size and sampling words are read), the index array's address and
+ * format, the draw commands themselves,
+ * and the semaphore/label/report methods. Anything else bumps the
+ * generation. */
+static int eng_preuse_safe_method(u32 m)
+{
+    if (m >= 0x1EFCu && m <= 0x1F7Cu) return 1;
+    if (m >= 0x1680u && m < 0x16C0u) return 1;
+    if (m >= 0x1A00u && m < 0x1C00u && !((m - 0x1A00u) & 31u)) return 1;
+    switch (m) {
+    case 0x0100u: case 0x1800u: case 0x1808u: case 0x180Cu: case 0x1810u:
+    case 0x1814u: case 0x1818u: case 0x1824u: case 0x1D6Cu: case 0x1D70u: case 0x1D74u:
+    /* The index array's address and format (location, 16/32-bit): read by the
+     * draw's vertex fetch, never by the pipeline key. MAG writes the format
+     * between almost every two draws. */
+    case 0x181Cu: case 0x1820u:
+    /* Actions on no state the key reads: the vertex cache invalidates (MAG
+     * issues one before nearly every draw) and clearing a report value. */
+    case 0x1710u: case 0x1714u: case 0x17C8u:
+        return 1;
+    }
+    return 0;
+}
+/* What a write to each register means to the key, one byte per register,
+ * built once from eng_preuse_safe_method and the dispatcher's register
+ * classes: RELEVANT when the key reads it (a write bumps the generation),
+ * COMPARABLE when a write of the value already there changes nothing (not
+ * an execution method, not the transform program upload window, which
+ * writes program memory). The per-method path then does one byte load
+ * instead of the range tests and the switch; the walker hands the engine
+ * about 6M methods a second in MAG. */
+#define ENG_PREUSE_RELEVANT   1u
+#define ENG_PREUSE_COMPARABLE 2u
+static u8 s_preuse_table[RSX_DSP_NUM_REGS];
+static int s_preuse_table_ready;
+static void eng_preuse_table_build(void)
+{
+    for (u32 ridx = 0; ridx < RSX_DSP_NUM_REGS; ridx++) {
+        const u32 m = ridx << 2;
+        u8 t = 0;
+        if (!eng_preuse_safe_method(m)) t |= ENG_PREUSE_RELEVANT;
+        if (g.rsx.klass[ridx] != RSX_DSP_CLASS_EXEC && !(m >= 0x0B80u && m < 0x0C00u)) t |= ENG_PREUSE_COMPARABLE;
+        s_preuse_table[ridx] = t;
+    }
+    s_preuse_table_ready = 1;
+}
+static int eng_preuse_on(void)
+{
+    if (s_preuse_mode < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_PIPELINE_REUSE");
+        s_preuse_mode = e && (!strcmp(e, "1") || !strcmp(e, "2")) ? e[0] - '0' : 0;
+        if (s_preuse_mode)
+            fprintf(stderr, "[rsx engine] PS3RECOMP_RSX_PIPELINE_REUSE=%d: unchanged pipeline inputs keep the previous draw's pipeline%s\n",
+                    s_preuse_mode, s_preuse_mode == 2 ? " (verified against a full gather)" : "");
+        if (s_preuse_mode && !s_preuse_table_ready) eng_preuse_table_build();
+    }
+    return s_preuse_mode;
+}
+/* Tests: the table byte for a register index (ENG_PREUSE_* bits), against
+ * the reference logic the test keeps. */
+unsigned rsx_draw_engine_pipeline_reuse_register_class(u32 ridx)
+{
+    if (!s_preuse_table_ready) eng_preuse_table_build();
+    return ridx < RSX_DSP_NUM_REGS ? s_preuse_table[ridx] : ENG_PREUSE_RELEVANT;
+}
+void rsx_draw_engine_pipeline_reuse_counts(unsigned long long* hits, unsigned long long* misses,
+                                           unsigned long long* mismatches)
+{
+    if (hits) *hits = s_preuse.hits;
+    if (misses) *misses = s_preuse.misses;
+    if (mismatches) *mismatches = s_preuse.mismatches;
+}
 void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned long long* misses)
 {
     if (hits) *hits = s_pkm.hits;
     if (misses) *misses = s_pkm.misses;
 }
 
-static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
                             u32* out_tex_used, u64* out_fp_hash,
@@ -4450,6 +4559,100 @@ void rsx_draw_engine_vs_constant_row_counts(unsigned long long* row_binds, unsig
     if (row_bytes) *row_bytes = s_vs_row_bytes;
 }
 
+static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+                            const rsx_be_render_state* rs,
+                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
+                            u32* out_tex_used, u64* out_fp_hash,
+                            const u8* host_formats)
+{
+    const int mode = eng_preuse_on();
+    if (!mode) return eng_pipeline_get_full(layout, rs, rt_fmt, rt_count, out_fixed, out_tex_used,
+                                            out_fp_hash, host_formats);
+    const u8* vp = NULL; const u8* fp = NULL; u32 vp_instrs = 0, fp_size = 0;
+    const int fixed_now = !eng_guest_programs(&vp, &vp_instrs, &fp, &fp_size);
+    if (fixed_now) { fp = NULL; fp_size = 0; }
+    const u32 host_on = host_formats != NULL;
+    const int same = s_preuse.valid && s_preuse.gen == s_preuse_gen && s_preuse.fixed_now == fixed_now &&
+        s_preuse.fp == fp && s_preuse.fp_size == fp_size && (!fp_size || !memcmp(s_preuse.fp_copy, fp, fp_size)) &&
+        s_preuse.layout_mask == layout->mask && s_preuse.layout_stride == layout->stride &&
+        s_preuse.rt_fmt == (u32)rt_fmt && s_preuse.rt_count == rt_count && s_preuse.host_on == host_on &&
+        (!host_on || (s_preuse.layout_count == layout->count && !memcmp(s_preuse.host_formats, host_formats, layout->count))) &&
+        !memcmp(&s_preuse.rs, rs, sizeof *rs);
+    if (same && mode == 1) {
+        draw_observer_programs(vp, vp_instrs, fp, fp_size);
+        s_preuse.hits++;
+        *out_fixed = s_preuse.fixed; *out_tex_used = s_preuse.tex_used; *out_fp_hash = s_preuse.fp_hash;
+        return s_preuse.handle;
+    }
+    const u32 handle = eng_pipeline_get_full(layout, rs, rt_fmt, rt_count, out_fixed, out_tex_used,
+                                             out_fp_hash, host_formats);
+    if (same) {
+        s_preuse.hits++;
+        if (handle != s_preuse.handle || *out_fixed != s_preuse.fixed ||
+            *out_tex_used != s_preuse.tex_used || *out_fp_hash != s_preuse.fp_hash) {
+            if (s_preuse.mismatches++ < 16)
+                fprintf(stderr, "[rsx engine] pipeline reuse MISMATCH: reused %u (tex %08X) but gathered %u (tex %08X)\n",
+                        s_preuse.handle, s_preuse.tex_used, handle, *out_tex_used);
+        }
+    } else {
+        s_preuse.misses++;
+        /* The first condition that failed. */
+        int why = 0;
+        if (!s_preuse.valid) why = 0;
+        else if (s_preuse.gen != s_preuse_gen) {
+            why = 1;
+            /* Every method written since the previous draw, each once. */
+            for (u32 w = 0; w < 64u; w++)
+                if (s_preuse.since[w])
+                    for (u32 b = 0; b < 32u; b++)
+                        if ((s_preuse.since[w] >> b) & 1u) s_preuse.bumps[w * 32u + b]++;
+        }
+        else if (s_preuse.fixed_now != fixed_now || s_preuse.fp != fp || s_preuse.fp_size != fp_size) why = 2;
+        else if (fp_size && memcmp(s_preuse.fp_copy, fp, fp_size)) why = 3;
+        else if (s_preuse.layout_mask != layout->mask || s_preuse.layout_stride != layout->stride) why = 4;
+        else if (memcmp(&s_preuse.rs, rs, sizeof *rs)) why = 5;
+        else why = 6;   /* target format/count or host formats */
+        s_preuse.why[why]++;
+    }
+    if (!((s_preuse.hits + s_preuse.misses) % 50000u))
+    {
+        fprintf(stderr, "[rsx engine] pipeline reuse: %llu kept, %llu gathered, %llu mismatches; gathered because: "
+                "none-kept %llu, register %llu, program-moved %llu, program-bytes %llu, layout %llu, render-state %llu, target %llu\n",
+                s_preuse.hits, s_preuse.misses, s_preuse.mismatches, s_preuse.why[0], s_preuse.why[1], s_preuse.why[2],
+                s_preuse.why[3], s_preuse.why[4], s_preuse.why[5], s_preuse.why[6]);
+        /* The methods that most often stood between two draws. */
+        fprintf(stderr, "[rsx engine] pipeline reuse: methods written between two draws (draws they stood between):");
+        for (int k = 0; k < 16; k++) {
+            u32 best = 0, at = 0;
+            for (u32 i = 0; i < 2048u; i++) if (s_preuse.bumps[i] > best) { best = s_preuse.bumps[i]; at = i; }
+            if (!best) break;
+            fprintf(stderr, " %04X=%u", at << 2, best);
+            s_preuse.bumps[at] = 0;
+        }
+        fprintf(stderr, "\n");
+    }
+    s_preuse.valid = 0;
+    memset(s_preuse.since, 0, sizeof s_preuse.since);
+    if (!handle) return handle;
+    if (fp_size > s_preuse.fp_cap) {
+        u8* n = (u8*)realloc(s_preuse.fp_copy, fp_size);
+        if (!n) return handle;
+        s_preuse.fp_copy = n; s_preuse.fp_cap = fp_size;
+    }
+    if (fp_size) memcpy(s_preuse.fp_copy, fp, fp_size);
+    s_preuse.fp = fp; s_preuse.fp_size = fp_size; s_preuse.fixed_now = fixed_now;
+    s_preuse.gen = s_preuse_gen;
+    s_preuse.layout_mask = layout->mask; s_preuse.layout_stride = layout->stride;
+    s_preuse.layout_count = layout->count;
+    s_preuse.rt_fmt = (u32)rt_fmt; s_preuse.rt_count = rt_count; s_preuse.host_on = host_on;
+    if (host_on) memcpy(s_preuse.host_formats, host_formats, layout->count);
+    s_preuse.rs = *rs;
+    s_preuse.handle = handle; s_preuse.tex_used = *out_tex_used;
+    s_preuse.fixed = *out_fixed; s_preuse.fp_hash = *out_fp_hash;
+    s_preuse.valid = 1;
+    return handle;
+}
+
 static void sink_end_core(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -4971,6 +5174,7 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
      * first draw copies all of it into vp_cb. */
     g.vp_cb_serial = 1; g.vs_bound_serial = 0;
     eng_pkm_reset();
+    s_preuse_mode = -1;   /* PS3RECOMP_RSX_PIPELINE_REUSE is read again at the first draw */
     { const char* e = getenv("PS3RECOMP_RSX_HOST_VERTEX_FORMATS");
       s_host_vf = e && !strcmp(e, "1") && g.be->pipeline_create_host && g.be->draw_host;
       if (e && !strcmp(e, "1") && !s_host_vf)
@@ -5079,6 +5283,28 @@ static void eng_method_core(u32 method, u32 arg)
         else if (m==0x181C) s_external.indices|=1;
         else if (m==0x1820) s_external.indices|=2;
         else if (m==0x1FC0) s_external.frequency=1;
+    }
+    /* A write that leaves a register as it was changes nothing the key reads:
+     * a register written before (never-written ones read as defaults), not an
+     * execution method, not the transform program upload window (which
+     * writes program memory, not the register). MAG rewrites whole texture
+     * units and vertex formats with the same values between most draws. */
+    /* Only with reuse on: off, nothing reads the generation, and this runs
+     * for every method the walker hands the engine (about 6M a second in
+     * MAG), so the switch-off form must not pay for it. */
+    if (eng_preuse_on()) {
+        const u32 ridx = (m & 0xFFFFCu) >> 2;
+        const u8 t = ridx < RSX_DSP_NUM_REGS ? s_preuse_table[ridx] : (u8)ENG_PREUSE_RELEVANT;
+        if ((t & ENG_PREUSE_RELEVANT) &&
+            !((t & ENG_PREUSE_COMPARABLE) && g.rsx.seen[ridx] && g.rsx.regs[ridx] == arg)) {
+            s_preuse_gen++;
+            /* The per-method histogram only in verify mode: it is diagnostic
+             * output, and the store per bump is not free on the walker. */
+            if (s_preuse_mode == 2) {
+                s_preuse.last_bump = m;
+                const u32 r = (m >> 2) & 2047u; s_preuse.since[r >> 5] |= 1u << (r & 31u);
+            }
+        }
     }
     rsx_dispatch_method(&g.rsx, m, arg);
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
@@ -5353,6 +5579,7 @@ int rsx_draw_engine_async_available(void){
     if(owner)owner->end(owner->user,RSX_ORIGINAL_READ,0,1);
     return result;
 }
+int rsx_draw_engine_in_primitive(void){return g.ready&&g.rsx.in_begin_end!=0;}
 u64 rsx_draw_engine_submit_async(void){
     const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
     if(owner && !owner->begin(owner->user,RSX_ORIGINAL_BOUNDARY)){return 0;}
@@ -5696,6 +5923,7 @@ int rsx_draw_engine_native_publish_external(const rsx_native_external_pass* p)
             }
         }
         eng_native_color_attest_publish(p);
+        s_preuse_gen++;   /* registers written directly: the pipeline inputs may differ */
         for(u32 i=0;i<p->register_count;++i) {
             const rsx_native_register_write* r=&p->registers[i];
             g.rsx.regs[r->method>>2]=r->value;

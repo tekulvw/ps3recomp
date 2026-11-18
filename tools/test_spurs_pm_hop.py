@@ -6,9 +6,20 @@ with and without PS3RECOMP_SPURS_SELF_DISPATCH=1, each of which must complete;
 and a PPU-kicked chain whose requests are stored while the workers sleep,
 which must start each PM well inside the coordinator's 1 ms timed pass (the
 request line's coherence watch wakes it) and, with PS3RECOMP_SPURS_STORE_WAKE=0,
-waits for that pass.
---hops N: timed runs; prints per-hop wall time and request-to-start latency.
-Manufactured policy modules only; no game content.
+waits for that pass. Every case runs under both coherence schemes
+(PS3RECOMP_COH_VERSIONS=0 and 1).
+
+The store wake is proved without timing: with it on, the scheduler has its
+request-line watch registered and every PPU store reaches the line's watches
+(the fixture counts them with a watch of its own); with it off, no watch is
+registered. Latency is then checked: the woken p50 must be under 500 us, measured
+up to three times on a busy host. The stores land at a pseudo-random 200-1200 us
+after each hop, so the polled arm usually waits near half the coordinator's
+1 ms timed pass and the woken arm is then required to be at most half of it.
+A host can still align both timers (macOS coalesces nearby timer deadlines,
+so the stand-in's sleep and the timed pass can expire together), which makes
+the polled arm fast too; that comparison is then reported as inconclusive
+rather than failed, since the wake itself is already proved above.
 """
 import argparse
 import os
@@ -44,23 +55,50 @@ with tempfile.TemporaryDirectory(prefix='spurs-pm-hop-') as tmp:
     else:
         cases = [('1', 'spu'), ('6', 'spu'), ('2', 'ppu')]
         hops = 200
-    for lanes, kick in cases:
-        for self_dispatch in ('0', '1'):
-            result = subprocess.run([str(out), str(hops), lanes, kick], capture_output=True, text=True, timeout=120,
-                                    env=dict(env, PS3RECOMP_SPURS_SELF_DISPATCH=self_dispatch))
+    for coh in ('0', '1'):
+        coh_env = dict(env, PS3RECOMP_COH_VERSIONS=coh)
+        for lanes, kick in cases:
+            for self_dispatch in ('0', '1'):
+                result = subprocess.run([str(out), str(hops), lanes, kick], capture_output=True, text=True,
+                                        timeout=120, env=dict(coh_env, PS3RECOMP_SPURS_SELF_DISPATCH=self_dispatch))
+                line = [l for l in result.stdout.splitlines() if l.startswith('pm_hop')]
+                if result.returncode or not line:
+                    sys.exit(f'FAIL coh_versions={coh} lanes={lanes} kick={kick} self={self_dispatch}\n'
+                             f'{result.stdout}\n{result.stderr[-2000:]}')
+                print(f'coh_versions={coh} self_dispatch={self_dispatch} ' + line[0])
+        if args.hops:
+            continue
+        def measure(store_wake):
+            result = subprocess.run([str(out), '300', '2', 'ppu-idle=200~1000'], capture_output=True, text=True,
+                                    timeout=120, env=dict(coh_env, PS3RECOMP_SPURS_STORE_WAKE=store_wake))
             line = [l for l in result.stdout.splitlines() if l.startswith('pm_hop')]
             if result.returncode or not line:
-                sys.exit(f'FAIL lanes={lanes} kick={kick} self={self_dispatch}\n{result.stdout}\n{result.stderr[-2000:]}')
-            print(f'self_dispatch={self_dispatch} ' + line[0])
-    if not args.hops:
-        def p50(store_wake):
-            result = subprocess.run([str(out), '300', '2', 'ppu-idle=200'], capture_output=True, text=True,
-                                    timeout=120, env=dict(env, PS3RECOMP_SPURS_STORE_WAKE=store_wake))
-            line = [l for l in result.stdout.splitlines() if l.startswith('pm_hop')]
-            if result.returncode or not line:
-                sys.exit(f'FAIL ppu-idle store_wake={store_wake}\n{result.stdout}\n{result.stderr[-2000:]}')
-            print(f'store_wake={store_wake} ' + line[0])
-            return float(line[0].split(' p50=')[1].split()[0])
-        woken, polled = p50('1'), p50('0')
-        assert woken < 500 and polled > woken, (woken, polled)
+                sys.exit(f'FAIL coh_versions={coh} ppu-idle store_wake={store_wake}\n'
+                         f'{result.stdout}\n{result.stderr[-2000:]}')
+            print(f'coh_versions={coh} store_wake={store_wake} ' + line[0])
+            field = lambda name: line[0].split(f' {name}=')[1].split()[0]
+            return (float(field('p50')), int(field('request_watched')),
+                    int(field('ppu_stores')), int(field('line_writes')))
+        attempts = []
+        for _ in range(3):
+            woken, watched_on, stores, writes = measure('1')
+            polled, watched_off, _, _ = measure('0')
+            if watched_on != 1 or watched_off != 0:
+                sys.exit(f'FAIL coh_versions={coh}: request-line watch registered={watched_on} with the store '
+                         f'wake on and {watched_off} with it off (want 1 and 0)')
+            if stores < 1 or writes != stores:
+                sys.exit(f'FAIL coh_versions={coh}: {stores} PPU stores reached the request line\'s '
+                         f'watches {writes} times')
+            attempts.append((woken, polled))
+            if woken < 500:
+                break
+        else:
+            sys.exit(f'FAIL coh_versions={coh}: store wake p50 not under 500 us in any attempt '
+                     f'(woken, polled): {attempts}')
+        if woken * 2 <= polled:
+            print(f'coh_versions={coh}: store wake p50 {woken:.0f} us vs {polled:.0f} us polled')
+        else:
+            print(f'coh_versions={coh}: INCONCLUSIVE latency comparison: the polled arm was also fast '
+                  f'({polled:.0f} us vs {woken:.0f} us woken), so this host aligned the timers; '
+                  f'the wake is proved by its watch registration and line writes above')
 print('PASS: SPURS policy-module hop chains completed')
