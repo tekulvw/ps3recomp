@@ -37,6 +37,9 @@ PER_PASS = {
     'GCM_FLIPCOUNT', 'GCM_RECDBG', 'GCM_SEMA_ACQUIRE', 'GCM_SEMA_ACQUIRE_MS', 'RTT_DUMP', 'GCM_SUBCH7',
     # at the circling recovery report
     'GCM_FIFO_CIRCLE_PASSES',
+    # the split walker's own switches: read once per run (gcm_split_on)
+    'PS3RECOMP_RSX_SPLIT_WALKER', 'PS3RECOMP_RSX_SPLIT_WALKER_RING_MB', 'PS3RECOMP_RSX_SPLIT_WALKER_GET_LEAD',
+    'PS3RECOMP_RSX_SPLIT_WALKER_STATS',
     # the general (non-plain) per-word path's own diagnostics; any of them
     # already turns PS3RECOMP_GCM_FAST_WALK off (gcm_plain_walk / s_walk_diag)
     'GCM_SUBCH_GATE', 'GCM_OBJDBG', 'RSX_LIVE_FEED_DBG', 'GCM_VAL_WATCH', 'GCM_METHOD_HIST',
@@ -77,6 +80,10 @@ def body(text, name):
 getenv = re.compile(r'(?:getenv|gcm_env_flag\(&[A-Za-z_0-9]+,|gcm_observer_option)\s*\(?\s*"([A-Z0-9_]+)"')
 walker = (video / 'cellGcmSys.c').read_text()
 read = set(getenv.findall(body(walker, 'gcm_rsx_process_fifo_pass')))
+# The pass's effects live in gcm_walker_split.inc (the method-packet loop, the
+# semaphore packet, the flip word): the same per-word path, read with it.
+seam = (video / 'gcm_walker_split.inc').read_text()
+read |= set(getenv.findall(seam))
 read |= set(getenv.findall((video / 'gcm_fifo_observer.h').read_text()))
 listed = set(re.findall(r'^\s*"([A-Z0-9_]+)",\s*$', (video / 'gcm_fifo_diag_env.h').read_text(), re.M))
 unknown = sorted(read - listed - PER_PASS)
@@ -84,7 +91,7 @@ assert not unknown, f'read in the walker but classified neither as per-word (gcm
 # RSX_ENGINE_PHASES is read by gph_enabled, outside the pass; the pass tests its cached word.
 assert listed <= read | {'RSX_ENGINE_PHASES'}, f'listed but not read on the path: {sorted(listed - read)}'
 observer = (video / 'gcm_fifo_observer.h').read_text()
-assert all(f'"{n}"' in walker + observer for n in listed), 'a listed variable is not read by the walker at all'
+assert all(f'"{n}"' in walker + observer + seam for n in listed), 'a listed variable is not read by the walker at all'
 stale = sorted(PER_PASS - read)
 assert not stale, f'classified per-pass but no longer read in the walker: {stale}'
 print(f'PASS env scan: {len(read)} variables read in the walker; {len(listed & read)} per-word (listed), '

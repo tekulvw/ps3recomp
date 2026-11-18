@@ -444,6 +444,9 @@ void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes);
 void rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
+/* The FIFO consumer presents the flip it just reached, on its own thread;
+ * the host's rsx_draw_engine_present() for that same flip then presents nothing. */
+void rsx_draw_engine_present_at_flip(u32 buffer_id);
 /* A flip the engine never sees as 0xE944 (a 0xFEAD driver word or the SetFlip
  * HLE, both handled by cellGcmSys): remember the buffer for the host's next
  * rsx_draw_engine_present() without presenting now. */

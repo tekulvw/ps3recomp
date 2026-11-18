@@ -5467,8 +5467,25 @@ static int eng_flush_checked_core(void)
     return 1;
 }
 
+/* A flip-time present made by the FIFO consumer itself (the split walker's
+ * record thread): the host's present of the same flip, which follows from
+ * the receipt, is then skipped, as PS3RECOMP_RSX_SINGLE_PRESENT skips it. */
+static int s_flip_presented_by_consumer;
+static unsigned long long s_consumer_present_skipped;
+static void original_rsx_draw_engine_present_at_flip(u32 buffer_id)
+{
+    g.last_flip_buffer = buffer_id & 7u;
+    eng_present(g.last_flip_buffer);
+    s_flip_presented_by_consumer = 1;
+}
 static void original_rsx_draw_engine_present(void)
 {
+    if (s_flip_presented_by_consumer) {
+        s_flip_presented_by_consumer = 0;
+        if (++s_consumer_present_skipped <= 4ull || s_consumer_present_skipped % 600ull == 0)
+            fprintf(stderr, "[rsx engine] consumer presented at the flip: %llu host re-presents skipped\n", s_consumer_present_skipped);
+        return;
+    }
     /* A host that drives the flip itself gets whichever buffer the guest's
      * own last flip named, and display buffer 0 before there has been one:
      * a runner that both consumes 0xE944 and calls here would otherwise
@@ -6102,6 +6119,12 @@ void rsx_draw_engine_present(void){
     const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
     if(owner && !owner->begin(owner->user,RSX_ORIGINAL_BOUNDARY)){return;}
     original_rsx_draw_engine_present();
+    if(owner)owner->end(owner->user,RSX_ORIGINAL_BOUNDARY,0,!g.rsx.in_begin_end);
+}
+void rsx_draw_engine_present_at_flip(u32 buffer_id){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_BOUNDARY)){return;}
+    original_rsx_draw_engine_present_at_flip(buffer_id);
     if(owner)owner->end(owner->user,RSX_ORIGINAL_BOUNDARY,0,!g.rsx.in_begin_end);
 }
 void rsx_draw_engine_present_buffer(u32 buffer_id){
