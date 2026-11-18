@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
+#include <atomic>
+#include <chrono>
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -1996,7 +1998,7 @@ static inline int vm_fast_window(uint32_t ea, uint32_t n)
 static inline int vm_fast_read(uint32_t ea, uint32_t n)
 {
     return __builtin_expect(vm_inline_ok, 1) && vm_fast_window(ea, n) &&
-           ea != VM_HLE_INJECT_BASE + 0x2008u;
+           (uint32_t)(ea - (VM_HLE_INJECT_BASE + 0x2000u)) >= 0x10u;   /* LAB: put/get/ref all take the slow path */
 }
 static inline int vm_coh_marked(uint32_t ea)
 {
@@ -2077,6 +2079,58 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
+
+/* LAB (GCM_CTRL_READ_STATS=<secs>): guest reads of the FIFO control block's put
+ * (+0) and get (+4) words, to learn whether this title polls `get` as a
+ * progress/idle signal before reusing memory. Counts reads, how many saw
+ * get == put, the put-get lag at each get read, spin runs (>= 8 get reads by
+ * one thread, each within 300 us of the previous) and the guest call sites. */
+static int s_ctrl_stats = -1;
+static void gcm_ctrl_read_note(uint32_t a)
+{
+    if (s_ctrl_stats < 0) { const char* e = getenv("GCM_CTRL_READ_STATS"); s_ctrl_stats = e ? atoi(e) : 0; }
+    if (s_ctrl_stats <= 0) return;
+    static std::atomic<unsigned long long> get_reads{0}, put_reads{0}, eq{0}, lag4k{0}, lag64k{0}, lag1m{0}, lagbig{0},
+        spin_runs{0}, spin_reads{0}, spin_us{0};
+    static std::atomic<unsigned> max_run{0};
+    static std::atomic<uint64_t> last_report{0}, t_first{0};
+    static std::atomic_flag lk = ATOMIC_FLAG_INIT;
+    static struct { uint64_t lr; unsigned long long n, n_get; } sites[24];
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    uint64_t f = 0; if (t_first.compare_exchange_strong(f, now)) f = now;
+    const int is_get = a == VM_HLE_INJECT_BASE + 0x2004u;
+    uint32_t pv, gv; memcpy(&pv, vm_base + VM_HLE_INJECT_BASE + 0x2000u, 4); memcpy(&gv, vm_base + VM_HLE_INJECT_BASE + 0x2004u, 4);
+    pv = __builtin_bswap32(pv); gv = __builtin_bswap32(gv);
+    if (is_get) {
+        get_reads++;
+        if (pv == gv) eq++;
+        else { const uint32_t lag = pv - gv; if (lag < 0x1000u) lag4k++; else if (lag < 0x10000u) lag64k++; else if (lag < 0x100000u) lag1m++; else lagbig++; }
+        static PPU_THREAD_LOCAL uint64_t last_us, run_t0; static PPU_THREAD_LOCAL unsigned run;
+        if (run && now - last_us <= 300u) run++;
+        else {
+            if (run >= 8u) { spin_runs++; spin_reads += run; spin_us += last_us - run_t0;
+                             unsigned m = max_run.load(); while (run > m && !max_run.compare_exchange_weak(m, run)) {} }
+            run = 1; run_t0 = now;
+        }
+        last_us = now;
+    } else put_reads++;
+    const uint64_t lr = g_active_ctx ? g_active_ctx->lr : 0;
+    while (lk.test_and_set(std::memory_order_acquire)) {}
+    { int i = 0; for (; i < 24; i++) { if (sites[i].lr == lr) break; if (!sites[i].n) { sites[i].lr = lr; break; } }
+      if (i < 24) { sites[i].n++; if (is_get) sites[i].n_get++; } }
+    uint64_t lr_ = last_report.load();
+    const int report = now - (lr_ ? lr_ : f) >= (uint64_t)s_ctrl_stats * 1000000ull && last_report.compare_exchange_strong(lr_, now);
+    if (report) {
+        fprintf(stderr, "[ctrl-reads] t=%.1fs get_reads=%llu put_reads=%llu eq=%llu lag<4K=%llu <64K=%llu <1M=%llu >=1M=%llu "
+                "spin_runs=%llu spin_reads=%llu spin_ms=%.1f max_run=%u now_lag=%d |",
+                (now - f) / 1e6, get_reads.load(), put_reads.load(), eq.load(), lag4k.load(), lag64k.load(), lag1m.load(), lagbig.load(),
+                spin_runs.load(), spin_reads.load(), spin_us.load() / 1e3, max_run.load(), (int)(pv - gv));
+        for (int i = 0; i < 24; i++) if (sites[i].n) fprintf(stderr, " %08llX:%llu/%llu", (unsigned long long)sites[i].lr, sites[i].n, sites[i].n_get);
+        fprintf(stderr, "\n");
+    }
+    lk.clear(std::memory_order_release);
+}
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
@@ -2103,6 +2157,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
     if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2008u)) { static int _rp=-1;
         if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
         if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+    if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2000u) || (uint32_t)a == (VM_HLE_INJECT_BASE + 0x2004u)) gcm_ctrl_read_note((uint32_t)a);
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
 #ifdef _WIN32
