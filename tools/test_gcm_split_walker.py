@@ -165,14 +165,21 @@ def main():
 
         if args.sanitize:
             flag = f'-fsanitize={args.sanitize}'
-            sbin = build(tmp, 'san-' + args.sanitize, extra=[flag, '-g', '-O1'])
-            ok, _, on, err_on = check(sbin, 'san', scale=20)   # a fifth of the workload under instrumentation
-            bad = 'WARNING: ThreadSanitizer' in err_on or 'ERROR: AddressSanitizer' in err_on
-            if not ok or bad:
-                failed += 1
-                print(f'FAIL under -fsanitize={args.sanitize}:\n' + err_on[-4000:])
-            else:
-                print(f'PASS under -fsanitize={args.sanitize}')
+            try:
+                sbin = build(tmp, 'san-' + args.sanitize, extra=[flag, '-g', '-O1'])
+            except subprocess.CalledProcessError:
+                # A toolchain without the sanitizer runtime (gcc without libtsan):
+                # nothing to check, not a failure of the walker.
+                sbin = None
+                print(f'SKIP -fsanitize={args.sanitize}: the sanitizer build failed on this toolchain')
+            if sbin:
+                ok, _, on, err_on = check(sbin, 'san', scale=20)   # a fifth of the workload under instrumentation
+                bad = 'WARNING: ThreadSanitizer' in err_on or 'ERROR: AddressSanitizer' in err_on
+                if not ok or bad:
+                    failed += 1
+                    print(f'FAIL under -fsanitize={args.sanitize}:\n' + err_on[-4000:])
+                else:
+                    print(f'PASS under -fsanitize={args.sanitize}')
 
         if args.mutants:
             sources = {'gcm_walker_split.inc': (video / 'gcm_walker_split.inc').read_text(),
