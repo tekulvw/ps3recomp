@@ -23,6 +23,7 @@ import sys
 
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC) = range(1, 15)
+RECORD = 18   # the split walker's record thread applying queued records
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 
 SYSCALL_NAMES = {   # runtime/syscalls/lv2_syscall_table.h
@@ -33,7 +34,7 @@ SYSCALL_NAMES = {   # runtime/syscalls/lv2_syscall_table.h
 }
 
 
-RSX_ROWS = ("acquire wait", "drain", "present", "encode (flush)", "encode (present)",
+RSX_ROWS = ("acquire wait", "drain", "record", "present", "encode (flush)", "encode (present)",
             "gpu wait (flush)", "gpu wait (present)", "gpu wait (in-flight)", "readback")
 
 
@@ -109,6 +110,8 @@ def main():
                 acc[("rsx", "acquire wait")] += o
             elif k == DRAIN:
                 acc[("rsx", "drain")] += o
+            elif k == RECORD:
+                acc[("rsx", "record")] += o
             elif k == PRESENT:
                 acc[("rsx", "present")] += o
             elif k == GPU_ENCODE:
