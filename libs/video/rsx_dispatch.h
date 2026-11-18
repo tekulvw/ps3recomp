@@ -161,6 +161,11 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
+/* 1 when rsx_dispatch_method's whole effect for register index `idx` is the
+ * register-file store and the seen[] count, in every state: a caller may make
+ * those two stores itself instead of calling. tools/test_rsx_dispatch_plain.py
+ * holds this answer to the function for every index. */
+int rsx_dispatch_plain_register(u32 idx);
 
 /* ---- decoded state getters -------------------------------------------- */
 

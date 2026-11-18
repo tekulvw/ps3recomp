@@ -379,6 +379,11 @@ jobs:
           # PS3RECOMP_RSX_VERTEX_SIMD: the vector decode against the scalar
           # loop, bit for bit, and its mutants.
           CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_vertex_fetch_simd.py --mutants
+          # The dispatcher's plain-register mirror against rsx_dispatch_method for
+          # every register index and state, and its mutants: the draw engine skips
+          # the call for a plain register, so a case added to the dispatcher
+          # without a line in the mirror must fail here.
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_rsx_dispatch_plain.py --mutants
           # PS3RECOMP_RSX_PIPELINE_REUSE: off/on/verify equivalence, the register-class
           # table against its reference logic, and its mutants.
           CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_engine_pipeline_reuse.py --mutants

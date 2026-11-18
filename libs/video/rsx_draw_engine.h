@@ -414,6 +414,10 @@ void rsx_draw_engine_pipeline_reuse_counts(unsigned long long* hits, unsigned lo
  * (bit 0 relevant: it bumps the generation; bit 1 comparable: a write of the
  * value already there does not). */
 unsigned rsx_draw_engine_pipeline_reuse_register_class(u32 ridx);
+/* Tests: the engine's own per-method class bits for register index `ridx`
+ * (4 plain for the dispatcher, 8 texture-unit offset word, 16 texture-unit
+ * format word, 32 tracked by the external-program status). */
+unsigned rsx_draw_engine_method_class(u32 ridx);
 /* Repeat texture binds in one frame after a guest-memory write that missed
  * the texture (no re-check), and those a write may have touched (checked). */
 void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked);
