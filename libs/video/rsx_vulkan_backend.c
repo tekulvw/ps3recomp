@@ -392,6 +392,12 @@ static struct {
     u64 lab_arena_used, lab_draws, lab_vbytes, lab_ibytes, lab_vsbytes, lab_psbytes;
     u64 lab_vs_rows_copies, lab_vs_rows_bytes, lab_vs_full, lab_vs_reused;
     u64 lab_hist_v[24], lab_hist_i[24], lab_hist_vs[24];
+    /* LAB: full VS block uploads compared row by row (16 B) with the block
+     * the previous full upload carried: changed rows, runs of changed rows,
+     * the span from the first to the last changed row, uploads that changed
+     * nothing, and a histogram of changed rows per upload. */
+    u8  lab_last_vs[16384]; u32 lab_last_vs_bytes; int lab_last_vs_valid;
+    u64 lab_cmp_uploads, lab_cmp_rows, lab_cmp_runs, lab_cmp_span_bytes, lab_cmp_unchanged, lab_cmp_hist[24];
 } s_bat;
 static u32 lab_log2(u64 n) { u32 b = 0; while (n > 1u && b < 23u) { n >>= 1; b++; } return b; }
 
@@ -5659,7 +5665,27 @@ static void vk_eng_draw_core(rsx_topology topology, vk_eng_pipe* P, const vk_eng
                 const u32 t = s_e2.vs_bytes - 32u;
                 memcpy((u8*)vc + t, s_bat.vsc + t, 32u);
                 s_bat.lab_vs_rows_copies++; s_bat.lab_vs_rows_bytes += 32u;
-            } else if (s_e2.vs_bytes && s_bat.vsc) { memcpy(vc, s_bat.vsc, s_e2.vs_bytes); s_bat.lab_vs_full++; }
+            } else if (s_e2.vs_bytes && s_bat.vsc) {
+                memcpy(vc, s_bat.vsc, s_e2.vs_bytes); s_bat.lab_vs_full++;
+                if (s_e2.vs_bytes <= sizeof s_bat.lab_last_vs) {
+                    if (s_bat.lab_last_vs_valid && s_bat.lab_last_vs_bytes == s_e2.vs_bytes) {
+                        const u32 rows = s_e2.vs_bytes / 16u;
+                        u32 changed = 0, runs = 0, first = 0, last = 0; int in_run = 0;
+                        for (u32 r = 0; r < rows; r++) {
+                            if (memcmp(s_bat.lab_last_vs + r * 16u, s_bat.vsc + r * 16u, 16u)) {
+                                if (!changed) first = r;
+                                last = r; changed++;
+                                if (!in_run) { runs++; in_run = 1; }
+                            } else in_run = 0;
+                        }
+                        s_bat.lab_cmp_uploads++; s_bat.lab_cmp_rows += changed; s_bat.lab_cmp_runs += runs;
+                        if (changed) s_bat.lab_cmp_span_bytes += (u64)(last - first + 1u) * 16u; else s_bat.lab_cmp_unchanged++;
+                        if (changed) s_bat.lab_cmp_hist[lab_log2(changed)]++;
+                    }
+                    memcpy(s_bat.lab_last_vs, s_bat.vsc, s_e2.vs_bytes);
+                    s_bat.lab_last_vs_bytes = s_e2.vs_bytes; s_bat.lab_last_vs_valid = 1;
+                }
+            }
             else memset(vc, 0, vsb);
             cb[0].range = vsb;
             s_e2.vs_last = cb[0]; s_e2.vs_last_batch = s_bat.batches; s_e2.vs_last_valid = 1;
@@ -6272,9 +6298,12 @@ static void vk_bat_log(void)
             (unsigned long long)s_bat.lab_vs_full, (unsigned long long)s_bat.lab_vs_reused,
             (unsigned long long)s_bat.lab_vs_rows_copies, (unsigned long long)s_bat.lab_vs_rows_bytes,
             (unsigned long long)s_bat.slot_waits, (unsigned long long)s_bat.waits_for_cpu);
-    for (int k = 0; k < 3; k++) {
-        const u64* h = k == 0 ? s_bat.lab_hist_v : k == 1 ? s_bat.lab_hist_i : s_bat.lab_hist_vs;
-        fprintf(stderr, "[rsx lab arena] hist_%s(log2):", k == 0 ? "v" : k == 1 ? "i" : "vs");
+    fprintf(stderr, "[rsx lab arena] vs_delta: uploads=%llu changed_rows=%llu runs=%llu span_bytes=%llu unchanged_uploads=%llu\n",
+            (unsigned long long)s_bat.lab_cmp_uploads, (unsigned long long)s_bat.lab_cmp_rows, (unsigned long long)s_bat.lab_cmp_runs,
+            (unsigned long long)s_bat.lab_cmp_span_bytes, (unsigned long long)s_bat.lab_cmp_unchanged);
+    for (int k = 0; k < 4; k++) {
+        const u64* h = k == 0 ? s_bat.lab_hist_v : k == 1 ? s_bat.lab_hist_i : k == 2 ? s_bat.lab_hist_vs : s_bat.lab_cmp_hist;
+        fprintf(stderr, "[rsx lab arena] hist_%s(log2):", k == 0 ? "v" : k == 1 ? "i" : k == 2 ? "vs" : "vs_changed_rows");
         for (u32 b = 0; b < 24; b++) if (h[b]) fprintf(stderr, " %u:%llu", b, (unsigned long long)h[b]);
         fprintf(stderr, "\n");
     }
