@@ -414,7 +414,7 @@ static int gcm_native_handoff_consume(u32 ea, u32 get, u32 put)
 }
 static int gcm_native_handoff_consume_core(u32 ea, u32 get, u32 put)
 {
-    rsx_native_handoff_arm source;
+    rsx_native_handoff_arm source = {0};
     rsx_native_handoff_ring_arm ring = {0};
     unsigned ring_writer = 0;
     uint64_t cookie = 0;

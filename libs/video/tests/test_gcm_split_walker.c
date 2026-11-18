@@ -33,6 +33,7 @@ static void gcm_split_drain(void) {}
 static void gcm_split_stop(void) {}
 #endif
 #include <assert.h>
+#include <stdarg.h>
 #include <sys/mman.h>
 #include <pthread.h>
 #include <time.h>

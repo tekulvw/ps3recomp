@@ -42,9 +42,27 @@
  *    present/pump lease). Mapping transitions and terminate drain the ring
  *    first (gcm_split_drain). */
 
-#include "rsx_vk_thread.h"   /* pthread names on every host (SRW/condvar on Windows) */
-#ifndef _WIN32
+/* The ring's wake-ups: a native SRWLOCK + CONDITION_VARIABLE on Windows, a
+ * pthread mutex + condition variable elsewhere, behind four wrappers of this
+ * file's own (no pthread-name macros, so the GCM fixtures' own shims and the
+ * POSIX win32_compat layer are not involved). The thread is a Win32 thread
+ * on Windows and a pthread elsewhere. */
+#ifdef _WIN32
+typedef struct { SRWLOCK lock; CONDITION_VARIABLE cv; } gcm_split_wait;
+static void gcm_split_wait_init(gcm_split_wait* w) { InitializeSRWLock(&w->lock); InitializeConditionVariable(&w->cv); }
+static void gcm_split_wait_lock(gcm_split_wait* w) { AcquireSRWLockExclusive(&w->lock); }
+static void gcm_split_wait_unlock(gcm_split_wait* w) { ReleaseSRWLockExclusive(&w->lock); }
+static void gcm_split_wait_sleep(gcm_split_wait* w) { SleepConditionVariableSRW(&w->cv, &w->lock, INFINITE, 0); }
+static void gcm_split_wait_wake(gcm_split_wait* w) { AcquireSRWLockExclusive(&w->lock); WakeAllConditionVariable(&w->cv); ReleaseSRWLockExclusive(&w->lock); }
+#else
+#include <pthread.h>
 #include <sched.h>
+typedef struct { pthread_mutex_t lock; pthread_cond_t cv; } gcm_split_wait;
+static void gcm_split_wait_init(gcm_split_wait* w) { pthread_mutex_init(&w->lock, NULL); pthread_cond_init(&w->cv, NULL); }
+static void gcm_split_wait_lock(gcm_split_wait* w) { pthread_mutex_lock(&w->lock); }
+static void gcm_split_wait_unlock(gcm_split_wait* w) { pthread_mutex_unlock(&w->lock); }
+static void gcm_split_wait_sleep(gcm_split_wait* w) { pthread_cond_wait(&w->cv, &w->lock); }
+static void gcm_split_wait_wake(gcm_split_wait* w) { pthread_mutex_lock(&w->lock); pthread_cond_broadcast(&w->cv); pthread_mutex_unlock(&w->lock); }
 #endif
 
 /* ---- the effects --------------------------------------------------------- */
@@ -457,7 +475,7 @@ static struct {
     u32  get_lead;                     /* PS3RECOMP_RSX_SPLIT_WALKER_GET_LEAD, words */
     _Atomic u64 head, tail;            /* consumed / published word indices (monotone) */
     _Atomic int rec_sleeping, dec_sleeping, stop, started, idle;
-    pthread_mutex_t mu; pthread_cond_t cv_rec, cv_dec;
+    gcm_split_wait rec_wait, dec_wait;   /* the record thread's / the decoder's sleep */
 #ifdef _WIN32
     HANDLE thread;
 #else
@@ -503,7 +521,7 @@ static int gcm_split_on(void)
             if (!s_rq.buf) { fprintf(stderr, "[rsx split walker] refused: no memory for a %llu-word ring\n", (unsigned long long)cap); want = 0; }
             else {
                 s_rq.cap = cap; s_rq.get_lead = (u32)lead; s_rq.stats_on = st && !strcmp(st, "1");
-                pthread_mutex_init(&s_rq.mu, NULL); pthread_cond_init(&s_rq.cv_rec, NULL); pthread_cond_init(&s_rq.cv_dec, NULL);
+                gcm_split_wait_init(&s_rq.rec_wait); gcm_split_wait_init(&s_rq.dec_wait);
                 fprintf(stderr, "[rsx split walker] on: decode on the frame clock, record on its own thread; ring %llu MiB, get lead %ld words\n",
                         (unsigned long long)(cap * 4 >> 20), lead);
             }
@@ -513,11 +531,7 @@ static int gcm_split_on(void)
     return s_split;
 }
 
-static uint64_t gcm_split_now_ns(void)
-{
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
-}
+static uint64_t gcm_split_now_ns(void) { return gcm_bound_now(); }   /* QPC / CLOCK_MONOTONIC, defined above */
 static void gcm_split_sleep_us(long us)
 {
 #ifdef _WIN32
@@ -558,7 +572,7 @@ static void gcm_rq_commit(u32 n)
 {
     atomic_store_explicit(&s_rq.tail, atomic_load_explicit(&s_rq.tail, memory_order_relaxed) + n, memory_order_release);
     if (atomic_load_explicit(&s_rq.rec_sleeping, memory_order_acquire)) {
-        pthread_mutex_lock(&s_rq.mu); pthread_cond_broadcast(&s_rq.cv_rec); pthread_mutex_unlock(&s_rq.mu);
+        gcm_split_wait_wake(&s_rq.rec_wait);
     }
 }
 /* The decoder's `get` publication: queued with the ring position it belongs
@@ -574,7 +588,7 @@ static int gcm_split_publish_get(u32 value)
     s_rq.getq[t % 64u].value = value;
     atomic_store_explicit(&s_rq.getq_tail, t + 1u, memory_order_release);
     if (atomic_load_explicit(&s_rq.rec_sleeping, memory_order_acquire)) {
-        pthread_mutex_lock(&s_rq.mu); pthread_cond_broadcast(&s_rq.cv_rec); pthread_mutex_unlock(&s_rq.mu);
+        gcm_split_wait_wake(&s_rq.rec_wait);
     }
     return 0;
 }
@@ -705,18 +719,18 @@ static void* gcm_split_record_main(void* unused)
             }
             if (head == tail) {
                 gcm_split_get_flush(head);
-                pthread_mutex_lock(&s_rq.mu);
+                gcm_split_wait_lock(&s_rq.rec_wait);
                 atomic_store_explicit(&s_rq.rec_sleeping, 1, memory_order_release);
                 atomic_store_explicit(&s_rq.idle, 1, memory_order_release);
                 while (atomic_load_explicit(&s_rq.tail, memory_order_acquire) == head &&
                        atomic_load_explicit(&s_rq.getq_tail, memory_order_acquire) == atomic_load_explicit(&s_rq.getq_head, memory_order_relaxed) &&
                        !atomic_load_explicit(&s_rq.stop, memory_order_acquire)) {
                     s_rq.empty_sleeps++;
-                    pthread_cond_wait(&s_rq.cv_rec, &s_rq.mu);
+                    gcm_split_wait_sleep(&s_rq.rec_wait);
                 }
                 atomic_store_explicit(&s_rq.rec_sleeping, 0, memory_order_release);
                 atomic_store_explicit(&s_rq.idle, 0, memory_order_release);
-                pthread_mutex_unlock(&s_rq.mu);
+                gcm_split_wait_unlock(&s_rq.rec_wait);
                 if (atomic_load_explicit(&s_rq.stop, memory_order_acquire) &&
                     atomic_load_explicit(&s_rq.tail, memory_order_acquire) == head) break;
                 continue;
@@ -747,7 +761,7 @@ static void* gcm_split_record_main(void* unused)
             atomic_store_explicit(&s_rq.head, head, memory_order_release);
             s_rq.records++; s_rq.words += len;
             if (atomic_load_explicit(&s_rq.dec_sleeping, memory_order_acquire)) {
-                pthread_mutex_lock(&s_rq.mu); pthread_cond_broadcast(&s_rq.cv_dec); pthread_mutex_unlock(&s_rq.mu);
+                gcm_split_wait_wake(&s_rq.dec_wait);
             }
             if (atomic_load_explicit(&s_lease_waiters, memory_order_acquire) > 0) gcm_split_lease_yield();
             if (stop) break;
@@ -801,7 +815,7 @@ void gcm_split_drain(void)
         const u64 tail = atomic_load_explicit(&s_rq.tail, memory_order_acquire);
         if (head == tail && atomic_load_explicit(&s_rq.idle, memory_order_acquire)) break;
         if (atomic_load_explicit(&s_rq.rec_sleeping, memory_order_acquire)) {
-            pthread_mutex_lock(&s_rq.mu); pthread_cond_broadcast(&s_rq.cv_rec); pthread_mutex_unlock(&s_rq.mu);
+            gcm_split_wait_wake(&s_rq.rec_wait);
         }
         gcm_split_sleep_us(100);
     }
@@ -818,7 +832,7 @@ void gcm_split_stop(void)
     r[0] = GCM_RQ_HDR(GCM_RQ_STOP, 0, 0);
     atomic_store_explicit(&s_rq.stop, 1, memory_order_release);
     gcm_rq_commit(1);
-    pthread_mutex_lock(&s_rq.mu); pthread_cond_broadcast(&s_rq.cv_rec); pthread_mutex_unlock(&s_rq.mu);
+    gcm_split_wait_wake(&s_rq.rec_wait);
 #ifdef _WIN32
     WaitForSingleObject(s_rq.thread, INFINITE); CloseHandle(s_rq.thread);
 #else

@@ -66,11 +66,6 @@ static inline int rsx_vk_clock_gettime(int clock, struct timespec *ts)
 }
 #define clock_gettime rsx_vk_clock_gettime
 
-static inline int rsx_vk_cond_init(rsx_vk_cond_t *c, const void *attr)
-{ (void)attr; InitializeConditionVariable(c); return 0; }
-static inline int rsx_vk_cond_destroy(rsx_vk_cond_t *c) { (void)c; return 0; }
-#define pthread_cond_init rsx_vk_cond_init
-#define pthread_cond_destroy rsx_vk_cond_destroy
 static inline int rsx_vk_cond_wait(rsx_vk_cond_t *c, rsx_vk_mutex_t *m)
 { return SleepConditionVariableSRW(c, m, INFINITE, 0) ? 0 : -1; }
 /* `until` is an absolute CLOCK_REALTIME deadline, as for pthreads.
