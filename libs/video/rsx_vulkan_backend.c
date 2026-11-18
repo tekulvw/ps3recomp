@@ -388,7 +388,12 @@ static struct {
     /* PS3RECOMP_VK_MERGE_PASSES=1: draws merged into an open render pass */
     int merge;
     u64 passes, merged_draws, feedback_breaks, binds_skipped;
+    /* LAB (lab/vk-arena-stats): what the draws copy into the arena. */
+    u64 lab_arena_used, lab_draws, lab_vbytes, lab_ibytes, lab_vsbytes, lab_psbytes;
+    u64 lab_vs_rows_copies, lab_vs_rows_bytes, lab_vs_full, lab_vs_reused;
+    u64 lab_hist_v[24], lab_hist_i[24], lab_hist_vs[24];
 } s_bat;
+static u32 lab_log2(u64 n) { u32 b = 0; while (n > 1u && b < 23u) { n >>= 1; b++; } return b; }
 
 /* The render pass a merged draw left open in the open batch (only with
  * s_bat.merge), and the dynamic state already recorded in it. Anything other
@@ -5641,14 +5646,20 @@ static void vk_eng_draw_core(rsx_topology topology, vk_eng_pipe* P, const vk_eng
         if (ip) memcpy(ip, indices, (size_t)ibytes);
         /* A bound block fills its whole range (vsb == vs_bytes); only an
          * empty one is the 16 zero bytes. */
-        if (reuse_vs) { cb[0] = s_e2.vs_last; s_e2.vs_reused++; }
+        s_bat.lab_draws++; s_bat.lab_vbytes += vbytes; s_bat.lab_ibytes += ibytes; s_bat.lab_psbytes += psb;
+        s_bat.lab_hist_v[lab_log2(vbytes)]++; if (ibytes) s_bat.lab_hist_i[lab_log2(ibytes)]++;
+        if (reuse_vs) { cb[0] = s_e2.vs_last; s_e2.vs_reused++; s_bat.lab_vs_reused++; }
         else {
+            s_bat.lab_vsbytes += vsb; s_bat.lab_hist_vs[lab_log2(vsb)]++;
             if (s_e2.vs_bytes && s_bat.vsc && s_e2.vs_spans) {
-                for (u32 row = 0, n = 0; rsx_be_row_run(s_e2.vs_mask, &row, &n); row += n)
+                for (u32 row = 0, n = 0; rsx_be_row_run(s_e2.vs_mask, &row, &n); row += n) {
                     memcpy((u8*)vc + row * 16u, s_bat.vsc + row * 16u, n * 16u);
+                    s_bat.lab_vs_rows_copies++; s_bat.lab_vs_rows_bytes += n * 16u;
+                }
                 const u32 t = s_e2.vs_bytes - 32u;
                 memcpy((u8*)vc + t, s_bat.vsc + t, 32u);
-            } else if (s_e2.vs_bytes && s_bat.vsc) memcpy(vc, s_bat.vsc, s_e2.vs_bytes);
+                s_bat.lab_vs_rows_copies++; s_bat.lab_vs_rows_bytes += 32u;
+            } else if (s_e2.vs_bytes && s_bat.vsc) { memcpy(vc, s_bat.vsc, s_e2.vs_bytes); s_bat.lab_vs_full++; }
             else memset(vc, 0, vsb);
             cb[0].range = vsb;
             s_e2.vs_last = cb[0]; s_e2.vs_last_batch = s_bat.batches; s_e2.vs_last_valid = 1;
@@ -6151,6 +6162,7 @@ static int vk_bat_flush(int wait)
     s_bat_last_ticket = sl->ticket;
     for (u32 i = 0; i < s_bat.nret; i++) if (!s_bat.ret[i].ticket) s_bat.ret[i].ticket = sl->ticket;
     s_bat.batches++; s_bat.batch_ops += s_bat.ops;
+    s_bat.lab_arena_used += bs->used;
     s_bat.cur = (s_bat.cur + 1u) % s_bat.nslots;
     if (wait) { s_bat.waits_for_cpu++; if (vk_e5_reap(sl->ticket, 1)) return -1; }
     return vk_e5_failed() ? -1 : 0;
@@ -6251,6 +6263,21 @@ static void vk_bat_log(void)
     if (s_bat.desc_reuse)
         fprintf(stderr, "[rsx inflight vulkan batch] descriptor sets written=%llu reused=%llu\n",
                 (unsigned long long)s_bat.sets_written, (unsigned long long)s_bat.sets_reused);
+    fprintf(stderr, "[rsx lab arena] t=%lld.%03ld draws=%llu arena_used=%llu vbytes=%llu ibytes=%llu vsbytes=%llu psbytes=%llu "
+            "vs_full=%llu vs_reused=%llu vs_row_copies=%llu vs_row_bytes=%llu slot_waits=%llu cpu_waits=%llu\n",
+            (long long)now.tv_sec, now.tv_nsec / 1000000L,
+            (unsigned long long)s_bat.lab_draws, (unsigned long long)s_bat.lab_arena_used,
+            (unsigned long long)s_bat.lab_vbytes, (unsigned long long)s_bat.lab_ibytes,
+            (unsigned long long)s_bat.lab_vsbytes, (unsigned long long)s_bat.lab_psbytes,
+            (unsigned long long)s_bat.lab_vs_full, (unsigned long long)s_bat.lab_vs_reused,
+            (unsigned long long)s_bat.lab_vs_rows_copies, (unsigned long long)s_bat.lab_vs_rows_bytes,
+            (unsigned long long)s_bat.slot_waits, (unsigned long long)s_bat.waits_for_cpu);
+    for (int k = 0; k < 3; k++) {
+        const u64* h = k == 0 ? s_bat.lab_hist_v : k == 1 ? s_bat.lab_hist_i : s_bat.lab_hist_vs;
+        fprintf(stderr, "[rsx lab arena] hist_%s(log2):", k == 0 ? "v" : k == 1 ? "i" : "vs");
+        for (u32 b = 0; b < 24; b++) if (h[b]) fprintf(stderr, " %u:%llu", b, (unsigned long long)h[b]);
+        fprintf(stderr, "\n");
+    }
 }
 
 static int vk_bat_init(void)
