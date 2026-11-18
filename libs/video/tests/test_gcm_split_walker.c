@@ -38,6 +38,20 @@ static void gcm_split_stop(void) {}
 #include <pthread.h>
 #include <time.h>
 
+/* The writer is the emulated guest: it polls label, ref and get words and
+ * rewrites its vertex buffer with plain loads and stores, exactly as guest
+ * code does through vm_base. Those are the accesses the fixture exists to
+ * race against the record thread, in wall time; they carry no happens-before
+ * edge by design, so ThreadSanitizer does not instrument this side. The
+ * walker's own two threads stay fully instrumented. */
+#if defined(__clang__)
+#define GUEST_SIDE __attribute__((no_sanitize("thread")))
+#elif defined(__GNUC__)
+#define GUEST_SIDE __attribute__((no_sanitize_thread))
+#else
+#define GUEST_SIDE
+#endif
+
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active = 0;
@@ -154,19 +168,6 @@ static u32 draw_words(u32 io)
 }
 
 /* ---- the fast guest writer ---- */
-/* The writer is the emulated guest: it polls label, ref and get words and
- * rewrites its vertex buffer with plain loads and stores, exactly as guest
- * code does through vm_base. Those are the accesses the fixture exists to
- * race against the record thread, in wall time; they carry no happens-before
- * edge by design, so ThreadSanitizer does not instrument this side. The
- * walker's own two threads stay fully instrumented. */
-#if defined(__clang__)
-#define GUEST_SIDE __attribute__((no_sanitize("thread")))
-#elif defined(__GNUC__)
-#define GUEST_SIDE __attribute__((no_sanitize_thread))
-#else
-#define GUEST_SIDE
-#endif
 
 enum { SIG_NONE, SIG_LABEL, SIG_REF, SIG_FLIP, SIG_GETPUT, SIG_QUIT };
 static _Atomic int g_sig_kind;
