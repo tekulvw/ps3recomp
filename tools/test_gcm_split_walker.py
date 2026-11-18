@@ -177,7 +177,9 @@ def main():
                 bad = 'WARNING: ThreadSanitizer' in err_on or 'ERROR: AddressSanitizer' in err_on
                 if not ok or bad:
                     failed += 1
-                    print(f'FAIL under -fsanitize={args.sanitize}:\n' + err_on[-4000:])
+                    # The first reports carry the stacks; the tail only counts them.
+                    first = err_on.find('WARNING:'); first = 0 if first < 0 else max(0, first - 200)
+                    print(f'FAIL under -fsanitize={args.sanitize}:\n' + err_on[first:first + 12000] + '\n...\n' + err_on[-600:])
                 else:
                     print(f'PASS under -fsanitize={args.sanitize}')
 

@@ -138,7 +138,7 @@ static void raw32(u32 ea,u32 v) { v=ps3_bswap32(v);memcpy(vm_base+ea,&v,4); }
 static u32 wr(u32 io, u32 w) { raw32(IO_EA(io), w); return io + 4; }
 static u32 wr_n(u32 io, const u32* w, u32 n) { for (u32 i = 0; i < n; i++) io = wr(io, w[i]); return io; }
 static void set_put(u32 io) { atomic_thread_fence(memory_order_release); raw32(CTRL + 0, io); }
-static u32 get_reg(void) { return vm_read32(CTRL + 4); }
+GUEST_SIDE static u32 get_reg(void) { return vm_read32(CTRL + 4); }
 static void walk_to(u32 put)
 {
     set_put(put);
@@ -146,7 +146,7 @@ static void walk_to(u32 put)
     assert(s_fifo_getoff == put);
 }
 static void drained(void) { gcm_split_drain(); }
-static void fill_vtx(u32 pattern) { for (u32 i = 0; i < VTX_BYTES / 4; i++) raw32(VTX_EA + i * 4, pattern); }
+GUEST_SIDE static void fill_vtx(u32 pattern) { for (u32 i = 0; i < VTX_BYTES / 4; i++) raw32(VTX_EA + i * 4, pattern); }
 static u32 draw_words(u32 io)
 {
     const u32 w[] = { 0x41808u, 4u, 0x41814u, 0x00030000u, 0x41808u, 0u };
@@ -154,13 +154,26 @@ static u32 draw_words(u32 io)
 }
 
 /* ---- the fast guest writer ---- */
+/* The writer is the emulated guest: it polls label, ref and get words and
+ * rewrites its vertex buffer with plain loads and stores, exactly as guest
+ * code does through vm_base. Those are the accesses the fixture exists to
+ * race against the record thread, in wall time; they carry no happens-before
+ * edge by design, so ThreadSanitizer does not instrument this side. The
+ * walker's own two threads stay fully instrumented. */
+#if defined(__clang__)
+#define GUEST_SIDE __attribute__((no_sanitize("thread")))
+#elif defined(__GNUC__)
+#define GUEST_SIDE __attribute__((no_sanitize_thread))
+#else
+#define GUEST_SIDE
+#endif
 
 enum { SIG_NONE, SIG_LABEL, SIG_REF, SIG_FLIP, SIG_GETPUT, SIG_QUIT };
 static _Atomic int g_sig_kind;
 static _Atomic u32 g_sig_value;
 static _Atomic int g_poisoned;
 static u32 g_label_ea;
-static void* writer_main(void* unused)
+GUEST_SIDE static void* writer_main(void* unused)
 {
     (void)unused;
     for (;;) {
