@@ -5258,12 +5258,17 @@ static void eng_method_core(u32 method, u32 arg)
      * execution method, not the transform program upload window (which
      * writes program memory, not the register). MAG rewrites whole texture
      * units and vertex formats with the same values between most draws. */
-    const u32 ridx = (m & 0xFFFFCu) >> 2;
-    const int unchanged = ridx < RSX_DSP_NUM_REGS && g.rsx.seen[ridx] && g.rsx.regs[ridx] == arg &&
-                          g.rsx.klass[ridx] != RSX_DSP_CLASS_EXEC && !(m >= 0x0B80u && m < 0x0C00u);
-    if (!unchanged && !eng_preuse_safe_method(m)) {
-        s_preuse_gen++; s_preuse.last_bump = m;
-        const u32 r = (m >> 2) & 2047u; s_preuse.since[r >> 5] |= 1u << (r & 31u);
+    /* Only with reuse on: off, nothing reads the generation, and this runs
+     * for every method the walker hands the engine (about 6M a second in
+     * MAG), so the switch-off form must not pay for it. */
+    if (eng_preuse_on()) {
+        const u32 ridx = (m & 0xFFFFCu) >> 2;
+        const int unchanged = ridx < RSX_DSP_NUM_REGS && g.rsx.seen[ridx] && g.rsx.regs[ridx] == arg &&
+                              g.rsx.klass[ridx] != RSX_DSP_CLASS_EXEC && !(m >= 0x0B80u && m < 0x0C00u);
+        if (!unchanged && !eng_preuse_safe_method(m)) {
+            s_preuse_gen++; s_preuse.last_bump = m;
+            const u32 r = (m >> 2) & 2047u; s_preuse.since[r >> 5] |= 1u << (r & 31u);
+        }
     }
     rsx_dispatch_method(&g.rsx, m, arg);
     if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
