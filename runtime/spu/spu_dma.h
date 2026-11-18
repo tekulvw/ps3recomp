@@ -2088,27 +2088,12 @@ static inline uint32_t mfc_tag_wait(const mfc_engine* mfc, uint32_t tag_mask,
 SPU_DMA_BODY void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
                                     uint32_t channel, uint32_t value)
 {
+    /* The parameter latches and the tag mask (spu_channel_inline.h). */
+    if (spu_mfc_latch_write(spu, channel, spu_make_preferred_u32(value)))
+        return;
     switch (channel) {
-    case MFC_LSA:
-        spu->mfc_lsa = value;
-        break;
-    case MFC_EAH:
-        spu->mfc_eah = value;
-        break;
-    case MFC_EAL:
-        spu->mfc_eal = value;
-        break;
-    case MFC_Size:
-        spu->mfc_size = value;
-        break;
-    case MFC_TagID:
-        spu->mfc_tag = value & 0x1F;
-        break;
     case MFC_Cmd:
         mfc_submit(mfc, spu, value);
-        break;
-    case MFC_WrTagMask:
-        spu->mfc_tag_mask = value;
         break;
     case MFC_WrTagUpdate:
         spu->mfc_tag_status = mfc_tag_wait(mfc, spu->mfc_tag_mask, value);
@@ -2138,11 +2123,11 @@ SPU_DMA_BODY void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
 static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
                                          uint32_t channel)
 {
+    /* Tag status, tag mask and atomic status: latched (spu_channel_inline.h). */
+    uint32_t latched;
+    if (spu_mfc_latched_read(spu, channel, &latched))
+        return latched;
     switch (channel) {
-    case MFC_RdTagStat:
-        return spu->mfc_tag_status;
-    case MFC_RdTagMask:
-        return spu->mfc_tag_mask;
     case MFC_RdListStallStat: {
         /* Accumulated tag-group mask of newly-stalled lists. Reading returns
          * the mask and clears it (RPCS3 ch_stall_stat semantics); the interrupt
@@ -2151,12 +2136,6 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
         spu->list_stall_stat = 0;
         return m;
     }
-    case MFC_RdAtomicStat:
-        /* Result of the last atomic line op (GETLLAR/PUTLLC/PUTLLUC), set by
-         * spu_mfc_atomic(): 0 = PUTLLC_SUCCESS, 1 = PUTLLC_FAILURE (line moved,
-         * SPU must retry). Honoring this is what keeps the SPURS lock-free queue
-         * consistent across concurrent SPU kernel threads. */
-        return spu->atomic_stat;
     default:
         return 0;
     }

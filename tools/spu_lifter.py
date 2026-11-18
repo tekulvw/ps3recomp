@@ -548,8 +548,27 @@ _PR_TO_V = re.compile(r"\b(rg\d+) = (?!=)([^;]*);")
 _PR_GOTO = re.compile(r"goto loc_([0-9A-F]{8});")
 _PR_CTX_CALL = re.compile(r"\b(\w+)\(ctx\b")
 # Inline helpers that take ctx but never read or write ctx->gpr (outside
-# out-of-line diagnostics) and never longjmp.
-_PR_INLINE_CTX = {"spu_pr_lq", "spu_pr_stq"}
+# out-of-line diagnostics) and never longjmp. The channel helpers are the
+# inline arm of --inline-channels (runtime/spu/spu_channel_inline.h); their
+# call arm keeps its own store marker.
+_PR_INLINE_CTX = {"spu_pr_lq", "spu_pr_stq", "spu_mfc_latch_write", "spu_rdch_latched"}
+
+# --inline-channels: the channel numbers whose write (a parameter latch) or
+# read (latched status) lifted code performs itself when the switch is on.
+# Every other channel, and every rchcnt, stays a call (spu_channel_inline.h).
+_INLINE_WRCH = {16: "MFC_LSA", 17: "MFC_EAH", 18: "MFC_EAL", 19: "MFC_Size",
+                20: "MFC_TagID", 22: "MFC_WrTagMask"}
+_INLINE_RDCH = {12: "MFC_RdTagMask", 24: "MFC_RdTagStat", 27: "MFC_RdAtomicStat"}
+_CHANNEL_NUMBER = {name: num for num, name in CHANNEL_NAMES.items()}
+
+
+def _chan_number(token: str):
+    """The channel number of an rdch/wrch/rchcnt operand, or None."""
+    token = token.strip()
+    if token in _CHANNEL_NUMBER:
+        return _CHANNEL_NUMBER[token]
+    m = re.match(r"ch(\d+)$", token)
+    return int(m.group(1)) if m else None
 # Instructions after which execution never falls through to the next one
 # (anything else is assumed to, which only over-approximates dirtiness).
 _PR_NO_FALLTHROUGH = {"bi", "iret", "stopd"}
@@ -577,9 +596,12 @@ def promote_function(items, suffix, max_regs=0):
         t = _GPR_REF.sub(lambda m: "rg" + m.group(1), c)
         if "ctx->gpr" in t or "gpr[" in t:
             return None
-        if insn.mnemonic in ("rdch", "rchcnt"):
+        if insn.mnemonic in ("rdch", "rchcnt") and "spu_channel_inline_on()" not in t:
             # The channel call must see stored registers, and its result must
-            # not be overwritten by the reload that follows it.
+            # not be overwritten by the reload that follows it. (An inline
+            # channel read, --inline-channels, carries its own store marker in
+            # its call arm and reloads nothing: the latched-status read never
+            # writes ctx->gpr. The check below still requires that marker.)
             m = re.fullmatch(r"(rg\d+) = (.*);", t)
             if not m:
                 return None
@@ -820,12 +842,13 @@ class SPULifter:
     def __init__(self, trace: bool = False, prefix: str = "", verified_code_image: int = 0,
                  verified_code_spans: bool = False, connected_regions: bool = False, region_bytes: int = 1024,
                  observe_original_work: bool = False, promote_regs: bool = False,
-                 promote_max_regs: int = 0):
+                 promote_max_regs: int = 0, inline_channels: bool = False):
         if promote_regs and (trace or observe_original_work or connected_regions):
             raise ValueError("--promote-regs cannot be combined with --trace, "
                              "--observe-original-work or --connected-regions")
         self.promote_regs = promote_regs
         self.promote_max_regs = promote_max_regs
+        self.inline_channels = inline_channels
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
@@ -1241,6 +1264,15 @@ class SPULifter:
 
         # ---- channel ops ----
         if mn == "rdch":
+            ch = _chan_number(ops[1])
+            if self.inline_channels and ch in _INLINE_RDCH:
+                # Latched status: read the context field when the switch is on
+                # (spu_channel_inline.h), else today's call. The call arm stores
+                # the promoted registers first (the full entry may run an armed
+                # diagnostic); neither arm reloads, the entry never writes them.
+                name = _INLINE_RDCH[ch]
+                return (f"if (spu_channel_inline_on()) {g(rt())} = spu_rdch_latched(ctx, {name}); "
+                        f"else {{ {_F}{g(rt())} = spu_rdch(ctx, {name}); }}")
             return f"{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
         if mn == "rchcnt":
             # CBEA: the count lands in the PREFERRED word, remaining slots ZERO
@@ -1248,6 +1280,13 @@ class SPULifter:
             return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
             # operands: channel, $rt
+            ch = _chan_number(ops[0])
+            if self.inline_channels and ch in _INLINE_WRCH:
+                # A parameter latch: store into the context when the switch is
+                # on, else today's call with its register store (see rdch).
+                name = _INLINE_WRCH[ch]
+                return (f"if (spu_channel_inline_on()) spu_mfc_latch_write(ctx, {name}, {g(_reg(ops[1]))}); "
+                        f"else {{ {_F}spu_wrch(ctx, {name}, {g(_reg(ops[1]))}); }}")
             return f"{_F}spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});{_R}"
 
         # ---- branches ----
@@ -1589,6 +1628,13 @@ def main() -> None:
                         "LS access diagnostics then need -DSPU_LS_DIAG=1. Not "
                         "combinable with --trace, --observe-original-work or "
                         "--connected-regions.")
+    p.add_argument("--inline-channels", action="store_true",
+                   help="Perform the MFC parameter-latch writes (LSA, EAH, EAL, size, tag, "
+                        "tag mask) and the latched status reads (tag status, tag mask, atomic "
+                        "status) in the lifted code when the runtime switch "
+                        "PS3RECOMP_SPU_CHANNEL_INLINE=1 is set and no channel diagnostic is "
+                        "armed; otherwise, and for every other channel, the runtime entry is "
+                        "called as without this option (runtime/spu/spu_channel_inline.h)")
     p.add_argument("--promote-max-regs", type=int, default=0, metavar="N",
                    help="With --promote-regs, leave a function unpromoted when it "
                         "names more than N SPU registers (0 = no limit).")
@@ -1732,7 +1778,8 @@ def main() -> None:
                       connected_regions=args.connected_regions, region_bytes=args.region_bytes,
                       observe_original_work=args.observe_original_work,
                       promote_regs=args.promote_regs,
-                      promote_max_regs=args.promote_max_regs)
+                      promote_max_regs=args.promote_max_regs,
+                      inline_channels=args.inline_channels)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
