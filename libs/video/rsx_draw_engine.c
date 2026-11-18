@@ -3122,6 +3122,123 @@ static void dc_collect_refs(void)
     }
 }
 
+/* ---- LAB: PS3RECOMP_RSX_VFETCH_STATS=<secs> ------------------------------
+ * How much of the decoded-vertex work repeats. Each fetched draw gets a KEY
+ * (layout, every enabled attribute's descriptor and resolved source range,
+ * the reference list before the collapse) and a CONTENT hash (the source
+ * bytes of every attribute's range). A table remembers keys; per draw it
+ * counts key hits by age (same frame / previous frame / older) and, for a
+ * key hit, whether the content matched. "key hit, content changed" is the
+ * rate at which a cache keyed on the key alone would serve stale vertices.
+ * Printed every <secs> seconds and reset (the table persists). Stats only;
+ * nothing rendered changes. */
+static int s_vfs_secs = -1;
+static int eng_vfetch_stats_on(void)
+{
+    if (s_vfs_secs < 0) { const char* e = getenv("PS3RECOMP_RSX_VFETCH_STATS"); s_vfs_secs = e ? atoi(e) : 0; }
+    return s_vfs_secs > 0;
+}
+#define ENG_VFS_SLOTS 65536u
+typedef struct { u64 key, content; u32 frame, hits; } eng_vfs_slot;
+static eng_vfs_slot* s_vfs_table;
+static struct {
+    unsigned long long draws, refs, unique, remapped_draws, out_bytes, src_bytes, ranges, no_range;
+    unsigned long long key_hit_same, key_hit_prev, key_hit_old, key_miss;
+    unsigned long long content_hit_same, content_hit_prev, content_hit_old;
+    unsigned long long content_hit_bytes, key_hit_bytes;   /* decode output bytes */
+    unsigned long long stale_same, stale_prev, stale_old;  /* key hit, content changed */
+    unsigned long long src_hit_bytes;                      /* source bytes under content hits */
+    unsigned long long inserts, evictions, hash_bytes;
+    u64 t0;
+} s_vfs;
+static void eng_vfetch_stats_note(const rsx_vertex_layout_plan* layout, u64 ref_hash, int allow_remap)
+{
+    if (!s_vfs_table) {
+        s_vfs_table = (eng_vfs_slot*)calloc(ENG_VFS_SLOTS, sizeof(eng_vfs_slot));
+        if (!s_vfs_table) { s_vfs_secs = 0; return; }
+    }
+    u64 key = 0x6A09E667F3BCC909ull;
+    key = eng_hash_step(key, ((u64)layout->mask << 32) | layout->stride);
+    key = eng_hash_step(key, ref_hash);
+    key = eng_hash_step(key, ((u64)dc.n_source_refs << 32) | dc.n_refs);
+    key = eng_hash_step(key, ((u64)dc.fetch_plan.base_offset << 32) | dc.fetch_plan.divider_mask);
+    u64 content = 0xBB67AE8584CAA73Bull;
+    unsigned long long src = 0, ranges = 0, no_range = 0;
+    for (u32 slot = 0; slot < layout->count; slot++) {
+        const u32 a = layout->attrs[slot];
+        const rsx_vertex_fetch_attr* f = &dc.fetch_plan.attr[a];
+        key = eng_hash_step(key, ((u64)f->desc.type << 56) | ((u64)f->desc.size << 48) |
+                                 ((u64)f->desc.location << 40) | ((u64)f->desc.frequency << 32) | f->desc.offset);
+        key = eng_hash_step(key, ((u64)f->desc.stride << 32) | f->elem_size);
+        if (!f->stable_base) { no_range++; key = eng_hash_step(key, 0xDEADull); continue; }
+        key = eng_hash_step(key, (u64)(uintptr_t)f->stable_base);
+        key = eng_hash_step(key, ((u64)f->stable_first << 32) | f->stable_last);
+        const u64 span = (u64)(f->stable_last - f->stable_first) * f->stride + f->elem_size;
+        if (span > 0x4000000ull) { no_range++; continue; }
+        content = eng_hash_step(content, eng_hash_bytes(f->stable_base, (u32)span));
+        src += span; ranges++;
+    }
+    const unsigned long long out = (unsigned long long)dc.n_refs * layout->stride;
+    s_vfs.draws++; s_vfs.refs += dc.n_source_refs; s_vfs.unique += dc.n_refs;
+    s_vfs.remapped_draws += dc.refs_remapped; s_vfs.out_bytes += out; s_vfs.src_bytes += src;
+    s_vfs.ranges += ranges; s_vfs.no_range += no_range; s_vfs.hash_bytes += src;
+    (void)allow_remap;
+    /* Linear probe, 16 deep; a full window evicts its oldest entry. */
+    u32 i = (u32)(key >> 20) & (ENG_VFS_SLOTS - 1u), oldest = i;
+    eng_vfs_slot* hit = NULL;
+    for (u32 p = 0; p < 16; p++) {
+        eng_vfs_slot* s = &s_vfs_table[(i + p) & (ENG_VFS_SLOTS - 1u)];
+        if (!s->hits) { if (!hit) { oldest = (i + p) & (ENG_VFS_SLOTS - 1u); } break; }
+        if (s->key == key) { hit = s; break; }
+        if (s->frame < s_vfs_table[oldest].frame) oldest = (i + p) & (ENG_VFS_SLOTS - 1u);
+    }
+    if (hit) {
+        const u32 age = g.frames - hit->frame;
+        const int same = hit->content == content;
+        s_vfs.key_hit_bytes += out;
+        if (age == 0)      { s_vfs.key_hit_same++; if (same) s_vfs.content_hit_same++; else s_vfs.stale_same++; }
+        else if (age == 1) { s_vfs.key_hit_prev++; if (same) s_vfs.content_hit_prev++; else s_vfs.stale_prev++; }
+        else               { s_vfs.key_hit_old++;  if (same) s_vfs.content_hit_old++;  else s_vfs.stale_old++; }
+        if (same) { s_vfs.content_hit_bytes += out; s_vfs.src_hit_bytes += src; }
+        hit->content = content; hit->frame = g.frames; hit->hits++;
+    } else {
+        s_vfs.key_miss++;
+        eng_vfs_slot* s = &s_vfs_table[oldest];
+        if (s->hits) s_vfs.evictions++;
+        s_vfs.inserts++;
+        s->key = key; s->content = content; s->frame = g.frames; s->hits = 1;
+    }
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const u64 now = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+    if (!s_vfs.t0) s_vfs.t0 = now;
+    if (now - s_vfs.t0 < (u64)s_vfs_secs * 1000000000ull) return;
+    const double secs = (double)(now - s_vfs.t0) / 1e9;
+    const double d = s_vfs.draws ? (double)s_vfs.draws : 1.0;
+    const unsigned long long key_hits = s_vfs.key_hit_same + s_vfs.key_hit_prev + s_vfs.key_hit_old;
+    const unsigned long long content_hits = s_vfs.content_hit_same + s_vfs.content_hit_prev + s_vfs.content_hit_old;
+    const unsigned long long stale = s_vfs.stale_same + s_vfs.stale_prev + s_vfs.stale_old;
+    fprintf(stderr,
+        "[vfetch-stats] %.1fs frames=%u draws=%llu (%.0f/s) refs=%llu unique=%llu (%.1f%% collapsed, %.1f%% draws remapped) "
+        "out=%.1f MB/s src=%.1f MB/s ranges/draw=%.2f no_range=%llu\n"
+        "[vfetch-stats]   key hits %.1f%% (same-frame %.1f%%, prev-frame %.1f%%, older %.1f%%)  content hits %.1f%% "
+        "(same %.1f%%, prev %.1f%%, older %.1f%%)  STALE-under-key %.2f%% (same %llu prev %llu older %llu)\n"
+        "[vfetch-stats]   bytes: content-hit out %.1f%% of decode output, src %.1f%% of source; table inserts=%llu evict=%llu\n",
+        secs, g.frames, s_vfs.draws, s_vfs.draws / secs, s_vfs.refs, s_vfs.unique,
+        s_vfs.refs ? 100.0 * (1.0 - (double)s_vfs.unique / (double)s_vfs.refs) : 0.0,
+        100.0 * (double)s_vfs.remapped_draws / d,
+        s_vfs.out_bytes / secs / 1048576.0, s_vfs.src_bytes / secs / 1048576.0,
+        (double)s_vfs.ranges / d, s_vfs.no_range,
+        100.0 * key_hits / d, 100.0 * s_vfs.key_hit_same / d, 100.0 * s_vfs.key_hit_prev / d, 100.0 * s_vfs.key_hit_old / d,
+        100.0 * content_hits / d, 100.0 * s_vfs.content_hit_same / d, 100.0 * s_vfs.content_hit_prev / d, 100.0 * s_vfs.content_hit_old / d,
+        100.0 * stale / d, s_vfs.stale_same, s_vfs.stale_prev, s_vfs.stale_old,
+        s_vfs.out_bytes ? 100.0 * (double)s_vfs.content_hit_bytes / (double)s_vfs.out_bytes : 0.0,
+        s_vfs.src_bytes ? 100.0 * (double)s_vfs.src_hit_bytes / (double)s_vfs.src_bytes : 0.0,
+        s_vfs.inserts, s_vfs.evictions);
+    fflush(stderr);
+    memset(&s_vfs, 0, sizeof s_vfs);
+    s_vfs.t0 = now;
+}
+
 /* Turn this group's batches into a reference list, then collapse repeated
  * references and fetch each unique vertex once.
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
@@ -3144,6 +3261,10 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     if (!dc.fetch_ok) return;
 
     dc.n_source_refs = dc.n_refs;
+    /* LAB (PS3RECOMP_RSX_VFETCH_STATS): the reference list before the collapse
+     * is the draw's index content; hash it before remap rewrites it. */
+    const u64 vfs_ref_hash = eng_vfetch_stats_on()
+        ? eng_hash_bytes((const u8*)dc.refs, dc.n_refs * (u32)sizeof(rsx_vertex_ref)) : 0;
     /* Only a topology this engine rebuilds through an index buffer may share
      * repeated references. A line strip or a point list is drawn in the order
      * it arrived, so collapsing duplicates would reorder it. */
@@ -3169,6 +3290,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         return;
     }
     dc.n_verts = dc.n_refs;
+    if (eng_vfetch_stats_on()) eng_vfetch_stats_note(layout, vfs_ref_hash, allow_remap);
 }
 
 /* ---- host-format vertex streams ------------------------------------------
