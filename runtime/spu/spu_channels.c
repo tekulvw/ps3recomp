@@ -1244,18 +1244,8 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     /* One load and one predicted branch when the compact form is off: the
      * switch is resolved by spu_context_init, and an unresolved -1 can only
      * mean the full form here. */
-    if (g_spu_dispatch_gates.fast_path > 0) {
-        const uint32_t v = value._u32[0];
-        switch (channel) {
-        case MFC_LSA:       ctx->mfc_lsa = v;          return;
-        case MFC_EAH:       ctx->mfc_eah = v;          return;
-        case MFC_EAL:       ctx->mfc_eal = v;          return;
-        case MFC_Size:      ctx->mfc_size = v;         return;
-        case MFC_TagID:     ctx->mfc_tag = v & 0x1F;   return;
-        case MFC_WrTagMask: ctx->mfc_tag_mask = v;     return;
-        default: break;
-        }
-    }
+    if (g_spu_dispatch_gates.fast_path > 0 && spu_mfc_latch_write(ctx, channel, value))
+        return;
     spu_wrch_full(ctx, channel, value);
 }
 static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
@@ -1273,18 +1263,11 @@ static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
     /* The MFC parameter channels and the tag mask only latch a value in the
-     * context (as mfc_channel_write does); nothing reads the engine for them.
-     * A DMA writes five or six of these per command, so they skip the engine
-     * lookup and the command path. */
-    switch (channel) {
-    case MFC_LSA:       ctx->mfc_lsa = v;          return;
-    case MFC_EAH:       ctx->mfc_eah = v;          return;
-    case MFC_EAL:       ctx->mfc_eal = v;          return;
-    case MFC_Size:      ctx->mfc_size = v;         return;
-    case MFC_TagID:     ctx->mfc_tag = v & 0x1F;   return;
-    case MFC_WrTagMask: ctx->mfc_tag_mask = v;     return;
-    default: break;
-    }
+     * context (spu_channel_inline.h, as mfc_channel_write does); nothing reads
+     * the engine for them. A DMA writes five or six of these per command, so
+     * they skip the engine lookup and the command path. */
+    if (spu_mfc_latch_write(ctx, channel, value))
+        return;
 
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
