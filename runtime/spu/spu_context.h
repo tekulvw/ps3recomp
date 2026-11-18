@@ -397,6 +397,12 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+    /* Direct tail calls (spu_lifter.py --direct-tail): the return pc of the
+     * innermost live lifted call and the host depth it set it at. A transfer
+     * run by a tail call instead of a drain hop sets drain_ret_pc from it, the
+     * value that hop would have set. Maintained by --direct-tail call sites
+     * and by every drain loop hop; read only by direct tails. */
+    uint32_t call_ret_pc, call_ret_depth;
     uint32_t region_dispatch_depth, region_return_pc;
     int region_dispatch_valid, region_has_return;
     /* Nonzero while this context is in the coherence holder list
@@ -1091,6 +1097,109 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             spu_region_dispatch_invoke((ctx),_tf,0,0);                                          \
         }                                                      \
     } while (0)
+
+/* ---- Direct tail calls between lifted functions (spu_lifter.py --direct-tail) ----
+ *
+ * A cross-function transfer to a known lifted function normally sets ctx->pc
+ * and g_spu_trampoline_fn and returns, and the enclosing drain calls the
+ * pointer. A --direct-tail image instead tail-calls the same pointer
+ * (frame replaced, no host-stack growth) when every duty the drain performs
+ * per transfer is a no-op at that moment, and otherwise takes the drain path:
+ *   - interrupt delivery: the drain delivers only when interrupts are enabled
+ *     and an enabled event is pending. The guard reads the same fields the
+ *     same way the drain does (plain loads; raisers on other threads set them
+ *     atomically) and sends exactly that case to the drain. The guard runs at
+ *     every transfer, so an event raised meanwhile is seen at the next one, as
+ *     the drain sees it at the next hop.
+ *   - the reservation-lost poll (event mask bit 0x400), the lockstep tick,
+ *     stack-reset entries and the task-launch checkpoint's slow path: any of
+ *     them armed sends the transfer to the drain.
+ *   - the checkpoint's fast path (steps, recent-pc ring), the drain's pc ring
+ *     and the region-dispatch reset are done by spu_direct_tail_note.
+ * Process-wide modes that cannot change while running (the kill switch
+ * PS3RECOMP_SPU_DIRECT_TAIL=0, step diagnostics, SPU_TAILRET, SPU_PCHIST)
+ * turn it off when a --direct-tail image registers (spu_direct_tail_image);
+ * region scope (SPU_REGION_FRAMED=1) is recorded as g_spu_direct_tail_on == 2
+ * and the note then records the drain's region frame as the invoke would.
+ *   - drain_ret_pc: a hop sets it to the owning drain's return pc. A tail call
+ *     sets the same value from call_ret_pc (see spu_context), which the
+ *     image's call sites and every drain hop keep; when it was not set for the
+ *     current depth (a callee entered from an image lifted without the flag)
+ *     the guard sends the transfer to the drain.
+ * Builds without clang musttail compile the guard to 0: the drain path. */
+typedef struct spu_recent_history { uint32_t pc[32]; uint32_t n; } spu_recent_history;
+extern SPU_THREAD_LOCAL spu_recent_history g_spu_recent;   /* last drain-step pcs, this thread */
+extern int g_spu_direct_tail_on;
+void spu_direct_tail_image(void);
+extern volatile int g_yz_lockstep_on;
+extern void* volatile g_pm_flow_ctx;
+static inline int spu_direct_tail_ok(const spu_context* ctx) {
+    return __atomic_load_n(&g_spu_direct_tail_on, __ATOMIC_RELAXED) > 0 &&
+           !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask)) &&
+           !((ctx)->event_mask & 0x400u) &&
+           g_yz_lockstep_on == 0 && !g_pm_flow_ctx &&
+           !spu_stack_reset_needed(ctx) &&
+           (!(ctx)->steps || ((ctx)->pc & SPU_LS_MASK)) &&
+           /* inside a call, only when that call's return pc is known here */
+           (!(ctx)->host_depth || (ctx)->call_ret_depth == (ctx)->host_depth);
+}
+#ifdef SPU_DIRECT_TAIL_TEST_COUNT
+extern unsigned long long g_spu_direct_tail_count;   /* synthetic tests: tail calls admitted */
+#endif
+static inline void spu_direct_tail_note(spu_context* ctx) {
+    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+#ifdef SPU_DIRECT_TAIL_TEST_COUNT
+    g_spu_direct_tail_count++;
+#endif
+    spu_recent_history* r = &g_spu_recent;
+    r->pc[r->n++ & 31] = pc;
+    ctx->steps++;
+    g_spu_pch[g_spu_pch_n++ & 7u] = pc;
+    /* The drain invokes each transfer through spu_region_dispatch_invoke,
+     * which with region scope on (g_spu_direct_tail_on == 2) records the
+     * owning drain's frame before the call: a call drain's depth and return
+     * pc, or the top-level drain's depth 0 with none. */
+    if (__atomic_load_n(&g_spu_direct_tail_on, __ATOMIC_RELAXED) == 2) {
+        ctx->region_dispatch_depth = ctx->host_depth;
+        ctx->region_return_pc = ctx->host_depth ? ctx->call_ret_pc : 0;
+        ctx->region_has_return = ctx->host_depth ? 1 : 0;
+        ctx->region_dispatch_valid = 1;
+    } else ctx->region_dispatch_valid = 0;
+    /* The drain that would have run this transfer is the innermost live
+     * call's spu_drain_call loop, which sets drain_ret_pc to that call's
+     * return pc at the hop. At depth 0 it is the top-level drain, which does
+     * not touch it. */
+    if (ctx->host_depth) ctx->drain_ret_pc = ctx->call_ret_pc;
+}
+#if defined(__clang__) && defined(__has_attribute)
+#  if __has_attribute(musttail) && (defined(__x86_64__) || defined(_M_X64) || \
+                                    defined(__aarch64__) || defined(_M_ARM64))
+#    define SPU_DIRECT_TAIL_SUPPORTED 1
+#  endif
+#endif
+/* Guard and note out of line by default: one call per transfer, and each of
+ * the many transfer sites stays a call, a test and a jump. Inlining both
+ * (SPU_DIRECT_TAIL_INLINE=1) saves the call but grows every site by the
+ * whole guard and note, which in a large lifted image costs more in code
+ * footprint than the call does. */
+int spu_direct_tail_enter(spu_context* ctx);   /* spu_direct_tail_ok, then the note */
+#ifndef SPU_DIRECT_TAIL_INLINE
+#  define SPU_DIRECT_TAIL_INLINE 0
+#endif
+#ifdef SPU_DIRECT_TAIL_SUPPORTED
+#  define SPU_MUSTTAIL __attribute__((musttail))
+#  if SPU_DIRECT_TAIL_INLINE
+#    define SPU_DIRECT_TAIL_OK(ctx) spu_direct_tail_ok(ctx)
+#    define SPU_DIRECT_TAIL_NOTE(ctx) spu_direct_tail_note(ctx)
+#  else
+#    define SPU_DIRECT_TAIL_OK(ctx) spu_direct_tail_enter(ctx)
+#    define SPU_DIRECT_TAIL_NOTE(ctx) ((void)0)
+#  endif
+#else
+#  define SPU_MUSTTAIL
+#  define SPU_DIRECT_TAIL_OK(ctx) 0
+#  define SPU_DIRECT_TAIL_NOTE(ctx) ((void)0)
+#endif
 
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task

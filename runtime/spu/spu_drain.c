@@ -64,8 +64,9 @@ extern void spu_halt(spu_context*);
  * ended where it should not have (spurs_policy.c, [pm-end]). */
 /* One thread-local object: every Darwin TLV access is a call, and this runs
  * on every drain transfer. */
-typedef struct spu_recent_history { uint32_t pc[32]; uint32_t n; } spu_recent_history;
-static _Thread_local spu_recent_history t_recent;
+/* Shared with spu_direct_tail_note (spu_context.h), which records the same step. */
+SPU_THREAD_LOCAL spu_recent_history g_spu_recent;
+#define t_recent g_spu_recent
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 {
     unsigned n = t_recent.n < 32 ? t_recent.n : 32, k = n < max ? n : max;
@@ -453,6 +454,35 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
     { extern void spu_halt(spu_context*); spu_halt(ctx); }
 }
 
+/* spu_context.h, "Direct tail calls": 1 once a --direct-tail image registered
+ * with nothing that needs every transfer in the drain armed process-wide. */
+int g_spu_direct_tail_on;
+void spu_direct_tail_image(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    const char* e = getenv("PS3RECOMP_SPU_DIRECT_TAIL");
+    const char* why = (e && !strcmp(e, "0")) ? "PS3RECOMP_SPU_DIRECT_TAIL=0"
+                    : spu_task_launch_diagnostics() ? "step diagnostics"
+                    : spu_tailret_enabled() ? "SPU_TAILRET"
+                    : getenv("SPU_PCHIST") ? "SPU_PCHIST" : NULL;
+#ifndef SPU_DIRECT_TAIL_SUPPORTED
+    if (!why) why = "not built with clang musttail";
+#endif
+    const int scope = spu_region_scope_enabled();
+    __atomic_store_n(&g_spu_direct_tail_on, why ? 0 : scope ? 2 : 1, __ATOMIC_RELAXED);
+    fprintf(stderr, "[spu] direct tail calls between lifted functions: %s%s%s%s\n",
+            why ? "off (" : "on", why ? why : "", why ? ")" : "", !why && scope ? " (region scope)" : "");
+}
+
+int spu_direct_tail_enter(spu_context* ctx)
+{
+    if (!spu_direct_tail_ok(ctx)) return 0;
+    spu_direct_tail_note(ctx);
+    return 1;
+}
+
 /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
 int spu_tailret_enabled(void)
 {
@@ -583,6 +613,10 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 
 static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t return_pc)
 {
+    /* Direct tails: this loop owns transfers made at the current depth, and
+     * a tail call needs its return pc (spu_context.call_ret_pc). Set at each
+     * hop, put back on every exit. */
+    const uint32_t outer_call_ret = ctx->call_ret_pc, outer_call_depth = ctx->call_ret_depth;
     ctx->region_dispatch_valid=0;
     spu_depth_guard_check(ctx);
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
@@ -599,7 +633,8 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
     /* Nested contexts/drains share this thread's cursor. Only the object
      * address is stable across calls and IRQ longjmps, never its contents. */
     spu_recent_history* const recent = &t_recent;
-#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; ctx->region_dispatch_valid=0; } while (0)
+#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; ctx->region_dispatch_valid=0; \
+                                 ctx->call_ret_pc = outer_call_ret; ctx->call_ret_depth = outer_call_depth; } while (0)
     for (;;) {
         while (*tramp) {
             if (*tramp == spu_indirect_branch &&
@@ -611,6 +646,7 @@ static SPU_DRAIN_NOINLINE void spu_drain_call_loop(spu_context* ctx, uint32_t re
             void (*fn)(spu_context*) = *tramp;
             *tramp = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
+            ctx->call_ret_pc = return_pc & SPU_LS_MASK; ctx->call_ret_depth = ctx->host_depth;
             spu_drain_hop_inline(ctx, fn, recent);
             SPU_LR_POLL(ctx);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {

@@ -386,6 +386,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     ctx->host_depth = 0;
     ctx->irq_frame = 0;
     ctx->drain_ret_pc = 0;
+    ctx->call_ret_pc = 0; ctx->call_ret_depth = 0;
     /* Nest-safe: a job run synchronously from inside another SPU's execution
      * re-enters here on the same host thread. The halt target is per-thread,
      * so save the outer one and put it back on the way out -- otherwise the
@@ -456,6 +457,7 @@ static int spu_native_service_call_impl(spu_context* ctx,uint32_t entry_pc,uint3
     const uint32_t stack = ctx->gpr[1]._u32[0];
     const uint32_t depth = ctx->host_depth;
     const uint32_t outer_return = ctx->drain_ret_pc;
+    const uint32_t outer_call_ret = ctx->call_ret_pc, outer_call_depth = ctx->call_ret_depth;
     const int image = ctx->image_id;
     const int outer_armed = s_spu_halt_armed;
     jmp_buf outer_env;
@@ -504,6 +506,7 @@ static int spu_native_service_call_impl(spu_context* ctx,uint32_t entry_pc,uint3
     ctx->host_depth = depth;
     ctx->irq_frame = 0;
     ctx->drain_ret_pc = outer_return;
+    ctx->call_ret_pc = outer_call_ret; ctx->call_ret_depth = outer_call_depth;
     ctx->region_dispatch_valid = 0;
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof outer_env);
@@ -523,6 +526,7 @@ int spu_native_owner_call(spu_context* ctx, void (*body)(spu_context*))
     if (!ctx || !body || ctx->status != SPU_STATUS_RUNNING) return -1;
     const int outer_armed = s_spu_halt_armed;
     const uint32_t depth = ctx->host_depth, outer_return = ctx->drain_ret_pc;
+    const uint32_t outer_call_ret = ctx->call_ret_pc, outer_call_depth = ctx->call_ret_depth;
     jmp_buf outer_env;
     if (outer_armed) memcpy(outer_env, s_spu_halt_env, sizeof outer_env);
     s_spu_halt_armed = 1;
@@ -532,6 +536,7 @@ int spu_native_owner_call(spu_context* ctx, void (*body)(spu_context*))
     if (reason) {
         ctx->host_depth = depth;
         ctx->drain_ret_pc = outer_return;
+        ctx->call_ret_pc = outer_call_ret; ctx->call_ret_depth = outer_call_depth;
         ctx->region_dispatch_valid = 0;
         g_spu_trampoline_fn = 0;
     }

@@ -820,11 +820,14 @@ class SPULifter:
     def __init__(self, trace: bool = False, prefix: str = "", verified_code_image: int = 0,
                  verified_code_spans: bool = False, connected_regions: bool = False, region_bytes: int = 1024,
                  observe_original_work: bool = False, promote_regs: bool = False,
-                 promote_max_regs: int = 0):
+                 promote_max_regs: int = 0, direct_tail: bool = False):
         if promote_regs and (trace or observe_original_work or connected_regions):
             raise ValueError("--promote-regs cannot be combined with --trace, "
                              "--observe-original-work or --connected-regions")
+        if direct_tail and connected_regions:
+            raise ValueError("--direct-tail cannot be combined with --connected-regions")
         self.promote_regs = promote_regs
+        self.direct_tail = direct_tail
         self.promote_max_regs = promote_max_regs
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
@@ -916,8 +919,7 @@ class SPULifter:
                      or (last_insn.mnemonic == "stop"
                          and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
                 and end in getattr(self, "func_starts", set())):
-            promo_suffix = (f"{{ ctx->pc = 0x{end:X}; "
-                            f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; {_F}return; }}")
+            promo_suffix = f"{{ {self._xfer(end)} }}"
             func.body_lines.append("    " + _strip_markers(promo_suffix))
 
         func.region_suffix = func.body_lines[suffix_start:]
@@ -1292,9 +1294,10 @@ class SPULifter:
                 # `bi $r0` returns via host return) + SPU_DRAIN (drains the
                 # callee's own tail-chains so they don't grow the caller frame)
                 # + image save/restore (adopt-on-serve cannot leak upward).
-                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
+                cr_set, cr_put = self._call_ret(addr + 4)
+                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {cr_set}"
                         f"ctx->host_depth++; {_F}{self.prefix}spu_func_{tgt:08X}(ctx); "
-                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); {_R}}}")
+                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; {cr_put}spu_img_restore(ctx, _si); {_R}}}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -1307,8 +1310,7 @@ class SPULifter:
             self.branch_targets.add(tgt)
             # Cross-function conditional branch = conditional tail: hand the
             # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
-            return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; {_F}return; }}")
+            return f"if ({cond}) {{ {self._xfer(tgt)} }}"
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -1355,11 +1357,12 @@ class SPULifter:
             # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
             # here and its `bi $r0` returns via host return.
             # read the target BEFORE writing the link: rt may be the same register as ra
+            cr_set, cr_put = self._call_ret(addr + 4)
             return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
-                    f"int32_t _si = (int32_t)ctx->image_id; "
+                    f"int32_t _si = (int32_t)ctx->image_id; {cr_set}"
                     f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
                     f"{_F}spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
-                    f"ctx->host_depth--; spu_img_restore(ctx, _si); {_R}}}")
+                    f"ctx->host_depth--; {cr_put}spu_img_restore(ctx, _si); {_R}}}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link
@@ -1411,6 +1414,28 @@ class SPULifter:
         }
         return table.get(mn, f"{word} != 0")
 
+    def _call_ret(self, ret: int):
+        """--direct-tail call sites keep ctx->call_ret_pc/depth naming the
+        innermost live call (its return pc and the depth inside it), so a tail
+        call in the callee can set drain_ret_pc as the drain hop would. Saved
+        in locals and put back after the callee's drain. Empty otherwise."""
+        if not self.direct_tail:
+            return "", ""
+        return (f"uint32_t _crp = ctx->call_ret_pc, _crd = ctx->call_ret_depth; "
+                f"ctx->call_ret_pc = 0x{ret & 0x3FFFC:X}; ctx->call_ret_depth = ctx->host_depth + 1; ",
+                "ctx->call_ret_pc = _crp; ctx->call_ret_depth = _crd; ")
+
+    def _xfer(self, tgt: int) -> str:
+        """A transfer to the lifted function at tgt from outside it. Without
+        --direct-tail: set pc and the trampoline and return to the drain. With
+        it: tail-call the same function when nothing the drain does per
+        transfer is armed (SPU_DIRECT_TAIL_OK), else the drain path."""
+        fn = f"{self.prefix}spu_func_{tgt:08X}"
+        if not self.direct_tail:
+            return f"ctx->pc = 0x{tgt:X}; g_spu_trampoline_fn = {fn}; {_F}return;"
+        return (f"ctx->pc = 0x{tgt:X}; {_F}if (SPU_DIRECT_TAIL_OK(ctx)) {{ SPU_DIRECT_TAIL_NOTE(ctx); "
+                f"SPU_MUSTTAIL return {fn}(ctx); }} g_spu_trampoline_fn = {fn}; {_F}return;")
+
     def _uncond_branch(self, tgt, func: LiftedFunction) -> str:
         if tgt is None:
             return "/* TODO spu: unresolved branch */;"
@@ -1419,8 +1444,7 @@ class SPULifter:
         self.branch_targets.add(tgt)
         # Cross-function unconditional tail: hand the target to the trampoline
         # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
-        return (f"{{ ctx->pc = 0x{tgt:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; {_F}return; }}")
+        return f"{{ {self._xfer(tgt)} }}"
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -1493,6 +1517,8 @@ class SPULifter:
         lines.append("};")
         lines.append("")
         lines.append(f"void {self.prefix}spu_recomp_register(void) {{")
+        if self.direct_tail:
+            lines.append("    spu_direct_tail_image();   /* lifted with --direct-tail */")
         if promoted:
             lines.append("#if !SPU_LS_DIAG")
             lines.append("    if (getenv(\"SPU_LS_LOWREAD\") || getenv(\"SPU_LS_WATCH\") || "
@@ -1589,6 +1615,14 @@ def main() -> None:
                         "LS access diagnostics then need -DSPU_LS_DIAG=1. Not "
                         "combinable with --trace, --observe-original-work or "
                         "--connected-regions.")
+    p.add_argument("--direct-tail", action="store_true",
+                   help="Emit each transfer to another lifted function as a guarded "
+                        "tail call of that function (clang musttail) instead of a "
+                        "return to the enclosing drain, falling back to the drain "
+                        "whenever anything the drain does per transfer is armed "
+                        "(runtime/spu/spu_context.h, \"Direct tail calls\"). Off by "
+                        "default; PS3RECOMP_SPU_DIRECT_TAIL=0 disables it at run time. "
+                        "Not combinable with --connected-regions.")
     p.add_argument("--promote-max-regs", type=int, default=0, metavar="N",
                    help="With --promote-regs, leave a function unpromoted when it "
                         "names more than N SPU registers (0 = no limit).")
@@ -1613,6 +1647,8 @@ def main() -> None:
         p.error("--promote-regs cannot be combined with --trace, --observe-original-work or --connected-regions")
     if args.promote_max_regs and not args.promote_regs:
         p.error("--promote-max-regs requires --promote-regs")
+    if args.direct_tail and args.connected_regions:
+        p.error("--direct-tail cannot be combined with --connected-regions")
     if args.connected_regions and not (args.verified_code_image and args.verified_code_spans):
         p.error("--connected-regions requires --verified-code-image and --verified-code-spans")
     if args.auto_functions:
@@ -1732,7 +1768,8 @@ def main() -> None:
                       connected_regions=args.connected_regions, region_bytes=args.region_bytes,
                       observe_original_work=args.observe_original_work,
                       promote_regs=args.promote_regs,
-                      promote_max_regs=args.promote_max_regs)
+                      promote_max_regs=args.promote_max_regs,
+                      direct_tail=args.direct_tail)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
