@@ -2794,10 +2794,14 @@ static void vk_swapchain_recover_now(void)
 
 static void vk_swapchain_lost(void)
 {
-    if (rsx_encq_active()) {
-        /* Encoding presents on a worker does not transfer ownership of the
-         * SDL/Win32 window. Recreation reads the drawable size and its failure
-         * destroys the window, so leave both to the existing owner pump. */
+    if (rsx_encq_on_encode_thread()) {
+        /* A present encoded on the encode thread found the swapchain gone.
+         * Encoding on a worker does not transfer ownership of the SDL/Win32
+         * window: recreation reads the drawable size and its failure destroys
+         * the window, so leave both to the owner's pump, which first drains
+         * the queue. Any other caller -- the owner itself, or the present
+         * thread, which owns every swapchain use while it runs -- recovers
+         * at once, as without the encode thread. */
         __atomic_store_n(&s_vk.window_recovery_pending, 1, __ATOMIC_RELEASE);
         return;
     }

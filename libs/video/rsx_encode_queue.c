@@ -38,7 +38,8 @@ static void q_broadcast(q_cond* c) { WakeAllConditionVariable(c); }
 static void q_yield(void) { SwitchToThread(); }
 typedef HANDLE q_thread;
 static DWORD WINAPI q_main_win(LPVOID arg);
-static int q_thread_start(q_thread* t) { *t = CreateThread(NULL, 0, q_main_win, NULL, 0, NULL); return *t ? 0 : -1; }
+static DWORD q_thread_id_started;
+static int q_thread_start(q_thread* t) { *t = CreateThread(NULL, 0, q_main_win, NULL, 0, &q_thread_id_started); return *t ? 0 : -1; }
 static void q_thread_join(q_thread t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
 static uint64_t q_now_ns(void)
 {
@@ -106,6 +107,9 @@ static struct {
     rsx_draw_backend proxy;
     int wrapped, running;
     q_thread thread;
+#ifdef _WIN32
+    DWORD thread_id;
+#endif
     q_op* ops;
     u8* bytes;
     _Atomic(u64) head, tail;             /* records: producer / consumer counters */
@@ -400,6 +404,15 @@ static void* q_main(void* arg)
 /* ---- public -------------------------------------------------------------- */
 
 int rsx_encq_active(void) { return Q.running; }
+int rsx_encq_on_encode_thread(void)
+{
+    if (!Q.running) return 0;
+#ifdef _WIN32
+    return GetCurrentThreadId() == Q.thread_id;
+#else
+    return pthread_equal(pthread_self(), Q.thread) != 0;
+#endif
+}
 
 void rsx_encq_drain(void)
 {
@@ -474,6 +487,9 @@ static int q_start(void)
     Q.vs_kind = 0; Q.vs_bound = 0;
     { const char* l = getenv("PS3RECOMP_RSX_INFLIGHT_LOG"); Q.log = l && !strcmp(l, "1"); }
     if (q_thread_start(&Q.thread)) return -1;
+#ifdef _WIN32
+    Q.thread_id = q_thread_id_started;
+#endif
     Q.running = 1;
     fprintf(stderr, "[rsx encode queue] encode thread on\n");
     return 0;

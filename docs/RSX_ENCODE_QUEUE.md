@@ -12,6 +12,8 @@ snapshots, checked waits and other operations requiring an answer drain earlier
 queued work first. A color snapshot allocates its object immediately and queues
 the copy at its original stream position.
 
+A lost swapchain is recovered where it is found, as without the queue, except when the encode thread itself finds it while presenting: it then leaves the recovery to the window owner's pump, which drains the queue first. With the present thread on, every swapchain use is the present thread's and the encode thread never sees the loss.
+
 Labels, reports and completion decisions stay with the FIFO walker. Queue
 submission tickets map to actual backend tickets; they do not claim completion
 until the backend reports it. Host split presents run in queue order, with at

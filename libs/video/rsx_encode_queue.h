@@ -52,6 +52,10 @@ const rsx_draw_backend* rsx_encq_wrap(const rsx_draw_backend* real, const rsx_en
 void rsx_encq_unwrap(void);
 /* Is the encode thread running? */
 int  rsx_encq_active(void);
+/* Is the caller the encode thread? (0 when it is not running.) A backend
+ * callback that may run on the encode thread, the walker or a present thread
+ * asks this to tell the first case apart. */
+int  rsx_encq_on_encode_thread(void);
 /* Wait until every queued call has been made. */
 void rsx_encq_drain(void);
 /* Queue fn(arg) in order with the engine's calls (a host present's second
