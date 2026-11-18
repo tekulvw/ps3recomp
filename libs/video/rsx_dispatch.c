@@ -308,6 +308,40 @@ static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
     }
 }
 
+/* KEEP IN STEP WITH rsx_dispatch_method BELOW. A register is plain when the
+ * function does nothing for it beyond `seen[idx]++; regs[idx] = arg;`: not a
+ * vertex attribute constant that vtx_const_fold rewrites into the 4F slots,
+ * not an immediate-vertex trigger, not a word of the transform program or
+ * transform constant upload windows, not a case of the switch. The draw
+ * engine stores plain writes itself and skips the call (rsx_draw_engine.c,
+ * eng_method_core: about 6M calls a second in MAG). A case added below
+ * without a line here fails tools/test_rsx_dispatch_plain.py, which runs the
+ * real function for every index and state and compares. Conservative is
+ * allowed (a plain register may be reported as not plain), unsound is not. */
+int rsx_dispatch_plain_register(u32 idx)
+{
+    if (idx >= RSX_DSP_NUM_REGS) return 0;
+    const u32 m = idx << 2;
+    /* vtx_const_fold's sub-ranges (its callers test 0x1500..0x1A00,
+     * 0x1E40..0x1E80 and 0x0A80..0x0B00; 0x1600..0x1880 inside the first is
+     * inert there, and the test holds that to the function too). */
+    if (m >= 0x1E40 && m < 0x1E80) return 0;
+    if (m >= 0x1880 && m < 0x1A00) return 0;
+    if (m >= 0x1500 && m < 0x1600) return 0;
+    if (m >= 0x0A80 && m < 0x0B00) return 0;
+    if (m == 0x1508 || m == 0x1C0C) return 0;           /* immediate vertex */
+    if (m >= M_VP_UPLOAD_INST && m < M_VP_UPLOAD_INST + 32 * 4) return 0;
+    if (m >= M_VP_UPLOAD_CONST && m < M_VP_UPLOAD_CONST + 32 * 4) return 0;
+    switch (m) {
+    case M_CLEAR_BUFFERS: case M_VERTEX_BEGIN_END: case M_INLINE_ARRAY:
+    case M_VB_VERTEX_BATCH: case M_VB_INDEX_BATCH:
+    case M_GCM_FLIP_HEAD_0: case M_GCM_FLIP_HEAD_1: case M_GCM_DRIVER_FLIP:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;

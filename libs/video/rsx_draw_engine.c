@@ -2661,8 +2661,25 @@ static int eng_preuse_safe_method(u32 m)
  * about 6M methods a second in MAG. */
 #define ENG_PREUSE_RELEVANT   1u
 #define ENG_PREUSE_COMPARABLE 2u
+/* The same byte also classifies what eng_method_core itself does with a
+ * write, so the per-method path reads one byte instead of its range tests:
+ * PLAIN: rsx_dispatch_method would only store the register and count it
+ *   (rsx_dispatch_plain_register), so the engine does that and skips the
+ *   call; TEXUNIT: a texture unit's offset word (the picture-identity
+ *   bookkeeping); PICRESOLVE: a texture unit's format word (resolve after
+ *   dispatch); EXTERNAL: a method the external-program status tracks. */
+#define ENG_METHOD_PLAIN      4u
+#define ENG_METHOD_TEXUNIT    8u
+#define ENG_METHOD_PICRESOLVE 16u
+#define ENG_METHOD_EXTERNAL   32u
 static u8 s_preuse_table[RSX_DSP_NUM_REGS];
 static int s_preuse_table_ready;
+static int eng_external_tracks_method(u32 m)
+{
+    return (m >= 0x0B80u && m < 0x0C00u) || m == 0x1EA0u || m == 0x08E4u || m == 0x1D60u ||
+           (m >= 0x1740u && m < 0x1780u) || (m >= 0x1680u && m < 0x16C0u) ||
+           m == 0x1738u || m == 0x173Cu || m == 0x181Cu || m == 0x1820u || m == 0x1FC0u;
+}
 static void eng_preuse_table_build(void)
 {
     for (u32 ridx = 0; ridx < RSX_DSP_NUM_REGS; ridx++) {
@@ -2670,6 +2687,10 @@ static void eng_preuse_table_build(void)
         u8 t = 0;
         if (!eng_preuse_safe_method(m)) t |= ENG_PREUSE_RELEVANT;
         if (g.rsx.klass[ridx] != RSX_DSP_CLASS_EXEC && !(m >= 0x0B80u && m < 0x0C00u)) t |= ENG_PREUSE_COMPARABLE;
+        if (rsx_dispatch_plain_register(ridx)) t |= ENG_METHOD_PLAIN;
+        if (m >= 0x1A00u && m < 0x1C00u && !((m - 0x1A00u) & 31u)) t |= ENG_METHOD_TEXUNIT;
+        if (m >= 0x1A04u && m < 0x1C00u && !((m - 0x1A04u) & 31u)) t |= ENG_METHOD_PICRESOLVE;
+        if (eng_external_tracks_method(m)) t |= ENG_METHOD_EXTERNAL;
         s_preuse_table[ridx] = t;
     }
     s_preuse_table_ready = 1;
@@ -2691,7 +2712,15 @@ static int eng_preuse_on(void)
 unsigned rsx_draw_engine_pipeline_reuse_register_class(u32 ridx)
 {
     if (!s_preuse_table_ready) eng_preuse_table_build();
-    return ridx < RSX_DSP_NUM_REGS ? s_preuse_table[ridx] : ENG_PREUSE_RELEVANT;
+    /* The reuse bits only; the engine's own method bits share the byte. */
+    return ridx < RSX_DSP_NUM_REGS ? (s_preuse_table[ridx] & (ENG_PREUSE_RELEVANT | ENG_PREUSE_COMPARABLE))
+                                   : ENG_PREUSE_RELEVANT;
+}
+/* Tests: the engine's own method bits for a register index (ENG_METHOD_*). */
+unsigned rsx_draw_engine_method_class(u32 ridx)
+{
+    if (!s_preuse_table_ready) eng_preuse_table_build();
+    return ridx < RSX_DSP_NUM_REGS ? (s_preuse_table[ridx] & ~(ENG_PREUSE_RELEVANT | ENG_PREUSE_COMPARABLE)) : 0u;
 }
 void rsx_draw_engine_pipeline_reuse_counts(unsigned long long* hits, unsigned long long* misses,
                                            unsigned long long* mismatches)
@@ -5194,6 +5223,7 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
     sink.immediate_vertex = sink_immediate_vertex;
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
+    s_preuse_table_ready = 0; eng_preuse_table_build();   /* klass[] is set now */
     g.ready = 1;
     memset(&s_external,0,sizeof(s_external));
     atomic_store(&s_checked_failed, 0);
@@ -5257,7 +5287,12 @@ static void eng_method_core(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
-    if(m>=0x1A00 && m<0x1C00 && !((m-0x1A00)&31)){
+    /* One byte says what this write means to the engine and the dispatcher
+     * (eng_preuse_table_build); the masks above keep m >> 2 inside it. */
+    if (!s_preuse_table_ready) eng_preuse_table_build();
+    const u32 ridx = m >> 2;
+    const u8 t = s_preuse_table[ridx];
+    if (t & ENG_METHOD_TEXUNIT) {
         const u32 unit=(m-0x1A00)/32;
         if(g.rsx.in_begin_end && dc.n_packets &&
            (s_picture_bound[unit] || pic_pending_command(s_picture_command_ea))){
@@ -5269,7 +5304,7 @@ static void eng_method_core(u32 method, u32 arg)
         rsx_picture_release(s_picture_bound[unit]);s_picture_bound[unit]=0;
         s_picture_offset_ea[unit]=s_picture_command_ea;s_picture_offset_pending[unit]=1;
     }
-    if (s_external.status.active) {
+    if ((t & ENG_METHOD_EXTERNAL) && s_external.status.active) {
         if (m>=0x0B80 && m<0x0C00) {
             const u64 pos=(u64)rsx_dsp_reg(&g.rsx,0x1E9C)*4+(((m-0x0B80)>>2)&3);
             if (pos<RSX_DSP_VP_WORDS) s_external.vp_words[pos]=1;
@@ -5293,8 +5328,6 @@ static void eng_method_core(u32 method, u32 arg)
      * for every method the walker hands the engine (about 6M a second in
      * MAG), so the switch-off form must not pay for it. */
     if (eng_preuse_on()) {
-        const u32 ridx = (m & 0xFFFFCu) >> 2;
-        const u8 t = ridx < RSX_DSP_NUM_REGS ? s_preuse_table[ridx] : (u8)ENG_PREUSE_RELEVANT;
         if ((t & ENG_PREUSE_RELEVANT) &&
             !((t & ENG_PREUSE_COMPARABLE) && g.rsx.seen[ridx] && g.rsx.regs[ridx] == arg)) {
             s_preuse_gen++;
@@ -5306,8 +5339,10 @@ static void eng_method_core(u32 method, u32 arg)
             }
         }
     }
-    rsx_dispatch_method(&g.rsx, m, arg);
-    if(m>=0x1A04 && m<0x1C00 && !((m-0x1A04)&31))eng_picture_resolve((m-0x1A04)/32);
+    /* A plain register: the dispatcher's whole effect, made here, no call. */
+    if (t & ENG_METHOD_PLAIN) { g.rsx.seen[ridx]++; g.rsx.regs[ridx] = arg; }
+    else rsx_dispatch_method(&g.rsx, m, arg);
+    if (t & ENG_METHOD_PICRESOLVE) eng_picture_resolve((m-0x1A04)/32);
 }
 
 static void original_rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea)
@@ -5555,9 +5590,15 @@ void rsx_draw_engine_method(u32 method, u32 arg){
 }
 void rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea){
     const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
-    if(owner && !owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return;}
+    if(!owner){
+        /* No owner: the engine's own path, without re-entering the public
+         * rsx_draw_engine_method (whose owner test would read the same NULL). */
+        s_picture_command_ea=data_ea;original_rsx_draw_engine_method(method,arg);s_picture_command_ea=0;
+        return;
+    }
+    if(!owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return;}
     original_rsx_draw_engine_method_at(method,arg,data_ea);
-    if(owner)owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+    owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
 }
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
                                         u32 pitch, u32 width, u32 height){
