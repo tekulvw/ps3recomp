@@ -980,8 +980,22 @@ static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageF
      * invalidate, so a non-coherent one is fine. */
     const VkMemoryPropertyFlags cached = vis | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     const int readback = usage == VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    /* PS3RECOMP_VK_ARENA_CACHED=1 (default off, read once): the buffers the
+     * CPU fills for the GPU to read (the batch arena, the vertex, index and
+     * constant buffers) take a cached coherent type when the device has one
+     * instead of the first coherent type, which is write-combined and
+     * uncached on RADV's GTT. MAG's walker copies a few KB per draw into the
+     * arena, about 4,300 draws a frame; on write-combined memory those short
+     * copies ran at half the cached bandwidth plus partial-line flushes, and
+     * on Linux that copy, not the decode, was the walker's floor. Readback
+     * buffers already take a cached type. */
+    static int s_arena_cached = -1;
+    if (s_arena_cached < 0) { const char* e = getenv("PS3RECOMP_VK_ARENA_CACHED"); s_arena_cached = e && !strcmp(e, "1"); }
+    const int gpu_read = !readback && (usage & (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     if (readback && vk_find_memory_type(req.memoryTypeBits, cached | coh, &type) == 0) b->coherent = 1;
     else if (readback && vk_find_memory_type(req.memoryTypeBits, cached, &type) == 0) b->coherent = 0;
+    else if (s_arena_cached && gpu_read && vk_find_memory_type(req.memoryTypeBits, cached | coh, &type) == 0) b->coherent = 1;
     else if (vk_find_memory_type(req.memoryTypeBits, coh, &type) == 0) b->coherent = 1;
     else if (vk_find_memory_type(req.memoryTypeBits, vis, &type) == 0) b->coherent = 0;
     else { VK_LOG("no host-visible memory for a buffer\n"); return -1; }
