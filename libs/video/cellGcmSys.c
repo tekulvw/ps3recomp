@@ -4017,7 +4017,14 @@ static void gcm_rsx_process_fifo_pass(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
-            { int transfer=nv0039_packet(w,put);
+            /* NV0039 inference (nv0039_packet) only ever recognises subchannel 1
+             * headers; for any other header it returned 0 and dropped an active
+             * copy unless the object was rebound. Do that here and spare the
+             * call: it was made for every method header (0.4 ms a frame in a
+             * MAG Training walker profile). */
+            { int transfer=0;
+              if(subch==1u) transfer=nv0039_packet(w,put);
+              else if(!s_nv0039.rebound) s_nv0039.active=0;
               if(transfer==1) continue;
               if(transfer==2) {
                   producer_waiting=!atomic_load(&s_checked_ref_failed);
