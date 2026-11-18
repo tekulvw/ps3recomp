@@ -2651,6 +2651,29 @@ static int eng_preuse_safe_method(u32 m)
     }
     return 0;
 }
+/* What a write to each register means to the key, one byte per register,
+ * built once from eng_preuse_safe_method and the dispatcher's register
+ * classes: RELEVANT when the key reads it (a write bumps the generation),
+ * COMPARABLE when a write of the value already there changes nothing (not
+ * an execution method, not the transform program upload window, which
+ * writes program memory). The per-method path then does one byte load
+ * instead of the range tests and the switch; the walker hands the engine
+ * about 6M methods a second in MAG. */
+#define ENG_PREUSE_RELEVANT   1u
+#define ENG_PREUSE_COMPARABLE 2u
+static u8 s_preuse_table[RSX_DSP_NUM_REGS];
+static int s_preuse_table_ready;
+static void eng_preuse_table_build(void)
+{
+    for (u32 ridx = 0; ridx < RSX_DSP_NUM_REGS; ridx++) {
+        const u32 m = ridx << 2;
+        u8 t = 0;
+        if (!eng_preuse_safe_method(m)) t |= ENG_PREUSE_RELEVANT;
+        if (g.rsx.klass[ridx] != RSX_DSP_CLASS_EXEC && !(m >= 0x0B80u && m < 0x0C00u)) t |= ENG_PREUSE_COMPARABLE;
+        s_preuse_table[ridx] = t;
+    }
+    s_preuse_table_ready = 1;
+}
 static int eng_preuse_on(void)
 {
     if (s_preuse_mode < 0) {
@@ -2659,8 +2682,16 @@ static int eng_preuse_on(void)
         if (s_preuse_mode)
             fprintf(stderr, "[rsx engine] PS3RECOMP_RSX_PIPELINE_REUSE=%d: unchanged pipeline inputs keep the previous draw's pipeline%s\n",
                     s_preuse_mode, s_preuse_mode == 2 ? " (verified against a full gather)" : "");
+        if (s_preuse_mode && !s_preuse_table_ready) eng_preuse_table_build();
     }
     return s_preuse_mode;
+}
+/* Tests: the table byte for a register index (ENG_PREUSE_* bits), against
+ * the reference logic the test keeps. */
+unsigned rsx_draw_engine_pipeline_reuse_register_class(u32 ridx)
+{
+    if (!s_preuse_table_ready) eng_preuse_table_build();
+    return ridx < RSX_DSP_NUM_REGS ? s_preuse_table[ridx] : ENG_PREUSE_RELEVANT;
 }
 void rsx_draw_engine_pipeline_reuse_counts(unsigned long long* hits, unsigned long long* misses,
                                            unsigned long long* mismatches)
@@ -5263,11 +5294,16 @@ static void eng_method_core(u32 method, u32 arg)
      * MAG), so the switch-off form must not pay for it. */
     if (eng_preuse_on()) {
         const u32 ridx = (m & 0xFFFFCu) >> 2;
-        const int unchanged = ridx < RSX_DSP_NUM_REGS && g.rsx.seen[ridx] && g.rsx.regs[ridx] == arg &&
-                              g.rsx.klass[ridx] != RSX_DSP_CLASS_EXEC && !(m >= 0x0B80u && m < 0x0C00u);
-        if (!unchanged && !eng_preuse_safe_method(m)) {
-            s_preuse_gen++; s_preuse.last_bump = m;
-            const u32 r = (m >> 2) & 2047u; s_preuse.since[r >> 5] |= 1u << (r & 31u);
+        const u8 t = ridx < RSX_DSP_NUM_REGS ? s_preuse_table[ridx] : (u8)ENG_PREUSE_RELEVANT;
+        if ((t & ENG_PREUSE_RELEVANT) &&
+            !((t & ENG_PREUSE_COMPARABLE) && g.rsx.seen[ridx] && g.rsx.regs[ridx] == arg)) {
+            s_preuse_gen++;
+            /* The per-method histogram only in verify mode: it is diagnostic
+             * output, and the store per bump is not free on the walker. */
+            if (s_preuse_mode == 2) {
+                s_preuse.last_bump = m;
+                const u32 r = (m >> 2) & 2047u; s_preuse.since[r >> 5] |= 1u << (r & 31u);
+            }
         }
     }
     rsx_dispatch_method(&g.rsx, m, arg);

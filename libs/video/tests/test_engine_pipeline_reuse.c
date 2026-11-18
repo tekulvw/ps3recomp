@@ -86,6 +86,37 @@ static int run(int mode, draw_rec* rec)
     return created;
 }
 
+/* The reference for the engine's register-class table: the per-method logic
+ * the table replaced, kept here verbatim so the table cannot drift from it. */
+static int ref_safe_method(u32 m)
+{
+    if (m >= 0x1EFCu && m <= 0x1F7Cu) return 1;
+    if (m >= 0x1680u && m < 0x16C0u) return 1;
+    if (m >= 0x1A00u && m < 0x1C00u && !((m - 0x1A00u) & 31u)) return 1;
+    switch (m) {
+    case 0x0100u: case 0x1800u: case 0x1808u: case 0x180Cu: case 0x1810u:
+    case 0x1814u: case 0x1818u: case 0x1824u: case 0x1D6Cu: case 0x1D70u: case 0x1D74u:
+    case 0x181Cu: case 0x1820u:
+    case 0x1710u: case 0x1714u: case 0x17C8u:
+        return 1;
+    }
+    return 0;
+}
+static rsx_dispatch g_ref_dsp;
+static void check_register_table(void)
+{
+    rsx_dispatch_init(&g_ref_dsp, NULL);
+    int bad = 0;
+    for (u32 ridx = 0; ridx < RSX_DSP_NUM_REGS; ridx++) {
+        const u32 m = ridx << 2;
+        const unsigned want = (ref_safe_method(m) ? 0u : 1u) |
+            ((g_ref_dsp.klass[ridx] != RSX_DSP_CLASS_EXEC && !(m >= 0x0B80u && m < 0x0C00u)) ? 2u : 0u);
+        const unsigned got = rsx_draw_engine_pipeline_reuse_register_class(ridx);
+        if (got != want && bad++ < 5) printf("  register %04X: class %u, reference %u\n", m, got, want);
+    }
+    CHECK(!bad, "the register-class table matches the reference logic for all %u registers", (unsigned)RSX_DSP_NUM_REGS);
+}
+
 int main(void)
 {
     vm_base = calloc(1, GUEST_BYTES);
@@ -107,6 +138,7 @@ int main(void)
         }
     CHECK(same && on == off, "every draw binds the same pipeline and fragment constants (first difference %d; %d vs %d pipelines)",
           first, on, off);
+    check_register_table();
     run(2, g_rec[2]);
     unsigned long long h3, m3, x3;
     rsx_draw_engine_pipeline_reuse_counts(&h3, &m3, &x3);
