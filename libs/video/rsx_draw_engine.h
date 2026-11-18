@@ -410,6 +410,10 @@ void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned lon
  * draws that gathered it, and (in verify mode 2) disagreements. */
 void rsx_draw_engine_pipeline_reuse_counts(unsigned long long* hits, unsigned long long* misses,
                                            unsigned long long* mismatches);
+/* Tests: what a write to register index `ridx` means to the pipeline key
+ * (bit 0 relevant: it bumps the generation; bit 1 comparable: a write of the
+ * value already there does not). */
+unsigned rsx_draw_engine_pipeline_reuse_register_class(u32 ridx);
 /* Repeat texture binds in one frame after a guest-memory write that missed
  * the texture (no re-check), and those a write may have touched (checked). */
 void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked);
