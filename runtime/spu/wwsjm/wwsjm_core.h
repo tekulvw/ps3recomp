@@ -37,11 +37,15 @@ extern "C" {
 #define WWSJM_CHUNK_BYTES    0x4000u  /* largest single GET of a staged copy */
 #define WWSJM_CONTEXT_BYTES  0x80u
 #define WWSJM_RESIDENT_MAX   8u
+#define WWSJM_MODULE_PAGE    16u      /* modules are linked for LS 0x4000 */
+/* N is a u16; capacities need not be powers of two, so the slot jumps when N
+ * wraps. The wrap was never observed; a check mode reports N at or above this. */
+#define WWSJM_INDEX_WRAP_WATCH 0xF000u
 
 typedef enum {
     WWSJM_OK = 0,
     WWSJM_E_ARG,            /* caller error: lane, array, wid out of range */
-    WWSJM_E_DETACHED,       /* the current array has no guest address */
+    WWSJM_E_DETACHED,       /* the current array has no guest address or no capacity */
     WWSJM_E_ENTRY_TYPE,     /* header entry type > 5 */
     WWSJM_E_HEADER,         /* header size nibble, size or EA alignment */
     WWSJM_E_COMMAND,        /* command 0/6/7 or a malformed command word */
@@ -88,7 +92,9 @@ typedef struct {
 
 void wwsjm_line_decode(const uint8_t raw[WWSJM_LINE_BYTES], wwsjm_line* out);
 
-/* Where the header of `index` on array `a` lives: slot index mod capacity. */
+/* Where the header of `index` on array `a` lives: the u16 index mod capacity
+ * (capacity - 1 is the line's field), with no special case at the u16 wrap.
+ * 0 for a malformed array (no EA, or capacity 2^32). */
 uint32_t wwsjm_header_ea(const wwsjm_line* l, unsigned a, uint16_t index);
 
 /* The entry the manager would examine next: array `current`, index N. */
@@ -164,10 +170,10 @@ wwsjm_status wwsjm_ready_apply(const uint8_t old[WWSJM_LINE_BYTES], unsigned wid
 #define WWSJM_READY_ON_FLAG 8u
 
 /* ---- dependency counters ------------------------------------------------- */
-/* Decrement the u16 at byte `offset` of a 128-byte line (wrapping). Returns
- * the new value. */
-uint16_t wwsjm_decrement(const uint8_t old[WWSJM_LINE_BYTES], unsigned offset,
-                         uint8_t out[WWSJM_LINE_BYTES]);
+/* Decrement the u16 at byte `offset` of a 128-byte line (wrapping) into `out`
+ * and `*value`. An odd offset or one past the line is refused. */
+wwsjm_status wwsjm_decrement(const uint8_t old[WWSJM_LINE_BYTES], unsigned offset,
+                             uint8_t out[WWSJM_LINE_BYTES], uint16_t* value);
 
 /* The u16 after a counter names the workload to wake and its ready count. */
 static inline void wwsjm_wake_target(uint16_t follower, unsigned* wid, uint8_t* value)
@@ -229,12 +235,15 @@ typedef struct {
     uint32_t dep_ea[WWSJM_MAX_DEPS];
     unsigned load_count;
     wwsjm_load load[WWSJM_MAX_LOADS];
+    unsigned nop_count;        /* no-op commands skipped (never observed; check reports) */
+    uint8_t set0_moved;        /* set 0 not at WWSJM_MODULE_PAGE (allowed; check reports) */
     uint32_t command_bytes;    /* through the run-job command */
     uint32_t userdata_offset;  /* parameter data: next 16-byte boundary */
     uint32_t userdata_bytes;
 } wwsjm_plan;
 
-/* Decode the first `size` bytes of a record into a staging plan. Every
+/* Decode the first `size` bytes of a record into a staging plan. No-op
+ * commands are skipped and counted; end and invalid commands are refused. Every
  * reserved set must lie inside [ls_low, ls_high) (a set of zero pages only
  * needs its start inside). Nothing partial is returned: on error the plan is
  * cleared and `*bad_slot` names the offending command. */
@@ -249,7 +258,8 @@ typedef struct {
 /* The LS a job still holds: every named buffer (logical buffer `first_buffer`
  * when none is named) of every set it reserved and has not released (bit s of
  * `released` = set s released). Zero-length sets hold nothing. */
-unsigned wwsjm_plan_held(const wwsjm_plan* p, uint32_t released, wwsjm_span* out, unsigned max);
+wwsjm_status wwsjm_plan_held(const wwsjm_plan* p, uint32_t released, wwsjm_span* out,
+                             unsigned max, unsigned* out_n);
 
 /* Place a job's sets beside LS that is not free (the buffers an earlier job
  * still holds): each set's ring starts at its lowest-numbered physical buffer
@@ -257,7 +267,8 @@ unsigned wwsjm_plan_held(const wwsjm_plan* p, uint32_t released, wwsjm_span* out
  * Returns the number of sets whose placed buffers still overlap `busy`: those
  * must not be filled while the earlier job runs (0 = stage now). Loads and
  * descriptors follow the placement. With no busy spans every ring starts at
- * its first buffer. */
+ * its first buffer. Set 0 (the module) and any set holding a shareable copy
+ * never rotate: their buffers stay put and only count as conflicts. */
 unsigned wwsjm_plan_place(wwsjm_plan* p, const wwsjm_span* busy, unsigned n_busy);
 
 /* Recompute every load's LS from the sets' `start` (for a caller that chooses
@@ -288,14 +299,16 @@ static inline wwsjm_status wwsjm_job_tag(unsigned* given, uint8_t* tag)
 }
 
 /* Where each element of a gather list lands (the MFC list rule: each element
- * starts on the next quadword, keeping its EA's offset within the quadword).
- * `list` holds `n` big-endian (size, EA) pairs. */
+ * starts on the next quadword after the previous element's last byte, keeping
+ * its EA's offset within the quadword). `list` holds `n` big-endian (size, EA)
+ * pairs; an element is at most 16 KiB; every byte must fit in `limit`; at most
+ * `max_out` pieces are written. */
 typedef struct {
     uint32_t ls, ea, bytes;
 } wwsjm_piece;
 
 wwsjm_status wwsjm_gather_layout(const uint8_t* list, unsigned n, uint32_t ls, uint32_t limit,
-                                 wwsjm_piece* out, unsigned* out_n);
+                                 wwsjm_piece* out, unsigned max_out, unsigned* out_n);
 
 /* ---- module/buffer residency within one run ------------------------------ */
 typedef struct {

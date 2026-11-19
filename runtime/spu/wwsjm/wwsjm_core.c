@@ -43,7 +43,9 @@ uint32_t wwsjm_header_ea(const wwsjm_line* l, unsigned a, uint16_t index)
 {
     /* The line holds capacity - 1; capacities need not be powers of two. */
     uint32_t capacity = l->mask[a] + 1u;
-    return l->array_ea[a] + 8u * (capacity ? (uint32_t)index % capacity : index);
+    if (!capacity || !l->array_ea[a])          /* malformed: wwsjm_cursor_of refuses it */
+        return 0;
+    return l->array_ea[a] + 8u * ((uint32_t)index % capacity);
 }
 
 wwsjm_status wwsjm_cursor_of(const wwsjm_line* l, wwsjm_cursor* out)
@@ -51,8 +53,8 @@ wwsjm_status wwsjm_cursor_of(const wwsjm_line* l, wwsjm_cursor* out)
     unsigned a = l->current;
     if (a >= WWSJM_ARRAYS)
         return WWSJM_E_ARG;
-    if (!l->array_ea[a])
-        return WWSJM_E_DETACHED;
+    if (!l->array_ea[a] || l->mask[a] == 0xFFFFFFFFu)
+        return WWSJM_E_DETACHED;               /* no array, or a capacity of 2^32 */
     out->array = a;
     out->index = l->m[a].next;
     out->header_ea = wwsjm_header_ea(l, a, out->index);
@@ -145,14 +147,16 @@ wwsjm_status wwsjm_ready_apply(const uint8_t old[WWSJM_LINE_BYTES], unsigned wid
     return WWSJM_OK;
 }
 
-uint16_t wwsjm_decrement(const uint8_t old[WWSJM_LINE_BYTES], unsigned offset,
-                         uint8_t out[WWSJM_LINE_BYTES])
+wwsjm_status wwsjm_decrement(const uint8_t old[WWSJM_LINE_BYTES], unsigned offset,
+                             uint8_t out[WWSJM_LINE_BYTES], uint16_t* value)
 {
+    if ((offset & 1) || offset > WWSJM_LINE_BYTES - 2)
+        return WWSJM_E_ARG;
     memcpy(out, old, WWSJM_LINE_BYTES);
-    offset &= (WWSJM_LINE_BYTES - 2);
     uint16_t v = (uint16_t)(wwsjm_be16(old + offset) - 1u);
     wwsjm_put16(out + offset, v);
-    return v;
+    *value = v;
+    return WWSJM_OK;
 }
 
 /* ---- command portion ------------------------------------------------------ */
@@ -253,6 +257,8 @@ wwsjm_status wwsjm_plan_commands(const uint8_t* record, uint32_t size, uint32_t 
             s->pages = (uint8_t)(arg >> 16);
             s->count = (uint8_t)((arg >> 8) & 0x7F);
             s->first_buffer = (uint8_t)arg;
+            if (w.set == 0 && s->first_page != WWSJM_MODULE_PAGE)
+                out->set0_moved = 1;
             uint32_t lo = set_lo(s), hi = set_hi(s);
             if (!s->count || s->count > 32 || lo < ls_low ||
                 hi > ls_high || (hi == lo && lo >= ls_high))
@@ -322,12 +328,15 @@ wwsjm_status wwsjm_plan_commands(const uint8_t* record, uint32_t size, uint32_t 
                 return fail(out, bad_slot, i, WWSJM_E_TOO_MANY);
             out->dep_ea[out->dep_count++] = arg;
             break;
+        case WWSJM_CMD_NOP:                    /* never observed: skipped, counted */
+            out->nop_count++;
+            break;
         case WWSJM_CMD_RUN:
             if (w.read || w.gather || w.share || w.quads)
                 return fail(out, bad_slot, i, WWSJM_E_FLAGS);
             run_at = i;
             break;
-        default:                               /* no-op, end, invalid */
+        default:                               /* end, invalid */
             return fail(out, bad_slot, i, WWSJM_E_COMMAND);
         }
     }
@@ -352,30 +361,47 @@ wwsjm_status wwsjm_buffer_span(const wwsjm_plan* p, unsigned set, unsigned buf, 
     return WWSJM_OK;
 }
 
-unsigned wwsjm_plan_held(const wwsjm_plan* p, uint32_t released, wwsjm_span* out, unsigned max)
+wwsjm_status wwsjm_plan_held(const wwsjm_plan* p, uint32_t released, wwsjm_span* out,
+                             unsigned max, unsigned* out_n)
 {
     unsigned n = 0;
+    *out_n = 0;
     for (unsigned k = 0; k < WWSJM_MAX_SETS; k++) {
         const wwsjm_set* s = &p->set[k];
         if (!s->reserved || !s->pages || (released >> k & 1))
             continue;
         uint32_t named = s->named ? s->named : 1u;
-        for (unsigned b = 0; b < s->count && n < max; b++) {
+        for (unsigned b = 0; b < s->count; b++) {
             if (!(named >> b & 1))
                 continue;
+            if (n >= max)
+                return WWSJM_E_TOO_MANY;
             uint32_t lo = phys_lo(s, phys_of(s, s->first_buffer + b));
             out[n].lo = lo;
             out[n].hi = lo + buffer_bytes(s);
             n++;
         }
     }
-    return n;
+    *out_n = n;
+    return WWSJM_OK;
 }
 
 static int overlaps_any(uint32_t lo, uint32_t hi, const wwsjm_span* busy, unsigned n)
 {
     for (unsigned i = 0; i < n; i++)
         if (lo < busy[i].hi && busy[i].lo < hi)
+            return 1;
+    return 0;
+}
+
+/* Set 0 holds the position-dependent module at its first page, and a set with
+ * a shareable copy may be reused in place by a later job: neither rotates. */
+static int pinned(const wwsjm_plan* p, unsigned set)
+{
+    if (set == 0)
+        return 1;
+    for (unsigned i = 0; i < p->use_count; i++)
+        if (p->use[i].set == set && p->use[i].fill == WWSJM_FILL_COPY && p->use[i].shareable)
             return 1;
     return 0;
 }
@@ -389,7 +415,7 @@ unsigned wwsjm_plan_place(wwsjm_plan* p, const wwsjm_span* busy, unsigned n_busy
             continue;
         uint32_t bytes = buffer_bytes(s);
         unsigned start = 0;
-        for (unsigned b = 0; b < s->count; b++)
+        for (unsigned b = 0; b < s->count && !pinned(p, k); b++)
             if (!overlaps_any(phys_lo(s, b), phys_lo(s, b) + bytes, busy, n_busy)) {
                 start = b;
                 break;
@@ -443,10 +469,11 @@ wwsjm_status wwsjm_buffer_descriptor(const wwsjm_plan* p, unsigned set, unsigned
 }
 
 wwsjm_status wwsjm_gather_layout(const uint8_t* list, unsigned n, uint32_t ls, uint32_t limit,
-                                 wwsjm_piece* out, unsigned* out_n)
+                                 wwsjm_piece* out, unsigned max_out, unsigned* out_n)
 {
-    uint32_t at = 0;
+    uint32_t at = 0;                           /* quadword-aligned offset of the next element */
     unsigned k = 0;
+    *out_n = 0;
     for (unsigned i = 0; i < n; i++) {
         uint32_t word = wwsjm_be32(list + 8u * i);
         uint32_t ea = wwsjm_be32(list + 8u * i + 4);
@@ -454,14 +481,18 @@ wwsjm_status wwsjm_gather_layout(const uint8_t* list, unsigned n, uint32_t ls, u
             return WWSJM_E_GATHER;
         if (!word)
             continue;
-        uint32_t span = (word + 15u) & ~15u;
-        if (at + span > limit)
+        if (word > WWSJM_CHUNK_BYTES)
             return WWSJM_E_GATHER;
+        uint32_t end = at + (ea & 15u) + word; /* the element keeps its EA's quadword offset */
+        if (end > limit)
+            return WWSJM_E_GATHER;
+        if (k >= max_out)
+            return WWSJM_E_TOO_MANY;
         out[k].ls = ls + at + (ea & 15u);
         out[k].ea = ea;
         out[k].bytes = word;
         k++;
-        at += span;
+        at = (end + 15u) & ~15u;
     }
     *out_n = k;
     return WWSJM_OK;

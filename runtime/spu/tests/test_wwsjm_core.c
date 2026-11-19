@@ -22,15 +22,15 @@ static const char* group = "";
 
 #define LIST_EA   0x10000000u
 #define ARRAY_EA  0x10010000u
-#define SPURS_EA  0x15700500u
+#define SPURS_EA  0x20000000u
 
 /* ---- builders ------------------------------------------------------------- */
 
 static void line_blank(uint8_t l[WWSJM_LINE_BYTES])
 {
     memset(l, 0, WWSJM_LINE_BYTES);
-    wwsjm_put32(l + 0x00, 0x019E4C80u);
-    wwsjm_put32(l + 0x04, 0x2F00u);
+    wwsjm_put32(l + 0x00, 0x00100000u);
+    wwsjm_put32(l + 0x04, 0x3000u);
     wwsjm_put16(l + 0x08, 0xABCD);              /* bytes the manager must preserve */
     wwsjm_put16(l + 0x0C, 0x1234);
     wwsjm_put16(l + 0x0E, 0xFFFF);
@@ -114,10 +114,10 @@ static void test_jl1_fresh_claim(void)
     wwsjm_cursor c;
     CHECK(wwsjm_cursor_of(&dl, &c) == WWSJM_OK);
     CHECK(c.array == 3 && c.index == 3 && c.header_ea == ARRAY_EA + 8 * 3);
-    header(h8, 0x00D0, 1, 0x020D0F00u);
+    header(h8, 0x00D0, 1, 0x02010000u);
     wwsjm_header h;
     CHECK(wwsjm_header_decode(h8, &h) == WWSJM_OK);
-    CHECK(h.size == 0xD0 && h.type == 1 && h.ea == 0x020D0F00u);
+    CHECK(h.size == 0xD0 && h.type == 1 && h.ea == 0x02010000u);
     CHECK(wwsjm_judge(&h, 0) == WWSJM_TAKE);
     CHECK(wwsjm_claim(l, 0, &h, out) == WWSJM_OK);
     const uint16_t want[8] = {4, 4, 3, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
@@ -145,7 +145,7 @@ static void test_jl2_counted_claim(void)
     group = "JL-2";
     uint8_t l[128], out[128], h8[8];
     jl2_line(l);
-    header(h8, 0x0080, 1, 0x020CE150u);
+    header(h8, 0x0080, 1, 0x02000100u);
     wwsjm_header h;
     CHECK(wwsjm_header_decode(h8, &h) == WWSJM_OK);
     CHECK(wwsjm_claim(l, 0, &h, out) == WWSJM_OK);
@@ -153,7 +153,7 @@ static void test_jl2_counted_claim(void)
     CHECK(markers_are(out, 3, want));
     uint32_t r[2];
     wwsjm_finish_result(&h, r);
-    CHECK(r[0] == 0x00800001u && r[1] == 0x020CE150u);
+    CHECK(r[0] == 0x00800001u && r[1] == 0x02000100u);
     wwsjm_finish_result(NULL, r);
     CHECK(r[0] == 0 && r[1] == 0xFFFFFFFFu);
     wwsjm_line dl;
@@ -194,7 +194,7 @@ static void test_jl4_gates(void)
     const uint16_t m[8] = {0x12, 0x12, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
     line_markers(l, 3, m);
     for (uint16_t type = 2; type <= 5; type += 3) {
-        header(h8, 0, type, 0x01E0EB04u);
+        header(h8, 0, type, 0x03000004u);
         wwsjm_header h;
         CHECK(wwsjm_header_decode(h8, &h) == WWSJM_OK);
         CHECK(wwsjm_header_is_gate(&h));
@@ -277,6 +277,7 @@ static void test_jl7_wrap(void)
     wwsjm_line_decode(l, &dl);
     CHECK(wwsjm_header_ea(&dl, 1, 0x10) == ARRAY_EA + 0x10000 + 0x80);
     CHECK(wwsjm_header_ea(&dl, 1, 0x1FF0) == ARRAY_EA + 0x10000);
+    CHECK(wwsjm_header_ea(&dl, 1, 0x1FF5) == ARRAY_EA + 0x10000 + 8 * 5);   /* spec JL-7 */
     CHECK(wwsjm_header_ea(&dl, 2, 0x0C00) == ARRAY_EA + 0x20000 + 8 * 0xC00);
     CHECK(wwsjm_header_ea(&dl, 2, 0x1400) == ARRAY_EA + 0x20000);
     /* a detached current array has no cursor */
@@ -284,6 +285,15 @@ static void test_jl7_wrap(void)
     wwsjm_line_decode(l, &dl);
     wwsjm_cursor c;
     CHECK(wwsjm_cursor_of(&dl, &c) == WWSJM_E_DETACHED);
+    /* a capacity field of 0xFFFFFFFF (capacity 2^32) is malformed, not a raw index */
+    line_array(l, 3, 0xFFFFFFFFu, ARRAY_EA + 0x30000);
+    wwsjm_line_decode(l, &dl);
+    CHECK(wwsjm_cursor_of(&dl, &c) == WWSJM_E_DETACHED);
+    CHECK(wwsjm_header_ea(&dl, 3, 5) == 0);
+    /* capacity 1 is legal: every index is slot 0 */
+    line_array(l, 3, 0, ARRAY_EA + 0x30000);
+    wwsjm_line_decode(l, &dl);
+    CHECK(wwsjm_cursor_of(&dl, &c) == WWSJM_OK && c.header_ea == ARRAY_EA + 0x30000);
 }
 
 /* generated: the S rule, lane rule and byte preservation on random lines */
@@ -377,7 +387,8 @@ static void test_dd1(void)
     memset(l, 0x5A, sizeof l);
     wwsjm_put16(l + 0x44, 0x0001);
     wwsjm_put16(l + 0x46, 0x0605);
-    CHECK(wwsjm_decrement(l, 0x44, out) == 0);
+    uint16_t dv = 99;
+    CHECK(wwsjm_decrement(l, 0x44, out, &dv) == WWSJM_OK && dv == 0);
     CHECK(wwsjm_be16(out + 0x44) == 0);
     CHECK(same_except(l, out, 0x44, 0x46, 999, 999));
     unsigned wid;
@@ -391,9 +402,12 @@ static void test_dd1(void)
     CHECK(inst2[6] == 5);
     CHECK(same_except(inst, inst2, 6, 7, 999, 999));
     wwsjm_put16(l + 0x44, 0x0004);
-    CHECK(wwsjm_decrement(l, 0x44, out) == 3);
+    CHECK(wwsjm_decrement(l, 0x44, out, &dv) == WWSJM_OK && dv == 3);
     wwsjm_put16(l + 0x44, 0x0000);
-    CHECK(wwsjm_decrement(l, 0x44, out) == 0xFFFF);              /* wraps */
+    CHECK(wwsjm_decrement(l, 0x44, out, &dv) == WWSJM_OK && dv == 0xFFFF);   /* wraps */
+    CHECK(wwsjm_decrement(l, 0x7E, out, &dv) == WWSJM_OK);                    /* last u16 */
+    CHECK(wwsjm_decrement(l, 0x45, out, &dv) == WWSJM_E_ARG);                 /* odd */
+    CHECK(wwsjm_decrement(l, 0x80, out, &dv) == WWSJM_E_ARG);                 /* past the line */
 }
 
 static void test_rc(void)
@@ -432,9 +446,9 @@ static void test_rc(void)
 
 /* ---- CL: command lists ------------------------------------------------------- */
 
-#define MOD_EA  0x019B9080u
-#define LIST_L  0x020CE250u
-#define DEP_Y   0x01E0EB44u
+#define MOD_EA  0x01000000u
+#define LIST_L  0x02000040u
+#define DEP_Y   0x03000014u
 
 static uint32_t cl1_record(uint8_t* rec)
 {
@@ -559,7 +573,7 @@ static void test_cl3_refusals(void)
     unsigned bad;
     CHECK(plan_one(0x00000C00, 0, &bad) == WWSJM_E_COMMAND && bad == 2);   /* end */
     CHECK(plan_one(0x00000E00, 0, &bad) == WWSJM_E_COMMAND && bad == 2);   /* invalid */
-    CHECK(plan_one(0x00000000, 0, &bad) == WWSJM_E_COMMAND);               /* no-op */
+    CHECK(plan_one(0x00000000, 0, &bad) == WWSJM_OK);                      /* no-op: skipped */
     /* set-0 pages reaching into the native context area */
     uint8_t rec[0x100];
     memset(rec, 0, sizeof rec);
@@ -699,14 +713,17 @@ static void test_placement(void)
     /* held: the placed buffers of unreleased sets */
     CHECK(wwsjm_plan_place(&p, busy, 2) == 0);
     wwsjm_span held[8];
-    unsigned n = wwsjm_plan_held(&p, 0, held, 8);
+    unsigned n = 0;
+    CHECK(wwsjm_plan_held(&p, 0, held, 8, &n) == WWSJM_OK);
     CHECK(n == 4);
+    unsigned m = 9;
+    CHECK(wwsjm_plan_held(&p, 0, held, 3, &m) == WWSJM_E_TOO_MANY);    /* never truncates */
     int saw = 0;
     for (unsigned i = 0; i < n; i++)
         if (held[i].lo == 0x9400 && held[i].hi == 0xA800)
             saw = 1;
     CHECK(saw);
-    CHECK(wwsjm_plan_held(&p, 1u << 1 | 1u << 0, held, 8) == 2);
+    CHECK(wwsjm_plan_held(&p, 1u << 1 | 1u << 0, held, 8, &n) == WWSJM_OK && n == 2);
     /* a three-buffer ring rotates every logical buffer */
     memset(rec, 0, sizeof rec);
     cmd(rec, 0, 0x00000240, 0x4C2C0300);
@@ -728,6 +745,99 @@ static void test_placement(void)
     CHECK(wwsjm_buffer_span(&p, 2, 0, &ls, &bytes) == WWSJM_OK && ls == 0x29000);
 }
 
+/* spec 12.1 invariants 1 and 3: set 0 and a set with a shareable copy stay put */
+static void test_pinned(void)
+{
+    group = "pinned";
+    uint8_t rec[0x100];
+    memset(rec, 0, sizeof rec);
+    cmd(rec, 0, 0x00000200, 0x10040200);    /* set 0: 2 x 4 pages at 16 */
+    cmd(rec, 1, 0x0040A400, MOD_EA);        /* 16 quadwords, read+shareable */
+    cmd(rec, 2, 0x00000220, 0x20040200);    /* set 1: 2 x 4 pages at 32 */
+    cmd(rec, 3, 0x0040A420, MOD_EA + 0x1000);
+    cmd(rec, 4, 0x00000240, 0x28040200);    /* set 2: same shape, plain copy */
+    cmd(rec, 5, 0x00408440, MOD_EA + 0x2000);
+    cmd(rec, 6, 0x00000A00, 0);
+    wwsjm_plan p;
+    CHECK(wwsjm_plan_commands(rec, 0x40, 0x4000, 0x3E000, &p, NULL) == WWSJM_OK);
+    CHECK(!p.set0_moved && p.nop_count == 0);
+    wwsjm_span busy[3] = {{0x4000, 0x4400}, {0x8000, 0x8400}, {0xA000, 0xA400}};
+    CHECK(wwsjm_plan_place(&p, busy, 3) == 2);
+    CHECK(p.set[0].start == 0 && p.set[1].start == 0 && p.set[2].start == 1);
+    for (unsigned i = 0; i < p.load_count; i++) {
+        unsigned set = p.use[p.load[i].use].set;
+        CHECK(p.load[i].ls == (set == 0 ? 0x4000u : set == 1 ? 0x8000u : 0xB000u));
+        CHECK(p.load[i].ls % WWSJM_PAGE_BYTES == 0);
+    }
+    /* set 0 stays at its first page even without a shareable copy */
+    cmd(rec, 1, 0x00408400, MOD_EA);        /* plain read */
+    CHECK(wwsjm_plan_commands(rec, 0x40, 0x4000, 0x3E000, &p, NULL) == WWSJM_OK);
+    CHECK(wwsjm_plan_place(&p, busy, 3) == 2 && p.set[0].start == 0);
+    cmd(rec, 1, 0x0040A400, MOD_EA);
+    /* a set 0 away from page 16 is allowed and noted */
+    cmd(rec, 0, 0x00000200, 0x30040200);
+    cmd(rec, 2, 0x00000220, 0x20040200);
+    CHECK(wwsjm_plan_commands(rec, 0x40, 0x4000, 0x3E000, &p, NULL) == WWSJM_OK && p.set0_moved);
+    /* no-op commands are skipped and counted */
+    memset(rec, 0, sizeof rec);
+    cmd(rec, 0, 0x00000000, 0);
+    cmd(rec, 1, 0x00000200, 0x10040100);
+    cmd(rec, 2, 0x00000000, 0x12345678);
+    cmd(rec, 3, 0x00000A00, 0);
+    CHECK(wwsjm_plan_commands(rec, 0x20, 0x4000, 0x3E000, &p, NULL) == WWSJM_OK);
+    CHECK(p.nop_count == 2 && p.set[0].reserved && p.userdata_offset == 0x20);
+}
+
+/* JL-1's command portion: 0xD0 bytes from the header's EA, userdata after the run command */
+static void test_jl1_portion(void)
+{
+    group = "JL-1 portion";
+    uint8_t rec[0x100], h8[8];
+    memset(rec, 0, sizeof rec);
+    cmd(rec, 0, 0x00000200, 0x10040100);
+    cmd(rec, 1, 0x0100A400, MOD_EA);
+    cmd(rec, 2, 0x00000220, 0x14020100);
+    cmd(rec, 3, 0x0004C420, LIST_L);
+    cmd(rec, 4, 0x00000A00, 0);
+    for (unsigned i = 0x30; i < 0xD0; i++)
+        rec[i] = (uint8_t)(0xA0 ^ i);
+    header(h8, 0x00D0, 1, 0x02010000u);
+    wwsjm_header h;
+    CHECK(wwsjm_header_decode(h8, &h) == WWSJM_OK && h.size == 0xD0);
+    wwsjm_plan p;
+    CHECK(wwsjm_plan_commands(rec, h.size, 0x4000, 0x3E000, &p, NULL) == WWSJM_OK);
+    CHECK(p.command_bytes == 0x28 && p.userdata_offset == 0x30 && p.userdata_bytes == 0xA0);
+    wwsjm_context_args a = {0};
+    a.lane = 0; a.dma_tag = 8; a.spurs_ea = SPURS_EA; a.wid = 6; a.index = 3; a.array = 3;
+    a.list_ea = LIST_EA; a.list_tag = 0x0A000000u; a.userdata_ls = 0x2000 + p.userdata_offset;
+    uint8_t ctx[WWSJM_CONTEXT_BYTES];
+    wwsjm_context_build(&a, ctx);
+    CHECK(wwsjm_be32(ctx + 0x20) == 0x2030 && wwsjm_be32(ctx + 0x2C) == 0x2030);
+    CHECK(wwsjm_be32(ctx + 0x14) == 0);
+}
+
+/* U18: the slot rule across capacities, including where N wraps (unobserved) */
+static void test_slot_modulus(void)
+{
+    group = "slot";
+    uint8_t l[128];
+    line_blank(l);
+    line_array(l, 0, 0x13FF, ARRAY_EA);
+    line_array(l, 1, 0x1FEF, ARRAY_EA + 0x10000);
+    line_array(l, 2, 0xFF, ARRAY_EA + 0x20000);
+    wwsjm_line dl;
+    wwsjm_line_decode(l, &dl);
+    for (uint32_t i = 0; i < 0x10000; i += 0x7F) {
+        CHECK(wwsjm_header_ea(&dl, 0, (uint16_t)i) == ARRAY_EA + 8 * (i % 0x1400));
+        CHECK(wwsjm_header_ea(&dl, 1, (uint16_t)i) == ARRAY_EA + 0x10000 + 8 * (i % 0x1FF0));
+        CHECK(wwsjm_header_ea(&dl, 2, (uint16_t)i) == ARRAY_EA + 0x20000 + 8 * (i & 0xFF));
+    }
+    /* the modulus is of the u16 index: 0xFFFF and 0 are not neighbouring slots */
+    CHECK(wwsjm_header_ea(&dl, 0, 0xFFFF) == ARRAY_EA + 8 * (0xFFFFu % 0x1400));
+    CHECK(wwsjm_header_ea(&dl, 0, 0x0000) == ARRAY_EA);
+    CHECK(0xFFFFu >= WWSJM_INDEX_WRAP_WATCH && 0xEFFFu < WWSJM_INDEX_WRAP_WATCH);
+}
+
 static void test_tags(void)
 {
     group = "tags";
@@ -744,24 +854,41 @@ static void test_gather(void)
 {
     group = "gather";
     uint8_t list[48];
-    wwsjm_put32(list + 0, 0x100);  wwsjm_put32(list + 4, 0x020CDD70);
-    wwsjm_put32(list + 8, 0x10);   wwsjm_put32(list + 12, 0x01E0EB10);
-    wwsjm_put32(list + 16, 0);     wwsjm_put32(list + 20, 0x12345670);     /* empty element */
-    wwsjm_put32(list + 24, 0x8C4); wwsjm_put32(list + 28, 0x01FB5254);     /* odd size, EA offset 4 */
-    wwsjm_put32(list + 32, 0x4);   wwsjm_put32(list + 36, 0x0100000C);
-    wwsjm_put32(list + 40, 0x20);  wwsjm_put32(list + 44, 0x01000020);
+    wwsjm_put32(list + 0, 0x100);  wwsjm_put32(list + 4, 0x02000000);
+    wwsjm_put32(list + 8, 0x10);   wwsjm_put32(list + 12, 0x03000010);
+    wwsjm_put32(list + 16, 0);     wwsjm_put32(list + 20, 0x04000000);     /* empty element */
+    wwsjm_put32(list + 24, 0x8C4); wwsjm_put32(list + 28, 0x05000004);     /* odd size, EA offset 4 */
+    wwsjm_put32(list + 32, 0x4);   wwsjm_put32(list + 36, 0x0600000C);
+    wwsjm_put32(list + 40, 0x20);  wwsjm_put32(list + 44, 0x07000020);
     wwsjm_piece pc[6];
     unsigned n = 0;
-    CHECK(wwsjm_gather_layout(list, 6, 0x5000, 0x1000, pc, &n) == WWSJM_OK);
+    CHECK(wwsjm_gather_layout(list, 6, 0x5000, 0xA10, pc, 6, &n) == WWSJM_OK);
     CHECK(n == 5);
-    CHECK(pc[0].ls == 0x5000 && pc[0].bytes == 0x100 && pc[0].ea == 0x020CDD70);
+    CHECK(pc[0].ls == 0x5000 && pc[0].bytes == 0x100 && pc[0].ea == 0x02000000);
     CHECK(pc[1].ls == 0x5100 && pc[1].bytes == 0x10);
     CHECK(pc[2].ls == 0x5114 && pc[2].bytes == 0x8C4);      /* keeps its offset in the quadword */
-    CHECK(pc[3].ls == 0x5110 + 0x8D0 + 0xC);                /* previous rounded up to 16 */
-    CHECK(pc[4].ls == 0x5110 + 0x8D0 + 0x10);
-    CHECK(wwsjm_gather_layout(list, 6, 0x5000, 0x9F0, pc, &n) == WWSJM_E_GATHER);  /* overflow */
+    CHECK(pc[3].ls == 0x59EC);                              /* after 0x5114 + 0x8C4, next quadword */
+    CHECK(pc[4].ls == 0x59F0);
+    for (unsigned i = 0; i + 1 < n; i++)                    /* no element overlaps the next */
+        CHECK(pc[i].ls + pc[i].bytes <= pc[i + 1].ls);
+    CHECK(wwsjm_gather_layout(list, 6, 0x5000, 0xA0F, pc, 6, &n) == WWSJM_E_GATHER);  /* last byte out */
+    CHECK(wwsjm_gather_layout(list, 6, 0x5000, 0xA10, pc, 4, &n) == WWSJM_E_TOO_MANY);
+    /* an element whose quadword offset plus size crosses into the next quadword */
+    uint8_t cross[16];
+    wwsjm_put32(cross + 0, 8);     wwsjm_put32(cross + 4, 0x0800000C);
+    wwsjm_put32(cross + 8, 0x10);  wwsjm_put32(cross + 12, 0x09000000);
+    CHECK(wwsjm_gather_layout(cross, 1, 0x5000, 0x10, pc, 6, &n) == WWSJM_E_GATHER);
+    CHECK(wwsjm_gather_layout(cross, 1, 0x5000, 0x14, pc, 6, &n) == WWSJM_OK && pc[0].ls == 0x500C);
+    CHECK(wwsjm_gather_layout(cross, 2, 0x5000, 0x30, pc, 6, &n) == WWSJM_OK && n == 2);
+    CHECK(pc[1].ls == 0x5020);                              /* not 0x5010: that would overlap */
+    CHECK(wwsjm_gather_layout(cross, 2, 0x5000, 0x2F, pc, 6, &n) == WWSJM_E_GATHER);
+    /* 16 KiB per element at most */
+    wwsjm_put32(cross + 0, 0x4000);  wwsjm_put32(cross + 4, 0x0A000000);
+    CHECK(wwsjm_gather_layout(cross, 1, 0x5000, 0x8000, pc, 6, &n) == WWSJM_OK);
+    wwsjm_put32(cross + 0, 0x4010);
+    CHECK(wwsjm_gather_layout(cross, 1, 0x5000, 0x8000, pc, 6, &n) == WWSJM_E_GATHER);
     wwsjm_put32(list + 8, 0x80000010);                       /* stall-and-notify */
-    CHECK(wwsjm_gather_layout(list, 2, 0x5000, 0x1000, pc, &n) == WWSJM_E_GATHER);
+    CHECK(wwsjm_gather_layout(list, 2, 0x5000, 0x1000, pc, 6, &n) == WWSJM_E_GATHER);
 }
 
 /* RS-1 */
@@ -849,6 +976,9 @@ int main(void)
     test_cl3_refusals();
     test_sets();
     test_placement();
+    test_pinned();
+    test_jl1_portion();
+    test_slot_modulus();
     test_tags();
     test_gather();
     test_rs1();

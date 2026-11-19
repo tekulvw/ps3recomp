@@ -33,8 +33,8 @@ MUTANTS = {
     # M6: shareable copies reloaded every time / never reloaded
     'M6a-always-reload': ('        resident = resident && uses;\n', '        resident = 0 * uses;\n'),
     'M6b-never-reload': ('        resident = resident && uses;\n', '        resident = uses;\n'),
-    # M7: gather element sizes rounded down
-    'M7-gather-rounds-down': ('        uint32_t span = (word + 15u) & ~15u;\n', '        uint32_t span = word & ~15u;\n'),
+    # M7: gather elements advance by their size rounded down
+    'M7-gather-rounds-down': ('        at = (end + 15u) & ~15u;\n', '        at = end & ~15u;\n'),
     # M8: the context's userdata pointer is stale / unaligned
     'M8a-userdata-unaligned': ('    out->userdata_offset = (out->command_bytes + 15u) & ~15u;\n',
                                '    out->userdata_offset = out->command_bytes;\n'),
@@ -46,8 +46,10 @@ MUTANTS = {
     # array switch modulus
     'switch-mod-3': ('(uint16_t)((cur + 1u) % WWSJM_ARRAYS)', '(uint16_t)((cur + 1u) % 3u)'),
     # header slot: AND with capacity - 1 instead of mod capacity
-    'slot-and-mask': ('8u * (capacity ? (uint32_t)index % capacity : index)',
-                      '8u * (((uint32_t)index & l->mask[a]) + 0 * capacity)'),
+    'slot-and-mask': ('8u * ((uint32_t)index % capacity)', '8u * ((uint32_t)index & l->mask[a])'),
+    # a capacity field of 0xFFFFFFFF accepted (raw-index fallback)
+    'malformed-capacity-accepted': ("    if (!l->array_ea[a] || l->mask[a] == 0xFFFFFFFFu)\n",
+                                    "    if (!l->array_ea[a])\n"),
     # ready rule: busy whenever claimable, or S >= N
     'ready-ignores-count': ('    return before16(l->m[a].next, l->m[a].submitted) ? busy : 0;\n', '    return busy;\n'),
     'ready-counts-equal': ('    return before16(l->m[a].next, l->m[a].submitted) ? busy : 0;\n',
@@ -65,6 +67,25 @@ MUTANTS = {
     'held-ignores-release': ('(released >> k & 1)', '(released >> k & 0)'),
     # gather: the quadword offset of the EA is ignored; stall flags accepted
     'gather-drops-ea-offset': ('        out[k].ls = ls + at + (ea & 15u);\n', '        out[k].ls = ls + at;\n'),
+    # review item 1: the quadword offset ignored by the bound / the advance; no 16 KiB limit
+    'gather-bound-ignores-offset': ('        if (end > limit)\n', '        if (end - (ea & 15u) > limit)\n'),
+    'gather-advance-ignores-offset': ('        at = (end + 15u) & ~15u;\n', '        at += (word + 15u) & ~15u;\n'),
+    'gather-no-element-max': ('        if (word > WWSJM_CHUNK_BYTES)\n', '        if (word > 0x7FFFu)\n'),
+    'gather-truncates-output': ('        if (k >= max_out)\n            return WWSJM_E_TOO_MANY;\n',
+                                '        if (k >= max_out)\n            break;\n'),
+    # review item 3: odd or out-of-line counter offsets masked instead of refused
+    'decrement-masks-offset': ('    if ((offset & 1) || offset > WWSJM_LINE_BYTES - 2)\n        return WWSJM_E_ARG;\n',
+                               '    offset &= (WWSJM_LINE_BYTES - 2);\n'),
+    # review item 4: held spans truncated silently
+    'held-truncates': ('            if (n >= max)\n                return WWSJM_E_TOO_MANY;\n',
+                       '            if (n >= max)\n                break;\n'),
+    # review item 5 / spec 12.1: set 0 or a shareable-copy set rotated
+    'set0-rotates': ('    if (set == 0)\n        return 1;\n', ''),
+    'shareable-set-rotates': ('        if (p->use[i].set == set && p->use[i].fill == WWSJM_FILL_COPY && p->use[i].shareable)\n',
+                              '        if (p->use[i].set == set && p->use[i].fill == WWSJM_FILL_COPY && 0 * p->use[i].shareable)\n'),
+    # spec E2: a no-op command refused instead of skipped
+    'nop-refused': ('            out->nop_count++;\n            break;\n',
+                    '            return fail(out, bad_slot, i, WWSJM_E_COMMAND);\n'),
     'gather-accepts-stall': ('        if (word & 0xFFFF8000u)                /* stall-and-notify or reserved bits */\n'
                              '            return WWSJM_E_GATHER;\n', '        word &= 0x7FFFu;\n'),
 }
