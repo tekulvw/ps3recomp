@@ -401,6 +401,10 @@ jobs:
           # mutants (dropped PUTLLC outcome, armed while unset, lost service return,
           # wrong nested drain target) fail.
           python3 tools/test_spurs_pm_record.py --mutants
+          # PS3RECOMP_SPURS_NATIVE_PM: the native policy-module seam is inert when unset
+          # (byte-identical runs and recordings), gated by fingerprint and SHA-256, and
+          # its service window holds its contract; its mutants must fail.
+          python3 tools/test_spurs_native_pm.py --mutants
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_fifo_busy.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread
           /tmp/test_color_feedback_engine
           # The texture cache's content hash: sensitivity, the cache, its speed.

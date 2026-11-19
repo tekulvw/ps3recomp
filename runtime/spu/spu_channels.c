@@ -32,6 +32,7 @@
 #include "spu_overlay_residency.h"
 #include "spu_native_service.h"
 #include "spurs_pm_observer.h"
+#include "spurs_native_pm.h"
 #include <stdint.h>
 #include <errno.h>
 #include <stdatomic.h>
@@ -4041,6 +4042,33 @@ static int spu_ib_diagnostics_armed(void)
     return value;
 }
 
+/* A branch into the native-service window during a native policy run: call
+ * the slot's host service; it reads r3..r6 and writes r3. Unless it says it
+ * placed pc itself, return to the r0 link exactly as `bi $r0` does (a host
+ * return while the caller's bracket is live, else a dispatch to the link).
+ * The job-return slot is reached by host return into the native run's drain,
+ * never through here; a branch to it here, to an empty slot, or to the middle
+ * of a slot is unsupported and stops the process. */
+static __attribute__((noinline, cold)) void spurs_native_window(spu_context* ctx)
+{
+    const uint32_t pc = ctx->pc & SPU_LS_MASK, off = pc - SPURS_NATIVE_PM_WINDOW_LS;
+    const unsigned slot = off / SPURS_NATIVE_PM_SLOT_BYTES;
+    spurs_native_service_fn fn = (off % SPURS_NATIVE_PM_SLOT_BYTES) == 0 && slot < SPURS_NATIVE_PM_SLOTS - 1
+                                 ? ctx->native_services->slot[slot] : NULL;
+    if (!fn) {
+        fprintf(stderr, "[spurs-native-pm] unsupported branch to LS 0x%05X (window slot %u%s) lr=0x%05X r3=0x%08X: "
+                "no native service there; stopping\n", pc, slot,
+                pc == SPURS_NATIVE_PM_JOB_RETURN_LS ? ", the job-return slot outside its drain" : "",
+                ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0]);
+        fflush(stderr);
+        _Exit(SPURS_NATIVE_PM_FATAL_EXIT);
+    }
+    if (fn(ctx) == SPURS_NATIVE_SERVICE_RETURN) {
+        ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+        if (ctx->host_depth == 0) g_spu_trampoline_fn = spu_indirect_branch;
+    }
+}
+
 /* cellSpursModulePoll as the HLE kernel answers it (spu_context.h). Inlined
  * into the resolver's intercept; spurs_kernel_select_workload is the same body
  * for other callers. */
@@ -4122,10 +4150,21 @@ void spu_indirect_branch(spu_context* ctx)
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited;
-        /* Opt-in policy-run recorder (spurs_pm_observer.h): behind the gate line. */
-        const struct spurs_pm_observer* const pm_observer = spu_pm_extras_on() ? ctx->pm_observer : NULL;
-        if (pm_observer && pm_observer->branch(ctx))
-            return;
+        /* Opt-in policy extras, all behind one test of the gate line: the
+         * policy-run recorder (spurs_pm_observer.h) and the native-service
+         * window (spurs_native_pm.h, only while a native run installed its
+         * table). */
+        const struct spurs_pm_observer* pm_observer = NULL;
+        if (spu_pm_extras_on()) {
+            pm_observer = ctx->pm_observer;
+            if (pm_observer && pm_observer->branch(ctx))
+                return;
+            if (ctx->native_services &&
+                ctx->pc - SPURS_NATIVE_PM_WINDOW_LS < SPURS_NATIVE_PM_WINDOW_END - SPURS_NATIVE_PM_WINDOW_LS) {
+                spurs_native_window(ctx);
+                return;
+            }
+        }
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
              * Print gated: fires once per policy run = thousands/sec. */
