@@ -72,4 +72,35 @@ static const char* const spu_fast_path_env[] = {
     "YDKJ_NO_CRI_R4",
     0
 };
+/* Every environment variable read between the entry of spu_indirect_branch
+ * and its call of the resolved function, by the resolver's dispatch cache, or
+ * by the dispatch histogram, plus the cache modes that must see every
+ * lookup. PS3RECOMP_SPU_IB_FAST=1 takes the short dispatch entry only while
+ * none of these is set (tools/test_spu_ib_fast.py checks the list) and the
+ * dispatch cache is on (SPU_DISPATCH_CACHE=1 exactly, spu_fast_path_resolve). */
+static const char* const spu_ib_fast_env[] = {
+    "LBP_HLE_JOBDONE",
+    "SPU_DSPDESC",
+    "SPU_DUMP_OVL",
+    "SPU_IBCOV",
+    "SPU_IBHIST",
+    "SPU_INTERP_UNLIFTED",
+    "SPU_IRQTRACE",
+    "SPU_JOBEXEC",
+    "SPU_JOBEXEC_DUMP",
+    "SPU_JOBTRACE",
+    "SPU_LOCKGUARD",
+    "SPU_MISS_DUMP_IMG",
+    "SPU_MISS_DUMP_PCMIN",
+    "SPU_OVERLAY_RESIDENCY_SHADOW",
+    "SPU_OVERLAY_RESIDENCY_STATS",
+    "SPU_POLLTRACE",
+    "SPU_VERIFIED_LEAF_BLOCKS",
+    "SPURS_PM_TRACE",
+    "YDKJ_CRI_CHAIN",
+    "YDKJ_NO_CRI_R4",
+    "YDKJ_POLTRACE",
+    "YDKJ_SPU_LSDUMP",
+    0
+};
 #endif
