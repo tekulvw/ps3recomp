@@ -393,6 +393,8 @@ jobs:
           # PS3RECOMP_RSX_VERTEX_SIMD: the vector decode against the scalar
           # loop, bit for bit, and its mutants (NEON here; SSE4.1 too under Rosetta).
           python3 tools/test_vertex_fetch_simd.py --mutants
+          # The native WWS job manager's pure core and its mutants.
+          python3 tools/test_wwsjm_core.py --mutants
           # PS3RECOMP_RSX_PIPELINE_REUSE: off/on/verify equivalence, the register-class
           # table against its reference logic, and its mutants.
           python3 tools/test_engine_pipeline_reuse.py --mutants
