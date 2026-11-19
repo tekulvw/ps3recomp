@@ -61,6 +61,7 @@ enum ps3_ft_kind {
                               * dispatch to the next job's or the end of the policy-module run */
     PS3_FT_FLIP_TICK   = 16, /* instant: a flip the RSX executed completes on the beat */
     PS3_FT_FLIP_DONE   = 17, /* instant: that completion delivered to the guest (status DONE, handler) */
+    PS3_FT_RECORD      = 18, /* the split walker's record thread applying queued records (busy span) */
 };
 
 #if defined(_MSC_VER)

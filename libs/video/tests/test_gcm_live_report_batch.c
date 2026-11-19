@@ -38,7 +38,7 @@ int rsx_live_draw_report_batch_status(uint64_t expected,uint64_t ticket,int wait
 }
 void rsx_live_draw_set_report_barrier(int(*barrier)(void)){live_barrier=barrier;}
 int rsx_live_draw_set_report_lease(void(*begin)(void),void(*end)(void)){return begin==cellGcm_rsx_consumer_begin&&end==cellGcm_rsx_consumer_end;}
-static void report(unsigned index){gcm_get_report(0x01000000u+index*16u);}
+static void report(unsigned index){gcm_get_report(0x01000000u+index*16u,s_fifo_getoff);}
 static void* barrier_thread(void* arg){(void)arg;assert(live_barrier());return NULL;}
 int main(int argc,char**argv){
     assert(argc==2);const char* mode=argv[1];int off=!strcmp(mode,"off"),legacy=!strcmp(mode,"legacy");
