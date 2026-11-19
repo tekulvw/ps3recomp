@@ -2179,7 +2179,8 @@ static WklPm* spurs_resolve_pm(u32 wid)
     uint64_t fp = spu_workload_fingerprint(vm_base + (uint32_t)(uintptr_t)w->pm,
                                            w->sizePm);
     r->fn = spu_workload_find_img(fp, &r->image_id);
-    /* PS3RECOMP_SPURS_NATIVE_PM: unset, the registry is never consulted. */
+    /* PS3RECOMP_SPURS_NATIVE_PM (read once, here, at the first resolution):
+     * unset, the registry is never consulted. */
     r->native = spurs_native_pm_mode() != SPURS_NATIVE_PM_OFF
         ? spurs_native_pm_select(wid, fp, vm_base + (uint32_t)(uintptr_t)w->pm, w->sizePm) : NULL;
     r->resolved = (r->fn || r->native) ? 1 : -1;
@@ -2538,7 +2539,7 @@ static int spurs_dispatch_slot(struct SpursInst* si, struct SpursPmSlot* slot, u
  *       (spurs_module_poll);
  *   PS3RECOMP_SPURS_STORE_WAKE=0    no coherence watch on the request line
  *       (spurs_request_line_written): requests a PPU stores wait for a pass. */
-static struct { int disabled, target_mode, self_dispatch, store_wake, module_poll_preempt, native_pm; long poll_us; } s_sched_opt;
+static struct { int disabled, target_mode, self_dispatch, store_wake, module_poll_preempt; long poll_us; } s_sched_opt;
 static void spurs_sched_options_read(void)
 {
     const char* e;
@@ -2548,7 +2549,6 @@ static void spurs_sched_options_read(void)
     e = getenv("PS3RECOMP_SPURS_SELF_DISPATCH"); s_sched_opt.self_dispatch = e && !strcmp(e, "1");
     e = getenv("PS3RECOMP_SPURS_STORE_WAKE");    s_sched_opt.store_wake = !(e && !strcmp(e, "0"));
     e = getenv("PS3RECOMP_SPURS_MODULE_POLL_PREEMPT"); s_sched_opt.module_poll_preempt = e && !strcmp(e, "1");
-    s_sched_opt.native_pm = spurs_native_pm_mode();   /* PS3RECOMP_SPURS_NATIVE_PM (spurs_native_pm.h) */
 }
 
 /* cellSpursModulePoll with preemption (PS3RECOMP_SPURS_MODULE_POLL_PREEMPT=1).

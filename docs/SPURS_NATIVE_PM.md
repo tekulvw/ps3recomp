@@ -12,7 +12,7 @@ window intercept in `spu_channels.c`, selection in `libs/spurs/cellSpurs.c`.
 
 ## Switch
 
-`PS3RECOMP_SPURS_NATIVE_PM`, read once when the scheduler starts:
+`PS3RECOMP_SPURS_NATIVE_PM`, read once, when the first workload's policy image is resolved:
 
 | Value | Effect |
 |---|---|
