@@ -57,9 +57,72 @@ static void ownership(void)
     c->ls=calloc(1,SPU_LS_SIZE);CHECK(c->ls!=NULL);expect(c,a,primary);
     free(c->ls);c->ls=c->ls_store;free(c);
 }
+/* Streamed jobs A and B take turns in one verified code slot; a target
+ * outside the slot belongs to the context's own image. Every job load bumps
+ * the residency epoch. With SPU_DCACHE_SLOT_RESIDENCY=1 the outside target and
+ * the reloaded job's targets stay cached once the slot is verified again, and
+ * a load whose bytes do not verify must never be served from the cache. */
+static void job_a(spu_context* c){(void)c;}
+static void job_b(spu_context* c){(void)c;}
+static void own(spu_context* c){(void)c;}
+static const uint8_t code_a[8]={0xA1,1,2,3,4,5,6,7};
+static const uint8_t code_b[8]={0xB2,1,2,3,4,5,6,7};
+static void load_job(spu_context* c,uint32_t src,const uint8_t* bytes)
+{
+    memset(c->ls+0x4000,0,0x100);memcpy(c->ls+0x4000,bytes,8);
+    spu_overlay_note_get(c,src,c->ls+0x4000,0x100);
+}
+static void slot_residency(void)
+{
+    /* Resolver-call counts are only meaningful with the cache plainly on:
+     * shadow mode runs the full resolver on every hit as well. */
+    const int counted=spu_dcache_mode()!=2;
+    const int slot_mode=spu_dcache_slot_mode()&&spu_dcache_mode()==1;
+    spu_begin_image(341);spu_register_function(0x4000,job_a);spu_register_function(0x4004,job_a);
+    spu_register_function(0x4008,job_a);
+    spu_begin_image(342);spu_register_function(0x4000,job_b);spu_register_function(0x4004,job_b);
+    spu_register_function(0x4008,job_b);
+    spu_begin_image(340);spu_register_function(0x9000,own);spu_begin_image(0);
+    spu_overlay_code_segment sa={0x4000,8,code_a},sb={0x4000,8,code_b};
+    CHECK(spu_overlay_register_verified_region(0x800000,0x4000,0x100,341,&sa,1));
+    CHECK(spu_overlay_register_verified_region(0x810000,0x4000,0x100,342,&sb,1));
+    spu_context* c=fresh(340);
+    load_job(c,0x800000,code_a);
+    expect(c,0x4000,job_a);expect(c,0x4004,job_a);expect(c,0x4008,job_a);expect(c,0x9000,own);
+    for(int round=0;round<3;++round){
+        load_job(c,0x810000,code_b);
+        expect(c,0x4000,job_b);
+        /* The slot is verified again, now holding B: A's entry for 0x4008
+         * has the same slot and state but another identity. */
+        CHECK(spu_lifted_lookup(c,0x4008)==job_b);
+        unsigned calls=coverage_full_calls;
+        CHECK(spu_lifted_lookup(c,0x9000)==own);           /* outside every slot */
+        CHECK(!counted || (slot_mode ? coverage_full_calls==calls : coverage_full_calls>calls));
+        load_job(c,0x800000,code_a);
+        calls=coverage_full_calls;
+        CHECK(spu_lifted_lookup(c,0x4000)==job_a);         /* pending: verified by the resolver */
+        CHECK(!counted || coverage_full_calls>calls);
+        calls=coverage_full_calls;
+        CHECK(spu_lifted_lookup(c,0x4004)==job_a);         /* same verified slot */
+        CHECK(!counted || (slot_mode ? coverage_full_calls==calls : coverage_full_calls>calls));
+        CHECK(spu_lifted_lookup(c,0x4008)==job_a);         /* B's entry: another identity */
+    }
+    /* A reload of A whose bytes do not match: nothing in the slot is served. */
+    memset(c->ls+0x4000,0,0x100);memcpy(c->ls+0x4000,code_b,8);
+    spu_overlay_note_get(c,0x800000,c->ls+0x4000,0x100);
+    CHECK(spu_lifted_lookup(c,0x4000)==NULL);
+    CHECK(spu_lifted_lookup(c,0x4004)==NULL);
+    CHECK(spu_lifted_lookup(c,0x9000)==own);
+    /* The correct bytes again: verified, and served. */
+    load_job(c,0x800000,code_a);expect(c,0x4004,job_a);expect(c,0x4000,job_a);
+    /* Another job in front: a second slot loaded over the same span from B. */
+    load_job(c,0x810000,code_b);expect(c,0x4004,job_b);
+    free(c);
+}
 int main(void)
 {
     ownership();
+    slot_residency();
     spu_begin_image(321);spu_register_function(0x10000,primary);
     spu_begin_image(331);spu_register_function(0x10000,verified_a);spu_register_function(0x10004,verified_a);
     spu_begin_image(332);spu_register_function(0x10000,verified_b);spu_register_function(0x10004,verified_b);
