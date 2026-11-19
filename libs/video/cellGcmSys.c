@@ -1248,6 +1248,7 @@ static s32 cellGcmInit_consumer_body(u32 cmdSize, u32 ioSize, u32 ioAddress)
       g_spu_put_hook = gcm_note_spu_put; }
 
     s_gcm_initialized = 1;
+    { void gcm_vbt_start_once(void); gcm_vbt_start_once(); }
     return CELL_OK;
 }
 
@@ -1488,8 +1489,10 @@ static void gcm_flip_adaptive_poll(void)
  * and mark a vblank+flip tick pending for the main thread to deliver. */
 static u32 s_fifo_getoff;   /* tentative: defined below */
 
+static int gcm_vbt_owns_beat(void);
 void cellGcm_request_tick(void)
 {
+    if (gcm_vbt_owns_beat()) return;
     s_vblank_count++;
     if (gcm_flip_adaptive()) { GCM_PENDING_SET(1); gcm_flip_adaptive_poll(); return; }
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
@@ -1581,7 +1584,22 @@ void ppu_gcm_pump(void)
 
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+/* PS3RECOMP_GCM_VBLANK_THREAD=1 (opt-in, read at cellGcmInit): the 60 Hz
+ * vblank beat -- the vblank count, the vblank interrupt and the completion of
+ * an executed flip -- comes from a thread of its own, on a 1/60 s grid of
+ * the monotonic clock, instead of from whichever host loop calls
+ * cellGcmTickVBlank/cellGcmTickFlip. That loop also drains the FIFO and
+ * waits for kicks, so it saw a beat only when it came round: up to its 4 ms
+ * idle wait late with the walker caught up, or a whole drain pass late with
+ * it busy. On hardware the vblank does not wait for the FIFO. The beat does
+ * exactly what the host's ticks did (no guest code runs on it; delivery stays
+ * in ppu_gcm_pump), and while it runs the host's calls do nothing. */
+static int s_vbt = -1;
+static volatile int s_vbt_running;
+static _Thread_local int s_vbt_self;
+static unsigned long long s_vbt_beats, s_vbt_late_max_us;
+static void gcm_tick_vblank_core(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+void cellGcmTickVBlank(void) { if (gcm_vbt_owns_beat()) return; gcm_tick_vblank_core(); }
 /* Only deliver a flip completion when a flip is actually outstanding.
  *
  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
@@ -1594,7 +1612,9 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * and its handler runs code that puts the status back to WAITING, so the
  * poll never saw DONE and the game never rendered another frame. On hardware
  * the callback IS the flip interrupt -- no flip, no callback. */
-void cellGcmTickFlip(void)
+static void gcm_tick_flip_core(void);
+void cellGcmTickFlip(void) { if (gcm_vbt_owns_beat()) return; gcm_tick_flip_core(); }
+static void gcm_tick_flip_core(void)
 {
     if (gcm_flip_adaptive()) { gcm_flip_adaptive_poll(); return; }
     /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
@@ -1608,6 +1628,85 @@ void cellGcmTickFlip(void)
         GCM_PENDING_SET(2);
     }
 }
+
+static uint64_t gcm_vbt_now_ns(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f; LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)(c.QuadPart / f.QuadPart) * 1000000000ull +
+           (uint64_t)(c.QuadPart % f.QuadPart) * 1000000000ull / (uint64_t)f.QuadPart;
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+#endif
+}
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#endif
+/* Sleep until `deadline` (gcm_vbt_now_ns time). */
+static void gcm_vbt_sleep_until(uint64_t deadline, void* timer)
+{
+    const uint64_t now = gcm_vbt_now_ns();
+    if (deadline <= now) return;
+#ifdef _WIN32
+    if (timer) {
+        LARGE_INTEGER due; due.QuadPart = -(LONGLONG)((deadline - now) / 100u);
+        if (SetWaitableTimer((HANDLE)timer, &due, 0, NULL, NULL, FALSE)) { WaitForSingleObject((HANDLE)timer, INFINITE); return; }
+    }
+    Sleep((DWORD)((deadline - now) / 1000000u));
+#else
+    (void)timer;
+    const uint64_t d = deadline - now;
+    const struct timespec ts = { (time_t)(d / 1000000000ull), (long)(d % 1000000000ull) };
+    nanosleep(&ts, NULL);
+#endif
+}
+#define GCM_VBT_PERIOD_NS 16666667ull
+static DWORD WINAPI gcm_vbt_main(LPVOID unused)
+{
+    (void)unused;
+    s_vbt_self = 1;
+    void* timer = NULL;
+#ifdef _WIN32
+    timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+#endif
+    uint64_t beat = gcm_vbt_now_ns();
+    for (;;) {
+        beat += GCM_VBT_PERIOD_NS;
+        gcm_vbt_sleep_until(beat, timer);
+        const uint64_t now = gcm_vbt_now_ns();
+        /* Asleep far past a beat (a suspended process): restart the grid
+         * rather than fire the missed beats back to back. */
+        if (now > beat + 4 * GCM_VBT_PERIOD_NS) beat = now;
+        const unsigned long long late = now > beat ? (now - beat) / 1000u : 0;
+        if (late > s_vbt_late_max_us) s_vbt_late_max_us = late;
+        gcm_tick_vblank_core();
+        gcm_tick_flip_core();
+        if (++s_vbt_beats % 600u == 0 && s_frame_log) {
+            fprintf(stderr, "[vblank thread] beats=%llu late_max_us=%llu\n", s_vbt_beats, s_vbt_late_max_us);
+            s_vbt_late_max_us = 0;
+        }
+    }
+    return 0;
+}
+/* Start the beat (once), when the switch says so. */
+static void gcm_vbt_start(void)
+{
+    if (s_vbt < 0) { const char* e = getenv("PS3RECOMP_GCM_VBLANK_THREAD"); s_vbt = e && !strcmp(e, "1"); }
+    if (!s_vbt || s_vbt_running) return;
+    HANDLE h = CreateThread(NULL, 0, gcm_vbt_main, NULL, 0, NULL);
+    if (!h) { fprintf(stderr, "[vblank thread] not started; the host's ticks stay the beat\n"); return; }
+    CloseHandle(h);
+    s_vbt_running = 1;
+    fprintf(stderr, "[vblank thread] the 60 Hz beat runs on its own thread\n");
+}
+static int gcm_vbt_owns_beat(void) { return s_vbt_running && !s_vbt_self; }
+void gcm_vbt_start_once(void) { gcm_vbt_start(); }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
  * (boot_main vblank_ticker). Not yet active: s_control.put stays 0 because
