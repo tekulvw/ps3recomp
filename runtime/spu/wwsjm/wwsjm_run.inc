@@ -306,17 +306,22 @@ static void wj_stage(struct wj_run* r)
 static uint32_t wj_bra(uint32_t target) { return 0x30000000u | ((target >> 2) & 0xFFFFu) << 7; }
 
 /* The fixed low local store every job may read (spec 13.4 item 1), planted
- * before each job: a job may have used any of it. */
+ * before each job: a job may have used any of it. The interrupt state at entry
+ * is set separately, just before the job is entered (wj_run_job). */
 static void wj_plant_low_ls(struct wj_run* r)
 {
     uint8_t* ls = r->ctx->ls;
     for (unsigned i = 0; i < 4; i++) wwsjm_put32(ls + 4 * i, wj_bra(SPURS_NATIVE_PM_SLOT_LS(WJ_SVC_IRQ_LANDING)));
     memset(ls + 0x10, 0, WJ_JOB_SCRATCH_LS - 0x10);
-    /* the kernel context fields spec 3.1 defines; the rest is the kernel's */
+    /* the SPURS kernel context, every word spec 13.4 lists */
+    memset(ls + WJ_KCTX_LS, 0, 0xC0);
     wwsjm_put32(ls + WJ_KCTX_LS + 0xC0, 0);
     wwsjm_put32(ls + WJ_KCTX_LS + 0xC4, r->spurs_ea);
     wwsjm_put32(ls + WJ_KCTX_LS + 0xC8, r->lane);
     wwsjm_put32(ls + WJ_KCTX_LS + 0xCC, 8);
+    wwsjm_put32(ls + WJ_KCTX_LS + 0xD0, 0);
+    wwsjm_put32(ls + WJ_KCTX_LS + 0xD4, 0xA00);
+    wwsjm_put32(ls + WJ_KCTX_LS + 0xD8, r->wid);
     wwsjm_put32(ls + WJ_KCTX_LS + 0xDC, r->wid);
     wwsjm_put32(ls + WJ_KCTX_LS + 0xE0, SPURS_PM_EXIT_TO_KERNEL_LS);
     wwsjm_put32(ls + WJ_KCTX_LS + 0xE4, SPURS_PM_SELECT_WORKLOAD_LS);
@@ -369,6 +374,12 @@ static void wj_run_job(struct wj_run* r, const struct wj_job* job)
     r->next.valid = 0;
     c->gpr[5] = spu_make_preferred_u32(entry);
     c->gpr[6] = spu_make_preferred_u32(WJ_ENTRY_R6);
+    /* Interrupts enabled with no event enabled (spec 5.1, 13.4, 14): jobs
+     * disable and re-enable them around service calls and may require them
+     * enabled; with the mask zero none is ever taken. The job's own toggles
+     * stand, and no service touches either. */
+    c->event_mask = 0;
+    c->int_enable = 1;
     WJ_COUNT(jobs, 1);
     if (spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_CTX_LS, 0) != 0)
         wj_fatal(r, "job did not return to the job-return slot", c->pc & SPU_LS_MASK, entry);
@@ -503,6 +514,8 @@ static int wj_run(spu_context* c, const struct spurs_native_pm_run* a)
     wwsjm_residency_reset(&r.res);   /* every run reloads (spec R6) */
     struct wj_run* outer = t_wj;
     t_wj = &r;
+    /* the interrupt state the run began with, restored when it ends */
+    const uint32_t int_enable0 = c->int_enable, event_mask0 = c->event_mask;
     WJ_COUNT(runs, 1);
     const unsigned long long jobs_before = __atomic_load_n(&s_wj_stats.jobs, __ATOMIC_RELAXED);
 
@@ -518,6 +531,8 @@ static int wj_run(spu_context* c, const struct spurs_native_pm_run* a)
         wj_run_job(&r, &job);
     }
     wj_ready_rule(&r);
+    c->int_enable = int_enable0;
+    c->event_mask = event_mask0;
     if (__atomic_load_n(&s_wj_stats.jobs, __ATOMIC_RELAXED) == jobs_before) WJ_COUNT(idle_runs, 1);
     t_wj = outer;
     return 0;

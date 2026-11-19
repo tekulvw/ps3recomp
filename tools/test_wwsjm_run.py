@@ -71,6 +71,14 @@ MUTANTS = {
     'context-moved': (RUN, '    WJ_CTX_LS = 0x1330, ', '    WJ_CTX_LS = 0x1200, '),
     'command-copy-moved': (RUN, '    WJ_PORTION_LS = 0xC00, ', '    WJ_PORTION_LS = 0x1200, '),
     'context-in-job-scratch': (RUN, '    WJ_CTX_LS = 0x1330, ', '    WJ_CTX_LS = 0x80, '),
+    # spec v0.5 (5.1, 13.4, 14): interrupt state at entry, the whole kernel context
+    'int-enable-not-set': (RUN, '    c->event_mask = 0;\n    c->int_enable = 1;', '    c->event_mask = 0;'),
+    'event-mask-not-cleared': (RUN, '    c->event_mask = 0;\n    c->int_enable = 1;', '    c->int_enable = 1;'),
+    'service-sets-int-enable': (RUN, '    if (++r->finishes > 1 && r->check)',
+                                '    c->int_enable = 1;\n    if (++r->finishes > 1 && r->check)'),
+    'kctx-low-not-zeroed': (RUN, '    memset(ls + WJ_KCTX_LS, 0, 0xC0);\n', ''),
+    'kctx-workload-addr-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xD4, 0xA00);\n', ''),
+    'kctx-unique-id-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xD8, r->wid);\n', ''),
 }
 
 
@@ -136,7 +144,7 @@ def check(binary: Path) -> list[str]:
         r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': mode})
         want = dict(done='1', jobs='61', ran='61', dup='0', missing='0', bad_out='0', regs='0', ctx='0', ud='0',
                     module='0', gather='0', desc='0', tag='0', finish='0', violations='0', lifted='0', current='1',
-                    n0='43', s0='43', n1='65', s1='65', lanes_busy='0', gate='0', switches='FFFE', lowls='0')
+                    n0='43', s0='43', n1='65', s1='65', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0')
         for k, v in want.items():
             expect(r.get(k) == v, f'native {mode}: {k}={r.get(k)} expected {v}')
         expect(int(r.get('finish_jobs', 0)) > 0, f'native {mode}: finish never claimed a next job: {r}')

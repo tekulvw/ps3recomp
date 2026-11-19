@@ -70,8 +70,18 @@ One dispatch on a slot's resident context, on its worker thread:
   - `0x000–0x00F`: four copies of an absolute branch (`bra`) to a window slot whose handler
     stops the process. The native run raises no SPU events, so that slot is never entered.
   - `0x010–0x07F`: zero.
-  - The SPURS kernel context fields at `0x1C0–0x1E7`: instance EA, lane, kernel DMA tag 8,
-    workload id, and the exit and select-workload addresses.
+  - The SPURS kernel context at `0x100–0x1E7`, every word the spec lists:
+    - `0x100–0x1BF` zero;
+    - `0x1C0` = 0 and `0x1C4` = instance EA;
+    - `0x1C8` = lane and `0x1CC` = kernel DMA tag 8;
+    - `0x1D0` = 0 and `0x1D4` = `0xA00`;
+    - `0x1D8` = `0x1DC` = workload id;
+    - `0x1E0`/`0x1E4` = the exit and select-workload addresses.
+
+  Every job is entered with SPU interrupts enabled and the event mask zero (spec §5.1, §14).
+  Jobs disable and re-enable interrupts around their service calls and may require them
+  enabled. With no event enabled, none is ever taken. The job's own toggles stand, services
+  never touch the bit, and the run restores the interrupt state it began with when it ends.
 
   These are job-facing contract addresses, not the lifted module's layout.
   `0x080–0x17F` belongs to the running job (its reservation buffers), and the manager keeps

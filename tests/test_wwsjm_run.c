@@ -20,7 +20,12 @@
  * a fill of the rest) before calling any service, so the manager must keep
  * nothing there while a job runs. After its last service call it also leaves
  * junk at 0x10-0x7F and 0x1C0-0x1E7, so the next job sees the fixed contents
- * only if the manager plants them before every job.
+ * only if the manager plants them before every job. It checks that it was
+ * entered with SPU interrupts enabled and no event enabled (spec 5.1), runs
+ * its service calls with interrupts disabled as the jobs do (and checks no
+ * service changed that), and returns with interrupts disabled and an event
+ * enabled, so the next job sees the required state only if the manager sets
+ * it before every job.
  *
  * argv[1]: "native" (register the implementation for the manufactured image),
  * "native-irq" (the same, and the first job branches to the interrupt vector's
@@ -74,7 +79,7 @@ static struct { uint32_t array, index, module, sum, wid, list; } s_job[MAX_JOBS]
 static unsigned s_jobs;
 static volatile uint32_t g_runs[MAX_JOBS];
 static volatile uint32_t g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather, g_err_desc, g_err_tag,
-    g_err_finish, g_violations, g_lifted_runs, g_finish_jobs, g_breaks, g_err_lowls;
+    g_err_finish, g_violations, g_lifted_runs, g_finish_jobs, g_breaks, g_err_lowls, g_err_irq;
 static int g_irq_test;
 
 /* ---- guest construction (the PPU stand-in) -------------------------------------- */
@@ -250,8 +255,12 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
                   target == be32r(x + 0x34) || target == be32r(x + 0x44) || target == be32r(x + 0x48);
         for (uint32_t o = 0x10; o < 0x80; o++) bad |= ls[o] != 0;
         bad |= be32r(ls + 0x1C0) != 0 || be32r(ls + 0x1C4) != SPURS_EA || be32r(ls + 0x1C8) != lane ||
-               be32r(ls + 0x1CC) != 8 || be32r(ls + 0x1DC) != s_job[k].wid || be32r(ls + 0x1E0) != 0x9C0u ||
-               be32r(ls + 0x1E4) != 0x9D0u;
+               be32r(ls + 0x1CC) != 8 || be32r(ls + 0x1D0) != 0 || be32r(ls + 0x1D4) != 0xA00u ||
+               be32r(ls + 0x1D8) != s_job[k].wid || be32r(ls + 0x1DC) != s_job[k].wid ||
+               be32r(ls + 0x1E0) != 0x9C0u || be32r(ls + 0x1E4) != 0x9D0u;
+        for (uint32_t o = 0x100; o < 0x1C0; o++) bad |= ls[o] != 0;
+        /* interrupts enabled, no event enabled (spec 5.1) */
+        if (spu_rdch(c, SPU_RdMachStat)._u32[0] != 1u || spu_rdch(c, SPU_RdEventMask)._u32[0] != 0) ERR(g_err_irq);
         bad |= ctx_ls != 0x1330u || ud < 0xC00u || ud >= 0xD00u;
         if (bad) ERR(g_err_lowls);
         if (g_irq_test && __atomic_exchange_n(&g_irq_test, 0, __ATOMIC_ACQ_REL)) {
@@ -260,6 +269,7 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
             c->host_depth--;
         }
     }
+    c->int_enable = 0;   /* the job's own toggle (`bid`): services run with interrupts off */
     /* the job's scratch: its reservation buffer at 0x80 (a GETLLAR of its list
      * line, as the jobs do) and the rest of 0x80-0x17F */
     mfc(c, MFC_GETLLAR_CMD, 0x80, s_job[k].list, 128, 0);
@@ -302,11 +312,14 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
     call_service(c, ctx_ls, 0x44, 0x1234, 0x5678, 0x9ABC, f);   /* garbage arguments */
     if (!(f[0] == 0 && f[1] == 0xFFFFFFFFu) && (f[0] & 0xFFFF) != 1) ERR(g_err_finish);
     if ((f[0] & 0xFFFF) == 1) ERR(g_finish_jobs);     /* finish claimed the next job */
+    if (spu_rdch(c, SPU_RdMachStat)._u32[0] != 0) ERR(g_err_irq);   /* a service changed the bit */
+    /* returns with interrupts off and an event enabled (no event is pending) */
+    spu_wrch(c, SPU_WrEventMask, spu_make_preferred_u32(0x2u));
     /* after its last service call the job leaves junk in the low local store the
      * manager must plant before every job (spec 13.4: "before entering any job";
      * the runtime's own kernel-context write happens only at the run's start) */
     memset(c->ls + 0x10, 0xC3, 0x70);
-    memset(c->ls + 0x1C0, 0x3C, 0x28);
+    memset(c->ls + 0x180, 0x3C, 0x68);
 done:
     c->gpr[0] = link;
     c->gpr[1] = spu_make_preferred_u32(0x3F990u);
@@ -435,11 +448,11 @@ int main(int argc, char** argv)
     for (unsigned a = 0; a < 2; a++) for (unsigned s = 0; s < 6; s++) lanes_busy += be16r(LIST_EA + 0x44 + 16 * a + 2 * s) != 0xFFFF;
     printf("result done=%d jobs=%u ran=%u dup=%u missing=%u bad_out=%u regs=%u ctx=%u ud=%u module=%u gather=%u desc=%u "
            "tag=%u finish=%u violations=%u lifted=%u current=%u n0=%u s0=%u n1=%u s1=%u lanes_busy=%u gate=%u "
-           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u\n",
+           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u irq=%u\n",
            done, s_jobs, ran, dup, missing, bad_out, g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather,
            g_err_desc, g_err_tag, g_err_finish, g_violations, g_lifted_runs, be16r(LIST_EA + 0x0A),
            be16r(LIST_EA + 0x42), be16r(LIST_EA + 0x40), be16r(LIST_EA + 0x52), be16r(LIST_EA + 0x50), lanes_busy,
-           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls);
+           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls, g_err_irq);
     fflush(stdout);
     if (native) spurs_wwsjm_print_stats();
     if (native && getenv("PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW")) spurs_wwsjm_shadow_print();
