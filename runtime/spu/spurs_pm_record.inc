@@ -170,6 +170,8 @@ static void spurs_pm_rec_configure(void)
         s_pmrec.stats_ns = (uint64_t)spurs_pm_rec_env_u32("PS3RECOMP_SPURS_PM_STATS_SECONDS", 5) * 1000000000ull;
         if (!s_pmrec.stats_ns) s_pmrec.stats_ns = 5000000000ull;
         s_pmrec.any = s_pmrec.record || s_pmrec.stats;
+        /* Open the hook sites' gate line (spu_context.h) only now. */
+        if (s_pmrec.any) __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);
         if (s_pmrec.stats) atexit(spurs_pm_rec_print_stats);
         if (s_pmrec.record)
             fprintf(stderr, "[spurs-pm-record] dir=%s wids=0x%04X max_runs=%u bytes=%u every=%u start_s=%llu\n",

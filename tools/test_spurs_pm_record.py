@@ -15,7 +15,8 @@ kind of recorded event once per run. The script requires:
 --mutants rebuilds the recorder with deliberate breaks and requires each to
 fail: a dropped PUTLLC outcome, an observer armed while every variable is
 unset, a lost service return, a job return not inferred when policy code
-enters the next job, a wrong drain target for the nested call.
+enters the next job, the hook sites' gate line never opened, a wrong drain
+target for the nested call.
 Manufactured modules only; no title code or data.
 """
 import argparse
@@ -44,6 +45,7 @@ MUTANTS = {
                             '            if (0) spurs_pm_rec_branch_event(t, ctx, SPURS_PM_REC_SERVICE_RETURN,'),
     'job-return-not-inferred-at-next-entry': ('        if (!t->depth && t->region == SPURS_PM_REGION_JOB) {',
                                               '        if (0) {'),
+    'gate-line-never-opened': ('        if (s_pmrec.any) __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);\n', ''),
     'nested-drain-target': ('spu_drain_call(ctx, link);     /* and the drain',
                             'spu_drain_call(ctx, link + 4); /* and the drain'),
 }

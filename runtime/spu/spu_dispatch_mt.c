@@ -52,7 +52,7 @@ void spu_indirect_branch_mt(spu_context* ctx)
     int special = (ctx->policy_mode &&
                    (pc == SPURS_PM_EXIT_TO_KERNEL_LS ||
                     pc == SPURS_PM_SELECT_WORKLOAD_LS ||
-                    ctx->pm_observer))   /* opt-in policy-run recorder sees every branch */
+                    (spu_pm_extras_on() && ctx->pm_observer)))   /* opt-in policy-run recorder sees every branch */
                   || pc == SPURS_TASKSET_PM_SYSCALL_LS
                   || ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID;
     if (!special) {

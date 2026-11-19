@@ -594,14 +594,24 @@ typedef struct spu_dispatch_gates {
     int fast_path;                /* spu_fast_path_on() (spu_drain.c)          */
     int channel_inline;           /* spu_channel_inline_on() (spu_channel_inline.h) */
     int ib_fast;                  /* spu_ib_fast_on() (spu_channels.c)         */
-    char pad[64 - 8 * sizeof(int)];
+    /* Nonzero only while an opt-in SPURS policy extra is configured (the
+     * policy-run recorder, spurs_pm_record.inc; a native policy module,
+     * spurs_native_pm.h). Every hook site tests this line, already loaded on
+     * those paths, before it touches the per-context hook pointers. */
+    int pm_extras;
+    char pad[64 - 9 * sizeof(int)];
 } spu_dispatch_gates;
 #ifdef __cplusplus
 static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
 #else
 _Static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
 #endif
-SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, -1, -1, -1, {0} };
+SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, -1, -1, -1, 0, {0} };
+/* One load of the gate line; predicted not taken. */
+static inline int spu_pm_extras_on(void)
+{
+    return __builtin_expect(g_spu_dispatch_gates.pm_extras != 0, 0);
+}
 
 /* PS3RECOMP_MFC_FAST=1 (opt-in): the MFC command path, the channel entries,
  * the overlay note and the drain hop run their compact form, which drops the

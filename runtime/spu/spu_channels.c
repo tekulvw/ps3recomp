@@ -1274,10 +1274,11 @@ static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
         if (channel == MFC_Cmd) {
-            const int is_atomic = v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD;
-            const int jobio = ps3_jobio_is(ctx) && is_atomic;
+            const int jobio = ps3_jobio_is(ctx) && (v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD);
             /* Opt-in policy-run recorder (spurs_pm_observer.h); NULL otherwise. */
-            const struct spurs_pm_observer* const pm_observer = is_atomic ? ctx->pm_observer : NULL;
+            const struct spurs_pm_observer* const pm_observer = spu_pm_extras_on() &&
+                (v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD)
+                ? ctx->pm_observer : NULL;
             const uint32_t jobio_ea = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1), jobio_lsa = ctx->mfc_lsa & SPU_LS_MASK;
             /* A conditional store is recorded with its source line before the
              * operation, and with the outcome afterwards. */
@@ -4040,8 +4041,10 @@ static int spu_ib_diagnostics_armed(void)
     return value;
 }
 
-/* cellSpursModulePoll as the HLE kernel answers it (spu_context.h). */
-void spurs_kernel_select_workload(spu_context* ctx)
+/* cellSpursModulePoll as the HLE kernel answers it (spu_context.h). Inlined
+ * into the resolver's intercept; spurs_kernel_select_workload is the same body
+ * for other callers. */
+static inline void spurs_kernel_select_workload_body(spu_context* ctx)
 {
     extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
     /* cellSpursModulePoll: report "no contention — keep running".
@@ -4070,8 +4073,9 @@ void spurs_kernel_select_workload(spu_context* ctx)
     ctx->gpr[3] = spu_make_preferred_u32(selected);
     ctx->gpr[3]._u32[1] = status;
     /* Opt-in policy-run recorder: every caller's poll, with its answer. */
-    if (ctx->pm_observer) ctx->pm_observer->kernel(ctx, SPURS_PM_KERNEL_SELECT);
+    if (spu_pm_extras_on() && ctx->pm_observer) ctx->pm_observer->kernel(ctx, SPURS_PM_KERNEL_SELECT);
 }
+void spurs_kernel_select_workload(spu_context* ctx) { spurs_kernel_select_workload_body(ctx); }
 
 void spu_indirect_branch(spu_context* ctx)
 {
@@ -4118,8 +4122,8 @@ void spu_indirect_branch(spu_context* ctx)
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited;
-        /* Opt-in policy-run recorder (spurs_pm_observer.h); NULL otherwise. */
-        const struct spurs_pm_observer* const pm_observer = ctx->pm_observer;
+        /* Opt-in policy-run recorder (spurs_pm_observer.h): behind the gate line. */
+        const struct spurs_pm_observer* const pm_observer = spu_pm_extras_on() ? ctx->pm_observer : NULL;
         if (pm_observer && pm_observer->branch(ctx))
             return;
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
@@ -4138,7 +4142,7 @@ void spu_indirect_branch(spu_context* ctx)
             return;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            spurs_kernel_select_workload(ctx);
+            spurs_kernel_select_workload_body(ctx);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }
