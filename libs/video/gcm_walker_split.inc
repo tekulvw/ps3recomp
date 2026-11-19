@@ -703,15 +703,21 @@ static void gcm_split_stats(uint64_t now)
 static void gcm_split_lease_yield(void)
 {
     const uint64_t t0 = s_rq.stats_on ? gcm_split_now_ns() : 0;
+    const unsigned taken0 = atomic_load_explicit(&s_lease_taken, memory_order_acquire);
     cellGcm_rsx_consumer_end();
     s_rq.lease_yields++;
-    /* Let the waiter take it: one yield of this thread's slice, then back.
-     * A waiter that did not get in by then takes it at the next record. */
+    /* Let the waiter take it: a lock released and re-taken at once is usually
+     * re-taken by the releasing thread (one yield was not enough on a busy
+     * two-core host: a guest report wait then took the whole queue). Yield
+     * until a waiter has taken the lease, bounded in case it gave up. */
+    for (int spins = 0; spins < 200 && atomic_load_explicit(&s_lease_taken, memory_order_acquire) == taken0 &&
+                        atomic_load_explicit(&s_lease_waiters, memory_order_acquire) > 0; spins++) {
 #ifdef _WIN32
-    Sleep(0);
+        Sleep(0);
 #else
-    sched_yield();
+        sched_yield();
 #endif
+    }
     cellGcm_rsx_consumer_begin();
     if (t0) s_rq.yield_ns += gcm_split_now_ns() - t0;
 }

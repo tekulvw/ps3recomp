@@ -42,6 +42,7 @@ void gcm_split_drain(void);
 void gcm_split_stop(void);
 static _Thread_local int s_on_record_thread;
 static _Atomic int s_lease_waiters;
+static _Atomic unsigned s_lease_taken;   /* bumps when a waiting thread has taken the lease */
 static int s_split = -1;              /* PS3RECOMP_RSX_SPLIT_WALKER: -1 unread, 0 off, 1 on */
 static void* s_checked_completion_user;
 static int (*s_checked_completion_ready)(void*);
@@ -617,7 +618,8 @@ void cellGcm_rsx_consumer_begin(void) {
         const int waiter = !s_on_record_thread && s_split == 1;
         if (waiter) atomic_fetch_add_explicit(&s_lease_waiters, 1, memory_order_acq_rel);
         AcquireSRWLockExclusive(&s_gcm_fifo_lock);
-        if (waiter) atomic_fetch_sub_explicit(&s_lease_waiters, 1, memory_order_acq_rel);
+        if (waiter) { atomic_fetch_sub_explicit(&s_lease_waiters, 1, memory_order_acq_rel);
+                      atomic_fetch_add_explicit(&s_lease_taken, 1u, memory_order_release); }
         rsx_fifo_busy_leave(RSX_FIFO_BUSY_LEASE_WAIT);
     }
 }
