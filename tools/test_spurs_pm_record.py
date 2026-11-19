@@ -12,11 +12,21 @@ kind of recorded event once per run. The script requires:
     the module performed, in order, with their data, outcomes and registers;
   * the workload filter, the per-workload run limit and the statistics lines.
 
+PS3RECOMP_SPURS_PM_RECORD_LSREAD adds the job code's local-store quadword
+reads below a limit: the script requires exactly the job's low reads (at and
+inside the block its r3 names, and an absolute one), with their addresses as
+formed, flags and values, none from the policy or a service or above the
+limit, the rest of the recording unchanged, the aggregate table, and the hook
+left unarmed (and the read gate closed) unless the switch and the recorder are
+both set.
+
 --mutants rebuilds the recorder with deliberate breaks and requires each to
 fail: a dropped PUTLLC outcome, an observer armed while every variable is
 unset, a lost service return, a job return not inferred when policy code
 enters the next job, the hook sites' gate line never opened, a wrong drain
-target for the nested call.
+target for the nested call; for the read events, the limit ignored, service
+reads reported, the hook armed without its switch, the in-context flag lost,
+the address's low bits dropped, and the read gate left closed.
 Manufactured modules only; no title code or data.
 """
 import argparse
@@ -48,6 +58,14 @@ MUTANTS = {
     'gate-line-never-opened': ('        if (s_pmrec.any) __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);\n', ''),
     'nested-drain-target': ('spu_drain_call(ctx, link);     /* and the drain',
                             'spu_drain_call(ctx, link + 4); /* and the drain'),
+    'lsread-limit-ignored': ('    if (a >= s_pmrec.lsread_limit) return;\n', ''),
+    'lsread-service-reported': ('    if (t->region != SPURS_PM_REGION_JOB || t->depth) return;',
+                                '    if (t->region == SPURS_PM_REGION_POLICY) return;'),
+    'lsread-armed-without-switch': ('            s_pmrec.lsread_limit = s_pmrec.any ? lim : 0;',
+                                    '            s_pmrec.lsread_limit = s_pmrec.any ? (lim ? lim : 0x4000u) : 0;'),
+    'lsread-in-ctx-flag-lost': ('        flags |= SPURS_PM_LSREAD_IN_CTX;', '        flags |= 0;'),
+    'lsread-low-bits-dropped': ('    pmb_u32(&b, lsa); pmb_u32(&b, 16);', '    pmb_u32(&b, q); pmb_u32(&b, 16);'),
+    'lsread-gate-not-opened': ('            __atomic_store_n(&g_spu_ls_rdiag, 1, __ATOMIC_RELEASE);\n', ''),
 }
 BASE_ENV = {k: v for k, v in os.environ.items() if not k.startswith(('SPU_', 'SPURS_', 'PS3_', 'PS3RECOMP_'))}
 
@@ -129,6 +147,7 @@ def check(binary: Path, tmp: Path) -> list[str]:
     off_dir = tmp / 'off'; off_dir.mkdir()
     off, off_err = run(binary, off_dir, {})
     expect(off['observer'] == '0', f'observer armed with every variable unset: {off}')
+    expect(off['pmread'] == '0' and off['rdiag'] == '0', f'LS read hook or gate armed while unset: {off}')
     expect(off['putllc_ok'] == '2' and off['putllc_fail'] == '2', f'fixture PUTLLC outcomes: {off}')
     expect(int(off['service_r3'], 16) == 0x5EC0FFEF, f'service result: {off}')
     expect(not list(off_dir.iterdir()), 'files written with the recorder off')
@@ -137,7 +156,8 @@ def check(binary: Path, tmp: Path) -> list[str]:
     rec_dir = tmp / 'rec'
     on, on_err = run(binary, tmp, {'PS3RECOMP_SPURS_PM_RECORD': str(rec_dir), 'PS3RECOMP_SPURS_PM_RECORD_BYTES': '16'})
     expect(on['observer'] == '1', 'observer not armed while recording')
-    for k in ('rc', 'putllc_ok', 'putllc_fail', 'service_r3', 'job_saw', 'select_wid', 'mem'):
+    expect(on['pmread'] == '0' and on['rdiag'] == '0', f'LS read hook armed without its switch: {on}')
+    for k in ('rc', 'putllc_ok', 'putllc_fail', 'service_r3', 'job_saw', 'select_wid', 'lsread_sum', 'mem'):
         expect(on[k] == off[k], f'recording changed {k}: {off[k]} -> {on[k]}')
     files = sorted(rec_dir.glob('pmrec-*.bin'))
     expect(len(files) == 1, f'expected one worker file, got {files}')
@@ -200,6 +220,8 @@ def check(binary: Path, tmp: Path) -> list[str]:
         n = sum(len(rec.runs(rec.read_file(f)[1])) for f in d.glob('pmrec-*.bin')) if d.exists() else 0
         expect(n == want_runs, f'{spec}: recorded {n} runs, expected {want_runs}')
 
+    fails += check_lsread(binary, tmp, off, rec_dir, events_of)
+
     stats_dir = tmp / 'stats'; stats_dir.mkdir()
     st, st_err = run(binary, stats_dir, {'PS3RECOMP_SPURS_PM_STATS': '1'})
     for k in ('rc', 'putllc_ok', 'putllc_fail', 'service_r3', 'job_saw', 'select_wid', 'mem'):
@@ -221,6 +243,82 @@ def check(binary: Path, tmp: Path) -> list[str]:
            and 'nop/00000:6' in cmds[-1], f'command histogram {cmds}')
     slots = [l for l in lines if 'service-slots' in l]
     expect(bool(slots) and '00000000/+0x44:2' in slots[-1], f'service slots {slots}')
+    return fails
+
+
+LS_LOW_READS = [   # (address as formed, flags: 1 inside the r3 block, 2 at r3, value bytes)
+    (LS_CTX, 3, (3).to_bytes(4, 'big') + bytes(12)),
+    (LS_CTX + 0x14, 1, bytes(16)),
+    (0x1C48, 0, b''.join((0xC0FFEE40 + o).to_bytes(4, 'big') for o in range(0, 16, 4))),
+]
+
+
+def check_lsread(binary: Path, tmp: Path, off: dict, base_dir: Path, events_of) -> list[str]:
+    fails = []
+
+    def expect(cond, msg):
+        if not cond:
+            fails.append(msg)
+
+    # the switch alone (no recorder): ignored, unarmed
+    alone_dir = tmp / 'lsread-alone'; alone_dir.mkdir()
+    al, al_err = run(binary, alone_dir, {'PS3RECOMP_SPURS_PM_RECORD_LSREAD': '1'})
+    expect(al['pmread'] == '0' and al['rdiag'] == '0' and al['observer'] == '0',
+           f'LS read switch alone armed something: {al}')
+    expect('PS3RECOMP_SPURS_PM_RECORD_LSREAD ignored' in al_err, 'no notice for the switch alone')
+    expect(not list(alone_dir.iterdir()), 'files written with the switch alone')
+
+    d = tmp / 'rec-lsread'
+    on, err = run(binary, tmp, {'PS3RECOMP_SPURS_PM_RECORD': str(d), 'PS3RECOMP_SPURS_PM_RECORD_BYTES': '16',
+                                'PS3RECOMP_SPURS_PM_RECORD_LSREAD': '1'})
+    expect(on['pmread'] == '1' and on['rdiag'] == '1', f'LS read hook not armed: {on}')
+    for k in ('rc', 'putllc_ok', 'putllc_fail', 'service_r3', 'job_saw', 'select_wid', 'lsread_sum', 'mem'):
+        expect(on[k] == off[k], f'LS read events changed {k}: {off[k]} -> {on[k]}')
+    try:
+        got = events_of(d)
+        reads = [e for e in got if e['kind'] == 'lsread']
+        expect([e for e in got if e['kind'] != 'lsread'] == events_of(base_dir),
+               'the rest of the recording changed with LS read events on')
+        expect(len(reads) == 2 * len(LS_LOW_READS),
+               f'{len(reads)} read events, expected {2 * len(LS_LOW_READS)}: '
+               + ' '.join(hex(e['lsa']) for e in reads))
+        for run_events in rec.runs([e for f in sorted(d.glob('pmrec-*.bin')) for e in rec.read_file(f)[1]]):
+            kinds = [e.get('branch') or e['kind'] for e in run_events]
+            enter = kinds.index('job_enter') if 'job_enter' in kinds else -1
+            body = run_events[enter + 1:enter + 1 + len(LS_LOW_READS)]
+            for i, (lsa, flags, value) in enumerate(LS_LOW_READS):
+                if i >= len(body):
+                    fails.append(f'read {i} missing'); break
+                check_event(body[i], 'lsread', dict(lsa=lsa, size=16, flags=flags, entry=JOB_ENTRY,
+                                                    ctx_lsa=LS_CTX, value=value), f'lsread {i}')
+                expect(body[i]['r3'][0] == LS_CTX, f'lsread {i}: r3 {body[i]["r3"]}')
+            expect(enter >= 0 and kinds[enter + 1 + len(LS_LOW_READS)] == 'service_call',
+                   f'reads not between the job entry and its service call: {kinds}')
+    except (AssertionError, rec.FormatError) as e:
+        fails.append(str(e))
+    table = sorted(d.glob('pmrec-lsread-*.txt'))
+    expect(len(table) == 1, f'expected one aggregate table, got {table}')
+    expect('[spurs-pm-lsread] job-region local-store reads below 0x4000 reported' in err, 'no configuration line')
+    if table:
+        rows = [l for l in table[0].read_text().splitlines() if ' lsq=' in l]
+        want = {(f'{lsa & ~15:05X}', flags) for lsa, flags, _ in LS_LOW_READS}
+        seen = set()
+        for l in rows:
+            f = dict(x.split('=', 1) for x in l.split()[1:] if '=' in x)
+            fl = (1 if f['in_ctx'] != '0' else 0) | (2 if f['at_ctx'] != '0' else 0)
+            seen.add((f['lsq'], fl))
+            expect(f['entry'] == f'{JOB_ENTRY:05X}' and f['reads'] == '2' and f['changed'] == '0',
+                   f'aggregate row {l}')
+        expect(seen == want, f'aggregate rows {sorted(seen)} != {sorted(want)}')
+        head = [l for l in table[0].read_text().splitlines() if 'job_reads=' in l]
+        expect(bool(head) and ' job_reads=8 below=6 overflow=0' in head[-1], f'aggregate totals {head}')
+
+    # statistics only: the table goes to stderr
+    sd = tmp / 'stats-lsread'; sd.mkdir()
+    st, st_err = run(binary, sd, {'PS3RECOMP_SPURS_PM_STATS': '1', 'PS3RECOMP_SPURS_PM_RECORD_LSREAD': '4000'})
+    expect(st['mem'] == off['mem'] and st['lsread_sum'] == off['lsread_sum'], 'statistics + LS reads changed results')
+    expect(not list(sd.iterdir()), 'statistics + LS reads wrote files')
+    expect(sum(' lsq=' in l for l in st_err.splitlines()) == len(LS_LOW_READS), 'no aggregate rows on stderr')
     return fails
 
 

@@ -23,9 +23,10 @@ from pathlib import Path
 
 MAGIC = b'SPMR'
 VERSION = 1
-RUN_BEGIN, RUN_END, COMMAND, TRANSFER, ATOMIC, BRANCH, KERNEL = range(1, 8)
+RUN_BEGIN, RUN_END, COMMAND, TRANSFER, ATOMIC, BRANCH, KERNEL, LSREAD = range(1, 9)
 KIND_NAMES = {RUN_BEGIN: 'run_begin', RUN_END: 'run_end', COMMAND: 'command', TRANSFER: 'transfer',
-              ATOMIC: 'atomic', BRANCH: 'branch', KERNEL: 'kernel'}
+              ATOMIC: 'atomic', BRANCH: 'branch', KERNEL: 'kernel', LSREAD: 'lsread'}
+LSREAD_IN_CTX, LSREAD_AT_CTX = 1, 2
 XFER_NAMES = {1: 'get', 2: 'put', 3: 'zero'}
 BRANCH_NAMES = {1: 'job_enter', 2: 'job_return', 3: 'service_call', 4: 'service_return'}
 KERNEL_NAMES = {1: 'select', 2: 'exit'}
@@ -80,6 +81,16 @@ def decode_payload(kind: int, p: bytes) -> dict:
         e, _ = _fields('I4IIIII', 'service r3_0 r3_1 r3_2 r3_3 region depth polls link', p)
         e['service'] = KERNEL_NAMES.get(e['service'], e['service'])
         e['r3'] = [e.pop(f'r3_{i}') for i in range(4)]
+    elif kind == LSREAD:
+        # PS3RECOMP_SPURS_PM_RECORD_LSREAD: a job-region local-store quadword read
+        e, o = _fields('IIIIIIIII4II', 'lsa size flags module_ea entry ctx_lsa pc r0 r1 '
+                       'r3_0 r3_1 r3_2 r3_3 pc_module_ea', p)
+        e['r3'] = [e.pop(f'r3_{i}') for i in range(4)]
+        e['in_ctx'] = bool(e['flags'] & LSREAD_IN_CTX)
+        e['at_ctx'] = bool(e['flags'] & LSREAD_AT_CTX)
+        e['value'] = p[o:o + 16]
+        if len(e['value']) != 16:
+            raise FormatError('short lsread')
     else:
         raise FormatError(f'unknown record kind {kind}')
     if 'region' in e:
