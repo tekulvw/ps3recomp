@@ -7,8 +7,8 @@ policy-module seam (`docs/SPURS_NATIVE_PM.md`). It has two parts:
   pure functions over byte buffers, with no `spu_context`, MFC, guest memory or globals.
 - **The run loop:** `runtime/spu/wwsjm/wwsjm_run.inc`, plus the shadow comparison in
   `wwsjm_shadow.inc`. Both are included by `spurs_native_pm.inc`, so they compile inside
-  `spurs_policy.c` with the core. CMake keeps `wwsjm_core.c` out of the runtime glob for that
-  reason.
+  `spurs_policy.c` with their own copy of the core (`WWSJM_API` is `static inline` there). A
+  separately compiled `wwsjm_core.c` object therefore never clashes with it.
 
 **Status:** opt-in, off by default. With `PS3RECOMP_SPURS_NATIVE_PM` unset, nothing here is
 registered or runs.

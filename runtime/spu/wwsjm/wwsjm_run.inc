@@ -10,6 +10,7 @@
  * context's MFC channels, guest reads of headers, records and lists, the job
  * API context in a local-store area of its own, job entry through the seam,
  * and the three job services through the native-service window. */
+#define WWSJM_API static inline
 #include "wwsjm/wwsjm_core.c"
 
 extern void spu_wrch(spu_context*, uint32_t, u128);

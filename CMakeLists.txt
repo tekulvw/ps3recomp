@@ -106,9 +106,7 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 #    *inside the game build* by clang so the tail call is guaranteed -- a plain
 #    call leaks one resolver frame per guest loop iteration. A port adds it to
 #    its own target; see templates/project/CMakeLists.txt.
-#  - runtime/spu/wwsjm/wwsjm_core.c: compiled inside spurs_policy.c (through
-#    spurs_native_pm.inc and wwsjm_run.inc), like the seam itself.
-list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$|/wwsjm/wwsjm_core\.c$")
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$")
 
 # ---------------------------------------------------------------------------
 # Static library
