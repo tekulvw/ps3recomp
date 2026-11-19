@@ -15,6 +15,7 @@
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_workload_flag.h"
+#include "spurs_native_pm.h"     /* PS3RECOMP_SPURS_NATIVE_PM: native policy modules (off) */
 #include "spu_coh_section.h"   /* host line read-modify-writes */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
@@ -458,6 +459,7 @@ struct SpursPmSlot {
     struct SpursInst* instance;
     u32 spu_num, wid, ea, pm_size;
     spu_lifted_entry_fn fn;
+    const struct spurs_native_pm* native;   /* NULL: the lifted policy module */
     int image_id, busy;
     const uint8_t* pm;
     u64 data;
@@ -2163,6 +2165,9 @@ typedef struct {
     spu_lifted_entry_fn fn;
     int                 image_id;
     int                 resolved;   /* 0=not tried, 1=found, -1=missing */
+    /* A registered native implementation chosen for this workload by
+     * PS3RECOMP_SPURS_NATIVE_PM (spurs_native_pm.h); NULL = the lifted path. */
+    const struct spurs_native_pm* native;
 } WklPm;
 static WklPm s_wkl_pm[CELL_SPURS_MAX_WORKLOAD];
 
@@ -2174,8 +2179,14 @@ static WklPm* spurs_resolve_pm(u32 wid)
     uint64_t fp = spu_workload_fingerprint(vm_base + (uint32_t)(uintptr_t)w->pm,
                                            w->sizePm);
     r->fn = spu_workload_find_img(fp, &r->image_id);
-    r->resolved = r->fn ? 1 : -1;
-    if (r->fn)
+    /* PS3RECOMP_SPURS_NATIVE_PM: unset, the registry is never consulted. */
+    r->native = spurs_native_pm_mode() != SPURS_NATIVE_PM_OFF
+        ? spurs_native_pm_select(wid, fp, vm_base + (uint32_t)(uintptr_t)w->pm, w->sizePm) : NULL;
+    r->resolved = (r->fn || r->native) ? 1 : -1;
+    if (!r->fn && r->native)
+        printf("[cellSpurs] wid=%u PM not lifted (fp=0x%016llX): native only\n",
+               wid, (unsigned long long)fp);
+    else if (r->fn)
         printf("[cellSpurs] wid=%u PM resolved (fp=0x%016llX image=%d)\n",
                wid, (unsigned long long)fp, r->image_id);
     else {
@@ -2197,7 +2208,7 @@ static WklPm* spurs_resolve_pm(u32 wid)
             }
         }
     }
-    return r->fn ? r : NULL;
+    return r->resolved > 0 ? r : NULL;
 }
 
 /* PS3RECOMP_SPURS_DISPATCH_DIAG=<start s>:<seconds> (opt-in, off by default):
@@ -2473,7 +2484,7 @@ static int spurs_dispatch_wid(struct SpursInst* si, struct SpursPmSlot* slot, u3
     if (signal & (0x8000u >> wid))
         ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~(0x8000u >> wid)));
     ef_line_end(ea);
-    slot->fn = pm->fn; slot->image_id = pm->image_id;
+    slot->fn = pm->fn; slot->native = pm->native; slot->image_id = pm->image_id;
     slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
     slot->pm_size = s_workloads[wid].sizePm;
     slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
@@ -2527,7 +2538,7 @@ static int spurs_dispatch_slot(struct SpursInst* si, struct SpursPmSlot* slot, u
  *       (spurs_module_poll);
  *   PS3RECOMP_SPURS_STORE_WAKE=0    no coherence watch on the request line
  *       (spurs_request_line_written): requests a PPU stores wait for a pass. */
-static struct { int disabled, target_mode, self_dispatch, store_wake, module_poll_preempt; long poll_us; } s_sched_opt;
+static struct { int disabled, target_mode, self_dispatch, store_wake, module_poll_preempt, native_pm; long poll_us; } s_sched_opt;
 static void spurs_sched_options_read(void)
 {
     const char* e;
@@ -2537,6 +2548,7 @@ static void spurs_sched_options_read(void)
     e = getenv("PS3RECOMP_SPURS_SELF_DISPATCH"); s_sched_opt.self_dispatch = e && !strcmp(e, "1");
     e = getenv("PS3RECOMP_SPURS_STORE_WAKE");    s_sched_opt.store_wake = !(e && !strcmp(e, "0"));
     e = getenv("PS3RECOMP_SPURS_MODULE_POLL_PREEMPT"); s_sched_opt.module_poll_preempt = e && !strcmp(e, "1");
+    s_sched_opt.native_pm = spurs_native_pm_mode();   /* PS3RECOMP_SPURS_NATIVE_PM (spurs_native_pm.h) */
 }
 
 /* cellSpursModulePoll with preemption (PS3RECOMP_SPURS_MODULE_POLL_PREEMPT=1).
@@ -2634,8 +2646,8 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         ReleaseSRWLockExclusive(&si->lock);
         const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         const uint64_t diag_t0 = s_diag_on > 0 ? ps3_ft_now() : 0;
-        const int pm_rc = spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
-                              slot->data, slot->wid, slot->ea, slot->spu_num);
+        const int pm_rc = spu_run_policy_module_native(slot->native, slot->fn, slot->image_id, slot->pm,
+                              slot->pm_size, slot->data, slot->wid, slot->ea, slot->spu_num);
         if (ft_t0) {
             extern void spu_ft_job_end(void);
             spu_ft_job_end();

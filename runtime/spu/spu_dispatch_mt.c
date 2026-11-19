@@ -14,6 +14,7 @@
  * image-23 cri hack, lookup miss diagnostics) falls back to the full resolver.
  */
 #include "spu_context.h"
+#include "spurs_native_pm.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -49,10 +50,12 @@ void spu_indirect_branch_mt(spu_context* ctx)
      * kernel-service addresses (exit-to-kernel / select-workload, which the
      * lib intercepts and RETURNS from without dispatching) and the special
      * HLE addresses still take the slow path. */
+    /* In a policy run: the native-service window and the two kernel services
+     * (one range, [0x900, 0x9E0); none of it is ever a lifted function), and
+     * every branch while the opt-in policy-run recorder observes the run. */
     int special = (ctx->policy_mode &&
-                   (pc == SPURS_PM_EXIT_TO_KERNEL_LS ||
-                    pc == SPURS_PM_SELECT_WORKLOAD_LS ||
-                    ctx->pm_observer))   /* opt-in policy-run recorder sees every branch */
+                   (pc - SPURS_NATIVE_PM_WINDOW_LS < SPURS_PM_SELECT_WORKLOAD_LS + 0x10u - SPURS_NATIVE_PM_WINDOW_LS ||
+                    ctx->pm_observer))
                   || pc == SPURS_TASKSET_PM_SYSCALL_LS
                   || ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID;
     if (!special) {

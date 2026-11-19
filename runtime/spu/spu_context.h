@@ -172,6 +172,7 @@ typedef struct spu_channel {
  * SPU execution context
  * -----------------------------------------------------------------------*/
 struct spurs_pm_observer;
+struct spurs_native_services;
 typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
@@ -421,6 +422,9 @@ typedef struct spu_context {
     /* SPURS policy-run observer (spurs_pm_observer.h): NULL unless the opt-in
      * policy-run recorder or statistics armed this context for one run. */
     const struct spurs_pm_observer* pm_observer;
+    /* Native policy-module services (spurs_native_pm.h): NULL unless a native
+     * policy run installed its table for the run. */
+    const struct spurs_native_services* native_services;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
