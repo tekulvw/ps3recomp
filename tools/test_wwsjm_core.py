@@ -82,7 +82,7 @@ MUTANTS = {
     # review item 5 / spec 12.1: set 0 or a shareable-copy set rotated
     'set0-rotates': ('    if (set == 0)\n        return 1;\n', ''),
     'shareable-set-rotates': ('        if (p->use[i].set == set && p->use[i].fill == WWSJM_FILL_COPY && p->use[i].shareable)\n',
-                              '        if (p->use[i].set == set && p->use[i].fill == WWSJM_FILL_COPY && 0 * p->use[i].shareable)\n'),
+                              '        if (p->use[i].set == set && p->use[i].fill == WWSJM_FILL_COPY && p->use[i].shareable == 2u)\n'),
     # spec E2: a no-op command refused instead of skipped
     'nop-refused': ('            out->nop_count++;\n            break;\n',
                     '            return fail(out, bad_slot, i, WWSJM_E_COMMAND);\n'),
