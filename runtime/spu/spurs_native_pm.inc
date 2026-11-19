@@ -205,6 +205,10 @@ static int spurs_native_pm_invoke(const struct spurs_native_pm* pm, spu_context*
                                   const struct spurs_native_pm_run* run)
 {
     t_npm_pm = pm; t_npm_run = run; t_npm_rc = -1;
+    /* Open the hook sites' gate line (spu_context.h) before the table exists:
+     * from here on the resolver tests for the service window in policy runs. */
+    if (!__atomic_load_n(&g_spu_dispatch_gates.pm_extras, __ATOMIC_RELAXED))
+        __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);
     c->native_services = pm->services;
     const int halted = spu_run_with_halt(spurs_npm_thunk, c);
     c->native_services = NULL;

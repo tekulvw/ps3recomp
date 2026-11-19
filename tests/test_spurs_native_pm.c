@@ -216,10 +216,11 @@ static int sched(const char* reg)
     for (uint32_t i = 0; i < 0x1000; i++) { h ^= vm_base[SPURS_EA + i]; h *= 1099511628211ull; }
     for (uint32_t i = 0; i < 0x80; i++) { h ^= vm_base[LIST_EA + i]; h *= 1099511628211ull; }
     printf("result count=%u lifted=%u native=%u consults=%lu services_installed=%u lifted_saw_services=%u "
-           "modes=%u poll=%u curcont=%u active=%u idle=%u ready=%u mem=%016llX\n",
+           "modes=%u poll=%u curcont=%u active=%u idle=%u ready=%u gate=%d mem=%016llX\n",
            vm_read32(LIST_EA), g_lifted_runs, g_native_runs, spurs_native_pm_consults(), g_observed_services,
            g_lifted_saw_services, g_modes, g_poll_answer, vm_read8(SPURS_EA + SPURS_WKL_CURCONT + WID),
-           si->active[WID], si->idle[WID], vm_read8(SPURS_EA + SPURS_WKL_READY1 + WID), (unsigned long long)h);
+           si->active[WID], si->idle[WID], vm_read8(SPURS_EA + SPURS_WKL_READY1 + WID), g_spu_dispatch_gates.pm_extras,
+           (unsigned long long)h);
     fflush(stdout);
     _exit(0);
 }

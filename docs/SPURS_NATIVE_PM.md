@@ -65,10 +65,13 @@ return address and is handled by the seam. A branch to an empty slot, the middle
 of a slot, or the job-return slot outside its drain stops the process (exit 86)
 with a message: unsupported behaviour is never skipped.
 
-The window test costs nothing outside policy runs and one load and compare in
-the resolver's policy-mode block otherwise; `spu_dispatch_mt.c`'s fast path sends
-the whole `[0x900, 0x9E0)` range (window and kernel services, none of it lifted
-code) to the full resolver with one compare.
+The window test sits behind `g_spu_dispatch_gates.pm_extras`, a word on the gate
+cache line the dispatch paths already load, predicted not taken. The seam opens it
+the first time a native run installs a service table; with the switch unset it
+stays 0 and the resolver's policy-mode block pays that one test for all opt-in
+policy extras (the recorder's hook shares it). `spu_dispatch_mt.c`'s fast path
+keeps its two kernel-service compares and sends window addresses to the full
+resolver only behind the same gate.
 
 ## Not yet covered
 

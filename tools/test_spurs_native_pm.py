@@ -54,6 +54,8 @@ MUTANTS = {
                                 '        ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;\n        if (ctx->host_depth == 0) g_spu_trampoline_fn',
                                 '        if (ctx->host_depth == 0) g_spu_trampoline_fn'),
     'sha-gate-skipped': ('runtime/spu/spurs_native_pm.inc', 'if (memcmp(sha, pm->sha256, 32) != 0) {', 'if (0) {'),
+    'gate-line-never-opened': ('runtime/spu/spurs_native_pm.inc',
+                               '        __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);\n', ''),
     'services-left-installed': ('runtime/spu/spurs_native_pm.inc', '    c->native_services = NULL;\n    t_npm_pm = NULL;',
                                 '    t_npm_pm = NULL;'),
 }
@@ -135,6 +137,7 @@ def check(binary: Path, tmp: Path) -> list[str]:
     # and without the recorder
     plain, _, _ = run(binary, ['sched', 'reg'])
     expect(plain['mem'] == base_r['mem'] and plain['consults'] == '0', f'unset without recorder: {plain}')
+    expect(plain['gate'] == '0', f'the hook gate line opened with every switch unset: {plain}')
 
     # --- identity gate and modes --------------------------------------------------
     r, err, _ = run(binary, ['sched', 'badsha'], {'PS3RECOMP_SPURS_NATIVE_PM': '1'})
@@ -147,7 +150,7 @@ def check(binary: Path, tmp: Path) -> list[str]:
     native = {}
     for value, mode_bit in (('1', 1 << 1), ('check', 1 << 2), ('fixture-native', 1 << 1)):
         r, err, _ = run(binary, ['sched', 'reg'], {'PS3RECOMP_SPURS_NATIVE_PM': value})
-        want = dict(count='6', lifted='0', native='6', services_installed='6', consults='1', curcont='0',
+        want = dict(count='6', lifted='0', native='6', services_installed='6', consults='1', curcont='0', gate='1',
                     active='0', ready='0', poll='3', modes=str(mode_bit))
         for k, v in want.items():
             expect(r.get(k) == v, f'native {value}: {k}={r.get(k)} expected {v}')
