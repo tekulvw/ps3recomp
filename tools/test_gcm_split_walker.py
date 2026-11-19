@@ -98,7 +98,7 @@ MUTANTS = {
          '    if (1) { nv0039_copy(s_nv0039.in_dma, s_nv0039.out_dma, v, io); return 0; }')]),
     # `get` published by the decoder: get == put before the draw is recorded
     'get-at-decode': ('gcm_walker_split.inc', [
-        ('    if (s_split != 1) { vm_write32(GCM_CONTROL_GUEST_ADDR + 4, value); return; }',
+        ('    if (s_split != 1 || s_rq.get_decode) { vm_write32(GCM_CONTROL_GUEST_ADDR + 4, value); return; }',
          '    if (1) { vm_write32(GCM_CONTROL_GUEST_ADDR + 4, value); return; }')]),
     # the draw fence ignored: `get` runs the lead past an unrecorded draw
     'no-draw-fence': ('gcm_walker_split.inc', [
