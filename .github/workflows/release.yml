@@ -48,6 +48,9 @@ jobs:
         with:
           arch: x64
 
+      # windows-latest's MSVC STL needs Clang 22+; the preinstalled LLVM is older.
+      - uses: ./.github/actions/windows-llvm
+
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: choco install ninja -y --no-progress
