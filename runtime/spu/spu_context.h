@@ -573,6 +573,10 @@ SPU_GATE int g_wws_read_probe = 0;
 SPU_GATE int g_spu_ls_rdiag   = -1;  /* any read diagnostic armed (see above)   */
 SPU_GATE int g_spu_ls_wdiag   = -1;  /* any write diagnostic armed              */
 SPU_GATE int g_spu_wws_probe  = -1;  /* SPU_WWS_PROBE: the WWS buffer/code logs */
+/* The policy-run recorder's local-store read hook (PS3RECOMP_SPURS_PM_RECORD_LSREAD,
+ * spurs_pm_record.inc): NULL unless that switch is set, and then one of the
+ * read diagnostics g_spu_ls_rdiag counts. */
+SPU_GATE void (*g_spu_ls_pmread)(const struct spu_context*, uint32_t) = 0;
 
 /* The read-mostly gates the dispatch path tests on every transfer, lookup and
  * drain hop, kept in one cache line of their own. The originals are file
@@ -738,11 +742,15 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
  * none is armed (the first call also settles g_spu_ls_watch_n). */
 static __attribute__((noinline, cold)) void spu_ls_read_diag(const spu_context* ctx, uint32_t lsa)
 {
+    void (*const pmread)(const struct spu_context*, uint32_t) =
+        __atomic_load_n(&g_spu_ls_pmread, __ATOMIC_ACQUIRE);
+    if (pmread && ctx->pm_observer) pmread(ctx, lsa);
     spu_ls_read_probe(ctx, lsa);
     const uint32_t a = lsa & SPU_LS_MASK & ~0xFu;
     spu_ls_watch_hit2(a, 0, &ctx->ls[a], (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-    g_spu_ls_rdiag = g_spu_ls_probe || spu_ls_wws_probe_on() || g_spu_ls_watch_n != 0;
+    g_spu_ls_rdiag = g_spu_ls_probe || spu_ls_wws_probe_on() || g_spu_ls_watch_n != 0 ||
+                     __atomic_load_n(&g_spu_ls_pmread, __ATOMIC_ACQUIRE) != 0;
 }
 
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)

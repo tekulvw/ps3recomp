@@ -28,6 +28,7 @@ pointer.
 | `PS3RECOMP_SPURS_PM_RECORD_BYTES=<n>` | Data bytes kept per transfer element (default 4096; `0` keeps all). Every transfer also carries a 64-bit FNV-1a hash of all its bytes. |
 | `PS3RECOMP_SPURS_PM_RECORD_START=<s>` | Only record runs that begin at least `<s>` seconds after the first policy run (skip boot). |
 | `PS3RECOMP_SPURS_PM_RECORD_EVERY=<n>` | Record one eligible run in `n` on each worker (default 1: consecutive runs). |
+| `PS3RECOMP_SPURS_PM_RECORD_LSREAD=1\|<hex limit>` | With the recorder or the statistics on: report job code's local-store quadword reads below `0x4000` (`1`) or below the given hex limit. See "Local-store reads" below. Ignored, with a notice, when neither is set. |
 | `PS3RECOMP_SPURS_PM_STATS=1` | Print cumulative counters and histograms to stderr (`[spurs-pm-stats]`) every `PS3RECOMP_SPURS_PM_STATS_SECONDS` (default 5) and at exit. Independent of recording. |
 
 `SPURS_PM_FRESH=1` (existing) makes every dispatch start from a fresh context;
@@ -67,6 +68,38 @@ sees the return: it performs the resolution and drains to the caller's r0 link,
 the same dispatch and drain target the lifted call bracket uses. That is the only
 structural difference while recording; the fixture requires identical results and
 guest memory with the recorder off, on, and statistics only.
+
+## Local-store reads
+
+`PS3RECOMP_SPURS_PM_RECORD_LSREAD` shows which local-store addresses job code
+reads that lie outside what it was handed: it reports each quadword load (`lqd`,
+`lqx`, `lqa` of non-register-promoted lifted code, `spu_ls_read128`) that job
+code at depth 0 performs below the limit during an observed run. Loads in the
+policy image, in a service a job called, by the runtime's own helpers, or at or
+above the limit are not reported. Register-promoted images compile the read
+gate out unless built with `-DSPU_LS_DIAG=1`.
+
+It costs nothing when unset: the hook is the runtime's existing read-diagnostic
+gate (`g_spu_ls_rdiag`, one load and an untaken branch per quadword load, see
+`spu_context.h`), which this switch arms only when it and the recorder are both
+set. While armed, every quadword load in every SPU thread takes the cold
+diagnostic call, so the switch is for short diagnostic runs.
+
+In a recorded run, each read is an `lsread` event: the address as the code formed
+it (the low four bits kept; SPU loads always fetch the whole quadword, which is
+`size`), the sixteen bytes the load returned, `in_ctx` (inside the 128-byte block
+whose address the job was handed in r3), `at_ctx` (the quadword the current r3
+names), the job's entry and the streamed-code source EA it runs from, the
+context address it was handed, the resolver's last pc and its code source, and
+r0, r1 and r3. Lifted code updates the pc only at branches, so `pc` is the last
+one, not the load's own.
+
+Independently of recording, every worker keeps an aggregate per (job module,
+entry, quadword): reads, how many were `in_ctx` and `at_ctx`, how many returned
+a value different from the first, and the first and last values. It is printed
+every `PS3RECOMP_SPURS_PM_STATS_SECONDS` and at exit: to
+`<dir>/pmrec-lsread-<pid>.txt` (rewritten each time, so a killed process keeps
+the last one) when recording, otherwise to stderr (`[spurs-pm-lsread]`).
 
 ## Statistics
 

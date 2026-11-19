@@ -60,8 +60,12 @@ enum {
 enum {
     SPURS_PM_REC_RUN_BEGIN = 1, SPURS_PM_REC_RUN_END = 2, SPURS_PM_REC_COMMAND = 3,
     SPURS_PM_REC_TRANSFER = 4, SPURS_PM_REC_ATOMIC = 5, SPURS_PM_REC_BRANCH = 6,
-    SPURS_PM_REC_KERNEL = 7
+    SPURS_PM_REC_KERNEL = 7, SPURS_PM_REC_LSREAD = 8
 };
+/* Local-store read events (PS3RECOMP_SPURS_PM_RECORD_LSREAD): flags, and the
+ * per-worker aggregate table. */
+enum { SPURS_PM_LSREAD_IN_CTX = 1u, SPURS_PM_LSREAD_AT_CTX = 2u };
+enum { SPURS_PM_LSREAD_TABLE = 1024 };
 enum { SPURS_PM_REC_JOB_ENTER = 1, SPURS_PM_REC_JOB_RETURN = 2,
        SPURS_PM_REC_SERVICE_CALL = 3, SPURS_PM_REC_SERVICE_RETURN = 4 };
 /* Where the observed program was when an event happened. */
@@ -78,6 +82,7 @@ static struct {
     uint32_t byte_cap;       /* 0 = all */
     uint32_t every;
     uint64_t start_ns, stats_ns;
+    uint32_t lsread_limit;   /* job-region LS reads below this are reported; 0 = off */
 } s_pmrec;
 static SRWLOCK s_pmrec_lock = SRWLOCK_INIT;
 
@@ -130,6 +135,8 @@ static uint32_t spurs_pm_rec_env_u32(const char* name, uint32_t dflt)
 }
 
 static void spurs_pm_rec_print_stats(void);
+static void spurs_pm_rec_print_lsread(void);
+static void spurs_pm_rec_ls_read(const struct spu_context* ctx, uint32_t lsa);
 static void spurs_pm_rec_configure(void)
 {
     AcquireSRWLockExclusive(&s_pmrec_lock);
@@ -170,9 +177,29 @@ static void spurs_pm_rec_configure(void)
         s_pmrec.stats_ns = (uint64_t)spurs_pm_rec_env_u32("PS3RECOMP_SPURS_PM_STATS_SECONDS", 5) * 1000000000ull;
         if (!s_pmrec.stats_ns) s_pmrec.stats_ns = 5000000000ull;
         s_pmrec.any = s_pmrec.record || s_pmrec.stats;
+        {
+            /* "1" = below 0x4000; otherwise a hex limit (0x prefix optional) */
+            const char* lr = getenv("PS3RECOMP_SPURS_PM_RECORD_LSREAD");
+            uint32_t lim = 0;
+            if (lr && *lr && strcmp(lr, "0") != 0)
+                lim = strcmp(lr, "1") == 0 ? 0x4000u : (uint32_t)strtoul(lr, NULL, 16);
+            if (lim > SPU_LS_SIZE) lim = SPU_LS_SIZE;
+            if (lim && !s_pmrec.any)
+                fprintf(stderr, "[spurs-pm-lsread] PS3RECOMP_SPURS_PM_RECORD_LSREAD ignored: it needs "
+                        "PS3RECOMP_SPURS_PM_RECORD or PS3RECOMP_SPURS_PM_STATS\n");
+            s_pmrec.lsread_limit = s_pmrec.any ? lim : 0;
+        }
         /* Open the hook sites' gate line (spu_context.h) only now. */
         if (s_pmrec.any) __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);
         if (s_pmrec.stats) atexit(spurs_pm_rec_print_stats);
+        if (s_pmrec.lsread_limit) {
+            /* the LS read hook, and the read-diagnostic gate it is part of */
+            __atomic_store_n(&g_spu_ls_pmread, spurs_pm_rec_ls_read, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_spu_ls_rdiag, 1, __ATOMIC_RELEASE);
+            atexit(spurs_pm_rec_print_lsread);
+            fprintf(stderr, "[spurs-pm-lsread] job-region local-store reads below 0x%X reported\n",
+                    s_pmrec.lsread_limit);
+        }
         if (s_pmrec.record)
             fprintf(stderr, "[spurs-pm-record] dir=%s wids=0x%04X max_runs=%u bytes=%u every=%u start_s=%llu\n",
                     s_pmrec.dir, s_pmrec.wid_mask, s_pmrec.max_runs, s_pmrec.byte_cap, s_pmrec.every,
@@ -190,6 +217,13 @@ struct spurs_pm_rec_stats {
     uint64_t module_loads, module_bytes, instance_writes[2], irq_branches;
 };
 struct spurs_pm_rec_slot { uint32_t module_ea, offset; uint64_t calls; };
+/* One job-region local-store quadword read below the limit, keyed by the job's
+ * module, its entry and the quadword address. */
+struct spurs_pm_lsread_row {
+    uint32_t module_ea, entry, lsa_q, used;
+    uint64_t reads, in_ctx, at_ctx, changed;   /* changed: value differed from the first */
+    uint8_t first[16], last[16];
+};
 struct spurs_pm_rec_thread {
     struct spurs_pm_rec_thread* next;
     FILE* file;
@@ -205,7 +239,10 @@ struct spurs_pm_rec_thread {
     unsigned depth;
     struct { uint32_t host_depth; int region; } stack[SPURS_PM_REC_DEPTH];
     int bypass;
-    uint32_t job_ctx_lsa, job_link, job_host_depth;
+    uint32_t job_ctx_lsa, job_link, job_host_depth, job_entry, job_module;
+    /* local-store reads (PS3RECOMP_SPURS_PM_RECORD_LSREAD) */
+    struct spurs_pm_lsread_row lsread[SPURS_PM_LSREAD_TABLE];
+    uint64_t lsread_jobs_reads, lsread_low_reads, lsread_overflow;
     /* the attached header arrays as last seen in the line */
     uint32_t array_line, array_ea[4], array_cap[4];
     struct { uint32_t ea, size; } cand[SPURS_PM_REC_CANDIDATES];
@@ -510,6 +547,7 @@ static int spurs_pm_rec_branch(spu_context* ctx)
         memcpy(block, ctx->ls + r3, n);
         t->region = SPURS_PM_REGION_JOB;
         t->job_ctx_lsa = r3; t->job_link = link; t->job_host_depth = ctx->host_depth; t->run_jobs++;
+        t->job_entry = pc; t->job_module = spurs_pm_rec_module_of(ctx, pc);
         PMREC_ADD(t->st[t->wid].job_entries, 1);
         spurs_pm_rec_branch_event(t, ctx, SPURS_PM_REC_JOB_ENTER, pc, SPURS_PM_REC_NO_SLOT,
                                   spurs_pm_rec_module_of(ctx, pc), 0, block, n);
@@ -566,6 +604,112 @@ static void spurs_pm_rec_kernel(spu_context* ctx, uint32_t kind)
     spurs_pm_rec_emit(t, SPURS_PM_REC_KERNEL, &b, NULL, 0);
 }
 
+/* A local-store quadword read by SPU code, before it happens (the read
+ * diagnostic gate in spu_context.h; lifted job code's lqd/lqx/lqa). Reported
+ * only for job code of a run this worker observes, at depth 0 (not inside a
+ * service call), and below the limit. SPU loads are always a whole quadword:
+ * the event carries the address as the code formed it (low four bits kept),
+ * the quadword's sixteen bytes, and the registers that say where the address
+ * could have come from. "in_ctx": inside the 128-byte block whose address the
+ * job was handed in r3; "at_ctx": the quadword the current r3 points at. */
+static void spurs_pm_rec_ls_read(const struct spu_context* cctx, uint32_t lsa)
+{
+    struct spurs_pm_rec_thread* t = t_pmrec;
+    spu_context* ctx = (spu_context*)cctx;
+    if (!t || t->ctx != ctx) return;
+    spurs_pm_rec_unwind(t, ctx);
+    if (t->region != SPURS_PM_REGION_JOB || t->depth) return;
+    t->lsread_jobs_reads++;
+    const uint32_t a = lsa & SPU_LS_MASK, q = a & ~0xFu;
+    if (a >= s_pmrec.lsread_limit) return;
+    t->lsread_low_reads++;
+    const uint32_t r3 = ctx->gpr[3]._u32[0] & SPU_LS_MASK;
+    uint32_t flags = 0;
+    if (t->job_ctx_lsa && q + 16 > t->job_ctx_lsa && q < t->job_ctx_lsa + SPURS_PM_REC_CTX_BYTES)
+        flags |= SPURS_PM_LSREAD_IN_CTX;
+    if (q == (r3 & ~0xFu)) flags |= SPURS_PM_LSREAD_AT_CTX;
+    const uint8_t* v = ctx->ls + q;
+    /* the aggregate row */
+    uint32_t h = (t->job_module * 2654435761u) ^ (t->job_entry * 40503u) ^ (q >> 4);
+    h = (h ^ (h >> 15)) * 2246822519u;
+    struct spurs_pm_lsread_row* row = NULL;
+    for (uint32_t i = 0; i < 32; i++) {
+        struct spurs_pm_lsread_row* e = &t->lsread[(h + i) & (SPURS_PM_LSREAD_TABLE - 1)];
+        if (!e->used) {
+            AcquireSRWLockExclusive(&s_pmrec_lock);    /* the printer reads rows */
+            e->module_ea = t->job_module; e->entry = t->job_entry; e->lsa_q = q;
+            memcpy(e->first, v, 16);
+            __atomic_store_n(&e->used, 1u, __ATOMIC_RELEASE);
+            ReleaseSRWLockExclusive(&s_pmrec_lock);
+            row = e; break;
+        }
+        if (e->module_ea == t->job_module && e->entry == t->job_entry && e->lsa_q == q) { row = e; break; }
+    }
+    if (row) {
+        PMREC_ADD(row->reads, 1);
+        if (flags & SPURS_PM_LSREAD_IN_CTX) PMREC_ADD(row->in_ctx, 1);
+        if (flags & SPURS_PM_LSREAD_AT_CTX) PMREC_ADD(row->at_ctx, 1);
+        if (memcmp(row->first, v, 16)) PMREC_ADD(row->changed, 1);
+        memcpy(row->last, v, 16);
+    } else PMREC_ADD(t->lsread_overflow, 1);
+    if (!t->recording) return;
+    struct spurs_pm_rec_buf b; b.n = 0;
+    pmb_u32(&b, lsa); pmb_u32(&b, 16); pmb_u32(&b, flags);
+    pmb_u32(&b, t->job_module); pmb_u32(&b, t->job_entry); pmb_u32(&b, t->job_ctx_lsa);
+    pmb_u32(&b, (uint32_t)ctx->pc & SPU_LS_MASK); pmb_u32(&b, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    pmb_u32(&b, ctx->gpr[1]._u32[0] & SPU_LS_MASK);
+    for (int i = 0; i < 4; i++) pmb_u32(&b, ctx->gpr[3]._u32[i]);
+    pmb_u32(&b, spurs_pm_rec_module_of(ctx, (uint32_t)ctx->pc & SPU_LS_MASK));
+    pmb_bytes(&b, v, 16);
+    spurs_pm_rec_emit(t, SPURS_PM_REC_LSREAD, &b, NULL, 0);
+}
+
+/* The aggregate table, merged over workers: stderr, and when recording also
+ * <dir>/pmrec-lsread-<pid>.txt (rewritten at each print, so a killed process
+ * keeps the last one). */
+static void spurs_pm_rec_print_lsread(void)
+{
+    if (!s_pmrec.lsread_limit) return;
+    FILE* f = NULL;
+    if (s_pmrec.record) {
+        char path[1200];
+        snprintf(path, sizeof(path), "%s/pmrec-lsread-%u.txt", s_pmrec.dir, spurs_pm_rec_getpid());
+        f = fopen(path, "w");
+    }
+    AcquireSRWLockShared(&s_pmrec_lock);
+    uint64_t all = 0, low = 0, over = 0; unsigned rows = 0;
+    for (struct spurs_pm_rec_thread* t = s_pmrec_threads; t; t = t->next) {
+        all += __atomic_load_n(&t->lsread_jobs_reads, __ATOMIC_RELAXED);
+        low += __atomic_load_n(&t->lsread_low_reads, __ATOMIC_RELAXED);
+        over += __atomic_load_n(&t->lsread_overflow, __ATOMIC_RELAXED);
+    }
+    char head[256];
+    snprintf(head, sizeof(head), "[spurs-pm-lsread] t_s=%.1f limit=0x%X job_reads=%llu below=%llu overflow=%llu\n",
+             (double)(spurs_pm_rec_now() - __atomic_load_n(&s_pmrec_first_ns, __ATOMIC_RELAXED)) / 1e9,
+             s_pmrec.lsread_limit, (unsigned long long)all, (unsigned long long)low, (unsigned long long)over);
+    fputs(head, stderr); if (f) fputs(head, f);
+    for (struct spurs_pm_rec_thread* t = s_pmrec_threads; t; t = t->next)
+        for (int i = 0; i < SPURS_PM_LSREAD_TABLE; i++) {
+            const struct spurs_pm_lsread_row* e = &t->lsread[i];
+            if (!__atomic_load_n(&e->used, __ATOMIC_ACQUIRE)) continue;
+            char line[400]; int n;
+            n = snprintf(line, sizeof(line), "[spurs-pm-lsread] worker=%u module=%08X entry=%05X lsq=%05X reads=%llu "
+                         "in_ctx=%llu at_ctx=%llu changed=%llu first=", t->seq, e->module_ea, e->entry, e->lsa_q,
+                         (unsigned long long)e->reads, (unsigned long long)e->in_ctx,
+                         (unsigned long long)e->at_ctx, (unsigned long long)e->changed);
+            for (int k = 0; k < 16; k++) n += snprintf(line + n, sizeof(line) - (size_t)n, "%02X", e->first[k]);
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " last=");
+            for (int k = 0; k < 16; k++) n += snprintf(line + n, sizeof(line) - (size_t)n, "%02X", e->last[k]);
+            snprintf(line + n, sizeof(line) - (size_t)n, "\n");
+            fputs(line, f ? f : stderr);   /* rows go to the file when there is one */
+            rows++;
+        }
+    ReleaseSRWLockShared(&s_pmrec_lock);
+    fprintf(stderr, "[spurs-pm-lsread] rows=%u%s\n", rows, f ? " (table in the recording directory)" : "");
+    if (f) fclose(f);
+    fflush(stderr);
+}
+
 static const struct spurs_pm_observer s_pmrec_observer = {
     spurs_pm_rec_transfer, spurs_pm_rec_command, spurs_pm_rec_atomic,
     spurs_pm_rec_branch, spurs_pm_rec_kernel
@@ -608,6 +752,7 @@ static void spurs_pm_record_run_begin(spu_context* ctx, int image_id, const uint
     t->pm_hi = 0xA00u + pm_size;
     t->region = SPURS_PM_REGION_POLICY; t->depth = 0; t->bypass = 0;
     t->job_ctx_lsa = 0; t->job_link = 0; t->job_host_depth = 0; t->run_jobs = 0; t->run_polls = 0;
+    t->job_entry = 0; t->job_module = 0;
     t->array_line = (uint32_t)wkl_data;
     memset(t->array_ea, 0, sizeof(t->array_ea));
     memset(t->cand, 0, sizeof(t->cand));
@@ -730,7 +875,7 @@ static void spurs_pm_record_run_end(spu_context* ctx, int result)
         t->recording = 0;
     }
     t->ctx = NULL;
-    if (s_pmrec.stats) {
+    if (s_pmrec.stats || s_pmrec.lsread_limit) {
         const uint64_t now = spurs_pm_rec_now();
         uint64_t next = __atomic_load_n(&s_pmrec_next_print, __ATOMIC_RELAXED);
         if (!next) {
@@ -739,7 +884,8 @@ static void spurs_pm_record_run_end(spu_context* ctx, int result)
         } else if (now >= next &&
                    __atomic_compare_exchange_n(&s_pmrec_next_print, &next, now + s_pmrec.stats_ns, 0,
                                                __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-            spurs_pm_rec_print_stats();
+            if (s_pmrec.stats) spurs_pm_rec_print_stats();
+            spurs_pm_rec_print_lsread();
         }
     }
 }
