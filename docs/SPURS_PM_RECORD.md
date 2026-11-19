@@ -16,8 +16,11 @@ Implementation: `runtime/spu/spurs_pm_record.inc` (included by
 
 All are read once, at the first policy run. With none set, no context ever gets
 an observer and the policy runner pays one load of a resolved configuration word
-per run; every hook site in the MFC engine and the resolver is one untaken test
-of a field of the context it is already working on.
+per run. Every hook site in the MFC engine and the resolver first tests
+`g_spu_dispatch_gates.pm_extras` (a word on the gate cache line those paths
+already load, predicted not taken), which the recorder opens only when one of
+these variables is set; only then does a site read the context's observer
+pointer.
 
 | Variable | Meaning |
 |---|---|
