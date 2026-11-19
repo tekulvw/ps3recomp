@@ -56,6 +56,21 @@ MUTANTS = {
     'finish-claims-nothing': (RUN, '        else if (wj_claim(r, &r->next, 1)) wwsjm_finish_result(&r->next.h, result);',
                               '        else if (0) wwsjm_finish_result(&r->next.h, result);'),
     'context-array-dropped': (RUN, '    a.array = job->array;', '    a.array = 0;'),
+    # spec 13.4: the fixed low local store
+    'low-ls-not-planted': (RUN, '    wj_plant_low_ls(r);\n    r->tags = 0;', '    r->tags = 0;'),
+    'vector-not-planted': (RUN, '    for (unsigned i = 0; i < 4; i++) wwsjm_put32(ls + 4 * i,',
+                           '    for (unsigned i = 0; i < 0; i++) wwsjm_put32(ls + 4 * i,'),
+    'vector-to-job-return': (RUN, 'wj_bra(SPURS_NATIVE_PM_SLOT_LS(WJ_SVC_IRQ_LANDING))',
+                             'wj_bra(SPURS_NATIVE_PM_JOB_RETURN_LS)'),
+    'vector-not-bra': (RUN, 'return 0x30000000u | ((target >> 2)', 'return 0x32000000u | ((target >> 2)'),
+    'low-zeros-skipped': (RUN, '    memset(ls + 0x10, 0, WJ_JOB_SCRATCH_LS - 0x10);\n', ''),
+    'irq-landing-quiet': (RUN, '    [WJ_SVC_IRQ_LANDING] = wj_svc_irq_landing,\n', '    [WJ_SVC_IRQ_LANDING] = wj_svc_release,\n'),
+    'kctx-lane-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xC8, r->lane);\n', ''),
+    'kctx-instance-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xC4, r->spurs_ea);\n', ''),
+    'kctx-select-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xE4, SPURS_PM_SELECT_WORKLOAD_LS);\n', ''),
+    'context-moved': (RUN, '    WJ_CTX_LS = 0x1330, ', '    WJ_CTX_LS = 0x1200, '),
+    'command-copy-moved': (RUN, '    WJ_PORTION_LS = 0xC00, ', '    WJ_PORTION_LS = 0x1200, '),
+    'context-in-job-scratch': (RUN, '    WJ_CTX_LS = 0x1330, ', '    WJ_CTX_LS = 0x80, '),
 }
 
 
@@ -121,7 +136,7 @@ def check(binary: Path) -> list[str]:
         r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': mode})
         want = dict(done='1', jobs='61', ran='61', dup='0', missing='0', bad_out='0', regs='0', ctx='0', ud='0',
                     module='0', gather='0', desc='0', tag='0', finish='0', violations='0', lifted='0', current='1',
-                    n0='43', s0='43', n1='65', s1='65', lanes_busy='0', gate='0', switches='FFFE')
+                    n0='43', s0='43', n1='65', s1='65', lanes_busy='0', gate='0', switches='FFFE', lowls='0')
         for k, v in want.items():
             expect(r.get(k) == v, f'native {mode}: {k}={r.get(k)} expected {v}')
         expect(int(r.get('finish_jobs', 0)) > 0, f'native {mode}: finish never claimed a next job: {r}')
@@ -134,6 +149,11 @@ def check(binary: Path) -> list[str]:
                    int(s.get('putllc_retries', 0)) > 0,
                    f'native {mode}: counters {s}')
         expect('FATAL' not in err, f'native {mode}: {err[-600:]}')
+    # the interrupt vector's target halts loudly
+    ri = subprocess.run([str(binary), 'native-irq'], env=dict(BASE_ENV, PS3RECOMP_SPURS_NATIVE_PM='1'),
+                        capture_output=True, text=True, timeout=60)
+    expect(ri.returncode != 0 and 'FATAL SPU interrupt vector entered' in ri.stderr,
+           f'interrupt vector target did not halt loudly: rc={ri.returncode} {ri.stderr[-400:]}')
     # the shadow comparison, fed the native runs' own events: every run identical,
     # also with the short dispatch entry requested (it must yield to the comparison:
     # the recorder that feeds it sees every branch)

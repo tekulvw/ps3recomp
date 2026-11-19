@@ -20,13 +20,22 @@ extern u128 spu_rdch(spu_context*, uint32_t);
 #define WJ_FINGERPRINT UINT64_C(0xAD16923605435AD0)
 #define WJ_SHA256 "6a3af90518af72ed790b36b2081ab2040237d378bf3644d4461356b44bcfc58a"
 
-/* Local store the native manager owns, below the job window. */
+/* Local store below the job window (spec 13.4). Job-facing, at the addresses
+ * the jobs were observed to read (spec 13.2, 5.2): the interrupt-vector
+ * quadword at 0 and zeros to 0x7F, the SPURS kernel context at 0x100-0x1E7,
+ * the command copy (and so the userdata) at 0xC00, the job API context at
+ * 0x1330. 0x80-0x17F belongs to the running job (its reservation buffers).
+ * The manager's own scratch is anywhere else below 0x4000. */
 enum {
+    WJ_JOB_SCRATCH_LS = 0x80,  /* [0x80, 0x180): the job's while it runs */
+    WJ_JOB_SCRATCH_END = 0x180,
+    WJ_KCTX_LS = 0x100,       /* SPURS kernel context (spec 3.1)    */
+    WJ_KCTX_END = 0x1E8,
+    WJ_PORTION_LS = 0xC00,    /* the record's command portion       */
     WJ_LINE_LS = 0x1000,      /* job list line (atomics)            */
     WJ_INST_LS = 0x1080,      /* SPURS instance line (ready counts) */
     WJ_DEP_LS = 0x1100,       /* dependency counter line            */
-    WJ_CTX_LS = 0x1200,       /* job API context (0x80 bytes)       */
-    WJ_PORTION_LS = 0x1300,   /* the record's command portion       */
+    WJ_CTX_LS = 0x1330,       /* job API context (0x80 bytes)       */
     WJ_STACK = 0x3F990,       /* job stack top (spec 5.1)           */
     WJ_LS_LOW = 0x4000,       /* job buffers live in [LOW, HIGH)    */
     WJ_LS_HIGH = 0x3C000,
@@ -38,6 +47,18 @@ enum {
  * Only get-buffer, finish and release exist; the others are left empty, and a
  * job that branches to one stops the process (the seam's loud refusal). */
 enum { WJ_SVC_GET_BUFFER = 1, WJ_SVC_FINISH = 5, WJ_SVC_RELEASE = 6 };
+/* The slot the interrupt-vector quadword at LS 0 branches to (spec 13.4): never
+ * entered, since the native run raises no SPU events; it halts loudly. */
+enum { WJ_SVC_IRQ_LANDING = 7 };
+
+/* No manager area overlaps a job-facing range or the job's scratch. */
+#define WJ_DISJOINT(a, an, b, bn) ((a) + (an) <= (b) || (b) + (bn) <= (a))
+_Static_assert(WJ_DISJOINT(WJ_PORTION_LS, WWSJM_MAX_PORTION, 0, WJ_KCTX_END) &&
+               WJ_DISJOINT(WJ_PORTION_LS, WWSJM_MAX_PORTION, WJ_CTX_LS, 0x80) &&
+               WJ_DISJOINT(WJ_PORTION_LS, WWSJM_MAX_PORTION, WJ_LINE_LS, 0x180), "command copy overlaps");
+_Static_assert(WJ_DISJOINT(WJ_LINE_LS, 0x180, 0, WJ_KCTX_END) && WJ_DISJOINT(WJ_LINE_LS, 0x180, WJ_CTX_LS, 0x80) &&
+               WJ_DISJOINT(WJ_CTX_LS, 0x80, 0, WJ_KCTX_END), "manager area overlaps a job-facing range");
+_Static_assert(SPURS_NATIVE_PM_SLOT_LS(WJ_SVC_IRQ_LANDING) < SPURS_NATIVE_PM_JOB_RETURN_LS, "landing slot");
 
 struct wj_job {
     int valid;
@@ -281,6 +302,26 @@ static void wj_stage(struct wj_run* r)
     if (issued) wj_wait_tag(c, WJ_STAGE_TAG);
 }
 
+/* SPU `bra` (absolute branch) to an LS address. */
+static uint32_t wj_bra(uint32_t target) { return 0x30000000u | ((target >> 2) & 0xFFFFu) << 7; }
+
+/* The fixed low local store every job may read (spec 13.4 item 1), planted
+ * before each job: a job may have used any of it. */
+static void wj_plant_low_ls(struct wj_run* r)
+{
+    uint8_t* ls = r->ctx->ls;
+    for (unsigned i = 0; i < 4; i++) wwsjm_put32(ls + 4 * i, wj_bra(SPURS_NATIVE_PM_SLOT_LS(WJ_SVC_IRQ_LANDING)));
+    memset(ls + 0x10, 0, WJ_JOB_SCRATCH_LS - 0x10);
+    /* the kernel context fields spec 3.1 defines; the rest is the kernel's */
+    wwsjm_put32(ls + WJ_KCTX_LS + 0xC0, 0);
+    wwsjm_put32(ls + WJ_KCTX_LS + 0xC4, r->spurs_ea);
+    wwsjm_put32(ls + WJ_KCTX_LS + 0xC8, r->lane);
+    wwsjm_put32(ls + WJ_KCTX_LS + 0xCC, 8);
+    wwsjm_put32(ls + WJ_KCTX_LS + 0xDC, r->wid);
+    wwsjm_put32(ls + WJ_KCTX_LS + 0xE0, SPURS_PM_EXIT_TO_KERNEL_LS);
+    wwsjm_put32(ls + WJ_KCTX_LS + 0xE4, SPURS_PM_SELECT_WORKLOAD_LS);
+}
+
 static void wj_run_job(struct wj_run* r, const struct wj_job* job)
 {
     spu_context* c = r->ctx;
@@ -321,6 +362,7 @@ static void wj_run_job(struct wj_run* r, const struct wj_job* job)
     const uint32_t entry = set0_ls + wwsjm_be32(c->ls + set0_ls + 0x10);
     if (entry < set0_ls || entry >= set0_ls + set0_bytes || (entry & 3)) wj_fatal(r, "module entry outside its set", entry, set0_ls);
 
+    wj_plant_low_ls(r);
     r->tags = 0;
     r->finishes = 0;
     r->released = 0;
@@ -423,10 +465,18 @@ static int wj_svc_finish(spu_context* c)
     return SPURS_NATIVE_SERVICE_RETURN;
 }
 
+static int wj_svc_irq_landing(spu_context* c)
+{
+    wj_fatal(wj_current(c), "SPU interrupt vector entered (the native job manager raises no SPU events)",
+             c->gpr[0]._u32[0] & SPU_LS_MASK, (uint32_t)c->pc & SPU_LS_MASK);
+    return SPURS_NATIVE_SERVICE_RETURN;
+}
+
 static const struct spurs_native_services s_wj_services = { {
     [WJ_SVC_GET_BUFFER] = wj_svc_get_buffer,
     [WJ_SVC_FINISH] = wj_svc_finish,
     [WJ_SVC_RELEASE] = wj_svc_release,
+    [WJ_SVC_IRQ_LANDING] = wj_svc_irq_landing,
 } };
 
 /* ---- one dispatch ---------------------------------------------------------------------- */

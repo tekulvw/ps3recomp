@@ -13,8 +13,19 @@
  * A monitor thread checks the PPU's completion predicate against the outputs
  * while the lanes run.
  *
- * argv[1]: "native" (register the implementation for the manufactured image)
- * or "unset" (register nothing extra; the switch decides). Prints one
+ * Each job also checks the fixed low local store (spec 13.4): the interrupt
+ * vector quadword at 0, zeros to 0x7F, the kernel context fields at 0x1C0-0x1E7,
+ * the context at 0x1330 and the command copy at 0xC00; then it uses all of its
+ * scratch 0x80-0x17F (a GETLLAR of its list line into 0x80, as the jobs do, and
+ * a fill of the rest) before calling any service, so the manager must keep
+ * nothing there while a job runs. After its last service call it also leaves
+ * junk at 0x10-0x7F and 0x1C0-0x1E7, so the next job sees the fixed contents
+ * only if the manager plants them before every job.
+ *
+ * argv[1]: "native" (register the implementation for the manufactured image),
+ * "native-irq" (the same, and the first job branches to the interrupt vector's
+ * target: the process must stop loudly) or "unset" (register nothing extra;
+ * the switch decides). Prints one
  * "result" line of key=value fields. */
 #include <assert.h>
 #include <pthread.h>
@@ -63,7 +74,8 @@ static struct { uint32_t array, index, module, sum, wid, list; } s_job[MAX_JOBS]
 static unsigned s_jobs;
 static volatile uint32_t g_runs[MAX_JOBS];
 static volatile uint32_t g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather, g_err_desc, g_err_tag,
-    g_err_finish, g_violations, g_lifted_runs, g_finish_jobs, g_breaks;
+    g_err_finish, g_violations, g_lifted_runs, g_finish_jobs, g_breaks, g_err_lowls;
+static int g_irq_test;
 
 /* ---- guest construction (the PPU stand-in) -------------------------------------- */
 static void be32w(uint32_t ea, uint32_t v) { vm_write32(ea, v); }
@@ -229,6 +241,30 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
         be32r(x + 0x18) != ((s_job[k].list + 0x0A000000u) | s_job[k].array) ||
         be32r(x + 0x1C) != (s_job[k].wid << 16 | 0xFFFFu))
         ERR(g_err_ctx);
+    /* the fixed low local store (spec 13.4) */
+    {
+        const uint8_t* ls = c->ls;
+        const uint32_t v = be32r(ls), target = ((v >> 7) & 0xFFFFu) << 2;
+        int bad = (v >> 23) != 0x060u || be32r(ls + 4) != v || be32r(ls + 8) != v || be32r(ls + 12) != v ||
+                  target < 0x900u || target >= 0x9B0u || (target & 15) ||
+                  target == be32r(x + 0x34) || target == be32r(x + 0x44) || target == be32r(x + 0x48);
+        for (uint32_t o = 0x10; o < 0x80; o++) bad |= ls[o] != 0;
+        bad |= be32r(ls + 0x1C0) != 0 || be32r(ls + 0x1C4) != SPURS_EA || be32r(ls + 0x1C8) != lane ||
+               be32r(ls + 0x1CC) != 8 || be32r(ls + 0x1DC) != s_job[k].wid || be32r(ls + 0x1E0) != 0x9C0u ||
+               be32r(ls + 0x1E4) != 0x9D0u;
+        bad |= ctx_ls != 0x1330u || ud < 0xC00u || ud >= 0xD00u;
+        if (bad) ERR(g_err_lowls);
+        if (g_irq_test && __atomic_exchange_n(&g_irq_test, 0, __ATOMIC_ACQ_REL)) {
+            c->gpr[0] = spu_link(JOB_SITE + 4); c->pc = target; c->host_depth++;
+            spu_indirect_branch(c); spu_drain_call(c, JOB_SITE + 4);
+            c->host_depth--;
+        }
+    }
+    /* the job's scratch: its reservation buffer at 0x80 (a GETLLAR of its list
+     * line, as the jobs do) and the rest of 0x80-0x17F */
+    mfc(c, MFC_GETLLAR_CMD, 0x80, s_job[k].list, 128, 0);
+    (void)spu_rdch(c, MFC_RdAtomicStat);
+    memset(c->ls + 0x80, 0xA5, 0x100);
     /* the module the record named, at its load base */
     if (memcmp(c->ls + 0x4000, vm_base + (module ? MOD_B_EA : MOD_A_EA), MOD_BYTES) != 0) ERR(g_err_module);
     /* inputs: get buffer 1 (with a tag), the gathered pieces at the list rule's places */
@@ -266,6 +302,11 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
     call_service(c, ctx_ls, 0x44, 0x1234, 0x5678, 0x9ABC, f);   /* garbage arguments */
     if (!(f[0] == 0 && f[1] == 0xFFFFFFFFu) && (f[0] & 0xFFFF) != 1) ERR(g_err_finish);
     if ((f[0] & 0xFFFF) == 1) ERR(g_finish_jobs);     /* finish claimed the next job */
+    /* after its last service call the job leaves junk in the low local store the
+     * manager must plant before every job (spec 13.4: "before entering any job";
+     * the runtime's own kernel-context write happens only at the run's start) */
+    memset(c->ls + 0x10, 0xC3, 0x70);
+    memset(c->ls + 0x1C0, 0x3C, 0x28);
 done:
     c->gpr[0] = link;
     c->gpr[1] = spu_make_preferred_u32(0x3F990u);
@@ -328,7 +369,8 @@ int main(int argc, char** argv)
 {
     vm_base = (uint8_t*)calloc(1, GUEST); ppu_vm_size = GUEST;
     { extern uint8_t g_vm_page_bitmap[65536 / 8]; memset(g_vm_page_bitmap, 255, sizeof g_vm_page_bitmap); }
-    const int native = argc > 1 && !strcmp(argv[1], "native");
+    const int native = argc > 1 && (!strcmp(argv[1], "native") || !strcmp(argv[1], "native-irq"));
+    g_irq_test = argc > 1 && !strcmp(argv[1], "native-irq");
     for (uint32_t i = 0; i < PM_SIZE; i++) vm_base[PM_EA + i] = (uint8_t)(i * 29u + 3u);
     const uint64_t fp = spu_workload_fingerprint(vm_base + PM_EA, PM_SIZE);
     spu_workload_register_img(fp, lifted_pm, IMAGE, "fixture");
@@ -393,11 +435,11 @@ int main(int argc, char** argv)
     for (unsigned a = 0; a < 2; a++) for (unsigned s = 0; s < 6; s++) lanes_busy += be16r(LIST_EA + 0x44 + 16 * a + 2 * s) != 0xFFFF;
     printf("result done=%d jobs=%u ran=%u dup=%u missing=%u bad_out=%u regs=%u ctx=%u ud=%u module=%u gather=%u desc=%u "
            "tag=%u finish=%u violations=%u lifted=%u current=%u n0=%u s0=%u n1=%u s1=%u lanes_busy=%u gate=%u "
-           "switches=%04X consults=%lu finish_jobs=%u breaks=%u\n",
+           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u\n",
            done, s_jobs, ran, dup, missing, bad_out, g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather,
            g_err_desc, g_err_tag, g_err_finish, g_violations, g_lifted_runs, be16r(LIST_EA + 0x0A),
            be16r(LIST_EA + 0x42), be16r(LIST_EA + 0x40), be16r(LIST_EA + 0x52), be16r(LIST_EA + 0x50), lanes_busy,
-           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks);
+           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls);
     fflush(stdout);
     if (native) spurs_wwsjm_print_stats();
     if (native && getenv("PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW")) spurs_wwsjm_shadow_print();

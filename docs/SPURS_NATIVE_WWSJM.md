@@ -63,8 +63,20 @@ One dispatch on a slot's resident context, on its worker thread:
   §12.1). Module copies go through the context's MFC GETs (16 KiB at most), except where the
   per-run residency table says the module is already in place. Each gathered element is one
   GET at the place the core lays out. The loop then waits for the staging tag.
-- **Entering a job.** The command portion is copied to LS `0x1300` and the job API context
-  built at `0x1200`. The job is entered through the seam with r1 = `0x3F990`,
+- **Entering a job.** The command portion is copied to LS `0xC00`, so the parameter data the
+  context points at lands at `0xC00` plus the commands' aligned length. The job API context is
+  built at `0x1330`. Before each job the loop also plants the fixed low local store that jobs
+  were observed to read (spec §13):
+  - `0x000–0x00F`: four copies of an absolute branch (`bra`) to a window slot whose handler
+    stops the process. The native run raises no SPU events, so that slot is never entered.
+  - `0x010–0x07F`: zero.
+  - The SPURS kernel context fields at `0x1C0–0x1E7`: instance EA, lane, kernel DMA tag 8,
+    workload id, and the exit and select-workload addresses.
+
+  These are job-facing contract addresses, not the lifted module's layout.
+  `0x080–0x17F` belongs to the running job (its reservation buffers), and the manager keeps
+  nothing there; static assertions keep the manager's own areas (`0x1000–0x117F`) clear of
+  every job-facing range. The job is entered through the seam with r1 = `0x3F990`,
   r3 = the context (all four words), r4 = 0, r5 = the entry and r6 = `0x2C000000`.
 - **Services, through the native-service window:**
   - **get buffer** returns the core's descriptor; a request with `r6 ≠ 0` takes the job's next
@@ -72,7 +84,8 @@ One dispatch on a slot's resident context, on its worker thread:
   - **release** returns all ones.
   - **finish** polls the kernel, claims the next job if one is claimable (the lane's marker
     stays on the running job), and publishes the ready count.
-  - The other context slots are left empty, so a job that calls one stops the process.
+  - The other context slots are left empty, so a job that calls one stops the process. Window
+    slot 7 is the interrupt-vector landing slot and stops the process too.
 - **After the job.** The retire is one PUTLLC, then the dependency decrements (one PUTLLC
   each), then a ready-count write for each counter that reached zero, then the ready rule.
   The loop continues with the job finish claimed, or claims again.
