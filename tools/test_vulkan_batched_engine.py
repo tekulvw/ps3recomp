@@ -2,8 +2,8 @@
 """Vulkan engine backend: the same synthetic operation stream recorded per
 operation (default), batched (PS3RECOMP_VK_BATCHED_ENGINE=1) and batched with
 same-target draws merged into one render pass (PS3RECOMP_VK_MERGE_PASSES=1),
-with descriptor sets reused across draws (PS3RECOMP_VK_DESCRIPTOR_REUSE=1), and
-with both, and batched through a pipeline cache saved by one run and loaded by
+with descriptor sets reused across draws (PS3RECOMP_VK_DESCRIPTOR_REUSE=1), with
+both, with the host buffers in cached memory (PS3RECOMP_VK_ARENA_CACHED=1), and batched through a pipeline cache saved by one run and loaded by
 the next (PS3RECOMP_VK_PIPELINE_CACHE), must read back identical bytes, every run clean under the Khronos validation layer
 (with synchronization validation). Synthetic inputs only.
 
@@ -105,6 +105,22 @@ def main():
                 diff = sum(a != b for a, b in zip(outputs["sync"], outputs[mode]))
                 raise SystemExit(f"{mode} readback differs from per-operation submission in {diff} bytes")
         print(f"PASS batched, merged, reused and merged+reused recording read back identically ({len(outputs['sync'])} bytes)")
+        # PS3RECOMP_VK_ARENA_CACHED=1: the arena and the host vertex/index/constant
+        # buffers take a cached coherent memory type when the device has one; the
+        # same bytes must read back, per operation and batched, under validation.
+        for mode in ("sync", "both"):
+            out = Path(tmp) / f"{mode}-arena-cached.bin"
+            result = subprocess.run([str(binary), mode, str(out), args.draws],
+                                    env=dict(environment, PS3RECOMP_VK_ARENA_CACHED="1"),
+                                    capture_output=True, text=True, timeout=1800)
+            result.check_returncode()
+            text = result.stdout + result.stderr
+            if "VUID-" in text or "SYNC-HAZARD" in text or "Validation Error" in text or "THREADING ERROR" in text:
+                raise SystemExit(f"Vulkan validation rejected the {mode} run with PS3RECOMP_VK_ARENA_CACHED=1")
+            if out.read_bytes() != outputs[mode]:
+                diff = sum(a != b for a, b in zip(out.read_bytes(), outputs[mode]))
+                raise SystemExit(f"{mode} readback with PS3RECOMP_VK_ARENA_CACHED=1 differs in {diff} bytes")
+        print("PASS PS3RECOMP_VK_ARENA_CACHED=1 reads back identically, per operation and batched")
         # PS3RECOMP_VK_PIPELINE_CACHE: the first run fills and saves the cache,
         # the second starts from it; both must read back as the others did.
         # A driver that keeps no payload in its pipeline cache (lavapipe) saves
