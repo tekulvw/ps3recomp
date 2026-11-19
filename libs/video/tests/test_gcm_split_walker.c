@@ -51,6 +51,12 @@ static void gcm_split_stop(void) {}
 #else
 #define GUEST_SIDE
 #endif
+/* The guest side's own loads and stores: direct volatile accesses inside
+ * uninstrumented functions, so neither the compiler's instrumentation nor the
+ * memcpy interceptor sees them (the names need no symbolizer). Big-endian
+ * words, as the guest writes them. */
+GUEST_SIDE static u32 guest_ld32(u32 ea) { const u32 v = *(const volatile u32*)(vm_base + ea); return __builtin_bswap32(v); }
+GUEST_SIDE static void guest_st32(u32 ea, u32 v) { *(volatile u32*)(vm_base + ea) = __builtin_bswap32(v); }
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
@@ -152,7 +158,7 @@ static void raw32(u32 ea,u32 v) { v=ps3_bswap32(v);memcpy(vm_base+ea,&v,4); }
 static u32 wr(u32 io, u32 w) { raw32(IO_EA(io), w); return io + 4; }
 static u32 wr_n(u32 io, const u32* w, u32 n) { for (u32 i = 0; i < n; i++) io = wr(io, w[i]); return io; }
 static void set_put(u32 io) { atomic_thread_fence(memory_order_release); raw32(CTRL + 0, io); }
-GUEST_SIDE static u32 get_reg(void) { return vm_read32(CTRL + 4); }
+GUEST_SIDE static u32 get_reg(void) { return guest_ld32(CTRL + 4); }
 static void walk_to(u32 put)
 {
     set_put(put);
@@ -160,7 +166,7 @@ static void walk_to(u32 put)
     assert(s_fifo_getoff == put);
 }
 static void drained(void) { gcm_split_drain(); }
-GUEST_SIDE static void fill_vtx(u32 pattern) { for (u32 i = 0; i < VTX_BYTES / 4; i++) raw32(VTX_EA + i * 4, pattern); }
+GUEST_SIDE static void fill_vtx(u32 pattern) { for (u32 i = 0; i < VTX_BYTES / 4; i++) guest_st32(VTX_EA + i * 4, pattern); }
 static u32 draw_words(u32 io)
 {
     const u32 w[] = { 0x41808u, 4u, 0x41814u, 0x00030000u, 0x41808u, 0u };
@@ -184,10 +190,10 @@ GUEST_SIDE static void* writer_main(void* unused)
         const u32 v = atomic_load(&g_sig_value);
         int fire = 0;
         switch (kind) {
-        case SIG_LABEL:  fire = vm_read32(g_label_ea) == v; break;
-        case SIG_REF:    fire = vm_read32(CTRL + 8) == v; break;
-        case SIG_FLIP:   fire = s_fifo_flips_reached == v; break;
-        case SIG_GETPUT: fire = get_reg() == vm_read32(CTRL + 0); break;
+        case SIG_LABEL:  fire = guest_ld32(g_label_ea) == v; break;
+        case SIG_REF:    fire = guest_ld32(CTRL + 8) == v; break;
+        case SIG_FLIP:   fire = *(volatile u32*)&s_fifo_flips_reached == v; break;
+        case SIG_GETPUT: fire = get_reg() == guest_ld32(CTRL + 0); break;
         }
         if (!fire) continue;
         fill_vtx(0xBADBAD00u);                  /* the guest reuses its buffer */
