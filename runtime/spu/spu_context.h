@@ -171,6 +171,7 @@ typedef struct spu_channel {
 /* ---------------------------------------------------------------------------
  * SPU execution context
  * -----------------------------------------------------------------------*/
+struct spurs_pm_observer;
 typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
@@ -417,6 +418,9 @@ typedef struct spu_context {
     /* PS3RECOMP_COH_VERSIONS (spu_coh_version.inc): the count of resv_ea's line
      * the reservation was taken under. It is lost when the count moves. */
     uint32_t resv_count;
+    /* SPURS policy-run observer (spurs_pm_observer.h): NULL unless the opt-in
+     * policy-run recorder or statistics armed this context for one run. */
+    const struct spurs_pm_observer* pm_observer;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -425,6 +429,15 @@ typedef struct spu_context {
  * kernel service; spu_indirect_branch intercepts (policy_mode only). */
 #define SPURS_PM_EXIT_TO_KERNEL_LS   0x9C0u
 #define SPURS_PM_SELECT_WORKLOAD_LS  0x9D0u
+/* The select-workload kernel service (spu_channels.c): counts the poll for
+ * the current run, consults the workload flag and the optional preemption
+ * hook, and leaves the kernel's answer in r3 ({selected wid, poll status} in
+ * the preferred doubleword). It does not change pc: the caller returns to
+ * its link. Shared by the resolver's intercept and any native policy run. */
+#ifdef __cplusplus
+extern "C"
+#endif
+void spurs_kernel_select_workload(struct spu_context* ctx);
 
 /* The taskset policy module's syscall trampoline. Both the full resolver
  * (spu_channels.c) and the musttail fast path (spu_dispatch_mt.c) must treat a

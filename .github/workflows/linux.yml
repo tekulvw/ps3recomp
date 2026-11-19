@@ -387,6 +387,11 @@ jobs:
           # PS3RECOMP_RSX_PIPELINE_REUSE: off/on/verify equivalence, the register-class
           # table against its reference logic, and its mutants.
           CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_engine_pipeline_reuse.py --mutants
+          # PS3RECOMP_SPURS_PM_RECORD / _STATS: the policy-run recorder is inert when
+          # unset, observes without effect, decodes to the performed events, and its
+          # mutants (dropped PUTLLC outcome, armed while unset, lost service return,
+          # wrong nested drain target) fail.
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_spurs_pm_record.py --mutants
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_fifo_busy.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread
           /tmp/test_color_feedback_engine
           # The texture cache's content hash: sensitivity, the cache, its speed.
