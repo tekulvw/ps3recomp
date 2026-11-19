@@ -48,7 +48,7 @@ typedef enum {
     WWSJM_E_DETACHED,       /* the current array has no guest address or no capacity */
     WWSJM_E_ENTRY_TYPE,     /* header entry type > 5 */
     WWSJM_E_HEADER,         /* header size nibble, size or EA alignment */
-    WWSJM_E_COMMAND,        /* command 0/6/7 or a malformed command word */
+    WWSJM_E_COMMAND,        /* command 6/7 (end, invalid) inside a command portion */
     WWSJM_E_FLAGS,          /* flag combination outside the contract */
     WWSJM_E_SET,            /* use of an unreserved set/buffer, double reserve */
     WWSJM_E_RANGE,          /* reserve outside the allowed LS window */
