@@ -1275,10 +1275,11 @@ static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
         if (channel == MFC_Cmd) {
-            const int is_atomic = v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD;
-            const int jobio = ps3_jobio_is(ctx) && is_atomic;
+            const int jobio = ps3_jobio_is(ctx) && (v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD);
             /* Opt-in policy-run recorder (spurs_pm_observer.h); NULL otherwise. */
-            const struct spurs_pm_observer* const pm_observer = is_atomic ? ctx->pm_observer : NULL;
+            const struct spurs_pm_observer* const pm_observer = spu_pm_extras_on() &&
+                (v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD)
+                ? ctx->pm_observer : NULL;
             const uint32_t jobio_ea = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1), jobio_lsa = ctx->mfc_lsa & SPU_LS_MASK;
             /* A conditional store is recorded with its source line before the
              * operation, and with the outcome afterwards. */
@@ -4048,7 +4049,7 @@ static int spu_ib_diagnostics_armed(void)
  * The job-return slot is reached by host return into the native run's drain,
  * never through here; a branch to it here, to an empty slot, or to the middle
  * of a slot is unsupported and stops the process. */
-static void spurs_native_window(spu_context* ctx)
+static __attribute__((noinline, cold)) void spurs_native_window(spu_context* ctx)
 {
     const uint32_t pc = ctx->pc & SPU_LS_MASK, off = pc - SPURS_NATIVE_PM_WINDOW_LS;
     const unsigned slot = off / SPURS_NATIVE_PM_SLOT_BYTES;
@@ -4068,8 +4069,10 @@ static void spurs_native_window(spu_context* ctx)
     }
 }
 
-/* cellSpursModulePoll as the HLE kernel answers it (spu_context.h). */
-void spurs_kernel_select_workload(spu_context* ctx)
+/* cellSpursModulePoll as the HLE kernel answers it (spu_context.h). Inlined
+ * into the resolver's intercept; spurs_kernel_select_workload is the same body
+ * for other callers. */
+static inline void spurs_kernel_select_workload_body(spu_context* ctx)
 {
     extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
     /* cellSpursModulePoll: report "no contention — keep running".
@@ -4098,8 +4101,9 @@ void spurs_kernel_select_workload(spu_context* ctx)
     ctx->gpr[3] = spu_make_preferred_u32(selected);
     ctx->gpr[3]._u32[1] = status;
     /* Opt-in policy-run recorder: every caller's poll, with its answer. */
-    if (ctx->pm_observer) ctx->pm_observer->kernel(ctx, SPURS_PM_KERNEL_SELECT);
+    if (spu_pm_extras_on() && ctx->pm_observer) ctx->pm_observer->kernel(ctx, SPURS_PM_KERNEL_SELECT);
 }
+void spurs_kernel_select_workload(spu_context* ctx) { spurs_kernel_select_workload_body(ctx); }
 
 void spu_indirect_branch(spu_context* ctx)
 {
@@ -4146,16 +4150,20 @@ void spu_indirect_branch(spu_context* ctx)
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited;
-        /* Opt-in policy-run recorder (spurs_pm_observer.h); NULL otherwise. */
-        const struct spurs_pm_observer* const pm_observer = ctx->pm_observer;
-        if (pm_observer && pm_observer->branch(ctx))
-            return;
-        /* Native-service window (spurs_native_pm.h): only while a native
-         * policy run has installed its table. */
-        if (ctx->native_services &&
-            ctx->pc - SPURS_NATIVE_PM_WINDOW_LS < SPURS_NATIVE_PM_WINDOW_END - SPURS_NATIVE_PM_WINDOW_LS) {
-            spurs_native_window(ctx);
-            return;
+        /* Opt-in policy extras, all behind one test of the gate line: the
+         * policy-run recorder (spurs_pm_observer.h) and the native-service
+         * window (spurs_native_pm.h, only while a native run installed its
+         * table). */
+        const struct spurs_pm_observer* pm_observer = NULL;
+        if (spu_pm_extras_on()) {
+            pm_observer = ctx->pm_observer;
+            if (pm_observer && pm_observer->branch(ctx))
+                return;
+            if (ctx->native_services &&
+                ctx->pc - SPURS_NATIVE_PM_WINDOW_LS < SPURS_NATIVE_PM_WINDOW_END - SPURS_NATIVE_PM_WINDOW_LS) {
+                spurs_native_window(ctx);
+                return;
+            }
         }
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
@@ -4173,7 +4181,7 @@ void spu_indirect_branch(spu_context* ctx)
             return;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            spurs_kernel_select_workload(ctx);
+            spurs_kernel_select_workload_body(ctx);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }
