@@ -69,6 +69,8 @@ with tempfile.TemporaryDirectory(prefix='spu-dcache-coverage-') as td:
                                 'if(i==0 && lsa>=s_verified_images[i].lo && lsa<s_verified_images[i].hi)'),
                 'odd-publication':('if(vregistration&1u)return spu_lifted_lookup_full(ctx,lsa);','/* bug: accepts incomplete publication */'),
                 'mixed-store':('if (fn && __atomic_load_n(&s_verified_generation,__ATOMIC_ACQUIRE)==vregistration) {','if (fn) {'),
+                'function-mask':('if(spu_lookup_exact(lsa,s_verified_images[i].image))','if(1)'),
+                'mask-registry':('e->vregistration==vregistration && e->rgen==rgen ? e->vmask','e->vregistration==vregistration ? e->vmask'),
             }
             for name,(old,new) in controls.items():
                 assert original.count(old)==1,(name,original.count(old))
