@@ -80,6 +80,8 @@ static const char* const spu_fast_path_env[] = {
  * dispatch cache is on (SPU_DISPATCH_CACHE=1 exactly, spu_fast_path_resolve). */
 static const char* const spu_ib_fast_env[] = {
     "LBP_HLE_JOBDONE",
+    "PS3RECOMP_SPURS_PM_RECORD",   /* the policy-run recorder sees every branch */
+    "PS3RECOMP_SPURS_PM_STATS",
     "SPU_DSPDESC",
     "SPU_DUMP_OVL",
     "SPU_IBCOV",

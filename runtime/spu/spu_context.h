@@ -171,6 +171,7 @@ typedef struct spu_channel {
 /* ---------------------------------------------------------------------------
  * SPU execution context
  * -----------------------------------------------------------------------*/
+struct spurs_pm_observer;
 typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
@@ -417,6 +418,9 @@ typedef struct spu_context {
     /* PS3RECOMP_COH_VERSIONS (spu_coh_version.inc): the count of resv_ea's line
      * the reservation was taken under. It is lost when the count moves. */
     uint32_t resv_count;
+    /* SPURS policy-run observer (spurs_pm_observer.h): NULL unless the opt-in
+     * policy-run recorder or statistics armed this context for one run. */
+    const struct spurs_pm_observer* pm_observer;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -425,6 +429,15 @@ typedef struct spu_context {
  * kernel service; spu_indirect_branch intercepts (policy_mode only). */
 #define SPURS_PM_EXIT_TO_KERNEL_LS   0x9C0u
 #define SPURS_PM_SELECT_WORKLOAD_LS  0x9D0u
+/* The select-workload kernel service (spu_channels.c): counts the poll for
+ * the current run, consults the workload flag and the optional preemption
+ * hook, and leaves the kernel's answer in r3 ({selected wid, poll status} in
+ * the preferred doubleword). It does not change pc: the caller returns to
+ * its link. Shared by the resolver's intercept and any native policy run. */
+#ifdef __cplusplus
+extern "C"
+#endif
+void spurs_kernel_select_workload(struct spu_context* ctx);
 
 /* The taskset policy module's syscall trampoline. Both the full resolver
  * (spu_channels.c) and the musttail fast path (spu_dispatch_mt.c) must treat a
@@ -581,14 +594,24 @@ typedef struct spu_dispatch_gates {
     int fast_path;                /* spu_fast_path_on() (spu_drain.c)          */
     int channel_inline;           /* spu_channel_inline_on() (spu_channel_inline.h) */
     int ib_fast;                  /* spu_ib_fast_on() (spu_channels.c)         */
-    char pad[64 - 8 * sizeof(int)];
+    /* Nonzero only while an opt-in SPURS policy extra is configured (the
+     * policy-run recorder, spurs_pm_record.inc; a native policy module,
+     * spurs_native_pm.h). Every hook site tests this line, already loaded on
+     * those paths, before it touches the per-context hook pointers. */
+    int pm_extras;
+    char pad[64 - 9 * sizeof(int)];
 } spu_dispatch_gates;
 #ifdef __cplusplus
 static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
 #else
 _Static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
 #endif
-SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, -1, -1, -1, {0} };
+SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, -1, -1, -1, 0, {0} };
+/* One load of the gate line; predicted not taken. */
+static inline int spu_pm_extras_on(void)
+{
+    return __builtin_expect(g_spu_dispatch_gates.pm_extras != 0, 0);
+}
 
 /* PS3RECOMP_MFC_FAST=1 (opt-in): the MFC command path, the channel entries,
  * the overlay note and the drain hop run their compact form, which drops the

@@ -22,6 +22,7 @@
 #include "spu_dma_source_trace.h"
 #include "spu_dma_publication.h"
 #include "../diagnostics/job_io_recorder.h"
+#include "spurs_pm_observer.h"
 #include "spu_dma_disposition.h"
 #include "../diagnostics/critical_write_trace.h"
 #include <stdint.h>
@@ -320,6 +321,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
          * follows the existing plain-MFC-write model; issuer reservation
          * behavior for storage controls is not separately modeled here. */
         if(ps3_jobio_is(spu))ps3_jobio_event(spu,PS3_JOBIO_ZERO,cmd,lsa,ea,size,NULL,0);
+        if (spu_pm_extras_on() && spu->pm_observer) spu->pm_observer->transfer(spu, SPURS_PM_XFER_ZERO, cmd, lsa, ea, size, NULL);
         if (g_spu_coh_ops) {   /* PS3RECOMP_COH_VERSIONS: each marked line under its count */
             g_spu_coh_ops->write((uint32_t)ea, vm_base + (uint32_t)ea, NULL, size, spu);
         } else {
@@ -868,6 +870,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
         spu_dma_disposition_after(&disposition, ls_ptr);
         copy_disposition = SPU_DMA_DISPOSITION_GET;
         if(ps3_jobio_is(spu))ps3_jobio_event(spu,PS3_JOBIO_GET,cmd,lsa,ea,size,ls_ptr,0);
+        if (spu_pm_extras_on() && spu->pm_observer) spu->pm_observer->transfer(spu, SPURS_PM_XFER_GET, cmd, lsa, ea, size, ls_ptr);
         if (armed) spu_dma_publication_observe(spu, lsa, ea, size, cmd);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
@@ -953,6 +956,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             if (armed) spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
             if(ps3_jobio_is(spu))ps3_jobio_event(spu,PS3_JOBIO_PUT,cmd,lsa,ea,size,ls_ptr,0);
+            if (spu_pm_extras_on() && spu->pm_observer) spu->pm_observer->transfer(spu, SPURS_PM_XFER_PUT, cmd, lsa, ea, size, ls_ptr);
             uint32_t a0 = (uint32_t)ea & ~127u;
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
             ps3_critical_write_token critical_write = {0};
@@ -1920,6 +1924,7 @@ SPU_DMA_BODY int mfc_submit_body(mfc_engine* mfc, spu_context* spu, uint32_t cmd
      * always on (policy runs are rare and their DMA pattern is the primary
      * bring-up signal: joblist fetch, job-module loads, output stores). */
     if (spu->policy_mode) {
+        if (spu_pm_extras_on() && spu->pm_observer) spu->pm_observer->command(spu, cmd, lsa, ea, size, tag);
         static int _pn = 0;
         /* Cap the boot-time flood, but reopen the trace once the PPU is at the
          * job barrier (g_barrier_sync_watch armed): the post-ticket DMA

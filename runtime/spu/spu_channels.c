@@ -31,6 +31,7 @@
 #include "spu_verified_overlay.h"
 #include "spu_overlay_residency.h"
 #include "spu_native_service.h"
+#include "spurs_pm_observer.h"
 #include <stdint.h>
 #include <errno.h>
 #include <stdatomic.h>
@@ -1274,11 +1275,15 @@ static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u
          * not the plain GET/PUT the DMA engine would do. */
         if (channel == MFC_Cmd) {
             const int jobio = ps3_jobio_is(ctx) && (v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD);
+            /* Opt-in policy-run recorder (spurs_pm_observer.h); NULL otherwise. */
+            const struct spurs_pm_observer* const pm_observer = spu_pm_extras_on() &&
+                (v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD)
+                ? ctx->pm_observer : NULL;
             const uint32_t jobio_ea = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1), jobio_lsa = ctx->mfc_lsa & SPU_LS_MASK;
             /* A conditional store is recorded with its source line before the
              * operation, and with the outcome afterwards. */
             uint8_t jobio_line[MFC_ATOMIC_LINE];
-            if (jobio && v != MFC_GETLLAR_CMD) memcpy(jobio_line, &ctx->ls[jobio_lsa], MFC_ATOMIC_LINE);
+            if ((jobio || pm_observer) && v != MFC_GETLLAR_CMD) memcpy(jobio_line, &ctx->ls[jobio_lsa], MFC_ATOMIC_LINE);
             if (spu_mfc_atomic(ctx, v)) {
                 if (jobio) {
                     if (v == MFC_GETLLAR_CMD)
@@ -1286,6 +1291,10 @@ static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u
                     else
                         ps3_jobio_event(ctx, v == MFC_PUTLLC_CMD ? PS3_JOBIO_PUTLLC : PS3_JOBIO_PUTLLUC, v, jobio_lsa, jobio_ea, MFC_ATOMIC_LINE, jobio_line, (uint32_t)ctx->atomic_stat);
                 }
+                if (pm_observer)
+                    pm_observer->atomic(ctx, v, jobio_lsa, jobio_ea,
+                                        v == MFC_GETLLAR_CMD ? &ctx->ls[jobio_lsa] : jobio_line,
+                                        (uint32_t)ctx->atomic_stat);
                 return;
             }
         }
@@ -4032,6 +4041,42 @@ static int spu_ib_diagnostics_armed(void)
     return value;
 }
 
+/* cellSpursModulePoll as the HLE kernel answers it (spu_context.h). Inlined
+ * into the resolver's intercept; spurs_kernel_select_workload is the same body
+ * for other callers. */
+static inline void spurs_kernel_select_workload_body(spu_context* ctx)
+{
+    extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
+    /* cellSpursModulePoll: report "no contention — keep running".
+     * (The host scheduler admits bounded workers; this service does not preempt.) */
+    unsigned n = ++g_spurs_pm_polls;
+    /* The poll count restarts with every policy-module run, which is
+     * thousands of runs a second: limit the log by process, not run. */
+    static atomic_uint s_poll_logs;
+    if ((n <= 4 || (n % 4096) == 0) &&
+        atomic_fetch_add_explicit(&s_poll_logs, 1, memory_order_relaxed) < 64)
+        fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+                n, ctx->gpr[3]._u32[0]);
+    /* The kernel ABI returns {selected wid, poll reason} in the
+     * preferred doubleword. Keep this runtime's current workload;
+     * returning all zero falsely requests a switch for every wid>0.
+     * Only its registered receiver may consume a pending flag. */
+    uint32_t ea_hi = spu_ls_read32(ctx, 0x1C0);
+    uint32_t ea = spu_ls_read32(ctx, 0x1C4);
+    uint32_t wid = spu_ls_read32(ctx, 0x1DC);
+    uint32_t status = ea_hi ? 0 : spurs_flag_status(ea, wid, 1);
+    /* A scheduler may name another workload this SPU should switch
+     * to (g_spurs_module_poll_hook); by default it never does. */
+    uint32_t selected = wid;
+    if (g_spurs_module_poll_hook && !ea_hi)
+        selected = g_spurs_module_poll_hook(ea, wid, spu_ls_read32(ctx, 0x1C8));
+    ctx->gpr[3] = spu_make_preferred_u32(selected);
+    ctx->gpr[3]._u32[1] = status;
+    /* Opt-in policy-run recorder: every caller's poll, with its answer. */
+    if (spu_pm_extras_on() && ctx->pm_observer) ctx->pm_observer->kernel(ctx, SPURS_PM_KERNEL_SELECT);
+}
+void spurs_kernel_select_workload(spu_context* ctx) { spurs_kernel_select_workload_body(ctx); }
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -4076,46 +4121,28 @@ void spu_indirect_branch(spu_context* ctx)
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
-        extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
+        extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited;
+        /* Opt-in policy-run recorder (spurs_pm_observer.h): behind the gate line. */
+        const struct spurs_pm_observer* const pm_observer = spu_pm_extras_on() ? ctx->pm_observer : NULL;
+        if (pm_observer && pm_observer->branch(ctx))
+            return;
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
              * Print gated: fires once per policy run = thousands/sec. */
             g_spurs_pm_exited = 1;
             { static SPU_THREAD_LOCAL int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
-              if (s_t) { static SPU_THREAD_LOCAL unsigned long _n = 0; unsigned long n = ++_n;
+              if (s_t) { extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
+                static SPU_THREAD_LOCAL unsigned long _n = 0; unsigned long n = ++_n;
                 if (n <= 64 || (n & 0xFFF) == 0)
                     fprintf(stderr, "[spurs-pm] exit-to-kernel#%lu (r3=0x%08X polls=%u)\n",
                             n, ctx->gpr[3]._u32[0], g_spurs_pm_polls); } }
+            if (pm_observer) pm_observer->kernel(ctx, SPURS_PM_KERNEL_EXIT);
             ctx->status = SPU_STATUS_STOPPED_BY_STOP;
             spu_halt(ctx);
             return;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            /* cellSpursModulePoll: report "no contention — keep running".
-             * (The host scheduler admits bounded workers; this service does not preempt.) */
-            unsigned n = ++g_spurs_pm_polls;
-            /* The poll count restarts with every policy-module run, which is
-             * thousands of runs a second: limit the log by process, not run. */
-            static atomic_uint s_poll_logs;
-            if ((n <= 4 || (n % 4096) == 0) &&
-                atomic_fetch_add_explicit(&s_poll_logs, 1, memory_order_relaxed) < 64)
-                fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
-                        n, ctx->gpr[3]._u32[0]);
-            /* The kernel ABI returns {selected wid, poll reason} in the
-             * preferred doubleword. Keep this runtime's current workload;
-             * returning all zero falsely requests a switch for every wid>0.
-             * Only its registered receiver may consume a pending flag. */
-            uint32_t ea_hi = spu_ls_read32(ctx, 0x1C0);
-            uint32_t ea = spu_ls_read32(ctx, 0x1C4);
-            uint32_t wid = spu_ls_read32(ctx, 0x1DC);
-            uint32_t status = ea_hi ? 0 : spurs_flag_status(ea, wid, 1);
-            /* A scheduler may name another workload this SPU should switch
-             * to (g_spurs_module_poll_hook); by default it never does. */
-            uint32_t selected = wid;
-            if (g_spurs_module_poll_hook && !ea_hi)
-                selected = g_spurs_module_poll_hook(ea, wid, spu_ls_read32(ctx, 0x1C8));
-            ctx->gpr[3] = spu_make_preferred_u32(selected);
-            ctx->gpr[3]._u32[1] = status;
+            spurs_kernel_select_workload_body(ctx);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }
