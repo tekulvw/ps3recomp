@@ -3048,6 +3048,7 @@ typedef struct {
 } spu_dcache_ent;
 typedef struct {
     uint32_t vepoch[SPU_VERIFIED_IMAGES];
+    uint32_t vtotal;   /* bumped with any vepoch: the short dispatch entry's one epoch */
     spu_dcache_ent ent[512];
 } spu_dcache_tls;
 static SPU_TLS spu_dcache_tls t_dcache;   /* one TLS object: Darwin TLV access is a call */
@@ -3078,6 +3079,7 @@ static void spu_dcache_note_get(uint32_t lsa, uint32_t size)
         for (unsigned j = 0; j < v->count; ++j)
             if (lsa < v->segments[j].lsa + v->segments[j].size && lsa + size > v->segments[j].lsa) {
                 t->vepoch[i]++;
+                t->vtotal++;
                 break;
             }
     }
@@ -3172,6 +3174,90 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         e->residency = c->dcache_residency; e->vmask = vmask; e->vsum = vsum;
     }
     return fn;
+}
+
+/* ---- Short dispatch entry (PS3RECOMP_SPU_IB_FAST=1, opt-in) ---------------
+ * spu_indirect_branch runs, on every computed branch, call or return it is
+ * handed: the interrupt-restore test, the policy-module service addresses,
+ * the taskset residency rules, the dispatch cache's hash into its 512-entry
+ * table and twelve-field compare, and the diagnostics after the lookup. A
+ * title's job manager and its jobs cross that entry several times per job,
+ * mostly to the same few targets. With the switch on, a dispatch that the
+ * full entry answered plainly -- the resolver's own function, none of the
+ * special cases -- is remembered in a small per-thread table keyed by
+ * everything the full entry reads before it calls that function, and the
+ * next dispatch of the same target under the same key calls it directly.
+ *
+ * The key is the dispatch cache's key (spu_lifted_lookup) with one change:
+ * the per-image byte epochs are replaced by their running total, so a GET
+ * into any verified image's code drops every entry on the thread instead of
+ * the entries whose target that image covers. A hit therefore never
+ * outlives a dispatch-cache hit for the same target. Beyond the cache's
+ * key, the short entry is taken only when the full entry's other branches
+ * cannot apply: no interrupt register file is saved on the context, no
+ * taskset task entries or ELFs are registered (those rules read local store
+ * on every dispatch), and the target is none of the reserved service
+ * addresses. Targets the full entry resolved through a fallback (an overlay
+ * signature match, a kernel/job-manager special case) are not recorded.
+ *
+ * Diagnostics the short entry does not run keep the full entry: the switch
+ * is ignored while any name in spu_ib_fast_env is set (spu_context.h). */
+enum { SPU_IBF_ENTRIES = 128 };
+typedef struct {
+    spu_lifted_fn fn;
+    uint32_t lsa, id;
+    int image, ovl, task;
+    uint32_t flags, rgen, vgen, vreg, residency, vtotal;
+} spu_ibf_ent;
+static SPU_TLS spu_ibf_ent t_ibf[SPU_IBF_ENTRIES];
+static inline int spu_ib_fast_on(void) { return g_spu_dispatch_gates.ib_fast > 0; }
+static inline uint32_t spu_ibf_flags(const spu_context* ctx)
+{
+    return (ctx->policy_mode ? 1u : 0u) | (ctx->ls != ctx->ls_store ? 2u : 0u);
+}
+/* The full entry's branches the short entry cannot take are closed. */
+static inline int spu_ibf_armed(const spu_context* ctx)
+{
+    return !ctx->irq_saved && !s_task_entry_count && !s_task_elf_count;
+}
+static inline spu_ibf_ent* spu_ibf_slot(uint32_t pc)
+{
+    return &t_ibf[(pc >> 2) & (SPU_IBF_ENTRIES - 1)];
+}
+/* The entry answers this dispatch: same target, same context lifetime, and
+ * every input of the full entry unchanged since the entry was recorded. */
+static inline int spu_ibf_hit(const spu_ibf_ent* e, const spu_context* ctx)
+{
+    return e->fn && e->lsa == ctx->pc && ctx->dcache_id && e->id == ctx->dcache_id &&
+        e->image == ctx->image_id && e->ovl == ctx->resident_ovl && e->task == ctx->resident_task &&
+        e->flags == spu_ibf_flags(ctx) && e->residency == ctx->dcache_residency &&
+        e->vtotal == t_dcache.vtotal &&
+        e->rgen == __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE) &&
+        e->vgen == __atomic_load_n(&s_verified_count, __ATOMIC_ACQUIRE) &&
+        e->vreg == __atomic_load_n(&s_verified_generation, __ATOMIC_ACQUIRE);
+}
+/* The reserved addresses the full entry services itself (policy-module
+ * kernel services, the taskset syscall, the planted job return). */
+static inline int spu_ibf_reserved(uint32_t pc)
+{
+    return pc == SPURS_PM_EXIT_TO_KERNEL_LS || pc == SPURS_PM_SELECT_WORKLOAD_LS ||
+           pc == SPURS_TASKSET_PM_SYSCALL_LS || pc == SPU_JOB_RETURN_LS;
+}
+/* Record a plain resolution. rgen/vgen/vreg were read before the resolver
+ * ran (an entry is never keyed by a count newer than the registry it saw);
+ * the residency and byte epochs are read after it, as the dispatch cache
+ * does, since the resolver may itself verify a pending resident slot. */
+static void spu_ibf_store(const spu_context* ctx, spu_lifted_fn fn, uint32_t pc,
+                          uint32_t rgen, uint32_t vgen, uint32_t vreg)
+{
+    if (!fn || !ctx->dcache_id || ctx->pc != pc || (vreg & 1u) || spu_ibf_reserved(pc) ||
+        __atomic_load_n(&s_verified_generation, __ATOMIC_ACQUIRE) != vreg)
+        return;
+    spu_ibf_ent* e = spu_ibf_slot(pc);
+    e->fn = fn; e->lsa = pc; e->id = ctx->dcache_id;
+    e->image = ctx->image_id; e->ovl = ctx->resident_ovl; e->task = ctx->resident_task;
+    e->flags = spu_ibf_flags(ctx); e->rgen = rgen; e->vgen = vgen; e->vreg = vreg;
+    e->residency = ctx->dcache_residency; e->vtotal = t_dcache.vtotal;
 }
 
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
@@ -3954,6 +4040,25 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    /* PS3RECOMP_SPU_IB_FAST=1: a target this thread resolved plainly under
+     * the same key is called here (spu_ibf_store, above). */
+    const int ibf = spu_ib_fast_on() && spu_ibf_armed(ctx);
+    if (ibf) {
+        const spu_ibf_ent* e = spu_ibf_slot(ctx->pc);
+        if (spu_ibf_hit(e, ctx)) {
+            spu_check_stack_reset(ctx, e->fn);
+#if defined(__clang__)
+            __attribute__((musttail)) return e->fn(ctx);
+#else
+            e->fn(ctx);
+            return;
+#endif
+        }
+    }
+    const uint32_t ibf_pc = ctx->pc;
+    const uint32_t ibf_rgen = ibf ? __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE) : 0;
+    const uint32_t ibf_vreg = ibf ? __atomic_load_n(&s_verified_generation, __ATOMIC_ACQUIRE) : 0;
+    const uint32_t ibf_vgen = ibf ? __atomic_load_n(&s_verified_count, __ATOMIC_ACQUIRE) : 0;
     spu_ibhist_note(ctx);
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
@@ -4134,6 +4239,7 @@ void spu_indirect_branch(spu_context* ctx)
     }
     /* Use the same ownership order as the interpreter's rejoin probe. */
     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
+    const spu_fn ibf_plain = fn;   /* the short entry records only this answer */
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
@@ -4416,6 +4522,7 @@ void spu_indirect_branch(spu_context* ctx)
                   s_dumped = 1; } } }
     }
     if (fn) {
+        if (ibf && fn == ibf_plain) spu_ibf_store(ctx, fn, ibf_pc, ibf_rgen, ibf_vgen, ibf_vreg);
         spu_check_stack_reset(ctx, fn);
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
          * Bink decoder's per-command dispatch does) must not grow the host
