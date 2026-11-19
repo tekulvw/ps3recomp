@@ -6,7 +6,7 @@
 
 /* Field offsets of the job list line (interface facts). */
 enum {
-    LINE_IMAGE_EA = 0x00, LINE_IMAGE_SIZE = 0x04, LINE_CURRENT = 0x0A, LINE_SWITCHES = 0x0E,
+    LINE_IMAGE_EA = 0x00, LINE_IMAGE_SIZE = 0x04, LINE_CURRENT = 0x0A, LINE_SWITCHES = 0x0C,
     LINE_MASK = 0x20, LINE_ARRAY_EA = 0x30, LINE_MARKERS = 0x40
 };
 
@@ -27,7 +27,7 @@ WWSJM_API void wwsjm_line_decode(const uint8_t raw[WWSJM_LINE_BYTES], wwsjm_line
     out->image_ea = wwsjm_be32(raw + LINE_IMAGE_EA);
     out->image_size = wwsjm_be32(raw + LINE_IMAGE_SIZE);
     out->current = wwsjm_be16(raw + LINE_CURRENT);
-    out->switch_count = wwsjm_be16(raw + LINE_SWITCHES);
+    out->switch_count = wwsjm_be32(raw + LINE_SWITCHES);
     for (unsigned a = 0; a < WWSJM_ARRAYS; a++) {
         out->mask[a] = wwsjm_be32(raw + LINE_MASK + 4u * a);
         out->array_ea[a] = wwsjm_be32(raw + LINE_ARRAY_EA + 4u * a);
@@ -113,7 +113,8 @@ WWSJM_API wwsjm_status wwsjm_claim(const uint8_t old[WWSJM_LINE_BYTES], unsigned
     } else if (h->type == WWSJM_ENTRY_SWITCH) {
         uint16_t cur = wwsjm_be16(out + LINE_CURRENT);
         wwsjm_put16(out + LINE_CURRENT, (uint16_t)((cur + 1u) % WWSJM_ARRAYS));
-        wwsjm_put16(out + LINE_SWITCHES, (uint16_t)(wwsjm_be16(out + LINE_SWITCHES) - 1u));
+        /* a u32 counter: its low halfword borrows from the high one */
+        wwsjm_put32(out + LINE_SWITCHES, wwsjm_be32(out + LINE_SWITCHES) - 1u);
     }
     return WWSJM_OK;
 }

@@ -155,7 +155,7 @@ static void wj_check_line(const struct wj_run* r, const uint8_t* old, const uint
     for (unsigned i = 0; i < 128; i++) {
         if (old[i] == now[i]) continue;
         const int markers = i >= 0x40u + 16u * array && i < 0x50u + 16u * array;
-        const int switching = switch_ok && (i == 0x0A || i == 0x0B || i == 0x0E || i == 0x0F);
+        const int switching = switch_ok && (i == 0x0A || i == 0x0B || (i >= 0x0C && i <= 0x0F));
         if (!markers && !switching) wj_fatal(r, "check: line byte outside the contract changed", i, now[i]);
     }
     /* other lanes' markers are never written */

@@ -92,7 +92,7 @@ typedef struct {
 typedef struct {
     uint32_t image_ea, image_size;
     uint16_t current;                /* the array the manager services */
-    uint16_t switch_count;           /* decremented by every array switch */
+    uint32_t switch_count;           /* +0x0C: decremented (u32) by every array switch */
     uint32_t mask[WWSJM_ARRAYS];     /* capacity - 1 */
     uint32_t array_ea[WWSJM_ARRAYS];
     wwsjm_markers m[WWSJM_ARRAYS];

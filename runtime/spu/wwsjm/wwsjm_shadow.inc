@@ -118,6 +118,7 @@ struct ws_thread {
     struct { unsigned wid; uint8_t value; } wake[WS_MAX_WAKE]; unsigned wake_n;
     int in_finish, finish_claim;          /* key index or -1 */
     int instance_writes, last_claim_type;
+    uint32_t last_poll_status;
     int pre_valid; uint16_t pre_S, pre_N;
     struct { uint32_t ea, size; } reads[WS_MAX_READS]; unsigned reads_n;
     struct ws_xfer* x; unsigned x_n;
@@ -331,7 +332,8 @@ static void ws_ready_tx(struct ws_thread* t, const uint8_t* old, const uint8_t* 
      * claim itself raised S): the original advertises work it just took */
     if (got == t->busy && want_v == 0 && t->pre_valid && t->pre_S == t->pre_N) { ws_ok(t, WSC_READY_UNCOUNTED); return; }
     if (got >= 1 && got <= 4) { ws_ok(t, WSC_READY_U17); return; }
-    ws_bad(t, WSC_READY, "ready wrote %u, rule says %u (verdict %u)", got, want_v, v);
+    ws_bad(t, WSC_READY, "ready wrote %u, rule says %u (verdict and last poll status 0x%X)", got, want_v,
+           (uint32_t)v | t->last_poll_status << 8);
 }
 
 static void ws_dep_tx(struct ws_thread* t, uint32_t ea, const uint8_t* old, const uint8_t* now, uint32_t status)
@@ -629,6 +631,7 @@ static void wj_shadow_event(spu_context* c, uint32_t kind, const uint8_t* p, uin
         memset(t->ll, 0, sizeof t->ll); memset(t->keys, 0, sizeof t->keys);
         memset(&t->job, 0, sizeof t->job); memset(&t->returned, 0, sizeof t->returned);
         t->in_finish = 0; t->finish_claim = -1; t->instance_writes = 0; t->last_claim_type = -1; t->pre_valid = 0;
+        t->last_poll_status = 0;
         t->bad = t->unk = t->hint = 0;
         t->has_view = ws_u32(p + 52) != 0;
         if (t->has_view) memcpy(t->list_view, p + 64, 128);
@@ -662,6 +665,7 @@ static void wj_shadow_event(spu_context* c, uint32_t kind, const uint8_t* p, uin
     case WS_BRANCH: ws_branch(t, p, n); return;
     case WS_KERNEL:
         if (n >= 4 && ws_u32(p) == 2) ws_stop_check(t);   /* exit to the kernel */
+        if (n >= 12 && ws_u32(p) == 1) t->last_poll_status = ws_u32(p + 8);   /* select: {wid, status} */
         return;
     case WS_RUN_END: {
         t->active = 0;
