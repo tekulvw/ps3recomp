@@ -41,6 +41,15 @@ WEAK void rsx_draw_engine_flush(void){}
 WEAK void rsx_live_draw_flush(void){}
 WEAK void rsx_live_draw_method_at(u32 method,u32 arg,u32 data_ea){(void)method;(void)arg;(void)data_ea;}
 WEAK void rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea){(void)method;(void)arg;(void)data_ea;}
+/* A run is its words one by one, through whichever method_at the fixture
+ * links (its own strong one or the inert one above). */
+WEAK void rsx_draw_engine_methods_at(u32 subch,u32 method,int incrementing,const u32* words,u32 count,u32 data_ea){
+    for(u32 i=0;i<count;i++){
+        const u32 w=words[i];
+        rsx_draw_engine_method_at((subch<<13)|(incrementing?method+i*4u:method),
+                                  (w>>24)|((w>>8)&0xFF00u)|((w<<8)&0xFF0000u)|(w<<24),data_ea+i*4u);
+    }
+}
 WEAK void rsx_draw_engine_mark_guest_dirty(u32 ea,u32 bytes){(void)ea;(void)bytes;}
 WEAK int rsx_draw_engine_flush_checked(void){return 0;}
 WEAK int rsx_draw_engine_checked_ready(void){return 0;}

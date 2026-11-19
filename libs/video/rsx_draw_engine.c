@@ -5277,32 +5277,60 @@ static void original_rsx_draw_engine_method(u32 method, u32 arg)
     eng_method_core(method, arg);
     ENG_PH_END(ENG_PH_METHOD, ph);
 }
+/* The subchannel is a binding slot, not an engine selector, and a title
+ * whose SPU-built command lists bind NV4097 elsewhere would otherwise
+ * store its state in the wrong register bank.  Standard NV4097 methods
+ * (< 0x2000) strip the subchannel with & 0x1FFC.  Driver methods
+ * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
+ * preserve them with the wider mask. */
+static inline u32 eng_method_register(u32 method)
+{
+    return (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+}
+static inline void eng_method_apply(u32 m, u32 arg, u32 command_ea);
 static void eng_method_core(u32 method, u32 arg)
 {
     if (!g.ready || !rsx_picture_ready()) return;
-    /* The subchannel is a binding slot, not an engine selector, and a title
-     * whose SPU-built command lists bind NV4097 elsewhere would otherwise
-     * store its state in the wrong register bank.  Standard NV4097 methods
-     * (< 0x2000) strip the subchannel with & 0x1FFC.  Driver methods
-     * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
-     * preserve them with the wider mask. */
-    u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    const u32 m = eng_method_register(method);
     /* One byte says what this write means to the engine and the dispatcher
-     * (eng_preuse_table_build); the masks above keep m >> 2 inside it. */
+     * (eng_preuse_table_build); the mask above keeps m >> 2 inside it. */
     if (!s_preuse_table_ready) eng_preuse_table_build();
+    eng_method_apply(m, arg, s_picture_command_ea);
+}
+/* The data words of one packet (rsx_draw_engine_methods_at): the per-word
+ * body of eng_method_core, with the entry work done once per run. The
+ * readiness test stays per word: another thread can fail the picture
+ * identities between two words, and the per-word path drops the rest. */
+static void eng_methods_core(u32 subch, u32 method, int incrementing,
+                             const u32* words, u32 count, u32 data_ea)
+{
+    if (!g.ready) return;
+    if (!s_preuse_table_ready) eng_preuse_table_build();
+    for (u32 i = 0; i < count; i++) {
+        if (!rsx_picture_ready()) return;
+        const u32 raw = (subch << 13) | (incrementing ? method + i * 4u : method);
+        const u32 w = words[i];
+        const u32 arg = (w >> 24) | ((w >> 8) & 0xFF00u) | ((w << 8) & 0xFF0000u) | (w << 24);
+        eng_method_apply(eng_method_register(raw), arg, data_ea + i * 4u);
+    }
+}
+/* One register write, `m` already masked (eng_method_register), with the
+ * guest address of its FIFO data word (0 when it had none). */
+static inline void eng_method_apply(u32 m, u32 arg, u32 command_ea)
+{
     const u32 ridx = m >> 2;
     const u8 t = s_preuse_table[ridx];
     if (t & ENG_METHOD_TEXUNIT) {
         const u32 unit=(m-0x1A00)/32;
         if(g.rsx.in_begin_end && dc.n_packets &&
-           (s_picture_bound[unit] || pic_pending_command(s_picture_command_ea))){
+           (s_picture_bound[unit] || pic_pending_command(command_ea))){
             pic_enter();pic_failed=1;pic_leave();ENG_CHECKED_FAIL();return;
         }
         if(s_picture_offset_pending[unit] && pic_pending_command(s_picture_offset_ea[unit])){
             pic_enter();pic_failed=1;pic_leave();ENG_CHECKED_FAIL();return;
         }
         rsx_picture_release(s_picture_bound[unit]);s_picture_bound[unit]=0;
-        s_picture_offset_ea[unit]=s_picture_command_ea;s_picture_offset_pending[unit]=1;
+        s_picture_offset_ea[unit]=command_ea;s_picture_offset_pending[unit]=1;
     }
     if ((t & ENG_METHOD_EXTERNAL) && s_external.status.active) {
         if (m>=0x0B80 && m<0x0C00) {
@@ -5599,6 +5627,32 @@ void rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea){
     if(!owner->begin(owner->user,RSX_ORIGINAL_MUTATE)){return;}
     original_rsx_draw_engine_method_at(method,arg,data_ea);
     owner->end(owner->user,RSX_ORIGINAL_MUTATE,0,0);
+}
+void rsx_draw_engine_methods_at(u32 subch, u32 method, int incrementing,
+                                const u32* words, u32 count, u32 data_ea){
+    const rsx_original_owner_hooks* owner=atomic_load_explicit(&s_original_owner_hooks,memory_order_acquire);
+    if(owner){
+        /* An owner brackets every method on its own (begin/end, primitive
+         * accounting), exactly as the per-word path hands them over. */
+        for(u32 i=0;i<count;i++){
+            const u32 w=words[i];
+            rsx_draw_engine_method_at((subch<<13)|(incrementing?method+i*4u:method),
+                                      (w>>24)|((w>>8)&0xFF00u)|((w<<8)&0xFF0000u)|(w<<24),
+                                      data_ea+i*4u);
+        }
+        return;
+    }
+    ENG_PH_BEGIN(ph);
+    eng_methods_core(subch,method,incrementing,words,count,data_ea);
+    ENG_PH_END(ENG_PH_METHOD,ph);
+    /* The phase counts methods, not runs. */
+    if(ph&&count>1u)s_eng_ph_n[ENG_PH_METHOD]+=count-1u;
+}
+/* Tests: a register's current value and write count. */
+u32 rsx_draw_engine_register(u32 ridx, u32* seen){
+    if(ridx>=RSX_DSP_NUM_REGS){if(seen)*seen=0;return 0;}
+    if(seen)*seen=g.rsx.seen[ridx];
+    return g.rsx.regs[ridx];
 }
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
                                         u32 pitch, u32 width, u32 height){
