@@ -185,7 +185,7 @@ struct spurs_pm_rec_stats {
     uint64_t runs, idle_runs, recorded_runs, job_entries, job_returns, service_calls, polls, exits;
     uint64_t getllar, putllc_ok, putllc_fail, putlluc, commands, list_commands;
     uint64_t get_n, get_bytes, put_n, put_bytes, zero_n;
-    uint64_t module_loads, module_bytes, instance_writes[2];
+    uint64_t module_loads, module_bytes, instance_writes[2], irq_branches;
 };
 struct spurs_pm_rec_slot { uint32_t module_ea, offset; uint64_t calls; };
 struct spurs_pm_rec_thread {
@@ -488,6 +488,10 @@ static int spurs_pm_rec_branch(spu_context* ctx)
     if (t->bypass) { t->bypass = 0; return 0; }   /* our own nested resolution */
     const uint32_t pc = ctx->pc & SPU_LS_MASK;
     if (pc == SPURS_PM_EXIT_TO_KERNEL_LS || pc == SPURS_PM_SELECT_WORKLOAD_LS) return 0;
+    /* Inside an SPU interrupt handler (registers saved until its return) the
+     * link register still holds whatever the interrupted code had: branches
+     * there are the handler's own, never a crossing. Not classified. */
+    if (ctx->irq_saved) { PMREC_ADD(t->st[t->wid].irq_branches, 1); return 0; }
     spurs_pm_rec_unwind(t, ctx);
     const uint32_t link = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
     const int to_job = pc >= t->pm_hi, from_job = link >= t->pm_hi;
@@ -651,7 +655,7 @@ static void spurs_pm_rec_print_stats(void)
             fprintf(stderr, "[spurs-pm-stats] worker=%u inst=0x%X lane=%u wid=%X runs=%llu idle=%llu recorded=%llu "
                     "jobs=%llu job_returns=%llu services=%llu polls=%llu exits=%llu getllar=%llu putllc_ok=%llu "
                     "putllc_fail=%llu putlluc=%llu cmds=%llu list_cmds=%llu get=%llu/%lluB put=%llu/%lluB zero=%llu "
-                    "module_loads=%llu module_bytes=%llu instance_writes=%llu/%llu\n",
+                    "module_loads=%llu module_bytes=%llu instance_writes=%llu/%llu irq_branches=%llu\n",
                     t->seq, t->spurs_ea, t->lane, w,
                     (unsigned long long)L(s->runs), (unsigned long long)L(s->idle_runs),
                     (unsigned long long)L(s->recorded_runs), (unsigned long long)L(s->job_entries),
@@ -664,7 +668,7 @@ static void spurs_pm_rec_print_stats(void)
                     (unsigned long long)L(s->put_n), (unsigned long long)L(s->put_bytes),
                     (unsigned long long)L(s->zero_n), (unsigned long long)L(s->module_loads),
                     (unsigned long long)L(s->module_bytes), (unsigned long long)L(s->instance_writes[0]),
-                    (unsigned long long)L(s->instance_writes[1]));
+                    (unsigned long long)L(s->instance_writes[1]), (unsigned long long)L(s->irq_branches));
         }
         for (int i = 0; i < 16; i++) types[i] += L(t->entry_type[i]);
         for (int o = 0; o < 8; o++) for (int f = 0; f < 32; f++) ops[o][f] += L(t->opcode[o][f]);

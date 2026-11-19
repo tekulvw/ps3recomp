@@ -51,6 +51,10 @@ order:
   or inferred when the call frame that entered the job is left);
 - kernel services: select-workload with its answer, exit-to-kernel.
 
+Branches taken inside an SPU interrupt handler (between the interrupt and its
+return, while the interrupted registers are saved) are the handler's own and are
+not classified as crossings; the statistics count them (`irq_branches`).
+
 Each event carries where the program was (`policy`, `job`, or `service` = inside
 a call from a job) and the nesting depth. Jobs' own transfers are recorded too
 (region `job`).
