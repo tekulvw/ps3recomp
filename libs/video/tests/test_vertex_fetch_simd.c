@@ -172,7 +172,7 @@ static void note_coverage(const rsx_vertex_fetch_plan* plan, u32 count)
 {
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
         const rsx_vertex_fetch_attr* f = &plan->attr[plan->layout.attrs[slot]];
-        if (!f->stable_base || !f->desc.type || !f->desc.size || f->desc.type == RSX_VTX_TYPE_CMP32) continue;
+        if (!f->stable_base || !f->desc.type || !f->desc.size) continue;
         simd_paths++;
         by_type[f->desc.type]++;
         by_n[f->desc.size < 4 ? f->desc.size : 4]++;
@@ -277,12 +277,12 @@ int main(void)
         edge_fetched++;
     }
     printf("test_vertex_fetch_simd: %d plans (%d fetched), %d edge plans, %d vector attribute passes "
-           "(types s16n %d f32 %d f16 %d u8n %d s16 %d u8 %d; sizes 1:%d 2:%d 3:%d 4:%d), "
+           "(types s16n %d f32 %d f16 %d u8n %d s16 %d cmp32 %d u8 %d; sizes 1:%d 2:%d 3:%d 4:%d), "
            "halves seen: %d denormal, %d inf, %d nan, %d failure(s)\n",
-           PLANS, fetched, edge_fetched, simd_paths, by_type[1], by_type[2], by_type[3], by_type[4], by_type[5], by_type[7],
+           PLANS, fetched, edge_fetched, simd_paths, by_type[1], by_type[2], by_type[3], by_type[4], by_type[5], by_type[6], by_type[7],
            by_n[1], by_n[2], by_n[3], by_n[4], specials_in_path[0], specials_in_path[1], specials_in_path[2], fails);
     int enough = fetched > PLANS / 2 && simd_paths > PLANS;
-    for (int t = 1; t <= 7; t++) if (t != RSX_VTX_TYPE_CMP32 && by_type[t] < 500) enough = 0;
+    for (int t = 1; t <= 7; t++) if (by_type[t] < 500) enough = 0;
     for (int k = 1; k <= 4; k++) if (by_n[k] < 500) enough = 0;
     for (int k = 0; k < 3; k++) if (specials_in_path[k] < 100) enough = 0;
     if (!enough) { printf("FAIL: too few cases exercised a path\n"); return 1; }
