@@ -47,7 +47,7 @@ MUTANTS = {
     'switch-mod-3': ('(uint16_t)((cur + 1u) % WWSJM_ARRAYS)', '(uint16_t)((cur + 1u) % 3u)'),
     # header slot: AND with capacity - 1 instead of mod capacity
     'slot-and-mask': ('8u * (capacity ? (uint32_t)index % capacity : index)',
-                      '8u * ((uint32_t)index & l->mask[a] + 0 * capacity)'),
+                      '8u * (((uint32_t)index & l->mask[a]) + 0 * capacity)'),
     # ready rule: busy whenever claimable, or S >= N
     'ready-ignores-count': ('    return before16(l->m[a].next, l->m[a].submitted) ? busy : 0;\n', '    return busy;\n'),
     'ready-counts-equal': ('    return before16(l->m[a].next, l->m[a].submitted) ? busy : 0;\n',

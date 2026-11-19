@@ -511,7 +511,7 @@ static void test_cl1(void)
     wwsjm_context_build(&a, ctx);
     CHECK(wwsjm_be32(ctx + 0x00) == 2 && wwsjm_be32(ctx + 0x04) == 8 && wwsjm_be32(ctx + 0x08) == 0);
     CHECK(wwsjm_be32(ctx + 0x0C) == SPURS_EA && wwsjm_be32(ctx + 0x10) == 0x00060005u);
-    CHECK(wwsjm_be32(ctx + 0x14) == 1 && wwsjm_be32(ctx + 0x18) == (LIST_EA + 0x0A000000u | 3));
+    CHECK(wwsjm_be32(ctx + 0x14) == 1 && wwsjm_be32(ctx + 0x18) == ((LIST_EA + 0x0A000000u) | 3));
     CHECK(wwsjm_be32(ctx + 0x1C) == 0x0006FFFFu);
     for (unsigned i = 0; i < 4; i++)
         CHECK(wwsjm_be32(ctx + 0x20 + 4 * i) == 0x2060);
