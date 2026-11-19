@@ -3983,6 +3983,8 @@ void spurs_kernel_select_workload(spu_context* ctx)
         selected = g_spurs_module_poll_hook(ea, wid, spu_ls_read32(ctx, 0x1C8));
     ctx->gpr[3] = spu_make_preferred_u32(selected);
     ctx->gpr[3]._u32[1] = status;
+    /* Opt-in policy-run recorder: every caller's poll, with its answer. */
+    if (ctx->pm_observer) ctx->pm_observer->kernel(ctx, SPURS_PM_KERNEL_SELECT);
 }
 
 void spu_indirect_branch(spu_context* ctx)
@@ -4032,7 +4034,6 @@ void spu_indirect_branch(spu_context* ctx)
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
             spurs_kernel_select_workload(ctx);
-            if (pm_observer) pm_observer->kernel(ctx, SPURS_PM_KERNEL_SELECT);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }

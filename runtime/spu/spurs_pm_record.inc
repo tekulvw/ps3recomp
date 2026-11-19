@@ -492,7 +492,12 @@ static int spurs_pm_rec_branch(spu_context* ctx)
     const uint32_t link = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
     const int to_job = pc >= t->pm_hi, from_job = link >= t->pm_hi;
     if (to_job && !from_job) {
-        /* policy code enters job code; r0 is where the job returns */
+        /* policy code enters job code; r0 is where the job returns. Policy code
+         * running again at this level means the previous job has returned. */
+        if (!t->depth && t->region == SPURS_PM_REGION_JOB) {
+            PMREC_ADD(t->st[t->wid].job_returns, 1);
+            spurs_pm_rec_branch_event(t, ctx, SPURS_PM_REC_JOB_RETURN, pc, SPURS_PM_REC_NO_SLOT, 0, 1, NULL, 0);
+        }
         uint8_t block[SPURS_PM_REC_CTX_BYTES];
         const uint32_t r3 = ctx->gpr[3]._u32[0] & SPU_LS_MASK;
         uint32_t n = SPU_LS_SIZE - r3 < SPURS_PM_REC_CTX_BYTES ? SPU_LS_SIZE - r3 : SPURS_PM_REC_CTX_BYTES;

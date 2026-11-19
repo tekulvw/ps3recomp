@@ -25,7 +25,7 @@ enum { MEM = 1u << 20, SPURS_EA = 0x10000, LIST_EA = 0x20000, HDR_EA = 0x21000, 
        /* local store */
        LS_LINE = 0x1000, LS_HDR = 0x1100, LS_REC = 0x1180, LS_PUT = 0x1200, LS_LIST = 0x1280,
        LS_GATHER = 0x1300, LS_UNCOND = 0x1380, LS_CTX = 0x1400, LS_SVC = 0x1500, LS_JOB = 0x1600,
-       PM_SERVICE = 0x1A00, PM_CALL_SITE = 0x2000, JOB_ENTRY = 0x4100, JOB_CALL_SITE = 0x4200,
+       PM_SERVICE = 0x1A00, PM_CALL_SITE = 0x2000, JOB_ENTRY = 0x4100, JOB_CALL_SITE = 0x4200, JOB2_ENTRY = 0x4400,
        SLOT = 0x44, SERVICE_RESULT = 0x5EC0FFEE };
 
 static unsigned char memory[MEM];
@@ -82,6 +82,9 @@ static void job(spu_context* c)
     SPU_RET(c);
 }
 
+/* A second job: returns at once (`bi $r0`). */
+static void job2(spu_context* c) { SPU_RET(c); }
+
 static void policy(spu_context* c)
 {
     st_observer = c->pm_observer != NULL;
@@ -115,6 +118,11 @@ static void policy(spu_context* c)
       c->gpr[1] = spu_splat_u32(0x3FF00); c->gpr[3] = spu_splat_u32(LS_CTX); c->gpr[4] = spu_splat_u32(0);
       c->pc = _tg; c->host_depth++;
       spu_indirect_branch(c); spu_drain_call(c, PM_CALL_SITE + 0x14);
+      c->host_depth--; spu_img_restore(c, _si); }
+    /* and a second job from the same call depth */
+    { c->gpr[0] = spu_link(PM_CALL_SITE + 0x18); int32_t _si = (int32_t)c->image_id;
+      c->gpr[3] = spu_splat_u32(LS_CTX); c->pc = JOB2_ENTRY; c->host_depth++;
+      spu_indirect_branch(c); spu_drain_call(c, PM_CALL_SITE + 0x18);
       c->host_depth--; spu_img_restore(c, _si); }
     /* exitToKernel */
     c->gpr[0] = spu_link(PM_CALL_SITE + 0x20); c->pc = SPURS_PM_EXIT_TO_KERNEL_LS;
@@ -157,6 +165,7 @@ int main(int argc, char** argv)
     spu_begin_image(IMAGE);
     spu_register_function(PM_SERVICE, service);
     spu_register_function(JOB_ENTRY, job);
+    spu_register_function(JOB2_ENTRY, job2);
     int rc = 0;
     for (int r = 0; r < runs; r++)
         rc |= spu_run_policy_module(policy, IMAGE, pm, sizeof(pm), LIST_EA, 6, SPURS_EA, 2);

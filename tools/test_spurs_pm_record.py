@@ -14,7 +14,8 @@ kind of recorded event once per run. The script requires:
 
 --mutants rebuilds the recorder with deliberate breaks and requires each to
 fail: a dropped PUTLLC outcome, an observer armed while every variable is
-unset, a lost service return, a wrong drain target for the nested call.
+unset, a lost service return, a job return not inferred when policy code
+enters the next job, a wrong drain target for the nested call.
 Manufactured modules only; no title code or data.
 """
 import argparse
@@ -41,6 +42,8 @@ MUTANTS = {
     'armed-while-unset': ('    if (!s_pmrec.any) return;\n', ''),
     'service-return-lost': ('            spurs_pm_rec_branch_event(t, ctx, SPURS_PM_REC_SERVICE_RETURN,',
                             '            if (0) spurs_pm_rec_branch_event(t, ctx, SPURS_PM_REC_SERVICE_RETURN,'),
+    'job-return-not-inferred-at-next-entry': ('        if (!t->depth && t->region == SPURS_PM_REGION_JOB) {',
+                                              '        if (0) {'),
     'nested-drain-target': ('spu_drain_call(ctx, link);     /* and the drain',
                             'spu_drain_call(ctx, link + 4); /* and the drain'),
 }
@@ -74,6 +77,8 @@ EXPECTED = [
     ('branch', dict(branch='service_return', pc=JOB_CALL_SITE + 4, depth=0)),
     ('command', dict(cmd=0x20, ea=JOB_PUT_EA, size=0x10, tag=31, region='job')),
     ('transfer', dict(xfer='put', ea=JOB_PUT_EA, size=0x10, region='job')),
+    ('branch', dict(branch='job_return', inferred=True, pc=0x4400)),
+    ('branch', dict(branch='job_enter', pc=0x4400, r0=PM_CALL_SITE + 0x18, inferred=False)),
     ('branch', dict(branch='job_return', inferred=True)),
     ('kernel', dict(service='exit', region='policy')),
 ]
@@ -144,7 +149,7 @@ def check(binary: Path, tmp: Path) -> list[str]:
                 b, end = r[0], r[-1]
                 check_event(b, 'run_begin', dict(run=i + 1, wid=6, lane=2, spurs_ea=0x10000, wkl_data=LIST_EA,
                                                  image_id=77, pm_size=0x2F00, line_valid=1), f'run{i}')
-                check_event(end, 'run_end', dict(run=i + 1, result=0, exited=1, polls=1, jobs=1, line_valid=1),
+                check_event(end, 'run_end', dict(run=i + 1, result=0, exited=1, polls=1, jobs=2, line_valid=1),
                             f'run{i}')
                 expect(b['line'][0x30:0x34] == HDR_EA.to_bytes(4, 'big'), f'run{i}: entry line')
                 expect(end['line'][0x40:0x44] == (i + 1).to_bytes(4, 'big'), f'run{i}: exit line marker')
@@ -192,7 +197,7 @@ def check(binary: Path, tmp: Path) -> list[str]:
     expect(bool(row), f'no statistics row: {lines}')
     if row:
         f = dict(x.split('=', 1) for x in row[-1].split()[1:] if '=' in x)
-        for k, v in dict(runs='2', jobs='2', services='2', polls='2', exits='2', getllar='2', putllc_ok='2',
+        for k, v in dict(runs='2', jobs='4', job_returns='4', services='2', polls='2', exits='2', getllar='2', putllc_ok='2',
                          putllc_fail='2', putlluc='2', idle='0', recorded='0').items():
             expect(f.get(k) == v, f'stats {k}={f.get(k)} expected {v}')
     types = [l for l in lines if 'entry-types' in l]
