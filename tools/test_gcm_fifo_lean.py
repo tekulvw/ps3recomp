@@ -39,7 +39,7 @@ PER_PASS = {
     'GCM_FIFO_CIRCLE_PASSES',
     # the split walker's own switches: read once per run (gcm_split_on)
     'PS3RECOMP_RSX_SPLIT_WALKER', 'PS3RECOMP_RSX_SPLIT_WALKER_RING_MB', 'PS3RECOMP_RSX_SPLIT_WALKER_GET_LEAD',
-    'PS3RECOMP_RSX_SPLIT_WALKER_STATS',
+    'PS3RECOMP_RSX_SPLIT_WALKER_STATS', 'PS3RECOMP_RSX_SPLIT_WALKER_GET',
     # the general (non-plain) per-word path's own diagnostics; any of them
     # already turns PS3RECOMP_GCM_FAST_WALK off (gcm_plain_walk / s_walk_diag)
     'GCM_SUBCH_GATE', 'GCM_OBJDBG', 'RSX_LIVE_FEED_DBG', 'GCM_VAL_WATCH', 'GCM_METHOD_HIST',

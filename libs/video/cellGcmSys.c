@@ -4104,8 +4104,7 @@ static void gcm_rsx_process_fifo_pass(void)
             }
             /* The packet's effects (gcm_fx_methods: the engine, labels,
              * references, reports, the 2D engines) go through the seam. */
-            { const u32 ea0 = count ? gcm_io2ea(s_fifo_getoff + 4) : 0;
-              const int r = gcm_seam_methods(w, s_fifo_getoff, count, ea0, plain_walk, legacy_state_live, checked, diag);
+            { const int r = gcm_seam_methods(w, s_fifo_getoff, count, plain_walk, legacy_state_live, checked, diag);
               if (r) { if (s_split == 1) { why = "ring-full"; producer_waiting = 1; s_rq.full_stops++; break; } return; } }
             s_fifo_getoff += 4 + count * 4;
             continue;

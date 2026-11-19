@@ -57,9 +57,10 @@ def build(tmp, label, include_first=None, defines=(), extra=()):
 TSAN_SUPPRESSIONS = "race:^writer_main$\nrace:^fill_vtx$\nrace:^get_reg$\n"
 
 
-def run(binary, form, timeout=240, scale=None, tsan_supp=None):
+def run(binary, form, timeout=240, scale=None, tsan_supp=None, extra_env=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith(('PS3RECOMP_', 'GCM_', 'MAG_', 'RSX_'))}
     if scale: env['GCM_SPLIT_TEST_SCALE'] = str(scale)
+    if extra_env: env.update(extra_env)
     if tsan_supp: env['TSAN_OPTIONS'] = f'suppressions={tsan_supp}:halt_on_error=0:history_size=4'
     r = subprocess.run([str(binary), form], capture_output=True, text=True, timeout=timeout, env=env)
     return r.returncode, r.stdout, r.stderr
@@ -153,6 +154,17 @@ def main():
             print(err_on[-2000:])
         else:
             print(f'PASS split walker: {len(log_lines(on))} log lines equal between the forms')
+
+        # PS3RECOMP_RSX_SPLIT_WALKER_GET=decode: the decoder publishes get; the
+        # label/ref/flip releases still never beat a draw, and the log is the same.
+        rc_d, on_d, err_d = run(binary, 'on', extra_env={'PS3RECOMP_RSX_SPLIT_WALKER_GET': 'decode'})
+        if rc_d != 0 or log_lines(on_d) != log_lines(on) or 'published by the decoder' not in err_d:
+            failed += 1
+            print('FAIL: the decode-published get form')
+            for l in on_d.splitlines():
+                if l.startswith('FAIL'): print('   ', l)
+        else:
+            print('PASS split walker with get published by the decoder')
 
         # The off form against origin/main's walker: the refactor is inert.
         ref = subprocess.run(['git', '-C', str(root), 'show', 'origin/main:libs/video/cellGcmSys.c'],

@@ -281,7 +281,12 @@ int main(int argc, char** argv)
     const int kinds[4] = { SIG_LABEL, SIG_REF, SIG_FLIP, SIG_GETPUT };
     const char* names[4] = { "label", "ref", "flip", "get==put" };
     u32 seg = 0x100000u;                               /* io page 1 */
+    const int get_decode = getenv("PS3RECOMP_RSX_SPLIT_WALKER_GET") && !strcmp(getenv("PS3RECOMP_RSX_SPLIT_WALKER_GET"), "decode");
     for (int k = 0; k < 4; k++) {
+        /* get published by the decoder: a guest that waits for get == put before
+         * reusing data is the hazard that mode accepts; the other three releases
+         * still must never beat the draw. */
+        if (kinds[k] == SIG_GETPUT && g_on && get_decode) { printf("writer get==put: skipped (get published by the decoder)\n"); continue; }
         atomic_store(&g_poison_hits, 0); atomic_store(&g_draws, 0);
         const int iters = 700 * scale_pct / 100;
         for (int i = 1; i <= iters; i++) {

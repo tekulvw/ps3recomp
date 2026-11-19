@@ -79,9 +79,16 @@ static int       s_legacy_state_inited;
  * the pass must stop at this packet and come back to it (a report dependency
  * or inline-image barrier failed): the direct path returns from the pass, the
  * record thread retries the record. */
-static int gcm_fx_methods(u32 type, u32 subch, u32 method, u32 count, u32 io,
-                          const u32* words, int plain_walk, int legacy_state_live,
-                          int checked, int diag)
+#if defined(__GNUC__) || defined(__clang__)
+#define GCM_FX_INLINE static inline __attribute__((always_inline))
+#else
+#define GCM_FX_INLINE static inline
+#endif
+/* Inlined at both call sites: the pass's direct call is then the per-word
+ * loop it had before the seam, with no call per packet. */
+GCM_FX_INLINE int gcm_fx_methods(u32 type, u32 subch, u32 method, u32 count, u32 io,
+                                 const u32* words, int plain_walk, int legacy_state_live,
+                                 int checked, int diag)
 {
     if(count && (subch==4u||subch==5u) && method<=0x7fcu &&
        (method>=0x400u || (type==0u && (u64)method+(u64)(count-1u)*4u>=0x400u)) &&
@@ -473,6 +480,7 @@ static struct {
     u32* buf;
     u64  cap;                          /* words, power of two */
     u32  get_lead;                     /* PS3RECOMP_RSX_SPLIT_WALKER_GET_LEAD, words */
+    int  get_decode;                   /* PS3RECOMP_RSX_SPLIT_WALKER_GET=decode: the decoder publishes `get` once the words are copied */
     _Atomic u64 head, tail;            /* consumed / published word indices (monotone) */
     _Atomic int rec_sleeping, dec_sleeping, stop, started, idle;
     gcm_split_wait rec_wait, dec_wait;   /* the record thread's / the decoder's sleep */
@@ -493,7 +501,7 @@ static struct {
     int stats_on;
     unsigned long long records, words, empty_sleeps, retries, lease_yields, get_pubs, get_holds, get_hold_words_max;
     unsigned long long full_stops;     /* decoder-side: passes ended or waits taken on a full ring */
-    uint64_t busy_ns, stats_at;
+    uint64_t busy_ns, yield_ns, stats_at;
 } s_rq;
 
 static int gcm_split_on(void)
@@ -517,13 +525,22 @@ static int gcm_split_on(void)
             const char* ld = getenv("PS3RECOMP_RSX_SPLIT_WALKER_GET_LEAD");
             long lead = ld ? strtol(ld, NULL, 0) : 256; if (lead < 0) lead = 0;
             const char* st = getenv("PS3RECOMP_RSX_SPLIT_WALKER_STATS");
+            /* PS3RECOMP_RSX_SPLIT_WALKER_GET=decode: `get` is the fetch pointer and
+             * the decoder publishes it as soon as it has copied the words behind
+             * it (ring reuse is then safe; a title that treats `get` as "executed"
+             * before reusing data is not). `record` (default): the record thread
+             * publishes it, bounded by the lead and never past an unconsumed
+             * record that reads guest memory. */
+            const char* gm = getenv("PS3RECOMP_RSX_SPLIT_WALKER_GET");
+            const int get_decode = gm && !strcmp(gm, "decode");
             s_rq.buf = (u32*)malloc(cap * sizeof(u32));
             if (!s_rq.buf) { fprintf(stderr, "[rsx split walker] refused: no memory for a %llu-word ring\n", (unsigned long long)cap); want = 0; }
             else {
-                s_rq.cap = cap; s_rq.get_lead = (u32)lead; s_rq.stats_on = st && !strcmp(st, "1");
+                s_rq.cap = cap; s_rq.get_lead = (u32)lead; s_rq.get_decode = get_decode; s_rq.stats_on = st && !strcmp(st, "1");
                 gcm_split_wait_init(&s_rq.rec_wait); gcm_split_wait_init(&s_rq.dec_wait);
-                fprintf(stderr, "[rsx split walker] on: decode on the frame clock, record on its own thread; ring %llu MiB, get lead %ld words\n",
-                        (unsigned long long)(cap * 4 >> 20), lead);
+                fprintf(stderr, "[rsx split walker] on: decode on the frame clock, record on its own thread; ring %llu MiB, get %s\n",
+                        (unsigned long long)(cap * 4 >> 20), get_decode ? "published by the decoder" : "published by the record thread, bounded");
+                if (!get_decode) fprintf(stderr, "[rsx split walker] get lead %ld words past the record thread, never past an unconsumed draw\n", lead);
             }
         }
         s_split = want;
@@ -639,7 +656,7 @@ static int gcm_split_apply(const u32* r, u64 pos)
     case GCM_RQ_SEMA: {
         const u32 w = r[1], io = r[2];
         const u32 count = (w >> 18) & 0x7FF, method = w & 0x1FFCu, type = w >> 29;
-        const u32 get_io = (!gcm_get_eq_put() && gcm_split_get_may_publish(pos)) ? io + 4 + count * 4 : 0;
+        const u32 get_io = (!gcm_get_eq_put() && !s_rq.get_decode && gcm_split_get_may_publish(pos)) ? io + 4 + count * 4 : 0;
         return gcm_fx_sema(type, method, count, io, r + 3, get_io);
     }
     case GCM_RQ_FLIP: {
@@ -672,12 +689,12 @@ static void gcm_split_stats(uint64_t now)
     const double dt = s_rq.stats_at ? (now - s_rq.stats_at) / 1e9 : 0.0;
     s_rq.stats_at = now;
     const u64 head = atomic_load(&s_rq.head), tail = atomic_load(&s_rq.tail);
-    fprintf(stderr, "[rsx split walker] records=%llu words=%llu busy=%.1f%% ring=%llu/%llu words full_stops=%llu empty_sleeps=%llu retries=%llu lease_yields=%llu get_pubs=%llu get_holds=%llu get_hold_max=%llu lease_waiters=%d\n",
-            s_rq.records, s_rq.words, dt > 0 ? 100.0 * s_rq.busy_ns / 1e9 / dt : 0.0,
+    fprintf(stderr, "[rsx split walker] records=%llu words=%llu busy=%.1f%% yield=%.1f%% ring=%llu/%llu words full_stops=%llu empty_sleeps=%llu retries=%llu lease_yields=%llu get_pubs=%llu get_holds=%llu get_hold_max=%llu lease_waiters=%d\n",
+            s_rq.records, s_rq.words, dt > 0 ? 100.0 * s_rq.busy_ns / 1e9 / dt : 0.0, dt > 0 ? 100.0 * s_rq.yield_ns / 1e9 / dt : 0.0,
             (unsigned long long)(tail - head), (unsigned long long)s_rq.cap,
             s_rq.full_stops, s_rq.empty_sleeps, s_rq.retries, s_rq.lease_yields, s_rq.get_pubs, s_rq.get_holds, s_rq.get_hold_words_max,
             atomic_load(&s_lease_waiters));
-    s_rq.busy_ns = 0; s_rq.get_hold_words_max = 0;
+    s_rq.busy_ns = 0; s_rq.yield_ns = 0; s_rq.get_hold_words_max = 0;
 }
 
 /* The lease, held while records are applied; given up when another thread
@@ -685,18 +702,18 @@ static void gcm_split_stats(uint64_t now)
  * other threads while the split is on. */
 static void gcm_split_lease_yield(void)
 {
+    const uint64_t t0 = s_rq.stats_on ? gcm_split_now_ns() : 0;
     cellGcm_rsx_consumer_end();
     s_rq.lease_yields++;
-    /* Let the waiter take it: a lock released and re-taken at once is often
-     * re-taken by the releasing thread. Bounded: the waiter may have given up. */
-    for (int spins = 0; spins < 200 && atomic_load_explicit(&s_lease_waiters, memory_order_acquire) > 0; spins++) {
+    /* Let the waiter take it: one yield of this thread's slice, then back.
+     * A waiter that did not get in by then takes it at the next record. */
 #ifdef _WIN32
-        Sleep(0);
+    Sleep(0);
 #else
-        sched_yield();
+    sched_yield();
 #endif
-    }
     cellGcm_rsx_consumer_begin();
+    if (t0) s_rq.yield_ns += gcm_split_now_ns() - t0;
 }
 
 #ifdef _WIN32
@@ -846,12 +863,13 @@ void gcm_split_stop(void)
 
 /* Each returns 0 when the pass may go on, 1 when it must stop at this packet
  * (direct: the effect asked for a retry; split: the ring is full). */
-static int gcm_seam_methods(u32 w, u32 io, u32 count, u32 ea0, int plain_walk,
-                            int legacy_state_live, int checked, int diag)
+GCM_FX_INLINE int gcm_seam_methods(u32 w, u32 io, u32 count, int plain_walk,
+                                   int legacy_state_live, int checked, int diag)
 {
     const u32 type = w >> 29, method = w & 0x1FFCu, subch = (w >> 13) & 7;
     if (s_split != 1)
         return gcm_fx_methods(type, subch, method, count, io, NULL, plain_walk, legacy_state_live, checked, diag);
+    const u32 ea0 = count ? gcm_io2ea(io + 4) : 0;   /* the first data word's address, for the record */
     u32* r = gcm_rq_reserve(4 + count);
     if (!r) return 1;
     r[0] = GCM_RQ_HDR(GCM_RQ_METHODS, (checked ? GCM_RQ_F_CHECKED : 0) | (plain_walk ? GCM_RQ_F_PLAIN : 0) |
@@ -951,7 +969,7 @@ static int gcm_seam_nv0039(u32 io, const u32 v[8])
 }
 static void gcm_seam_publish_get(u32 value)
 {
-    if (s_split != 1) { vm_write32(GCM_CONTROL_GUEST_ADDR + 4, value); return; }
+    if (s_split != 1 || s_rq.get_decode) { vm_write32(GCM_CONTROL_GUEST_ADDR + 4, value); return; }
     while (gcm_split_publish_get(value) < 0) { s_rq.full_stops++; gcm_split_sleep_us(100); }
 }
 static void gcm_seam_pass_end(int issue)
