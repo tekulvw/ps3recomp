@@ -134,9 +134,15 @@ def check(binary: Path) -> list[str]:
                    int(s.get('putllc_retries', 0)) > 0,
                    f'native {mode}: counters {s}')
         expect('FATAL' not in err, f'native {mode}: {err[-600:]}')
-    # the shadow comparison, fed the native runs' own events: every run identical
-    for mode in ('1', 'check'):
-        r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': mode, 'PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW': '1'})
+    # the shadow comparison, fed the native runs' own events: every run identical,
+    # also with the short dispatch entry requested (it must yield to the comparison:
+    # the recorder that feeds it sees every branch)
+    for mode, extra in (('1', {}), ('check', {}),
+                        ('1', {'PS3RECOMP_SPU_IB_FAST': '1', 'SPU_DISPATCH_CACHE': '1'})):
+        r, err = run(binary, ['native'], dict(extra, PS3RECOMP_SPURS_NATIVE_PM=mode, PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW='1'))
+        if extra:
+            expect('PS3RECOMP_SPU_IB_FAST=1 ignored: a native policy-module shadow comparison is on' in err,
+                   f'self-shadow with IB_FAST: the short entry did not yield: {err[-400:]}')
         expect(r.get('done') == '1' and r.get('dup') == '0', f'self-shadow {mode}: {r}')
         sh = shadow_summary(err)
         expect(sh is not None and sh['mismatches'] == 0 and sh['unverifiable'] == 0 and sh['runs'] > 0 and

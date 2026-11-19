@@ -669,6 +669,17 @@ SPU_FAST_PATH_COLD int spu_fast_path_resolve(void)
      * short entry runs none of them. */
     int ib_fast = spu_fast_path_switch_in("PS3RECOMP_SPU_IB_FAST", spu_ib_fast_env);
     if (ib_fast) {
+        /* A native policy module's shadow comparison (PS3RECOMP_SPURS_NATIVE_PM=shadow,
+         * or _SELF_SHADOW) is fed by the policy-run recorder, which must see every
+         * branch, like the recorder's own switches in spu_ib_fast_env. */
+        const char* npm = getenv("PS3RECOMP_SPURS_NATIVE_PM");
+        const char* self = getenv("PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW");
+        if ((npm && !strcmp(npm, "shadow")) || (self && *self && strcmp(self, "0"))) {
+            fprintf(stderr, "[spu] PS3RECOMP_SPU_IB_FAST=1 ignored: a native policy-module shadow comparison is on\n");
+            ib_fast = 0;
+        }
+    }
+    if (ib_fast) {
         /* The short entry keys its table by the dispatch cache's context
          * lifetime id and byte epochs, which exist only while that cache is
          * on (SPU_DISPATCH_CACHE=1; =shadow must see every lookup). */
