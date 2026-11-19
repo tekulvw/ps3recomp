@@ -138,7 +138,7 @@ int main(void) {
     memset(&s_reports,0,sizeof(s_reports));s_reports.generation=7;
     watched=0x2000430;prepare(watched);g_ww_lo=g_ww_hi=0;
     flushed=live_flushed=1; /* Existing publication assertions remain active. */
-    cellGcm_rsx_consumer_begin();gcm_get_report(0x01000430);cellGcm_rsx_consumer_end();
+    cellGcm_rsx_consumer_begin();gcm_get_report(0x01000430,s_fifo_getoff);cellGcm_rsx_consumer_end();
     assert(s_reports.count==1&&s_reports.unissued==1&&!notified);
     u64 before_issue=fixture_issued;
     (void)cellGcmGetReport(1,0x43);(void)cellGcmGetTimeStamp(0x43);
@@ -193,7 +193,7 @@ int main(void) {
     s_inline_no_gpu_wait=0;fixture_completed=fixture_issued;
     /* GPU error is sticky and never publishes success or grants a VM lease. */
     raw32(watched+12,0x10000);
-    cellGcm_rsx_consumer_begin();gcm_get_report(0x01000430);cellGcm_rsx_consumer_end();
+    cellGcm_rsx_consumer_begin();gcm_get_report(0x01000430,s_fifo_getoff);cellGcm_rsx_consumer_end();
     fixture_gpu_error=1;cellGcm_rsx_process_fifo();
     assert(s_reports.failed&&vm_read32(watched+12)==0x10000&&notified==1);
     assert(!gcm_report_vm_begin(0,UINT64_C(0x100000000)));
