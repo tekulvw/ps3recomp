@@ -179,6 +179,17 @@ def check(binary: Path, tmp: Path) -> list[str]:
             fails.append(str(e))
     expect('[spurs-pm-record] dir=' in on_err, 'no configuration line')
 
+    # the short dispatch entry (PS3RECOMP_SPU_IB_FAST) yields to the recorder:
+    # the same recording with it requested
+    def events_of(d):
+        return [{k: v for k, v in e.items() if k != 't_ns'}
+                for f in sorted(d.glob('pmrec-*.bin')) for e in rec.read_file(f)[1]]
+    ibf_dir = tmp / 'rec-ibf'
+    ibf, _ = run(binary, tmp, {'PS3RECOMP_SPURS_PM_RECORD': str(ibf_dir), 'PS3RECOMP_SPURS_PM_RECORD_BYTES': '16',
+                               'PS3RECOMP_SPU_IB_FAST': '1', 'SPU_DISPATCH_CACHE': '1'})
+    expect(ibf['mem'] == off['mem'], 'IB_FAST + recorder changed guest memory')
+    expect(files and events_of(ibf_dir) == events_of(rec_dir), 'recording differs with PS3RECOMP_SPU_IB_FAST=1')
+
     # workload filter and run limit (Windows-style suffix parsing is covered by the
     # C parser's own rules: a non-hex suffix is never taken)
     for spec, want_runs in ((f'{tmp}/f1:7', 0), (f'{tmp}/f2:6,a', 3), (f'{tmp}/f3::2', 2), (f'{tmp}/f4:6:1', 1)):

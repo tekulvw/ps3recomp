@@ -380,6 +380,19 @@ static inline rsx_v4 rsx_v4_div(rsx_v4 v, float d)
 static inline rsx_v4 rsx_v4_or(rsx_v4 a, rsx_v4 b) { return _mm_or_si128(a, b); }
 static inline rsx_v4 rsx_v4_fill(u32 w) { return _mm_set_epi32((int)w, 0, 0, 0); }
 static inline void rsx_v4_store(float* v, rsx_v4 x) { _mm_storeu_si128((__m128i*)v, x); }
+/* One CMP32 word (big-endian in lane 0): the 11/11/10-bit signed fields to
+ * (x / 1023, y / 1023, z / 511, 0), as rsx_vertex_decode_element computes
+ * them (sign-extend by shifts, int to float, the same IEEE divisions). Each
+ * field is moved to the top of its lane by a power-of-two multiply (no
+ * per-lane shift below AVX2), then shifted down arithmetically: 21 for the
+ * 11-bit fields, 22 for the 10-bit one. */
+static inline rsx_v4 rsx_v4_cmp32(rsx_v4 raw)
+{
+    const __m128i w = _mm_shuffle_epi32(rsx_v4_be32(raw), 0);
+    const __m128i top = _mm_mullo_epi32(w, _mm_setr_epi32(1 << 21, 1 << 10, 1, 0));
+    const __m128i s = _mm_blend_epi16(_mm_srai_epi32(top, 21), _mm_srai_epi32(top, 22), 0x30);
+    return _mm_castps_si128(_mm_div_ps(_mm_cvtepi32_ps(s), _mm_setr_ps(1023.0f, 1023.0f, 511.0f, 1.0f)));
+}
 /* Four halves in 32-bit lanes, decoded as rsx_compact_be_f16 does. */
 static inline rsx_v4 rsx_v4_half(rsx_v4 h)
 {
@@ -435,6 +448,17 @@ static inline rsx_v4 rsx_v4_div(rsx_v4 v, float d)
 static inline rsx_v4 rsx_v4_or(rsx_v4 a, rsx_v4 b) { return vorrq_u32(a, b); }
 static inline rsx_v4 rsx_v4_fill(u32 w) { return vsetq_lane_u32(w, vdupq_n_u32(0), 3); }
 static inline void rsx_v4_store(float* v, rsx_v4 x) { vst1q_u32((u32*)v, x); }
+/* One CMP32 word (big-endian in lane 0): see the x86 form. */
+static inline rsx_v4 rsx_v4_cmp32(rsx_v4 raw)
+{
+    static const u32 scale[4] = { 1u << 21, 1u << 10, 1u, 0u };
+    static const u32 lane_z[4] = { 0u, 0u, 0xFFFFFFFFu, 0u };
+    static const float div[4] = { 1023.0f, 1023.0f, 511.0f, 1.0f };
+    const uint32x4_t w = vdupq_laneq_u32(rsx_v4_be32(raw), 0);
+    const int32x4_t top = vreinterpretq_s32_u32(vmulq_u32(w, vld1q_u32(scale)));
+    const int32x4_t s = vbslq_s32(vld1q_u32(lane_z), vshrq_n_s32(top, 22), vshrq_n_s32(top, 21));
+    return vreinterpretq_u32_f32(vdivq_f32(vcvtq_f32_s32(s), vld1q_f32(div)));
+}
 static inline rsx_v4 rsx_v4_half(rsx_v4 h)
 {
     const uint32x4_t sign  = vshlq_n_u32(vandq_u32(h, vdupq_n_u32(0x8000)), 16);
@@ -511,11 +535,15 @@ int rsx_vertex_fetch_many(
         const u32 modulo = (plan->divider_mask >> attr) & 1u;
         const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
 #if RSX_VERTEX_SIMD
-        if (simd && type != RSX_VTX_TYPE_CMP32) {
+        if (simd) {
             /* Lanes past n hold zero after the load, and every decode maps a
-             * zero lane to +0.0f, so (0, 0, 0, 1) is the one OR of w. */
-            const rsx_v4 fill = n < 4 ? rsx_v4_fill(0x3F800000u) : rsx_v4_fill(0);
-            const u32 bytes = n * (type == RSX_VTX_TYPE_FLOAT ? 4u :
+             * zero lane to +0.0f, so (0, 0, 0, 1) is the one OR of w. A CMP32
+             * element is one packed word whatever the size, and its w is
+             * always 1. */
+            const int cmp32 = type == RSX_VTX_TYPE_CMP32;
+            const rsx_v4 fill = n < 4 || cmp32 ? rsx_v4_fill(0x3F800000u) : rsx_v4_fill(0);
+            const u32 bytes = cmp32 ? 4u :
+                              n * (type == RSX_VTX_TYPE_FLOAT ? 4u :
                                    type == RSX_VTX_TYPE_UNORM8 || type == RSX_VTX_TYPE_UINT8 ? 1u : 2u);
 #define RSX_FETCH_LOOP_SIMD(decode)                                                 \
             for (u32 i = 0; i < count; i++) {                                       \
@@ -546,6 +574,9 @@ int rsx_vertex_fetch_many(
                 break;
             case RSX_VTX_TYPE_SNORM16:
                 RSX_FETCH_LOOP_SIMD(rsx_v4_div(rsx_v4_f32(rsx_v4_sext16(rsx_v4_be16(raw))), 32767.0f))
+                break;
+            case RSX_VTX_TYPE_CMP32:
+                RSX_FETCH_LOOP_SIMD(rsx_v4_cmp32(raw))
                 break;
             default:   /* RSX_VTX_TYPE_SINT16 */
                 RSX_FETCH_LOOP_SIMD(rsx_v4_f32(rsx_v4_sext16(rsx_v4_be16(raw))))
