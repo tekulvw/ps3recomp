@@ -163,6 +163,10 @@ def check(binary: Path, tmp: Path) -> list[str]:
                 hook='6', job_c='0', services_installed='2', lifted_saw_services='0', hook_default_null='1', count='3')
     for k, v in want.items():
         expect(r.get(k) == v, f'direct: {k}={r.get(k)} expected {v}')
+    # the short dispatch entry (PS3RECOMP_SPU_IB_FAST) never answers a window slot:
+    # every service call still reaches its service
+    fr, _, _ = run(binary, ['direct'], {'PS3RECOMP_SPU_IB_FAST': '1', 'SPU_DISPATCH_CACHE': '1'})
+    expect(fr == r, f'direct with PS3RECOMP_SPU_IB_FAST=1 differs: {fr} vs {r}')
     # the same with the policy-run recorder on: identical results, and the native
     # runs' polls, job entries, service calls/returns and exits are recorded
     d = tmp / 'rec-direct'
