@@ -593,14 +593,15 @@ typedef struct spu_dispatch_gates {
     int ovl_stats;                /* overlay residency statistics wanted       */
     int fast_path;                /* spu_fast_path_on() (spu_drain.c)          */
     int channel_inline;           /* spu_channel_inline_on() (spu_channel_inline.h) */
-    char pad[64 - 7 * sizeof(int)];
+    int ib_fast;                  /* spu_ib_fast_on() (spu_channels.c)         */
+    char pad[64 - 8 * sizeof(int)];
 } spu_dispatch_gates;
 #ifdef __cplusplus
 static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
 #else
 _Static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
 #endif
-SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, -1, -1, {0} };
+SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, -1, -1, -1, {0} };
 
 /* PS3RECOMP_MFC_FAST=1 (opt-in): the MFC command path, the channel entries,
  * the overlay note and the drain hop run their compact form, which drops the
@@ -622,18 +623,22 @@ SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1
 #endif
 /* One opt-in switch: 1 when `name`=1 is set and no channel diagnostic is
  * armed; the first armed diagnostic is reported as the reason otherwise. */
-SPU_FAST_PATH_COLD int spu_fast_path_switch(const char* name)
+SPU_FAST_PATH_COLD int spu_fast_path_switch_in(const char* name, const char* const* env)
 {
     const char* e = getenv(name);
     int on = e && e[0] == '1' && !e[1];
     if (on)
-        for (const char* const* n = spu_fast_path_env; *n; ++n)
+        for (const char* const* n = env; *n; ++n)
             if (getenv(*n)) {
                 fprintf(stderr, "[spu] %s=1 ignored: %s is set\n", name, *n);
                 on = 0;
                 break;
             }
     return on;
+}
+SPU_FAST_PATH_COLD int spu_fast_path_switch(const char* name)
+{
+    return spu_fast_path_switch_in(name, spu_fast_path_env);
 }
 /* Resolves both the compact runtime form (PS3RECOMP_MFC_FAST) and the inline
  * channel form lifted code may carry (PS3RECOMP_SPU_CHANNEL_INLINE,
@@ -643,6 +648,23 @@ SPU_FAST_PATH_COLD int spu_fast_path_resolve(void)
 {
     if (g_spu_dispatch_gates.fast_path >= 0) return g_spu_dispatch_gates.fast_path;
     g_spu_dispatch_gates.channel_inline = spu_fast_path_switch("PS3RECOMP_SPU_CHANNEL_INLINE");
+    /* PS3RECOMP_SPU_IB_FAST=1 (opt-in): the indirect-dispatch entry answers a
+     * repeated target from a small per-thread table ahead of the full
+     * resolver (spu_indirect_branch, spu_channels.c). It is chosen only while
+     * none of the dispatch diagnostics in spu_ib_fast_env is armed, since the
+     * short entry runs none of them. */
+    int ib_fast = spu_fast_path_switch_in("PS3RECOMP_SPU_IB_FAST", spu_ib_fast_env);
+    if (ib_fast) {
+        /* The short entry keys its table by the dispatch cache's context
+         * lifetime id and byte epochs, which exist only while that cache is
+         * on (SPU_DISPATCH_CACHE=1; =shadow must see every lookup). */
+        const char* dc = getenv("SPU_DISPATCH_CACHE");
+        if (!dc || strcmp(dc, "1")) {
+            fprintf(stderr, "[spu] PS3RECOMP_SPU_IB_FAST=1 ignored: SPU_DISPATCH_CACHE is not 1\n");
+            ib_fast = 0;
+        }
+    }
+    g_spu_dispatch_gates.ib_fast = ib_fast;
     const int on = spu_fast_path_switch("PS3RECOMP_MFC_FAST");
     g_spu_dispatch_gates.fast_path = on;
     return on;
