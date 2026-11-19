@@ -261,7 +261,7 @@ wwsjm_status wwsjm_plan_commands(const uint8_t* record, uint32_t size, uint32_t 
                 out->set0_moved = 1;
             uint32_t lo = set_lo(s), hi = set_hi(s);
             if (!s->count || s->count > 32 || lo < ls_low ||
-                hi > ls_high || (hi == lo && lo >= ls_high))
+                hi > ls_high || (hi == lo && lo >= WWSJM_LS_BYTES))
                 return fail(out, bad_slot, i, WWSJM_E_RANGE);
             for (unsigned k = 0; k < WWSJM_MAX_SETS; k++) {
                 const wwsjm_set* o = &out->set[k];

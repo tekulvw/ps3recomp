@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""The native WWS job manager's run loop (runtime/spu/wwsjm/wwsjm_run.inc).
+
+Builds tests/test_wwsjm_run.c with the real SPURS initializer, coordinator,
+five workers, policy runner, resolver, MFC engine and drain, and requires:
+
+  * switch unset: the lifted path; the registry is never consulted and no job
+    runs natively (the implementation is inert);
+  * PS3RECOMP_SPURS_NATIVE_PM=1 and =check: every job of a manufactured list
+    runs exactly once across five lanes. The list has two header arrays (one
+    with a capacity that is not a power of two, crossing the slot wrap), a
+    no-op, a gate opened by dependency decrements and their ready-count wake, a
+    report gate and an array switch. Each job sees the registers, context
+    words, parameter data, module bytes, gathered inputs, get-buffer
+    descriptors and DMA tags the specification gives it. The PPU's completion
+    predicate never reports a job whose output is missing, and the final line
+    has every lane free and N == S on both arrays.
+
+--mutants: run-loop breaks that the fixture must catch (reservation loss
+ignored, a retire that drops the held job, decrements or wakes skipped, the
+userdata pointer at the command portion, modules never reloaded, the tag
+counter kept across jobs, finish claiming nothing, the switch's array
+ignored).
+Manufactured modules and lists only; no title code or data.
+"""
+import argparse
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+if os.name == 'nt':
+    print('SKIP: POSIX fixture'); raise SystemExit(0)
+ROOT = Path(__file__).resolve().parents[1]
+SPU = ROOT / 'runtime/spu'
+UNITS = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c', 'spu_workload.c', 'spurs_policy.c',
+         'spurs_job.c', 'spu_tsp_weak.c', 'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c']
+BASE_ENV = {k: v for k, v in os.environ.items() if not k.startswith(('SPU_', 'SPURS_', 'PS3_', 'PS3RECOMP_'))}
+RUN = 'runtime/spu/wwsjm/wwsjm_run.inc'
+# (file relative to the repository, old, new)
+MUTANTS = {
+    'M4-reservation-loss-ignored': (RUN, '        if (!wj_putllc(r, WJ_LINE_LS, r->list_ea, now)) continue;   /* lost: re-read */\n',
+                                    '        (void)wj_putllc(r, WJ_LINE_LS, r->list_ea, now);\n'),
+    'retire-drops-held-job': (RUN, '    wwsjm_held held = { r->next.valid, r->next.array, r->next.index };',
+                              '    wwsjm_held held = { 0, r->next.array, r->next.index };'),
+    'decrement-skipped': (RUN, '    for (unsigned d = 0; d < r->plan.dep_count; d++) {', '    for (unsigned d = 0; d < 0; d++) {'),
+    'wake-skipped': (RUN, '        wj_ready_store(r, target, value);\n        WJ_COUNT(wakes, 1);',
+                     '        (void)target; (void)value;\n        WJ_COUNT(wakes, 1);'),
+    'M8-userdata-at-portion': (RUN, '    a.userdata_ls = WJ_PORTION_LS + r->plan.userdata_offset;', '    a.userdata_ls = WJ_PORTION_LS;'),
+    'module-never-reloaded': (RUN, '            if (l->skip) { WJ_COUNT(load_skips, 1); continue; }',
+                              '            if (l->skip || r->res.n) { WJ_COUNT(load_skips, 1); continue; }'),
+    'tags-kept-across-jobs': (RUN, '    r->tags = 0;\n    r->finishes = 0;', '    r->finishes = 0;'),
+    'finish-claims-nothing': (RUN, '        else if (wj_claim(r, &r->next, 1)) wwsjm_finish_result(&r->next.h, result);',
+                              '        else if (0) wwsjm_finish_result(&r->next.h, result);'),
+    'context-array-dropped': (RUN, '    a.array = job->array;', '    a.array = 0;'),
+}
+
+
+# Breaks of the native run the shadow comparison must report as mismatches.
+SHADOW_SEES = ('M4-reservation-loss-ignored', 'retire-drops-held-job', 'decrement-skipped', 'wake-skipped',
+               'M8-userdata-at-portion', 'module-never-reloaded', 'tags-kept-across-jobs', 'finish-claims-nothing',
+               'context-array-dropped')
+
+
+def build(tmp: Path, name: str, mutant=None) -> Path:
+    shadow = tmp / f'{name}-src'
+    shadow.mkdir()
+    sources = {u: SPU / u for u in UNITS}
+    incs = []
+    if mutant:
+        rel, old, new = mutant
+        src = ROOT / rel
+        text = src.read_text()
+        assert text.count(old) == 1, f'{name}: mutant anchor not unique in {rel}'
+        # the run loop is an include of spurs_policy.c: shadow the include chain
+        (shadow / 'wwsjm').mkdir()
+        (shadow / 'wwsjm' / src.name).write_text(text.replace(old, new))
+        shutil.copy(SPU / 'wwsjm/wwsjm_core.c', shadow / 'wwsjm/wwsjm_core.c')
+        shutil.copy(SPU / 'wwsjm/wwsjm_core.h', shadow / 'wwsjm/wwsjm_core.h')
+        shutil.copy(SPU / 'spurs_native_pm.inc', shadow / 'spurs_native_pm.inc')
+        shutil.copy(SPU / 'spurs_policy.c', shadow / 'spurs_policy.c')
+        sources['spurs_policy.c'] = shadow / 'spurs_policy.c'
+    out = tmp / name
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O2', '-UNDEBUG', '-w',
+                    '-ffunction-sections', '-fdata-sections',
+                    '-Wl,-dead_strip' if platform.system() == 'Darwin' else '-Wl,--gc-sections',
+                    '-I' + str(shadow), '-I' + str(ROOT / 'include'), '-I' + str(SPU), '-I' + str(ROOT / 'libs/spurs'),
+                    '-I' + str(ROOT / 'runtime/platform'),
+                    str(ROOT / 'tests/test_wwsjm_run.c'), str(ROOT / 'libs/spurs/spurs_taskset.c'),
+                    *[str(p) for p in sources.values()],
+                    str(ROOT / 'runtime/platform/win32_compat.c'), str(ROOT / 'runtime/diagnostics/job_io_recorder.c'),
+                    '-pthread', '-lm', '-o', str(out)], check=True)
+    return out
+
+
+def run(binary: Path, args, env=None):
+    r = subprocess.run([str(binary), *args], env=dict(BASE_ENV, **(env or {})), capture_output=True, text=True,
+                       timeout=60)
+    line = [l for l in r.stdout.splitlines() if l.startswith('result ')]
+    if r.returncode != 0 or not line:
+        raise AssertionError(f'{args} {env}: rc={r.returncode}\n{r.stdout}\n{r.stderr[-3000:]}')
+    return dict(f.split('=', 1) for f in line[0].split()[1:]), r.stderr
+
+
+def check(binary: Path) -> list[str]:
+    fails = []
+
+    def expect(cond, msg):
+        if not cond:
+            fails.append(msg)
+
+    r, err = run(binary, ['unset'])
+    expect(r['ran'] == '0' and r['consults'] == '0' and int(r['lifted']) > 0 and '[wwsjm]' not in err
+           and '[spurs-native-pm]' not in err, f'unset: not inert: {r} {err[-300:]}')
+    r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': '1'})
+    expect('wid=3 runs native wwsjm-fixture' in err, f'native: no selection line: {err[-400:]}')
+    for mode in ('1', 'check'):
+        r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': mode})
+        want = dict(done='1', jobs='61', ran='61', dup='0', missing='0', bad_out='0', regs='0', ctx='0', ud='0',
+                    module='0', gather='0', desc='0', tag='0', finish='0', violations='0', lifted='0', current='1',
+                    n0='43', s0='43', n1='65', s1='65', lanes_busy='0', gate='0', switches='FFFE')
+        for k, v in want.items():
+            expect(r.get(k) == v, f'native {mode}: {k}={r.get(k)} expected {v}')
+        expect(int(r.get('finish_jobs', 0)) > 0, f'native {mode}: finish never claimed a next job: {r}')
+        stats = [l for l in err.splitlines() if l.startswith('[wwsjm] runs=')]
+        expect(bool(stats), f'native {mode}: no [wwsjm] counters')
+        if stats:
+            s = dict(f.split('=', 1) for f in stats[-1].split()[1:])
+            expect(s.get('jobs') == '61' and s.get('decrements') == '8' and s.get('wakes') == '1' and
+                   int(s.get('resident_skips', 0)) > 0 and s.get('retires') == '61' and
+                   int(s.get('putllc_retries', 0)) > 0,
+                   f'native {mode}: counters {s}')
+        expect('FATAL' not in err, f'native {mode}: {err[-600:]}')
+    # the shadow comparison, fed the native runs' own events: every run identical
+    for mode in ('1', 'check'):
+        r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': mode, 'PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW': '1'})
+        expect(r.get('done') == '1' and r.get('dup') == '0', f'self-shadow {mode}: {r}')
+        sh = shadow_summary(err)
+        expect(sh is not None and sh['mismatches'] == 0 and sh['unverifiable'] == 0 and sh['runs'] > 0 and
+               sh['identical'] == sh['runs'] and all(sh['ok'].get(c, 0) > 0 for c in SHADOW_CLASSES),
+               f'self-shadow {mode}: {sh} {err[-800:]}')
+    return fails
+
+
+SHADOW_CLASSES = ('claim', 'retire', 'stop', 'decrement', 'wake', 'ready', 'plan', 'load', 'load_skip', 'gather',
+                  'context', 'userdata', 'getbuf', 'release', 'finish')
+
+
+def shadow_summary(err: str):
+    lines = [l for l in err.splitlines() if l.startswith('[wwsjm-shadow] runs=')]
+    if not lines:
+        return None
+    l = lines[-1]
+    head = dict(f.split('=', 1) for f in l.split(' ok{')[0].split()[1:])
+    ok = dict(f.split('=', 1) for f in l.split(' ok{')[1].split('}')[0].split())
+    tail = dict(f.split('=', 1) for f in l.rsplit('}', 1)[1].split())
+    return dict(runs=int(head['runs']), identical=int(head['identical']), ok={k: int(v) for k, v in ok.items()},
+                mismatches=int(tail['mismatches']), unverifiable=int(tail['unverifiable']))
+
+
+def shadow_detects(binary: Path) -> bool:
+    """A broken native run, fed to the shadow comparison, must show mismatches."""
+    try:
+        r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': '1', 'PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW': '1'})
+    except AssertionError as e:
+        err = str(e)
+    sh = shadow_summary(err)
+    return sh is not None and sh['mismatches'] > 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--mutants', action='store_true')
+    a = ap.parse_args()
+    with tempfile.TemporaryDirectory(prefix='wwsjm-run-') as t:
+        tmp = Path(t)
+        fails = check(build(tmp, 'fixture'))
+        for f in fails:
+            print('FAIL:', f)
+        if fails:
+            return 1
+        print('PASS: native WWS job manager run loop: inert when unset; 61 jobs on two workloads, gates, a wake, a switch, lost reservations, '
+              'non-power-of-two wrap; contract held on five lanes (1 and check)')
+        if a.mutants:
+            bad = []
+            for name, m in MUTANTS.items():
+                try:
+                    caught = bool(check(build(tmp, f'mutant-{name}', m)))
+                except (AssertionError, subprocess.SubprocessError):
+                    caught = True
+                print(f"[{'PASS' if caught else 'FAIL'}] mutant {name} {'caught' if caught else 'NOT caught'}")
+                if not caught:
+                    bad.append(name)
+                # the shadow comparison must see the same break on its own
+                if name in SHADOW_SEES:
+                    seen = shadow_detects(tmp / f'mutant-{name}')
+                    print(f"[{'PASS' if seen else 'FAIL'}] mutant {name} {'seen' if seen else 'NOT seen'} by the shadow comparison")
+                    if not seen:
+                        bad.append(name + ' (shadow)')
+            if bad:
+                return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

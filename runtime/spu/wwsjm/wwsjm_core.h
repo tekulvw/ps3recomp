@@ -38,6 +38,7 @@ extern "C" {
 #define WWSJM_CONTEXT_BYTES  0x80u
 #define WWSJM_RESIDENT_MAX   8u
 #define WWSJM_MODULE_PAGE    16u      /* modules are linked for LS 0x4000 */
+#define WWSJM_LS_BYTES       0x40000u /* local store */
 /* N is a u16; capacities need not be powers of two, so the slot jumps when N
  * wraps. The wrap was never observed; a check mode reports N at or above this. */
 #define WWSJM_INDEX_WRAP_WATCH 0xF000u
@@ -244,8 +245,8 @@ typedef struct {
 
 /* Decode the first `size` bytes of a record into a staging plan. No-op
  * commands are skipped and counted; end and invalid commands are refused. Every
- * reserved set must lie inside [ls_low, ls_high) (a set of zero pages only
- * needs its start inside). Nothing partial is returned: on error the plan is
+ * reserved set must lie inside [ls_low, ls_high); a set of zero pages only
+ * needs its start inside local store. Nothing partial is returned: on error the plan is
  * cleared and `*bad_slot` names the offending command. */
 wwsjm_status wwsjm_plan_commands(const uint8_t* record, uint32_t size, uint32_t ls_low,
                                  uint32_t ls_high, wwsjm_plan* out, unsigned* bad_slot);

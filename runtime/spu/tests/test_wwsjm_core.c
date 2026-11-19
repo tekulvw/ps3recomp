@@ -668,8 +668,11 @@ static void test_sets(void)
             chunks++;
         }
     CHECK(chunks == 4 && total == 0xE740);
-    /* a zero-page set must still start inside the window */
+    /* a zero-page set only needs its start inside local store */
+    CHECK(wwsjm_plan_commands(rec, 0x70, 0x4000, 0x3E000, &p, &bad) == WWSJM_OK);
+    cmd(rec, 4, 0x00000280, 0x00000100);    /* page 0: below the window, still refused */
     CHECK(wwsjm_plan_commands(rec, 0x70, 0x4000, 0x3E000, &p, &bad) == WWSJM_E_RANGE && bad == 4);
+    cmd(rec, 4, 0x00000280, 0xF8000100);
     /* a set's buffer may be named only once */
     cmd(rec, 9, 0x00000441, 0);
     CHECK(wwsjm_plan_commands(rec, 0x70, 0x4000, 0x40000, &p, &bad) == WWSJM_E_SET && bad == 9);

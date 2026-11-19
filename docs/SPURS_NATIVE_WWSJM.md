@@ -1,13 +1,29 @@
-# Native WWS job manager: the pure core
+# Native WWS job manager
 
-`runtime/spu/wwsjm/wwsjm_core.{h,c}` is the guest-visible contract of the SPURS WWS job manager
-policy module, written as pure functions over byte buffers. It has no `spu_context`, no MFC, no
-guest memory and no globals. A later run loop reads guest memory, asks the core what to publish,
-and performs the atomics and transfers through the runtime's MFC path.
+A native implementation of the SPURS WWS job manager policy module, run through the native
+policy-module seam (`docs/SPURS_NATIVE_PM.md`). It has two parts:
 
-**Status:** the core and its synthetic tests only. Nothing in the runtime links or calls it yet,
-and there is no switch: build outputs and behaviour are unchanged. The run loop, the
-native-service window and the opt-in switch (`PS3RECOMP_SPURS_NATIVE_PM`) are later changes.
+- **The pure core:** `runtime/spu/wwsjm/wwsjm_core.{h,c}`. This is the guest-visible contract as
+  pure functions over byte buffers, with no `spu_context`, MFC, guest memory or globals.
+- **The run loop:** `runtime/spu/wwsjm/wwsjm_run.inc`, plus the shadow comparison in
+  `wwsjm_shadow.inc`. Both are included by `spurs_native_pm.inc`, so they compile inside
+  `spurs_policy.c` with the core. CMake keeps `wwsjm_core.c` out of the runtime glob for that
+  reason.
+
+**Status:** opt-in, off by default. With `PS3RECOMP_SPURS_NATIVE_PM` unset, nothing here is
+registered or runs.
+
+| `PS3RECOMP_SPURS_NATIVE_PM` | Effect for the job manager's workloads |
+|---|---|
+| unset, `0` | The lifted policy module (default). |
+| `1`, `wwsjm` | The native run loop. |
+| `check` | The native run loop plus self-checks: every line transaction changes only what the contract allows, other lanes' markers are untouched, finish is called exactly once per job, the stack is restored, and each staged GET has the right shape. A violation stops the process (exit 86) with the workload, lane and line. |
+| `shadow` | The lifted module. Its runs' events are compared with the core's decisions (see "Shadow comparison"). |
+
+The implementation is registered for one policy image identity: fingerprint
+`0xAD16923605435AD0` and the SHA-256 of the image the specification was written for. It takes
+only workloads of a five-SPU instance, whose job-context constant and three services the
+specification establishes. Other instances keep the lifted module (spec U11, U12).
 
 **Method:** the core implements a behavioural specification written from the outside: the guest
 memory the job manager reads and writes, the jobs it starts and the services it gives them. It is
@@ -32,6 +48,66 @@ userdata copy), it receives them as arguments.
 | Get buffer | `wwsjm_buffer_descriptor`, `wwsjm_job_tag` | Returns 16 bytes: the set, the logical buffer, a DMA tag, LS/4, length/4, and the use command's EA and byte length when the buffer was filled by a read. A job that asks for a tag gets the next one, counting down from 31, per job. |
 | Job context | `wwsjm_context_build`, `wwsjm_finish_result` | 0x80 bytes: lane, kernel DMA tag, SPURS EA, `wid << 16 \| index`, dependency count, `list EA + per-instance constant \| array`, `wid << 16 \| 0xFFFF`, four copies of the userdata address, then the service slots. Finish returns the claimed job's header words, or `{0, 0xFFFFFFFF}`. |
 
+## The run loop
+
+One dispatch on a slot's resident context, on its worker thread:
+
+- **Entry.** On a flag entry (poll status 4), the workload's ready count becomes 8. The job
+  list line is read with GETLLAR.
+- **Claiming.** Entries at N are claimed with one PUTLLC each. A lost reservation re-reads and
+  retries. Non-job entries are claimed and passed, with a kernel poll after each; an answer
+  naming another workload ends the run at the next entry boundary. The loop stops when the
+  entry at N is not claimable.
+- **Staging a job.** The record's command portion is read from guest memory and planned by the
+  core. Each set's ring starts at its first buffer, because no job runs beside this one (spec
+  §12.1). Module copies go through the context's MFC GETs (16 KiB at most), except where the
+  per-run residency table says the module is already in place. Each gathered element is one
+  GET at the place the core lays out. The loop then waits for the staging tag.
+- **Entering a job.** The command portion is copied to LS `0x1300` and the job API context
+  built at `0x1200`. The job is entered through the seam with r1 = `0x3F990`,
+  r3 = the context (all four words), r4 = 0, r5 = the entry and r6 = `0x2C000000`.
+- **Services, through the native-service window:**
+  - **get buffer** returns the core's descriptor; a request with `r6 ≠ 0` takes the job's next
+    DMA tag.
+  - **release** returns all ones.
+  - **finish** polls the kernel, claims the next job if one is claimable (the lane's marker
+    stays on the running job), and publishes the ready count.
+  - The other context slots are left empty, so a job that calls one stops the process.
+- **After the job.** The retire is one PUTLLC, then the dependency decrements (one PUTLLC
+  each), then a ready-count write for each counter that reached zero, then the ready rule.
+  The loop continues with the job finish claimed, or claims again.
+
+Guest reads of headers, gate counters, records and gather lists go to guest memory directly.
+When a policy-run observer is armed they are reported as GETs, so recordings and the shadow
+comparison see them. Every refusal by the core (entry type, header, command, flags, ranges,
+gather list) stops the process loudly; unsupported behaviour is never skipped. Counters print
+as one `[wwsjm]` line at exit.
+
+## Shadow comparison
+
+With `PS3RECOMP_SPURS_NATIVE_PM=shadow`, the lifted module runs and owns every effect. The
+policy-run recorder hands each event of its runs to `wwsjm_shadow.inc`, which keeps the bytes
+each run observed. At every guest-visible effect it asks the core what the native manager would
+have published, and compares:
+
+- claims and retires (exact line bytes) and stops;
+- dependency decrements, and the wakes they cause (exact);
+- the run's own ready-count writes;
+- plans, module loads and resident skips;
+- gathered pieces;
+- context words and the parameter data offset;
+- get-buffer, release and finish results.
+
+Allowed differences are counted by class (spec §12):
+
+- `placement`: the recorded ring start is adopted (§12.1);
+- `ready_preclaim`, `ready_gate_unread`, `ready_zero_after_job_claim`,
+  `ready_after_uncounted_claim` and `ready_1_4`: ready-count hints (§12.2).
+
+Anything else is a mismatch: counted, and the first 40 printed. Missing effects count too: a
+dependency not decremented, a wake not published, or a job entered without a successful claim.
+A `[wwsjm-shadow]` summary prints every 5 s and at exit.
+
 ## What the replay showed
 
 A private harness (game-derived inputs, kept outside the repositories) replayed recorded policy
@@ -54,6 +130,27 @@ Two kinds of difference remain, and both are allowed:
   manager's choice. `wwsjm_plan_relocate` lets a caller choose it.
 
 ## Tests
+
+`python3 tools/test_wwsjm_run.py [--mutants]` (POSIX) builds `tests/test_wwsjm_run.c` with the
+real SPURS initializer, coordinator, five workers, policy runner, resolver, MFC engine and drain.
+
+- **The list.** A manufactured list of 61 jobs, on two workloads and two header arrays. One
+  array's capacity is not a power of two, and its indices cross the slot wrap. The list also
+  has a no-op, a gate opened by the jobs' dependency decrements, a wake that alone starts the
+  second workload, a report gate and an array switch.
+- **Lost reservations.** A PPU-side writer keeps changing a word of the line the manager never
+  reads, so store-conditionals are lost and retried.
+- **Each job** checks what the specification says it is handed: registers, context words,
+  parameter data, module bytes, gathered inputs, get-buffer descriptors and DMA tags.
+- **A monitor thread** checks the PPU's completion predicate against the outputs.
+- **The arms:** switch unset (inert), `1`, `check`, and `1` with
+  `PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW=1`. The last must leave every run identical: no
+  mismatch, no unverifiable event, and every comparison class exercised.
+- **`--mutants`:** nine run-loop breaks. They are a reservation loss ignored, a retire that
+  drops the held job, decrements or the wake skipped, the parameter data pointer at the command
+  portion, modules never reloaded, the tag counter kept across jobs, finish claiming nothing,
+  and the context's array dropped. Each must fail the fixture, and must also show as mismatches
+  in the shadow comparison.
 
 `python3 tools/test_wwsjm_core.py [--mutants]` builds `runtime/spu/tests/test_wwsjm_core.c`
 against the core. The test covers:

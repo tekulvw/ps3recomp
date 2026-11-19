@@ -395,6 +395,8 @@ jobs:
           python3 tools/test_vertex_fetch_simd.py --mutants
           # The native WWS job manager's pure core and its mutants.
           python3 tools/test_wwsjm_core.py --mutants
+          # Its run loop on the real scheduler, the shadow comparison, and the run-loop mutants.
+          python3 tools/test_wwsjm_run.py --mutants
           # PS3RECOMP_RSX_PIPELINE_REUSE: off/on/verify equivalence, the register-class
           # table against its reference logic, and its mutants.
           python3 tools/test_engine_pipeline_reuse.py --mutants
