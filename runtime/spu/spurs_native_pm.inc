@@ -245,12 +245,12 @@ int spurs_native_pm_enter_job(spu_context* c, uint32_t entry, uint32_t stack,
     const uint32_t entry0 = t_npm_entry;
     t_npm_in_job = 1; t_npm_far_return = 0; t_npm_entry = entry & SPU_LS_MASK;
     const int halted = spu_run_with_halt(spurs_npm_job_thunk, c);
-    const int far = t_npm_far_return;
+    const int far_returned = t_npm_far_return;
     t_npm_in_job = in0; t_npm_far_return = far0; t_npm_entry = entry0;
     c->host_depth = depth0; c->drain_ret_pc = drain0; c->irq_frame = irq0;
     c->region_dispatch_valid = 0;
     spu_img_restore(c, saved_image);
-    if (halted && far) {
+    if (halted && far_returned) {
         c->status = status0;
         c->pc = SPURS_NATIVE_PM_JOB_RETURN_LS;
         return 0;
