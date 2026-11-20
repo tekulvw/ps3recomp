@@ -27,7 +27,8 @@
  * to the next PM run's start (its exit, the worker's bookkeeping, the
  * coordinator's pass and the wake of the worker that runs it).
  *
- * argv: hops (default 2000), lanes (nSpus, default 1), spu | ppu | ppu-idle=N[~J].
+ * argv: hops (default 2000), lanes (nSpus, default 1), spu | ppu | ppu-idle=N[~J],
+ * [inst2]: also run a second one-SPU instance whose spans must carry their own lane.
  * The fixture fails if the chain stalls; every hop must run. */
 #include <assert.h>
 #include <pthread.h>
@@ -53,7 +54,11 @@ unsigned long long ps3_ms_now(void)
     return 1000ull + (unsigned long long)t.tv_sec * 1000ull + (unsigned long long)t.tv_nsec / 1000000ull;
 }
 
-enum { GUEST = 16u << 20, SPURS_EA = 0x100000, PM_A = 0x200000, PM_B = 0x201000, PM_SIZE = 0x100 };
+enum { GUEST = 16u << 20, SPURS_EA = 0x100000, PM_A = 0x200000, PM_B = 0x201000, PM_SIZE = 0x100,
+       /* inst2: a second SPURS instance of one SPU running workload C, a self-kicked
+        * chain of INST2_HOPS; its spans must carry a different lane than instance 1's SPU 0. */
+       SPURS_EA2 = 0x110000, PM_C = 0x202000, INST2_HOPS = 50 };
+static volatile uint32_t g_inst2, g_hops2, g_lane2;
 static volatile uint32_t g_hops, g_target, g_ppu_kick, g_ppu_idle_us, g_ppu_jitter_us;
 static uint64_t g_start_ns[1 << 16], g_kick_ns[1 << 16];
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
@@ -62,27 +67,40 @@ static void ch_w(spu_context* c, uint32_t ch, uint32_t v) { spu_wrch(c, ch, u32v
 static uint32_t ch_r(spu_context* c, uint32_t ch) { return spu_rdch(c, ch)._u32[0]; }
 
 /* Raise wid's ready count to 1 with an SPU atomic on the instance line. */
-static void spu_kick(spu_context* c, uint32_t wid)
+static void spu_kick_ea(spu_context* c, uint32_t ea, uint32_t wid)
 {
     for (;;) {
-        ch_w(c, MFC_LSA, 0x3F000); ch_w(c, MFC_EAH, 0); ch_w(c, MFC_EAL, SPURS_EA); ch_w(c, MFC_Cmd, MFC_GETLLAR_CMD);
+        ch_w(c, MFC_LSA, 0x3F000); ch_w(c, MFC_EAH, 0); ch_w(c, MFC_EAL, ea); ch_w(c, MFC_Cmd, MFC_GETLLAR_CMD);
         (void)ch_r(c, MFC_RdAtomicStat);
         c->ls[0x3F000 + SPURS_WKL_READY1 + wid] = 1;
-        ch_w(c, MFC_LSA, 0x3F000); ch_w(c, MFC_EAH, 0); ch_w(c, MFC_EAL, SPURS_EA); ch_w(c, MFC_Cmd, MFC_PUTLLC_CMD);
+        ch_w(c, MFC_LSA, 0x3F000); ch_w(c, MFC_EAH, 0); ch_w(c, MFC_EAL, ea); ch_w(c, MFC_Cmd, MFC_PUTLLC_CMD);
         if (ch_r(c, MFC_RdAtomicStat) == 0) return;
     }
 }
-/* Each SPURS worker labels its PS3_FTRACE spans with its own SPU number (the
- * policy-module context's spu_id is 0 on every SPU); the kernel's spuNum at
- * LS 0x1C8 is that SPU. Counted, and checked at the end. */
+static void spu_kick(spu_context* c, uint32_t wid) { spu_kick_ea(c, SPURS_EA, wid); }
+/* Each SPURS worker labels its PS3_FTRACE spans with its lane: its instance's
+ * index times 8 plus its SPU number (the policy-module context's spu_id is 0 on
+ * every SPU). The kernel context gives the SPU number at LS 0x1C8 and the
+ * instance at LS 0x1C4; the lane must be spurs_ft_lane of those. Counted, and
+ * checked at the end. Returns the lane. */
 extern int spu_ft_spu(void);
 static volatile uint32_t g_label_bad, g_label_lanes;
+static uint32_t ls_be32(const spu_context* c, uint32_t off)
+{
+    return ((uint32_t)c->ls[off] << 24) | ((uint32_t)c->ls[off + 1] << 16) | ((uint32_t)c->ls[off + 2] << 8) | c->ls[off + 3];
+}
+static uint32_t check_label(spu_context* c)
+{
+    const uint32_t sn = ls_be32(c, 0x1C8);
+    const struct SpursInst* si = spurs_inst_find(ls_be32(c, 0x1C4));
+    const int want = si ? (int)spurs_ft_lane(si, sn) : -2;
+    if (spu_ft_spu() != want) __atomic_add_fetch(&g_label_bad, 1, __ATOMIC_RELAXED);
+    __atomic_or_fetch(&g_label_lanes, 1u << ((uint32_t)spu_ft_spu() & 31), __ATOMIC_RELAXED);
+    return (uint32_t)spu_ft_spu();
+}
 static void pm_run(spu_context* c, uint32_t next)
 {
-    {   const uint32_t sn = ((uint32_t)c->ls[0x1C8] << 24) | ((uint32_t)c->ls[0x1C9] << 16) |
-                            ((uint32_t)c->ls[0x1CA] << 8) | c->ls[0x1CB];
-        if (spu_ft_spu() != (int)sn) __atomic_add_fetch(&g_label_bad, 1, __ATOMIC_RELAXED);
-        __atomic_or_fetch(&g_label_lanes, 1u << (sn & 31), __ATOMIC_RELAXED); }
+    check_label(c);
     const uint64_t t = now_ns();
     const uint32_t h = __atomic_load_n(&g_hops, __ATOMIC_ACQUIRE);
     if (h < (1u << 16)) g_start_ns[h] = t;
@@ -96,17 +114,30 @@ static void pm_run(spu_context* c, uint32_t next)
 }
 static void pm_a(spu_context* c) { pm_run(c, 1); }
 static void pm_b(spu_context* c) { pm_run(c, 0); }
+/* Workload C on the second instance: a self-kicked chain, one hop per run. */
+static void pm_c(spu_context* c)
+{
+    g_lane2 = check_label(c);
+    const uint32_t h = __atomic_add_fetch(&g_hops2, 1, __ATOMIC_ACQ_REL);
+    if (h < INST2_HOPS) spu_kick_ea(c, SPURS_EA2, 2);
+    c->pc = SPURS_PM_EXIT_TO_KERNEL_LS;
+    g_spu_trampoline_fn = spu_indirect_branch;
+}
 
-static void add_workload(uint32_t wid, uint32_t pm, spu_lifted_entry_fn fn, uint32_t nspus)
+static void add_workload_on(uint32_t ea, uint32_t wid, uint32_t pm, spu_lifted_entry_fn fn, uint32_t nspus)
 {
     for (uint32_t i = 0; i < PM_SIZE; i++) vm_base[pm + i] = (uint8_t)(i * 7u + wid * 13u + 1u);
     spu_workload_register_img(spu_workload_fingerprint(vm_base + pm, PM_SIZE), fn, 40 + (int)wid, "bench");
     s_workloads[wid].in_use = 1; s_workloads[wid].is_taskset = 0;
     s_workloads[wid].pm = (const void*)(uintptr_t)pm; s_workloads[wid].sizePm = PM_SIZE;
-    s_workloads[wid].data = 0x300000u + wid * 0x100u; s_workloads[wid].spurs_ea = SPURS_EA;
-    vm_base[SPURS_EA + SPURS_WKL_STATE1 + wid] = 2;
-    vm_base[SPURS_EA + SPURS_WKL_MAXCONT + wid] = 1;
-    for (uint32_t sn = 0; sn < nspus; sn++) vm_base[SPURS_EA + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn] = 1;
+    s_workloads[wid].data = 0x300000u + wid * 0x100u; s_workloads[wid].spurs_ea = ea;
+    vm_base[ea + SPURS_WKL_STATE1 + wid] = 2;
+    vm_base[ea + SPURS_WKL_MAXCONT + wid] = 1;
+    for (uint32_t sn = 0; sn < nspus; sn++) vm_base[ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn] = 1;
+}
+static void add_workload(uint32_t wid, uint32_t pm, spu_lifted_entry_fn fn, uint32_t nspus)
+{
+    add_workload_on(SPURS_EA, wid, pm, fn, nspus);
 }
 
 /* Counts the PPU stand-in's writes that the coherence layer reports to the
@@ -130,6 +161,7 @@ int main(int argc, char** argv)
         g_ppu_idle_us = (uint32_t)strtoul(argv[3] + 9, &end, 0);
         if (end && *end == '~') g_ppu_jitter_us = (uint32_t)strtoul(end + 1, 0, 0);
     }
+    g_inst2 = argc > 4 && !strcmp(argv[4], "inst2");
     uint32_t lcg = 0x2545F491u;
     assert(hops >= 2 && hops <= (1u << 16) && nspus >= 1 && nspus <= 6);
     vm_base = (uint8_t*)calloc(1, GUEST); ppu_vm_size = GUEST;
@@ -141,6 +173,12 @@ int main(int argc, char** argv)
     add_workload(0, PM_A, pm_a, nspus);
     add_workload(1, PM_B, pm_b, nspus);
     vm_write32(SPURS_EA + SPURS_WKL_ENABLED, 0xC0000000u);
+    if (g_inst2) {
+        add_workload_on(SPURS_EA2, 2, PM_C, pm_c, 1);
+        assert(spurs_initialize_common(SPURS_EA2, 1, "bench2") == CELL_OK);
+        add_workload_on(SPURS_EA2, 2, PM_C, pm_c, 1);
+        vm_write32(SPURS_EA2 + SPURS_WKL_ENABLED, 0x20000000u);
+    }
     g_target = hops;
     static spu_coh_watch line_watch;
     if (g_ppu_kick) {
@@ -151,8 +189,10 @@ int main(int argc, char** argv)
     const uint64_t t0 = now_ns();
     g_kick_ns[0] = t0;
     vm_write8(SPURS_EA + SPURS_WKL_READY1 + 0, 1);         /* first request, as the PPU makes it */
+    if (g_inst2) vm_write8(SPURS_EA2 + SPURS_WKL_READY1 + 2, 1);
     uint32_t seen = 0, ppu_stores = 0;
-    while (__atomic_load_n(&g_hops, __ATOMIC_ACQUIRE) < hops) {
+    while (__atomic_load_n(&g_hops, __ATOMIC_ACQUIRE) < hops ||
+           (g_inst2 && __atomic_load_n(&g_hops2, __ATOMIC_ACQUIRE) < INST2_HOPS)) {
         const uint32_t h = __atomic_load_n(&g_hops, __ATOMIC_ACQUIRE);
         if (g_ppu_kick && h != seen) {                         /* PPU stand-in: plain store */
             seen = h;
@@ -167,16 +207,19 @@ int main(int argc, char** argv)
         if (now_ns() - t0 > 60ull * 1000000000ull) { fprintf(stderr, "FAIL: stalled at hop %u\n", h); return 1; }
     }
     const uint64_t t1 = now_ns();
-    if (g_label_bad) { fprintf(stderr, "FAIL: %u PM runs on a thread not labelled with its SPU\n", g_label_bad); return 1; }
+    if (g_label_bad) { fprintf(stderr, "FAIL: %u PM runs on a thread not labelled with its lane\n", g_label_bad); return 1; }
+    if (g_inst2 && (g_lane2 < 8 || g_lane2 % 8 != 0)) {
+        fprintf(stderr, "FAIL: the second instance's SPU 0 ran on lane %u, not a lane of its own\n", g_lane2); return 1; }
     uint64_t lat[1 << 16]; uint32_t n = 0;
     for (uint32_t h = 1; h < hops; h++) lat[n++] = g_start_ns[h] - g_kick_ns[h];
     qsort(lat, n, sizeof lat[0], cmp64);
-    printf("pm_hop kick=%s idle_us=%u jitter_us=%u nspus=%u hops=%u spu_lanes=0x%x request_watched=%d ppu_stores=%u line_writes=%u "
+    printf("pm_hop kick=%s idle_us=%u jitter_us=%u nspus=%u hops=%u spu_lanes=0x%x inst2_hops=%u inst2_lane=%u request_watched=%d ppu_stores=%u line_writes=%u "
            "per_hop_us=%.2f request_to_start_us p50=%.2f p90=%.2f p99=%.2f max=%.2f\n",
-           g_ppu_kick ? "ppu" : "spu", g_ppu_idle_us, g_ppu_jitter_us, nspus, hops, g_label_lanes,
+           g_ppu_kick ? "ppu" : "spu", g_ppu_idle_us, g_ppu_jitter_us, nspus, hops, g_label_lanes, g_hops2, g_lane2,
            spurs_inst_find(SPURS_EA) ? spurs_inst_find(SPURS_EA)->request_watched : -1, ppu_stores,
            __atomic_load_n(&g_line_fires, __ATOMIC_RELAXED), (t1 - t0) / 1000.0 / hops,
            lat[n / 2] / 1000.0, lat[n * 9 / 10] / 1000.0, lat[n * 99 / 100] / 1000.0, lat[n - 1] / 1000.0);
     fflush(stdout);
+    if (PS3_FT_ON()) ps3_ft_dump();   /* _exit skips atexit; write the PS3_FTRACE file the runner checks */
     _exit(0);
 }

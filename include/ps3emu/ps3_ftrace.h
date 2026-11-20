@@ -43,8 +43,12 @@ extern "C" {
 enum ps3_ft_kind {
     PS3_FT_SYSCALL     = 1,  /* who = PPU tid, a = syscall number, b = guest lr        */
     PS3_FT_USLEEP      = 2,  /* who = PPU tid, a = usleep calls merged, b = guest lr   */
-    PS3_FT_SPU_WAIT    = 3,  /* who = SPU id,  a = channel,      b = LS pc             */
-    PS3_FT_SPU_BUSY    = 4,  /* who = SPU id,  a = lifted image, b = SPURS wid (LS 0x1DC) */
+    /* SPU spans: who is the SPU LANE. A SPURS worker's lane is its instance's
+     * index times 8 plus its SPU number in that instance (cellSpurs.c
+     * spurs_ft_lane), so two instances' "SPU 0" threads are separate rows; a
+     * "# lane <n> ..." header line names each. Other SPU threads use spu_id. */
+    PS3_FT_SPU_WAIT    = 3,  /* who = SPU lane, a = channel,      b = LS pc             */
+    PS3_FT_SPU_BUSY    = 4,  /* who = SPU lane, a = lifted image, b = SPURS wid (LS 0x1DC) */
     PS3_FT_SEMA        = 5,  /* RSX blocked on ACQUIRE: a = label offset, b = value    */
     PS3_FT_SEMA_GAVEUP = 6,  /* same, ended by a bounded acquire giving up            */
     PS3_FT_DRAIN       = 7,  /* one RSX FIFO drain pass, a = 1 if it ended on an ACQUIRE */
@@ -57,7 +61,7 @@ enum ps3_ft_kind {
     PS3_FT_GPU_EXEC    = 14, /* Metal: a command buffer's own GPU time, ending when the CPU saw it
                               * complete; who = render passes, a = depth resolves | colour copies << 16,
                               * b = 1 present / 0 flush */
-    PS3_FT_SPU_JOB     = 15, /* who = SPU id, a = streamed job image, from its first verified
+    PS3_FT_SPU_JOB     = 15, /* who = SPU lane, a = streamed job image, from its first verified
                               * dispatch to the next job's or the end of the policy-module run */
     PS3_FT_FLIP_TICK   = 16, /* instant: a flip the RSX executed completes on the beat */
     PS3_FT_FLIP_DONE   = 17, /* instant: that completion delivered to the guest (status DONE, handler) */
@@ -71,7 +75,7 @@ enum ps3_ft_kind {
 
 typedef struct { uint64_t t0, t1; uint32_t a, b, who, kind; } ps3_ft_rec;
 
-enum { PS3_FT_TIDS = 256 };
+enum { PS3_FT_TIDS = 256, PS3_FT_LANES = 32 };
 
 typedef struct {
     int on;              /* 0 unknown, 1 initialising, 2 recording, 3 off/done */
@@ -82,6 +86,7 @@ typedef struct {
     char path[1024];
     struct { uint64_t t0, t1; uint32_t lr, n; } us[PS3_FT_TIDS];   /* usleep run being merged */
     char names[PS3_FT_TIDS][28];
+    char lanes[PS3_FT_LANES][64];   /* "# lane <n> <text>" header lines: SPU lane descriptions */
 } ps3_ft_state;
 
 PS3_FT_SHARED ps3_ft_state g_ps3_ft = { 0 };
@@ -128,6 +133,8 @@ static inline void ps3_ft_dump(void)
     fprintf(f, "# ps3_ftrace start_us=%.3f end_us=%.3f spans=%u dropped=%u base_ns=%llu clock=%s\n",
             (double)(s->start - s->base) / 1e3, (double)(s->end - s->base) / 1e3, n, s->dropped,
             (unsigned long long)s->base, clock_name);
+    for (uint32_t l = 0; l < PS3_FT_LANES; l++)
+        if (s->lanes[l][0]) fprintf(f, "# lane %u %s\n", l, s->lanes[l]);
     for (uint32_t t = 0; t < PS3_FT_TIDS; t++)
         if (s->names[t][0]) fprintf(f, "T %u %s\n", t, s->names[t]);
     for (uint32_t i = 0; i < n; i++) {
@@ -228,6 +235,14 @@ static inline void ps3_ft_name(uint32_t tid, const char* name)
 {
     if (tid >= PS3_FT_TIDS || !name || !PS3_FT_ON()) return;
     snprintf(g_ps3_ft.names[tid], sizeof g_ps3_ft.names[tid], "%s", name);
+}
+
+/* An SPU lane's description (its SPURS instance and SPU number), written as a
+ * "# lane <n> <text>" header line so the report can name the lane's rows. */
+static inline void ps3_ft_lane_name(uint32_t lane, const char* text)
+{
+    if (lane >= PS3_FT_LANES || !text || !PS3_FT_ON()) return;
+    snprintf(g_ps3_ft.lanes[lane], sizeof g_ps3_ft.lanes[lane], "%s", text);
 }
 
 #ifdef __cplusplus

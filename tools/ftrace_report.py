@@ -12,7 +12,7 @@ flips and presents. A frame here is the time between two guest flip requests.
 The report says, for the median frame, how each thread spent it, and draws a
 few frames as a timeline (one column per --ms-per-col ms):
   PPU   '#' running   '.' usleep poll   's' other blocking syscall
-  SPU   '#' busy      ' ' waiting on a channel
+  SPU   '#' busy      ' ' waiting on a channel   (one row per lane: SPURS instance * 8 + SPU)
   RSX   'S' blocked on ACQUIRE   'D' FIFO drain   'P' present   '|' flip reached
         inside D/P: 'E' Metal encode   'G' waiting for the GPU   'R' render-target readback
 """
@@ -38,11 +38,16 @@ RSX_ROWS = ("acquire wait", "drain", "present", "encode (flush)", "encode (prese
 
 
 def load(path):
-    names, spans, header = {}, [], ""
+    names, lanes, spans, header = {}, {}, [], ""
     with open(path) as f:
         for line in f:
+            if line.startswith("# lane "):   # SPU lane descriptions: "# lane <n> spurs=<i> ea=... spu=<k> ..."
+                _, _, lane, text = line.rstrip("\n").split(" ", 3)
+                lanes[int(lane)] = text
+                continue
             if line.startswith("#"):
-                header = line.strip()
+                if line.startswith("# ps3_ftrace"):
+                    header = line.strip()
                 continue
             if line.startswith("T "):
                 _, tid, name = line.rstrip("\n").split(" ", 2)
@@ -51,7 +56,16 @@ def load(path):
             k, who, a, b, t0, t1 = line.split()
             spans.append((int(k), int(who), int(a, 16), int(b, 16), float(t0) / 1e3, float(t1) / 1e3))
     spans.sort(key=lambda s: s[4])
-    return header, names, spans
+    return header, names, lanes, spans
+
+
+def lane_label(lanes, lane):
+    """'spurs=1 spu=0' for a named SPURS lane, else ''."""
+    text = lanes.get(lane)
+    if not text:
+        return ""
+    fields = dict(w.split("=", 1) for w in text.split() if "=" in w)
+    return f"spurs={fields.get('spurs', '?')} spu={fields.get('spu', '?')}"
 
 
 def overlap(s0, s1, f0, f1):
@@ -66,7 +80,7 @@ def main():
     ap.add_argument("--threads", default="", help="PPU tids to draw (default: the six least blocked)")
     args = ap.parse_args()
 
-    header, names, spans = load(args.trace)
+    header, names, lanes, spans = load(args.trace)
     print(header)
     flips = [s[4] for s in spans if s[0] == FLIP_REQ]
     if len(flips) < 3:
@@ -144,9 +158,9 @@ def main():
         sites = sorted(((mean(v), k) for k, v in ppu[t].items()), reverse=True)[:4]
         desc = ", ".join(f"{kind}@{site:08X} {ms:.1f}" for ms, (kind, site) in sites)
         print(f"    tid {t:3d} {nm[:28]:28s} blocked {total:5.1f}  ({desc})")
-    print("  SPUs (busy):")
+    print("  SPU lanes (busy; a SPURS lane is its instance's index * 8 + its SPU number):")
     for sp in spus:
-        print(f"    spu {sp:3d} busy {mean(spu_busy[sp]):5.1f}  ({100 * mean(spu_busy[sp]) / med:.0f}%)")
+        print(f"    lane {sp:3d} {lane_label(lanes, sp):16s} busy {mean(spu_busy[sp]):5.1f}  ({100 * mean(spu_busy[sp]) / med:.0f}%)")
     tot = sum(spu_wid.values()) or 1
     print("  SPU busy time by SPURS workload id (LS 0x1DC) / lifted image:")
     print("    " + ", ".join(f"wid {w:#x} {100 * v / tot:.0f}%" for w, v in sorted(spu_wid.items(), key=lambda x: -x[1])[:8]))
@@ -222,7 +236,7 @@ def main():
             if key[0] == "ppu":
                 label = f"{key[1]:3d} {names.get(key[1], '?')[:14]:14s}"
             elif key[0] == "spu":
-                label = f"spu {key[1]:<14d}"
+                label = f"lane {key[1]:<3d}{lane_label(lanes, key[1])[:14]:14s}"
             else:
                 label = "rsx" + " " * 15
             print(f"  {label} {''.join(row)}")

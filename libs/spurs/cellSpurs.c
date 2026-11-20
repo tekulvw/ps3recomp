@@ -2628,6 +2628,17 @@ static uint32_t spurs_module_poll(uint32_t ea, uint32_t current, uint32_t sn)
     return r;
 }
 
+/* The diagnostic lane a worker's PS3_FTRACE and tprof records carry. Each
+ * instance numbers its SPUs from 0, so a title with two instances (one of 5
+ * SPUs and one of 1, say) has two "SPU 0" threads; labelled by SPU number
+ * alone their busy time summed into one row and read as one saturated SPU.
+ * The lane is the instance's index times 8 plus its SPU number. Labels only:
+ * the guest's spuNum (LS 0x1C8) and the scheduler keep slot->spu_num. */
+static u32 spurs_ft_lane(const struct SpursInst* si, u32 spu_num)
+{
+    return (u32)(si - s_inst) * 8u + spu_num;
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -2636,14 +2647,15 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
     struct SpursInst* si = slot->instance;
+    const u32 lane = spurs_ft_lane(si, slot->spu_num);
 #if defined(__APPLE__)
     spurs_pm_darwin_qos((unsigned)slot->spu_num);
 #endif
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
-    ps3_tprof_thread('S', (uint32_t)slot->spu_num);
-    { extern void spu_ft_set_spu(int); spu_ft_set_spu((int)slot->spu_num); }   /* PS3_FTRACE span labels */
+    ps3_tprof_thread('S', lane);
+    { extern void spu_ft_set_spu(int); spu_ft_set_spu((int)lane); }   /* PS3_FTRACE span labels */
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)
@@ -2658,7 +2670,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         if (ft_t0) {
             extern void spu_ft_job_end(void);
             spu_ft_job_end();
-            ps3_ft_span(PS3_FT_SPU_BUSY, slot->spu_num, (uint32_t)slot->image_id, slot->wid, ft_t0, ps3_ft_now());
+            ps3_ft_span(PS3_FT_SPU_BUSY, lane, (uint32_t)slot->image_id, slot->wid, ft_t0, ps3_ft_now());
         }
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
@@ -2789,6 +2801,12 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
         memset(slot, 0, sizeof(*slot));
         slot->wake = wake;
         slot->instance = si; slot->spu_num = sn;
+        if (PS3_FT_ON()) {   /* name the lane for the report (spurs_ft_lane) */
+            char text[64];
+            snprintf(text, sizeof text, "spurs=%d ea=0x%08X spu=%u nspus=%u %s",
+                     (int)(si - s_inst), si->ea, sn, si->nspus, si->prefix);
+            ps3_ft_lane_name(spurs_ft_lane(si, sn), text);
+        }
         slot->thread = CreateThread(NULL, 1u << 20, spurs_pm_worker, slot, 0, NULL);
         if (!slot->thread) goto failed;
     }
