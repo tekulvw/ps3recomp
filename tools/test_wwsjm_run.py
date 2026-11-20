@@ -81,7 +81,8 @@ MUTANTS = {
     'kctx-workload-addr-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xD4, 0xA00);\n', ''),
     'kctx-unique-id-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xD8, r->wid);\n', ''),
     # spec v0.7 (16, 6.1, 6.5): verify after ready := 0, the in-run flag
-    'verify-skipped': (RUN, '            if (wj_verify(&r)) continue;\n            goto verified;', '            goto verified;'),
+    # the verify after ready := 0 does nothing (both exits use it: the claim path and the stop path)
+    'verify-skipped': (RUN, 'static int wj_verify(struct wj_run* r)\n{\n', 'static int wj_verify(struct wj_run* r)\n{\n    if (r) return 0;\n'),
     'flag-poll-write-dropped': (RUN, '    if (status == 4) { wj_ready_store(r, r->wid, WWSJM_READY_ON_FLAG); WJ_COUNT(flag_polls, 1); }',
                                 '    if (status == 4) { WJ_COUNT(flag_polls, 1); }'),
     # spec v0.6 (5.1, 15): r1 word 1, the stack bytes the ABI stack check tests
@@ -105,6 +106,11 @@ MUTANTS = {
     'stack-reserved-overlap': (RUN, '    WJ_CTX_LS = 0x1330, ', '    WJ_CTX_LS = 0x3F000, '),
 }
 
+
+# Breaks whose effect depends on a race (here: whether the run that published
+# in its exit window ends through the claim path or a kernel-requested stop),
+# so the mutant check tries a few runs.
+RACY = ('verify-skipped',)
 
 # Breaks of the native run the shadow comparison must report as mismatches.
 SHADOW_SEES = ('list-copy-missing', 'flag-poll-write-dropped', 'M4-reservation-loss-ignored', 'retire-drops-held-job', 'decrement-skipped', 'wake-skipped',
@@ -283,10 +289,14 @@ def main() -> int:
                 except subprocess.SubprocessError:   # refused at compile time (a static assertion)
                     print(f'[PASS] mutant {name} caught (does not compile)')
                     continue
-                try:
-                    caught = bool(check(binary))
-                except (AssertionError, subprocess.SubprocessError):
-                    caught = True
+                caught = False
+                for _ in range(4 if name in RACY else 1):   # a racy break shows only on some runs
+                    try:
+                        caught = bool(check(binary))
+                    except (AssertionError, subprocess.SubprocessError):
+                        caught = True
+                    if caught:
+                        break
                 print(f"[{'PASS' if caught else 'FAIL'}] mutant {name} {'caught' if caught else 'NOT caught'}")
                 if not caught:
                     bad.append(name)
