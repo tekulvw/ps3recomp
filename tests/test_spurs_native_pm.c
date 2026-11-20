@@ -157,10 +157,10 @@ static int native_run(spu_context* c, const struct spurs_native_pm_run* a)
         memset(c->ls + LS_CTX, 0, 0x40);
         spu_ls_write32(c, LS_CTX + 0, SPURS_NATIVE_PM_SLOT_LS(0));
         spu_ls_write32(c, LS_CTX + 4, SPURS_NATIVE_PM_SLOT_LS(1));
-        if (spurs_native_pm_enter_job(c, JOB_A, STACK, LS_CTX, 7) != 0) g_job_bad++;
-        if (spurs_native_pm_enter_job(c, JOB_B, STACK, LS_CTX, 0) != 0) g_job_bad++;
-        if (spurs_native_pm_enter_job(c, JOB_C, STACK, LS_CTX, 0) != 0) g_job_bad++;   /* hook claims it */
-        if (g_direct == 2) spurs_native_pm_enter_job(c, JOB_BAD, STACK, LS_CTX, 0);
+        if (spurs_native_pm_enter_job(c, JOB_A, STACK, 0x1000, LS_CTX, 7) != 0) g_job_bad++;
+        if (spurs_native_pm_enter_job(c, JOB_B, STACK, 0x1000, LS_CTX, 0) != 0) g_job_bad++;
+        if (spurs_native_pm_enter_job(c, JOB_C, STACK, 0x1000, LS_CTX, 0) != 0) g_job_bad++;   /* hook claims it */
+        if (g_direct == 2) spurs_native_pm_enter_job(c, JOB_BAD, STACK, 0x1000, LS_CTX, 0);
         if (g_direct_rc_mode) return 1;
     }
     return 0;

@@ -79,7 +79,7 @@ static struct { uint32_t array, index, module, sum, wid, list; } s_job[MAX_JOBS]
 static unsigned s_jobs;
 static volatile uint32_t g_runs[MAX_JOBS];
 static volatile uint32_t g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather, g_err_desc, g_err_tag,
-    g_err_finish, g_violations, g_lifted_runs, g_finish_jobs, g_breaks, g_err_lowls, g_err_irq;
+    g_err_finish, g_violations, g_lifted_runs, g_finish_jobs, g_breaks, g_err_lowls, g_err_irq, g_err_stack;
 static int g_irq_test;
 
 /* ---- guest construction (the PPU stand-in) -------------------------------------- */
@@ -231,8 +231,17 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
     const uint32_t ctx_ls = c->gpr[3]._u32[0];
     if (c->gpr[3]._u32[1] != ctx_ls || c->gpr[3]._u32[2] != ctx_ls || c->gpr[3]._u32[3] != ctx_ls ||
         c->gpr[4]._u32[0] != 0 || c->gpr[5]._u32[0] != entry || c->gpr[6]._u32[0] != 0x2C000000u ||
-        c->gpr[1]._u32[0] != 0x3F990u)
+        c->gpr[1]._u32[0] != 0x3F990u || c->gpr[1]._u32[1] != 0x1980u || c->gpr[1]._u32[2] != 0 ||
+        c->gpr[1]._u32[3] != 0)
         ERR(g_err_regs);
+    /* a subroutine's frame and the SPU ABI stack check: r1 drops by the frame
+     * in every word, and word 1 (bytes still available) must stay >= 0 */
+    {
+        const uint32_t frame = 0xC0;
+        u128 sp = c->gpr[1];
+        for (int i = 0; i < 4; i++) sp._u32[i] -= frame;
+        if ((int32_t)sp._u32[1] < 0) ERR(g_err_stack);
+    }
     const uint8_t* x = c->ls + ctx_ls;
     const uint32_t ud = be32r(x + 0x20);
     if (be32r(x + 0x24) != ud || be32r(x + 0x28) != ud || be32r(x + 0x2C) != ud || (ud & 15)) ERR(g_err_ud);
@@ -448,11 +457,11 @@ int main(int argc, char** argv)
     for (unsigned a = 0; a < 2; a++) for (unsigned s = 0; s < 6; s++) lanes_busy += be16r(LIST_EA + 0x44 + 16 * a + 2 * s) != 0xFFFF;
     printf("result done=%d jobs=%u ran=%u dup=%u missing=%u bad_out=%u regs=%u ctx=%u ud=%u module=%u gather=%u desc=%u "
            "tag=%u finish=%u violations=%u lifted=%u current=%u n0=%u s0=%u n1=%u s1=%u lanes_busy=%u gate=%u "
-           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u irq=%u\n",
+           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u irq=%u stack=%u\n",
            done, s_jobs, ran, dup, missing, bad_out, g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather,
            g_err_desc, g_err_tag, g_err_finish, g_violations, g_lifted_runs, be16r(LIST_EA + 0x0A),
            be16r(LIST_EA + 0x42), be16r(LIST_EA + 0x40), be16r(LIST_EA + 0x52), be16r(LIST_EA + 0x50), lanes_busy,
-           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls, g_err_irq);
+           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls, g_err_irq, g_err_stack);
     fflush(stdout);
     if (native) spurs_wwsjm_print_stats();
     if (native && getenv("PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW")) spurs_wwsjm_shadow_print();

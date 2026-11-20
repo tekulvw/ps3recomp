@@ -79,6 +79,12 @@ MUTANTS = {
     'kctx-low-not-zeroed': (RUN, '    memset(ls + WJ_KCTX_LS, 0, 0xC0);\n', ''),
     'kctx-workload-addr-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xD4, 0xA00);\n', ''),
     'kctx-unique-id-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xD8, r->wid);\n', ''),
+    # spec v0.6 (5.1, 15): r1 word 1, the stack bytes the ABI stack check tests
+    'stack-bytes-zero': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
+                         'spurs_native_pm_enter_job(c, entry, WJ_STACK, 0, WJ_CTX_LS, 0)'),
+    'stack-bytes-too-few': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
+                            'spurs_native_pm_enter_job(c, entry, WJ_STACK, 0x80, WJ_CTX_LS, 0)'),
+    'stack-reserved-overlap': (RUN, '    WJ_CTX_LS = 0x1330, ', '    WJ_CTX_LS = 0x3F000, '),
 }
 
 
@@ -144,7 +150,7 @@ def check(binary: Path) -> list[str]:
         r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': mode})
         want = dict(done='1', jobs='61', ran='61', dup='0', missing='0', bad_out='0', regs='0', ctx='0', ud='0',
                     module='0', gather='0', desc='0', tag='0', finish='0', violations='0', lifted='0', current='1',
-                    n0='43', s0='43', n1='65', s1='65', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0')
+                    n0='43', s0='43', n1='65', s1='65', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0', stack='0')
         for k, v in want.items():
             expect(r.get(k) == v, f'native {mode}: {k}={r.get(k)} expected {v}')
         expect(int(r.get('finish_jobs', 0)) > 0, f'native {mode}: finish never claimed a next job: {r}')

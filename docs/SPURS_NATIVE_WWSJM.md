@@ -86,8 +86,13 @@ One dispatch on a slot's resident context, on its worker thread:
   These are job-facing contract addresses, not the lifted module's layout.
   `0x080–0x17F` belongs to the running job (its reservation buffers), and the manager keeps
   nothing there; static assertions keep the manager's own areas (`0x1000–0x117F`) clear of
-  every job-facing range. The job is entered through the seam with r1 = `0x3F990`,
-  r3 = the context (all four words), r4 = 0, r5 = the entry and r6 = `0x2C000000`.
+  every job-facing range. The job is entered through the seam with r1 = {`0x3F990`, `0x1980`, 0, 0}.
+  Word 1 is the stack bytes available, which the SPU ABI stack check in job code tests
+  when it allocates a frame (spec §15). The job stack `[0x3E010, 0x3F990)` is reserved,
+  and static assertions keep every manager area and the job window out of it. The other
+  entry registers are r3 = the context (all four words), r4 = 0, r5 = the entry and
+  r6 = `0x2C000000`. The lifted manager's leftovers in r2 and r7–r127 are not reproduced
+  (spec §15).
 - **Services, through the native-service window:**
   - **get buffer** returns the core's descriptor; a request with `r6 ≠ 0` takes the job's next
     DMA tag.

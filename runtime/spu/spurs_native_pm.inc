@@ -196,12 +196,13 @@ extern void spu_indirect_branch(spu_context*);
 extern void spu_drain_call(spu_context*, uint32_t);
 
 int spurs_native_pm_enter_job(spu_context* c, uint32_t entry, uint32_t stack,
-                              uint32_t context_ls, uint32_t arg)
+                              uint32_t stack_bytes, uint32_t context_ls, uint32_t arg)
 {
     spurs_native_pm_payload_fn hook = spurs_native_pm_payload_hook();
     const u128 link = spu_make_preferred_u32(SPURS_NATIVE_PM_JOB_RETURN_LS);
     c->gpr[0] = link;
     c->gpr[1] = spu_make_preferred_u32(stack & SPU_LS_MASK & ~15u);
+    c->gpr[1]._u32[1] = stack_bytes;
     c->gpr[3]._u32[0] = c->gpr[3]._u32[1] = c->gpr[3]._u32[2] = c->gpr[3]._u32[3] = context_ls & SPU_LS_MASK;
     c->gpr[4] = spu_make_preferred_u32(arg);
     if (hook && hook(c, entry & SPU_LS_MASK)) return 0;

@@ -62,9 +62,10 @@ lifted run that did not exit (`-2`). The run may poll the kernel with
 
 ## Entering job code and the service window
 
-`spurs_native_pm_enter_job(ctx, entry, stack, context, arg)` consults the payload
-hook (`spurs_native_pm_set_payload_hook`, NULL by default), else sets r0 = the
-job-return slot, r1, r3, r4 and runs the job in a call bracket that drains until
+`spurs_native_pm_enter_job(ctx, entry, stack, stack_bytes, context, arg)` consults
+the payload hook (`spurs_native_pm_set_payload_hook`, NULL by default), else sets
+r0 = the job-return slot, r1 = {stack, stack_bytes, 0, 0} (the SPU ABI stack pointer
+and the bytes-available word its stack check tests), r3, r4 and runs the job in a call bracket that drains until
 the job returns there. It returns 0 when the job returned (by host return or by a
 computed jump to its link).
 

@@ -37,6 +37,8 @@ enum {
     WJ_DEP_LS = 0x1100,       /* dependency counter line            */
     WJ_CTX_LS = 0x1330,       /* job API context (0x80 bytes)       */
     WJ_STACK = 0x3F990,       /* job stack top (spec 5.1)           */
+    WJ_STACK_BYTES = 0x1980,  /* r1 word 1: stack bytes available (spec 5.1, 15) */
+    WJ_STACK_BOTTOM = WJ_STACK - WJ_STACK_BYTES,   /* 0x3E010: [BOTTOM, WJ_STACK) is the job's */
     WJ_LS_LOW = 0x4000,       /* job buffers live in [LOW, HIGH)    */
     WJ_LS_HIGH = 0x3C000,
     WJ_STAGE_TAG = 3,
@@ -59,6 +61,10 @@ _Static_assert(WJ_DISJOINT(WJ_PORTION_LS, WWSJM_MAX_PORTION, 0, WJ_KCTX_END) &&
 _Static_assert(WJ_DISJOINT(WJ_LINE_LS, 0x180, 0, WJ_KCTX_END) && WJ_DISJOINT(WJ_LINE_LS, 0x180, WJ_CTX_LS, 0x80) &&
                WJ_DISJOINT(WJ_CTX_LS, 0x80, 0, WJ_KCTX_END), "manager area overlaps a job-facing range");
 _Static_assert(SPURS_NATIVE_PM_SLOT_LS(WJ_SVC_IRQ_LANDING) < SPURS_NATIVE_PM_JOB_RETURN_LS, "landing slot");
+/* The job stack [0x3E010, 0x3F990) holds nothing of the manager's or of the job window. */
+_Static_assert(WJ_STACK_BOTTOM == 0x3E010 && WJ_LS_HIGH <= WJ_STACK_BOTTOM &&
+               WJ_LINE_LS + 0x180 <= WJ_STACK_BOTTOM && WJ_CTX_LS + 0x80 <= WJ_STACK_BOTTOM &&
+               WJ_PORTION_LS + WWSJM_MAX_PORTION <= WJ_STACK_BOTTOM, "job stack overlaps");
 
 struct wj_job {
     int valid;
@@ -381,7 +387,7 @@ static void wj_run_job(struct wj_run* r, const struct wj_job* job)
     c->event_mask = 0;
     c->int_enable = 1;
     WJ_COUNT(jobs, 1);
-    if (spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_CTX_LS, 0) != 0)
+    if (spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0) != 0)
         wj_fatal(r, "job did not return to the job-return slot", c->pc & SPU_LS_MASK, entry);
     if (r->check) {
         if (r->finishes != 1) wj_fatal(r, "check: finish not called exactly once", r->finishes, entry);
