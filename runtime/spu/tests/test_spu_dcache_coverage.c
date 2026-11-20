@@ -122,6 +122,35 @@ int main(void)
     /* Subsequent caller mutations to source descriptors did not remove overlap. */
     memcpy(c->ls+0x10100,bytes_b,4);spu_overlay_note_get(c,0x700004,c->ls+0x10100,4);
     expect(c,0x10000,NULL);
+    /* A covering image with NO function at the target is never compared
+     * there: a DMA into its code must not drop the target's entry. Image C
+     * spans 0x30000..0x30308 around target 0x30100, where only image A2
+     * (334) has a function; a GET into C's tail segment leaves its entry. */
+    spu_begin_image(334);spu_register_function(0x30100,verified_a);
+    spu_begin_image(333);spu_register_function(0x30300,verified_b);spu_begin_image(0);
+    static const uint8_t bytes_c[8]={0x33,4,5,6,7,8,9,10};
+    spu_verified_code_segment seg_a2={0x30100,8,bytes_a};
+    spu_verified_code_segment seg_c[2]={{0x30000,8,bytes_c},{0x30300,8,bytes_c}};
+    CHECK(spu_verified_overlay_register(321,334,&seg_a2,1));
+    CHECK(spu_verified_overlay_register(321,333,seg_c,2));
+    memcpy(c->ls+0x30100,bytes_a,8);memcpy(c->ls+0x30000,bytes_c,8);memcpy(c->ls+0x30300,bytes_c,8);
+    expect(c,0x30100,verified_a);expect(c,0x30100,verified_a);
+    {
+        unsigned calls=coverage_full_calls;
+        spu_overlay_note_get(c,0x730000,c->ls+0x30300,8);   /* C's code only */
+        CHECK(spu_lifted_lookup(c,0x30100)==verified_a);
+        if(spu_dcache_mode()==1)CHECK(coverage_full_calls==calls);   /* A's entry kept */
+        spu_overlay_note_get(c,0x740000,c->ls+0x30100,8);   /* A's own code */
+        CHECK(spu_lifted_lookup(c,0x30100)==verified_a);
+        if(spu_dcache_mode()==1)CHECK(coverage_full_calls==calls+1);   /* dropped and re-resolved */
+        /* A function registered later at the target in C joins the mask. */
+        spu_begin_image(333);spu_register_function(0x30100,verified_b);spu_begin_image(0);
+        expect(c,0x30100,verified_a);   /* C's bytes at 0x30100 do not match: A2 still owns it */
+        calls=coverage_full_calls;
+        spu_overlay_note_get(c,0x750000,c->ls+0x30300,8);   /* C's code: now relevant */
+        CHECK(spu_lifted_lookup(c,0x30100)==verified_a);
+        if(spu_dcache_mode()==1)CHECK(coverage_full_calls==calls+1);
+    }
     free(c);
     CHECK(!atomic_load(&s_dcache_shadow_bad));
     printf("DCACHE_COVERAGE mode=%d passed=%d failed=%d\n",spu_dcache_mode(),g_pass,g_fail);

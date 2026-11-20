@@ -3105,15 +3105,25 @@ static void spu_dcache_stats(void)
         fprintf(stderr, "[spu-dcache] hits=%llu misses=%llu shadow_mismatches=%llu\n",
                 atomic_load(&s_dcache_hits), atomic_load(&s_dcache_misses), atomic_load(&s_dcache_shadow_bad));
 }
-/* Range coverage depends only on the LSA and immutable registration snapshot.
- * Keep all overlapping bounding spans: a DMA into a later segment can change
- * the owner at this LSA even when it does not touch the current owner's code. */
+/* The images whose bytes the resolver compares at this LSA: those whose
+ * bounding span covers it AND that register a function exactly there. The
+ * resolver skips every other image before any byte comparison
+ * (spu_verified_lookup: a function-table miss is final), so a DMA into such
+ * an image's code cannot change the owner at this LSA. Keep every covering
+ * image that does have a function there: a DMA into a later one's segment
+ * can change the owner even when it does not touch the current owner's
+ * code. The mask depends on the LSA, the verified registration snapshot and
+ * the function registry (the reuse test in spu_lifted_lookup checks all
+ * three). Streamed job modules share one code buffer, so without the
+ * function test a small job's data GETs, which overlap larger modules'
+ * segments, dropped every entry for its code on every transfer. */
 static uint16_t spu_dcache_coverage_mask(uint32_t lsa, unsigned count)
 {
     uint16_t mask=0;
     for(unsigned i=0;i<count;++i)
         if(lsa>=s_verified_images[i].lo && lsa<s_verified_images[i].hi)
-            mask|=(uint16_t)(1u<<i);
+            if(spu_lookup_exact(lsa,s_verified_images[i].image))
+                mask|=(uint16_t)(1u<<i);
     return mask;
 }
 static uint32_t spu_dcache_epoch_sum(const spu_dcache_tls* t,uint16_t mask)
@@ -3146,7 +3156,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     const uint8_t flags = (uint8_t)((ctx->policy_mode ? 1 : 0) | (ctx->ls != ctx->ls_store ? 2 : 0));
     spu_dcache_ent* e = &t->ent[(((lsa >> 2) ^ id) * 0x9E3779B1u) >> 23];
     const uint16_t vmask=e->fn && e->lsa==lsa && e->vgen==vgen &&
-        e->vregistration==vregistration ? e->vmask : spu_dcache_coverage_mask(lsa,vgen);
+        e->vregistration==vregistration && e->rgen==rgen ? e->vmask : spu_dcache_coverage_mask(lsa,vgen);
     uint32_t vsum=spu_dcache_epoch_sum(t,vmask);
     if (e->fn && e->id == id && e->lsa == lsa && e->image == ctx->image_id &&
         e->ovl == ctx->resident_ovl && e->task == ctx->resident_task && e->flags == flags &&
