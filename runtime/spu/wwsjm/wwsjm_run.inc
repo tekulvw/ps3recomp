@@ -44,7 +44,7 @@ enum {
     WJ_STACK_BOTTOM = WJ_STACK - WJ_STACK_BYTES,   /* 0x3E010: [BOTTOM, WJ_STACK) is the job's */
     WJ_LS_LOW = 0x4000,       /* job buffers live in [LOW, HIGH)    */
     WJ_LS_HIGH = 0x3E000,     /* up to the job stack: a set may end at 0x3E000 (observed) */
-    WJ_STAGE_TAG = 3,
+    WJ_STAGE_TAG = 12,        /* the manager's own staging tag: outside the jobs' 16..31 */
     WJ_ENTRY_R6 = 0x2C000000, /* reproduced as observed (spec U14)  */
     WJ_GATHER_LIST_MAX = 1024 /* bytes (64 quadwords; observed <= 12) */
 };
@@ -69,7 +69,7 @@ _Static_assert(WJ_STACK_BOTTOM == 0x3E010 && WJ_LS_HIGH <= WJ_STACK_BOTTOM &&
                WJ_LINE_LS + 0x180 <= WJ_STACK_BOTTOM && WJ_CTX_LS + 0x80 <= WJ_STACK_BOTTOM &&
                WJ_PORTION_LS + WWSJM_MAX_PORTION <= WJ_STACK_BOTTOM, "job stack overlaps");
 
-enum { WJ_TAGS = 32 };
+enum { WJ_TAGS = WWSJM_JOB_TAG_COUNT };
 
 struct wj_job {
     int valid;
@@ -147,6 +147,20 @@ static void wj_guest_read(const struct wj_run* r, uint32_t ea, uint32_t n, uint8
     if (r && spu_pm_extras_on() && r->ctx->pm_observer)
         r->ctx->pm_observer->transfer(r->ctx, SPURS_PM_XFER_GET, MFC_GET_CMD, lsa, ea, n, out);
 }
+/* An 8-byte header, read as one atomic load when it is 8-aligned (it always is:
+ * header arrays are 8-byte entries), so a publisher's concurrent write is seen
+ * whole or not at all. */
+static void wj_guest_read8(const struct wj_run* r, uint32_t ea, uint8_t out[8], uint32_t lsa)
+{
+    uint64_t limit = ppu_vm_size ? ppu_vm_size : UINT64_C(0x100000000);
+    if (!vm_base || (uint64_t)ea + 8 > limit) wj_fatal(r, "guest read out of range", ea, 8);
+    if (ea & 7) { wj_guest_read(r, ea, 8, out, lsa); return; }
+    const uint64_t v = __atomic_load_n((const uint64_t*)(const void*)(vm_base + ea), __ATOMIC_ACQUIRE);
+    memcpy(out, &v, 8);
+    if (r && spu_pm_extras_on() && r->ctx->pm_observer)
+        r->ctx->pm_observer->transfer(r->ctx, SPURS_PM_XFER_GET, MFC_GET_CMD, lsa, ea, 8, out);
+}
+
 
 static void wj_mfc(spu_context* c, uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size, uint32_t tag)
 {
@@ -214,7 +228,7 @@ static wwsjm_verdict wj_examine(struct wj_run* r, const uint8_t line[128], wwsjm
         fprintf(stderr, "[wwsjm] index 0x%04X at or above 0x%04X on array %u (wid %u): the u16 wrap is unobserved\n",
                 cur->index, WWSJM_INDEX_WRAP_WATCH, cur->array, r->wid);
     uint8_t raw[8];
-    wj_guest_read(r, cur->header_ea, 8, raw, WJ_READ_LS);
+    wj_guest_read8(r, cur->header_ea, raw, WJ_READ_LS);
     st = wwsjm_header_decode(raw, h);
     if (st != WWSJM_OK) wj_fatal(r, "entry header outside the contract", wwsjm_be32(raw), wwsjm_be32(raw + 4));
 #ifdef WWSJM_TEST_HOOKS
@@ -481,7 +495,17 @@ static void wj_run_job(struct wj_run* r, const struct wj_job* job)
     c->event_mask = 0;
     c->int_enable = 1;
     WJ_COUNT(jobs, 1);
-    if (spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0) != 0)
+    const int entered = spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0);
+    if (entered == SPURS_NATIVE_PM_JOB_HALTED) {
+        /* the job halted or stopped: its entry stays claimed and unretired (its
+         * lane marker too); the halt goes on to the run's own bracket */
+        if (r->check)
+            fprintf(stderr, "[wwsjm] check: job %u:0x%04X (wid %u lane %u, entry 0x%05X) halted with status 0x%X at pc 0x%05X;"
+                    " it stays claimed and unretired\n", job->array, job->index, r->wid, r->lane, entry, c->status,
+                    (uint32_t)c->pc & SPU_LS_MASK);
+        spu_halt(c);
+    }
+    if (entered != 0)
         wj_fatal(r, "job did not return to the job-return slot", c->pc & SPU_LS_MASK, entry);
     if (r->check) {
         if (r->finishes != 1) wj_fatal(r, "check: finish not called exactly once", r->finishes, entry);

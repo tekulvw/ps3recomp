@@ -100,7 +100,7 @@ struct ws_job {
     wwsjm_plan plan;
     uint32_t cmd_ls, deps_left[WWSJM_MAX_DEPS];
     unsigned deps_n, tags;
-    struct { uint8_t set, buf, tag; } tag_of[32]; unsigned tag_n;
+    struct { uint8_t set, buf, tag; } tag_of[WWSJM_JOB_TAG_COUNT]; unsigned tag_n;
 };
 struct ws_xfer { uint32_t seq, lsa, ea, size; uint8_t region, payload, get; };
 
@@ -423,6 +423,21 @@ static int ws_window_has(const struct ws_thread* t, uint32_t from, uint32_t lsa,
     return 0;
 }
 
+/* Spec 18.1: an element may run into the list copy only over entries already
+ * consumed: element k ends at or before the copy's start + 8*(k+1). */
+static int ws_gather_consumed_ok(const uint8_t* list, const wwsjm_load* l, const wwsjm_piece* pc, unsigned n)
+{
+    const uint32_t copy = l->ls + l->limit - l->bytes;
+    unsigned piece = 0;
+    for (unsigned k = 0; k < l->bytes / 8 && piece < n; k++) {
+        if (!wwsjm_be32(list + 8u * k)) continue;
+        const uint32_t end = pc[piece].ls + pc[piece].bytes;
+        if (end > copy && end > copy + 8u * (k + 1)) return 0;
+        piece++;
+    }
+    return 1;
+}
+
 /* Try other ring starts for set q until `test` passes; counted as placement. */
 static int ws_try_starts(struct ws_thread* t, unsigned q, uint32_t from)
 {
@@ -508,7 +523,8 @@ static void ws_enter(struct ws_thread* t, unsigned array, uint16_t index, int na
         uint8_t list[1024];
         if (l->bytes > sizeof list || !ws_mem_read(t, l->ea, l->bytes, list)) { ws_unk(t, WSC_GATHER); continue; }
         wwsjm_piece pc[128]; unsigned n = 0;
-        if (wwsjm_gather_layout(list, l->bytes / 8, l->ls, l->limit, pc, 128, &n) != WWSJM_OK) {
+        if (wwsjm_gather_layout(list, l->bytes / 8, l->ls, l->limit, pc, 128, &n) != WWSJM_OK ||
+            !ws_gather_consumed_ok(list, l, pc, n)) {
             ws_bad(t, WSC_GATHER, "gather list refused at 0x%08X (%u bytes)", l->ea, l->bytes, 0); continue;
         }
         int all = 1;
@@ -519,6 +535,12 @@ static void ws_enter(struct ws_thread* t, unsigned array, uint16_t index, int na
                 ws_bad(t, WSC_GATHER, "gathered pieces of the list at 0x%08X not at their places (set %u)", l->ea, set, 0);
                 continue;
             }
+        }
+        /* the list copy in the buffer's last 16*L bytes, where the job reads it (17.1) */
+        if (!ws_window_has(t, key->claim_seq, l->ls + l->limit - l->bytes, l->ea, l->bytes)) {
+            ws_bad(t, WSC_GATHER, "gather list at 0x%08X not copied to its buffer's end (LS 0x%05X)", l->ea,
+                   l->ls + l->limit - l->bytes, 0);
+            continue;
         }
         WS_ADD(ok[WSC_GATHER], n);
     }
@@ -600,11 +622,15 @@ static void ws_branch(struct ws_thread* t, const uint8_t* p, uint32_t n)
         struct ws_job* j = &t->job;
         unsigned i = 0;
         while (i < j->tag_n && (j->tag_of[i].set != t->last_call_r4 || j->tag_of[i].buf != t->last_call_r5)) i++;
-        if (i == j->tag_n && i < 32) {
+        if (i == j->tag_n) {
+            if (i >= WWSJM_JOB_TAG_COUNT) {   /* the run loop stops the process here */
+                ws_bad(t, WSC_GETBUF, "more DMA tags than a job may take (set %u buffer %u)", t->last_call_r4, t->last_call_r5, 0);
+                return;
+            }
             j->tag_of[i].set = (uint8_t)t->last_call_r4; j->tag_of[i].buf = (uint8_t)t->last_call_r5;
             j->tag_of[i].tag = (uint8_t)(31u - j->tags++); j->tag_n++;
         }
-        if (i < 32) tag = j->tag_of[i].tag;
+        tag = j->tag_of[i].tag;
     }
     uint8_t d[16];
     wwsjm_status st = wwsjm_buffer_descriptor(&t->job.plan, t->last_call_r4, t->last_call_r5, tag, d);

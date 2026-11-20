@@ -146,7 +146,10 @@ spurs_native_pm_payload_fn spurs_native_pm_payload_hook(void);
  * (the SPU ABI's stack pointer and the word its stack check tests), r3 =
  * context (in all four words), r4 = arg (r2, r5..r79 are the caller's), and a
  * call bracket that drains until the job returns to that slot. Returns 0 when
- * the job returned there (or the hook ran it), -1 if it came back elsewhere. */
+ * the job returned there (or the hook ran it), -1 if it came back elsewhere,
+ * and SPURS_NATIVE_PM_JOB_HALTED if the job halted or stopped: ctx->status says
+ * how, and the caller passes the halt on with spu_halt(). */
+#define SPURS_NATIVE_PM_JOB_HALTED (-2)
 int spurs_native_pm_enter_job(struct spu_context*, uint32_t entry, uint32_t stack,
                               uint32_t stack_bytes, uint32_t context_ls, uint32_t arg);
 

@@ -86,6 +86,9 @@ MUTANTS = {
                                 '    if (status == 4) { WJ_COUNT(flag_polls, 1); }'),
     # spec v0.6 (5.1, 15): r1 word 1, the stack bytes the ABI stack check tests
     # spec v0.8 (17): the gather list copy, zero-size elements, tags per set
+    # the character-creation bug: the list read but never copied to the buffer's end
+    'list-copy-missing': (RUN, '        wj_guest_read(r, l->ea, l->bytes, list, list_ls);\n        memcpy(c->ls + list_ls, list, l->bytes);',
+                          '        wj_guest_read(r, l->ea, l->bytes, list, 0);'),
     'list-copy-at-start': (RUN, '        const uint32_t list_ls = l->ls + l->limit - l->bytes;', '        const uint32_t list_ls = l->ls;'),
     'zero-size-element-advances': ('runtime/spu/wwsjm/wwsjm_core.c', '        if (!word)\n            continue;\n', ''),
     'window-top-3C000': (RUN, '    WJ_LS_HIGH = 0x3E000, ', '    WJ_LS_HIGH = 0x3C000, '),
@@ -104,7 +107,7 @@ MUTANTS = {
 
 
 # Breaks of the native run the shadow comparison must report as mismatches.
-SHADOW_SEES = ('flag-poll-write-dropped', 'M4-reservation-loss-ignored', 'retire-drops-held-job', 'decrement-skipped', 'wake-skipped',
+SHADOW_SEES = ('list-copy-missing', 'flag-poll-write-dropped', 'M4-reservation-loss-ignored', 'retire-drops-held-job', 'decrement-skipped', 'wake-skipped',
                'M8-userdata-at-portion', 'module-never-reloaded', 'tags-kept-across-jobs', 'finish-claims-nothing',
                'context-array-dropped')
 
@@ -190,6 +193,13 @@ def check(binary: Path) -> list[str]:
                         capture_output=True, text=True, timeout=60)
     expect(rb.returncode == 86 and 'refused gather list' in rb.stderr,
            f'an illegal overlap was not refused: rc={rb.returncode} {rb.stderr[-300:]}')
+    # a job that halts: check mode names it as claimed and unretired, and the halt
+    # reaches the run's bracket (no FATAL)
+    rh = subprocess.run([str(binary), 'native'], env=dict(BASE_ENV, PS3RECOMP_SPURS_NATIVE_PM='check', WWSJM_FIXTURE_JOB_HALT='1',
+                                                          WWSJM_FIXTURE_NO_BREAKER='1'),
+                        capture_output=True, text=True, timeout=60)
+    expect('check: job 0:0x0002' in rh.stderr and 'stays claimed and unretired' in rh.stderr and 'FATAL' not in rh.stderr,
+           f'a halted job was not named: rc={rh.returncode} {rh.stderr[-400:]}')
     # the interrupt vector's target halts loudly
     ri = subprocess.run([str(binary), 'native-irq'], env=dict(BASE_ENV, PS3RECOMP_SPURS_NATIVE_PM='1'),
                         capture_output=True, text=True, timeout=60)

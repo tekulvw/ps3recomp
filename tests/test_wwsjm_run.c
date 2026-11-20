@@ -387,6 +387,12 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
             c->host_depth--;
         }
     }
+    if (k == 1 && getenv("WWSJM_FIXTURE_JOB_HALT")) {   /* a genuine job halt (an assert) */
+        extern void spu_halt(spu_context*);
+        c->status = SPU_STATUS_STOPPED_BY_HALT;
+        spu_halt(c);
+        return;
+    }
     c->int_enable = 0;   /* the job's own toggle (`bid`): services run with interrupts off */
     /* the job's scratch: its reservation buffer at 0x80 (a GETLLAR of its list
      * line, as the jobs do) and the rest of 0x80-0x17F */

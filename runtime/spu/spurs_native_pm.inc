@@ -255,7 +255,7 @@ int spurs_native_pm_enter_job(spu_context* c, uint32_t entry, uint32_t stack,
         c->pc = SPURS_NATIVE_PM_JOB_RETURN_LS;
         return 0;
     }
-    if (halted) spu_halt(c);   /* the job halted or stopped: on to the run's own bracket */
+    if (halted) return SPURS_NATIVE_PM_JOB_HALTED;   /* the caller passes the halt on (spu_halt) */
     return (c->pc & SPU_LS_MASK) == SPURS_NATIVE_PM_JOB_RETURN_LS ? 0 : -1;
 }
 
