@@ -119,6 +119,7 @@ struct ws_thread {
     int in_finish, finish_claim;          /* key index or -1 */
     int instance_writes, last_claim_type;
     uint32_t last_poll_status;
+    int poll_other;                       /* the last select answered another workload */
     int pre_valid; uint16_t pre_S, pre_N;
     struct { uint32_t ea, size; } reads[WS_MAX_READS]; unsigned reads_n;
     struct ws_xfer* x; unsigned x_n;
@@ -394,6 +395,9 @@ static void ws_atomic(struct ws_thread* t, const uint8_t* p, uint32_t n)
 
 static void ws_stop_check(struct ws_thread* t)
 {
+    /* the kernel asked for another workload: the stop is the kernel's, whatever
+     * the line (read later, e.g. by the ready rule) shows */
+    if (t->poll_other) { ws_ok(t, WSC_STOP); return; }
     if (!t->has_view) { ws_unk(t, WSC_STOP); return; }
     wwsjm_cursor cur; wwsjm_header h; uint8_t raw[8]; wwsjm_verdict v;
     if (!ws_entry(t, t->list_view, &cur, &h, raw, &v)) { ws_unk(t, WSC_STOP); return; }
@@ -635,7 +639,7 @@ static void wj_shadow_event(spu_context* c, uint32_t kind, const uint8_t* p, uin
         memset(t->ll, 0, sizeof t->ll); memset(t->keys, 0, sizeof t->keys);
         memset(&t->job, 0, sizeof t->job); memset(&t->returned, 0, sizeof t->returned);
         t->in_finish = 0; t->finish_claim = -1; t->instance_writes = 0; t->last_claim_type = -1; t->pre_valid = 0;
-        t->last_poll_status = 0;
+        t->last_poll_status = 0; t->poll_other = 0;
         t->bad = t->unk = t->hint = 0;
         t->has_view = ws_u32(p + 52) != 0;
         if (t->has_view) memcpy(t->list_view, p + 64, 128);
@@ -669,7 +673,10 @@ static void wj_shadow_event(spu_context* c, uint32_t kind, const uint8_t* p, uin
     case WS_BRANCH: ws_branch(t, p, n); return;
     case WS_KERNEL:
         if (n >= 4 && ws_u32(p) == 2) ws_stop_check(t);   /* exit to the kernel */
-        if (n >= 12 && ws_u32(p) == 1) t->last_poll_status = ws_u32(p + 8);   /* select: {wid, status} */
+        if (n >= 12 && ws_u32(p) == 1) {   /* select: r3 = {wid, status} */
+            t->last_poll_status = ws_u32(p + 8);
+            t->poll_other = ws_u32(p + 4) != t->wid;
+        }
         return;
     case WS_RUN_END: {
         t->active = 0;
