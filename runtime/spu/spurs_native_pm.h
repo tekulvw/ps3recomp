@@ -11,8 +11,10 @@
  *   1            every workload whose policy image has a registered native
  *                implementation (fingerprint and SHA-256 both match) runs it.
  *   check        as 1, and the implementation is told to run its self-checks.
- *   shadow       the lifted path; reserved for an implementation's shadow
- *                comparison (none is wired yet: the runs stay lifted).
+ *   shadow       the lifted path; a workload an implementation would take
+ *                has its lifted runs' policy-run events (the recorder's
+ *                format, spurs_pm_record.inc) handed to the implementation's
+ *                shadow hook, which compares them with its own decisions.
  *   <name>       as 1, restricted to the implementation of that name.
  *
  * The choice is made once per workload id, when its policy image is first
@@ -88,6 +90,14 @@ struct spurs_native_pm {
     int (*run)(struct spu_context*, const struct spurs_native_pm_run*);
     /* Installed in ctx->native_services for the run; may be NULL. */
     const struct spurs_native_services* services;
+    /* Optional: whether this implementation takes workload `wid` of the SPURS
+     * instance at `spurs_ea` with `n_spus` SPUs (0 = unknown). Asked once, at
+     * selection, after the identity gate; a refusal keeps the lifted path. */
+    int (*accept)(uint32_t spurs_ea, uint32_t wid, uint32_t n_spus);
+    /* Optional: one policy-run event of a lifted run of a shadowed workload,
+     * as {kind, payload} in the recorder's file format (tools/spurs_pm_record.py),
+     * on the worker thread running it. Used only in shadow mode. */
+    void (*shadow)(struct spu_context*, uint32_t kind, const uint8_t* payload, uint32_t n);
 };
 
 /* Registration (any time before the workload is first resolved). Returns 0, or
@@ -102,6 +112,25 @@ int spurs_native_pm_mode(void);
  * registry only when the mode is ON or CHECK; prints one line per decision. */
 const struct spurs_native_pm* spurs_native_pm_select(uint32_t wid, uint64_t fingerprint,
                                                      const uint8_t* image, uint32_t size);
+/* The same, for workload `wid` of the instance at `spurs_ea` with `n_spus`
+ * SPUs (passed to the implementation's accept hook). */
+const struct spurs_native_pm* spurs_native_pm_select_instance(uint32_t wid, uint64_t fingerprint,
+                                                              const uint8_t* image, uint32_t size,
+                                                              uint32_t spurs_ea, uint32_t n_spus);
+/* PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW=1 with the switch on: native runs' events
+ * also go to their implementation's shadow comparison (fixtures, diagnostics). */
+int spurs_native_pm_self_shadow(void);
+/* The implementation shadowing workload `wid` (shadow mode), or NULL. */
+const struct spurs_native_pm* spurs_native_pm_shadowed(uint32_t wid);
+/* Implementations built into the runtime (the WWS job manager) are registered
+ * the first time a selection is made with the switch on; never while unset. */
+void spurs_native_pm_register_builtins(void);
+/* The native WWS job manager's descriptor (runtime/spu/wwsjm/wwsjm_run.inc). */
+const struct spurs_native_pm* spurs_wwsjm_native(void);
+/* Its counters, one [wwsjm] line on stderr (also printed at exit once registered). */
+void spurs_wwsjm_print_stats(void);
+/* The shadow comparison's summary, one [wwsjm-shadow] line on stderr. */
+void spurs_wwsjm_shadow_print(void);
 /* How many times the registry has been consulted (inertness checks). */
 unsigned long spurs_native_pm_consults(void);
 
@@ -113,11 +142,16 @@ void spurs_native_pm_set_payload_hook(spurs_native_pm_payload_fn);
 spurs_native_pm_payload_fn spurs_native_pm_payload_hook(void);
 
 /* Enter job code at `entry` from a native run: the payload hook first; else
- * r0 = the job-return slot, r1 = stack, r3 = context, r4 = arg, and a call
- * bracket that drains until the job returns to that slot. Returns 0 when the
- * job returned there (or the hook ran it), -1 if it came back elsewhere. */
+ * r0 = the job-return slot, r1 = {stack top, stack bytes available, 0, 0}
+ * (the SPU ABI's stack pointer and the word its stack check tests), r3 =
+ * context (in all four words), r4 = arg (r2, r5..r79 are the caller's), and a
+ * call bracket that drains until the job returns to that slot. Returns 0 when
+ * the job returned there (or the hook ran it), -1 if it came back elsewhere,
+ * and SPURS_NATIVE_PM_JOB_HALTED if the job halted or stopped: ctx->status says
+ * how, and the caller passes the halt on with spu_halt(). */
+#define SPURS_NATIVE_PM_JOB_HALTED (-2)
 int spurs_native_pm_enter_job(struct spu_context*, uint32_t entry, uint32_t stack,
-                              uint32_t context_ls, uint32_t arg);
+                              uint32_t stack_bytes, uint32_t context_ls, uint32_t arg);
 
 /* SHA-256 (FIPS 180-4) of a byte range. */
 void spurs_native_pm_sha256(const uint8_t* data, size_t n, uint8_t out[32]);

@@ -231,11 +231,18 @@ static void test_jl5_switch(void)
     CHECK(wwsjm_be16(out + 0x0A) == 2);
     CHECK(wwsjm_be16(out + 0x0E) == 0xFFDD);
     CHECK(wwsjm_be16(out + 0x08) == 0xABCD && wwsjm_be16(out + 0x0C) == 0x1234);
-    CHECK(same_except(l, out, 0x50, 0x60, 0x0A, 0x0E));
+    CHECK(same_except(l, out, 0x50, 0x60, 0x0A, 0x0E));   /* (+0x0C unchanged: no borrow) */
     wwsjm_line dl;
     wwsjm_line_decode(out, &dl);
     wwsjm_cursor c;
     CHECK(wwsjm_cursor_of(&dl, &c) == WWSJM_OK && c.array == 2);
+    /* the counter is the u32 at +0x0C: its low halfword borrows from the high one */
+    wwsjm_put16(l + 0x0C, 0xFFFF);
+    wwsjm_put16(l + 0x0E, 0x0000);
+    line_markers(l, 1, m);
+    CHECK(wwsjm_claim(l, 2, &h, out) == WWSJM_OK);
+    CHECK(wwsjm_be32(out + 0x0C) == 0xFFFEFFFFu);
+    wwsjm_put16(l + 0x0C, 0x1234);
     /* 3 -> 0 */
     wwsjm_put16(l + 0x0A, 3);
     line_markers(l, 3, m);
@@ -668,8 +675,11 @@ static void test_sets(void)
             chunks++;
         }
     CHECK(chunks == 4 && total == 0xE740);
-    /* a zero-page set must still start inside the window */
+    /* a zero-page set only needs its start inside local store */
+    CHECK(wwsjm_plan_commands(rec, 0x70, 0x4000, 0x3E000, &p, &bad) == WWSJM_OK);
+    cmd(rec, 4, 0x00000280, 0x00000100);    /* page 0: below the window, still refused */
     CHECK(wwsjm_plan_commands(rec, 0x70, 0x4000, 0x3E000, &p, &bad) == WWSJM_E_RANGE && bad == 4);
+    cmd(rec, 4, 0x00000280, 0xF8000100);
     /* a set's buffer may be named only once */
     cmd(rec, 9, 0x00000441, 0);
     CHECK(wwsjm_plan_commands(rec, 0x70, 0x4000, 0x40000, &p, &bad) == WWSJM_E_SET && bad == 9);

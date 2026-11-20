@@ -6,14 +6,14 @@
 
 /* Field offsets of the job list line (interface facts). */
 enum {
-    LINE_IMAGE_EA = 0x00, LINE_IMAGE_SIZE = 0x04, LINE_CURRENT = 0x0A, LINE_SWITCHES = 0x0E,
+    LINE_IMAGE_EA = 0x00, LINE_IMAGE_SIZE = 0x04, LINE_CURRENT = 0x0A, LINE_SWITCHES = 0x0C,
     LINE_MASK = 0x20, LINE_ARRAY_EA = 0x30, LINE_MARKERS = 0x40
 };
 
 static unsigned marker_offset(unsigned a) { return LINE_MARKERS + 16u * a; }
 static unsigned lane_offset(unsigned a, unsigned lane) { return marker_offset(a) + 4u + 2u * lane; }
 
-const char* wwsjm_status_name(wwsjm_status s)
+WWSJM_API const char* wwsjm_status_name(wwsjm_status s)
 {
     static const char* const names[] = {
         "ok", "argument", "detached array", "entry type", "header", "command", "flags", "set",
@@ -22,12 +22,12 @@ const char* wwsjm_status_name(wwsjm_status s)
     return (unsigned)s < sizeof names / sizeof names[0] ? names[s] : "?";
 }
 
-void wwsjm_line_decode(const uint8_t raw[WWSJM_LINE_BYTES], wwsjm_line* out)
+WWSJM_API void wwsjm_line_decode(const uint8_t raw[WWSJM_LINE_BYTES], wwsjm_line* out)
 {
     out->image_ea = wwsjm_be32(raw + LINE_IMAGE_EA);
     out->image_size = wwsjm_be32(raw + LINE_IMAGE_SIZE);
     out->current = wwsjm_be16(raw + LINE_CURRENT);
-    out->switch_count = wwsjm_be16(raw + LINE_SWITCHES);
+    out->switch_count = wwsjm_be32(raw + LINE_SWITCHES);
     for (unsigned a = 0; a < WWSJM_ARRAYS; a++) {
         out->mask[a] = wwsjm_be32(raw + LINE_MASK + 4u * a);
         out->array_ea[a] = wwsjm_be32(raw + LINE_ARRAY_EA + 4u * a);
@@ -39,7 +39,7 @@ void wwsjm_line_decode(const uint8_t raw[WWSJM_LINE_BYTES], wwsjm_line* out)
     }
 }
 
-uint32_t wwsjm_header_ea(const wwsjm_line* l, unsigned a, uint16_t index)
+WWSJM_API uint32_t wwsjm_header_ea(const wwsjm_line* l, unsigned a, uint16_t index)
 {
     /* The line holds capacity - 1; capacities need not be powers of two. */
     uint32_t capacity = l->mask[a] + 1u;
@@ -48,7 +48,7 @@ uint32_t wwsjm_header_ea(const wwsjm_line* l, unsigned a, uint16_t index)
     return l->array_ea[a] + 8u * ((uint32_t)index % capacity);
 }
 
-wwsjm_status wwsjm_cursor_of(const wwsjm_line* l, wwsjm_cursor* out)
+WWSJM_API wwsjm_status wwsjm_cursor_of(const wwsjm_line* l, wwsjm_cursor* out)
 {
     unsigned a = l->current;
     if (a >= WWSJM_ARRAYS)
@@ -61,7 +61,7 @@ wwsjm_status wwsjm_cursor_of(const wwsjm_line* l, wwsjm_cursor* out)
     return WWSJM_OK;
 }
 
-wwsjm_status wwsjm_header_decode(const uint8_t raw[WWSJM_HEADER_BYTES], wwsjm_header* out)
+WWSJM_API wwsjm_status wwsjm_header_decode(const uint8_t raw[WWSJM_HEADER_BYTES], wwsjm_header* out)
 {
     uint16_t size_word = wwsjm_be16(raw);
     out->size = size_word & 0x0FFF;
@@ -79,7 +79,7 @@ wwsjm_status wwsjm_header_decode(const uint8_t raw[WWSJM_HEADER_BYTES], wwsjm_he
     return WWSJM_OK;
 }
 
-wwsjm_verdict wwsjm_judge(const wwsjm_header* h, uint16_t gate_value)
+WWSJM_API wwsjm_verdict wwsjm_judge(const wwsjm_header* h, uint16_t gate_value)
 {
     if (h->type == WWSJM_ENTRY_EMPTY)
         return WWSJM_STOP_EMPTY;
@@ -91,7 +91,7 @@ wwsjm_verdict wwsjm_judge(const wwsjm_header* h, uint16_t gate_value)
 /* a precedes b in the 16-bit modular order */
 static int before16(uint16_t a, uint16_t b) { return (int16_t)(uint16_t)(a - b) < 0; }
 
-wwsjm_status wwsjm_claim(const uint8_t old[WWSJM_LINE_BYTES], unsigned lane,
+WWSJM_API wwsjm_status wwsjm_claim(const uint8_t old[WWSJM_LINE_BYTES], unsigned lane,
                          const wwsjm_header* h, uint8_t out[WWSJM_LINE_BYTES])
 {
     if (lane >= WWSJM_LANES || h->type == WWSJM_ENTRY_EMPTY || h->type > WWSJM_ENTRY_REPORT)
@@ -113,12 +113,13 @@ wwsjm_status wwsjm_claim(const uint8_t old[WWSJM_LINE_BYTES], unsigned lane,
     } else if (h->type == WWSJM_ENTRY_SWITCH) {
         uint16_t cur = wwsjm_be16(out + LINE_CURRENT);
         wwsjm_put16(out + LINE_CURRENT, (uint16_t)((cur + 1u) % WWSJM_ARRAYS));
-        wwsjm_put16(out + LINE_SWITCHES, (uint16_t)(wwsjm_be16(out + LINE_SWITCHES) - 1u));
+        /* a u32 counter: its low halfword borrows from the high one */
+        wwsjm_put32(out + LINE_SWITCHES, wwsjm_be32(out + LINE_SWITCHES) - 1u);
     }
     return WWSJM_OK;
 }
 
-wwsjm_status wwsjm_retire(const uint8_t old[WWSJM_LINE_BYTES], unsigned array, unsigned lane,
+WWSJM_API wwsjm_status wwsjm_retire(const uint8_t old[WWSJM_LINE_BYTES], unsigned array, unsigned lane,
                           const wwsjm_held* next, uint8_t out[WWSJM_LINE_BYTES])
 {
     if (lane >= WWSJM_LANES || array >= WWSJM_ARRAYS)
@@ -129,7 +130,7 @@ wwsjm_status wwsjm_retire(const uint8_t old[WWSJM_LINE_BYTES], unsigned array, u
     return WWSJM_OK;
 }
 
-uint8_t wwsjm_ready_value(const wwsjm_line* l, wwsjm_verdict at_next, uint8_t busy)
+WWSJM_API uint8_t wwsjm_ready_value(const wwsjm_line* l, wwsjm_verdict at_next, uint8_t busy)
 {
     unsigned a = l->current;
     if (a >= WWSJM_ARRAYS || at_next != WWSJM_TAKE)
@@ -137,7 +138,7 @@ uint8_t wwsjm_ready_value(const wwsjm_line* l, wwsjm_verdict at_next, uint8_t bu
     return before16(l->m[a].next, l->m[a].submitted) ? busy : 0;
 }
 
-wwsjm_status wwsjm_ready_apply(const uint8_t old[WWSJM_LINE_BYTES], unsigned wid, uint8_t value,
+WWSJM_API wwsjm_status wwsjm_ready_apply(const uint8_t old[WWSJM_LINE_BYTES], unsigned wid, uint8_t value,
                                uint8_t out[WWSJM_LINE_BYTES])
 {
     if (wid >= 16)
@@ -147,7 +148,7 @@ wwsjm_status wwsjm_ready_apply(const uint8_t old[WWSJM_LINE_BYTES], unsigned wid
     return WWSJM_OK;
 }
 
-wwsjm_status wwsjm_decrement(const uint8_t old[WWSJM_LINE_BYTES], unsigned offset,
+WWSJM_API wwsjm_status wwsjm_decrement(const uint8_t old[WWSJM_LINE_BYTES], unsigned offset,
                              uint8_t out[WWSJM_LINE_BYTES], uint16_t* value)
 {
     if ((offset & 1) || offset > WWSJM_LINE_BYTES - 2)
@@ -228,7 +229,7 @@ static int add_load(wwsjm_plan* p, unsigned use, unsigned fill, unsigned share, 
     return 1;
 }
 
-wwsjm_status wwsjm_plan_commands(const uint8_t* record, uint32_t size, uint32_t ls_low,
+WWSJM_API wwsjm_status wwsjm_plan_commands(const uint8_t* record, uint32_t size, uint32_t ls_low,
                                  uint32_t ls_high, wwsjm_plan* out, unsigned* bad_slot)
 {
     memset(out, 0, sizeof *out);
@@ -261,7 +262,7 @@ wwsjm_status wwsjm_plan_commands(const uint8_t* record, uint32_t size, uint32_t 
                 out->set0_moved = 1;
             uint32_t lo = set_lo(s), hi = set_hi(s);
             if (!s->count || s->count > 32 || lo < ls_low ||
-                hi > ls_high || (hi == lo && lo >= ls_high))
+                hi > ls_high || (hi == lo && lo >= WWSJM_LS_BYTES))
                 return fail(out, bad_slot, i, WWSJM_E_RANGE);
             for (unsigned k = 0; k < WWSJM_MAX_SETS; k++) {
                 const wwsjm_set* o = &out->set[k];
@@ -348,7 +349,7 @@ wwsjm_status wwsjm_plan_commands(const uint8_t* record, uint32_t size, uint32_t 
     return WWSJM_OK;
 }
 
-wwsjm_status wwsjm_buffer_span(const wwsjm_plan* p, unsigned set, unsigned buf, uint32_t* ls,
+WWSJM_API wwsjm_status wwsjm_buffer_span(const wwsjm_plan* p, unsigned set, unsigned buf, uint32_t* ls,
                                uint32_t* bytes)
 {
     if (set >= WWSJM_MAX_SETS)
@@ -361,7 +362,7 @@ wwsjm_status wwsjm_buffer_span(const wwsjm_plan* p, unsigned set, unsigned buf, 
     return WWSJM_OK;
 }
 
-wwsjm_status wwsjm_plan_held(const wwsjm_plan* p, uint32_t released, wwsjm_span* out,
+WWSJM_API wwsjm_status wwsjm_plan_held(const wwsjm_plan* p, uint32_t released, wwsjm_span* out,
                              unsigned max, unsigned* out_n)
 {
     unsigned n = 0;
@@ -406,7 +407,7 @@ static int pinned(const wwsjm_plan* p, unsigned set)
     return 0;
 }
 
-unsigned wwsjm_plan_place(wwsjm_plan* p, const wwsjm_span* busy, unsigned n_busy)
+WWSJM_API unsigned wwsjm_plan_place(wwsjm_plan* p, const wwsjm_span* busy, unsigned n_busy)
 {
     unsigned conflicts = 0;
     for (unsigned k = 0; k < WWSJM_MAX_SETS; k++) {
@@ -434,7 +435,7 @@ unsigned wwsjm_plan_place(wwsjm_plan* p, const wwsjm_span* busy, unsigned n_busy
     return conflicts;
 }
 
-void wwsjm_plan_relocate(wwsjm_plan* p)
+WWSJM_API void wwsjm_plan_relocate(wwsjm_plan* p)
 {
     for (unsigned i = 0; i < p->load_count; i++) {
         wwsjm_load* l = &p->load[i];
@@ -445,7 +446,7 @@ void wwsjm_plan_relocate(wwsjm_plan* p)
     }
 }
 
-wwsjm_status wwsjm_buffer_descriptor(const wwsjm_plan* p, unsigned set, unsigned buf,
+WWSJM_API wwsjm_status wwsjm_buffer_descriptor(const wwsjm_plan* p, unsigned set, unsigned buf,
                                      uint8_t tag, uint8_t out[16])
 {
     uint32_t ls, bytes;
@@ -468,7 +469,7 @@ wwsjm_status wwsjm_buffer_descriptor(const wwsjm_plan* p, unsigned set, unsigned
     return WWSJM_OK;
 }
 
-wwsjm_status wwsjm_gather_layout(const uint8_t* list, unsigned n, uint32_t ls, uint32_t limit,
+WWSJM_API wwsjm_status wwsjm_gather_layout(const uint8_t* list, unsigned n, uint32_t ls, uint32_t limit,
                                  wwsjm_piece* out, unsigned max_out, unsigned* out_n)
 {
     uint32_t at = 0;                           /* quadword-aligned offset of the next element */
@@ -500,9 +501,9 @@ wwsjm_status wwsjm_gather_layout(const uint8_t* list, unsigned n, uint32_t ls, u
 
 /* ---- residency ------------------------------------------------------------- */
 
-void wwsjm_residency_reset(wwsjm_residency* r) { r->n = 0; }
+WWSJM_API void wwsjm_residency_reset(wwsjm_residency* r) { r->n = 0; }
 
-int wwsjm_residency_holds(const wwsjm_residency* r, uint32_t ls, uint32_t bytes, uint32_t ea)
+WWSJM_API int wwsjm_residency_holds(const wwsjm_residency* r, uint32_t ls, uint32_t bytes, uint32_t ea)
 {
     for (unsigned i = 0; i < r->n; i++)
         if (r->e[i].ls == ls && r->e[i].bytes == bytes && r->e[i].ea == ea)
@@ -510,7 +511,7 @@ int wwsjm_residency_holds(const wwsjm_residency* r, uint32_t ls, uint32_t bytes,
     return 0;
 }
 
-void wwsjm_residency_clobber(wwsjm_residency* r, uint32_t ls, uint32_t bytes)
+WWSJM_API void wwsjm_residency_clobber(wwsjm_residency* r, uint32_t ls, uint32_t bytes)
 {
     unsigned keep = 0;
     for (unsigned i = 0; i < r->n; i++) {
@@ -521,7 +522,7 @@ void wwsjm_residency_clobber(wwsjm_residency* r, uint32_t ls, uint32_t bytes)
     r->n = keep;
 }
 
-void wwsjm_residency_note(wwsjm_residency* r, uint32_t ls, uint32_t bytes, uint32_t ea)
+WWSJM_API void wwsjm_residency_note(wwsjm_residency* r, uint32_t ls, uint32_t bytes, uint32_t ea)
 {
     wwsjm_residency_clobber(r, ls, bytes);
     if (r->n == WWSJM_RESIDENT_MAX) {          /* forget the oldest */
@@ -534,7 +535,7 @@ void wwsjm_residency_note(wwsjm_residency* r, uint32_t ls, uint32_t bytes, uint3
     r->n++;
 }
 
-void wwsjm_plan_residency(wwsjm_plan* p, wwsjm_residency* r)
+WWSJM_API void wwsjm_plan_residency(wwsjm_plan* p, wwsjm_residency* r)
 {
     /* A set is resident when every use of it is a shareable copy that was the
      * last thing loaded at the same place from the same source. */
@@ -575,7 +576,7 @@ void wwsjm_plan_residency(wwsjm_plan* p, wwsjm_residency* r)
 
 /* ---- context ----------------------------------------------------------------- */
 
-void wwsjm_context_build(const wwsjm_context_args* a, uint8_t out[WWSJM_CONTEXT_BYTES])
+WWSJM_API void wwsjm_context_build(const wwsjm_context_args* a, uint8_t out[WWSJM_CONTEXT_BYTES])
 {
     memset(out, 0, WWSJM_CONTEXT_BYTES);
     wwsjm_put32(out + 0x00, a->lane);
@@ -591,7 +592,7 @@ void wwsjm_context_build(const wwsjm_context_args* a, uint8_t out[WWSJM_CONTEXT_
         wwsjm_put32(out + 0x30 + 4 * i, a->slot[i]);
 }
 
-void wwsjm_finish_result(const wwsjm_header* claimed, uint32_t out[2])
+WWSJM_API void wwsjm_finish_result(const wwsjm_header* claimed, uint32_t out[2])
 {
     if (!claimed) {
         out[0] = 0;

@@ -44,7 +44,7 @@ unsigned long long ps3_ms_now(void)
 
 enum { GUEST = 16u << 20, SPURS_EA = 0x100000, PM_EA = 0x200000, PM_SIZE = 0x180, LIST_EA = 0x300000,
        WID = 3, RUNS = 6, IMAGE = 61,
-       LS_LINE = 0x1000, LS_CTX = 0x1400, JOB_A = 0x4000, JOB_B = 0x4100, JOB_C = 0x4200, JOB_BAD = 0x4300,
+       LS_LINE = 0x1000, LS_CTX = 0x1400, JOB_A = 0x4000, JOB_B = 0x4100, JOB_C = 0x4200, JOB_BAD = 0x4300, JOB_D = 0x4500,
        JOB_SITE = 0x4800, STACK = 0x3FF00, MARK = 0x7E57AB1Eu };
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static volatile uint32_t g_lifted_runs, g_native_runs, g_services, g_job_ok, g_job_bad, g_hook_calls,
@@ -120,6 +120,19 @@ static void job_b(spu_context* c)   /* returns by a computed jump to r0 */
     c->pc = c->gpr[0]._u32[0];
     g_spu_trampoline_fn = spu_indirect_branch;
 }
+/* returns with `bi $r0` from a frame deeper than its entry: a subroutine it
+ * called through a bracket branches to the job's link (design 5: the job ends) */
+static void job_d(spu_context* c)
+{
+    const uint32_t link = c->gpr[0]._u32[0];
+    __atomic_add_fetch(&g_job_ok, 1, __ATOMIC_ACQ_REL);
+    c->gpr[0] = spu_link(JOB_SITE + 4); c->host_depth++;
+    c->pc = link; spu_indirect_branch(c);
+    spu_drain_call(c, JOB_SITE + 4);
+    c->host_depth--;
+    __atomic_add_fetch(&g_job_bad, 1, __ATOMIC_ACQ_REL);   /* never reached */
+    SPU_RET(c);
+}
 static void job_c(spu_context* c) { __atomic_add_fetch(&g_job_c_ran, 1, __ATOMIC_ACQ_REL); SPU_RET(c); }
 static void job_bad(spu_context* c)   /* calls an empty window slot */
 {
@@ -157,10 +170,11 @@ static int native_run(spu_context* c, const struct spurs_native_pm_run* a)
         memset(c->ls + LS_CTX, 0, 0x40);
         spu_ls_write32(c, LS_CTX + 0, SPURS_NATIVE_PM_SLOT_LS(0));
         spu_ls_write32(c, LS_CTX + 4, SPURS_NATIVE_PM_SLOT_LS(1));
-        if (spurs_native_pm_enter_job(c, JOB_A, STACK, LS_CTX, 7) != 0) g_job_bad++;
-        if (spurs_native_pm_enter_job(c, JOB_B, STACK, LS_CTX, 0) != 0) g_job_bad++;
-        if (spurs_native_pm_enter_job(c, JOB_C, STACK, LS_CTX, 0) != 0) g_job_bad++;   /* hook claims it */
-        if (g_direct == 2) spurs_native_pm_enter_job(c, JOB_BAD, STACK, LS_CTX, 0);
+        if (spurs_native_pm_enter_job(c, JOB_A, STACK, 0x1000, LS_CTX, 7) != 0) g_job_bad++;
+        if (spurs_native_pm_enter_job(c, JOB_B, STACK, 0x1000, LS_CTX, 0) != 0) g_job_bad++;
+        if (spurs_native_pm_enter_job(c, JOB_C, STACK, 0x1000, LS_CTX, 0) != 0) g_job_bad++;   /* hook claims it */
+        if (spurs_native_pm_enter_job(c, JOB_D, STACK, 0x1000, LS_CTX, 0) != 0) g_job_bad++;   /* returns from deeper */
+        if (g_direct == 2) spurs_native_pm_enter_job(c, JOB_BAD, STACK, 0x1000, LS_CTX, 0);
         if (g_direct_rc_mode) return 1;
     }
     return 0;
@@ -185,6 +199,7 @@ static void setup_image(void)
     spu_register_function(JOB_B, job_b);
     spu_register_function(JOB_C, job_c);
     spu_register_function(JOB_BAD, job_bad);
+    spu_register_function(JOB_D, job_d);
 }
 
 static int sched(const char* reg)

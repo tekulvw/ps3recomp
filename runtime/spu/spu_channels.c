@@ -4046,19 +4046,27 @@ static int spu_ib_diagnostics_armed(void)
  * the slot's host service; it reads r3..r6 and writes r3. Unless it says it
  * placed pc itself, return to the r0 link exactly as `bi $r0` does (a host
  * return while the caller's bracket is live, else a dispatch to the link).
- * The job-return slot is reached by host return into the native run's drain,
- * never through here; a branch to it here, to an empty slot, or to the middle
- * of a slot is unsupported and stops the process. */
+ * The job-return slot is normally reached by host return into the job's entry
+ * bracket; a branch to it here comes from a frame deeper than that bracket and
+ * ends the job by unwinding to it (spurs_native_pm_job_return_far). Outside a
+ * job, and for an empty slot or the middle of a slot, the branch is
+ * unsupported and stops the process. */
 static __attribute__((noinline, cold)) void spurs_native_window(spu_context* ctx)
 {
     const uint32_t pc = ctx->pc & SPU_LS_MASK, off = pc - SPURS_NATIVE_PM_WINDOW_LS;
     const unsigned slot = off / SPURS_NATIVE_PM_SLOT_BYTES;
     spurs_native_service_fn fn = (off % SPURS_NATIVE_PM_SLOT_BYTES) == 0 && slot < SPURS_NATIVE_PM_SLOTS - 1
                                  ? ctx->native_services->slot[slot] : NULL;
+    if (!fn && pc == SPURS_NATIVE_PM_JOB_RETURN_LS) {
+        /* the job returned with `bi $r0` from a frame deeper than its entry
+         * bracket: end it there (does not return while a job is active) */
+        extern void spurs_native_pm_job_return_far(spu_context*);
+        spurs_native_pm_job_return_far(ctx);
+    }
     if (!fn) {
         fprintf(stderr, "[spurs-native-pm] unsupported branch to LS 0x%05X (window slot %u%s) lr=0x%05X r3=0x%08X: "
                 "no native service there; stopping\n", pc, slot,
-                pc == SPURS_NATIVE_PM_JOB_RETURN_LS ? ", the job-return slot outside its drain" : "",
+                pc == SPURS_NATIVE_PM_JOB_RETURN_LS ? ", the job-return slot outside a job" : "",
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0]);
         fflush(stderr);
         _Exit(SPURS_NATIVE_PM_FATAL_EXIT);
