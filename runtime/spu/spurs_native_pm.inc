@@ -195,6 +195,33 @@ spurs_native_pm_payload_fn spurs_native_pm_payload_hook(void)
 extern void spu_indirect_branch(spu_context*);
 extern void spu_drain_call(spu_context*, uint32_t);
 
+/* The job a native run is in on this thread: where a branch to the job-return
+ * slot from a frame deeper than the entry bracket lands (design 5: the job
+ * ended; unwind to the entry bracket). NULL outside a job. */
+#include <setjmp.h>
+#include "spu_jmp.h"
+#if defined(_WIN32)
+#define SPURS_NPM_SETJMP(env) setjmp(env)
+#define SPURS_NPM_LONGJMP(env, v) longjmp(env, v)
+#else
+#define SPURS_NPM_SETJMP(env) _setjmp(env)
+#define SPURS_NPM_LONGJMP(env, v) _longjmp(env, v)
+#endif
+static SPU_THREAD_LOCAL jmp_buf* t_npm_job_env;
+
+/* Called by the window intercept (spu_channels.c) for a branch to the
+ * job-return slot that no drain bracket took as a host return: a job that
+ * returned with `bi $r0` from a frame deeper than its entry. Ends the job. */
+void spurs_native_pm_job_return_far(spu_context* c)
+{
+    jmp_buf* env = t_npm_job_env;
+    if (!env) return;                       /* not in a job: the caller refuses it */
+    extern void spu_interp_attr_unwind(void);
+    spu_interp_attr_unwind();
+    c->pc = SPURS_NATIVE_PM_JOB_RETURN_LS;
+    SPURS_NPM_LONGJMP(*env, 1);
+}
+
 int spurs_native_pm_enter_job(spu_context* c, uint32_t entry, uint32_t stack,
                               uint32_t stack_bytes, uint32_t context_ls, uint32_t arg)
 {
@@ -207,11 +234,27 @@ int spurs_native_pm_enter_job(spu_context* c, uint32_t entry, uint32_t stack,
     c->gpr[4] = spu_make_preferred_u32(arg);
     if (hook && hook(c, entry & SPU_LS_MASK)) return 0;
     const int32_t saved_image = (int32_t)c->image_id;
-    c->pc = entry & SPU_LS_MASK;
-    c->host_depth++;
-    spu_indirect_branch(c);
-    spu_drain_call(c, SPURS_NATIVE_PM_JOB_RETURN_LS);
-    c->host_depth--;
+    const uint32_t depth0 = c->host_depth;
+    void* const irq_frame0 = c->irq_frame;
+    const uint32_t drain_ret0 = c->drain_ret_pc;
+    jmp_buf env;
+    jmp_buf* const outer = t_npm_job_env;
+    t_npm_job_env = &env;
+    if (SPURS_NPM_SETJMP(env) == 0) {
+        spu_jmp_no_unwind(env);
+        c->pc = entry & SPU_LS_MASK;
+        c->host_depth++;
+        spu_indirect_branch(c);
+        spu_drain_call(c, SPURS_NATIVE_PM_JOB_RETURN_LS);
+    } else {
+        /* the job returned to the slot from a deeper frame: those frames are gone */
+        g_spu_trampoline_fn = 0;
+        c->irq_frame = irq_frame0;
+        c->drain_ret_pc = drain_ret0;
+        c->region_dispatch_valid = 0;
+    }
+    t_npm_job_env = outer;
+    c->host_depth = depth0;
     spu_img_restore(c, saved_image);
     return (c->pc & SPU_LS_MASK) == SPURS_NATIVE_PM_JOB_RETURN_LS ? 0 : -1;
 }
