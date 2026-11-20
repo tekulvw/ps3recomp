@@ -242,14 +242,19 @@ def shadow_summary(err: str):
                 mismatches=int(tail['mismatches']), unverifiable=int(tail['unverifiable']))
 
 
-def shadow_detects(binary: Path) -> bool:
-    """A broken native run, fed to the shadow comparison, must show mismatches."""
-    try:
-        r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': '1', 'PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW': '1'})
-    except AssertionError as e:
-        err = str(e)
-    sh = shadow_summary(err)
-    return sh is not None and sh['mismatches'] > 0
+def shadow_detects(binary: Path, attempts: int = 5) -> bool:
+    """A broken native run, fed to the shadow comparison, must show mismatches.
+    Some breaks only show when a race goes one way (the in-run flag can be taken
+    by a dispatch's entry instead of the finish poll), so a few runs are tried."""
+    for _ in range(attempts):
+        try:
+            r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': '1', 'PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW': '1'})
+        except AssertionError as e:
+            err = str(e)
+        sh = shadow_summary(err)
+        if sh is not None and sh['mismatches'] > 0:
+            return True
+    return False
 
 
 def main() -> int:
