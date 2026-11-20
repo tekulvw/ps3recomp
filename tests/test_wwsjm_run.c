@@ -169,15 +169,16 @@ static uint32_t record(unsigned k, int dep)
     s_job[k].sum = sum;
     /* set 6's list: eight 16-aligned elements whose last one ends 0x20 bytes into
      * the list copy, over entries already consumed (spec 18.1); job 0's list is
-     * illegal when WWSJM_FIXTURE_BAD_GATHER is set (its first element ends past
-     * its own entry) */
+     * illegal when WWSJM_FIXTURE_BAD_GATHER is set */
     {
         const uint32_t gl2 = GLIST2_EA + 0x40u * k, in2 = IN2_EA + 0x400u * k;
         static const uint32_t size[8] = { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x60 };
         const int bad = k == 0 && getenv("WWSJM_FIXTURE_BAD_GATHER");
         for (uint32_t i = 0; i < 0x400; i++) vm_base[in2 + i] = (uint8_t)(i * 7u + k * 3u + 5u);
         for (unsigned i = 0, at = 0; i < 8; i++) {
-            const uint32_t sz = bad && i == 0 ? 0x3D0 : size[i];
+            /* the illegal list fits the buffer (0x3D0 < 0x400) but its first
+             * element ends past its own entry (0x3C8): only the overlap rule refuses it */
+            const uint32_t sz = bad ? (i == 0 ? 0x3D0 : 0) : size[i];
             be32w(gl2 + 8u * i, sz); be32w(gl2 + 8u * i + 4, in2 + at); at += size[i];
         }
     }
