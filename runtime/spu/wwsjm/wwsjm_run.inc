@@ -92,7 +92,8 @@ static SRWLOCK s_wj_lock = SRWLOCK_INIT;
 
 static struct {
     unsigned long long runs, idle_runs, jobs, claims, nonjob_claims, retires, decrements, wakes,
-        ready_writes, putllc_retries, polls, loads, load_skips, gathers, nops, set0_moved, index_watch;
+        ready_writes, putllc_retries, polls, loads, load_skips, gathers, nops, set0_moved, index_watch,
+        verifies, verify_work, flag_polls;
 } s_wj_stats;
 #define WJ_COUNT(f, n) __atomic_add_fetch(&s_wj_stats.f, (unsigned long long)(n), __ATOMIC_RELAXED)
 
@@ -102,10 +103,10 @@ static void wj_print_stats(void)
 #define L(f) __atomic_load_n(&s_wj_stats.f, __ATOMIC_RELAXED)
     fprintf(stderr, "[wwsjm] runs=%llu idle=%llu jobs=%llu claims=%llu nonjob=%llu retires=%llu decrements=%llu "
             "wakes=%llu ready_writes=%llu putllc_retries=%llu polls=%llu loads=%llu resident_skips=%llu "
-            "gathers=%llu nops=%llu set0_moved=%llu index_watch=%llu\n",
+            "gathers=%llu nops=%llu set0_moved=%llu index_watch=%llu verifies=%llu verify_work=%llu flag_polls=%llu\n",
             L(runs), L(idle_runs), L(jobs), L(claims), L(nonjob_claims), L(retires), L(decrements), L(wakes),
             L(ready_writes), L(putllc_retries), L(polls), L(loads), L(load_skips), L(gathers), L(nops),
-            L(set0_moved), L(index_watch));
+            L(set0_moved), L(index_watch), L(verifies), L(verify_work), L(flag_polls));
 #undef L
     fflush(stderr);
 }
@@ -209,6 +210,12 @@ static wwsjm_verdict wj_examine(struct wj_run* r, const uint8_t line[128], wwsjm
     wj_guest_read(r, cur->header_ea, 8, raw, 0);
     st = wwsjm_header_decode(raw, h);
     if (st != WWSJM_OK) wj_fatal(r, "entry header outside the contract", wwsjm_be32(raw), wwsjm_be32(raw + 4));
+#ifdef WWSJM_TEST_HOOKS
+    {   /* synthetic fixtures only: publish concurrently at this exact point */
+        extern void wwsjm_test_header_read(uint32_t list_ea, uint16_t index, unsigned type);
+        wwsjm_test_header_read(r->list_ea, cur->index, h->type);
+    }
+#endif
     uint16_t gate = 0;
     if (wwsjm_header_is_gate(h)) {
         uint8_t g[2];
@@ -227,11 +234,15 @@ static void wj_ready_store(struct wj_run* r, unsigned wid, uint8_t value)
         if (wj_putllc(r, WJ_INST_LS, r->spurs_ea, now)) break;
     }
     WJ_COUNT(ready_writes, 1);
+#ifdef WWSJM_TEST_HOOKS
+    { extern void wwsjm_test_ready_store(uint32_t list_ea, unsigned wid, uint8_t value);
+      wwsjm_test_ready_store(r->list_ea, wid, value); }
+#endif
 }
 
 /* Spec 6.4 on the line as it is now: busy while counted entries remain and the
  * entry at N is claimable. */
-static void wj_ready_rule(struct wj_run* r)
+static uint8_t wj_ready_rule(struct wj_run* r)
 {
     uint8_t line[128];
     wj_getllar(r, WJ_LINE_LS, r->list_ea, line);
@@ -240,11 +251,51 @@ static void wj_ready_rule(struct wj_run* r)
     const wwsjm_verdict v = wj_examine(r, line, &cur, &h);
     wwsjm_line dl;
     wwsjm_line_decode(line, &dl);
-    wj_ready_store(r, r->wid, wwsjm_ready_value(&dl, v, (uint8_t)r->busy));
+    const uint8_t value = wwsjm_ready_value(&dl, v, (uint8_t)r->busy);
+    wj_ready_store(r, r->wid, value);
+    return value;
+}
+
+/* A select-workload poll; a status that reports this workload's flag is
+ * followed by ready := 8, as at entry (spec 6.1, U19). Returns the answer. */
+static uint32_t wj_poll(struct wj_run* r)
+{
+    spurs_kernel_select_workload(r->ctx);
+    WJ_COUNT(polls, 1);
+    const uint32_t answer = r->ctx->gpr[3]._u32[0], status = r->ctx->gpr[3]._u32[1];
+    if (status == 4) { wj_ready_store(r, r->wid, WWSJM_READY_ON_FLAG); WJ_COUNT(flag_polls, 1); }
+    return answer;
+}
+
+/* The verify of spec 6.5 / 16.2 R12: a fresh line read and the header at N read
+ * after it. Returns 1 when the entry at N is claimable (the claim loop goes
+ * on). Records what it saw for the exit check (R14). */
+static int wj_verify(struct wj_run* r)
+{
+    uint8_t line[128];
+    wj_getllar(r, WJ_LINE_LS, r->list_ea, line);
+    wwsjm_cursor cur;
+    wwsjm_header h;
+    const wwsjm_verdict v = wj_examine(r, line, &cur, &h);
+    WJ_COUNT(verifies, 1);
+    if (v == WWSJM_TAKE) { WJ_COUNT(verify_work, 1); return 1; }
+    if (r->check) {
+        /* R14: S may exceed N at exit only while the entry at N is not yet
+         * visible (type 0) or is a gate still closed */
+        wwsjm_line dl;
+        wwsjm_line_decode(line, &dl);
+        const unsigned a = dl.current;
+        if (a < WWSJM_ARRAYS && dl.m[a].next != dl.m[a].submitted &&
+            h.type != WWSJM_ENTRY_EMPTY && !wwsjm_header_is_gate(&h))
+            wj_fatal(r, "check: exit with S beyond N and a visible entry at N (R14)", h.type, cur.index);
+    }
+    return 0;
 }
 
 /* Claim entries at N until a job is claimed (returns 1, *job set) or the entry
- * at N is not claimable (returns 0). Non-job entries are claimed and passed. */
+ * at N is not claimable (returns 0). Non-job entries are claimed and passed.
+ * Every decision is made on the line read just before it and the header read
+ * after that line read (R10); a failed claim re-reads both (R11). */
 static int wj_claim(struct wj_run* r, struct wj_job* job, int in_finish)
 {
     uint8_t old[128], now[128];
@@ -266,9 +317,7 @@ static int wj_claim(struct wj_run* r, struct wj_job* job, int in_finish)
         }
         WJ_COUNT(nonjob_claims, 1);
         if (!in_finish) {              /* poll between entries, never inside a job */
-            spurs_kernel_select_workload(r->ctx);
-            WJ_COUNT(polls, 1);
-            if (r->ctx->gpr[3]._u32[0] != r->wid) { r->stop = 1; return 0; }
+            if (wj_poll(r) != r->wid) { r->stop = 1; return 0; }
         }
     }
 }
@@ -470,9 +519,7 @@ static int wj_svc_finish(spu_context* c)
     uint32_t result[2];
     wwsjm_finish_result(NULL, result);
     if (r->finishes == 1 && !r->stop) {
-        spurs_kernel_select_workload(c);
-        WJ_COUNT(polls, 1);
-        if (c->gpr[3]._u32[0] != r->wid) r->stop = 1;
+        if (wj_poll(r) != r->wid) r->stop = 1;
         else if (wj_claim(r, &r->next, 1)) wwsjm_finish_result(&r->next.h, result);
         wj_ready_rule(r);
     }
@@ -531,14 +578,27 @@ static int wj_run(spu_context* c, const struct spurs_native_pm_run* a)
         if (r.next.valid) {
             job = r.next;
             r.next.valid = 0;
-        } else if (r.stop || !wj_claim(&r, &job, 0)) {
+        } else if (r.stop) {
             break;
+        } else if (!wj_claim(&r, &job, 0)) {
+            if (r.stop) break;
+            /* nothing claimable on the claim's snapshot: ready := 0 (6.4), then
+             * verify, and go on claiming if the verify finds work (6.5, R12) */
+            wj_ready_store(&r, r.wid, 0);
+            if (wj_verify(&r)) continue;
+            goto verified;
         }
         wj_run_job(&r, &job);
     }
-    wj_ready_rule(&r);
+    /* the kernel asked for another workload: the ready value from a fresh
+     * snapshot (R10); a 0 is verified, and work seen there is advertised */
+    if (wj_ready_rule(&r) == 0 && wj_verify(&r)) wj_ready_store(&r, r.wid, (uint8_t)r.busy);
+verified:
     c->int_enable = int_enable0;
     c->event_mask = event_mask0;
+#ifdef WWSJM_TEST_HOOKS
+    { extern void wwsjm_test_run_end(uint32_t list_ea); wwsjm_test_run_end(r.list_ea); }
+#endif
     if (__atomic_load_n(&s_wj_stats.jobs, __ATOMIC_RELAXED) == jobs_before) WJ_COUNT(idle_runs, 1);
     t_wj = outer;
     return 0;

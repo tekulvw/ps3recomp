@@ -79,6 +79,10 @@ MUTANTS = {
     'kctx-low-not-zeroed': (RUN, '    memset(ls + WJ_KCTX_LS, 0, 0xC0);\n', ''),
     'kctx-workload-addr-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xD4, 0xA00);\n', ''),
     'kctx-unique-id-dropped': (RUN, '    wwsjm_put32(ls + WJ_KCTX_LS + 0xD8, r->wid);\n', ''),
+    # spec v0.7 (16, 6.1, 6.5): verify after ready := 0, the in-run flag
+    'verify-skipped': (RUN, '            if (wj_verify(&r)) continue;\n            goto verified;', '            goto verified;'),
+    'flag-poll-write-dropped': (RUN, '    if (status == 4) { wj_ready_store(r, r->wid, WWSJM_READY_ON_FLAG); WJ_COUNT(flag_polls, 1); }',
+                                '    if (status == 4) { WJ_COUNT(flag_polls, 1); }'),
     # spec v0.6 (5.1, 15): r1 word 1, the stack bytes the ABI stack check tests
     'stack-bytes-zero': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
                          'spurs_native_pm_enter_job(c, entry, WJ_STACK, 0, WJ_CTX_LS, 0)'),
@@ -89,7 +93,7 @@ MUTANTS = {
 
 
 # Breaks of the native run the shadow comparison must report as mismatches.
-SHADOW_SEES = ('M4-reservation-loss-ignored', 'retire-drops-held-job', 'decrement-skipped', 'wake-skipped',
+SHADOW_SEES = ('flag-poll-write-dropped', 'M4-reservation-loss-ignored', 'retire-drops-held-job', 'decrement-skipped', 'wake-skipped',
                'M8-userdata-at-portion', 'module-never-reloaded', 'tags-kept-across-jobs', 'finish-claims-nothing',
                'context-array-dropped')
 
@@ -113,7 +117,7 @@ def build(tmp: Path, name: str, mutant=None) -> Path:
         shutil.copy(SPU / 'spurs_policy.c', shadow / 'spurs_policy.c')
         sources['spurs_policy.c'] = shadow / 'spurs_policy.c'
     out = tmp / name
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O2', '-UNDEBUG', '-w',
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O2', '-UNDEBUG', '-w', '-DWWSJM_TEST_HOOKS',
                     '-ffunction-sections', '-fdata-sections',
                     '-Wl,-dead_strip' if platform.system() == 'Darwin' else '-Wl,--gc-sections',
                     '-I' + str(shadow), '-I' + str(ROOT / 'include'), '-I' + str(SPU), '-I' + str(ROOT / 'libs/spurs'),
@@ -148,9 +152,9 @@ def check(binary: Path) -> list[str]:
     expect('wid=3 runs native wwsjm-fixture' in err, f'native: no selection line: {err[-400:]}')
     for mode in ('1', 'check'):
         r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': mode})
-        want = dict(done='1', jobs='61', ran='61', dup='0', missing='0', bad_out='0', regs='0', ctx='0', ud='0',
+        want = dict(done='1', jobs='73', ran='73', dup='0', missing='0', bad_out='0', regs='0', ctx='0', ud='0',
                     module='0', gather='0', desc='0', tag='0', finish='0', violations='0', lifted='0', current='1',
-                    n0='43', s0='43', n1='65', s1='65', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0', stack='0')
+                    n0='43', s0='43', n1='77', s1='77', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0', stack='0', race='12', stalls='0', lost_kicks='0')
         for k, v in want.items():
             expect(r.get(k) == v, f'native {mode}: {k}={r.get(k)} expected {v}')
         expect(int(r.get('finish_jobs', 0)) > 0, f'native {mode}: finish never claimed a next job: {r}')
@@ -158,10 +162,16 @@ def check(binary: Path) -> list[str]:
         expect(bool(stats), f'native {mode}: no [wwsjm] counters')
         if stats:
             s = dict(f.split('=', 1) for f in stats[-1].split()[1:])
-            expect(s.get('jobs') == '61' and s.get('decrements') == '8' and s.get('wakes') == '1' and
-                   int(s.get('resident_skips', 0)) > 0 and s.get('retires') == '61' and
+            expect(s.get('jobs') == '73' and s.get('decrements') == '8' and s.get('wakes') == '1' and
+                   int(s.get('resident_skips', 0)) > 0 and s.get('retires') == '73' and
                    int(s.get('putllc_retries', 0)) > 0,
                    f'native {mode}: counters {s}')
+            # the in-run flag poll is followed by ready := 8 (6.1, U19); the race
+            # entries' kicks are never lost (spec 16, R12: stalls=0 above)
+            expect(s.get('flag_polls') == '1', f'native {mode}: in-run flag poll: {s}')
+        # every one of the 8 in-window publications whose kick the lane then
+        # overwrote with ready := 0 was followed by its verify (R12)
+        expect(int(r.get('verified_kicks', 0)) >= 1, f'native {mode}: no kick was overwritten and verified: {r}')
         expect('FATAL' not in err, f'native {mode}: {err[-600:]}')
     # the interrupt vector's target halts loudly
     ri = subprocess.run([str(binary), 'native-irq'], env=dict(BASE_ENV, PS3RECOMP_SPURS_NATIVE_PM='1'),
@@ -222,8 +232,9 @@ def main() -> int:
             print('FAIL:', f)
         if fails:
             return 1
-        print('PASS: native WWS job manager run loop: inert when unset; 61 jobs on two workloads, gates, a wake, a switch, lost reservations, '
-              'non-power-of-two wrap; contract held on five lanes (1 and check)')
+        print('PASS: native WWS job manager run loop: inert when unset; 73 jobs on two workloads, gates, a wake, a switch, lost reservations, '
+              'non-power-of-two wrap, concurrent publication and late headers, an in-run flag, variable reserves; contract held on five '
+              'lanes (1 and check)')
         if a.mutants:
             bad = []
             for name, m in MUTANTS.items():

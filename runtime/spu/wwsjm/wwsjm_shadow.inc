@@ -120,6 +120,7 @@ struct ws_thread {
     int instance_writes, last_claim_type;
     uint32_t last_poll_status;
     int poll_other;                       /* the last select answered another workload */
+    int flag_owed;                        /* a mid-run poll reported the flag: ready := 8 owed */
     int pre_valid; uint16_t pre_S, pre_N;
     struct { uint32_t ea, size; } reads[WS_MAX_READS]; unsigned reads_n;
     struct ws_xfer* x; unsigned x_n;
@@ -305,6 +306,10 @@ static void ws_ready_tx(struct ws_thread* t, const uint8_t* old, const uint8_t* 
         if (status != 0) t->instance_writes = 0;
         return;
     }
+    if (t->flag_owed) {   /* a mid-run poll reported the flag: ready := 8 (6.1, U19) */
+        wwsjm_ready_apply(old, t->wid, WWSJM_READY_ON_FLAG, want);
+        if (!memcmp(want, now, 128)) { ws_ok(t, WSC_READY_FLAG); if (status == 0) t->flag_owed = 0; return; }
+    }
     if (t->wake_n) {
         if (wwsjm_ready_apply(old, t->wake[0].wid, t->wake[0].value, want) == WWSJM_OK && !memcmp(want, now, 128)) {
             ws_ok(t, WSC_WAKE);
@@ -456,6 +461,10 @@ static void ws_owed(struct ws_thread* t)
                t->wake[0].wid, t->wake[0].value, t->wake_n);
         t->wake_n = 0;
     }
+    if (t->flag_owed) {   /* a poll reported the flag, and no ready := 8 followed (6.1, U19) */
+        ws_bad(t, WSC_READY_FLAG, "a poll reported the flag but ready := 8 was not written", 0, 0, 0);
+        t->flag_owed = 0;
+    }
 }
 
 static void ws_enter(struct ws_thread* t, unsigned array, uint16_t index, int native, const uint8_t* ctxb, uint32_t ctx_n)
@@ -602,7 +611,16 @@ static void ws_branch(struct ws_thread* t, const uint8_t* p, uint32_t n)
         }
     }
     if (st != WWSJM_OK) ws_bad(t, WSC_GETBUF, "get-buffer of set %u buffer %u refused by the core (%u)", t->last_call_r4, t->last_call_r5, st);
-    else if (memcmp(d, got, 16) != 0) ws_bad(t, WSC_GETBUF, "get-buffer of set %u buffer %u: word 1 0x%08X differs", t->last_call_r4, t->last_call_r5, r3[1]);
+    else if (memcmp(d, got, 16) != 0) {
+        ws_bad(t, WSC_GETBUF, "get-buffer of set %u buffer %u: word 1 0x%08X differs", t->last_call_r4, t->last_call_r5, r3[1]);
+        fprintf(stderr, "[wwsjm-shadow]   getbuf words recorded %08X %08X %08X %08X native %08X %08X %08X %08X"
+                " (set: first page %u, pages %u, count %u, start %u)\n", r3[0], r3[1], r3[2], r3[3],
+                wwsjm_be32(d), wwsjm_be32(d + 4), wwsjm_be32(d + 8), wwsjm_be32(d + 12),
+                t->last_call_r4 < WWSJM_MAX_SETS ? t->job.plan.set[t->last_call_r4].first_page : 0,
+                t->last_call_r4 < WWSJM_MAX_SETS ? t->job.plan.set[t->last_call_r4].pages : 0,
+                t->last_call_r4 < WWSJM_MAX_SETS ? t->job.plan.set[t->last_call_r4].count : 0,
+                t->last_call_r4 < WWSJM_MAX_SETS ? t->job.plan.set[t->last_call_r4].start : 0);
+    }
     else ws_ok(t, WSC_GETBUF);
 }
 
@@ -639,7 +657,7 @@ static void wj_shadow_event(spu_context* c, uint32_t kind, const uint8_t* p, uin
         memset(t->ll, 0, sizeof t->ll); memset(t->keys, 0, sizeof t->keys);
         memset(&t->job, 0, sizeof t->job); memset(&t->returned, 0, sizeof t->returned);
         t->in_finish = 0; t->finish_claim = -1; t->instance_writes = 0; t->last_claim_type = -1; t->pre_valid = 0;
-        t->last_poll_status = 0; t->poll_other = 0;
+        t->last_poll_status = 0; t->poll_other = 0; t->flag_owed = 0;
         t->bad = t->unk = t->hint = 0;
         t->has_view = ws_u32(p + 52) != 0;
         if (t->has_view) memcpy(t->list_view, p + 64, 128);
@@ -676,6 +694,7 @@ static void wj_shadow_event(spu_context* c, uint32_t kind, const uint8_t* p, uin
         if (n >= 12 && ws_u32(p) == 1) {   /* select: r3 = {wid, status} */
             t->last_poll_status = ws_u32(p + 8);
             t->poll_other = ws_u32(p + 4) != t->wid;
+            if (ws_u32(p + 8) == 4) t->flag_owed = 1;
         }
         return;
     case WS_RUN_END: {

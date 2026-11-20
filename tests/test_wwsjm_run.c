@@ -69,13 +69,26 @@ enum {
     GATE_EA = 0x900004, REPORT_EA = 0x900104, LIST2_EA = 0x330000, ARR2_EA = 0x340000,
     WID = 3, WID2 = 4, IMAGE = 61, NSPUS = 5,
     ENTRY_A = 0x30, ENTRY_B = 0x40, JOB_SITE = 0x4800, OUT_MAGIC = 0x0D0E0F01,
-    MAX_JOBS = 64
+    MAX_JOBS = 96
 };
 /* array 0: nop, 20 jobs (the first 8 decrement the gate), gate, 20 jobs, switch.
  * array 1 starts at index 0x2C: report gate, 20 jobs (slots 0x2D..0x2F, 0..0x10). */
 enum { A0_JOBS1 = 20, A0_DEPS = 8, A0_JOBS2 = 20, A1_START = 0x2C, A1_JOBS = 20, A1_CAP = 0x30 };
+/* After array 1's last job, RACE_JOBS more are published one at a time while
+ * no job runs, at the moment a manager has just read the empty header at N
+ * (spec 16): the first RACE_ORDERED in the PPU's order (header, S, ready kick)
+ * inside that window, the rest with S first and the header and the kick a
+ * little later (S seen late, R13). Only a manager that verifies after writing
+ * ready := 0 (R12) still runs the ordered ones: the kick it overwrote is the
+ * only one. The continuous PPU kick stops before the race. */
+enum { RACE_JOBS = 12, RACE_ORDERED = 8 };
 
-static struct { uint32_t array, index, module, sum, wid, list; } s_job[MAX_JOBS];
+static struct { uint32_t array, index, module, sum, wid, list, pages; } s_job[MAX_JOBS];
+static struct { unsigned k; uint32_t index; uint16_t size; volatile unsigned long long kicked; int stalled; } s_race[RACE_JOBS];
+static volatile unsigned g_stalls;
+static unsigned g_race_next, g_race_first = 0xFFFFFFFFu;
+static volatile unsigned g_running, g_late_pending, g_late_i, g_race_published;
+static volatile unsigned long long g_late_due, g_last_pub;
 static unsigned s_jobs;
 static volatile uint32_t g_runs[MAX_JOBS];
 static volatile uint32_t g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather, g_err_desc, g_err_tag,
@@ -121,7 +134,7 @@ static uint32_t record(unsigned k, int dep)
 #define CMD(w0, w1) do { be32w(rec + 8 * n, (w0)); be32w(rec + 8 * n + 4, (w1)); n++; } while (0)
     CMD(0x00000200, 0x10010100);                               /* set 0: 1 page at 16      */
     CMD((MOD_BYTES / 16u) << 18 | 0xA400, mod);                /* read+shareable module    */
-    CMD(0x00000220, 0x20020200);                               /* set 1: 2 x 2 pages at 32 */
+    CMD(0x00000220, 0x20000200u | s_job[k].pages << 16);       /* set 1: 2 x (2..4) pages at 32 */
     CMD(2u << 18 | 0xC420, GLIST_EA + 0x40u * k);              /* read+gather, 2 quadwords */
     CMD(0x00000260, 0x30010100);                               /* set 3: 1 page at 48      */
     CMD(0x00000460, 0);
@@ -153,7 +166,7 @@ static unsigned add_job(uint32_t array, uint32_t index, int dep)
 {
     const unsigned k = s_jobs++;
     s_job[k].array = array; s_job[k].index = index; s_job[k].module = (k / 2) & 1;
-    s_job[k].wid = WID; s_job[k].list = LIST_EA;
+    s_job[k].wid = WID; s_job[k].list = LIST_EA; s_job[k].pages = 2 + k % 3;
     const uint32_t size = record(k, dep);
     if (array == 0) header(ARR0_EA, 64, index, (uint16_t)size, 1, REC_EA + 0x100u * k);
     else header(ARR1_EA, A1_CAP, index, (uint16_t)size, 1, REC_EA + 0x100u * k);
@@ -169,6 +182,7 @@ static void build_list2(void)
     for (unsigned a = 0; a < 4; a++) for (unsigned s = 0; s < 6; s++) be16w(LIST2_EA + 0x44 + 16 * a + 2 * s, 0xFFFF);
     const unsigned k = s_jobs++;
     s_job[k].array = 0; s_job[k].index = 0; s_job[k].module = 1; s_job[k].wid = WID2; s_job[k].list = LIST2_EA;
+    s_job[k].pages = 3;
     const uint32_t size = record(k, 0);
     header(ARR2_EA, 16, 0, (uint16_t)size, 1, REC_EA + 0x100u * k);
     be16w(LIST2_EA + 0x40, 1);
@@ -199,7 +213,77 @@ static void build_list(void)
     for (unsigned j = 0; j < A1_JOBS; j++) add_job(1, k++, 0);
     header(ARR1_EA, A1_CAP, k, 0, 0, 0);                                /* nothing more */
     be16w(LIST_EA + 0x50, (uint16_t)k);                                 /* S1 */
+    /* the race entries: records ready, headers not yet published, not counted */
+    g_race_first = k;
+    for (unsigned i = 0; i < RACE_JOBS; i++) {
+        const unsigned j = s_jobs++;
+        s_job[j].array = 1; s_job[j].index = k + i; s_job[j].module = (j / 2) & 1;
+        s_job[j].wid = WID; s_job[j].list = LIST_EA; s_job[j].pages = 2 + j % 3;
+        s_race[i].k = j; s_race[i].index = k + i; s_race[i].size = (uint16_t)record(j, 0);
+        header(ARR1_EA, A1_CAP, k + i, 0, 0, 0);
+    }
     be16w(LIST_EA + 0x52, A1_START);                                    /* N1 */
+}
+
+/* ---- the concurrent publisher (spec 16) ------------------------------------------- */
+static void raise_s1(void)
+{
+    uint16_t* p = (uint16_t*)(vm_base + LIST_EA + 0x50);   /* big-endian S of array 1 */
+    uint16_t old = __atomic_load_n(p, __ATOMIC_ACQUIRE), now;
+    do {
+        const uint16_t v = (uint16_t)(((old & 0xFF) << 8 | old >> 8) + 1u);
+        now = (uint16_t)((v & 0xFF) << 8 | v >> 8);
+    } while (!__atomic_compare_exchange_n(p, &old, now, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    vm_write8(SPURS_EA + 0x7F, vm_read8(SPURS_EA + 0x7F));   /* no-op store: keeps the write path alike */
+}
+static void publish_header(unsigned i)
+{
+    const uint32_t at = ARR1_EA + 8u * (s_race[i].index % A1_CAP);
+    vm_write32(at + 4, REC_EA + 0x100u * s_race[i].k);
+    vm_write32(at, (uint32_t)s_race[i].size << 16 | 1u);
+}
+/* Per lane (host thread): 1 = this lane published in its exit window and the
+ * kick is out; 2 = the lane then stored ready := 0 over it. A lane that ends its
+ * run in state 2 without reading the line and header again has lost the kick
+ * (spec 16.1); a header read in state 2 is the verify (R12). */
+static __thread int t_race_state;
+static volatile unsigned g_lost_kicks, g_verified_kicks;
+void wwsjm_test_ready_store(uint32_t list_ea, unsigned wid, uint8_t value)
+{
+    if (list_ea == LIST_EA && wid == WID && t_race_state == 1 && value == 0) t_race_state = 2;
+}
+void wwsjm_test_run_end(uint32_t list_ea)
+{
+    if (list_ea == LIST_EA && t_race_state == 2) __atomic_add_fetch(&g_lost_kicks, 1, __ATOMIC_ACQ_REL);
+    t_race_state = 0;
+}
+/* Called by the run loop (WWSJM_TEST_HOOKS) right after it read a header, before
+ * it decides: publish the next race entry exactly then, while no job runs. */
+void wwsjm_test_header_read(uint32_t list_ea, uint16_t index, unsigned type)
+{
+    if (list_ea == LIST_EA && t_race_state == 2) {   /* the verify after ready := 0 */
+        __atomic_add_fetch(&g_verified_kicks, 1, __ATOMIC_ACQ_REL);
+        t_race_state = 0;
+    }
+    unsigned i = __atomic_load_n(&g_race_next, __ATOMIC_ACQUIRE);
+    if (list_ea != LIST_EA || type != 0 || i >= RACE_JOBS || index != s_race[i].index ||
+        __atomic_load_n(&g_running, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_late_pending, __ATOMIC_ACQUIRE))
+        return;
+    if (!__atomic_compare_exchange_n(&g_race_next, &i, i + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    __atomic_add_fetch(&g_race_published, 1, __ATOMIC_ACQ_REL);
+    g_last_pub = now_ns();
+    if (i < RACE_ORDERED) {                     /* the PPU's order: header, S, kick */
+        publish_header(i);
+        raise_s1();
+        s_race[i].kicked = now_ns();
+        vm_write8(SPURS_EA + SPURS_WKL_READY1 + WID, NSPUS);
+        t_race_state = 1;
+    } else {                                    /* S first; header and kick later */
+        raise_s1();
+        g_late_i = i;
+        g_late_due = now_ns() + 2000000ull;
+        __atomic_store_n(&g_late_pending, 1, __ATOMIC_RELEASE);
+    }
 }
 
 /* ---- job code (lifted-style C) ---------------------------------------------------- */
@@ -249,6 +333,7 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
     const uint32_t k = be32r(u), out = be32r(u + 4), sum = be32r(u + 8);
     if (k >= s_jobs || be32r(u + 0x1C) != 0x55D47A00u || be32r(u + 0x0C) != module) { ERR(g_err_ud); goto done; }
     __atomic_add_fetch(&g_runs[k], 1, __ATOMIC_ACQ_REL);
+    __atomic_add_fetch(&g_running, 1, __ATOMIC_ACQ_REL);
     const uint32_t lane = be32r(x + 0x00);
     if (lane >= NSPUS || be32r(x + 0x04) != 8 || be32r(x + 0x08) != 0 || be32r(x + 0x0C) != SPURS_EA ||
         be32r(x + 0x10) != (s_job[k].wid << 16 | s_job[k].index) || be32r(x + 0x14) != be32r(u + 0x18) ||
@@ -290,7 +375,8 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
     uint32_t d[4];
     call_service(c, ctx_ls, 0x34, 1, 0, 1, d);
     const uint32_t in_ls = (d[1] >> 16) * 4, in_len = (d[1] & 0xFFFF) * 4;
-    if ((d[0] >> 24) != 1 || ((d[0] >> 16) & 0xFF) != 0 || in_len != 0x800 || (in_ls != 0x8000 && in_ls != 0x8800) ||
+    const uint32_t bytes1 = s_job[k].pages * 0x400u;   /* this job's own reserve (spec 16.3) */
+    if ((d[0] >> 24) != 1 || ((d[0] >> 16) & 0xFF) != 0 || in_len != bytes1 || (in_ls != 0x8000 && in_ls != 0x8000 + bytes1) ||
         d[2] != GLIST_EA + 0x40u * k || d[3] != 0x20)
         ERR(g_err_desc);
     if ((d[0] & 0xFF) != 0x1F) ERR(g_err_tag);
@@ -317,6 +403,13 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
     spu_wrch(c, MFC_WrTagUpdate, spu_make_preferred_u32(2));
     (void)spu_rdch(c, MFC_RdTagStat);
     if (call_service(c, ctx_ls, 0x48, 1, 0, 0, NULL) != 0xFFFFFFFFu) ERR(g_err_desc);
+    if (s_job[k].wid == WID2) {
+        /* the second workload's receiver flag is raised while its job runs: the
+         * poll inside finish reports it, and ready := 8 must follow (6.1, U19) */
+        vm_base[SPURS_EA + 0x74] &= (uint8_t)~0x40u;
+        vm_write8(SPURS_EA + SPURS_WKL_FLAG_RECEIVER, WID2);
+        vm_write32(SPURS_EA + SPURS_WKL_FLAG_VALUE, 0);
+    }
     uint32_t f[4];
     call_service(c, ctx_ls, 0x44, 0x1234, 0x5678, 0x9ABC, f);   /* garbage arguments */
     if (!(f[0] == 0 && f[1] == 0xFFFFFFFFu) && (f[0] & 0xFFFF) != 1) ERR(g_err_finish);
@@ -329,6 +422,7 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
      * the runtime's own kernel-context write happens only at the run's start) */
     memset(c->ls + 0x10, 0xC3, 0x70);
     memset(c->ls + 0x180, 0x3C, 0x68);
+    __atomic_sub_fetch(&g_running, 1, __ATOMIC_ACQ_REL);
 done:
     c->gpr[0] = link;
     c->gpr[1] = spu_make_preferred_u32(0x3F990u);
@@ -367,7 +461,36 @@ static void* monitor(void* arg)
         }
         /* the PPU keeps the first workload kicked while it has work (never the
          * second: only the gate counter's wake may start that one) */
-        if (s_kick && be16r(LIST_EA + 0x52) != be16r(LIST_EA + 0x50)) vm_write8(SPURS_EA + SPURS_WKL_READY1 + WID, NSPUS);
+        if (s_kick && be16r(LIST_EA + 0x52) != be16r(LIST_EA + 0x50) && be16r(LIST_EA + 0x52) < g_race_first)
+            vm_write8(SPURS_EA + SPURS_WKL_READY1 + WID, NSPUS);
+        /* a published and kicked race entry that has not run 200 ms later: the
+         * kick was lost (a stall); count it, and kick again so the test ends */
+        int waiting = 0;
+        for (unsigned i = 0; i < RACE_JOBS; i++) {
+            const unsigned long long t = s_race[i].kicked;
+            if (!t || g_runs[s_race[i].k]) continue;
+            waiting = 1;
+            if (!s_race[i].stalled && now_ns() - t > 200000000ull) {
+                s_race[i].stalled = 1;
+                __atomic_add_fetch(&g_stalls, 1, __ATOMIC_ACQ_REL);
+                vm_write8(SPURS_EA + SPURS_WKL_READY1 + WID, NSPUS);
+            }
+        }
+        /* while race entries remain and nothing runs or waits, an empty kick now
+         * and then gets a lane to read the empty header the publisher waits for */
+        if (s_kick && !waiting && __atomic_load_n(&g_race_next, __ATOMIC_ACQUIRE) < RACE_JOBS &&
+            be16r(LIST_EA + 0x52) >= g_race_first && !g_late_pending && !g_running &&
+            now_ns() - g_last_pub > 20000000ull) {
+            g_last_pub = now_ns();
+            vm_write8(SPURS_EA + SPURS_WKL_READY1 + WID, NSPUS);
+        }
+        /* a late race entry: its header, then the PPU's kick */
+        if (__atomic_load_n(&g_late_pending, __ATOMIC_ACQUIRE) && now_ns() >= g_late_due) {
+            publish_header(g_late_i);
+            s_race[g_late_i].kicked = now_ns();
+            vm_write8(SPURS_EA + SPURS_WKL_READY1 + WID, NSPUS);
+            __atomic_store_n(&g_late_pending, 0, __ATOMIC_RELEASE);
+        }
         const struct timespec d = { 0, 50000 }; nanosleep(&d, NULL);
     }
     return NULL;
@@ -457,11 +580,11 @@ int main(int argc, char** argv)
     for (unsigned a = 0; a < 2; a++) for (unsigned s = 0; s < 6; s++) lanes_busy += be16r(LIST_EA + 0x44 + 16 * a + 2 * s) != 0xFFFF;
     printf("result done=%d jobs=%u ran=%u dup=%u missing=%u bad_out=%u regs=%u ctx=%u ud=%u module=%u gather=%u desc=%u "
            "tag=%u finish=%u violations=%u lifted=%u current=%u n0=%u s0=%u n1=%u s1=%u lanes_busy=%u gate=%u "
-           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u irq=%u stack=%u\n",
+           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u irq=%u stack=%u race=%u stalls=%u lost_kicks=%u verified_kicks=%u\n",
            done, s_jobs, ran, dup, missing, bad_out, g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather,
            g_err_desc, g_err_tag, g_err_finish, g_violations, g_lifted_runs, be16r(LIST_EA + 0x0A),
            be16r(LIST_EA + 0x42), be16r(LIST_EA + 0x40), be16r(LIST_EA + 0x52), be16r(LIST_EA + 0x50), lanes_busy,
-           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls, g_err_irq, g_err_stack);
+           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls, g_err_irq, g_err_stack, g_race_published, g_stalls, g_lost_kicks, g_verified_kicks);
     fflush(stdout);
     if (native) spurs_wwsjm_print_stats();
     if (native && getenv("PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW")) spurs_wwsjm_shadow_print();
