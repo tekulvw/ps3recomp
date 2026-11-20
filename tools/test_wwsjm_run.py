@@ -84,6 +84,10 @@ MUTANTS = {
     'flag-poll-write-dropped': (RUN, '    if (status == 4) { wj_ready_store(r, r->wid, WWSJM_READY_ON_FLAG); WJ_COUNT(flag_polls, 1); }',
                                 '    if (status == 4) { WJ_COUNT(flag_polls, 1); }'),
     # spec v0.6 (5.1, 15): r1 word 1, the stack bytes the ABI stack check tests
+    # spec v0.8 (17): the gather list copy, zero-size elements, tags per set
+    'list-copy-at-start': (RUN, '        const uint32_t list_ls = l->ls + l->limit - l->bytes;', '        const uint32_t list_ls = l->ls;'),
+    'zero-size-element-advances': ('runtime/spu/wwsjm/wwsjm_core.c', '        if (!word)\n            continue;\n', ''),
+    'tag-per-call': (RUN, '        if (!r->set_tag[set]) {', '        if (1) {'),
     'stack-bytes-zero': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
                          'spurs_native_pm_enter_job(c, entry, WJ_STACK, 0, WJ_CTX_LS, 0)'),
     'stack-bytes-too-few': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
@@ -110,9 +114,9 @@ def build(tmp: Path, name: str, mutant=None) -> Path:
         assert text.count(old) == 1, f'{name}: mutant anchor not unique in {rel}'
         # the run loop is an include of spurs_policy.c: shadow the include chain
         (shadow / 'wwsjm').mkdir()
+        for f in ('wwsjm_core.c', 'wwsjm_core.h', 'wwsjm_run.inc', 'wwsjm_shadow.inc'):
+            shutil.copy(SPU / 'wwsjm' / f, shadow / 'wwsjm' / f)
         (shadow / 'wwsjm' / src.name).write_text(text.replace(old, new))
-        shutil.copy(SPU / 'wwsjm/wwsjm_core.c', shadow / 'wwsjm/wwsjm_core.c')
-        shutil.copy(SPU / 'wwsjm/wwsjm_core.h', shadow / 'wwsjm/wwsjm_core.h')
         shutil.copy(SPU / 'spurs_native_pm.inc', shadow / 'spurs_native_pm.inc')
         shutil.copy(SPU / 'spurs_policy.c', shadow / 'spurs_policy.c')
         sources['spurs_policy.c'] = shadow / 'spurs_policy.c'
@@ -154,7 +158,7 @@ def check(binary: Path) -> list[str]:
         r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': mode})
         want = dict(done='1', jobs='73', ran='73', dup='0', missing='0', bad_out='0', regs='0', ctx='0', ud='0',
                     module='0', gather='0', desc='0', tag='0', finish='0', violations='0', lifted='0', current='1',
-                    n0='43', s0='43', n1='77', s1='77', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0', stack='0', race='12', stalls='0', lost_kicks='0')
+                    n0='43', s0='43', n1='77', s1='77', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0', stack='0', listcopy='0', race='12', stalls='0', lost_kicks='0')
         for k, v in want.items():
             expect(r.get(k) == v, f'native {mode}: {k}={r.get(k)} expected {v}')
         expect(int(r.get('finish_jobs', 0)) > 0, f'native {mode}: finish never claimed a next job: {r}')

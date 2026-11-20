@@ -61,8 +61,11 @@ One dispatch on a slot's resident context, on its worker thread:
 - **Staging a job.** The record's command portion is read from guest memory and planned by the
   core. Each set's ring starts at its first buffer, because no job runs beside this one (spec
   §12.1). Module copies go through the context's MFC GETs (16 KiB at most), except where the
-  per-run residency table says the module is already in place. Each gathered element is one
-  GET at the place the core lays out. The loop then waits for the staging tag.
+  per-run residency table says the module is already in place. A gather copies its (size, EA) list into the last `16·L` bytes of
+  the buffer, where the job reads it. Each element is then one GET from the buffer's start,
+  under MFC list rules (spec §17.1): zero-size elements transfer nothing and do not advance,
+  and no element may reach the list copy. Header and gate reads go to guest memory directly;
+  the manager uses no local store below `0x200`. The loop then waits for the staging tag.
 - **Entering a job.** The command portion is copied to LS `0xC00`, so the parameter data the
   context points at lands at `0xC00` plus the commands' aligned length. The job API context is
   built at `0x1330`. Before each job the loop also plants the fixed low local store that jobs
@@ -94,8 +97,9 @@ One dispatch on a slot's resident context, on its worker thread:
   r6 = `0x2C000000`. The lifted manager's leftovers in r2 and r7–r127 are not reproduced
   (spec §15).
 - **Services, through the native-service window:**
-  - **get buffer** returns the core's descriptor; a request with `r6 ≠ 0` takes the job's next
-    DMA tag.
+  - **get buffer** returns the core's descriptor. A set's DMA tag is allocated at its first
+    request with `r6 ≠ 0` (31 downward), and a repeat request for the set returns the same tag;
+    `r6 = 0` gives 0 (spec §5.3, §17.3).
   - **release** returns all ones.
   - **finish** polls the kernel, claims the next job if one is claimable (the lane's marker
     stays on the running job), and publishes the ready count.

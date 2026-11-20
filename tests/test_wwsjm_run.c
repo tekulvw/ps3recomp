@@ -92,7 +92,7 @@ static volatile unsigned long long g_late_due, g_last_pub;
 static unsigned s_jobs;
 static volatile uint32_t g_runs[MAX_JOBS];
 static volatile uint32_t g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather, g_err_desc, g_err_tag,
-    g_err_finish, g_violations, g_lifted_runs, g_finish_jobs, g_breaks, g_err_lowls, g_err_irq, g_err_stack;
+    g_err_finish, g_violations, g_lifted_runs, g_finish_jobs, g_breaks, g_err_lowls, g_err_irq, g_err_stack, g_err_listcopy;
 static int g_irq_test;
 
 /* ---- guest construction (the PPU stand-in) -------------------------------------- */
@@ -135,8 +135,9 @@ static uint32_t record(unsigned k, int dep)
     CMD(0x00000200, 0x10010100);                               /* set 0: 1 page at 16      */
     CMD((MOD_BYTES / 16u) << 18 | 0xA400, mod);                /* read+shareable module    */
     CMD(0x00000220, 0x20000200u | s_job[k].pages << 16);       /* set 1: 2 x (2..4) pages at 32 */
-    CMD(2u << 18 | 0xC420, GLIST_EA + 0x40u * k);              /* read+gather, 2 quadwords */
+    CMD(3u << 18 | 0xC420, GLIST_EA + 0x40u * k);              /* read+gather, 3 quadwords */
     CMD(0x00000260, 0x30010100);                               /* set 3: 1 page at 48      */
+    CMD(0x00000280, 0x3C000100);                               /* set 4: 0 pages at 60     */
     CMD(0x00000460, 0);
     if (dep) CMD(0x00000800, GATE_EA);
     CMD(0x00000600, 0xF);
@@ -152,10 +153,15 @@ static uint32_t record(unsigned k, int dep)
     struct piece pc[4];
     layout(in, pc);
     uint32_t sum = 0;
-    for (unsigned i = 0; i < 4; i++) {
-        be32w(GLIST_EA + 0x40u * k + 8u * i, pc[i].size);
-        be32w(GLIST_EA + 0x40u * k + 8u * i + 4, pc[i].ea);
-        for (uint32_t b = 0; b < pc[i].size; b++) sum += vm_base[pc[i].ea + b];
+    /* six list entries: the four pieces and two zero-size elements at
+     * unaligned EAs, which transfer nothing and do not advance (spec 17.1) */
+    const uint32_t gl = GLIST_EA + 0x40u * k;
+    for (unsigned i = 0, e = 0; i < 6; i++) {
+        if (i == 1 || i == 4) { be32w(gl + 8u * i, 0); be32w(gl + 8u * i + 4, in + 0x7Cu + 0x17Du * (i == 4)); continue; }
+        be32w(gl + 8u * i, pc[e].size);
+        be32w(gl + 8u * i + 4, pc[e].ea);
+        for (uint32_t b = 0; b < pc[e].size; b++) sum += vm_base[pc[e].ea + b];
+        e++;
     }
     s_job[k].sum = sum;
     be32w(rec + ud + 0x08, sum);
@@ -377,9 +383,19 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
     const uint32_t in_ls = (d[1] >> 16) * 4, in_len = (d[1] & 0xFFFF) * 4;
     const uint32_t bytes1 = s_job[k].pages * 0x400u;   /* this job's own reserve (spec 16.3) */
     if ((d[0] >> 24) != 1 || ((d[0] >> 16) & 0xFF) != 0 || in_len != bytes1 || (in_ls != 0x8000 && in_ls != 0x8000 + bytes1) ||
-        d[2] != GLIST_EA + 0x40u * k || d[3] != 0x20)
+        d[2] != GLIST_EA + 0x40u * k || d[3] != 0x30)
         ERR(g_err_desc);
     if ((d[0] & 0xFF) != 0x1F) ERR(g_err_tag);
+    /* the list copy sits in the last 16*L bytes of the buffer (spec 17.1) */
+    if (memcmp(c->ls + in_ls + in_len - 0x30, vm_base + GLIST_EA + 0x40u * k, 0x30) != 0) ERR(g_err_listcopy);
+    /* a repeat request for the set returns the same descriptor and tag; a
+     * zero-page set sits at its own page with length 0 and takes the next tag
+     * (spec 5.3, 17.2, 17.3) */
+    uint32_t d2[4], z[4];
+    call_service(c, ctx_ls, 0x34, 1, 0, 1, d2);
+    if (memcmp(d, d2, sizeof d)) ERR(g_err_tag);
+    call_service(c, ctx_ls, 0x34, 4, 0, 1, z);
+    if (z[0] != 0x0400001Eu || z[1] != (0xF000u / 4) << 16) ERR(g_err_tag);
     struct piece pc[4];
     layout(IN_EA + 0x200u * k, pc);
     uint32_t got = 0;
@@ -580,11 +596,11 @@ int main(int argc, char** argv)
     for (unsigned a = 0; a < 2; a++) for (unsigned s = 0; s < 6; s++) lanes_busy += be16r(LIST_EA + 0x44 + 16 * a + 2 * s) != 0xFFFF;
     printf("result done=%d jobs=%u ran=%u dup=%u missing=%u bad_out=%u regs=%u ctx=%u ud=%u module=%u gather=%u desc=%u "
            "tag=%u finish=%u violations=%u lifted=%u current=%u n0=%u s0=%u n1=%u s1=%u lanes_busy=%u gate=%u "
-           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u irq=%u stack=%u race=%u stalls=%u lost_kicks=%u verified_kicks=%u\n",
+           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u irq=%u stack=%u listcopy=%u race=%u stalls=%u lost_kicks=%u verified_kicks=%u\n",
            done, s_jobs, ran, dup, missing, bad_out, g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather,
            g_err_desc, g_err_tag, g_err_finish, g_violations, g_lifted_runs, be16r(LIST_EA + 0x0A),
            be16r(LIST_EA + 0x42), be16r(LIST_EA + 0x40), be16r(LIST_EA + 0x52), be16r(LIST_EA + 0x50), lanes_busy,
-           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls, g_err_irq, g_err_stack, g_race_published, g_stalls, g_lost_kicks, g_verified_kicks);
+           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls, g_err_irq, g_err_stack, g_err_listcopy, g_race_published, g_stalls, g_lost_kicks, g_verified_kicks);
     fflush(stdout);
     if (native) spurs_wwsjm_print_stats();
     if (native && getenv("PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW")) spurs_wwsjm_shadow_print();

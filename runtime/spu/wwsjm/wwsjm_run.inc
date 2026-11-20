@@ -28,6 +28,9 @@ extern u128 spu_rdch(spu_context*, uint32_t);
  * The manager's own scratch is anywhere else below 0x4000. */
 enum {
     WJ_JOB_SCRATCH_LS = 0x80,  /* [0x80, 0x180): the job's while it runs */
+    WJ_READ_LS = 0x200,       /* where header and gate reads are reported (the
+                                 manager reads guest memory directly; spec 17.1
+                                 keeps it out of 0x000-0x1FF) */
     WJ_JOB_SCRATCH_END = 0x180,
     WJ_KCTX_LS = 0x100,       /* SPURS kernel context (spec 3.1)    */
     WJ_KCTX_END = 0x1E8,
@@ -81,6 +84,7 @@ struct wj_run {
     struct wj_job cur, next;
     wwsjm_plan plan;
     unsigned tags, finishes;
+    uint8_t set_tag[WWSJM_MAX_SETS];   /* the DMA tag each set was given this job (0 = none) */
     uint32_t released;
     int stop;                 /* the kernel asked for another workload */
 };
@@ -207,7 +211,7 @@ static wwsjm_verdict wj_examine(struct wj_run* r, const uint8_t line[128], wwsjm
         fprintf(stderr, "[wwsjm] index 0x%04X at or above 0x%04X on array %u (wid %u): the u16 wrap is unobserved\n",
                 cur->index, WWSJM_INDEX_WRAP_WATCH, cur->array, r->wid);
     uint8_t raw[8];
-    wj_guest_read(r, cur->header_ea, 8, raw, 0);
+    wj_guest_read(r, cur->header_ea, 8, raw, WJ_READ_LS);
     st = wwsjm_header_decode(raw, h);
     if (st != WWSJM_OK) wj_fatal(r, "entry header outside the contract", wwsjm_be32(raw), wwsjm_be32(raw + 4));
 #ifdef WWSJM_TEST_HOOKS
@@ -219,7 +223,7 @@ static wwsjm_verdict wj_examine(struct wj_run* r, const uint8_t line[128], wwsjm
     uint16_t gate = 0;
     if (wwsjm_header_is_gate(h)) {
         uint8_t g[2];
-        wj_guest_read(r, h->ea, 2, g, 0);
+        wj_guest_read(r, h->ea, 2, g, WJ_READ_LS);
         gate = wwsjm_be16(g);
     }
     return wwsjm_judge(h, gate);
@@ -340,14 +344,18 @@ static void wj_stage(struct wj_run* r)
             WJ_COUNT(loads, 1);
             continue;
         }
-        /* gather: the (size, EA) list is guest memory; each element lands per
-         * the core's layout */
+        /* gather (spec 17.1): the (size, EA) list is copied to the last 16*L
+         * bytes of the buffer, where the job reads it; the elements land from
+         * the buffer's start under MFC list rules and must stay below the copy */
         uint8_t list[WJ_GATHER_LIST_MAX];
         if (l->bytes > sizeof list) wj_fatal(r, "gather list longer than supported", l->ea, l->bytes);
-        wj_guest_read(r, l->ea, l->bytes, list, 0);
+        if (l->bytes > l->limit || (l->bytes & 15)) wj_fatal(r, "gather list does not fit its buffer", l->bytes, l->limit);
+        const uint32_t list_ls = l->ls + l->limit - l->bytes;
+        wj_guest_read(r, l->ea, l->bytes, list, list_ls);
+        memcpy(c->ls + list_ls, list, l->bytes);
         wwsjm_piece pc[sizeof list / 8];
         unsigned n = 0;
-        wwsjm_status st = wwsjm_gather_layout(list, l->bytes / 8, l->ls, l->limit, pc, sizeof pc / sizeof pc[0], &n);
+        wwsjm_status st = wwsjm_gather_layout(list, l->bytes / 8, l->ls, l->limit - l->bytes, pc, sizeof pc / sizeof pc[0], &n);
         if (st != WWSJM_OK) wj_fatal(r, "gather list outside the contract", l->ea, st);
         for (unsigned k = 0; k < n; k++)
             wj_mfc(c, MFC_GET_CMD, pc[k].ls, pc[k].ea, pc[k].bytes, WJ_STAGE_TAG);
@@ -424,6 +432,7 @@ static void wj_run_job(struct wj_run* r, const struct wj_job* job)
 
     wj_plant_low_ls(r);
     r->tags = 0;
+    memset(r->set_tag, 0, sizeof r->set_tag);
     r->finishes = 0;
     r->released = 0;
     r->next.valid = 0;
@@ -492,7 +501,15 @@ static int wj_svc_get_buffer(spu_context* c)
     struct wj_run* r = wj_current(c);
     const uint32_t set = c->gpr[4]._u32[0], buf = c->gpr[5]._u32[0], want = c->gpr[6]._u32[0];
     uint8_t tag = 0;
-    if (want && wwsjm_job_tag(&r->tags, &tag) != WWSJM_OK) wj_fatal(r, "more DMA tags than a job may take", set, r->tags);
+    /* one tag per set per job, taken at the set's first r6 != 0 request
+     * (31 downward); a repeat request for the set returns it (spec 5.3, 17.3) */
+    if (want && set < WWSJM_MAX_SETS) {
+        if (!r->set_tag[set]) {
+            if (wwsjm_job_tag(&r->tags, &tag) != WWSJM_OK) wj_fatal(r, "more DMA tags than a job may take", set, r->tags);
+            r->set_tag[set] = tag;
+        }
+        tag = r->set_tag[set];
+    }
     uint8_t d[16];
     wwsjm_status st = wwsjm_buffer_descriptor(&r->plan, set, buf, tag, d);
     if (st != WWSJM_OK) wj_fatal(r, "get-buffer for a set the record did not reserve", set, buf);
