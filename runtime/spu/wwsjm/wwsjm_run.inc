@@ -398,7 +398,13 @@ static void wj_run_job(struct wj_run* r, const struct wj_job* job)
     wj_guest_read(r, job->h.ea, job->h.size, rec, WJ_PORTION_LS);
     unsigned bad = 0;
     wwsjm_status st = wwsjm_plan_commands(rec, job->h.size, WJ_LS_LOW, WJ_LS_HIGH, &r->plan, &bad);
-    if (st != WWSJM_OK) wj_fatal(r, wwsjm_status_name(st), bad, wwsjm_be32(rec + 8 * (bad < 32 ? bad : 0)));
+    if (st != WWSJM_OK) {
+        /* the record the core refused, for the report (hex, 8-byte commands) */
+        fprintf(stderr, "[wwsjm] refused record at 0x%08X (%u bytes, command %u):", job->h.ea, job->h.size, bad);
+        for (uint32_t o = 0; o + 4 <= job->h.size; o += 4) fprintf(stderr, "%s%08X", (o & 7) ? " " : "  ", wwsjm_be32(rec + o));
+        fprintf(stderr, "\n");
+        wj_fatal(r, wwsjm_status_name(st), bad, wwsjm_be32(rec + 8 * (bad < 32 ? bad : 0)));
+    }
     if (r->plan.nop_count) WJ_COUNT(nops, r->plan.nop_count);
     if (r->plan.set0_moved && __atomic_add_fetch(&s_wj_stats.set0_moved, 1, __ATOMIC_RELAXED) == 1)
         fprintf(stderr, "[wwsjm] set 0 reserved away from page %u (wid %u): allowed; the module may run interpreted\n",
