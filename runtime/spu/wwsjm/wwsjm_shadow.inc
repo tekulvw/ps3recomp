@@ -370,7 +370,11 @@ static void ws_atomic(struct ws_thread* t, const uint8_t* p, uint32_t n)
     if (cmd == MFC_GETLLAR_CMD) {
         ws_ll_set(t, ea, line);
         ws_mem_write(t, ea, line, 128);
-        if (ea == t->list_ea) { memcpy(t->list_view, line, 128); t->has_view = 1; t->pre_valid = 0; t->reads_n = 0; }
+        /* the manager's view of the list is what the manager read: a job's own
+         * GETLLAR of the line (into its reservation buffer) is not one */
+        if (ea == t->list_ea && region != WS_JOB) {
+            memcpy(t->list_view, line, 128); t->has_view = 1; t->pre_valid = 0; t->reads_n = 0;
+        }
         return;
     }
     if (cmd != MFC_PUTLLC_CMD) return;
