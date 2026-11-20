@@ -138,6 +138,7 @@ static uint32_t record(unsigned k, int dep)
     CMD(3u << 18 | 0xC420, GLIST_EA + 0x40u * k);              /* read+gather, 3 quadwords */
     CMD(0x00000260, 0x30010100);                               /* set 3: 1 page at 48      */
     CMD(0x00000280, 0x3C000100);                               /* set 4: 0 pages at 60     */
+    CMD(0x000002A0, 0xF7010100);                               /* set 5: 1 page at 247, ending at 0x3E000 */
     CMD(0x00000460, 0);
     if (dep) CMD(0x00000800, GATE_EA);
     CMD(0x00000600, 0xF);

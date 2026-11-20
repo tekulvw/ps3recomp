@@ -87,6 +87,7 @@ MUTANTS = {
     # spec v0.8 (17): the gather list copy, zero-size elements, tags per set
     'list-copy-at-start': (RUN, '        const uint32_t list_ls = l->ls + l->limit - l->bytes;', '        const uint32_t list_ls = l->ls;'),
     'zero-size-element-advances': ('runtime/spu/wwsjm/wwsjm_core.c', '        if (!word)\n            continue;\n', ''),
+    'window-top-3C000': (RUN, '    WJ_LS_HIGH = 0x3E000, ', '    WJ_LS_HIGH = 0x3C000, '),
     'tag-per-call': (RUN, '        if (!r->set_tag[set]) {', '        if (1) {'),
     'stack-bytes-zero': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
                          'spurs_native_pm_enter_job(c, entry, WJ_STACK, 0, WJ_CTX_LS, 0)'),

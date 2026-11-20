@@ -43,7 +43,7 @@ enum {
     WJ_STACK_BYTES = 0x1980,  /* r1 word 1: stack bytes available (spec 5.1, 15) */
     WJ_STACK_BOTTOM = WJ_STACK - WJ_STACK_BYTES,   /* 0x3E010: [BOTTOM, WJ_STACK) is the job's */
     WJ_LS_LOW = 0x4000,       /* job buffers live in [LOW, HIGH)    */
-    WJ_LS_HIGH = 0x3C000,
+    WJ_LS_HIGH = 0x3E000,     /* up to the job stack: a set may end at 0x3E000 (observed) */
     WJ_STAGE_TAG = 3,
     WJ_ENTRY_R6 = 0x2C000000, /* reproduced as observed (spec U14)  */
     WJ_GATHER_LIST_MAX = 1024 /* bytes (64 quadwords; observed <= 12) */
