@@ -199,3 +199,7 @@ that always or never reloads, gathers rounded down, a stale or unaligned userdat
 `S`, switch, slot, malformed-capacity, ready, tag, descriptor, placement, pinned-set, no-op, decrement-offset, held-capacity and gather (quadword offset, element limit, output capacity) rules. CI runs the fixture on
 Linux, macOS and Windows through the `tools/test_*.py` loop, and runs the mutants on Linux (clang
 and gcc) and macOS.
+
+`PS3RECOMP_WWSJM_STATS=<seconds>` (off when unset) prints the run loop's counters line
+(`[wwsjm] runs=… gather_overlaps=…`) every `<seconds>`, for processes that are killed
+rather than exited, which never reach the at-exit print.

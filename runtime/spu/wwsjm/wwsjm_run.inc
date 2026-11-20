@@ -603,6 +603,26 @@ static const struct spurs_native_services s_wj_services = { {
 
 /* ---- one dispatch ---------------------------------------------------------------------- */
 
+/* PS3RECOMP_WWSJM_STATS=<seconds>: the counters line every <seconds> (a process
+ * that is killed never reaches the at-exit print). Off when unset. */
+static void wj_periodic_stats(void)
+{
+    static int s_period = -1;
+    static unsigned long long s_next;
+    if (s_period < 0) {
+        const char* e = getenv("PS3RECOMP_WWSJM_STATS");
+        s_period = e && *e ? atoi(e) : 0;
+    }
+    if (s_period <= 0) return;
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    const unsigned long long now = (unsigned long long)ts.tv_sec;
+    unsigned long long next = __atomic_load_n(&s_next, __ATOMIC_RELAXED);
+    if (!next) { __atomic_compare_exchange_n(&s_next, &next, now + (unsigned)s_period, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); return; }
+    if (now >= next && __atomic_compare_exchange_n(&s_next, &next, now + (unsigned)s_period, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        wj_print_stats();
+}
+
 static int wj_run(spu_context* c, const struct spurs_native_pm_run* a)
 {
     struct wj_run r;
@@ -658,6 +678,7 @@ verified:
     { extern void wwsjm_test_run_end(uint32_t list_ea); wwsjm_test_run_end(r.list_ea); }
 #endif
     if (__atomic_load_n(&s_wj_stats.jobs, __ATOMIC_RELAXED) == jobs_before) WJ_COUNT(idle_runs, 1);
+    wj_periodic_stats();
     t_wj = outer;
     return 0;
 }
