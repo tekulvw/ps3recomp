@@ -356,7 +356,13 @@ static void wj_stage(struct wj_run* r)
         wwsjm_piece pc[sizeof list / 8];
         unsigned n = 0;
         wwsjm_status st = wwsjm_gather_layout(list, l->bytes / 8, l->ls, l->limit - l->bytes, pc, sizeof pc / sizeof pc[0], &n);
-        if (st != WWSJM_OK) wj_fatal(r, "gather list outside the contract", l->ea, st);
+        if (st != WWSJM_OK) {
+            fprintf(stderr, "[wwsjm] refused gather list at 0x%08X (%u bytes) into LS 0x%05X, room 0x%X (elements below 0x%05X), %s:",
+                    l->ea, l->bytes, l->ls, l->limit, list_ls, wwsjm_status_name(st));
+            for (uint32_t o = 0; o + 8 <= l->bytes; o += 8) fprintf(stderr, " (%X, %08X)", wwsjm_be32(list + o), wwsjm_be32(list + o + 4));
+            fprintf(stderr, "\n");
+            wj_fatal(r, "gather list outside the contract", l->ea, st);
+        }
         for (unsigned k = 0; k < n; k++)
             wj_mfc(c, MFC_GET_CMD, pc[k].ls, pc[k].ea, pc[k].bytes, WJ_STAGE_TAG);
         issued |= n != 0;
