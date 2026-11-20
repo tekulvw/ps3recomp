@@ -100,7 +100,7 @@ struct ws_job {
     wwsjm_plan plan;
     uint32_t cmd_ls, deps_left[WWSJM_MAX_DEPS];
     unsigned deps_n, tags;
-    uint8_t set_tag[WWSJM_MAX_SETS];
+    struct { uint8_t set, buf, tag; } tag_of[32]; unsigned tag_n;
 };
 struct ws_xfer { uint32_t seq, lsa, ea, size; uint8_t region, payload, get; };
 
@@ -596,9 +596,15 @@ static void ws_branch(struct ws_thread* t, const uint8_t* p, uint32_t n)
     if (slot != 0x34) return;
     if (!t->job.valid || !t->job.has_plan) { ws_unk(t, WSC_GETBUF); return; }
     uint8_t tag = 0;
-    if (t->last_call_r6 && t->last_call_r4 < WWSJM_MAX_SETS) {   /* one tag per set per job (5.3, 17.3) */
-        if (!t->job.set_tag[t->last_call_r4]) t->job.set_tag[t->last_call_r4] = (uint8_t)(31u - t->job.tags++);
-        tag = t->job.set_tag[t->last_call_r4];
+    if (t->last_call_r6) {   /* one tag per (set, buffer) per job, memoised (5.3, 18.2) */
+        struct ws_job* j = &t->job;
+        unsigned i = 0;
+        while (i < j->tag_n && (j->tag_of[i].set != t->last_call_r4 || j->tag_of[i].buf != t->last_call_r5)) i++;
+        if (i == j->tag_n && i < 32) {
+            j->tag_of[i].set = (uint8_t)t->last_call_r4; j->tag_of[i].buf = (uint8_t)t->last_call_r5;
+            j->tag_of[i].tag = (uint8_t)(31u - j->tags++); j->tag_n++;
+        }
+        if (i < 32) tag = j->tag_of[i].tag;
     }
     uint8_t d[16];
     wwsjm_status st = wwsjm_buffer_descriptor(&t->job.plan, t->last_call_r4, t->last_call_r5, tag, d);

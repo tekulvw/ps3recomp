@@ -69,6 +69,8 @@ _Static_assert(WJ_STACK_BOTTOM == 0x3E010 && WJ_LS_HIGH <= WJ_STACK_BOTTOM &&
                WJ_LINE_LS + 0x180 <= WJ_STACK_BOTTOM && WJ_CTX_LS + 0x80 <= WJ_STACK_BOTTOM &&
                WJ_PORTION_LS + WWSJM_MAX_PORTION <= WJ_STACK_BOTTOM, "job stack overlaps");
 
+enum { WJ_TAGS = 32 };
+
 struct wj_job {
     int valid;
     unsigned array;
@@ -84,7 +86,8 @@ struct wj_run {
     struct wj_job cur, next;
     wwsjm_plan plan;
     unsigned tags, finishes;
-    uint8_t set_tag[WWSJM_MAX_SETS];   /* the DMA tag each set was given this job (0 = none) */
+    struct { uint8_t set, buf, tag; } tag_of[WJ_TAGS];   /* (set, buffer) -> DMA tag, this job */
+    unsigned tag_n;
     uint32_t released;
     int stop;                 /* the kernel asked for another workload */
 };
@@ -97,7 +100,7 @@ static SRWLOCK s_wj_lock = SRWLOCK_INIT;
 static struct {
     unsigned long long runs, idle_runs, jobs, claims, nonjob_claims, retires, decrements, wakes,
         ready_writes, putllc_retries, polls, loads, load_skips, gathers, nops, set0_moved, index_watch,
-        verifies, verify_work, flag_polls;
+        verifies, verify_work, flag_polls, gather_overlaps;
 } s_wj_stats;
 #define WJ_COUNT(f, n) __atomic_add_fetch(&s_wj_stats.f, (unsigned long long)(n), __ATOMIC_RELAXED)
 
@@ -107,10 +110,10 @@ static void wj_print_stats(void)
 #define L(f) __atomic_load_n(&s_wj_stats.f, __ATOMIC_RELAXED)
     fprintf(stderr, "[wwsjm] runs=%llu idle=%llu jobs=%llu claims=%llu nonjob=%llu retires=%llu decrements=%llu "
             "wakes=%llu ready_writes=%llu putllc_retries=%llu polls=%llu loads=%llu resident_skips=%llu "
-            "gathers=%llu nops=%llu set0_moved=%llu index_watch=%llu verifies=%llu verify_work=%llu flag_polls=%llu\n",
+            "gathers=%llu nops=%llu set0_moved=%llu index_watch=%llu verifies=%llu verify_work=%llu flag_polls=%llu gather_overlaps=%llu\n",
             L(runs), L(idle_runs), L(jobs), L(claims), L(nonjob_claims), L(retires), L(decrements), L(wakes),
             L(ready_writes), L(putllc_retries), L(polls), L(loads), L(load_skips), L(gathers), L(nops),
-            L(set0_moved), L(index_watch), L(verifies), L(verify_work), L(flag_polls));
+            L(set0_moved), L(index_watch), L(verifies), L(verify_work), L(flag_polls), L(gather_overlaps));
 #undef L
     fflush(stderr);
 }
@@ -344,9 +347,11 @@ static void wj_stage(struct wj_run* r)
             WJ_COUNT(loads, 1);
             continue;
         }
-        /* gather (spec 17.1): the (size, EA) list is copied to the last 16*L
-         * bytes of the buffer, where the job reads it; the elements land from
-         * the buffer's start under MFC list rules and must stay below the copy */
+        /* gather (spec 17.1, 18.1): the (size, EA) list is copied to the last
+         * 16*L bytes of the buffer, where the job reads it; the elements land
+         * from the buffer's start under MFC list rules. An element may run into
+         * the copy over entries already consumed: element k must end at or
+         * before the copy's start + 8*(k+1), and inside the buffer. */
         uint8_t list[WJ_GATHER_LIST_MAX];
         if (l->bytes > sizeof list) wj_fatal(r, "gather list longer than supported", l->ea, l->bytes);
         if (l->bytes > l->limit || (l->bytes & 15)) wj_fatal(r, "gather list does not fit its buffer", l->bytes, l->limit);
@@ -355,9 +360,28 @@ static void wj_stage(struct wj_run* r)
         memcpy(c->ls + list_ls, list, l->bytes);
         wwsjm_piece pc[sizeof list / 8];
         unsigned n = 0;
-        wwsjm_status st = wwsjm_gather_layout(list, l->bytes / 8, l->ls, l->limit - l->bytes, pc, sizeof pc / sizeof pc[0], &n);
+        wwsjm_status st = wwsjm_gather_layout(list, l->bytes / 8, l->ls, l->limit, pc, sizeof pc / sizeof pc[0], &n);
+        if (st == WWSJM_OK) {
+            /* list entry k behind each piece (zero-size entries have none) */
+            unsigned piece = 0, overlap = 0;
+            for (unsigned k = 0; k < l->bytes / 8 && piece < n; k++) {
+                if (!wwsjm_be32(list + 8u * k)) continue;
+                const uint32_t end = pc[piece].ls + pc[piece].bytes;
+                if (end > list_ls) {
+                    if (end > list_ls + 8u * (k + 1)) { st = WWSJM_E_GATHER; break; }
+                    overlap = 1;
+                }
+                piece++;
+            }
+            if (overlap && st == WWSJM_OK) {
+                WJ_COUNT(gather_overlaps, 1);
+                if (r->check)
+                    fprintf(stderr, "[wwsjm] check: gather at 0x%08X (%u bytes) runs into its list copy at LS 0x%05X (wid %u)\n",
+                            l->ea, l->bytes, list_ls, r->wid);
+            }
+        }
         if (st != WWSJM_OK) {
-            fprintf(stderr, "[wwsjm] refused gather list at 0x%08X (%u bytes) into LS 0x%05X, room 0x%X (elements below 0x%05X), %s:",
+            fprintf(stderr, "[wwsjm] refused gather list at 0x%08X (%u bytes) into LS 0x%05X, room 0x%X (list copy at 0x%05X), %s:",
                     l->ea, l->bytes, l->ls, l->limit, list_ls, wwsjm_status_name(st));
             for (uint32_t o = 0; o + 8 <= l->bytes; o += 8) fprintf(stderr, " (%X, %08X)", wwsjm_be32(list + o), wwsjm_be32(list + o + 4));
             fprintf(stderr, "\n");
@@ -444,7 +468,7 @@ static void wj_run_job(struct wj_run* r, const struct wj_job* job)
 
     wj_plant_low_ls(r);
     r->tags = 0;
-    memset(r->set_tag, 0, sizeof r->set_tag);
+    r->tag_n = 0;
     r->finishes = 0;
     r->released = 0;
     r->next.valid = 0;
@@ -513,14 +537,19 @@ static int wj_svc_get_buffer(spu_context* c)
     struct wj_run* r = wj_current(c);
     const uint32_t set = c->gpr[4]._u32[0], buf = c->gpr[5]._u32[0], want = c->gpr[6]._u32[0];
     uint8_t tag = 0;
-    /* one tag per set per job, taken at the set's first r6 != 0 request
-     * (31 downward); a repeat request for the set returns it (spec 5.3, 17.3) */
-    if (want && set < WWSJM_MAX_SETS) {
-        if (!r->set_tag[set]) {
-            if (wwsjm_job_tag(&r->tags, &tag) != WWSJM_OK) wj_fatal(r, "more DMA tags than a job may take", set, r->tags);
-            r->set_tag[set] = tag;
+    /* one tag per (set, buffer) per job, taken at the pair's first r6 != 0
+     * request (31 downward) and returned again for repeats; r6 = 0 gives 0 and
+     * takes nothing (spec 5.3, 18.2) */
+    if (want) {
+        unsigned i = 0;
+        while (i < r->tag_n && (r->tag_of[i].set != set || r->tag_of[i].buf != buf)) i++;
+        if (i == r->tag_n) {
+            if (i >= WJ_TAGS || wwsjm_job_tag(&r->tags, &tag) != WWSJM_OK)
+                wj_fatal(r, "more DMA tags than a job may take", set, r->tags);
+            r->tag_of[i].set = (uint8_t)set; r->tag_of[i].buf = (uint8_t)buf; r->tag_of[i].tag = tag;
+            r->tag_n++;
         }
-        tag = r->set_tag[set];
+        tag = r->tag_of[i].tag;
     }
     uint8_t d[16];
     wwsjm_status st = wwsjm_buffer_descriptor(&r->plan, set, buf, tag, d);

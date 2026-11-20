@@ -52,7 +52,7 @@ MUTANTS = {
     'M8-userdata-at-portion': (RUN, '    a.userdata_ls = WJ_PORTION_LS + r->plan.userdata_offset;', '    a.userdata_ls = WJ_PORTION_LS;'),
     'module-never-reloaded': (RUN, '            if (l->skip) { WJ_COUNT(load_skips, 1); continue; }',
                               '            if (l->skip || r->res.n) { WJ_COUNT(load_skips, 1); continue; }'),
-    'tags-kept-across-jobs': (RUN, '    r->tags = 0;\n    memset(r->set_tag, 0, sizeof r->set_tag);\n    r->finishes = 0;',
+    'tags-kept-across-jobs': (RUN, '    r->tags = 0;\n    r->tag_n = 0;\n    r->finishes = 0;',
                               '    r->finishes = 0;'),
     'finish-claims-nothing': (RUN, '        else if (wj_claim(r, &r->next, 1)) wwsjm_finish_result(&r->next.h, result);',
                               '        else if (0) wwsjm_finish_result(&r->next.h, result);'),
@@ -89,7 +89,12 @@ MUTANTS = {
     'list-copy-at-start': (RUN, '        const uint32_t list_ls = l->ls + l->limit - l->bytes;', '        const uint32_t list_ls = l->ls;'),
     'zero-size-element-advances': ('runtime/spu/wwsjm/wwsjm_core.c', '        if (!word)\n            continue;\n', ''),
     'window-top-3C000': (RUN, '    WJ_LS_HIGH = 0x3E000, ', '    WJ_LS_HIGH = 0x3C000, '),
-    'tag-per-call': (RUN, '        if (!r->set_tag[set]) {', '        if (1) {'),
+    'tag-per-call': (RUN, '        while (i < r->tag_n && (r->tag_of[i].set != set || r->tag_of[i].buf != buf)) i++;',
+                     '        i = r->tag_n;'),
+    'tag-per-set': (RUN, '        while (i < r->tag_n && (r->tag_of[i].set != set || r->tag_of[i].buf != buf)) i++;',
+                    '        while (i < r->tag_n && r->tag_of[i].set != set) i++;'),
+    'overlap-rule-off': (RUN, '                    if (end > list_ls + 8u * (k + 1)) { st = WWSJM_E_GATHER; break; }\n', ''),
+    'overlap-refused': (RUN, '                    overlap = 1;\n', '                    st = WWSJM_E_GATHER; break;\n'),
     'stack-bytes-zero': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
                          'spurs_native_pm_enter_job(c, entry, WJ_STACK, 0, WJ_CTX_LS, 0)'),
     'stack-bytes-too-few': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
@@ -160,7 +165,7 @@ def check(binary: Path) -> list[str]:
         r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': mode})
         want = dict(done='1', jobs='73', ran='73', dup='0', missing='0', bad_out='0', regs='0', ctx='0', ud='0',
                     module='0', gather='0', desc='0', tag='0', finish='0', violations='0', lifted='0', current='1',
-                    n0='43', s0='43', n1='77', s1='77', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0', stack='0', listcopy='0', race='12', stalls='0', lost_kicks='0')
+                    n0='43', s0='43', n1='77', s1='77', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0', stack='0', listcopy='0', overlap='0', race='12', stalls='0', lost_kicks='0')
         for k, v in want.items():
             expect(r.get(k) == v, f'native {mode}: {k}={r.get(k)} expected {v}')
         expect(int(r.get('finish_jobs', 0)) > 0, f'native {mode}: finish never claimed a next job: {r}')
@@ -175,10 +180,16 @@ def check(binary: Path) -> list[str]:
             # the in-run flag poll is followed by ready := 8 (6.1, U19); the race
             # entries' kicks are never lost (spec 16, R12: stalls=0 above)
             expect(s.get('flag_polls') == '1', f'native {mode}: in-run flag poll: {s}')
+            expect(s.get('gather_overlaps') == '73', f'native {mode}: gathers into the list copy: {s}')
         # every one of the 8 in-window publications whose kick the lane then
         # overwrote with ready := 0 was followed by its verify (R12)
         expect(int(r.get('verified_kicks', 0)) >= 1, f'native {mode}: no kick was overwritten and verified: {r}')
         expect('FATAL' not in err, f'native {mode}: {err[-600:]}')
+    # a gather element that overwrites a list entry not yet consumed halts (spec 18.1)
+    rb = subprocess.run([str(binary), 'native'], env=dict(BASE_ENV, PS3RECOMP_SPURS_NATIVE_PM='1', WWSJM_FIXTURE_BAD_GATHER='1'),
+                        capture_output=True, text=True, timeout=60)
+    expect(rb.returncode == 86 and 'refused gather list' in rb.stderr,
+           f'an illegal overlap was not refused: rc={rb.returncode} {rb.stderr[-300:]}')
     # the interrupt vector's target halts loudly
     ri = subprocess.run([str(binary), 'native-irq'], env=dict(BASE_ENV, PS3RECOMP_SPURS_NATIVE_PM='1'),
                         capture_output=True, text=True, timeout=60)
