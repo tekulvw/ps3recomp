@@ -23,9 +23,9 @@ from pathlib import Path
 
 MAGIC = b'SPMR'
 VERSION = 1
-RUN_BEGIN, RUN_END, COMMAND, TRANSFER, ATOMIC, BRANCH, KERNEL, LSREAD = range(1, 9)
+RUN_BEGIN, RUN_END, COMMAND, TRANSFER, ATOMIC, BRANCH, KERNEL, LSREAD, REGS = range(1, 10)
 KIND_NAMES = {RUN_BEGIN: 'run_begin', RUN_END: 'run_end', COMMAND: 'command', TRANSFER: 'transfer',
-              ATOMIC: 'atomic', BRANCH: 'branch', KERNEL: 'kernel', LSREAD: 'lsread'}
+              ATOMIC: 'atomic', BRANCH: 'branch', KERNEL: 'kernel', LSREAD: 'lsread', REGS: 'regs'}
 LSREAD_IN_CTX, LSREAD_AT_CTX = 1, 2
 XFER_NAMES = {1: 'get', 2: 'put', 3: 'zero'}
 BRANCH_NAMES = {1: 'job_enter', 2: 'job_return', 3: 'service_call', 4: 'service_return'}
@@ -91,6 +91,15 @@ def decode_payload(kind: int, p: bytes) -> dict:
         e['value'] = p[o:o + 16]
         if len(e['value']) != 16:
             raise FormatError('short lsread')
+    elif kind == REGS:
+        # PS3RECOMP_SPURS_PM_RECORD_REGS: the register file at a job entry (1) or halt (2)
+        e, o = _fields('IIIIIIII', 'why pc int_enable event_mask status region entry module_ea', p)
+        e['why'] = {1: 'job_enter', 2: 'halt'}.get(e['why'], e['why'])
+        raw = p[o:o + 2048]
+        if len(raw) != 2048:
+            raise FormatError('short regs')
+        e['gpr'] = [list(struct.unpack_from('<4I', raw, 16 * r)) for r in range(128)]
+        e['ls'] = p[o + 2048:]   # at a halt: local store from the halted function's entry
     else:
         raise FormatError(f'unknown record kind {kind}')
     if 'region' in e:

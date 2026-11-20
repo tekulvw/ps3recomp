@@ -29,6 +29,7 @@ pointer.
 | `PS3RECOMP_SPURS_PM_RECORD_START=<s>` | Only record runs that begin at least `<s>` seconds after the first policy run (skip boot). |
 | `PS3RECOMP_SPURS_PM_RECORD_EVERY=<n>` | Record one eligible run in `n` on each worker (default 1: consecutive runs). |
 | `PS3RECOMP_SPURS_PM_RECORD_LSREAD=1\|<hex limit>` | With the recorder or the statistics on: report job code's local-store quadword reads below `0x4000` (`1`) or below the given hex limit. See "Local-store reads" below. Ignored, with a notice, when neither is set. |
+| `PS3RECOMP_SPURS_PM_RECORD_REGS=1` | With the recorder on: a `regs` event (kind 9) with the whole register file (128 × 4 words), `int_enable`, `event_mask` and status at every job entry, and at a halt or stop of the observed context (not the run's normal exit to the kernel) the same plus the 512 bytes of local store from the halted function's entry. See "Register files" below. |
 | `PS3RECOMP_SPURS_PM_STATS=1` | Print cumulative counters and histograms to stderr (`[spurs-pm-stats]`) every `PS3RECOMP_SPURS_PM_STATS_SECONDS` (default 5) and at exit. Independent of recording. |
 
 `SPURS_PM_FRESH=1` (existing) makes every dispatch start from a fresh context;
@@ -100,6 +101,19 @@ a value different from the first, and the first and last values. It is printed
 every `PS3RECOMP_SPURS_PM_STATS_SECONDS` and at exit: to
 `<dir>/pmrec-lsread-<pid>.txt` (rewritten each time, so a killed process keeps
 the last one) when recording, otherwise to stderr (`[spurs-pm-lsread]`).
+
+## Register files
+
+`PS3RECOMP_SPURS_PM_RECORD_REGS` answers "what state did job code start in, and what did it hold
+when it stopped". It makes two kinds of event:
+
+- **At a job entry:** the whole register file, with the interrupt enable, the event mask and the
+  status.
+- **At a halt or stop of the observed context:** the same, plus the 512 bytes of local store from
+  the halted function's entry, so the halting instruction and its operand register can be read.
+
+The halt event comes through a hook pointer in `spu_halt` that is NULL unless the switch is set.
+Each event is about 2 KiB, so use it with a run limit.
 
 ## Statistics
 
