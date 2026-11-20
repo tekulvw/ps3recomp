@@ -100,7 +100,7 @@ static SRWLOCK s_wj_lock = SRWLOCK_INIT;
 static struct {
     unsigned long long runs, idle_runs, jobs, claims, nonjob_claims, retires, decrements, wakes,
         ready_writes, putllc_retries, polls, loads, load_skips, gathers, nops, set0_moved, index_watch,
-        verifies, verify_work, flag_polls, gather_overlaps;
+        verifies, verify_work, flag_polls, flag_entries, gather_overlaps;
 } s_wj_stats;
 #define WJ_COUNT(f, n) __atomic_add_fetch(&s_wj_stats.f, (unsigned long long)(n), __ATOMIC_RELAXED)
 
@@ -110,10 +110,10 @@ static void wj_print_stats(void)
 #define L(f) __atomic_load_n(&s_wj_stats.f, __ATOMIC_RELAXED)
     fprintf(stderr, "[wwsjm] runs=%llu idle=%llu jobs=%llu claims=%llu nonjob=%llu retires=%llu decrements=%llu "
             "wakes=%llu ready_writes=%llu putllc_retries=%llu polls=%llu loads=%llu resident_skips=%llu "
-            "gathers=%llu nops=%llu set0_moved=%llu index_watch=%llu verifies=%llu verify_work=%llu flag_polls=%llu gather_overlaps=%llu\n",
+            "gathers=%llu nops=%llu set0_moved=%llu index_watch=%llu verifies=%llu verify_work=%llu flag_polls=%llu flag_entries=%llu gather_overlaps=%llu\n",
             L(runs), L(idle_runs), L(jobs), L(claims), L(nonjob_claims), L(retires), L(decrements), L(wakes),
             L(ready_writes), L(putllc_retries), L(polls), L(loads), L(load_skips), L(gathers), L(nops),
-            L(set0_moved), L(index_watch), L(verifies), L(verify_work), L(flag_polls), L(gather_overlaps));
+            L(set0_moved), L(index_watch), L(verifies), L(verify_work), L(flag_polls), L(flag_entries), L(gather_overlaps));
 #undef L
     fflush(stderr);
 }
@@ -674,7 +674,7 @@ static int wj_run(spu_context* c, const struct spurs_native_pm_run* a)
     WJ_COUNT(runs, 1);
     const unsigned long long jobs_before = __atomic_load_n(&s_wj_stats.jobs, __ATOMIC_RELAXED);
 
-    if (a->poll_status == 4) wj_ready_store(&r, r.wid, WWSJM_READY_ON_FLAG);
+    if (a->poll_status == 4) { wj_ready_store(&r, r.wid, WWSJM_READY_ON_FLAG); WJ_COUNT(flag_entries, 1); }
     for (;;) {
         struct wj_job job;
         if (r.next.valid) {

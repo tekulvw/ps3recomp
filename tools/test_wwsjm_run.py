@@ -182,7 +182,11 @@ def check(binary: Path) -> list[str]:
                    f'native {mode}: counters {s}')
             # the in-run flag poll is followed by ready := 8 (6.1, U19); the race
             # entries' kicks are never lost (spec 16, R12: stalls=0 above)
-            expect(s.get('flag_polls') == '1', f'native {mode}: in-run flag poll: {s}')
+            # the flag raised inside the second workload's job is honoured exactly
+            # once: by the poll inside finish (6.1, U19), or, when another lane's
+            # dispatch takes it first, at that run's entry
+            expect(int(s.get('flag_polls', 0)) + int(s.get('flag_entries', 0)) == 1,
+                   f'native {mode}: the in-run flag: {s}')
             expect(s.get('gather_overlaps') == '73', f'native {mode}: gathers into the list copy: {s}')
         # every one of the 8 in-window publications whose kick the lane then
         # overwrote with ready := 0 was followed by its verify (R12)
