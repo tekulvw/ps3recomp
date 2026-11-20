@@ -58,7 +58,8 @@ MUTANTS = {
                                '        __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);\n', ''),
     'far-job-return-refused': ('runtime/spu/spu_channels.c',
                                '        spurs_native_pm_job_return_far(ctx);\n', ''),
-    'far-job-return-depth-kept': ('runtime/spu/spurs_native_pm.inc', '    c->host_depth = depth0;\n', ''),
+    'far-job-return-depth-kept': ('runtime/spu/spurs_native_pm.inc', '    c->host_depth = depth0; c->drain_ret_pc', '    c->drain_ret_pc'),
+    'far-job-return-not-ended': ('runtime/spu/spurs_native_pm.inc', '    if (halted && far) {', '    if (0) {'),
     'services-left-installed': ('runtime/spu/spurs_native_pm.inc', '    c->native_services = NULL;\n    t_npm_pm = NULL;',
                                 '    t_npm_pm = NULL;'),
 }
