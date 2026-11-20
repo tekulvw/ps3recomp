@@ -381,6 +381,16 @@ void rsx_draw_engine_shutdown(void);
 void rsx_draw_engine_method(u32 method, u32 arg);
 #define RSX_ENGINE_HAS_PICTURE_IDENTITIES 1
 void rsx_draw_engine_method_at(u32 method,u32 arg,u32 data_ea);
+/* A run of `count` data words of one method packet, as the FIFO holds them
+ * (big-endian, consecutive, `words[0]` at guest address data_ea): methods
+ * method, method + 4, ... on `subch` when incrementing, else `method` for
+ * every word. The same per-word effects, in the same order, as `count` calls
+ * of rsx_draw_engine_method_at((subch << 13) | m, arg, ea), without the
+ * per-call entry work; the walker's plain-method path hands over whole
+ * packets this way (one call per 1 MB IO page). */
+#define RSX_ENGINE_HAS_METHOD_RUNS 1
+void rsx_draw_engine_methods_at(u32 subch, u32 method, int incrementing,
+                                const u32* words, u32 count, u32 data_ea);
 
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */
@@ -418,6 +428,9 @@ unsigned rsx_draw_engine_pipeline_reuse_register_class(u32 ridx);
  * (4 plain for the dispatcher, 8 texture-unit offset word, 16 texture-unit
  * format word, 32 tracked by the external-program status). */
 unsigned rsx_draw_engine_method_class(u32 ridx);
+/* Tests: the register file entry for a register index (value; *seen = its
+ * write count). */
+u32 rsx_draw_engine_register(u32 ridx, u32* seen);
 /* Repeat texture binds in one frame after a guest-memory write that missed
  * the texture (no re-check), and those a write may have touched (checked). */
 void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked);

@@ -3624,10 +3624,33 @@ static int gcm_walk_special(u32 m)
         return 0;
     }
 }
+/* Does an incrementing packet of `count` words from `method` (or a
+ * non-incrementing one, every word `method`) touch a method with effects of
+ * its own? The per-word path asks gcm_walk_special(method + 4 * i) for each
+ * word; the answer for the whole packet decides whether it can go to the
+ * engine as one run (gcm_walk_runs). A method past 0x1FFC is never special,
+ * so the range test and the per-word test agree there too. */
+static int gcm_walk_special_in(int incrementing, u32 method, u32 count)
+{
+    if (!incrementing || count <= 1u) return gcm_walk_special(method);
+    static const u16 specials[] = { 0x0050u, 0x0104u, 0x0180u, 0x01A4u, 0x01A8u,
+                                    0x1800u, 0x1D6Cu, 0x1D70u, 0x1D74u };
+    const u32 last = method + (count - 1u) * 4u;
+    for (u32 k = 0; k < sizeof specials / sizeof specials[0]; k++)
+        if (specials[k] >= method && specials[k] <= last) return 1;
+    return 0;
+}
+/* PS3RECOMP_GCM_FAST_WALK_RUNS=0 (default on, read once with the plain walk):
+ * the plain-method path hands the engine one word at a time, as it did
+ * before whole packets went over as runs (rsx_draw_engine_methods_at). The
+ * switch exists to measure the two forms against each other. */
+static int s_walk_runs = -1;
+static unsigned long long s_walk_plain_runs;
 static int gcm_plain_walk(int legacy_state_live)
 {
     if (s_walk_fast < 0) { const char* e = getenv("PS3RECOMP_GCM_FAST_WALK"); s_walk_fast = e && !strcmp(e, "1"); }
     if (!s_walk_fast) return 0;
+    if (s_walk_runs < 0) { const char* e = getenv("PS3RECOMP_GCM_FAST_WALK_RUNS"); s_walk_runs = !(e && !strcmp(e, "0")); }
     if (s_walk_diag < 0) {
         const char* vw = getenv("GCM_VAL_WATCH");
         const char* hs = getenv("GCM_METHOD_HIST");
@@ -4158,6 +4181,30 @@ static void gcm_rsx_process_fifo_pass(void)
             if(count && (subch==4u||subch==5u) && method<=0x7fcu &&
                (method>=0x400u || (type==0u && (u64)method+(u64)(count-1u)*4u>=0x400u)) &&
                !gcm_inline_image_barrier())return;
+            /* Plain packets as runs: when no word of the packet is a method
+             * with effects of its own, the engine gets the packet's words in
+             * one call per 1 MB IO page (the table maps whole pages, so the
+             * words of a page are consecutive in guest memory), instead of
+             * one call per word below. Same words, same methods, same data
+             * addresses, same order; the per-word timing of RSX_ENGINE_PHASES
+             * keeps the per-word form. */
+            if (plain_walk && s_walk_runs && (subch == 0 || (subch == 1 && !s_walk_s1_2d)) &&
+                !(diag && s_gph_on > 0) && !gcm_walk_special_in(type == 0, method, count)) {
+                u32 i = 0;
+                while (i < count) {
+                    const u32 dio = s_fifo_getoff + 4 + i * 4;
+                    const u32 dea = gcm_io2ea(dio);
+                    if (!dea) break;
+                    u32 run = (0x100000u - (dio & 0xFFFFFu)) >> 2;
+                    if (run > count - i) run = count - i;
+                    rsx_draw_engine_methods_at(subch, type == 0 ? method + i * 4 : method, type == 0,
+                                               vm_ptr32(dea), run, dea);
+                    s_walk_plain_words += run; s_walk_plain_runs++;
+                    i += run;
+                }
+                s_fifo_getoff += 4 + count * 4;
+                continue;
+            }
             u32 dea = 0;
             for (u32 i = 0; i < count; i++) {
                 /* Plain walk: within one 1 MB IO page the next word's address
