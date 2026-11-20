@@ -379,24 +379,28 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
     /* the module the record named, at its load base */
     if (memcmp(c->ls + 0x4000, vm_base + (module ? MOD_B_EA : MOD_A_EA), MOD_BYTES) != 0) ERR(g_err_module);
     /* inputs: get buffer 1 (with a tag), the gathered pieces at the list rule's places */
-    uint32_t d[4];
+    /* tags: one per set per job, from 31 down in the order the job first asks
+     * (odd jobs ask for the zero-page set 4 first) (spec 5.3, 17.3) */
+    uint32_t d[4], z[4];
+    const uint32_t tag1 = (k & 1) ? 0x1E : 0x1F, tag4 = (k & 1) ? 0x1F : 0x1E;
+    if (k & 1) call_service(c, ctx_ls, 0x34, 4, 0, 1, z);
     call_service(c, ctx_ls, 0x34, 1, 0, 1, d);
     const uint32_t in_ls = (d[1] >> 16) * 4, in_len = (d[1] & 0xFFFF) * 4;
     const uint32_t bytes1 = s_job[k].pages * 0x400u;   /* this job's own reserve (spec 16.3) */
     if ((d[0] >> 24) != 1 || ((d[0] >> 16) & 0xFF) != 0 || in_len != bytes1 || (in_ls != 0x8000 && in_ls != 0x8000 + bytes1) ||
         d[2] != GLIST_EA + 0x40u * k || d[3] != 0x30)
         ERR(g_err_desc);
-    if ((d[0] & 0xFF) != 0x1F) ERR(g_err_tag);
+    if ((d[0] & 0xFF) != tag1) ERR(g_err_tag);
     /* the list copy sits in the last 16*L bytes of the buffer (spec 17.1) */
     if (memcmp(c->ls + in_ls + in_len - 0x30, vm_base + GLIST_EA + 0x40u * k, 0x30) != 0) ERR(g_err_listcopy);
     /* a repeat request for the set returns the same descriptor and tag; a
      * zero-page set sits at its own page with length 0 and takes the next tag
      * (spec 5.3, 17.2, 17.3) */
-    uint32_t d2[4], z[4];
+    uint32_t d2[4];
     call_service(c, ctx_ls, 0x34, 1, 0, 1, d2);
     if (memcmp(d, d2, sizeof d)) ERR(g_err_tag);
-    call_service(c, ctx_ls, 0x34, 4, 0, 1, z);
-    if (z[0] != 0x0400001Eu || z[1] != (0xF000u / 4) << 16) ERR(g_err_tag);
+    if (!(k & 1)) call_service(c, ctx_ls, 0x34, 4, 0, 1, z);
+    if (z[0] != (0x04000000u | tag4) || z[1] != (0xF000u / 4) << 16) ERR(g_err_tag);
     struct piece pc[4];
     layout(IN_EA + 0x200u * k, pc);
     uint32_t got = 0;

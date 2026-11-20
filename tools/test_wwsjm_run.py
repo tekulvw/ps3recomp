@@ -52,7 +52,8 @@ MUTANTS = {
     'M8-userdata-at-portion': (RUN, '    a.userdata_ls = WJ_PORTION_LS + r->plan.userdata_offset;', '    a.userdata_ls = WJ_PORTION_LS;'),
     'module-never-reloaded': (RUN, '            if (l->skip) { WJ_COUNT(load_skips, 1); continue; }',
                               '            if (l->skip || r->res.n) { WJ_COUNT(load_skips, 1); continue; }'),
-    'tags-kept-across-jobs': (RUN, '    r->tags = 0;\n    r->finishes = 0;', '    r->finishes = 0;'),
+    'tags-kept-across-jobs': (RUN, '    r->tags = 0;\n    memset(r->set_tag, 0, sizeof r->set_tag);\n    r->finishes = 0;',
+                              '    r->finishes = 0;'),
     'finish-claims-nothing': (RUN, '        else if (wj_claim(r, &r->next, 1)) wwsjm_finish_result(&r->next.h, result);',
                               '        else if (0) wwsjm_finish_result(&r->next.h, result);'),
     'context-array-dropped': (RUN, '    a.array = job->array;', '    a.array = 0;'),
@@ -244,7 +245,16 @@ def main() -> int:
             bad = []
             for name, m in MUTANTS.items():
                 try:
-                    caught = bool(check(build(tmp, f'mutant-{name}', m)))
+                    binary = build(tmp, f'mutant-{name}', m)
+                except AssertionError as e:          # a stale anchor is a broken test, not a catch
+                    print(f'[FAIL] mutant {name}: {e}')
+                    bad.append(name)
+                    continue
+                except subprocess.SubprocessError:   # refused at compile time (a static assertion)
+                    print(f'[PASS] mutant {name} caught (does not compile)')
+                    continue
+                try:
+                    caught = bool(check(binary))
                 except (AssertionError, subprocess.SubprocessError):
                     caught = True
                 print(f"[{'PASS' if caught else 'FAIL'}] mutant {name} {'caught' if caught else 'NOT caught'}")
