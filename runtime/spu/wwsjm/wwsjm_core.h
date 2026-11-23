@@ -22,6 +22,13 @@
 extern "C" {
 #endif
 
+/* Linkage of the core's functions: external by default; a user that compiles
+ * the core into its own translation unit (the run loop does) defines it as
+ * `static inline` first, so a separately built core object never clashes. */
+#ifndef WWSJM_API
+#define WWSJM_API
+#endif
+
 #define WWSJM_LINE_BYTES     128u
 #define WWSJM_ARRAYS         4u
 #define WWSJM_LANES          6u
@@ -38,6 +45,7 @@ extern "C" {
 #define WWSJM_CONTEXT_BYTES  0x80u
 #define WWSJM_RESIDENT_MAX   8u
 #define WWSJM_MODULE_PAGE    16u      /* modules are linked for LS 0x4000 */
+#define WWSJM_LS_BYTES       0x40000u /* local store */
 /* N is a u16; capacities need not be powers of two, so the slot jumps when N
  * wraps. The wrap was never observed; a check mode reports N at or above this. */
 #define WWSJM_INDEX_WRAP_WATCH 0xF000u
@@ -60,7 +68,7 @@ typedef enum {
     WWSJM_E_TOO_MANY        /* more dependencies/loads than the plan holds */
 } wwsjm_status;
 
-const char* wwsjm_status_name(wwsjm_status s);
+WWSJM_API const char* wwsjm_status_name(wwsjm_status s);
 
 /* ---- big-endian accessors ---------------------------------------------- */
 static inline uint16_t wwsjm_be16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
@@ -84,18 +92,18 @@ typedef struct {
 typedef struct {
     uint32_t image_ea, image_size;
     uint16_t current;                /* the array the manager services */
-    uint16_t switch_count;           /* decremented by every array switch */
+    uint32_t switch_count;           /* +0x0C: decremented (u32) by every array switch */
     uint32_t mask[WWSJM_ARRAYS];     /* capacity - 1 */
     uint32_t array_ea[WWSJM_ARRAYS];
     wwsjm_markers m[WWSJM_ARRAYS];
 } wwsjm_line;
 
-void wwsjm_line_decode(const uint8_t raw[WWSJM_LINE_BYTES], wwsjm_line* out);
+WWSJM_API void wwsjm_line_decode(const uint8_t raw[WWSJM_LINE_BYTES], wwsjm_line* out);
 
 /* Where the header of `index` on array `a` lives: the u16 index mod capacity
  * (capacity - 1 is the line's field), with no special case at the u16 wrap.
  * 0 for a malformed array (no EA, or capacity 2^32). */
-uint32_t wwsjm_header_ea(const wwsjm_line* l, unsigned a, uint16_t index);
+WWSJM_API uint32_t wwsjm_header_ea(const wwsjm_line* l, unsigned a, uint16_t index);
 
 /* The entry the manager would examine next: array `current`, index N. */
 typedef struct {
@@ -104,7 +112,7 @@ typedef struct {
     uint32_t header_ea;
 } wwsjm_cursor;
 
-wwsjm_status wwsjm_cursor_of(const wwsjm_line* l, wwsjm_cursor* out);
+WWSJM_API wwsjm_status wwsjm_cursor_of(const wwsjm_line* l, wwsjm_cursor* out);
 
 /* ---- headers and the claim decision ------------------------------------ */
 enum {
@@ -122,7 +130,7 @@ typedef struct {
     uint32_t ea;
 } wwsjm_header;
 
-wwsjm_status wwsjm_header_decode(const uint8_t raw[WWSJM_HEADER_BYTES], wwsjm_header* out);
+WWSJM_API wwsjm_status wwsjm_header_decode(const uint8_t raw[WWSJM_HEADER_BYTES], wwsjm_header* out);
 
 /* Types 2 and 5 depend on the u16 at their EA. */
 static inline int wwsjm_header_is_gate(const wwsjm_header* h)
@@ -137,12 +145,12 @@ typedef enum {
 } wwsjm_verdict;
 
 /* `gate_value` is read only for gates. */
-wwsjm_verdict wwsjm_judge(const wwsjm_header* h, uint16_t gate_value);
+WWSJM_API wwsjm_verdict wwsjm_judge(const wwsjm_header* h, uint16_t gate_value);
 
 /* Claim the entry at the cursor of `old` for lane `lane`. Publishes N+1, raises
  * S to N+1 when it was behind, records the lane's oldest held job for a type-1
  * entry, and advances the current array for a type-4 entry. */
-wwsjm_status wwsjm_claim(const uint8_t old[WWSJM_LINE_BYTES], unsigned lane,
+WWSJM_API wwsjm_status wwsjm_claim(const uint8_t old[WWSJM_LINE_BYTES], unsigned lane,
                          const wwsjm_header* h, uint8_t out[WWSJM_LINE_BYTES]);
 
 /* A job the lane still holds after the retiring one (the one claimed during
@@ -155,16 +163,16 @@ typedef struct {
 
 /* Publish the completion of the job claimed on array `array` by lane `lane`:
  * the lane's marker on that array becomes the next held job there, or none. */
-wwsjm_status wwsjm_retire(const uint8_t old[WWSJM_LINE_BYTES], unsigned array, unsigned lane,
+WWSJM_API wwsjm_status wwsjm_retire(const uint8_t old[WWSJM_LINE_BYTES], unsigned array, unsigned lane,
                           const wwsjm_held* next, uint8_t out[WWSJM_LINE_BYTES]);
 
 /* ---- SPURS ready counts -------------------------------------------------- */
 /* The value the manager publishes for its own workload: `busy` while entries
  * are counted beyond N and the entry at N is claimable, else 0. */
-uint8_t wwsjm_ready_value(const wwsjm_line* l, wwsjm_verdict at_next, uint8_t busy);
+WWSJM_API uint8_t wwsjm_ready_value(const wwsjm_line* l, wwsjm_verdict at_next, uint8_t busy);
 
 /* Instance-line write: byte `wid` of the first 16 bytes becomes `value`. */
-wwsjm_status wwsjm_ready_apply(const uint8_t old[WWSJM_LINE_BYTES], unsigned wid, uint8_t value,
+WWSJM_API wwsjm_status wwsjm_ready_apply(const uint8_t old[WWSJM_LINE_BYTES], unsigned wid, uint8_t value,
                                uint8_t out[WWSJM_LINE_BYTES]);
 
 #define WWSJM_READY_ON_FLAG 8u
@@ -172,7 +180,7 @@ wwsjm_status wwsjm_ready_apply(const uint8_t old[WWSJM_LINE_BYTES], unsigned wid
 /* ---- dependency counters ------------------------------------------------- */
 /* Decrement the u16 at byte `offset` of a 128-byte line (wrapping) into `out`
  * and `*value`. An odd offset or one past the line is refused. */
-wwsjm_status wwsjm_decrement(const uint8_t old[WWSJM_LINE_BYTES], unsigned offset,
+WWSJM_API wwsjm_status wwsjm_decrement(const uint8_t old[WWSJM_LINE_BYTES], unsigned offset,
                              uint8_t out[WWSJM_LINE_BYTES], uint16_t* value);
 
 /* The u16 after a counter names the workload to wake and its ready count. */
@@ -244,10 +252,10 @@ typedef struct {
 
 /* Decode the first `size` bytes of a record into a staging plan. No-op
  * commands are skipped and counted; end and invalid commands are refused. Every
- * reserved set must lie inside [ls_low, ls_high) (a set of zero pages only
- * needs its start inside). Nothing partial is returned: on error the plan is
+ * reserved set must lie inside [ls_low, ls_high); a set of zero pages only
+ * needs its start inside local store. Nothing partial is returned: on error the plan is
  * cleared and `*bad_slot` names the offending command. */
-wwsjm_status wwsjm_plan_commands(const uint8_t* record, uint32_t size, uint32_t ls_low,
+WWSJM_API wwsjm_status wwsjm_plan_commands(const uint8_t* record, uint32_t size, uint32_t ls_low,
                                  uint32_t ls_high, wwsjm_plan* out, unsigned* bad_slot);
 
 /* An LS range [lo, hi) that is not free. */
@@ -258,7 +266,7 @@ typedef struct {
 /* The LS a job still holds: every named buffer (logical buffer `first_buffer`
  * when none is named) of every set it reserved and has not released (bit s of
  * `released` = set s released). Zero-length sets hold nothing. */
-wwsjm_status wwsjm_plan_held(const wwsjm_plan* p, uint32_t released, wwsjm_span* out,
+WWSJM_API wwsjm_status wwsjm_plan_held(const wwsjm_plan* p, uint32_t released, wwsjm_span* out,
                              unsigned max, unsigned* out_n);
 
 /* Place a job's sets beside LS that is not free (the buffers an earlier job
@@ -269,21 +277,21 @@ wwsjm_status wwsjm_plan_held(const wwsjm_plan* p, uint32_t released, wwsjm_span*
  * descriptors follow the placement. With no busy spans every ring starts at
  * its first buffer. Set 0 (the module) and any set holding a shareable copy
  * never rotate: their buffers stay put and only count as conflicts. */
-unsigned wwsjm_plan_place(wwsjm_plan* p, const wwsjm_span* busy, unsigned n_busy);
+WWSJM_API unsigned wwsjm_plan_place(wwsjm_plan* p, const wwsjm_span* busy, unsigned n_busy);
 
 /* Recompute every load's LS from the sets' `start` (for a caller that chooses
  * the ring starts itself). */
-void wwsjm_plan_relocate(wwsjm_plan* p);
+WWSJM_API void wwsjm_plan_relocate(wwsjm_plan* p);
 
 /* LS address and length of logical buffer `buf` of a reserved set, after
  * placement. */
-wwsjm_status wwsjm_buffer_span(const wwsjm_plan* p, unsigned set, unsigned buf, uint32_t* ls,
+WWSJM_API wwsjm_status wwsjm_buffer_span(const wwsjm_plan* p, unsigned set, unsigned buf, uint32_t* ls,
                                uint32_t* bytes);
 
 /* The get-buffer result for logical buffer `buf` of `set`: set, buffer, DMA
  * `tag` (0 when the job did not ask for one), LS/4, length/4, and for a buffer
  * filled by a read (copy or gather) the use command's EA and length in bytes. */
-wwsjm_status wwsjm_buffer_descriptor(const wwsjm_plan* p, unsigned set, unsigned buf,
+WWSJM_API wwsjm_status wwsjm_buffer_descriptor(const wwsjm_plan* p, unsigned set, unsigned buf,
                                      uint8_t tag, uint8_t out[16]);
 
 /* DMA tags handed to one job: each get-buffer that asks for a tag receives the
@@ -307,7 +315,7 @@ typedef struct {
     uint32_t ls, ea, bytes;
 } wwsjm_piece;
 
-wwsjm_status wwsjm_gather_layout(const uint8_t* list, unsigned n, uint32_t ls, uint32_t limit,
+WWSJM_API wwsjm_status wwsjm_gather_layout(const uint8_t* list, unsigned n, uint32_t ls, uint32_t limit,
                                  wwsjm_piece* out, unsigned max_out, unsigned* out_n);
 
 /* ---- module/buffer residency within one run ------------------------------ */
@@ -316,16 +324,16 @@ typedef struct {
     struct { uint32_t ls, bytes, ea; } e[WWSJM_RESIDENT_MAX];
 } wwsjm_residency;
 
-void wwsjm_residency_reset(wwsjm_residency* r);
-int  wwsjm_residency_holds(const wwsjm_residency* r, uint32_t ls, uint32_t bytes, uint32_t ea);
+WWSJM_API void wwsjm_residency_reset(wwsjm_residency* r);
+WWSJM_API int  wwsjm_residency_holds(const wwsjm_residency* r, uint32_t ls, uint32_t bytes, uint32_t ea);
 /* LS [ls, ls+bytes) now holds something else. */
-void wwsjm_residency_clobber(wwsjm_residency* r, uint32_t ls, uint32_t bytes);
-void wwsjm_residency_note(wwsjm_residency* r, uint32_t ls, uint32_t bytes, uint32_t ea);
+WWSJM_API void wwsjm_residency_clobber(wwsjm_residency* r, uint32_t ls, uint32_t bytes);
+WWSJM_API void wwsjm_residency_note(wwsjm_residency* r, uint32_t ls, uint32_t bytes, uint32_t ea);
 
 /* Call after placement. Marks each shareable copy that is already resident
  * (same LS, same source, same length) as skipped; everything else the job
  * reserves replaces what was resident there. */
-void wwsjm_plan_residency(wwsjm_plan* p, wwsjm_residency* r);
+WWSJM_API void wwsjm_plan_residency(wwsjm_plan* p, wwsjm_residency* r);
 
 /* ---- the job API context --------------------------------------------------- */
 enum {
@@ -347,10 +355,10 @@ typedef struct {
     uint32_t slot[WWSJM_SLOTS];
 } wwsjm_context_args;
 
-void wwsjm_context_build(const wwsjm_context_args* a, uint8_t out[WWSJM_CONTEXT_BYTES]);
+WWSJM_API void wwsjm_context_build(const wwsjm_context_args* a, uint8_t out[WWSJM_CONTEXT_BYTES]);
 
 /* Finish's result: the claimed job's header words, or {0, 0xFFFFFFFF}. */
-void wwsjm_finish_result(const wwsjm_header* claimed, uint32_t out[2]);
+WWSJM_API void wwsjm_finish_result(const wwsjm_header* claimed, uint32_t out[2]);
 
 #ifdef __cplusplus
 }

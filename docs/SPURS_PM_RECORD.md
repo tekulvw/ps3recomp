@@ -93,7 +93,8 @@ whose address the job was handed in r3), `at_ctx` (the quadword the current r3
 names), the job's entry and the streamed-code source EA it runs from, the
 context address it was handed, the resolver's last pc and its code source, and
 r0, r1 and r3. Lifted code updates the pc only at branches, so `pc` is the last
-one, not the load's own.
+one, not the load's own. These events go to the recording file only, never to a native policy
+module's shadow comparison, and a shadow comparison alone does not arm the switch.
 
 Independently of recording, every worker keeps an aggregate per (job module,
 entry, quadword): reads, how many were `in_ctx` and `at_ctx`, how many returned

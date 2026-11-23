@@ -2171,6 +2171,12 @@ typedef struct {
 } WklPm;
 static WklPm s_wkl_pm[CELL_SPURS_MAX_WORKLOAD];
 
+static u32 spurs_inst_nspus(u32 ea)
+{
+    struct SpursInst* si = spurs_inst_find(ea);
+    return si ? si->nspus : 0;
+}
+
 static WklPm* spurs_resolve_pm(u32 wid)
 {
     WklPm* r = &s_wkl_pm[wid];
@@ -2182,7 +2188,8 @@ static WklPm* spurs_resolve_pm(u32 wid)
     /* PS3RECOMP_SPURS_NATIVE_PM (read once, here, at the first resolution):
      * unset, the registry is never consulted. */
     r->native = spurs_native_pm_mode() != SPURS_NATIVE_PM_OFF
-        ? spurs_native_pm_select(wid, fp, vm_base + (uint32_t)(uintptr_t)w->pm, w->sizePm) : NULL;
+        ? spurs_native_pm_select_instance(wid, fp, vm_base + (uint32_t)(uintptr_t)w->pm, w->sizePm,
+                                          w->spurs_ea, spurs_inst_nspus(w->spurs_ea)) : NULL;
     r->resolved = (r->fn || r->native) ? 1 : -1;
     if (!r->fn && r->native)
         printf("[cellSpurs] wid=%u PM not lifted (fp=0x%016llX): native only\n",

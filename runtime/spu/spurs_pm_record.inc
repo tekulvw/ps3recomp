@@ -34,6 +34,9 @@
  * unset no context ever gets an observer and spu_run_policy_module pays one
  * load of a resolved configuration word per run. */
 #include "spurs_pm_observer.h"
+#include "spurs_native_pm.h"
+/* Largest captured tail a shadowing implementation receives with one event. */
+#define SPURS_PM_REC_SINK_TAIL 16384u
 #include <errno.h>
 #include <time.h>
 #ifdef _WIN32
@@ -74,8 +77,10 @@ enum { SPURS_PM_REGION_POLICY = 0, SPURS_PM_REGION_JOB = 1, SPURS_PM_REGION_SERV
 /* ---- configuration (read once) ----------------------------------------- */
 static struct {
     int resolved;            /* 0 not read, 1 read */
-    int any;                 /* recording or statistics configured */
+    int any;                 /* recording, statistics or a shadow configured */
     int record, stats;
+    int shadow;              /* PS3RECOMP_SPURS_NATIVE_PM=shadow: events of shadowed
+                                workloads go to their implementation's comparison */
     char dir[1024];
     uint32_t wid_mask;       /* bit w = record workload w */
     uint32_t max_runs;       /* 0 = unlimited */
@@ -179,21 +184,25 @@ static void spurs_pm_rec_configure(void)
         s_pmrec.start_ns = (uint64_t)spurs_pm_rec_env_u32("PS3RECOMP_SPURS_PM_RECORD_START", 0) * 1000000000ull;
         s_pmrec.stats_ns = (uint64_t)spurs_pm_rec_env_u32("PS3RECOMP_SPURS_PM_STATS_SECONDS", 5) * 1000000000ull;
         if (!s_pmrec.stats_ns) s_pmrec.stats_ns = 5000000000ull;
-        s_pmrec.any = s_pmrec.record || s_pmrec.stats;
+        s_pmrec.shadow = spurs_native_pm_mode() == SPURS_NATIVE_PM_SHADOW || spurs_native_pm_self_shadow();
+        s_pmrec.any = s_pmrec.record || s_pmrec.stats || s_pmrec.shadow;
         { const char* rg = getenv("PS3RECOMP_SPURS_PM_RECORD_REGS");
           s_pmrec.regs = s_pmrec.record && rg && *rg && strcmp(rg, "0") != 0;
           if (s_pmrec.regs) g_spurs_pm_halt_hook = spurs_pm_record_halt; }
         {
-            /* "1" = below 0x4000; otherwise a hex limit (0x prefix optional) */
+            /* "1" = below 0x4000; otherwise a hex limit (0x prefix optional).
+             * Reported by the recording and the statistics only: a shadow
+             * comparison alone does not arm it. */
             const char* lr = getenv("PS3RECOMP_SPURS_PM_RECORD_LSREAD");
+            const int host = s_pmrec.record || s_pmrec.stats;
             uint32_t lim = 0;
             if (lr && *lr && strcmp(lr, "0") != 0)
                 lim = strcmp(lr, "1") == 0 ? 0x4000u : (uint32_t)strtoul(lr, NULL, 16);
             if (lim > SPU_LS_SIZE) lim = SPU_LS_SIZE;
-            if (lim && !s_pmrec.any)
+            if (lim && !host)
                 fprintf(stderr, "[spurs-pm-lsread] PS3RECOMP_SPURS_PM_RECORD_LSREAD ignored: it needs "
                         "PS3RECOMP_SPURS_PM_RECORD or PS3RECOMP_SPURS_PM_STATS\n");
-            s_pmrec.lsread_limit = s_pmrec.any ? lim : 0;
+            s_pmrec.lsread_limit = host ? lim : 0;
         }
         /* Open the hook sites' gate line (spu_context.h) only now. */
         if (s_pmrec.any) __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);
@@ -237,7 +246,9 @@ struct spurs_pm_rec_thread {
     uint64_t eligible;
     /* the current run */
     spu_context* ctx;
-    int recording;
+    int recording;           /* to_file || to_sink */
+    int to_file;
+    const struct spurs_native_pm* to_sink;   /* the shadowing implementation */
     uint32_t wid, lane, spurs_ea, pm_hi, run_seq, run_jobs, run_polls;
     uint64_t pm_fp; const uint8_t* pm_fp_host; uint32_t pm_fp_size;
     /* region tracking: base region plus nested service calls */
@@ -302,11 +313,30 @@ static void pmb_u64(struct spurs_pm_rec_buf* o, uint64_t v)
 static void pmb_bytes(struct spurs_pm_rec_buf* o, const uint8_t* p, uint32_t n)
 { if (p) memcpy(o->b + o->n, p, n); else memset(o->b + o->n, 0, n); o->n += n; }
 
+static void spurs_pm_rec_emit_file(struct spurs_pm_rec_thread* t, uint32_t kind,
+                                   const struct spurs_pm_rec_buf* body,
+                                   const uint8_t* tail, uint32_t tail_n);
 static void spurs_pm_rec_emit(struct spurs_pm_rec_thread* t, uint32_t kind,
                               const struct spurs_pm_rec_buf* body,
                               const uint8_t* tail, uint32_t tail_n)
 {
-    if (!t->file) return;
+    if (t->to_sink) {
+        uint8_t joined[sizeof body->b + SPURS_PM_REC_SINK_TAIL];
+        uint32_t n = body->n;
+        memcpy(joined, body->b, n);
+        const uint32_t tn = tail_n < SPURS_PM_REC_SINK_TAIL ? tail_n : SPURS_PM_REC_SINK_TAIL;
+        if (tn) { memcpy(joined + n, tail, tn); n += tn; }
+        t->to_sink->shadow(t->ctx, kind, joined, n);
+    }
+    spurs_pm_rec_emit_file(t, kind, body, tail, tail_n);
+}
+/* The recording file only: diagnostic events a shadowing implementation does
+ * not compare (local-store reads, register files). */
+static void spurs_pm_rec_emit_file(struct spurs_pm_rec_thread* t, uint32_t kind,
+                                   const struct spurs_pm_rec_buf* body,
+                                   const uint8_t* tail, uint32_t tail_n)
+{
+    if (!t->to_file || !t->file) return;
     uint8_t h[8] = { (uint8_t)kind, 0, 0, 0 };
     uint32_t len = body->n + tail_n;
     for (int i = 0; i < 4; i++) h[4 + i] = (uint8_t)(len >> (8 * i));
@@ -532,7 +562,7 @@ extern void spu_drain_call(spu_context*, uint32_t);
  * (ctx->pc). 128 registers, four words each. */
 static void spurs_pm_rec_regs_event(struct spurs_pm_rec_thread* t, const spu_context* ctx, uint32_t why)
 {
-    if (!t->recording || !s_pmrec.regs) return;
+    if (!t->to_file || !s_pmrec.regs) return;   /* the file only, like the read events */
     struct spurs_pm_rec_buf b; b.n = 0;
     pmb_u32(&b, why); pmb_u32(&b, (uint32_t)ctx->pc & SPU_LS_MASK); pmb_u32(&b, ctx->int_enable);
     pmb_u32(&b, ctx->event_mask); pmb_u32(&b, ctx->status); pmb_u32(&b, (uint32_t)t->region);
@@ -549,7 +579,7 @@ static void spurs_pm_rec_regs_event(struct spurs_pm_rec_thread* t, const spu_con
         extra = SPU_LS_SIZE - at < 512 ? SPU_LS_SIZE - at : 512;
         memcpy(o + 128 * 16, ctx->ls + at, extra);
     }
-    spurs_pm_rec_emit(t, SPURS_PM_REC_REGS, &b, o, 128 * 16 + extra);
+    spurs_pm_rec_emit_file(t, SPURS_PM_REC_REGS, &b, o, 128 * 16 + extra);
     free(o);
 }
 /* At an SPU halt or stop (spu_halt): the register file of the observed context. */
@@ -695,7 +725,9 @@ static void spurs_pm_rec_ls_read(const struct spu_context* cctx, uint32_t lsa)
         if (memcmp(row->first, v, 16)) PMREC_ADD(row->changed, 1);
         memcpy(row->last, v, 16);
     } else PMREC_ADD(t->lsread_overflow, 1);
-    if (!t->recording) return;
+    /* the file only: a shadowing implementation compares the program's
+     * decisions, which these reads are not */
+    if (!t->to_file) return;
     struct spurs_pm_rec_buf b; b.n = 0;
     pmb_u32(&b, lsa); pmb_u32(&b, 16); pmb_u32(&b, flags);
     pmb_u32(&b, t->job_module); pmb_u32(&b, t->job_entry); pmb_u32(&b, t->job_ctx_lsa);
@@ -704,7 +736,7 @@ static void spurs_pm_rec_ls_read(const struct spu_context* cctx, uint32_t lsa)
     for (int i = 0; i < 4; i++) pmb_u32(&b, ctx->gpr[3]._u32[i]);
     pmb_u32(&b, spurs_pm_rec_module_of(ctx, (uint32_t)ctx->pc & SPU_LS_MASK));
     pmb_bytes(&b, v, 16);
-    spurs_pm_rec_emit(t, SPURS_PM_REC_LSREAD, &b, NULL, 0);
+    spurs_pm_rec_emit_file(t, SPURS_PM_REC_LSREAD, &b, NULL, 0);
 }
 
 /* The aggregate table, merged over workers: stderr, and when recording also
@@ -803,11 +835,13 @@ static void spurs_pm_record_run_begin(spu_context* ctx, int image_id, const uint
     const int line_ok = spurs_pm_rec_guest_line((uint32_t)wkl_data, line);
     if (line_ok) spurs_pm_rec_note_line(t, line);
     PMREC_ADD(t->st[t->wid].runs, 1);
-    t->recording = 0;
+    t->recording = 0; t->to_file = 0; t->to_sink = NULL;
+    if (s_pmrec.shadow) t->to_sink = spurs_native_pm_shadowed(t->wid);
     if (s_pmrec.record && now - first_ns >= s_pmrec.start_ns && (s_pmrec.wid_mask & (1u << t->wid)) &&
         (t->eligible++ % s_pmrec.every) == 0 && spurs_pm_rec_take_run(spurs_ea, t->wid) &&
         spurs_pm_rec_open(t))
-        t->recording = 1;
+        t->to_file = 1;
+    t->recording = t->to_file || t->to_sink;
     if (t->recording) {
         PMREC_ADD(t->st[t->wid].recorded_runs, 1);
         t->run_seq = __atomic_add_fetch(&s_pmrec_run_seq, 1, __ATOMIC_RELAXED);
@@ -914,8 +948,8 @@ static void spurs_pm_record_run_end(spu_context* ctx, int result)
         pmb_u32(&b, t->run_jobs); pmb_u32(&b, (uint32_t)line_ok); pmb_u64(&b, spurs_pm_rec_now());
         pmb_bytes(&b, line_ok ? line : NULL, SPURS_PM_REC_LINE);
         spurs_pm_rec_emit(t, SPURS_PM_REC_RUN_END, &b, NULL, 0);
-        fflush(t->file);
-        t->recording = 0;
+        if (t->to_file) fflush(t->file);
+        t->recording = 0; t->to_file = 0; t->to_sink = NULL;
     }
     t->ctx = NULL;
     if (s_pmrec.stats || s_pmrec.lsread_limit) {
