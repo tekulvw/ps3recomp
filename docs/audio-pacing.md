@@ -69,6 +69,29 @@ A build with `PS3RECOMP_AUDIO_USE_SDL2` on Windows uses the SDL parameters. Test
 WASAPI shape against a simulated device: 480-frame pulls every 10 ms and 1 ms polling. The shape has
 not yet been measured against a real Windows endpoint.
 
+## Host timing counters
+
+The mixing thread always counts the timing events above, so an embedding application can report a
+session's audio health without any diagnostic switch. `ps3recomp_audio_host_stats()` in
+`include/ps3emu/audio_host_stats.h` copies them out; it is lock-free, and returns -1 until the
+first guest block read. The counters are relaxed atomics, incremented at most a few times per
+period and never per sample, and they are cumulative for the process.
+
+| Field | Counted when |
+|---|---|
+| `periods` | the host device accepted a mixed guest block (`SDL_QueueAudio` succeeded, or WASAPI took at least one of its frames); silence blocks are not periods |
+| `underruns`, `starved_frames` | `audio_pace` found the device queue below the low-water mark at a read and queued one silence block (256 frames); the prime at start and after a device returns is not counted |
+| `late_periods` | `audio_pace` moved the schedule one period later at the high-water mark, or a read came a whole period or more after it was due |
+| `dropped_periods` | the backlog after a stall or suspension longer than four periods was dropped (every pacing, every host), counted in periods; or WASAPI had no room for all of a submission (one per trimmed submission) |
+| `device_errors` | host backend initialisation failed at `cellAudioInit`, `SDL_QueueAudio` returned an error, or WASAPI's `GetCurrentPadding` started failing (once per failing spell) |
+| `clock_frames`, `clock_ns` | 256 frames per guest block read after the first, and the monotonic time from the first read to the latest. `clock_frames - clock_ns * 48000 / 1e9` is the guest audio clock's drift against 48 kHz |
+| `backend` | `sdl2`, `dummy` (SDL's dummy driver), `wasapi`, or `none` when no device opened |
+
+The struct and the getter share one name, as `struct stat` and `stat()` do, so the type is written
+`struct ps3recomp_audio_host_stats` in both C and C++. `tools/test_posix_audio_pacing.py` checks the
+counters against what the fixture's device and guest saw in every mode, and
+`tools/test_audio_host_stats_header.py` checks the layout and C linkage from C++.
+
 ## Switch
 
 | Variable | Values | Effect |

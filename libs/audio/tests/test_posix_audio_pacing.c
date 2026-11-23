@@ -193,6 +193,10 @@ int main(int argc,char** argv) {
     /* 9: SDL's dummy driver with PS3RECOMP_AUDIO_DUMMY_CLOCK=1 paces on the clock even
      * though its queue never drains, and nothing is queued to it. */
     if(mode==9)setenv("PS3RECOMP_AUDIO_DUMMY_CLOCK","1",1);
+    struct ps3recomp_audio_host_stats st;
+    /* Host timing counters (include/ps3emu/audio_host_stats.h): none before the first read. */
+    assert(ps3recomp_audio_host_stats(&st)==-1 && st.version==PS3RECOMP_AUDIO_HOST_STATS_VERSION &&
+           !st.periods && !st.clock_frames && !st.sample_rate);
     s_mix_thread_running=1;audio_mix_thread_func(NULL);
     printf("mode=%d pacing=%s elapsed_ns=%llu blocks=%u cursor=%llu submit=%llu silence=%llu peak_queue=%u max_batch=%u min_gap_us=%llu pulls=%u starved=%u sleeps=%u queries=%u\n",
         mode,argv[2],(unsigned long long)(now_ns-start_ns),notifications,(unsigned long long)p->read_index,(unsigned long long)submit_count,
@@ -231,5 +235,31 @@ int main(int argc,char** argv) {
     if(mode==9){assert(!submit_count);}
     if(mode==5){assert(stopped && restarted && p->read_index+17<notifications && p->read_index+21>notifications);}
     else assert(p->read_index==notifications);
+    /* The counters agree with what the fixture's device and guest saw. */
+    const int got=ps3recomp_audio_host_stats(&st);
+    if(!notifications) assert(got==-1);
+    else {
+        assert(got==0 && st.version==1 && st.sample_rate==48000 && !strcmp(st.backend,"none"));
+        assert(st.clock_frames==(uint64_t)(notifications-1)*256);
+        if(mode==6) assert(!st.periods && st.device_errors==submit_count+silence_submits);
+        else assert(st.periods==submit_count && !st.device_errors);
+        assert(st.starved_frames==st.underruns*256 && st.underruns<=silence_submits);
+        const double drift=(double)st.clock_frames-(double)st.clock_ns*48000.0/1e9;
+        printf("stats mode=%d periods=%llu underruns=%llu late=%llu dropped=%llu errors=%llu frames=%llu ns=%llu drift=%.1f\n",
+            mode,(unsigned long long)st.periods,(unsigned long long)st.underruns,(unsigned long long)st.late_periods,
+            (unsigned long long)st.dropped_periods,(unsigned long long)st.device_errors,(unsigned long long)st.clock_frames,
+            (unsigned long long)st.clock_ns,drift);
+        /* A steady clock: clock-paced reads keep 48 kHz within a period. The queue pacing reads
+         * its three-block lead at once, so it runs those 768 frames ahead. */
+        if((mode==0 || mode==7) && !queue_pacing) assert(drift>-256 && drift<256);
+        if((mode==0 || mode==7) && queue_pacing) assert(drift>512 && drift<1024);
+        if(mode==0 || mode==7) assert(!st.dropped_periods && !st.late_periods && !st.underruns);
+        /* A two-second suspension drops about 375 periods of backlog, not reads them. */
+        if(mode==4) assert(st.dropped_periods>=360 && st.dropped_periods<=380);
+        /* The queue pacing also drops the backlog its frozen device built up (mode 3). */
+        else if(!(mode==3 && queue_pacing)) assert(st.dropped_periods<=1);
+        /* A stalled device: the clock pacer slips the schedule at the high-water mark. */
+        if(mode==2 && !queue_pacing) assert(st.late_periods>=100);
+    }
     mutex_destroy(&s_audio_mutex);puts("PASS actual POSIX mixer timing/queue/control fixture");return 0;
 }
