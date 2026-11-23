@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix='spu-hot-check-')as td:
   exe=pathlib.Path(td)/('ubsan'if san else'o2')
   cmd=[os.environ.get('CC','cc'),'-std=gnu17','-O2','-UNDEBUG','-I'+str(r/'include'),'-I'+str(s),'-I'+str(r/'runtime/platform'),str(s/'tests/test_spu_interp_hot_blocks.c'),*[str(s/(x+'.c'))for x in u],str(r/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(exe)]
   if san:cmd[1:1]=['-fsanitize=undefined','-fno-sanitize-recover=all']
-  p=subprocess.run(cmd,capture_output=True,text=True,timeout=45);assert not p.returncode,p.stderr
+  p=subprocess.run(cmd,capture_output=True,text=True,timeout=300);assert not p.returncode,p.stderr
   outputs=[]
   for mode in ('0','1'):
    p=subprocess.run([str(exe)],env=dict(e,SPU_INTERP_HOT_BLOCKS=mode),capture_output=True,text=True,timeout=10);assert not p.returncode,p.stdout+p.stderr

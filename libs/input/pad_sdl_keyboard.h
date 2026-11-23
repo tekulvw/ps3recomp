@@ -12,6 +12,7 @@ typedef struct {
     uint16_t buttons;
     uint8_t analog_lx, analog_ly, analog_rx, analog_ry;
     uint8_t window;   /* a game window is publishing; 0 leaves the port alone */
+    uint8_t left_stick, right_stick;   /* a key of that stick is held */
 } PS3RecompSDLKeyboardPadState;
 /* Window-pump thread, after its events are polled: take one snapshot of the
  * SDL keyboard. Keys count only while `window` has keyboard focus and nothing
