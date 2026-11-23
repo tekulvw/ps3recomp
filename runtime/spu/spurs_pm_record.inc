@@ -307,6 +307,9 @@ static void pmb_u64(struct spurs_pm_rec_buf* o, uint64_t v)
 static void pmb_bytes(struct spurs_pm_rec_buf* o, const uint8_t* p, uint32_t n)
 { if (p) memcpy(o->b + o->n, p, n); else memset(o->b + o->n, 0, n); o->n += n; }
 
+static void spurs_pm_rec_emit_file(struct spurs_pm_rec_thread* t, uint32_t kind,
+                                   const struct spurs_pm_rec_buf* body,
+                                   const uint8_t* tail, uint32_t tail_n);
 static void spurs_pm_rec_emit(struct spurs_pm_rec_thread* t, uint32_t kind,
                               const struct spurs_pm_rec_buf* body,
                               const uint8_t* tail, uint32_t tail_n)
@@ -319,6 +322,14 @@ static void spurs_pm_rec_emit(struct spurs_pm_rec_thread* t, uint32_t kind,
         if (tn) { memcpy(joined + n, tail, tn); n += tn; }
         t->to_sink->shadow(t->ctx, kind, joined, n);
     }
+    spurs_pm_rec_emit_file(t, kind, body, tail, tail_n);
+}
+/* The recording file only: diagnostic events a shadowing implementation does
+ * not compare (local-store reads). */
+static void spurs_pm_rec_emit_file(struct spurs_pm_rec_thread* t, uint32_t kind,
+                                   const struct spurs_pm_rec_buf* body,
+                                   const uint8_t* tail, uint32_t tail_n)
+{
     if (!t->to_file || !t->file) return;
     uint8_t h[8] = { (uint8_t)kind, 0, 0, 0 };
     uint32_t len = body->n + tail_n;
@@ -682,7 +693,7 @@ static void spurs_pm_rec_ls_read(const struct spu_context* cctx, uint32_t lsa)
     for (int i = 0; i < 4; i++) pmb_u32(&b, ctx->gpr[3]._u32[i]);
     pmb_u32(&b, spurs_pm_rec_module_of(ctx, (uint32_t)ctx->pc & SPU_LS_MASK));
     pmb_bytes(&b, v, 16);
-    spurs_pm_rec_emit(t, SPURS_PM_REC_LSREAD, &b, NULL, 0);
+    spurs_pm_rec_emit_file(t, SPURS_PM_REC_LSREAD, &b, NULL, 0);
 }
 
 /* The aggregate table, merged over workers: stderr, and when recording also
