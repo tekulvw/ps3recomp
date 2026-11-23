@@ -183,11 +183,35 @@ static void keyboard_mode(const char*mode){
         key_report("released",0,128,128,128,128);assert(layout_queries>0);return;
     }
     if(!strcmp(mode,"keyboard-controller")){
-        /* A controller on port 0 always wins over the keyboard. */
-        fixture_connected=1;fixture_focus=1;physical_buttons=XINPUT_GAMEPAD_B;hold('X',1);hold('W',1);
-        key_report("controller wins",CELL_PAD_CTRL_CIRCLE,128,128,128,128);
-        fixture_connected=0;hold('X',0);hold('W',0);hold('V',1);
+        /* With a controller on port 0 the keyboard merges into it: buttons add,
+         * and a stick follows its keys while one is held. */
+        fixture_connected=1;fixture_focus=1;physical_buttons=XINPUT_GAMEPAD_B;
+        key_report("controller alone",CELL_PAD_CTRL_CIRCLE,128,128,128,128);
+        hold('X',1);key_report("keyboard button adds",CELL_PAD_CTRL_CIRCLE|CELL_PAD_CTRL_CROSS,128,128,128,128);
+        physical_axes=1;assert(report(1)>0);
+        const unsigned clx=axis(0),cly=axis(1),crx=axis(2),cry=axis(3);
+        assert(clx!=128&&cly!=128&&crx!=128&&cry!=128);
+        hold('W',1);key_report("held left stick follows the keys",CELL_PAD_CTRL_CIRCLE|CELL_PAD_CTRL_CROSS,128,0,crx,cry);
+        hold('S',1);key_report("opposing keys still own the stick",CELL_PAD_CTRL_CIRCLE|CELL_PAD_CTRL_CROSS,128,128,crx,cry);
+        hold('W',0);hold('S',0);hold('L',1);key_report("right stick keys",CELL_PAD_CTRL_CIRCLE|CELL_PAD_CTRL_CROSS,clx,cly,255,128);
+        hold('L',0);hold('X',0);key_report("released: controller exactly",CELL_PAD_CTRL_CIRCLE,clx,cly,crx,cry);
+        /* Pressure: a controller button keeps its reading, a keyboard button reads full. */
+        assert(cellPadSetPortSetting(0,CELL_PAD_SETTING_PRESS_ON)==CELL_OK);
+        hold('R',1);key_report("keyboard L2 with controller",CELL_PAD_CTRL_CIRCLE|CELL_PAD_CTRL_L2,clx,cly,crx,cry);
+        assert(vm_read16(0x104+2*CELL_PAD_BTN_OFFSET_PRESS_L2)==255&&vm_read16(0x104+2*CELL_PAD_BTN_OFFSET_PRESS_CIRCLE)==255);
+        hold('R',0);
+        /* Another window in front: the keyboard adds nothing, the controller still plays. */
+        hold('X',1);fixture_focus=2;key_report("unfocused keyboard, controller kept",CELL_PAD_CTRL_CIRCLE,clx,cly,crx,cry);
+        fixture_focus=1;key_report("held across focus stays ignored",CELL_PAD_CTRL_CIRCLE,clx,cly,crx,cry);
+        hold('X',0);physical_axes=0;
+        /* Unplugging leaves the keyboard alone on the port. */
+        fixture_connected=0;hold('V',1);
         key_report("unplugged",CELL_PAD_CTRL_TRIANGLE,128,128,128,128);hold('V',0);return;
+    }
+    if(!strcmp(mode,"keyboard-controller-off")){
+        /* PAD_NO_KEYBOARD: a controller's report is untouched by held keys. */
+        fixture_connected=1;fixture_focus=1;physical_buttons=XINPUT_GAMEPAD_B;hold('X',1);hold('W',1);
+        key_report("keyboard off beside controller",CELL_PAD_CTRL_CIRCLE,128,128,128,128);return;
     }
     /* "keyboard": foreign foreground ignores keys and a key held across the
      * focus change stays ignored until released. */
@@ -222,7 +246,10 @@ int main(int argc,char**argv){
     const int is_analog=!strncmp(mode,"analog",6);
     assert(!_putenv_s("PAD_FILE_ANALOG_NONCE",is_analog&&strcmp(mode,"analog-off")?"owned":""));
     if(!strcmp(mode,"no-controller")||!strcmp(mode,"analog-no-controller")){fixture_connected=0;assert(!_putenv_s("PAD_NO_KEYBOARD","1"));}
-    if(is_keyboard){fixture_connected=0;assert(!_putenv_s("PAD_NO_KEYBOARD",!strcmp(mode,"keyboard-off")?"1":""));}
+    if(is_keyboard){fixture_connected=0;assert(!_putenv_s("PAD_NO_KEYBOARD",!strcmp(mode,"keyboard-off")||!strcmp(mode,"keyboard-controller-off")?"1":""));}
+    /* The unfocused-mailbox modes count focus queries; the keyboard (which also
+     * asks, beside a controller) stays out of that count. */
+    if(!strcmp(mode,"legacy")||!strcmp(mode,"zero")||!strcmp(mode,"no-file"))assert(!_putenv_s("PAD_NO_KEYBOARD","1"));
     if(!strcmp(mode,"long-path")){char path[600];memset(path,'x',sizeof(path)-1);path[sizeof(path)-1]=0;assert(!_putenv_s("PAD_FILE",path));}
     assert(cellPadInit(7)==CELL_OK);publish("0x4000 3\n");
     if(is_keyboard){

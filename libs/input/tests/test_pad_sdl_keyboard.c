@@ -2,7 +2,7 @@
  * snapshots through the production publish step and real big-endian
  * cellPadGetData reports. Checks the layout (same as the macOS window pad),
  * both sticks, opposing keys, focus, a dialog owning the keyboard and keys
- * held across it, controller priority, window loss, the headless no-window
+ * held across it, merging into a controller, window loss, the headless no-window
  * case and PAD_NO_KEYBOARD. Mode "sdl" also samples a real SDL window.
  *
  * Build: see tools/test_pad_sdl_keyboard.py. */
@@ -160,9 +160,28 @@ static void test_focus_and_dialog(void)
 
 static void test_controller_and_window_loss(void)
 {
+    /* A controller on port 0 (the double holds B, sticks centred at 127): the
+     * keyboard merges into it. Buttons add; a stick follows its keys while one
+     * is held, even opposing ones; nothing held leaves the controller as is. */
     s_sdl_controllers[0] = (SDL_GameController*)&s_fake_gc; s_attached = 1;
+    publish(1, 1, 0);
+    report("controller alone", CELL_PAD_CTRL_CIRCLE, 127, 127, 127, 127);
     press(SDL_SCANCODE_X, 1);
-    report("physical controller wins port 0", CELL_PAD_CTRL_CIRCLE, 127, 127, 127, 127);
+    report("keyboard button adds to the controller", CELL_PAD_CTRL_CIRCLE | CELL_PAD_CTRL_CROSS, 127, 127, 127, 127);
+    press(SDL_SCANCODE_W, 1);
+    report("held left stick follows the keys", CELL_PAD_CTRL_CIRCLE | CELL_PAD_CTRL_CROSS, 128, 0, 127, 127);
+    press(SDL_SCANCODE_S, 1);
+    report("opposing keys still own the stick", CELL_PAD_CTRL_CIRCLE | CELL_PAD_CTRL_CROSS, 128, 128, 127, 127);
+    press(SDL_SCANCODE_W, 0); press(SDL_SCANCODE_S, 0); press(SDL_SCANCODE_J, 1);
+    report("right stick keys", CELL_PAD_CTRL_CIRCLE | CELL_PAD_CTRL_CROSS, 127, 127, 0, 128);
+    press(SDL_SCANCODE_J, 0);
+    publish(1, 0, 0);
+    report("unfocused keyboard adds nothing", CELL_PAD_CTRL_CIRCLE, 127, 127, 127, 127);
+    publish(1, 1, 0);
+    report("held across focus stays ignored", CELL_PAD_CTRL_CIRCLE, 127, 127, 127, 127);
+    keys[SDL_SCANCODE_X] = 0; publish(1, 1, 0);
+    report("released: the controller exactly", CELL_PAD_CTRL_CIRCLE, 127, 127, 127, 127);
+    press(SDL_SCANCODE_X, 1);
     s_attached = 0;
     report("controller unplugged: keyboard fills the port", CELL_PAD_CTRL_CROSS, 128, 128, 128, 128);
 
@@ -175,7 +194,7 @@ static void test_controller_and_window_loss(void)
     assert(s_host_state[0].buttons == CELL_PAD_CTRL_TRIANGLE);   /* no window: untouched */
     s_host_state[0].buttons = 0;
     memset(keys, 0, sizeof keys);
-    printf("controller priority and window loss\n");
+    printf("merged with a controller, unplugging and window loss\n");
 }
 
 static void test_real_sdl_window(void)
@@ -202,8 +221,11 @@ int main(int argc, char** argv)
     setup();
     if (!strcmp(mode, "off")) {
         setenv("PAD_NO_KEYBOARD", "1", 1);
-        keys[SDL_SCANCODE_X] = 1; publish(1, 1, 0);
+        keys[SDL_SCANCODE_X] = 1; keys[SDL_SCANCODE_W] = 1; publish(1, 1, 0);
         report("PAD_NO_KEYBOARD leaves port 0 alone", 0, 0, 0, 0, 0);
+        s_sdl_controllers[0] = (SDL_GameController*)&s_fake_gc; s_attached = 1;
+        report("PAD_NO_KEYBOARD leaves a controller alone", CELL_PAD_CTRL_CIRCLE, 127, 127, 127, 127);
+        s_attached = 0;
         printf("PAD_NO_KEYBOARD opt-out\n");
     } else if (!strcmp(mode, "sdl")) {
         test_real_sdl_window();
