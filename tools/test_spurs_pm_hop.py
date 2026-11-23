@@ -3,6 +3,8 @@
 
 Default (CI): short chains, SPU-kicked on 1 and 6 lanes and PPU-kicked on 2,
 with and without PS3RECOMP_SPURS_SELF_DISPATCH=1, each of which must complete;
+a two-instance run under PS3_FTRACE whose trace must put the second instance's
+SPU on its own lane (instance index * 8 + SPU number, named by a "# lane" line);
 and a PPU-kicked chain whose requests are stored while the workers sleep,
 which must start each PM well inside the coordinator's 1 ms timed pass (the
 request line's coherence watch wakes it) and, with PS3RECOMP_SPURS_STORE_WAKE=0,
@@ -68,6 +70,33 @@ with tempfile.TemporaryDirectory(prefix='spurs-pm-hop-') as tmp:
                 print(f'coh_versions={coh} self_dispatch={self_dispatch} ' + line[0])
         if args.hops:
             continue
+        # Two instances: the second instance's single SPU must trace on its own lane
+        # (instance index * 8 + SPU number), named by a "# lane" header line, so two
+        # instances' "SPU 0" threads are never summed into one row.
+        trace = Path(tmp) / f'trace-{coh}.txt'
+        result = subprocess.run([str(out), '200', '2', 'spu', 'inst2'], capture_output=True, text=True,
+                                timeout=120, env=dict(coh_env, PS3_FTRACE=f'0:60:{trace}'))
+        line = [l for l in result.stdout.splitlines() if l.startswith('pm_hop')]
+        if result.returncode or not line or ' inst2_hops=50 ' not in line[0]:
+            sys.exit(f'FAIL coh_versions={coh} inst2\n{result.stdout}\n{result.stderr[-2000:]}')
+        print(f'coh_versions={coh} inst2 ' + line[0])
+        lanes, by_wid = {}, {}
+        for l in trace.read_text().splitlines():
+            if l.startswith('# lane '):
+                _, _, lane, text = l.split(' ', 3)
+                lanes[int(lane)] = text
+            elif l[:1].isdigit():
+                k, who, a, b, _, _ = l.split()
+                if int(k) == 4:   # SPU_BUSY: who = lane, b = wid
+                    by_wid.setdefault(int(b, 16), set()).add(int(who))
+        inst_of = {lane: int(text.split()[0].split('=')[1]) for lane, text in lanes.items()}
+        if sorted(lanes) != [0, 1, 8] or [inst_of[l] for l in (0, 1, 8)] != [0, 0, 1] or 'bench2' not in lanes[8]:
+            sys.exit(f'FAIL coh_versions={coh} inst2: lane header lines {lanes} (want lanes 0,1 of instance 0 and lane 8 of instance 1)')
+        if not by_wid.get(0) or not by_wid.get(1) or not by_wid.get(2):
+            sys.exit(f'FAIL coh_versions={coh} inst2: no busy spans for every workload {by_wid}')
+        if by_wid[2] != {8} or not (by_wid[0] | by_wid[1]) <= {0, 1}:
+            sys.exit(f'FAIL coh_versions={coh} inst2: busy spans by workload -> lanes {by_wid} (want wid 2 only on lane 8)')
+        print(f'coh_versions={coh} inst2 lanes {sorted(lanes)}; busy lanes by wid ' + ', '.join(f'{w}:{sorted(v)}' for w, v in sorted(by_wid.items())))
         def measure(store_wake):
             result = subprocess.run([str(out), '300', '2', 'ppu-idle=200~1000'], capture_output=True, text=True,
                                     timeout=120, env=dict(coh_env, PS3RECOMP_SPURS_STORE_WAKE=store_wake))
