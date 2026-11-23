@@ -49,3 +49,28 @@ always answers "no update available" and finishes cleanly. Every call prints a
    one.
 6. The `*Ex` forms (a result structure instead of status/error) are not
    provided; an import of one stays unresolved and halts visibly.
+
+## Other imports on a linked account's online path
+
+A title that signs in with a ticket goes on to calls that were also unhandled.
+They answer as a signed-in account with nothing on it:
+
+- `sceNpManagerGetMyLanguages(langs)`: the same answer as `sceNpGetMyLanguages`
+  (English first). Before NP init: `NOT_INITIALIZED`; null: `INVALID_ARGUMENT`.
+- `sceNpManagerGetAccountRegion(country, language)`: country code "us" (two
+  letters, then a terminating zero and one zero byte of padding), language
+  English (1). Either pointer may be null; both null is `INVALID_ARGUMENT`.
+- `sceNpManagerGetNetworkTime(tick)`: the host's current UTC time as a
+  64-bit count of microseconds since 0001-01-01 00:00:00. Only when the
+  manager reports online (a local ticket or a psnr server); otherwise
+  `OFFLINE`, as a console without a PSN connection has no network clock.
+- `sceNpBasicGetBlockListEntry(index, npid)`: the block list is empty (its count
+  is already 0), so every index is `DATA_NOT_FOUND`; null is `INVALID_ARGUMENT`.
+- `sceNpSignalingAddExtendedHandler(ctx, handler, arg)`: records the handler on
+  an existing context (`CTX_NOT_FOUND` otherwise). No signaling events occur.
+- `sceNpSignalingTerminateConnection(ctx, conn)`: no connection is ever active,
+  so it succeeds on an existing context, `CTX_NOT_FOUND` otherwise.
+- `cellHttpInitCookie(pool, size)` / `cellHttpEndCookie()`: no cookie jar is
+  kept; both succeed once cellHttp is initialised (`NOT_INITIALIZED` before).
+- `cellHttpTransactionAbortConnection(trans)`: the same as aborting the
+  transaction.

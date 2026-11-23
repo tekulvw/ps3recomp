@@ -1000,3 +1000,24 @@ s32 cellHttpAbortTransaction(CellHttpTransId transId)
     printf("[cellHttp] AbortTransaction(trans=%u)\n", transId);
     return CELL_OK;
 }
+
+/* Aborting a transaction's connection is aborting the transaction here. */
+s32 cellHttpTransactionAbortConnection(CellHttpTransId transId)
+{
+    printf("[cellHttp] TransactionAbortConnection(trans=%u)\n", transId);
+    return cellHttpAbortTransaction(transId);
+}
+
+/* No cookie jar is kept, so there is nothing to set up or release. */
+s32 cellHttpInitCookie(void* pool, u32 poolSize)
+{
+    (void)pool;
+    printf("[cellHttp] InitCookie(size=%u) -> no cookie jar\n", poolSize);
+    return s_http_initialized ? CELL_OK : (s32)CELL_HTTP_ERROR_NOT_INITIALIZED;
+}
+
+s32 cellHttpEndCookie(void)
+{
+    printf("[cellHttp] EndCookie()\n");
+    return s_http_initialized ? CELL_OK : (s32)CELL_HTTP_ERROR_NOT_INITIALIZED;
+}
