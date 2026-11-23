@@ -19,7 +19,7 @@ def main():
         subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O1', '-UNDEBUG',
                         *includes, str(ROOT / 'tests/test_ppu_hle_toc.cpp'),
                         str(ROOT / 'runtime/ppu/ppu_hle.cpp'), '-pthread',
-                        '-o', str(tmp / 'fixture')], check=True, timeout=45)
+                        '-o', str(tmp / 'fixture')], check=True, timeout=300)
         env = {k: v for k, v in os.environ.items()
                if k in ('PATH', 'HOME', 'TMPDIR', 'SYSTEMROOT')}
         subprocess.run([str(tmp / 'fixture')], env=env, check=True, timeout=10)

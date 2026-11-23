@@ -31,7 +31,7 @@ static uint8_t stick_axis(uint32_t keys, unsigned short negative, unsigned short
     return direction < 0 ? 0 : direction > 0 ? 255 : 128;
 }
 PS3RecompMacOSPadState ps3recomp_pad_macos_state(void) {
-    PS3RecompMacOSPadState state = {0, 128, 128, 128, 128};
+    PS3RecompMacOSPadState state = {0, 128, 128, 128, 128, 0, 0};
     if (!atomic_load(&s_focused)) return state;
     /* All buttons and both sticks derive from one physical-key snapshot. */
     uint32_t keys = atomic_load(&s_keys);
@@ -41,6 +41,8 @@ PS3RecompMacOSPadState ps3recomp_pad_macos_state(void) {
     state.analog_ly = stick_axis(keys, 13, 1);  /* W / S */
     state.analog_rx = stick_axis(keys, 38, 37); /* J / L */
     state.analog_ry = stick_axis(keys, 34, 40); /* I / K */
+    state.left_stick = (keys & (key_slot(13) | key_slot(1) | key_slot(0) | key_slot(2))) != 0;
+    state.right_stick = (keys & (key_slot(34) | key_slot(40) | key_slot(38) | key_slot(37))) != 0;
     return state;
 }
 uint16_t ps3recomp_pad_macos_buttons(void) {

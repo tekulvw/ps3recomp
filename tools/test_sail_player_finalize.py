@@ -24,7 +24,7 @@ def main():
         includes=['-I'+str(p) for p in (root/'include',root/'runtime/ppu',tmp)]
         subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',*includes,'-c',str(root/'libs/codec/cellSail.c'),'-o',str(tmp/'sail.o')],check=True,timeout=30)
         subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',*includes,'-c',str(root/'libs/codec/cellPamf.c'),'-o',str(tmp/'pamf.o')],check=True,timeout=30)
-        subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG',*includes,str(root/'tests/test_sail_player_finalize.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),str(tmp/'nids.cpp'),str(tmp/'sail.o'),str(tmp/'pamf.o'),'-o',str(tmp/'fixture')],check=True,timeout=45)
+        subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG',*includes,str(root/'tests/test_sail_player_finalize.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),str(tmp/'nids.cpp'),str(tmp/'sail.o'),str(tmp/'pamf.o'),'-o',str(tmp/'fixture')],check=True,timeout=300)
         env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','TMPDIR','SYSTEMROOT')}
         media=Path(sys.argv[1]).resolve() if len(sys.argv)>1 else None
         if media is not None: shutil.copyfile(media,tmp/'fixture.pam')

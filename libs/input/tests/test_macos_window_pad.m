@@ -65,14 +65,16 @@ int main(int argc, char** argv) { @autoreleasepool {
     if (virtual_pad) {
         key(view,NSEventTypeKeyDown,7,0);
         assert(ps3recomp_pad_macos_buttons()==CELL_PAD_CTRL_CROSS);
-        assert(report()==0); /* attached SDL pad has priority */
+        assert(report()==CELL_PAD_CTRL_CROSS); /* the keyboard merges into an attached SDL pad */
         assert(SDL_JoystickSetVirtualButton(virtual_pad,SDL_CONTROLLER_BUTTON_B,1)==0);
-        assert(report()==CELL_PAD_CTRL_CIRCLE);
+        assert(report()==(CELL_PAD_CTRL_CROSS|CELL_PAD_CTRL_CIRCLE));
         assert(SDL_JoystickSetVirtualButton(virtual_pad,SDL_CONTROLLER_BUTTON_B,0)==0);
+        assert(report()==CELL_PAD_CTRL_CROSS);
+        key(view,NSEventTypeKeyUp,7,0);
         assert(report()==0);
         [s_window close]; assert(cellPadEnd()==CELL_OK);
         SDL_JoystickClose(virtual_pad); free(vm_base);
-        puts("SDL controller overrides native keyboard fallback");
+        puts("native keyboard merges into an SDL controller");
         return 0;
     }
     if (argc==2 && !strcmp(argv[1],"disabled")) {

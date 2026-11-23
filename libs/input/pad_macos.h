@@ -6,6 +6,7 @@
 typedef struct {
     uint16_t buttons;
     uint8_t analog_lx, analog_ly, analog_rx, analog_ry;
+    uint8_t left_stick, right_stick;   /* a key of that stick is held */
 } PS3RecompMacOSPadState;
 PS3RecompMacOSPadState ps3recomp_pad_macos_state(void);
 uint16_t ps3recomp_pad_macos_buttons(void);
