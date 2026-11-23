@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile real Windows cellPad focus tests; no desktop, game, or controller."""
+"""Compile real Windows cellPad focus and keyboard tests; no desktop, game, or controller."""
 import os
 from pathlib import Path
 import shutil
@@ -25,7 +25,8 @@ def main():
                        cwd=work, check=True, timeout=60)
         env = {k: v for k, v in os.environ.items() if not k.startswith(('PAD_', 'YDKJ_'))}
         for mode in ('analog-reparse','reparse','analog','analog-no-controller','analog-focus','analog-osk','analog-invalid','analog-locked','analog-mixed','analog-off','analog-no-focus',
-                     'osk-owner','late-unfocused', 'locked-admission', 'focused', 'no-controller', 'blocked-discard', 'long-path', 'legacy', 'zero', 'no-file'):
+                     'osk-owner','late-unfocused', 'locked-admission', 'focused', 'no-controller', 'blocked-discard', 'long-path', 'legacy', 'zero', 'no-file',
+                     'keyboard', 'keyboard-azerty', 'keyboard-controller', 'keyboard-off'):
             subprocess.run([str(binary), mode, str(work/(mode+'.txt'))],
                            cwd=work, env=env, check=True, timeout=10)
     return 0
