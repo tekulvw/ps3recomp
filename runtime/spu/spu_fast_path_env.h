@@ -18,6 +18,7 @@ static const char* const spu_fast_path_env[] = {
     "SPU_CMDDUMP",
     "SPU_CMDHIST",
     "SPU_DBG_MBOX",
+    "SPU_DCACHE_MISS_STATS",
     "SPU_DMACHK",
     "SPU_DMATRACE",
     "SPU_DMATRACE_ALL",
@@ -38,6 +39,7 @@ static const char* const spu_fast_path_env[] = {
     "SPU_DMA_REPEAT_LIMIT",
     "SPU_DMA_REPEAT_LOG",
     "SPU_DMA_REPEAT_SECS",
+    "SPU_DMA_SHAPE_STATS",
     "SPU_DMA_SKIP_DUMP",
     "SPU_DMA_SOURCE_F32BE",
     "SPU_DMA_WATCH",
@@ -82,6 +84,7 @@ static const char* const spu_ib_fast_env[] = {
     "LBP_HLE_JOBDONE",
     "PS3RECOMP_SPURS_PM_RECORD",   /* the policy-run recorder sees every branch */
     "PS3RECOMP_SPURS_PM_STATS",
+    "SPU_DCACHE_MISS_STATS",       /* counts every lookup and its miss reason */
     "SPU_DSPDESC",
     "SPU_DUMP_OVL",
     "SPU_IBCOV",

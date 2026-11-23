@@ -62,7 +62,7 @@ for f in ('spu_dma.h', 'spu_dma_publication_impl.h', 'spu_dma_source_trace.h', '
     read |= set(getenv.findall((spu / f).read_text()))
 channels = (spu / 'spu_channels.c').read_text()
 for fn in ('spu_wrch_full', 'spu_rdch_full', 'spu_rchcnt', 'spu_ls_watch_list',
-           'spu_overlay_note_get', 'spu_lockguard_check'):
+           'spu_overlay_note_get', 'spu_lockguard_check', 'spu_dcache_miss_stats'):
     read |= set(getenv.findall(body(channels, fn)))
 listed = set(re.findall(r'^\s*"([A-Z0-9_]+)",\s*$', (spu / 'spu_fast_path_env.h').read_text(), re.M))
 missing = sorted(read - listed)
