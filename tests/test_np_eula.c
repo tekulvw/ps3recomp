@@ -27,6 +27,7 @@ void cellOskDialog_tick(void){}
 void cellMsgDialog_tick(void){}
 void np_psnr_pump(void){}
 void ps3_np_ticket_tick(void){}
+void cellGameUpdate_tick(void){}
 uint8_t* vm_base;
 void vm_write8(uint64_t a,uint8_t v){(void)a;(void)v;}
 void vm_write32(uint64_t a,uint32_t v){(void)a;(void)v;}

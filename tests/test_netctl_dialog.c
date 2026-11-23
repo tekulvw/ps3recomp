@@ -2,6 +2,7 @@
 #include "../libs/network/cellNetCtl.h"
 #include "../libs/system/cellSysutil.h"
 #include "../runtime/ppu/ppu_memory.h"
+#include "ps3emu/guest_call.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@ void cellSysutilQueueEvent(int slot, u32 status, u32 param) {
     ++events;
 }
 const char* np_psnr_identity(void) { return NULL; }
+ps3_guest_caller_fn g_ps3_guest_caller; /* cellSysutil.c owns it; unused here */
 int main(int argc, char** argv) {
     (void)argv;
     const uint32_t ea=0x100;

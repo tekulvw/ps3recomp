@@ -18,6 +18,8 @@ typedef struct {
     int in_use;
     SceNpSignalingHandler handler;
     void* handlerArg;
+    void* extHandler;      /* guest OPD; recorded, never called (no events) */
+    void* extHandlerArg;
 } SignalingCtx;
 
 static SignalingCtx s_ctx[SCE_NP_SIGNALING_CTX_MAX];
@@ -74,6 +76,17 @@ s32 sceNpSignalingDestroyCtx(SceNpSignalingCtxId ctxId)
     return CELL_OK;
 }
 
+s32 sceNpSignalingAddExtendedHandler(SceNpSignalingCtxId ctxId, void* handler, void* arg)
+{
+    printf("[sceNpSignaling] AddExtendedHandler(%u)\n", ctxId);
+    if (!s_initialized) return (s32)SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED;
+    if (ctxId >= SCE_NP_SIGNALING_CTX_MAX || !s_ctx[ctxId].in_use)
+        return (s32)SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND;
+    s_ctx[ctxId].extHandler = handler;
+    s_ctx[ctxId].extHandlerArg = arg;
+    return CELL_OK;
+}
+
 /* Connection operations — offline stubs */
 
 s32 sceNpSignalingActivateConnection(SceNpSignalingCtxId ctxId,
@@ -83,6 +96,16 @@ s32 sceNpSignalingActivateConnection(SceNpSignalingCtxId ctxId,
     (void)ctxId; (void)peerNpId; (void)connId;
     printf("[sceNpSignaling] ActivateConnection() - offline\n");
     return (s32)SCE_NP_SIGNALING_ERROR_NOT_CONNECTED;
+}
+
+/* No connection is ever activated here, so there is nothing to tear down. */
+s32 sceNpSignalingTerminateConnection(SceNpSignalingCtxId ctxId, SceNpSignalingConnId connId)
+{
+    printf("[sceNpSignaling] TerminateConnection(%u, %u)\n", ctxId, connId);
+    if (!s_initialized) return (s32)SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED;
+    if (ctxId >= SCE_NP_SIGNALING_CTX_MAX || !s_ctx[ctxId].in_use)
+        return (s32)SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND;
+    return CELL_OK;
 }
 
 s32 sceNpSignalingDeactivateConnection(SceNpSignalingCtxId ctxId,

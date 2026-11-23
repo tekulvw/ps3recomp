@@ -23,6 +23,7 @@ int fixture_getaddrinfo(const char*host,const char*service,const struct addrinfo
 void fixture_freeaddrinfo(struct addrinfo*info){assert(info);++free_calls;}
 const char*np_psnr_identity(void){return NULL;}
 void cellSysutilQueueEvent(int slot,u32 status,u32 param){(void)slot;(void)status;(void)param;}
+ps3_guest_caller_fn g_ps3_guest_caller; /* cellSysutil.c owns it; unused here */
 int g_resv_store_active;uint32_t g_ww_lo,g_ww_hi;
 void ppu_resv_break_store(uint64_t ea){(void)ea;}int spu_coh_is_reserved(uint32_t ea){(void)ea;return 0;}
 void spu_lockline_lock(void){}void spu_lockline_unlock(void){}void spu_coh_notify_write(uint32_t ea){(void)ea;}

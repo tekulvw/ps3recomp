@@ -7,6 +7,7 @@
 
 #include "cellNetCtl.h"
 #include "cellSysutil.h"   /* cellSysutilQueueEvent, CELL_SYSUTIL_MAX_CALLBACKS */
+#include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cellGameUpdate answers */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
 #include "ps3emu/endian.h" /* ps3_bswap32 -- CellNetCtlInfo/NatInfo integer fields are guest big-endian */
 #include "np_psnr.h"      /* np_psnr_identity -- the player name the MAC derives from */
@@ -402,4 +403,192 @@ s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
     printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0x%08x\n", dialog_result);
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED);
     return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Game update check (cellGameUpdate*)
+ *
+ * Behaviour is specified in docs/cell-game-update.md. In short: there is no
+ * patch server, so a check always answers "no update" (and Finish answers
+ * "finished"). Answers are recorded here and handed to the title's callback
+ * from its own cellSysutilCheckCallback (cellGameUpdate_tick), never from
+ * inside the call that asked, so a title that arms its wait state after the
+ * call still sees the answer. Term drops answers not yet delivered.
+ * -----------------------------------------------------------------------*/
+
+#ifdef _WIN32
+#include <windows.h>
+static SRWLOCK s_gu_lock = SRWLOCK_INIT;
+#define GU_LOCK()   AcquireSRWLockExclusive(&s_gu_lock)
+#define GU_UNLOCK() ReleaseSRWLockExclusive(&s_gu_lock)
+#else
+#include <pthread.h>
+static pthread_mutex_t s_gu_lock = PTHREAD_MUTEX_INITIALIZER;
+#define GU_LOCK()   pthread_mutex_lock(&s_gu_lock)
+#define GU_UNLOCK() pthread_mutex_unlock(&s_gu_lock)
+#endif
+
+typedef struct {
+    int pending;
+    u32 cb_opd;     /* guest OPD of the title's callback */
+    u32 userdata;   /* guest pointer, passed back untouched */
+    s32 status;     /* CELL_GAMEUPDATE_RESULT_STATUS_* */
+} GameUpdateAnswer;
+
+static int              s_gu_initialized;
+static int              s_gu_delivering;
+static u64              s_gu_generation;   /* bumped by Term */
+static GameUpdateAnswer s_gu_check;        /* answer to a Start */
+static GameUpdateAnswer s_gu_finish;       /* answer to a Finish */
+
+static const char* gu_status_name(s32 status)
+{
+    switch (status) {
+    case CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE: return "NO_UPDATE";
+    case CELL_GAMEUPDATE_RESULT_STATUS_FINISHED:  return "FINISHED";
+    case CELL_GAMEUPDATE_RESULT_STATUS_ABORTED:   return "ABORTED";
+    default:                                      return "?";
+    }
+}
+
+s32 cellGameUpdateInit(void)
+{
+    GU_LOCK();
+    s32 rc = CELL_OK;
+    if (s_gu_initialized) {
+        rc = (s32)CELL_GAMEUPDATE_ERROR_ALREADY_INITIALIZED;
+    } else {
+        s_gu_initialized = 1;
+        memset(&s_gu_check, 0, sizeof(s_gu_check));
+        memset(&s_gu_finish, 0, sizeof(s_gu_finish));
+    }
+    GU_UNLOCK();
+    printf("[cellGameUpdate] Init() -> 0x%08x\n", (u32)rc);
+    return rc;
+}
+
+s32 cellGameUpdateTerm(void)
+{
+    GU_LOCK();
+    s32 rc = CELL_OK;
+    int dropped = 0;
+    if (!s_gu_initialized) {
+        rc = (s32)CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED;
+    } else {
+        dropped = s_gu_check.pending + s_gu_finish.pending;
+        memset(&s_gu_check, 0, sizeof(s_gu_check));
+        memset(&s_gu_finish, 0, sizeof(s_gu_finish));
+        s_gu_initialized = 0;
+        s_gu_delivering = 0;
+        s_gu_generation++;
+    }
+    GU_UNLOCK();
+    printf("[cellGameUpdate] Term() -> 0x%08x (%d undelivered answer(s) dropped)\n",
+           (u32)rc, dropped);
+    return rc;
+}
+
+/* Record one answer for the next sysutil poll. */
+static s32 gu_record(GameUpdateAnswer* slot, CellGameUpdateCallback cb_func,
+                     void* userdata, s32 status)
+{
+    if (!s_gu_initialized) return (s32)CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED;
+    if (!cb_func)          return (s32)CELL_GAMEUPDATE_ERROR_INVALID_ADDR;
+    if (slot->pending)     return (s32)CELL_GAMEUPDATE_ERROR_BUSY;
+    slot->pending  = 1;
+    slot->cb_opd   = (u32)(uintptr_t)cb_func;
+    slot->userdata = (u32)(uintptr_t)userdata;
+    slot->status   = status;
+    return CELL_OK;
+}
+
+static s32 gu_start(const char* what, CellGameUpdateCallback cb_func, void* userdata)
+{
+    GU_LOCK();
+    s32 rc = gu_record(&s_gu_check, cb_func, userdata,
+                       CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE);
+    GU_UNLOCK();
+    printf("[cellGameUpdate] %s(cb=0x%08x, userdata=0x%08x) -> 0x%08x%s\n", what,
+           (u32)(uintptr_t)cb_func, (u32)(uintptr_t)userdata, (u32)rc,
+           rc == CELL_OK ? ", no update (answered at the next sysutil poll)" : "");
+    return rc;
+}
+
+s32 cellGameUpdateCheckStartAsync(const CellGameUpdateParam* param,
+                                  CellGameUpdateCallback cb_func, void* userdata)
+{
+    if (!param) {
+        printf("[cellGameUpdate] CheckStartAsync(param=NULL) -> 0x%08x\n",
+               (u32)CELL_GAMEUPDATE_ERROR_INVALID_ADDR);
+        return (s32)CELL_GAMEUPDATE_ERROR_INVALID_ADDR;
+    }
+    return gu_start("CheckStartAsync", cb_func, userdata);
+}
+
+s32 cellGameUpdateCheckStartWithoutDialogAsync(CellGameUpdateCallback cb_func, void* userdata)
+{
+    return gu_start("CheckStartWithoutDialogAsync", cb_func, userdata);
+}
+
+s32 cellGameUpdateCheckFinishAsync(CellGameUpdateCallback cb_func, void* userdata)
+{
+    GU_LOCK();
+    s32 rc = gu_record(&s_gu_finish, cb_func, userdata,
+                       CELL_GAMEUPDATE_RESULT_STATUS_FINISHED);
+    GU_UNLOCK();
+    printf("[cellGameUpdate] CheckFinishAsync(cb=0x%08x, userdata=0x%08x) -> 0x%08x\n",
+           (u32)(uintptr_t)cb_func, (u32)(uintptr_t)userdata, (u32)rc);
+    return rc;
+}
+
+s32 cellGameUpdateCheckAbort(void)
+{
+    GU_LOCK();
+    s32 rc = CELL_OK;
+    int aborted = 0;
+    if (!s_gu_initialized) {
+        rc = (s32)CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED;
+    } else if (s_gu_check.pending) {
+        s_gu_check.status = CELL_GAMEUPDATE_RESULT_STATUS_ABORTED;
+        aborted = 1;
+    }
+    GU_UNLOCK();
+    printf("[cellGameUpdate] CheckAbort() -> 0x%08x%s\n", (u32)rc,
+           aborted ? ", pending check now answers ABORTED" : "");
+    return rc;
+}
+
+void cellGameUpdate_tick(void)
+{
+    GU_LOCK();
+    ps3_guest_caller_fn caller = g_ps3_guest_caller;
+    if (!caller || s_gu_delivering || (!s_gu_check.pending && !s_gu_finish.pending)) {
+        GU_UNLOCK();
+        return;
+    }
+    /* Take this poll's answers off the record before any guest code runs:
+     * a nested poll cannot repeat them, and a step the callback starts goes
+     * to a later poll. */
+    GameUpdateAnswer batch[2];
+    int n = 0;
+    if (s_gu_check.pending)  { batch[n++] = s_gu_check;  s_gu_check.pending = 0; }
+    if (s_gu_finish.pending) { batch[n++] = s_gu_finish; s_gu_finish.pending = 0; }
+    const u64 generation = s_gu_generation;
+    s_gu_delivering = 1;
+    GU_UNLOCK();
+
+    for (int i = 0; i < n; i++) {
+        GU_LOCK();
+        const int live = generation == s_gu_generation;   /* no Term meanwhile */
+        GU_UNLOCK();
+        if (!live) break;
+        printf("[cellGameUpdate] callback(status=%s(%d), error=0x0) -> cb=0x%08x\n",
+               gu_status_name(batch[i].status), batch[i].status, batch[i].cb_opd);
+        caller(batch[i].cb_opd, (u64)(u32)batch[i].status, 0, batch[i].userdata,
+               0, 0, 0, 0, 0);
+    }
+
+    GU_LOCK();
+    if (generation == s_gu_generation) s_gu_delivering = 0;
+    GU_UNLOCK();
 }
