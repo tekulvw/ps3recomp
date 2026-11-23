@@ -1371,6 +1371,43 @@ SPU_DMA_BODY int mfc_submit_body(mfc_engine* mfc, spu_context* spu, uint32_t cmd
     uint32_t tag  = spu->mfc_tag & 0x1F;
     int rc = 0;
 
+    /* SPU_DMA_SHAPE_STATS=1: this thread's MFC commands by kind (GET, PUT,
+     * other) and form (single or list), single transfers by size, list
+     * transfers by element count. One line per thread every 2^18 commands;
+     * counted per thread so nothing is shared between SPU threads. Says which
+     * transfer shapes a fast path would have to cover. */
+    { static int s_ds = -1;
+      if (s_ds < 0) { const char* e = getenv("SPU_DMA_SHAPE_STATS"); s_ds = e && !strcmp(e, "1"); }
+      if (s_ds) {
+          static SPU_THREAD_LOCAL struct { unsigned long long n, c[3][2][5], bytes[3], next_ms; unsigned id; } t_ds;
+          static unsigned s_ds_threads;
+          const uint32_t fam = cmd & 0xF0u;
+          const int kind = fam == 0x40u ? 0 : fam == 0x20u ? 1 : 2;
+          const int list = kind < 2 && (cmd & 0x04u);
+          const uint32_t q = list ? size / 8u : size;   /* list: elements */
+          const int b = list ? (q <= 1 ? 0 : q <= 4 ? 1 : q <= 16 ? 2 : q <= 64 ? 3 : 4)
+                             : (q <= 16 ? 0 : q <= 128 ? 1 : q <= 1024 ? 2 : q <= 4096 ? 3 : 4);
+          t_ds.c[kind][list][b]++;
+          if (!list) t_ds.bytes[kind] += size;
+          if ((++t_ds.n & 1023u) == 0 && GetTickCount64() >= t_ds.next_ms) {
+              /* Cumulative, at most once a second per thread. */
+              static const char* const kn[3] = { "get", "put", "other" };
+              const unsigned long long now = GetTickCount64();
+              t_ds.next_ms = now + 1000;
+              if (!t_ds.id) t_ds.id = __atomic_add_fetch(&s_ds_threads, 1u, __ATOMIC_RELAXED);
+              fprintf(stderr, "[dma-shape] t_ms=%llu thread=%u cmds=%llu", now, t_ds.id, t_ds.n);
+              for (int k = 0; k < 3; ++k) {
+                  fprintf(stderr, " | %s bytes=%llu single<=16,128,1K,4K,more=%llu,%llu,%llu,%llu,%llu",
+                          kn[k], t_ds.bytes[k], t_ds.c[k][0][0], t_ds.c[k][0][1], t_ds.c[k][0][2],
+                          t_ds.c[k][0][3], t_ds.c[k][0][4]);
+                  if (k < 2)
+                      fprintf(stderr, " list<=1,4,16,64,more=%llu,%llu,%llu,%llu,%llu",
+                              t_ds.c[k][1][0], t_ds.c[k][1][1], t_ds.c[k][1][2], t_ds.c[k][1][3], t_ds.c[k][1][4]);
+              }
+              fprintf(stderr, "\n");
+          }
+      } }
+
     /* SPU_WATCHEA=<hex guest addr>: report every DMA whose destination range
      * covers one word, with the SPU id, its pc and the value the word holds
      * after the transfer.

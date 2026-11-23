@@ -72,7 +72,7 @@ def body(text, name):
 # 1. the diagnostics list
 getenv = re.compile(r'getenv\("([A-Z0-9_]+)"\)')
 read = set()
-for fn in ('spu_indirect_branch', 'spu_lifted_lookup', 'spu_dcache_mode', 'spu_ibhist_note',
+for fn in ('spu_indirect_branch', 'spu_lifted_lookup', 'spu_dcache_miss_stats', 'spu_dcache_mode', 'spu_ibhist_note',
            'spu_verified_leaf_mode', 'spu_overlay_residency_shadow', 'spu_dispatch_kind_on'):
     read |= set(getenv.findall(body(channels, fn)))
 env_h = (spu / 'spu_fast_path_env.h').read_text()
