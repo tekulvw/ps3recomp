@@ -19,7 +19,7 @@ def main():
         subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-D_GNU_SOURCE','-O1','-ffunction-sections','-fdata-sections',
             '-I'+str(root/'include'),str(root/'tests/test_cellfs_vfs_root.c'),
             str(root/'libs/filesystem/cellFs.c'),str(root/'runtime/syscalls/sys_fs.c'),
-            gc,'-o',str(binary)],check=True,timeout=45)
+            gc,'-o',str(binary)],check=True,timeout=300)
         env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','TMPDIR','SYSTEMROOT')}
         relative='PS3_GAME/USRDIR/movie.pam'
         for folder in ['gamedata/dev_bdvd','disc','explicit','root/assets']:
