@@ -107,11 +107,6 @@ MUTANTS = {
 }
 
 
-# Breaks whose effect depends on a race (here: whether the run that published
-# in its exit window ends through the claim path or a kernel-requested stop),
-# so the mutant check tries a few runs.
-RACY = ('verify-skipped',)
-
 # Breaks of the native run the shadow comparison must report as mismatches.
 SHADOW_SEES = ('list-copy-missing', 'flag-poll-write-dropped', 'M4-reservation-loss-ignored', 'retire-drops-held-job', 'decrement-skipped', 'wake-skipped',
                'M8-userdata-at-portion', 'module-never-reloaded', 'tags-kept-across-jobs', 'finish-claims-nothing',
@@ -289,14 +284,10 @@ def main() -> int:
                 except subprocess.SubprocessError:   # refused at compile time (a static assertion)
                     print(f'[PASS] mutant {name} caught (does not compile)')
                     continue
-                caught = False
-                for _ in range(4 if name in RACY else 1):   # a racy break shows only on some runs
-                    try:
-                        caught = bool(check(binary))
-                    except (AssertionError, subprocess.SubprocessError):
-                        caught = True
-                    if caught:
-                        break
+                try:
+                    caught = bool(check(binary))
+                except (AssertionError, subprocess.SubprocessError):
+                    caught = True
                 print(f"[{'PASS' if caught else 'FAIL'}] mutant {name} {'caught' if caught else 'NOT caught'}")
                 if not caught:
                     bad.append(name)
