@@ -60,7 +60,8 @@ PS3RecompSDLKeyboardPadState ps3recomp_pad_sdl_keyboard_state(void)
     /* One snapshot for buttons and sticks. */
     PadKeyboardReport report = pad_keyboard_report(atomic_load(&s_keys));
     PS3RecompSDLKeyboardPadState state = {report.buttons, report.analog_lx, report.analog_ly,
-                                          report.analog_rx, report.analog_ry, 0};
+                                          report.analog_rx, report.analog_ry, 0,
+                                          report.left_held, report.right_held};
     state.window = (uint8_t)atomic_load(&s_window);
     return state;
 }
