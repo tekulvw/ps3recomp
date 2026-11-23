@@ -152,10 +152,12 @@ jobs:
       # ISA level a build can select; the AVX-512 level runs where the runner has it.
       - name: Run the SPU x86 float helper tests
         run: |
-          for isa in -msse4.1 -march=x86-64-v3 -march=x86-64-v4; do
-            if [ "$isa" = -march=x86-64-v3 ] && ! grep -q avx2 /proc/cpuinfo; then echo "no AVX2: $isa skipped"; continue; fi
-            if [ "$isa" = -march=x86-64-v4 ] && ! grep -q avx512bw /proc/cpuinfo; then echo "no AVX-512: $isa skipped"; continue; fi
-            for t in test_spu_float_convert test_spu_float_exact; do
+          # The last two levels add the opt-in SPU_FLOAT_X86_RZ switch: on v3 it must leave the exact
+          # AVX2 form in place, on v4 it selects the AVX-512 embedded-rounding form.
+          for isa in -msse4.1 -march=x86-64-v3 -march=x86-64-v4 "-march=x86-64-v3 -DSPU_FLOAT_X86_RZ=1 -DSPU_EXPECT_X86_RZ=0" "-march=x86-64-v4 -DSPU_FLOAT_X86_RZ=1 -DSPU_EXPECT_X86_RZ=1"; do
+            case "$isa" in -march=x86-64-v3*) if ! grep -q avx2 /proc/cpuinfo; then echo "no AVX2: $isa skipped"; continue; fi;; esac
+            case "$isa" in -march=x86-64-v4*) if ! grep -q avx512bw /proc/cpuinfo; then echo "no AVX-512: $isa skipped"; continue; fi;; esac
+            for t in test_spu_float_convert test_spu_float_exact test_spu_float_avx512; do
               ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
                 -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off $isa -I include -I runtime/spu \
                 -o /tmp/$t runtime/spu/tests/$t.c -lm
@@ -374,6 +376,33 @@ jobs:
           # walk they are now computed without.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
           /tmp/test_vertex_fetch_plan
+          # PS3RECOMP_RSX_VERTEX_SIMD: the vector decode against the scalar
+          # loop, bit for bit, and its mutants.
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_vertex_fetch_simd.py --mutants
+          # The dispatcher's plain-register mirror against rsx_dispatch_method for
+          # every register index and state, and its mutants: the draw engine skips
+          # the call for a plain register, so a case added to the dispatcher
+          # without a line in the mirror must fail here.
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_rsx_dispatch_plain.py --mutants
+          # The native WWS job manager's pure core: the specification's vectors,
+          # generated cases and the mutants each must fail.
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_wwsjm_core.py --mutants
+          # The native WWS job manager's run loop on the real scheduler (five lanes,
+          # gates, a wake, an array switch, lost reservations), its shadow
+          # comparison, and the run-loop mutants each must fail.
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_wwsjm_run.py --mutants
+          # PS3RECOMP_RSX_PIPELINE_REUSE: off/on/verify equivalence, the register-class
+          # table against its reference logic, and its mutants.
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_engine_pipeline_reuse.py --mutants
+          # PS3RECOMP_SPURS_PM_RECORD / _STATS: the policy-run recorder is inert when
+          # unset, observes without effect, decodes to the performed events, and its
+          # mutants (dropped PUTLLC outcome, armed while unset, lost service return,
+          # wrong nested drain target) fail.
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_spurs_pm_record.py --mutants
+          # PS3RECOMP_SPURS_NATIVE_PM: the native policy-module seam is inert when unset
+          # (byte-identical runs and recordings), gated by fingerprint and SHA-256, and
+          # its service window holds its contract; its mutants must fail.
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_spurs_native_pm.py --mutants
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_fifo_busy.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread
           /tmp/test_color_feedback_engine
           # The texture cache's content hash: sensitivity, the cache, its speed.

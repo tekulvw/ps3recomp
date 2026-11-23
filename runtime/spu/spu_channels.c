@@ -31,6 +31,8 @@
 #include "spu_verified_overlay.h"
 #include "spu_overlay_residency.h"
 #include "spu_native_service.h"
+#include "spurs_pm_observer.h"
+#include "spurs_native_pm.h"
 #include <stdint.h>
 #include <errno.h>
 #include <stdatomic.h>
@@ -1235,7 +1237,20 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);
+/* Three writes in four only latch an MFC parameter. The compact form answers
+ * them here, ahead of the full entry's frame; the full form keeps its own
+ * latch cases behind the channel histogram so SPU_CHHIST still counts them. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    /* One load and one predicted branch when the compact form is off: the
+     * switch is resolved by spu_context_init, and an unresolved -1 can only
+     * mean the full form here. */
+    if (g_spu_dispatch_gates.fast_path > 0 && spu_mfc_latch_write(ctx, channel, value))
+        return;
+    spu_wrch_full(ctx, channel, value);
+}
+static SPU_DMA_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
@@ -1250,29 +1265,26 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
     /* The MFC parameter channels and the tag mask only latch a value in the
-     * context (as mfc_channel_write does); nothing reads the engine for them.
-     * A DMA writes five or six of these per command, so they skip the engine
-     * lookup and the command path. */
-    switch (channel) {
-    case MFC_LSA:       ctx->mfc_lsa = v;          return;
-    case MFC_EAH:       ctx->mfc_eah = v;          return;
-    case MFC_EAL:       ctx->mfc_eal = v;          return;
-    case MFC_Size:      ctx->mfc_size = v;         return;
-    case MFC_TagID:     ctx->mfc_tag = v & 0x1F;   return;
-    case MFC_WrTagMask: ctx->mfc_tag_mask = v;     return;
-    default: break;
-    }
+     * context (spu_channel_inline.h, as mfc_channel_write does); nothing reads
+     * the engine for them. A DMA writes five or six of these per command, so
+     * they skip the engine lookup and the command path. */
+    if (spu_mfc_latch_write(ctx, channel, value))
+        return;
 
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
         if (channel == MFC_Cmd) {
             const int jobio = ps3_jobio_is(ctx) && (v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD);
+            /* Opt-in policy-run recorder (spurs_pm_observer.h); NULL otherwise. */
+            const struct spurs_pm_observer* const pm_observer = spu_pm_extras_on() &&
+                (v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD || v == MFC_PUTLLUC_CMD || v == MFC_PUTQLLUC_CMD)
+                ? ctx->pm_observer : NULL;
             const uint32_t jobio_ea = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1), jobio_lsa = ctx->mfc_lsa & SPU_LS_MASK;
             /* A conditional store is recorded with its source line before the
              * operation, and with the outcome afterwards. */
             uint8_t jobio_line[MFC_ATOMIC_LINE];
-            if (jobio && v != MFC_GETLLAR_CMD) memcpy(jobio_line, &ctx->ls[jobio_lsa], MFC_ATOMIC_LINE);
+            if ((jobio || pm_observer) && v != MFC_GETLLAR_CMD) memcpy(jobio_line, &ctx->ls[jobio_lsa], MFC_ATOMIC_LINE);
             if (spu_mfc_atomic(ctx, v)) {
                 if (jobio) {
                     if (v == MFC_GETLLAR_CMD)
@@ -1280,6 +1292,10 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                     else
                         ps3_jobio_event(ctx, v == MFC_PUTLLC_CMD ? PS3_JOBIO_PUTLLC : PS3_JOBIO_PUTLLUC, v, jobio_lsa, jobio_ea, MFC_ATOMIC_LINE, jobio_line, (uint32_t)ctx->atomic_stat);
                 }
+                if (pm_observer)
+                    pm_observer->atomic(ctx, v, jobio_lsa, jobio_ea,
+                                        v == MFC_GETLLAR_CMD ? &ctx->ls[jobio_lsa] : jobio_line,
+                                        (uint32_t)ctx->atomic_stat);
                 return;
             }
         }
@@ -1528,7 +1544,20 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
+static SPU_DMA_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel);
+/* The MFC status reads and the machine-status read are latched context state
+ * and never block; the compact form returns them ahead of the full entry. */
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
+{
+    if (g_spu_dispatch_gates.fast_path > 0) {
+        if (channel_is_mfc(channel))
+            return spu_make_preferred_u32(mfc_channel_read(NULL, ctx, channel));
+        if (channel == SPU_RdMachStat)
+            return spu_make_preferred_u32(ctx->int_enable & 1u);
+    }
+    return spu_rdch_full(ctx, channel);
+}
+static SPU_DMA_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel)
 {
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
@@ -2153,7 +2182,20 @@ static int spu_verified_cover_any(uint32_t lsa, uint32_t size)
     if (!size || lsa >= SPU_LS_SIZE) return 0;
     uint32_t last = lsa + size - 1u;
     if (last >= SPU_LS_SIZE) last = SPU_LS_SIZE - 1u;
-    for (uint32_t b = lsa >> SPU_VERIFIED_COVER_SHIFT; b <= last >> SPU_VERIFIED_COVER_SHIFT; ++b)
+    const uint32_t b0 = lsa >> SPU_VERIFIED_COVER_SHIFT, b1 = last >> SPU_VERIFIED_COVER_SHIFT;
+    if (spu_fast_path_on()) {
+        /* The same test a byte at a time: a 16 KiB transfer covers 128 bits
+         * of the map, sixteen bytes, instead of 128 single-bit probes. */
+        for (uint32_t i = b0 >> 3; i <= b1 >> 3; ++i) {
+            uint8_t m = __atomic_load_n(&s_verified_cover[i], __ATOMIC_RELAXED);
+            if (!m) continue;
+            if (i == b0 >> 3) m &= (uint8_t)(0xFFu << (b0 & 7u));
+            if (i == b1 >> 3) m &= (uint8_t)(0xFFu >> (7u - (b1 & 7u)));
+            if (m) return 1;
+        }
+        return 0;
+    }
+    for (uint32_t b = b0; b <= b1; ++b)
         if ((__atomic_load_n(&s_verified_cover[b >> 3], __ATOMIC_RELAXED) >> (b & 7u)) & 1u) return 1;
     return 0;
 }
@@ -2748,6 +2790,21 @@ static void spu_overlay_residency_print(void)
             atomic_load(&s_ovl_res_refused), atomic_load(&s_ovl_res_shadow),
             atomic_load(&s_ovl_res_shadow_bad));
 }
+/* The residency counters are only ever printed by the statistics (and the
+ * shadow check reports through them), so they are kept only while either is
+ * on: incremented on every residency dispatch by every SPU thread, they kept
+ * a cache line moving between cores that the dispatch path reads
+ * (spu_context.h, spu_dispatch_gates). */
+static int spu_overlay_residency_counting(void)
+{
+    int c = g_spu_dispatch_gates.ovl_stats;
+    if (c < 0) {
+        c = spu_overlay_residency_option("SPU_OVERLAY_RESIDENCY_STATS") ||
+            spu_overlay_residency_option("SPU_OVERLAY_RESIDENCY_SHADOW");
+        g_spu_dispatch_gates.ovl_stats = c;
+    }
+    return c;
+}
 static void spu_overlay_residency_stats(void)
 {
     static int on = -1;
@@ -2789,12 +2846,13 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
 {
     int* state = &ctx->resident_code[slot].verify_state;
     const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
+    const int counting = spu_overlay_residency_counting();
     if (*state == SPU_OVERLAY_PENDING) {
-        atomic_fetch_add_explicit(&s_ovl_res_checks, 1, memory_order_relaxed);
+        if (counting) atomic_fetch_add_explicit(&s_ovl_res_checks, 1, memory_order_relaxed);
         *state = spu_overlay_code_matches(ctx, o) ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
         if (*state == SPU_OVERLAY_VERIFIED && PS3_FT_ON())
             spu_ft_job_begin(ctx, ctx->resident_code[slot].image_id);
-        if (*state == SPU_OVERLAY_REJECTED)
+        if (*state == SPU_OVERLAY_REJECTED && counting)
             atomic_fetch_add_explicit(&s_ovl_res_rejects, 1, memory_order_relaxed);
     } else if (*state == SPU_OVERLAY_VERIFIED && spu_overlay_residency_shadow()) {
         atomic_fetch_add_explicit(&s_ovl_res_shadow, 1, memory_order_relaxed);
@@ -2804,7 +2862,7 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
         }
     }
     const int ok = *state == SPU_OVERLAY_VERIFIED;
-    atomic_fetch_add_explicit(ok ? &s_ovl_res_dispatches : &s_ovl_res_refused, 1, memory_order_relaxed);
+    if (counting) atomic_fetch_add_explicit(ok ? &s_ovl_res_dispatches : &s_ovl_res_refused, 1, memory_order_relaxed);
     spu_overlay_residency_stats();
     return ok;
 }
@@ -2821,6 +2879,7 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
         s_stack_reset[n].entry = entry & SPU_LS_MASK;
         s_stack_reset[n].image_id = image_id;
         __atomic_store_n(&g_spu_stack_reset_count,n+1,__ATOMIC_RELEASE);
+        __atomic_store_n(&g_spu_dispatch_gates.stack_reset_count,n+1,__ATOMIC_RELEASE);
     }
 }
 
@@ -2999,6 +3058,7 @@ typedef struct {
 } spu_dcache_ent;
 typedef struct {
     uint32_t vepoch[SPU_VERIFIED_IMAGES];
+    uint32_t vtotal;   /* bumped with any vepoch: the short dispatch entry's one epoch */
     spu_dcache_ent ent[512];
     /* SPU_DCACHE_MISS_STATS=1: this thread's lookups and misses by reason. */
     unsigned long long st_hits, st_miss[8], st_next_ms; unsigned st_thread;
@@ -3021,6 +3081,8 @@ static atomic_ullong s_dcache_hits, s_dcache_misses, s_dcache_shadow_bad;
 static uint32_t s_dcache_next_id;
 static int spu_dcache_mode(void)
 {
+    const int g = g_spu_dispatch_gates.dcache_mode;
+    if (g >= 0) return g;
     static atomic_int mode;
     int m = atomic_load_explicit(&mode, memory_order_relaxed);
     if (!m) {
@@ -3028,6 +3090,7 @@ static int spu_dcache_mode(void)
         m = !e ? 1 : !strcmp(e, "1") ? 2 : !strcmp(e, "shadow") ? 3 : 1;
         atomic_store_explicit(&mode, m, memory_order_relaxed);
     }
+    g_spu_dispatch_gates.dcache_mode = m - 1;
     return m - 1;   /* 0 off, 1 on, 2 shadow */
 }
 static void spu_dcache_note_get(uint32_t lsa, uint32_t size)
@@ -3041,6 +3104,7 @@ static void spu_dcache_note_get(uint32_t lsa, uint32_t size)
         for (unsigned j = 0; j < v->count; ++j)
             if (lsa < v->segments[j].lsa + v->segments[j].size && lsa + size > v->segments[j].lsa) {
                 t->vepoch[i]++;
+                t->vtotal++;
                 break;
             }
     }
@@ -3179,6 +3243,90 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     return fn;
 }
 
+/* ---- Short dispatch entry (PS3RECOMP_SPU_IB_FAST=1, opt-in) ---------------
+ * spu_indirect_branch runs, on every computed branch, call or return it is
+ * handed: the interrupt-restore test, the policy-module service addresses,
+ * the taskset residency rules, the dispatch cache's hash into its 512-entry
+ * table and twelve-field compare, and the diagnostics after the lookup. A
+ * title's job manager and its jobs cross that entry several times per job,
+ * mostly to the same few targets. With the switch on, a dispatch that the
+ * full entry answered plainly -- the resolver's own function, none of the
+ * special cases -- is remembered in a small per-thread table keyed by
+ * everything the full entry reads before it calls that function, and the
+ * next dispatch of the same target under the same key calls it directly.
+ *
+ * The key is the dispatch cache's key (spu_lifted_lookup) with one change:
+ * the per-image byte epochs are replaced by their running total, so a GET
+ * into any verified image's code drops every entry on the thread instead of
+ * the entries whose target that image covers. A hit therefore never
+ * outlives a dispatch-cache hit for the same target. Beyond the cache's
+ * key, the short entry is taken only when the full entry's other branches
+ * cannot apply: no interrupt register file is saved on the context, no
+ * taskset task entries or ELFs are registered (those rules read local store
+ * on every dispatch), and the target is none of the reserved service
+ * addresses. Targets the full entry resolved through a fallback (an overlay
+ * signature match, a kernel/job-manager special case) are not recorded.
+ *
+ * Diagnostics the short entry does not run keep the full entry: the switch
+ * is ignored while any name in spu_ib_fast_env is set (spu_context.h). */
+enum { SPU_IBF_ENTRIES = 128 };
+typedef struct {
+    spu_lifted_fn fn;
+    uint32_t lsa, id;
+    int image, ovl, task;
+    uint32_t flags, rgen, vgen, vreg, residency, vtotal;
+} spu_ibf_ent;
+static SPU_TLS spu_ibf_ent t_ibf[SPU_IBF_ENTRIES];
+static inline int spu_ib_fast_on(void) { return g_spu_dispatch_gates.ib_fast > 0; }
+static inline uint32_t spu_ibf_flags(const spu_context* ctx)
+{
+    return (ctx->policy_mode ? 1u : 0u) | (ctx->ls != ctx->ls_store ? 2u : 0u);
+}
+/* The full entry's branches the short entry cannot take are closed. */
+static inline int spu_ibf_armed(const spu_context* ctx)
+{
+    return !ctx->irq_saved && !s_task_entry_count && !s_task_elf_count;
+}
+static inline spu_ibf_ent* spu_ibf_slot(uint32_t pc)
+{
+    return &t_ibf[(pc >> 2) & (SPU_IBF_ENTRIES - 1)];
+}
+/* The entry answers this dispatch: same target, same context lifetime, and
+ * every input of the full entry unchanged since the entry was recorded. */
+static inline int spu_ibf_hit(const spu_ibf_ent* e, const spu_context* ctx)
+{
+    return e->fn && e->lsa == ctx->pc && ctx->dcache_id && e->id == ctx->dcache_id &&
+        e->image == ctx->image_id && e->ovl == ctx->resident_ovl && e->task == ctx->resident_task &&
+        e->flags == spu_ibf_flags(ctx) && e->residency == ctx->dcache_residency &&
+        e->vtotal == t_dcache.vtotal &&
+        e->rgen == __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE) &&
+        e->vgen == __atomic_load_n(&s_verified_count, __ATOMIC_ACQUIRE) &&
+        e->vreg == __atomic_load_n(&s_verified_generation, __ATOMIC_ACQUIRE);
+}
+/* The reserved addresses the full entry services itself (policy-module
+ * kernel services, the taskset syscall, the planted job return). */
+static inline int spu_ibf_reserved(uint32_t pc)
+{
+    return pc == SPURS_PM_EXIT_TO_KERNEL_LS || pc == SPURS_PM_SELECT_WORKLOAD_LS ||
+           pc == SPURS_TASKSET_PM_SYSCALL_LS || pc == SPU_JOB_RETURN_LS;
+}
+/* Record a plain resolution. rgen/vgen/vreg were read before the resolver
+ * ran (an entry is never keyed by a count newer than the registry it saw);
+ * the residency and byte epochs are read after it, as the dispatch cache
+ * does, since the resolver may itself verify a pending resident slot. */
+static void spu_ibf_store(const spu_context* ctx, spu_lifted_fn fn, uint32_t pc,
+                          uint32_t rgen, uint32_t vgen, uint32_t vreg)
+{
+    if (!fn || !ctx->dcache_id || ctx->pc != pc || (vreg & 1u) || spu_ibf_reserved(pc) ||
+        __atomic_load_n(&s_verified_generation, __ATOMIC_ACQUIRE) != vreg)
+        return;
+    spu_ibf_ent* e = spu_ibf_slot(pc);
+    e->fn = fn; e->lsa = pc; e->id = ctx->dcache_id;
+    e->image = ctx->image_id; e->ovl = ctx->resident_ovl; e->task = ctx->resident_task;
+    e->flags = spu_ibf_flags(ctx); e->rgen = rgen; e->vgen = vgen; e->vreg = vreg;
+    e->residency = ctx->dcache_residency; e->vtotal = t_dcache.vtotal;
+}
+
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
@@ -3234,7 +3382,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].source_ea = ea;
                     ctx->resident_code[slot].image_id = o->image_id;
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
-                    if (o->code) atomic_fetch_add_explicit(&s_ovl_res_loads, 1, memory_order_relaxed);
+                    if (o->code && spu_overlay_residency_counting())
+                        atomic_fetch_add_explicit(&s_ovl_res_loads, 1, memory_order_relaxed);
                     ctx->resident_code[slot].source_index = i;
                     spu_dcache_residency_changed(ctx);
                     return;
@@ -3955,6 +4104,77 @@ static int spu_ib_diagnostics_armed(void)
     return value;
 }
 
+/* A branch into the native-service window during a native policy run: call
+ * the slot's host service; it reads r3..r6 and writes r3. Unless it says it
+ * placed pc itself, return to the r0 link exactly as `bi $r0` does (a host
+ * return while the caller's bracket is live, else a dispatch to the link).
+ * The job-return slot is normally reached by host return into the job's entry
+ * bracket; a branch to it here comes from a frame deeper than that bracket and
+ * ends the job by unwinding to it (spurs_native_pm_job_return_far). Outside a
+ * job, and for an empty slot or the middle of a slot, the branch is
+ * unsupported and stops the process. */
+static __attribute__((noinline, cold)) void spurs_native_window(spu_context* ctx)
+{
+    const uint32_t pc = ctx->pc & SPU_LS_MASK, off = pc - SPURS_NATIVE_PM_WINDOW_LS;
+    const unsigned slot = off / SPURS_NATIVE_PM_SLOT_BYTES;
+    spurs_native_service_fn fn = (off % SPURS_NATIVE_PM_SLOT_BYTES) == 0 && slot < SPURS_NATIVE_PM_SLOTS - 1
+                                 ? ctx->native_services->slot[slot] : NULL;
+    if (!fn && pc == SPURS_NATIVE_PM_JOB_RETURN_LS) {
+        /* the job returned with `bi $r0` from a frame deeper than its entry
+         * bracket: end it there (does not return while a job is active) */
+        extern void spurs_native_pm_job_return_far(spu_context*);
+        spurs_native_pm_job_return_far(ctx);
+    }
+    if (!fn) {
+        fprintf(stderr, "[spurs-native-pm] unsupported branch to LS 0x%05X (window slot %u%s) lr=0x%05X r3=0x%08X: "
+                "no native service there; stopping\n", pc, slot,
+                pc == SPURS_NATIVE_PM_JOB_RETURN_LS ? ", the job-return slot outside a job" : "",
+                ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0]);
+        fflush(stderr);
+        _Exit(SPURS_NATIVE_PM_FATAL_EXIT);
+    }
+    if (fn(ctx) == SPURS_NATIVE_SERVICE_RETURN) {
+        ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+        if (ctx->host_depth == 0) g_spu_trampoline_fn = spu_indirect_branch;
+    }
+}
+
+/* cellSpursModulePoll as the HLE kernel answers it (spu_context.h). Inlined
+ * into the resolver's intercept; spurs_kernel_select_workload is the same body
+ * for other callers. */
+static inline void spurs_kernel_select_workload_body(spu_context* ctx)
+{
+    extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
+    /* cellSpursModulePoll: report "no contention — keep running".
+     * (The host scheduler admits bounded workers; this service does not preempt.) */
+    unsigned n = ++g_spurs_pm_polls;
+    /* The poll count restarts with every policy-module run, which is
+     * thousands of runs a second: limit the log by process, not run. */
+    static atomic_uint s_poll_logs;
+    if ((n <= 4 || (n % 4096) == 0) &&
+        atomic_fetch_add_explicit(&s_poll_logs, 1, memory_order_relaxed) < 64)
+        fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+                n, ctx->gpr[3]._u32[0]);
+    /* The kernel ABI returns {selected wid, poll reason} in the
+     * preferred doubleword. Keep this runtime's current workload;
+     * returning all zero falsely requests a switch for every wid>0.
+     * Only its registered receiver may consume a pending flag. */
+    uint32_t ea_hi = spu_ls_read32(ctx, 0x1C0);
+    uint32_t ea = spu_ls_read32(ctx, 0x1C4);
+    uint32_t wid = spu_ls_read32(ctx, 0x1DC);
+    uint32_t status = ea_hi ? 0 : spurs_flag_status(ea, wid, 1);
+    /* A scheduler may name another workload this SPU should switch
+     * to (g_spurs_module_poll_hook); by default it never does. */
+    uint32_t selected = wid;
+    if (g_spurs_module_poll_hook && !ea_hi)
+        selected = g_spurs_module_poll_hook(ea, wid, spu_ls_read32(ctx, 0x1C8));
+    ctx->gpr[3] = spu_make_preferred_u32(selected);
+    ctx->gpr[3]._u32[1] = status;
+    /* Opt-in policy-run recorder: every caller's poll, with its answer. */
+    if (spu_pm_extras_on() && ctx->pm_observer) ctx->pm_observer->kernel(ctx, SPURS_PM_KERNEL_SELECT);
+}
+void spurs_kernel_select_workload(spu_context* ctx) { spurs_kernel_select_workload_body(ctx); }
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -3963,6 +4183,25 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    /* PS3RECOMP_SPU_IB_FAST=1: a target this thread resolved plainly under
+     * the same key is called here (spu_ibf_store, above). */
+    const int ibf = spu_ib_fast_on() && spu_ibf_armed(ctx);
+    if (ibf) {
+        const spu_ibf_ent* e = spu_ibf_slot(ctx->pc);
+        if (spu_ibf_hit(e, ctx)) {
+            spu_check_stack_reset(ctx, e->fn);
+#if defined(__clang__)
+            __attribute__((musttail)) return e->fn(ctx);
+#else
+            e->fn(ctx);
+            return;
+#endif
+        }
+    }
+    const uint32_t ibf_pc = ctx->pc;
+    const uint32_t ibf_rgen = ibf ? __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE) : 0;
+    const uint32_t ibf_vreg = ibf ? __atomic_load_n(&s_verified_generation, __ATOMIC_ACQUIRE) : 0;
+    const uint32_t ibf_vgen = ibf ? __atomic_load_n(&s_verified_count, __ATOMIC_ACQUIRE) : 0;
     spu_ibhist_note(ctx);
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
@@ -3980,46 +4219,39 @@ void spu_indirect_branch(spu_context* ctx)
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
-        extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
+        extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited;
+        /* Opt-in policy extras, all behind one test of the gate line: the
+         * policy-run recorder (spurs_pm_observer.h) and the native-service
+         * window (spurs_native_pm.h, only while a native run installed its
+         * table). */
+        const struct spurs_pm_observer* pm_observer = NULL;
+        if (spu_pm_extras_on()) {
+            pm_observer = ctx->pm_observer;
+            if (pm_observer && pm_observer->branch(ctx))
+                return;
+            if (ctx->native_services &&
+                ctx->pc - SPURS_NATIVE_PM_WINDOW_LS < SPURS_NATIVE_PM_WINDOW_END - SPURS_NATIVE_PM_WINDOW_LS) {
+                spurs_native_window(ctx);
+                return;
+            }
+        }
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
              * Print gated: fires once per policy run = thousands/sec. */
             g_spurs_pm_exited = 1;
             { static SPU_THREAD_LOCAL int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
-              if (s_t) { static SPU_THREAD_LOCAL unsigned long _n = 0; unsigned long n = ++_n;
+              if (s_t) { extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
+                static SPU_THREAD_LOCAL unsigned long _n = 0; unsigned long n = ++_n;
                 if (n <= 64 || (n & 0xFFF) == 0)
                     fprintf(stderr, "[spurs-pm] exit-to-kernel#%lu (r3=0x%08X polls=%u)\n",
                             n, ctx->gpr[3]._u32[0], g_spurs_pm_polls); } }
+            if (pm_observer) pm_observer->kernel(ctx, SPURS_PM_KERNEL_EXIT);
             ctx->status = SPU_STATUS_STOPPED_BY_STOP;
             spu_halt(ctx);
             return;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            /* cellSpursModulePoll: report "no contention — keep running".
-             * (The host scheduler admits bounded workers; this service does not preempt.) */
-            unsigned n = ++g_spurs_pm_polls;
-            /* The poll count restarts with every policy-module run, which is
-             * thousands of runs a second: limit the log by process, not run. */
-            static atomic_uint s_poll_logs;
-            if ((n <= 4 || (n % 4096) == 0) &&
-                atomic_fetch_add_explicit(&s_poll_logs, 1, memory_order_relaxed) < 64)
-                fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
-                        n, ctx->gpr[3]._u32[0]);
-            /* The kernel ABI returns {selected wid, poll reason} in the
-             * preferred doubleword. Keep this runtime's current workload;
-             * returning all zero falsely requests a switch for every wid>0.
-             * Only its registered receiver may consume a pending flag. */
-            uint32_t ea_hi = spu_ls_read32(ctx, 0x1C0);
-            uint32_t ea = spu_ls_read32(ctx, 0x1C4);
-            uint32_t wid = spu_ls_read32(ctx, 0x1DC);
-            uint32_t status = ea_hi ? 0 : spurs_flag_status(ea, wid, 1);
-            /* A scheduler may name another workload this SPU should switch
-             * to (g_spurs_module_poll_hook); by default it never does. */
-            uint32_t selected = wid;
-            if (g_spurs_module_poll_hook && !ea_hi)
-                selected = g_spurs_module_poll_hook(ea, wid, spu_ls_read32(ctx, 0x1C8));
-            ctx->gpr[3] = spu_make_preferred_u32(selected);
-            ctx->gpr[3]._u32[1] = status;
+            spurs_kernel_select_workload_body(ctx);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }
@@ -4143,6 +4375,7 @@ void spu_indirect_branch(spu_context* ctx)
     }
     /* Use the same ownership order as the interpreter's rejoin probe. */
     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
+    const spu_fn ibf_plain = fn;   /* the short entry records only this answer */
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
@@ -4425,6 +4658,7 @@ void spu_indirect_branch(spu_context* ctx)
                   s_dumped = 1; } } }
     }
     if (fn) {
+        if (ibf && fn == ibf_plain) spu_ibf_store(ctx, fn, ibf_pc, ibf_rgen, ibf_vgen, ibf_vreg);
         spu_check_stack_reset(ctx, fn);
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
          * Bink decoder's per-command dispatch does) must not grow the host

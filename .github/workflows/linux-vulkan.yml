@@ -109,3 +109,18 @@ jobs:
             fi
           done
           exit $fail
+
+      # The batched engine fixture (tools/test_vulkan_batched_engine.py): one
+      # synthetic operation stream recorded per operation, batched, with
+      # merged passes, with reused descriptor sets, and through a saved
+      # pipeline cache must read back identical bytes, every run clean under
+      # the validation layer with synchronization validation. It builds its
+      # own fixture binary with pkg-config (vulkan, sdl2) and glslang, all
+      # installed above; linux.yml's unit-test loop skips it because it needs
+      # a Vulkan device, which lavapipe provides here.
+      - name: Batched engine readback fixture, under the validation layer
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang CXX=clang++; else export CC=gcc CXX=g++; fi
+          python3 tools/test_vulkan_batched_engine.py --draws 600 2>&1 | tee batched.log
+          test "${PIPESTATUS[0]}" -eq 0
+          grep -q "^PASS" batched.log

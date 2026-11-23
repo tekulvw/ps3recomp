@@ -38,7 +38,9 @@ static pthread_mutex_t s_ticket_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 static SceNpManagerCallback s_npmgr_cb;
 static void* s_npmgr_cb_arg;
-static char s_local_ticket[16];
+/* The account payload is at most 16 bytes; a ticket file at most this many. */
+#define NP_LOCAL_TICKET_FILE_MAX 4096
+static unsigned char s_local_ticket[NP_LOCAL_TICKET_FILE_MAX];
 static u32 s_local_ticket_size;
 static int s_ticket_pending, s_ticket_delivering;
 static int s_status_pending, s_manager_delivering;
@@ -68,6 +70,54 @@ static u32 np_local_account(const char* name, char out[16])
         out[n++] = (char)c;
     }
     return n >= 3 ? n : 0;
+}
+
+/* PS3RECOMP_NP_TICKET_FILE names a file whose exact bytes are the ticket. It is
+ * read at each request, so a launcher can replace it before every sign-in. A
+ * missing, unreadable, empty or oversized file fails the request visibly; it
+ * never falls back to the account payload. Returns the size, or 0 on failure. */
+static u32 np_read_ticket_file(const char* path, unsigned char* out)
+{
+    if (!*path) {
+        fprintf(stderr, "[sceNp] RequestTicket2: PS3RECOMP_NP_TICKET_FILE is set but empty\n");
+        return 0;
+    }
+#ifdef _WIN32
+    /* Open by the wide value so a path outside the ANSI code page still works. */
+    wchar_t wide[2048];
+    DWORD length = GetEnvironmentVariableW(L"PS3RECOMP_NP_TICKET_FILE", wide, 2048);
+    FILE* f = NULL;
+    if (length && length < 2048 && _wfopen_s(&f, wide, L"rb")) f = NULL;
+#else
+    FILE* f = fopen(path, "rb");
+#endif
+    if (!f) {
+        fprintf(stderr, "[sceNp] RequestTicket2: cannot open ticket file %s\n", path);
+        return 0;
+    }
+    /* One byte past the limit distinguishes a full ticket from an oversized one. */
+    size_t n = 0, got;
+    while (n < NP_LOCAL_TICKET_FILE_MAX &&
+           (got = fread(out + n, 1, NP_LOCAL_TICKET_FILE_MAX - n, f)) > 0)
+        n += got;
+    unsigned char extra;
+    int oversized = n == NP_LOCAL_TICKET_FILE_MAX && fread(&extra, 1, 1, f) == 1;
+    int failed = ferror(f);
+    fclose(f);
+    if (failed) {
+        fprintf(stderr, "[sceNp] RequestTicket2: cannot read ticket file %s\n", path);
+        return 0;
+    }
+    if (oversized) {
+        fprintf(stderr, "[sceNp] RequestTicket2: ticket file %s exceeds %u bytes\n",
+                path, (unsigned)NP_LOCAL_TICKET_FILE_MAX);
+        return 0;
+    }
+    if (!n) {
+        fprintf(stderr, "[sceNp] RequestTicket2: ticket file %s is empty\n", path);
+        return 0;
+    }
+    return (u32)n;
 }
 
 static void np_clear_ticket(void)
@@ -371,16 +421,32 @@ s32 sceNpManagerRequestTicket2(const SceNpId* npId, const SceNpTicketVersion* ve
     if (!size || !configured_size) return SCE_NP_AUTH_EINVALID_ARGUMENT;
     if (size != configured_size || memcmp(requested, configured, size))
         return SCE_NP_ERROR_DIFFERENT_USER;
+    /* The file is read outside the lock; only a complete read is published. */
+    unsigned char file_ticket[NP_LOCAL_TICKET_FILE_MAX];
+    const char* file = getenv("PS3RECOMP_NP_TICKET_FILE");
+    const unsigned char* payload = (const unsigned char*)requested;
+    if (file) {
+        size = np_read_ticket_file(file, file_ticket);
+        if (!size) {
+            /* Never leave an earlier sign-in's ticket for GetTicket to return. */
+            TICKET_LOCK();
+            if (!s_ticket_pending && !s_ticket_delivering) np_clear_ticket();
+            TICKET_UNLOCK();
+            return (s32)SCE_NP_ERROR_INTERNAL;
+        }
+        payload = file_ticket;
+    }
     TICKET_LOCK();
     if (!s_np_initialized || generation != s_np_generation) {
         TICKET_UNLOCK(); return SCE_NP_ERROR_NOT_INITIALIZED;
     }
     if (!s_npmgr_cb) { TICKET_UNLOCK(); return SCE_NP_ERROR_INVALID_STATE; }
     if (s_ticket_pending || s_ticket_delivering) { TICKET_UNLOCK(); return SCE_NP_AUTH_EBUSY; }
-    memcpy(s_local_ticket, requested, size); s_local_ticket_size = size;
+    memcpy(s_local_ticket, payload, size); s_local_ticket_size = size;
     s_ticket_pending = 1;
     TICKET_UNLOCK();
-    printf("[sceNp] RequestTicket2: local account payload pending (%u bytes, not PSN)\n", size);
+    printf("[sceNp] RequestTicket2: local %s pending (%u bytes, not PSN)\n",
+           file ? "ticket file" : "account payload", size);
     return CELL_OK;
 }
 
@@ -426,7 +492,7 @@ s32 sceNpManagerGetTicket(void* buffer, u32* bufferSize)
     if (buffer) vm_memcpy_to((u32)(uintptr_t)buffer, s_local_ticket, size);
     vm_write32(size_ea, size);
     TICKET_UNLOCK();
-    printf("[sceNp] GetTicket: local account payload (%u bytes, not PSN)\n", size);
+    printf("[sceNp] GetTicket: local ticket (%u bytes, not PSN)\n", size);
     return CELL_OK;
 }
 

@@ -406,6 +406,18 @@ void rsx_draw_engine_fp_memo_counts(unsigned long long* hits, unsigned long long
 /* Draws whose pipeline-key inputs equaled the previous draw's (no key hash or
  * table probe), and draws that computed the key. */
 void rsx_draw_engine_pipeline_memo_counts(unsigned long long* hits, unsigned long long* misses);
+/* PS3RECOMP_RSX_PIPELINE_REUSE: draws that kept the previous draw's pipeline,
+ * draws that gathered it, and (in verify mode 2) disagreements. */
+void rsx_draw_engine_pipeline_reuse_counts(unsigned long long* hits, unsigned long long* misses,
+                                           unsigned long long* mismatches);
+/* Tests: what a write to register index `ridx` means to the pipeline key
+ * (bit 0 relevant: it bumps the generation; bit 1 comparable: a write of the
+ * value already there does not). */
+unsigned rsx_draw_engine_pipeline_reuse_register_class(u32 ridx);
+/* Tests: the engine's own per-method class bits for register index `ridx`
+ * (4 plain for the dispatcher, 8 texture-unit offset word, 16 texture-unit
+ * format word, 32 tracked by the external-program status). */
+unsigned rsx_draw_engine_method_class(u32 ridx);
 /* Repeat texture binds in one frame after a guest-memory write that missed
  * the texture (no re-check), and those a write may have touched (checked). */
 void rsx_draw_engine_dirty_filter_counts(unsigned long long* skipped, unsigned long long* rechecked);

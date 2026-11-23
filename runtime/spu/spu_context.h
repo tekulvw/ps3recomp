@@ -171,6 +171,8 @@ typedef struct spu_channel {
 /* ---------------------------------------------------------------------------
  * SPU execution context
  * -----------------------------------------------------------------------*/
+struct spurs_pm_observer;
+struct spurs_native_services;
 typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
@@ -417,6 +419,12 @@ typedef struct spu_context {
     /* PS3RECOMP_COH_VERSIONS (spu_coh_version.inc): the count of resv_ea's line
      * the reservation was taken under. It is lost when the count moves. */
     uint32_t resv_count;
+    /* SPURS policy-run observer (spurs_pm_observer.h): NULL unless the opt-in
+     * policy-run recorder or statistics armed this context for one run. */
+    const struct spurs_pm_observer* pm_observer;
+    /* Native policy-module services (spurs_native_pm.h): NULL unless a native
+     * policy run installed its table for the run. */
+    const struct spurs_native_services* native_services;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -425,6 +433,15 @@ typedef struct spu_context {
  * kernel service; spu_indirect_branch intercepts (policy_mode only). */
 #define SPURS_PM_EXIT_TO_KERNEL_LS   0x9C0u
 #define SPURS_PM_SELECT_WORKLOAD_LS  0x9D0u
+/* The select-workload kernel service (spu_channels.c): counts the poll for
+ * the current run, consults the workload flag and the optional preemption
+ * hook, and leaves the kernel's answer in r3 ({selected wid, poll status} in
+ * the preferred doubleword). It does not change pc: the caller returns to
+ * its link. Shared by the resolver's intercept and any native policy run. */
+#ifdef __cplusplus
+extern "C"
+#endif
+void spurs_kernel_select_workload(struct spu_context* ctx);
 
 /* The taskset policy module's syscall trampoline. Both the full resolver
  * (spu_channels.c) and the musttail fast path (spu_dispatch_mt.c) must treat a
@@ -448,8 +465,16 @@ typedef struct spu_context {
 void spu_mfc_release(spu_context* ctx);
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
 
+#if defined(_MSC_VER)
+static int spu_fast_path_resolve(void);     /* below, with the gate block */
+#else
+static int spu_fast_path_resolve(void) __attribute__((noinline, cold, unused));
+#endif
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 {
+    /* Resolve the compact-form switch once, before any SPU code runs on this
+     * context; every hot site then tests the resolved word with one load. */
+    (void)spu_fast_path_resolve();
     memset(ctx, 0, sizeof(*ctx));
     ctx->ls     = ctx->ls_store;   /* a raw SPU repoints this at guest memory */
     ctx->spu_id = spu_id;
@@ -527,8 +552,16 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 /* The diagnostic gates the inline helpers below read. Defined here rather than
  * in spu_channels.c, as one merged definition per program (selectany / weak),
  * so every target that includes this header links whether or not it builds
- * spu_channels.c -- the SPU unit tests and sync_stress do not. */
-#if defined(_MSC_VER)
+ * spu_channels.c -- the SPU unit tests and sync_stress do not.
+ *
+ * Every PE target takes selectany, MinGW included: GNU ld does not fold a
+ * GNU-weak data definition on PE-COFF. Each translation unit keeps its own
+ * copy and the program's references bind to one address that need not be any
+ * of them (the MinGW builds of the Python fixtures showed a gate bound inside
+ * another weak object, so a read-once gate saw a stale value and a first-use
+ * store landed in that object). A selectany COMDAT is one object, as on ELF
+ * and Mach-O with a weak definition. */
+#if defined(_WIN32)
 #  define SPU_GATE __declspec(selectany)
 #else
 #  define SPU_GATE __attribute__((weak))
@@ -540,6 +573,134 @@ SPU_GATE int g_wws_read_probe = 0;
 SPU_GATE int g_spu_ls_rdiag   = -1;  /* any read diagnostic armed (see above)   */
 SPU_GATE int g_spu_ls_wdiag   = -1;  /* any write diagnostic armed              */
 SPU_GATE int g_spu_wws_probe  = -1;  /* SPU_WWS_PROBE: the WWS buffer/code logs */
+
+/* The read-mostly gates the dispatch path tests on every transfer, lookup and
+ * drain hop, kept in one cache line of their own. The originals are file
+ * statics and globals the linker places where it likes: on both the Linux and
+ * the Windows engine the dispatch cache's mode flag shared a line with the
+ * overlay residency counters every SPU thread incremented, so each lookup
+ * started with a cross-core miss (those counters are now kept only while
+ * their statistics are on, spu_channels.c). Each copy is filled from its
+ * original on first use (-1 = not read yet) and never differs from it
+ * afterwards: the sources are fixed once read, except the stack-reset count,
+ * whose only writer updates both. */
+#if defined(_MSC_VER)
+#  define SPU_LINE_ALIGNED __declspec(align(64))
+#else
+#  define SPU_LINE_ALIGNED __attribute__((aligned(64)))
+#endif
+typedef struct spu_dispatch_gates {
+    int dcache_mode;              /* spu_dcache_mode(): 0 off, 1 on, 2 shadow  */
+    int region_scope;             /* spu_region_scope_enabled()                */
+    int task_diag;                /* spu_task_launch_diagnostics()             */
+    unsigned stack_reset_count;   /* g_spu_stack_reset_count                   */
+    int ovl_stats;                /* overlay residency statistics wanted       */
+    int fast_path;                /* spu_fast_path_on() (spu_drain.c)          */
+    int channel_inline;           /* spu_channel_inline_on() (spu_channel_inline.h) */
+    int ib_fast;                  /* spu_ib_fast_on() (spu_channels.c)         */
+    /* Nonzero only while an opt-in SPURS policy extra is configured (the
+     * policy-run recorder, spurs_pm_record.inc; a native policy module,
+     * spurs_native_pm.h). Every hook site tests this line, already loaded on
+     * those paths, before it touches the per-context hook pointers. */
+    int pm_extras;
+    char pad[64 - 9 * sizeof(int)];
+} spu_dispatch_gates;
+#ifdef __cplusplus
+static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
+#else
+_Static_assert(sizeof(spu_dispatch_gates) == 64, "the dispatch gates fill exactly one cache line");
+#endif
+SPU_GATE SPU_LINE_ALIGNED spu_dispatch_gates g_spu_dispatch_gates = { -1, -1, -1, 0, -1, -1, -1, -1, 0, {0} };
+/* One load of the gate line; predicted not taken. */
+static inline int spu_pm_extras_on(void)
+{
+    return __builtin_expect(g_spu_dispatch_gates.pm_extras != 0, 0);
+}
+
+/* PS3RECOMP_MFC_FAST=1 (opt-in): the MFC command path, the channel entries,
+ * the overlay note and the drain hop run their compact form, which drops the
+ * environment-armed diagnostics and their per-command gate tests. It is
+ * chosen only while none of those diagnostics is armed (spu_fast_path_env.h
+ * lists every variable they read), so the diagnostics never go missing:
+ * arming any of them keeps the full form. Fixed for the run; read once. */
+#include "spu_fast_path_env.h"
+/* Defined here, not in a runtime unit: the users below are compiled into
+ * fixtures that link no runtime unit at all. Every copy writes the one shared
+ * gate block. Out of line and cold: spu_context_init runs it once per
+ * context, and the hot sites test the resolved word only (below), so the
+ * environment walk and its report never enter the drain loop or the channel
+ * entries. */
+#if defined(_MSC_VER)
+#  define SPU_FAST_PATH_COLD static __declspec(noinline)
+#else
+#  define SPU_FAST_PATH_COLD static __attribute__((noinline, cold, unused))
+#endif
+/* One opt-in switch: 1 when `name`=1 is set and no channel diagnostic is
+ * armed; the first armed diagnostic is reported as the reason otherwise. */
+SPU_FAST_PATH_COLD int spu_fast_path_switch_in(const char* name, const char* const* env)
+{
+    const char* e = getenv(name);
+    int on = e && e[0] == '1' && !e[1];
+    if (on)
+        for (const char* const* n = env; *n; ++n)
+            if (getenv(*n)) {
+                fprintf(stderr, "[spu] %s=1 ignored: %s is set\n", name, *n);
+                on = 0;
+                break;
+            }
+    return on;
+}
+SPU_FAST_PATH_COLD int spu_fast_path_switch(const char* name)
+{
+    return spu_fast_path_switch_in(name, spu_fast_path_env);
+}
+/* Resolves both the compact runtime form (PS3RECOMP_MFC_FAST) and the inline
+ * channel form lifted code may carry (PS3RECOMP_SPU_CHANNEL_INLINE,
+ * spu_channel_inline.h); the two are independent and share the diagnostics
+ * list. Returns the compact-form word. */
+SPU_FAST_PATH_COLD int spu_fast_path_resolve(void)
+{
+    if (g_spu_dispatch_gates.fast_path >= 0) return g_spu_dispatch_gates.fast_path;
+    g_spu_dispatch_gates.channel_inline = spu_fast_path_switch("PS3RECOMP_SPU_CHANNEL_INLINE");
+    /* PS3RECOMP_SPU_IB_FAST=1 (opt-in): the indirect-dispatch entry answers a
+     * repeated target from a small per-thread table ahead of the full
+     * resolver (spu_indirect_branch, spu_channels.c). It is chosen only while
+     * none of the dispatch diagnostics in spu_ib_fast_env is armed, since the
+     * short entry runs none of them. */
+    int ib_fast = spu_fast_path_switch_in("PS3RECOMP_SPU_IB_FAST", spu_ib_fast_env);
+    if (ib_fast) {
+        /* A native policy module's shadow comparison (PS3RECOMP_SPURS_NATIVE_PM=shadow,
+         * or _SELF_SHADOW) is fed by the policy-run recorder, which must see every
+         * branch, like the recorder's own switches in spu_ib_fast_env. */
+        const char* npm = getenv("PS3RECOMP_SPURS_NATIVE_PM");
+        const char* self = getenv("PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW");
+        if ((npm && !strcmp(npm, "shadow")) || (self && *self && strcmp(self, "0"))) {
+            fprintf(stderr, "[spu] PS3RECOMP_SPU_IB_FAST=1 ignored: a native policy-module shadow comparison is on\n");
+            ib_fast = 0;
+        }
+    }
+    if (ib_fast) {
+        /* The short entry keys its table by the dispatch cache's context
+         * lifetime id and byte epochs, which exist only while that cache is
+         * on (SPU_DISPATCH_CACHE=1; =shadow must see every lookup). */
+        const char* dc = getenv("SPU_DISPATCH_CACHE");
+        if (!dc || strcmp(dc, "1")) {
+            fprintf(stderr, "[spu] PS3RECOMP_SPU_IB_FAST=1 ignored: SPU_DISPATCH_CACHE is not 1\n");
+            ib_fast = 0;
+        }
+    }
+    g_spu_dispatch_gates.ib_fast = ib_fast;
+    const int on = spu_fast_path_switch("PS3RECOMP_MFC_FAST");
+    g_spu_dispatch_gates.fast_path = on;
+    return on;
+}
+/* One load and one compare. The switch is resolved by spu_context_init before
+ * any SPU code runs on a context; an unresolved -1 can only select the full
+ * form, which is always correct. */
+static inline int spu_fast_path_on(void)
+{
+    return g_spu_dispatch_gates.fast_path > 0;
+}
 static inline int spu_ls_wws_probe_on(void)
 {
     if (g_spu_wws_probe < 0) g_spu_wws_probe = getenv("SPU_WWS_PROBE") ? 1 : 0;
@@ -868,7 +1029,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*));
 extern unsigned g_spu_stack_reset_count;
 static inline int spu_stack_reset_needed(const spu_context* ctx) {
-    unsigned count=__atomic_load_n(&g_spu_stack_reset_count,__ATOMIC_ACQUIRE);
+    unsigned count=__atomic_load_n(&g_spu_dispatch_gates.stack_reset_count,__ATOMIC_ACQUIRE);
     return count && ctx->host_depth && !ctx->policy_mode;
 }
 /* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
@@ -894,22 +1055,20 @@ int  spu_tailret_enabled(void);
 extern int g_spu_region_scope_mode;
 int spu_region_scope_enabled(void);
 static inline int spu_region_scope_on(void) {
-#if defined(_MSC_VER)
-    return spu_region_scope_enabled();
-#else
-    int mode=__atomic_load_n(&g_spu_region_scope_mode,__ATOMIC_RELAXED);
-    return mode ? mode==2 : spu_region_scope_enabled();
-#endif
+    int r = g_spu_dispatch_gates.region_scope;
+    if (r < 0) g_spu_dispatch_gates.region_scope = r = spu_region_scope_enabled();
+    return r;
 }
 static inline void spu_region_dispatch_invoke(spu_context* ctx,
     void (*fn)(spu_context*), int has_return, uint32_t return_pc) {
-    ctx->region_dispatch_valid=0;
+    /* With region scope off the flag is only ever written clear, so the
+     * compact form skips the clearing store before the call. */
     if(spu_region_scope_on()) {
         ctx->region_dispatch_depth=ctx->host_depth;
         ctx->region_return_pc=return_pc&SPU_LS_MASK;
         ctx->region_has_return=has_return;
         ctx->region_dispatch_valid=1;
-    }
+    } else if(!spu_fast_path_on()) ctx->region_dispatch_valid=0;
     fn(ctx);
     ctx->region_dispatch_valid=0;
 }
@@ -1024,6 +1183,10 @@ static inline void spu_pchist_tick(const spu_context* ctx)
  * never match -- it restarts dispatch from r0's stale value instead. Same
  * host-frame return as SPU_RET, publishing the register actually branched. */
 #define SPU_RET_REG(ctx, n) do {                                       (ctx)->pc = (ctx)->gpr[n]._u32[0];                             if ((ctx)->host_depth == 0)                                        g_spu_trampoline_fn = spu_indirect_branch;                 return;                                                    } while (0)
+
+/* The latch and status channel operations shared by the channel entries and
+ * lifted code (needs the context, the gate line and the u128 helpers above). */
+#include "spu_channel_inline.h"
 
 #ifdef __cplusplus
 } /* extern "C" */
