@@ -16,7 +16,10 @@
  *   W / A / S / D       left stick, full deflection
  *   I / J / K / L       right stick, full deflection
  *
- * Opposing stick keys cancel to centre (128). A host builds one bit mask of
+ * Opposing stick keys cancel to centre (128). A stick counts as held while any
+ * of its keys is, even when they cancel: on a port a controller also drives,
+ * that stick follows the keys and the buttons add to the controller's.
+ * A host builds one bit mask of
  * held keys, indexed by position in pad_keyboard_bindings[], passes it through
  * pad_keyboard_latch() and turns the result into a report with
  * pad_keyboard_report(). Header-only so each host's fixture builds with no
@@ -62,6 +65,7 @@ _Static_assert(PAD_KEYBOARD_BINDING_COUNT <= 32, "held-key mask capacity");
 typedef struct {
     uint16_t buttons;
     uint8_t analog_lx, analog_ly, analog_rx, analog_ry;
+    uint8_t left_held, right_held;   /* a key of that stick is held */
 } PadKeyboardReport;
 
 /* Bit for one usage in a held-key mask; 0 when the layout does not bind it. */
@@ -97,13 +101,17 @@ static inline uint8_t pad_keyboard_axis(uint32_t keys, uint8_t negative, uint8_t
 /* Buttons and both sticks from one held-key mask. */
 static inline PadKeyboardReport pad_keyboard_report(uint32_t keys)
 {
-    PadKeyboardReport report = {0, 128, 128, 128, 128};
+    PadKeyboardReport report = {0, 128, 128, 128, 128, 0, 0};
     for (unsigned i = 0; i < PAD_KEYBOARD_BINDING_COUNT; i++)
         if (keys & (1u << i)) report.buttons |= pad_keyboard_bindings[i].button;
     report.analog_lx = pad_keyboard_axis(keys, PAD_KEY_A, PAD_KEY_D);
     report.analog_ly = pad_keyboard_axis(keys, PAD_KEY_W, PAD_KEY_S);
     report.analog_rx = pad_keyboard_axis(keys, PAD_KEY_J, PAD_KEY_L);
     report.analog_ry = pad_keyboard_axis(keys, PAD_KEY_I, PAD_KEY_K);
+    report.left_held = (keys & (pad_keyboard_bit(PAD_KEY_W) | pad_keyboard_bit(PAD_KEY_A) |
+                                pad_keyboard_bit(PAD_KEY_S) | pad_keyboard_bit(PAD_KEY_D))) != 0;
+    report.right_held = (keys & (pad_keyboard_bit(PAD_KEY_I) | pad_keyboard_bit(PAD_KEY_J) |
+                                 pad_keyboard_bit(PAD_KEY_K) | pad_keyboard_bit(PAD_KEY_L))) != 0;
     return report;
 }
 #endif

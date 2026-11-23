@@ -109,6 +109,20 @@ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
 
+/* The keyboard on port 0 when a controller already drives it (every host's
+ * keyboard pad): its buttons add to the controller's, and a stick with one of
+ * its keys held follows the keys instead of the controller's stick. Nothing
+ * held leaves the controller's report exactly as it was. */
+#if defined(_WIN32) || defined(PAD_HAS_SDL_KEYBOARD) || (defined(__APPLE__) && !TARGET_OS_IPHONE)
+static void pad_keyboard_merge(PadHostState* hs, u16 buttons, u8 lx, u8 ly, u8 rx, u8 ry,
+                               int left_held, int right_held)
+{
+    hs->buttons |= buttons;
+    if (left_held) { hs->analog_lx = lx; hs->analog_ly = ly; }
+    if (right_held) { hs->analog_rx = rx; hs->analog_ry = ry; }
+}
+#endif
+
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
@@ -180,11 +194,12 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
  * it can be watched but not played. That is what The Simpsons Arcade Game hit:
  * it reached its attract loop and no input existed to start a game.
  *
- * Only fills in for port 0, only when XInput found nothing there, so a real
- * controller always wins and nothing changes for a port that has one. Keys are
- * read only while a window of THIS process is in the foreground and no native
- * dialog owns input, so typing in another application does not drive the
- * game. Set PAD_NO_KEYBOARD=1 to disable it entirely.
+ * Port 0 only. When XInput found nothing there, the keyboard is the port; when
+ * a controller (real, or a virtual one from Steam Input or a streaming client)
+ * drives it, the keyboard merges into it (pad_keyboard_merge), so both work.
+ * Keys are read only while a window of THIS process is in the foreground and
+ * no native dialog owns input, so typing in another application does not
+ * drive the game. Set PAD_NO_KEYBOARD=1 to disable it entirely.
  *
  * The layout is the Linux SDL window's (pad_keyboard_layout.h): X/Z/C/V
  * cross/square/circle/triangle, Return START, Space SELECT, Q/E L1/R1, R/T
@@ -268,17 +283,24 @@ static void pad_poll_keyboard(void)
         if (vk[i] && (GetAsyncKeyState(vk[i]) & 0x8000)) held |= 1u << i;
     PadKeyboardReport report = pad_keyboard_report(pad_keyboard_latch(&blocked, held, focused));
 
-    memset(hs, 0, sizeof(*hs));
-    hs->connected = 1;
-    hs->buttons   = report.buttons;
-    hs->analog_lx = report.analog_lx;
-    hs->analog_ly = report.analog_ly;
-    hs->analog_rx = report.analog_rx;
-    hs->analog_ry = report.analog_ry;
+    const int controller = hs->connected;   /* this poll's XInput reading */
+    if (controller) {
+        pad_keyboard_merge(hs, report.buttons, report.analog_lx, report.analog_ly, report.analog_rx,
+                           report.analog_ry, report.left_held, report.right_held);
+    } else {
+        memset(hs, 0, sizeof(*hs));
+        hs->connected = 1;
+        hs->buttons   = report.buttons;
+        hs->analog_lx = report.analog_lx;
+        hs->analog_ly = report.analog_ly;
+        hs->analog_rx = report.analog_rx;
+        hs->analog_ry = report.analog_ry;
+    }
 
     { static int said = 0;
-      if (!said && report.buttons) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
+      if (!said && (report.buttons || report.left_held || report.right_held)) { said = 1;
+          printf("[cellPad] keyboard active on port 0 (%s)\n",
+                 controller ? "merged with the XInput controller" : "no XInput device");
           fflush(stdout); } }
     static int trace = -1;
     static u16 previous = 0;
@@ -544,15 +566,20 @@ static unsigned long long pad_now_ms(void)
 
 #ifdef PAD_HAS_SDL_KEYBOARD
 /* The SDL game window publishes its keyboard (pad_sdl_keyboard.c) from its
- * event pump; this only reads that snapshot. A physical controller still wins;
- * the keyboard only fills the vacant port, as on macOS. */
+ * event pump; this only reads that snapshot. It merges into a controller on
+ * port 0 and is the port when none is there, as on Windows and macOS. */
 static void pad_poll_sdl_keyboard(void)
 {
     static int keyboard_off = -1;
     if (keyboard_off < 0) keyboard_off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
-    if (keyboard_off || s_host_state[0].connected) return;
+    if (keyboard_off) return;
     PadHostState* hs = &s_host_state[0];
     PS3RecompSDLKeyboardPadState keyboard = ps3recomp_pad_sdl_keyboard_state();
+    if (hs->connected) {
+        pad_keyboard_merge(hs, keyboard.buttons, keyboard.analog_lx, keyboard.analog_ly, keyboard.analog_rx,
+                           keyboard.analog_ry, keyboard.left_stick, keyboard.right_stick);
+        return;
+    }
     /* Without a game window (headless runs) port 0 is left exactly as before;
      * a window that goes away releases what its keyboard held, once. */
     static int s_owned = 0;
@@ -594,17 +621,21 @@ static void pad_poll_backend(void)
     pad_poll_sdl2();
 #endif
 #ifdef _WIN32
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    pad_poll_keyboard();
 #endif
 #ifdef PAD_HAS_SDL_KEYBOARD
     pad_poll_sdl_keyboard();
 #endif
 #if defined(__APPLE__) && !TARGET_OS_IPHONE
-    /* Native Metal windows do not publish their key events through SDL. A
-     * physical controller still wins; keyboard only fills the vacant port. */
+    /* Native Metal windows do not publish their key events through SDL. The
+     * keyboard merges into a controller on port 0 and is the port without one. */
     static int keyboard_off = -1;
     if (keyboard_off < 0) keyboard_off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
-    if (!keyboard_off && !s_host_state[0].connected) {
+    if (!keyboard_off && s_host_state[0].connected) {
+        PS3RecompMacOSPadState keyboard = ps3recomp_pad_macos_state();
+        pad_keyboard_merge(&s_host_state[0], keyboard.buttons, keyboard.analog_lx, keyboard.analog_ly,
+                           keyboard.analog_rx, keyboard.analog_ry, keyboard.left_stick, keyboard.right_stick);
+    } else if (!keyboard_off) {
         PadHostState* hs = &s_host_state[0];
         PS3RecompMacOSPadState keyboard = ps3recomp_pad_macos_state();
         u16 btns = keyboard.buttons;

@@ -79,13 +79,20 @@ int main(int argc, char** argv) { @autoreleasepool {
     if (physical || disabled) {
         key(view,YES,7); key(view,YES,13); key(view,YES,34);
         check("native Cross before port arbitration",ps3recomp_pad_macos_buttons(),CELL_PAD_CTRL_CROSS);
-        /* SDL's existing centered-axis conversion produces 127. */
-        unsigned center=physical ? 127 : 0; /* disabled fallback leaves the vacant port zeroed */
-        report("keyboard fallback suppressed",0,center,center,center,center);
         if (physical) {
+            /* The keyboard merges into the controller: Cross adds, and the
+             * sticks with a held key (W left, I right) follow the keys. */
+            report("keyboard merged into the controller",CELL_PAD_CTRL_CROSS,128,0,128,0);
             assert(SDL_JoystickSetVirtualButton(controller,SDL_CONTROLLER_BUTTON_B,1)==0);
             assert(SDL_JoystickSetVirtualAxis(controller,SDL_CONTROLLER_AXIS_RIGHTX,32767)==0);
-            report("physical controller still drives port",CELL_PAD_CTRL_CIRCLE,127,127,255,127);
+            report("controller and keyboard buttons together",CELL_PAD_CTRL_CROSS|CELL_PAD_CTRL_CIRCLE,128,0,128,0);
+            key(view,NO,34);
+            /* SDL's existing centered-axis conversion produces 127. */
+            report("released right stick keys: the controller's stick",CELL_PAD_CTRL_CROSS|CELL_PAD_CTRL_CIRCLE,128,0,255,127);
+            key(view,NO,7); key(view,NO,13);
+            report("keyboard released: the controller exactly",CELL_PAD_CTRL_CIRCLE,127,127,255,127);
+        } else {
+            report("keyboard fallback off: vacant port left zeroed",0,0,0,0,0);
         }
     } else {
         report("neutral",0,128,128,128,128);
