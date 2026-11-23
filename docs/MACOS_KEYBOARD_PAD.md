@@ -5,8 +5,8 @@ port zero. Click the game window and use this layout:
 
 | Keys | PS3 control |
 | --- | --- |
-| **W / S / A / D** | **Right stick** up / down / left / right |
-| **I / K / J / L** | **Left stick** up / down / left / right |
+| **W / S / A / D** | **Left stick** up / down / left / right |
+| **I / K / J / L** | **Right stick** up / down / left / right |
 | **Arrow keys** | D-pad only |
 | **X / Z / C / V** | Cross / Square / Circle / Triangle |
 | **Return** or **keypad Enter** | START |
@@ -33,8 +33,8 @@ Set `PAD_NO_KEYBOARD=1` to disable the keyboard fallback and
 AppKit event handlers update atomic physical-key state on the main thread.
 cellPad reads one snapshot for all buttons and both sticks on guest polling
 threads without calling AppKit. Pressure-enabled reports retain the existing
-digital-button pressure synthesis and big-endian layout. The Windows keyboard
-fallback keeps its existing layout.
+digital-button pressure synthesis and big-endian layout. Linux and Windows use
+the same layout ([LINUX_KEYBOARD_PAD.md](LINUX_KEYBOARD_PAD.md)).
 
 `python3 tools/test_macos_keyboard_layout.py` checks synthetic native key events
 through the production view handlers and real big-endian cellPad reports. It

@@ -1,5 +1,5 @@
 /* SDL game-window keyboard fallback for controller port zero (Linux and other
- * non-Apple, non-Windows hosts). Same physical layout as the macOS window pad. */
+ * non-Apple, non-Windows hosts). Layout: pad_keyboard_layout.h. */
 #ifndef PS3RECOMP_PAD_SDL_KEYBOARD_H
 #define PS3RECOMP_PAD_SDL_KEYBOARD_H
 #include <stdint.h>
