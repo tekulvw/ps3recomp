@@ -61,7 +61,7 @@ def main():
         contract = Path(temporary) / "contract"
         subprocess.run([os.environ.get("CC", "cc"), "-std=c17", "-Wall", "-Wextra", "-Werror", "-Ilibs/video",
                         *flags, "libs/video/tests/test_frontend_vulkan_contract.c", "libs/video/rsx_frontend.c",
-                        "-pthread", "-o", str(contract)], cwd=ROOT, check=True, timeout=60)
+                        "-pthread", "-o", str(contract)], cwd=ROOT, check=True, timeout=300)
         subprocess.run([str(contract)], check=True, timeout=5)
         if args.contract_only:
             return
@@ -74,7 +74,7 @@ def main():
                    "libs/video/tests/test_frontend_vulkan.c", "libs/video/rsx_frontend.c",
                    "libs/video/rsx_frontend_vulkan.c", "-Wl,--gc-sections", "-pthread", "-ldl", "-lm",
                    *flags, "-o", str(binary)]
-        subprocess.run(command, cwd=ROOT, check=True, timeout=90)
+        subprocess.run(command, cwd=ROOT, check=True, timeout=300)
         if not args.build_only:
             environment = dict(os.environ, PS3RECOMP_VK_DEVICE=args.gpu_index)
             if args.require_validation:

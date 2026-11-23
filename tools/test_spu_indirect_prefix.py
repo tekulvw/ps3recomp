@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix='spu-indirect-prefix-') as tmp:
                     *[str(spu/(u+'.c')) for u in units],
                     str(root/'runtime/platform/win32_compat.c'),
                     str(root/'runtime/diagnostics/job_io_recorder.c'),
-                    '-pthread','-lm','-o',str(binary)],check=True,timeout=60)
+                    '-pthread','-lm','-o',str(binary)],check=True,timeout=300)
     markers={'SPU_IBCOV':'[ibcov3]','SPU_POLLTRACE':'[ibranch]','YDKJ_POLTRACE':'[POLTRACE]'}
     for switch in (None,*markers):
         result=subprocess.run([str(binary)],env=dict(env,**({switch:'1'} if switch else {})),

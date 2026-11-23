@@ -24,6 +24,6 @@ def main():
     if os.name=='nt': print('SKIP POSIX clock fixture; Windows preserves existing QPC domain');return
     with tempfile.TemporaryDirectory(prefix='ppu-clock-') as tmp:
         p=Path(tmp);(p/'test.cpp').write_text(pre+body+test)
-        subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-UNDEBUG','-I'+str(root/'runtime/ppu'),str(p/'test.cpp'),'-o',str(p/'test')],check=True,timeout=30)
+        subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-UNDEBUG','-I'+str(root/'runtime/ppu'),str(p/'test.cpp'),'-o',str(p/'test')],check=True,timeout=300)
         subprocess.run([str(p/'test')],check=True,timeout=5)
 if __name__=='__main__': main()

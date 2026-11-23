@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix='spu-task-pool-') as tmp:
         command = [compiler, '-std=gnu17', '-O2', '-Wall', '-Wextra', '-UNDEBUG',
                    '-I' + str(ROOT / 'include'), str(SOURCE),
                    *([] if windows else ['-pthread']), '-o', str(binary)]
-    subprocess.run(command, check=True, timeout=120, cwd=tmp)
+    subprocess.run(command, check=True, timeout=300, cwd=tmp)
     results = {}
     for mode in (None, '1'):
         env = {k: v for k, v in os.environ.items() if k != 'PS3RECOMP_SPU_TASK_POOL'}

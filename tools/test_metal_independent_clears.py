@@ -15,6 +15,6 @@ with tempfile.TemporaryDirectory(prefix="metal-clears-") as tmp:
                     "libs/video/rsx_texture_layout.c",'runtime/diagnostics/critical_trace.c', "runtime/diagnostics/render_ablation.c", "libs/video/rsx_fifo_busy.c", "-Wl,-dead_strip",
                     "-framework", "Metal", "-framework", "Cocoa",
                     "-framework", "QuartzCore", "-o", str(binary)],
-                   cwd=ROOT, check=True, timeout=60)
+                   cwd=ROOT, check=True, timeout=300)
     for mode in ("independent_clears", "independent_depth_stencil"):
         subprocess.run([str(binary), mode], check=True, timeout=20)

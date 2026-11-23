@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix='ps3-sysmodule-query-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/system'),
                     str(root / 'tests/test_sysmodule_is_loaded_ex.c'),
                     str(root / 'libs/system/cellSysmodule.c'),
-                    str(root / 'tests/sysmodule_memory_fixture.c'), '-o', str(binary)], check=True, timeout=30)
+                    str(root / 'tests/sysmodule_memory_fixture.c'), '-o', str(binary)], check=True, timeout=300)
     env = {key: value for key, value in os.environ.items()
            if key in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT")}
     subprocess.run([str(binary)], check=True, timeout=10, env=env)

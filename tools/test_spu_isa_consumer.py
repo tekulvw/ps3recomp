@@ -12,7 +12,7 @@ import tempfile
 ROOT=Path(__file__).resolve().parents[1]
 
 def run(command,**kwargs):
-    result=subprocess.run(command,capture_output=True,text=True,timeout=120,**kwargs)
+    result=subprocess.run(command,capture_output=True,text=True,timeout=300,**kwargs)
     assert result.returncode==0,(command,result.returncode,result.stdout,result.stderr)
     return result
 

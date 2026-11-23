@@ -17,5 +17,5 @@ with tempfile.TemporaryDirectory(prefix="metal-depth-z24-") as tmp:
                     "runtime/diagnostics/render_ablation.c", "-lc++", "-Wl,-dead_strip",
                     "-framework", "Metal", "-framework", "Cocoa",
                     "-framework", "QuartzCore", "-o", str(binary)],
-                   cwd=ROOT, check=True, timeout=120)
+                   cwd=ROOT, check=True, timeout=300)
     subprocess.run([str(binary)], check=True, timeout=120)

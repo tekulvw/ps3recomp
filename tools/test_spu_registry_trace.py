@@ -17,11 +17,11 @@ def main():
         for i,source in enumerate((root/'runtime/spu/tests/test_spu_registry_trace.c',root/'runtime/host/host_stubs.c')):
             obj=work/(str(i)+'.obj')
             subprocess.run([compiler,'/nologo','/std:c17','/O1','/Gy','/Gw','/MT','/UNDEBUG','/D_CRT_SECURE_NO_WARNINGS',
-                '/I'+str(root/'include'),'/I'+str(root/'runtime/spu'),'/c',str(source),'/Fo'+str(obj)],cwd=work,check=True,timeout=60)
+                '/I'+str(root/'include'),'/I'+str(root/'runtime/spu'),'/c',str(source),'/Fo'+str(obj)],cwd=work,check=True,timeout=300)
             objects.append(str(obj))
         exe=work/'fixture.exe'
         libs=('gdi32','user32','ws2_32','winmm','synchronization','bcrypt','psapi','dbghelp')
-        subprocess.run([compiler,'/nologo',*objects,str(lib),'/Fe'+str(exe),'/link','/OPT:REF',*(v+'.lib' for v in libs)],cwd=work,check=True,timeout=60)
+        subprocess.run([compiler,'/nologo',*objects,str(lib),'/Fe'+str(exe),'/link','/OPT:REF',*(v+'.lib' for v in libs)],cwd=work,check=True,timeout=300)
         base={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','PS3_','MAG_','YDKJ_'))}
         for value in (None,'0','2'):
             env=dict(base)

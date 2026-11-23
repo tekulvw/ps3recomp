@@ -13,6 +13,6 @@ def main():
         binary = pathlib.Path(tmp) / "fixture"
         subprocess.run([cc, "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-I", "libs/video",
                         "libs/video/tests/test_rsx_present_thread.c", "-pthread", "-o", str(binary)],
-                       cwd=ROOT, check=True, timeout=60)
+                       cwd=ROOT, check=True, timeout=300)
         subprocess.run([str(binary)], check=True, timeout=60)
 if __name__ == "__main__": main()

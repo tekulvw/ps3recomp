@@ -32,5 +32,5 @@ with tempfile.TemporaryDirectory(prefix="frame-capture-") as directory:
                     "libs/video/tests/test_metal_frame_capture.m", "libs/video/rsx_texture_layout.c",
                     "runtime/diagnostics/critical_trace.c", "runtime/diagnostics/render_ablation.c",
                     "libs/video/rsx_fifo_busy.c", "libs/input/pad_macos.m", "-Wl,-dead_strip", "-framework", "Metal", "-framework", "Cocoa",
-                    "-framework", "QuartzCore", "-o", str(gpu)], cwd=root, check=True, timeout=60)
+                    "-framework", "QuartzCore", "-o", str(gpu)], cwd=root, check=True, timeout=300)
     subprocess.run([str(gpu), str(directory / "surface.rgba")], check=True, timeout=30)

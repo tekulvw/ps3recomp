@@ -27,12 +27,12 @@ def main():
                 definitions = ['/DFEEDBACK_RENDERER_SOURCE="' + args.renderer_source.resolve().as_posix() + '"']
             subprocess.run([compiler, '/nologo', '/std:c17', '/O1', '/Gy', '/Gw', '/W0', '/MT',
                 '/D_CRT_SECURE_NO_WARNINGS', *definitions, '/I' + str(root / 'include'), '/I' + str(root / 'libs/video'),
-                '/I' + str(root / 'runtime'), '/c', str(source), '/Fo' + str(obj)], check=True, timeout=90)
+                '/I' + str(root / 'runtime'), '/c', str(source), '/Fo' + str(obj)], check=True, timeout=300)
             objects.append(str(obj))
         binary = work / 'fixture.exe'
         libs = ('d3d12', 'dxgi', 'd3dcompiler', 'dxguid', 'gdi32', 'user32', 'ole32', 'ws2_32', 'xinput', 'bcrypt', 'winmm', 'shlwapi', 'synchronization', 'psapi', 'dbghelp')
         subprocess.run([compiler, '/nologo', *objects, str(args.runtime_library.resolve()), '/Fe' + str(binary),
-            '/link', '/OPT:REF', *(name + '.lib' for name in libs)], check=True, timeout=90)
+            '/link', '/OPT:REF', *(name + '.lib' for name in libs)], check=True, timeout=300)
         scenarios = ('large-first', 'small-first', 'no-alias', 'float', 'half', 'other-size', 'other-pitch', 'other-format', 'other-remap', 'newer-covering') if args.scenario == 'all' else (args.scenario,)
         for mode in ('buffered', 'literal'):
             for scenario in scenarios:

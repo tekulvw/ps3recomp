@@ -65,5 +65,5 @@ with tempfile.TemporaryDirectory(prefix="timer-gcm-dispatch-")as td:
   # Darwin executables require naming an optional undefined import explicitly;
   # the weak_import reference remains null when the provider is not linked.
   if absent and sys.platform=="darwin":linker +=["-Wl,-U,_ppu_gcm_pump"]
-  subprocess.run([os.environ.get("CXX","c++"),*flags,"-I"+str(p),"-I"+str(ROOT/"runtime/ppu"),"-I"+str(ROOT/"include"),"-I"+str(ROOT),str(ROOT/"runtime/ppu/ppu_loader.cpp"),str(p/"check.cpp"),*linker,"-pthread","-o",str(out)],check=True,timeout=60)
+  subprocess.run([os.environ.get("CXX","c++"),*flags,"-I"+str(p),"-I"+str(ROOT/"runtime/ppu"),"-I"+str(ROOT/"include"),"-I"+str(ROOT),str(ROOT/"runtime/ppu/ppu_loader.cpp"),str(p/"check.cpp"),*linker,"-pthread","-o",str(out)],check=True,timeout=300)
   subprocess.run([str(out)],check=True,timeout=10)

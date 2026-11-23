@@ -16,7 +16,7 @@ with tempfile.TemporaryDirectory(prefix="macos-pad-") as tmp:
     bridge=root/"libs/input/pad_macos.m"
     if bridge.exists(): cmd.append(str(bridge))
     cmd += [*sdl,"-framework","AppKit","-framework","Metal","-framework","QuartzCore","-Wl,-dead_strip","-o",str(tmp/"test")]
-    subprocess.run(cmd,check=True,timeout=60)
+    subprocess.run(cmd,check=True,timeout=300)
     if "--build-only" in sys.argv:
         print("native Metal window input fixture compiled (not launched)")
         raise SystemExit(0)

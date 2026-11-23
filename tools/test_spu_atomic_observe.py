@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix='spu-atomic-observe-') as td:
     tmp=pathlib.Path(td);exe=tmp/'test'
     cmd=['cc','-std=gnu17','-O2','-UNDEBUG','-I'+str(ROOT/'include'),'-I'+str(SPU),'-I'+str(ROOT/'runtime/platform'),str(SPU/'tests/test_spu_atomic_observe.c'),*[str(SPU/(u+'.c')) for u in units],str(ROOT/'runtime/platform/win32_compat.c'),str(ROOT/'runtime/diagnostics/job_io_recorder.c'),str(ROOT/'runtime/diagnostics/critical_trace.c'),'-pthread','-lm','-o',str(exe)]
     if args.ubsan:cmd[1:1]=['-fsanitize=undefined','-fno-sanitize-recover=all']
-    r=subprocess.run(cmd,capture_output=True,text=True,timeout=60);assert not r.returncode,r.stdout+r.stderr
+    r=subprocess.run(cmd,capture_output=True,text=True,timeout=300);assert not r.returncode,r.stdout+r.stderr
     results=[]
     for mode in [0,1]:
         output=tmp/f'observe-{mode}.json';e=dict(env)

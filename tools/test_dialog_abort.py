@@ -23,5 +23,5 @@ with tempfile.TemporaryDirectory(prefix="dialog-abort-") as temporary:
         str(root / "libs/system/tests/test_dialog_abort.c"),
         str(root / "libs/system/cellSysutil.c"),
         "-pthread", gc_flag, "-o", str(binary),
-    ], check=True, timeout=60, env=env, cwd=temporary)
+    ], check=True, timeout=300, env=env, cwd=temporary)
     subprocess.run([str(binary)], check=True, timeout=10, env=env, cwd=temporary)

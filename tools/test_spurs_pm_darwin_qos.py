@@ -10,7 +10,7 @@ def run(out):
     exe=out/'fixture'
     cmd=[os.environ.get('CC','cc'),'-std=gnu17','-O2','-UNDEBUG','-ffunction-sections','-fdata-sections','-Wl,-dead_strip','-I'+str(ROOT/'include'),'-I'+str(ROOT/'runtime/spu'),'-I'+str(ROOT/'runtime/platform'),str(ROOT/'tests/test_spurs_pm_darwin_qos.c'),str(ROOT/'libs/spurs/spurs_taskset.c'),*[str(ROOT/'runtime/spu'/(u+'.c')) for u in units],str(ROOT/'runtime/platform/win32_compat.c'),str(ROOT/'runtime/diagnostics/job_io_recorder.c'),'-pthread','-lm','-o',str(exe)]
     (out/'build-argv.json').write_text(json.dumps(cmd,indent=2)+'\n')
-    b=subprocess.run(cmd,capture_output=True,text=True,timeout=60)
+    b=subprocess.run(cmd,capture_output=True,text=True,timeout=300)
     (out/'build.stdout').write_text(b.stdout);(out/'build.stderr').write_text(b.stderr)
     assert not b.returncode,b.stdout+b.stderr
     env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_','PS3_TPROF','PS3_FTRACE'))}

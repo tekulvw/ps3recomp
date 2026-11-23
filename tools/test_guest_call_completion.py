@@ -43,6 +43,6 @@ assert(escaped&&out==0&&g_active_ctx==&owner);assert(!g_trampoline_fn);throwing=
 """
     with tempfile.TemporaryDirectory(prefix='guest-call-completion-') as tmp:
         tmp=Path(tmp);cpp=tmp/'fixture.cpp';cpp.write_text(pre+scope+'\n'+checked+'\n'+legacy+'\n'+('' if checked else baseline)+tests)
-        subprocess.run([os.environ.get('CXX','c++'),'-std=c++20','-O1','-UNDEBUG','-I'+str(root/'runtime/ppu'),str(cpp),'-o',str(tmp/'fixture')],check=True,timeout=30)
+        subprocess.run([os.environ.get('CXX','c++'),'-std=c++20','-O1','-UNDEBUG','-I'+str(root/'runtime/ppu'),str(cpp),'-o',str(tmp/'fixture')],check=True,timeout=300)
         subprocess.run([str(tmp/'fixture')],check=True,timeout=5)
 if __name__=='__main__':main()

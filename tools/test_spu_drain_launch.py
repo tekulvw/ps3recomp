@@ -37,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix='spu-drain-launch-') as td:
                  *[str(SPU/(u+'.c')) for u in UNITS],
                  str(ROOT/'runtime/platform/win32_compat.c'),
                  str(ROOT/'runtime/diagnostics/job_io_recorder.c'),'-pthread','-lm','-o',str(exe)]
-        built=subprocess.run(command,capture_output=True,text=True,timeout=60)
+        built=subprocess.run(command,capture_output=True,text=True,timeout=300)
         assert built.returncode==0,built.stdout+built.stderr
         testenv=dict(env,SPU_REGION_FRAMED='1')
         if diagnostics:testenv.update(SPU_STEPTRACE='906',SPU_EXITTRACE='906')

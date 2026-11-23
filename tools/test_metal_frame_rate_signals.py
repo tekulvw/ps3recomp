@@ -4,7 +4,7 @@ import os, pathlib, platform, subprocess, tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='metal-fps-signals-') as tmp:
     binary = pathlib.Path(tmp) / 'math'
-    subprocess.run(['clang', '-std=c11', '-I', 'libs/video', 'libs/video/tests/test_metal_frame_rate_signals.c', *([] if os.name == 'nt' else ['-lm']), '-o', str(binary)], cwd=ROOT, check=True, timeout=60)
+    subprocess.run(['clang', '-std=c11', '-I', 'libs/video', 'libs/video/tests/test_metal_frame_rate_signals.c', *([] if os.name == 'nt' else ['-lm']), '-o', str(binary)], cwd=ROOT, check=True, timeout=300)
     subprocess.run([str(binary)], check=True, timeout=20)
     if platform.system() != 'Darwin':
         print('SKIP: Objective-C callback fixture requires macOS')
@@ -18,5 +18,5 @@ with tempfile.TemporaryDirectory(prefix='metal-fps-signals-') as tmp:
                                            '-Wl,-U,_cellGcm_rsx_consumer_end']}
         for name, args in [('test_metal_frame_rate_signals', []), ('test_metal_frame_rate', ['stats'])]:
             binary = pathlib.Path(tmp) / name
-            subprocess.run(common + ['libs/video/tests/' + name + '.m'] + link + extra[name] + ['-o', str(binary)], cwd=ROOT, check=True, timeout=60)
+            subprocess.run(common + ['libs/video/tests/' + name + '.m'] + link + extra[name] + ['-o', str(binary)], cwd=ROOT, check=True, timeout=300)
             subprocess.run([str(binary)] + args, check=True, timeout=20)

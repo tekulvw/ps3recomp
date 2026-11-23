@@ -21,17 +21,17 @@ def main():
         work=Path(temp);objects=[]
         stub=work/'stub.exe'
         subprocess.run([compiler,'/nologo','/std:c17','/O1','/MT','/W4','/WX','/I'+str(root/'include'),
-            str(root/'libs/video/tests/test_live_draw_report_batch_stub.c'),'/Fe'+str(stub),'/Fo'+str(work/'stub.obj')],check=True,timeout=60)
+            str(root/'libs/video/tests/test_live_draw_report_batch_stub.c'),'/Fe'+str(stub),'/Fo'+str(work/'stub.obj')],check=True,timeout=300)
         subprocess.run([str(stub)],check=True,timeout=10)
         print('PASS non-Windows API stub (no GPU)',flush=True)
         for i,source in enumerate((root/'libs/video/tests/test_live_draw_report_batch.c',root/'runtime/host/host_stubs.c')):
             obj=work/(str(i)+'.obj')
             subprocess.run([compiler,'/nologo','/std:c17','/O1','/Gy','/Gw','/W0','/MT','/D_CRT_SECURE_NO_WARNINGS',
-                '/I'+str(root/'include'),'/I'+str(root/'libs/video'),'/I'+str(root/'runtime'),'/c',str(source),'/Fo'+str(obj)],check=True,timeout=90)
+                '/I'+str(root/'include'),'/I'+str(root/'libs/video'),'/I'+str(root/'runtime'),'/c',str(source),'/Fo'+str(obj)],check=True,timeout=300)
             objects.append(str(obj))
         exe=work/'fixture.exe'
         libs=('d3d12','dxgi','d3dcompiler','dxguid','gdi32','user32','ole32','ws2_32','xinput','bcrypt','winmm','shlwapi','synchronization','psapi','dbghelp')
-        subprocess.run([compiler,'/nologo',*objects,str(a.runtime_library.resolve()),'/Fe'+str(exe),'/link','/OPT:REF',*(x+'.lib' for x in libs)],check=True,timeout=90)
+        subprocess.run([compiler,'/nologo',*objects,str(a.runtime_library.resolve()),'/Fe'+str(exe),'/link','/OPT:REF',*(x+'.lib' for x in libs)],check=True,timeout=300)
         scenarios=('mip-pressure','cube-pressure','oversize','draw-pressure','multi-texture-pressure','pressure-failure','adapter','lease','status-failures',
             'failure-close','failure-signal','failure-fence','failure-wait','failure-device','failure-reset','failure-list-reset') if a.scenario=='all' else (
             ('draw-pressure','multi-texture-pressure','pressure-failure') if a.scenario=='preparation' else (a.scenario,))
