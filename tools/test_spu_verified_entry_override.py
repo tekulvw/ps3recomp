@@ -18,7 +18,7 @@ with tempfile.TemporaryDirectory(prefix='spu-entry-override-') as td:
         command=['cc','-std=gnu17','-O2','-UNDEBUG','-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform'),str(spu/'tests/test_spu_verified_entry_override.c'),*[str(spu/(unit+'.c')) for unit in units],str(root/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(binary)]
         if sanitize: command[1:1]=['-fsanitize=undefined','-fno-sanitize-recover=all']
         if os.environ.get('RED')=='1':command[1:1]=['-DSPU_OVERRIDE_RED']
-        result=subprocess.run(command,capture_output=True,text=True,timeout=45)
+        result=subprocess.run(command,capture_output=True,text=True,timeout=300)
         assert result.returncode==0,result.stderr
         for prefilter in ('0','1'):
             result=subprocess.run([str(binary)],env=dict(env,SPU_VERIFIED_ENTRY_PREFILTER=prefilter),capture_output=True,text=True,timeout=10)

@@ -246,6 +246,15 @@ s32 sceNpBasicGetBlockListEntryCount(u32* count)
     return CELL_OK;
 }
 
+/* The block list is empty (count 0 above), so there is no entry to read. */
+s32 sceNpBasicGetBlockListEntry(u32 index, void* npid)
+{
+    printf("[sceNpBasic] GetBlockListEntry(%u) -> DATA_NOT_FOUND (empty list)\n", index);
+    if (!npid)
+        return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
+    return (s32)SCE_NP_BASIC_ERROR_DATA_NOT_FOUND;
+}
+
 s32 sceNpBasicAddBlockListEntry(const SceNpOnlineId* onlineId)
 {
     onlineId = GUEST_PTR(onlineId, const SceNpOnlineId*);

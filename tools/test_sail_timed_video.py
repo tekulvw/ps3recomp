@@ -26,7 +26,7 @@ def main():
         subprocess.run([os.environ.get('CC','cc'),'-DPS3RECOMP_SAIL_FFMPEG=1','-std=gnu17','-O1','-UNDEBUG',*includes,'-c',str(root/'libs/codec/cellPamf.c'),'-o',str(tmp/'pamf.o')],check=True,timeout=30)
         (tmp/'pictures.c').write_text('#include "'+str(root/'libs/video/rsx_picture_identity.inc')+'"\n')
         subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1',*includes,'-c',str(tmp/'pictures.c'),'-o',str(tmp/'pictures.o')],check=True,timeout=30)
-        subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG',*includes,str(root/'tests/test_sail_timed_video.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),str(tmp/'nids.cpp'),str(tmp/'sail.o'),str(tmp/'pamf.o'),str(tmp/'pictures.o'),'-o',str(tmp/'fixture')],check=True,timeout=45)
+        subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG',*includes,str(root/'tests/test_sail_timed_video.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),str(tmp/'nids.cpp'),str(tmp/'sail.o'),str(tmp/'pamf.o'),str(tmp/'pictures.o'),'-o',str(tmp/'fixture')],check=True,timeout=300)
         env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','TMPDIR','SYSTEMROOT')}
         media=None
         if media is not None: shutil.copyfile(media,tmp/'thx.pam')

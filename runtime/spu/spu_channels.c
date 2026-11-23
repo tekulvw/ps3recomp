@@ -4118,6 +4118,46 @@ static inline void spurs_kernel_select_workload_body(spu_context* ctx)
 }
 void spurs_kernel_select_workload(spu_context* ctx) { spurs_kernel_select_workload_body(ctx); }
 
+/* SPU_DISPATCH_KIND_STATS=1: what the indirect-branch lookups are. Lifted
+ * code already returns natively through a live brsl/bisl frame (SPU_RET with
+ * host_depth > 0 never gets here), so a lookup is one of:
+ *   ret_pc   the target is the innermost live call's planted return pc
+ *            (drain_ret_pc) -- a return the drain did not short-circuit;
+ *   link0    the target is the value in r0, the link register: a return
+ *            through r0, split by whether a host call frame is live (depth>0)
+ *            or gone (depth 0: task resume, restack, top-level drain);
+ *   other    any other target: indirect calls (bisl), computed jumps,
+ *            returns through another link register, interrupt returns.
+ * Counted per thread; one cumulative line per thread at most once a second. */
+static int spu_dispatch_kind_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_DISPATCH_KIND_STATS"); on = e && !strcmp(e, "1"); }
+    return on;
+}
+static SPU_TLS struct { unsigned long long n, ret_pc, link0_live, link0_gone, other_live, other_gone, next_ms; unsigned id; } t_dk;
+static unsigned s_dk_threads;
+static void spu_dispatch_kind_note(const spu_context* ctx)
+{
+    const uint32_t pc = ctx->pc & SPU_LS_MASK;
+    const int live = ctx->host_depth > 0;
+    if (ctx->drain_ret_pc && pc == (ctx->drain_ret_pc & SPU_LS_MASK)) t_dk.ret_pc++;
+    else if (pc == (ctx->gpr[0]._u32[0] & SPU_LS_MASK)) { if (live) t_dk.link0_live++; else t_dk.link0_gone++; }
+    else if (live) t_dk.other_live++;
+    else t_dk.other_gone++;
+    if ((++t_dk.n & 4095u) == 0) {
+        const unsigned long long now = GetTickCount64();
+        if (now >= t_dk.next_ms) {
+            t_dk.next_ms = now + 1000;
+            if (!t_dk.id) t_dk.id = __atomic_add_fetch(&s_dk_threads, 1u, __ATOMIC_RELAXED);
+            fprintf(stderr, "[spu-dispatch-kind] t_ms=%llu thread=%u spu=%d lookups=%llu ret_pc=%llu "
+                    "link0_live=%llu link0_gone=%llu other_live=%llu other_gone=%llu\n",
+                    now, t_dk.id, t_ft_spu, t_dk.n, t_dk.ret_pc, t_dk.link0_live, t_dk.link0_gone,
+                    t_dk.other_live, t_dk.other_gone);
+        }
+    }
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -4317,6 +4357,7 @@ void spu_indirect_branch(spu_context* ctx)
         if (ti) ctx->resident_task = ti;
     }
     /* Use the same ownership order as the interpreter's rejoin probe. */
+    if (spu_dispatch_kind_on()) spu_dispatch_kind_note(ctx);
     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
     const spu_fn ibf_plain = fn;   /* the short entry records only this answer */
     /* The job returned through the link register we planted: it is finished.

@@ -26,7 +26,7 @@ def main():
         env = {k: v for k, v in os.environ.items() if not k.startswith(('PAD_', 'YDKJ_'))}
         for mode in ('analog-reparse','reparse','analog','analog-no-controller','analog-focus','analog-osk','analog-invalid','analog-locked','analog-mixed','analog-off','analog-no-focus',
                      'osk-owner','late-unfocused', 'locked-admission', 'focused', 'no-controller', 'blocked-discard', 'long-path', 'legacy', 'zero', 'no-file',
-                     'keyboard', 'keyboard-azerty', 'keyboard-controller', 'keyboard-off'):
+                     'keyboard', 'keyboard-azerty', 'keyboard-controller', 'keyboard-controller-off', 'keyboard-off'):
             subprocess.run([str(binary), mode, str(work/(mode+'.txt'))],
                            cwd=work, env=env, check=True, timeout=10)
     return 0
