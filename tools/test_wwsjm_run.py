@@ -169,7 +169,8 @@ def check(binary: Path) -> list[str]:
         r, err = run(binary, ['native'], {'PS3RECOMP_SPURS_NATIVE_PM': mode})
         want = dict(done='1', jobs='73', ran='73', dup='0', missing='0', bad_out='0', regs='0', ctx='0', ud='0',
                     module='0', gather='0', desc='0', tag='0', finish='0', violations='0', lifted='0', current='1',
-                    n0='43', s0='43', n1='77', s1='77', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0', stack='0', listcopy='0', overlap='0', race='12', stalls='0', lost_kicks='0')
+                    n0='43', s0='43', n1='77', s1='77', lanes_busy='0', gate='0', switches='FFFE', lowls='0', irq='0', stack='0', listcopy='0', overlap='0', race='12', stalls='0', lost_kicks='0',
+                    flag_ready='1')
         for k, v in want.items():
             expect(r.get(k) == v, f'native {mode}: {k}={r.get(k)} expected {v}')
         expect(int(r.get('finish_jobs', 0)) > 0, f'native {mode}: finish never claimed a next job: {r}')
@@ -181,12 +182,12 @@ def check(binary: Path) -> list[str]:
                    int(s.get('resident_skips', 0)) > 0 and s.get('retires') == '73' and
                    int(s.get('putllc_retries', 0)) > 0,
                    f'native {mode}: counters {s}')
-            # the in-run flag poll is followed by ready := 8 (6.1, U19); the race
-            # entries' kicks are never lost (spec 16, R12: stalls=0 above)
-            # the flag raised inside the second workload's job is honoured exactly
-            # once: by the poll inside finish (6.1, U19), or, when another lane's
-            # dispatch takes it first, at that run's entry
-            expect(int(s.get('flag_polls', 0)) + int(s.get('flag_entries', 0)) == 1,
+            # the in-run flag poll is followed by ready := 8 (6.1, U19; flag_ready
+            # above); the race entries' kicks are never lost (spec 16, R12:
+            # stalls=0 above). The second workload runs on one lane at a time, so
+            # the flag raised inside its job is always taken by the poll inside
+            # finish, never by another lane's entry.
+            expect(s.get('flag_polls') == '1' and s.get('flag_entries') == '0',
                    f'native {mode}: the in-run flag: {s}')
             expect(s.get('gather_overlaps') == '73', f'native {mode}: gathers into the list copy: {s}')
         # every one of the 8 in-window publications whose kick the lane then
