@@ -43,7 +43,7 @@ def main():
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1',
                         '-ffunction-sections', '-fdata-sections', '-c',
                         str(ROOT / 'runtime/syscalls/sys_memory.c'), '-o', str(obj)],
-                       check=True, timeout=60)
+                       check=True, timeout=300)
         flags = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-ldl']
         binary = tmp / 'fixture'
         subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O1',
@@ -52,7 +52,7 @@ def main():
                         '-I' + str(ROOT / 'runtime/platform'),
                         str(ROOT / 'runtime/ppu/ppu_loader.cpp'),
                         str(ROOT / 'tests/test_loaded_image_memory.cpp'),
-                        str(obj), *flags, '-o', str(binary)], check=True, timeout=120)
+                        str(obj), *flags, '-o', str(binary)], check=True, timeout=300)
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(('PPU_', 'PS3_', 'PS3RECOMP_', 'SPU_'))}
         subprocess.run([str(binary), str(elf), str(empty)], env=env, check=True, timeout=20)

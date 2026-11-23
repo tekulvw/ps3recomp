@@ -25,10 +25,10 @@ with tempfile.TemporaryDirectory(prefix='ppu-original-observer-')as temporary:
         for name,input_source in [('fixture',ROOT/'tests/test_ppu_original_work.c'),('observer',ROOT/'runtime/diagnostics/original_work_observer.c')]:
             obj=directory/(name+'.o');objects.append(str(obj))
             compiler=[os.environ.get('CXX','c++'),'-std=gnu++20','-x','c++'] if name=='fixture' else [os.environ.get('CC','cc'),'-std=gnu17']
-            built=subprocess.run([*compiler,*flags,'-c',str(input_source),'-o',str(obj)],capture_output=True,text=True,timeout=60)
+            built=subprocess.run([*compiler,*flags,'-c',str(input_source),'-o',str(obj)],capture_output=True,text=True,timeout=300)
             if built.returncode:raise RuntimeError(built.stdout+built.stderr)
         command=[os.environ.get('CXX','c++'),'-std=gnu++20',*flags,'-x','c++',str(directory/'ppu_recomp.c'),'-x','none',*objects,'-lm','-o',str(binary)]
-        built=subprocess.run(command,capture_output=True,text=True,timeout=60)
+        built=subprocess.run(command,capture_output=True,text=True,timeout=300)
         if built.returncode:raise RuntimeError(built.stdout+built.stderr)
         if args.compile_only:
             print(f'PPU observed={observed} BUILD ONLY; execution pending',flush=True)

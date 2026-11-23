@@ -64,11 +64,11 @@ def main():
                        "-fdata-sections", "-Iinclude", "-Ilibs/video", *flags]
             if cxx:
                 command += ["-DPS3RECOMP_HAVE_SPIRV_TRANSLATION=1", *glslang_flags]
-            subprocess.run(command + ["-c", source, "-o", str(output)], cwd=ROOT, check=True, timeout=120)
+            subprocess.run(command + ["-c", source, "-o", str(output)], cwd=ROOT, check=True, timeout=300)
             objects.append(str(output))
         binary = Path(tmp) / "fixture"
         subprocess.run([os.environ.get("CXX", "c++"), *objects, "-Wl,--gc-sections", "-pthread", "-ldl", "-lm",
-                        *libraries, *glslang_libs, "-o", str(binary)], cwd=ROOT, check=True, timeout=120)
+                        *libraries, *glslang_libs, "-o", str(binary)], cwd=ROOT, check=True, timeout=300)
         settings = Path(tmp) / "vk_layer_settings.txt"
         settings.write_text("khronos_validation.validate_core = true\n"
                             "khronos_validation.validate_sync = true\n")

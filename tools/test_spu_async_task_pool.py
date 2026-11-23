@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix='spu-async-task-pool-') as tmp:
                     *[str(spu / (u + '.c')) for u in units],
                     str(root / 'runtime/platform/win32_compat.c'),
                     str(root / 'runtime/diagnostics/job_io_recorder.c'),
-                    '-pthread', '-lm', '-o', str(binary)], check=True, timeout=180)
+                    '-pthread', '-lm', '-o', str(binary)], check=True, timeout=300)
     results = {}
     for mode in (None, '1'):
         e = dict(env)

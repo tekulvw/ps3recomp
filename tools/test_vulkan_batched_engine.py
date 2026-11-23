@@ -57,17 +57,17 @@ def main():
                        "-fdata-sections", "-Iinclude", "-Ilibs/video", *flags]
             if cxx:
                 command += ["-DPS3RECOMP_HAVE_SPIRV_TRANSLATION=1", *glslang_flags]
-            subprocess.run(command + ["-c", source, "-o", str(output)], cwd=ROOT, check=True, timeout=120)
+            subprocess.run(command + ["-c", source, "-o", str(output)], cwd=ROOT, check=True, timeout=300)
             objects.append(str(output))
         binary = Path(tmp) / "fixture"
         link = [os.environ.get("CXX", "c++"), *objects, "-Wl,--gc-sections", "-pthread", "-ldl", "-lm",
                 *libraries, *glslang_libs, "-o", str(binary)]
-        linked = subprocess.run(link, cwd=ROOT, capture_output=True, text=True, timeout=120)
+        linked = subprocess.run(link, cwd=ROOT, capture_output=True, text=True, timeout=300)
         if linked.returncode:
             # A static glslang (Ubuntu's glslang-dev) needs SPIRV-Tools and the
             # SPIRV library spelled out after it; a shared one does not.
             extra = ["-lSPIRV", "-lSPIRV-Tools-opt", "-lSPIRV-Tools"]
-            retried = subprocess.run(link[:-2] + extra + link[-2:], cwd=ROOT, capture_output=True, text=True, timeout=120)
+            retried = subprocess.run(link[:-2] + extra + link[-2:], cwd=ROOT, capture_output=True, text=True, timeout=300)
             if retried.returncode:
                 sys.stderr.write(linked.stderr + retried.stderr)
                 raise SystemExit("linking the fixture failed")

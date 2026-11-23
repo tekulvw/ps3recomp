@@ -20,7 +20,7 @@ def main():
             subprocess.run(["cc", "-std=gnu17", "-ffunction-sections", "-fdata-sections",
                             "-Iinclude", "-D" + define, "libs/network/tests/test_socket_sigpipe.c",
                             "-Wl,-dead_strip" if os.uname().sysname == "Darwin" else "-Wl,--gc-sections",
-                            "-pthread", "-o", str(binary)], cwd=ROOT, check=True, timeout=120)
+                            "-pthread", "-o", str(binary)], cwd=ROOT, check=True, timeout=300)
             control = subprocess.run([str(binary), "raw", "default"], capture_output=True, timeout=10)
             assert control.returncode == -signal.SIGPIPE, control
             for mode in modes:

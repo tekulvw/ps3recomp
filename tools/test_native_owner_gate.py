@@ -24,5 +24,5 @@ with tempfile.TemporaryDirectory(prefix='native-owner-gate-') as tmp:
                    source, str(ROOT/'runtime/platform/win32_compat.c'),
                    '-Wl,-dead_strip' if sys.platform == 'darwin' else '-Wl,--gc-sections',
                    '-pthread', '-o', str(binary)]
-    subprocess.run(command, check=True, timeout=60)
+    subprocess.run(command, check=True, timeout=300)
     subprocess.run([str(binary)], check=True, timeout=20)

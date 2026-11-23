@@ -21,9 +21,9 @@ def main():
             obj=work/(str(i)+'.obj');objects.append(str(obj))
             host_flags=['/Dps3_hle_register_ctx=fixture_unused_hle_register_ctx'] if i==1 else ['/DPS3RECOMP_NATIVE_OSK_WINDOWS=1']
             subprocess.run([compiler,'/nologo','/std:c17','/O1','/MT','/Gy','/Gw','/W0','/UNDEBUG','/D_CRT_SECURE_NO_WARNINGS',*host_flags,
-                '/I'+str(root/'include'),'/I'+str(root/'runtime/ppu'),'/c',str(source),'/Fo'+str(obj)],check=True,timeout=60)
+                '/I'+str(root/'include'),'/I'+str(root/'runtime/ppu'),'/c',str(source),'/Fo'+str(obj)],check=True,timeout=300)
         binary=work/'fixture.exe';libraries=['d3d12','dxgi','d3dcompiler','dxguid','gdi32','user32','ole32','ws2_32','xinput','bcrypt','winmm','shlwapi','synchronization','psapi','dbghelp']
-        subprocess.run([compiler,'/nologo','/std:c++17','/EHsc','/MT','/Gy','/Gw','/W0','/D_CRT_SECURE_NO_WARNINGS','/I'+str(root/'include'),'/I'+str(root/'runtime/ppu'),'/I'+str(work),*objects,str(work/'nids.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),str(root/'tests/native_osk_bridge.cpp'),str(args.runtime_library),'/Fo'+str(work)+'\\','/Fe'+str(binary),'/link','/OPT:REF',*(x+'.lib' for x in libraries)],check=True,timeout=90)
+        subprocess.run([compiler,'/nologo','/std:c++17','/EHsc','/MT','/Gy','/Gw','/W0','/D_CRT_SECURE_NO_WARNINGS','/I'+str(root/'include'),'/I'+str(root/'runtime/ppu'),'/I'+str(work),*objects,str(work/'nids.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),str(root/'tests/native_osk_bridge.cpp'),str(args.runtime_library),'/Fo'+str(work)+'\\','/Fe'+str(binary),'/link','/OPT:REF',*(x+'.lib' for x in libraries)],check=True,timeout=300)
         user=ctypes.WinDLL('user32',use_last_error=True)
         user.CreateDesktopW.argtypes=[W.LPCWSTR,W.LPCWSTR,ctypes.c_void_p,W.DWORD,W.DWORD,ctypes.c_void_p];user.CreateDesktopW.restype=W.HANDLE
         user.CloseDesktop.argtypes=[W.HANDLE];user.CloseDesktop.restype=W.BOOL

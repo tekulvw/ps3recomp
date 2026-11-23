@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix='sys-event-race-') as tmp:
     else:
         command = [compiler, '-std=gnu17', '-O2', '-UNDEBUG', *('-I' + str(i) for i in includes),
                    str(SOURCE), *([] if windows else ['-pthread']), '-o', str(binary)]
-    subprocess.run(command, check=True, timeout=180, cwd=tmp)
+    subprocess.run(command, check=True, timeout=300, cwd=tmp)
     for attempt in range(3):
         run = subprocess.run([str(binary)], cwd=tmp, timeout=180, capture_output=True, text=True)
         print(run.stdout.strip(), flush=True)

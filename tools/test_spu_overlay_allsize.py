@@ -45,7 +45,7 @@ def run(work):
         if sanitize:cmd+=['-fsanitize=undefined','-fno-sanitize-recover=all']
         cmd+=['-I'+str(where),'-I'+str(work),'-I'+str(ROOT/'include'),'-I'+str(SPU),'-I'+str(ROOT/'runtime/platform'),str(SPU/'tests/test_spu_overlay_allsize.c'),*[str(SPU/(u+'.c')) for u in units],str(ROOT/'runtime/platform/win32_compat.c'),str(ROOT/'runtime/diagnostics/job_io_recorder.c'),'-pthread','-lm','-o',str(exe)]
         (where/'build-argv.json').write_text(json.dumps(cmd,indent=2)+'\n')
-        build=subprocess.run(cmd,capture_output=True,text=True,timeout=60)
+        build=subprocess.run(cmd,capture_output=True,text=True,timeout=300)
         (where/'build.stdout').write_text(build.stdout);(where/'build.stderr').write_text(build.stderr)
         assert not build.returncode,build.stdout+build.stderr
         results=[]

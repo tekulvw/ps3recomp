@@ -14,5 +14,5 @@ if not compiler: raise SystemExit('A Windows C compiler is required')
 with tempfile.TemporaryDirectory(prefix='d3d-checked-') as temp:
     binary=Path(temp)/'test.exe'
     subprocess.run([compiler,'/nologo','/std:c17','/W4','/WX','/MT',
-        str(root/'libs/video/tests/test_d3d12_checked_fence.c'),'/Fo'+temp+'\\','/Fe'+str(binary)],check=True,timeout=60)
+        str(root/'libs/video/tests/test_d3d12_checked_fence.c'),'/Fo'+temp+'\\','/Fe'+str(binary)],check=True,timeout=300)
     subprocess.run([str(binary)],check=True,timeout=10)

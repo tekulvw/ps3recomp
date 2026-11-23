@@ -19,5 +19,5 @@ with tempfile.TemporaryDirectory(prefix="gcm-kick-stats-") as tmp:
                str(sdk / "runtime/platform/win32_compat.c"),
                "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
                "-pthread", "-lm", "-o", str(out)]
-    subprocess.run(command, check=True, timeout=60)
+    subprocess.run(command, check=True, timeout=300)
     subprocess.run([str(out)], check=True, timeout=20)

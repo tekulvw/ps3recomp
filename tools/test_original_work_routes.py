@@ -55,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix='original-routes-') as temporary:
         str(ROOT/'runtime/diagnostics/original_work_threads_windows.c'),
         str(ROOT/'runtime/diagnostics/job_io_recorder.c'),str(ROOT/'runtime/diagnostics/critical_trace.c'),
         *[str(tmp/name/'spu_recomp.c')for name in ['legacy','region','leaf','halt']],'-pthread','-lm','-o',str(binary)]
-    compiled=subprocess.run(command,capture_output=True,text=True,timeout=90)
+    compiled=subprocess.run(command,capture_output=True,text=True,timeout=300)
     if compiled.returncode:raise RuntimeError(compiled.stdout+compiled.stderr)
     if args.compile_only:
         print('BUILD ONLY: original runtime/generated fixture linked; execution pending',flush=True)
@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix='original-routes-') as temporary:
     default_command=[os.environ.get('CC','cc'),'-std=gnu17','-O2',
         *['-I'+str(path)for path in [ROOT/'include',SPU,ROOT/'runtime/platform']],
         '-c',str(SPU/'spu_interp.c'),'-o',str(default_object)]
-    checked=subprocess.run(default_command,capture_output=True,text=True,timeout=60)
+    checked=subprocess.run(default_command,capture_output=True,text=True,timeout=300)
     if checked.returncode:raise RuntimeError(checked.stdout+checked.stderr)
     symbols=subprocess.run([os.environ.get('NM','nm'),'-u',str(default_object)],capture_output=True,text=True,timeout=120)
     if symbols.returncode:raise RuntimeError(symbols.stdout+symbols.stderr)

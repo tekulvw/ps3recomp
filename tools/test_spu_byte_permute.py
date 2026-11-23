@@ -37,7 +37,7 @@ common = ["-std=gnu17", "-UNDEBUG", "-fno-strict-aliasing", "-ffp-contract=off",
 
 def run(argv, label, output, env=None):
     process = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             timeout=60, env=env)
+                             timeout=300, env=env)
     commands.append({"label": label, "argv": [str(x) for x in argv], "exit_code": process.returncode,
                      "output": process.stdout})
     (output / (label + ".log")).write_text(process.stdout)

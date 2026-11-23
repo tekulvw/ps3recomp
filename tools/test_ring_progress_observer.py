@@ -20,5 +20,5 @@ with tempfile.TemporaryDirectory(prefix="ring-progress-observer-") as directory:
                str(ROOT / "libs/video/tests/gcm_deferred_fixture_stubs.c"), str(ROOT / "libs/video/rsx_fifo_busy.c"),
                "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
                "-pthread", "-lm", "-o", str(binary)]
-    subprocess.run(command, check=True, timeout=60)
+    subprocess.run(command, check=True, timeout=300)
     subprocess.run([str(binary)], check=True, timeout=10)

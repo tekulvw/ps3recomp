@@ -11,9 +11,9 @@ def main():
         work=Path(tmp);objects=[]
         for i,src in enumerate((root/'libs/video/tests/test_gcm_live_report_gpu.c',root/'runtime/host/host_stubs.c')):
             defines=['/Dps3_ww_report_inline=fixture_inert_write_watch']if i==1 else[]
-            obj=work/f'{i}.obj';subprocess.run([cc,'/nologo','/std:c17','/O1','/Gy','/Gw','/W0','/MT','/D_CRT_SECURE_NO_WARNINGS',*defines,'/I'+str(root/'include'),'/I'+str(root/'libs/video'),'/I'+str(root/'runtime'),'/c',str(src),'/Fo'+str(obj)],check=True,timeout=90);objects.append(str(obj))
+            obj=work/f'{i}.obj';subprocess.run([cc,'/nologo','/std:c17','/O1','/Gy','/Gw','/W0','/MT','/D_CRT_SECURE_NO_WARNINGS',*defines,'/I'+str(root/'include'),'/I'+str(root/'libs/video'),'/I'+str(root/'runtime'),'/c',str(src),'/Fo'+str(obj)],check=True,timeout=300);objects.append(str(obj))
         exe=work/'fixture.exe';libs=('d3d12','dxgi','d3dcompiler','dxguid','gdi32','user32','ole32','ws2_32','xinput','bcrypt','winmm','shlwapi','synchronization','psapi','dbghelp')
-        subprocess.run([cc,'/nologo',*objects,str(a.runtime_library.resolve()),'/Fe'+str(exe),'/link','/OPT:REF',*(x+'.lib'for x in libs)],check=True,timeout=90)
+        subprocess.run([cc,'/nologo',*objects,str(a.runtime_library.resolve()),'/Fe'+str(exe),'/link','/OPT:REF',*(x+'.lib'for x in libs)],check=True,timeout=300)
         for mode in (('batch','dependency','partial')if a.scenario=='all'else(a.scenario,)):
             print('SCENARIO',mode,flush=True);r=subprocess.run([str(exe),mode],cwd=work,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=60);print(r.stdout,flush=True)
             r.check_returncode();validated=False;writes=0

@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix="gcm-reports-midprim-") as tmp:
            "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
            str(ROOT / "libs/video/tests/gcm_deferred_fixture_stubs.c"),str(ROOT / "libs/video/rsx_fifo_busy.c"),
            "-pthread", "-lm", "-o", str(out)]
-    subprocess.run(cmd, check=True, timeout=60)
+    subprocess.run(cmd, check=True, timeout=300)
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("PS3RECOMP_", "GCM_", "MAG_"))}
     subprocess.run([str(out)], check=True, timeout=10, env=env)

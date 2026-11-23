@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix="gcm-report-") as tmp:
            "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
            str(ROOT / "libs/video/tests/gcm_deferred_fixture_stubs.c"),str(ROOT / "libs/video/rsx_fifo_busy.c"),
            "-pthread", "-lm", "-o", str(out)]
-    subprocess.run(cmd, check=True, timeout=60)
+    subprocess.run(cmd, check=True, timeout=300)
 
     for mode in ("live_data_ea","park_patch","park_branch","park_wrap","park_invalid","circling","invalid_jump","held","repeat_wrap","unknown_word","malformed","incomplete","success","failure","rescue","overflow","external_success","external_failure","external_notready","external_report_success","external_report_failure","external_held"):
         subprocess.run([str(out),mode],check=True,timeout=10)

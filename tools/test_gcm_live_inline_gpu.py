@@ -15,9 +15,9 @@ def main():
         for i,source in enumerate((root/'libs/video/tests/test_gcm_live_inline_gpu.c',root/'runtime/host/host_stubs.c')):
             obj=work/f'{i}.obj';defines=['/Dps3_ww_report_inline=fixture_inert_write_watch']if i else[]
             subprocess.run([cc,'/nologo','/std:c17','/O1','/Gy','/Gw','/W0','/MT','/D_CRT_SECURE_NO_WARNINGS',*defines,
-                '/I'+str(root/'include'),'/I'+str(root/'libs/video'),'/I'+str(root/'runtime'),'/c',str(source),'/Fo'+str(obj)],check=True,timeout=90);objects.append(str(obj))
+                '/I'+str(root/'include'),'/I'+str(root/'libs/video'),'/I'+str(root/'runtime'),'/c',str(source),'/Fo'+str(obj)],check=True,timeout=300);objects.append(str(obj))
         exe=work/'fixture.exe';libs=('d3d12','dxgi','d3dcompiler','dxguid','gdi32','user32','ole32','ws2_32','xinput','bcrypt','winmm','shlwapi','synchronization','psapi','dbghelp')
-        subprocess.run([cc,'/nologo',*objects,str(a.runtime_library.resolve()),'/Fe'+str(exe),'/link','/OPT:REF',*(x+'.lib'for x in libs)],check=True,timeout=90)
+        subprocess.run([cc,'/nologo',*objects,str(a.runtime_library.resolve()),'/Fe'+str(exe),'/link','/OPT:REF',*(x+'.lib'for x in libs)],check=True,timeout=300)
         modes=('fp','vertex','index','pending','off','batch-off','partial','failure','pressure','reference')if a.scenario=='all'else(
             ('fp','pending','pressure','reference')if a.scenario=='constants'else(a.scenario,))
         for mode in modes:

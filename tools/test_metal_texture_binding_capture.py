@@ -14,5 +14,5 @@ else:
         subprocess.run(["clang","-fobjc-arc","-DPS3RECOMP_DISABLE_NATIVE_OSK","-Iinclude","-Ilibs/video",
             "libs/video/tests/test_metal_texture_binding_capture.m","libs/video/rsx_texture_layout.c",'runtime/diagnostics/critical_trace.c','runtime/diagnostics/render_ablation.c','libs/video/rsx_fifo_busy.c',
             "libs/input/pad_macos.m","-Wl,-dead_strip","-framework","Metal","-framework","Cocoa",
-            "-framework","QuartzCore","-o",str(binary)],cwd=root,check=True,timeout=120)
+            "-framework","QuartzCore","-o",str(binary)],cwd=root,check=True,timeout=300)
         subprocess.run([str(binary),str(directory/"texture.rgba")],check=True,timeout=30)

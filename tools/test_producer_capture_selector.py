@@ -15,7 +15,7 @@ with tempfile.TemporaryDirectory(prefix="producer-selector-") as directory:
                "libs/video/rsx_vertex_compact.c", "libs/video/rsx_texture_layout.c", "libs/video/rsx_vp_decompiler.c",
                "libs/video/rsx_fp_decompiler.c", "runtime/diagnostics/render_ablation.c", "runtime/diagnostics/critical_trace.c", "libs/video/rsx_fifo_busy.c"]
     subprocess.run(["cc", "-std=gnu17", "-O2", "-UNDEBUG", "-fsanitize=undefined", "-Iinclude", "-Ilibs/video",
-                    *sources, "-o", str(binary)], cwd=root, check=True, timeout=60)
+                    *sources, "-o", str(binary)], cwd=root, check=True, timeout=300)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("RSX_ENGINE_", "PS3RECOMP_RSX_BINDING_CAPTURE"))}
     for mode in ("wildcard", "exact", "wrong-control", "unset", "empty", "malformed", "multiple", "wrong-target", "oversized-limit"):
         output = directory / mode

@@ -51,7 +51,7 @@ def main():
                         "libs/video/tests/gcm_deferred_fixture_stubs.c", "libs/input/pad_macos.m", "-lc++",
                         "-Wl,-dead_strip", "-framework", "Metal", "-framework", "Cocoa",
                         "-framework", "QuartzCore", *flags, "-o", str(binary)],
-                       cwd=ROOT, check=True, timeout=180)
+                       cwd=ROOT, check=True, timeout=300)
         result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120)
         print(result.stdout.strip())
         if result.returncode:

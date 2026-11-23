@@ -20,7 +20,7 @@ def main():
                    "runtime/diagnostics/critical_trace.c","libs/video/rsx_fifo_busy.c", "runtime/diagnostics/render_ablation.c",
                    "libs/input/pad_macos.m", "-Wl,-dead_strip", "-framework", "Metal",
                    "-framework", "Cocoa", "-framework", "QuartzCore", "-o", str(binary)]
-        subprocess.run(command, cwd=ROOT, check=True, timeout=90)
+        subprocess.run(command, cwd=ROOT, check=True, timeout=300)
         if args.build_only:
             print("Metal frontend fixture compiled; GPU execution not performed")
             return
