@@ -23,7 +23,7 @@ GETTER = LAYOUT + r'''
 #include <string.h>
 int ps3recomp_audio_host_stats(struct ps3recomp_audio_host_stats* out)
 { memset(out, 0, sizeof *out); out->version = 1; out->sample_rate = 48000; out->clock_frames = 480000;
-  out->clock_ns = 10000000000ull; strcpy(out->backend, "dummy"); return 0; }
+  out->clock_ns = 10000000000ull; memcpy(out->backend, "dummy", 6); return 0; }
 '''
 CALLER = LAYOUT.replace('_Static_assert', 'static_assert') + r'''
 #include <cstdio>
