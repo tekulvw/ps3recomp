@@ -41,6 +41,13 @@ SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload cal
 SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
 SPU_THREAD_LOCAL volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
+/* Opt-in policy-run recorder and statistics (PS3RECOMP_SPURS_PM_RECORD,
+ * PS3RECOMP_SPURS_PM_STATS); inert unless configured. */
+#include "spurs_pm_record.inc"
+/* The native policy-module seam (PS3RECOMP_SPURS_NATIVE_PM); inert unless an
+ * implementation is registered and selected. */
+#include "spurs_native_pm.inc"
+
 /* LV2 service endpoints for resident policy contexts. IDs have a disjoint
  * runtime namespace from ordinary LV2 SPU threads (allocated from 0x2000).
  * Each ID owns an actual context; reset/retirement invalidates its generation.
@@ -278,7 +285,17 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
                           uint32_t spu_num)
 {
-    if (!entry || !pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
+    return spu_run_policy_module_native(NULL, entry, image_id, pm_host, pm_size,
+                                        wkl_data, wid, spurs_ea, spu_num);
+}
+
+int spu_run_policy_module_native(const struct spurs_native_pm* native,
+                                 spu_lifted_entry_fn entry, int image_id,
+                                 const uint8_t* pm_host, uint32_t pm_size,
+                                 uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
+                                 uint32_t spu_num)
+{
+    if ((!entry && !native) || !pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
         return -1;
 
     /* Reuse one context per thread: this runs per policy dispatch (thousands
@@ -516,7 +533,17 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     unsigned batch_before = g_wws_batch_gets;
     unsigned claim_before = g_spu_putllc_sync_hit;
 
-    const int pm_halted = spu_run_with_halt(entry, ctx);
+    spurs_pm_record_run_begin(ctx, image_id, pm_host, pm_size, wkl_data, wid, spurs_ea, spu_num, first);
+    struct spurs_native_pm_run native_run;
+    if (native) {
+        native_run.spurs_ea = spurs_ea; native_run.wid = wid; native_run.spu_num = spu_num;
+        native_run.wkl_data = wkl_data; native_run.poll_status = ctx->gpr[5]._u32[0];
+        native_run.image_id = image_id; native_run.pm_host = pm_host; native_run.pm_size = pm_size;
+        native_run.fresh = first; native_run.mode = spurs_native_pm_mode();
+    }
+    const int pm_halted = native ? spurs_native_pm_invoke(native, ctx, &native_run)
+                                 : spu_run_with_halt(entry, ctx);
+    spurs_pm_record_run_end(ctx, g_spurs_pm_exited ? 0 : -2);
     /* A lane's run should only end through exitToKernel. Anything else strands
      * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
     if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {

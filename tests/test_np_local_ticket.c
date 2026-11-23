@@ -38,19 +38,25 @@ static unsigned online_callbacks;
 static jmp_buf escape_frame;
 static int escape_callback;
 static const char *wanted;
+static size_t wanted_size;
 static void callback(u32 opd,u64 a,u64 b,u64 c,u64 d,u64 e,u64 f,u64 g,u64 h){
  assert(opd==0x1234);assert(c==0x5678);
  if(a==3){assert(b==0);online_callbacks++;return;}
- assert(a==255);assert(b==strlen(wanted));
+ size_t n=wanted_size?wanted_size:strlen(wanted);
+ assert(a==255);assert(b==n);
  if(escape_callback)longjmp(escape_frame,1);
  assert(!(d|e|f|g|h));callbacks++;
  assert((u32)request((void*)0x100,(void*)0x300,(void*)0x400,0,0,0,0)==0x8002a00a);
- vm_write32(0x500,32);assert(get((void*)0x600,(void*)0x500)==0);
- assert(vm_read32(0x500)==strlen(wanted));assert(!memcmp(vm_base+0x600,wanted,strlen(wanted)));
+ vm_write32(0x500,8192);memset(vm_base+0x600,0xaa,n+1);assert(get((void*)0x600,(void*)0x500)==0);
+ assert(vm_read32(0x500)==n);assert(!memcmp(vm_base+0x600,wanted,n));assert(vm_base[0x600+n]==0xaa);
  cellSysutilCheckCallback(); /* Reentrant poll must not duplicate completion. */
 }
+static void write_file(const char *path,const void *bytes,size_t n){
+ FILE *f=fopen(path,"wb");assert(f);assert(fwrite(bytes,1,n,f)==n);assert(!fclose(f));
+}
 static s32 req(void){return request((void*)0x100,(void*)0x300,(void*)0x400,0,0,0,0);}
-int main(void){
+int main(int argc,char **argv){
+ assert(argc==2); /* A private directory for synthetic ticket files. */
  ppu_hle_register_all();assert(request_handler && get_handler);
  request=(request_fn)request_handler;get=(get_fn)get_handler;
  vm_base=calloc(1,ppu_vm_size);assert(vm_base);
@@ -113,6 +119,43 @@ int main(void){
  setenv("PS3RECOMP_NP_LOCAL_TICKET","0",1);
  cellSysutilCheckCallback();assert(callbacks==3);
  assert((u32)req()==0x8002aa0c);assert((u32)get(0,(void*)0x500)==0x8002aa0c);
+ /* PS3RECOMP_NP_TICKET_FILE: exact opaque bytes, read again at every request. */
+ char path[1024],missing[1024];
+ snprintf(path,sizeof path,"%s/ticket.bin",argv[1]);snprintf(missing,sizeof missing,"%s/absent.bin",argv[1]);
+ static unsigned char blob[4097];
+ for(unsigned i=0;i<sizeof blob;i++)blob[i]=(unsigned char)(i*37+11);
+ blob[0]='M';blob[5]=0;blob[6]=0;blob[141]=0; /* NULs, including the last byte, survive. */
+ write_file(path,blob,142);
+ setenv("PS3RECOMP_NP_LOCAL_TICKET","1",1);setenv("PS3RECOMP_NP_TICKET_FILE",path,1);
+ sceNpManagerGetNpId((void*)0x100);
+ unsigned online_before=online_callbacks;sceNpManagerRegisterCallback((void*)0x1234,(void*)0x5678);
+ cellSysutilCheckCallback();assert(online_callbacks==online_before+1);
+ wanted=(const char*)blob;wanted_size=142;
+ assert(req()==0);cellSysutilCheckCallback();assert(callbacks==4);
+ /* A fresh ticket replaces the file between sign-ins; the next request sees it. */
+ blob[0]='N';write_file(path,blob,110);wanted_size=110;
+ assert(req()==0);cellSysutilCheckCallback();assert(callbacks==5);
+ /* The ticket is still bound to the configured identity. */
+ memset(vm_base+0x100,0,sizeof(SceNpId));memcpy(vm_base+0x100,"Someone",7);
+ assert((u32)req()==0x8002aa16);sceNpManagerGetNpId((void*)0x100);
+ /* The upper limit is accepted; one byte more, an empty or a missing file fails
+  * visibly, never falling back to the account payload or keeping an old ticket. */
+ write_file(path,blob,4096);wanted_size=4096;
+ assert(req()==0);cellSysutilCheckCallback();assert(callbacks==6);
+ write_file(path,blob,4097);assert((u32)req()==0x8002aaff);
+ assert((u32)get(0,(void*)0x500)==0x8002aa0a);
+ write_file(path,blob,0);assert((u32)req()==0x8002aaff);
+ setenv("PS3RECOMP_NP_TICKET_FILE",missing,1);assert((u32)req()==0x8002aaff);
+ setenv("PS3RECOMP_NP_TICKET_FILE",argv[1],1);assert((u32)req()==0x8002aaff); /* a directory */
+ setenv("PS3RECOMP_NP_TICKET_FILE","",1);assert((u32)req()==0x8002aaff);
+ cellSysutilCheckCallback();assert(callbacks==6);
+ /* Without the variable, the account payload is the default again. */
+ unsetenv("PS3RECOMP_NP_TICKET_FILE");wanted="playerretail";wanted_size=0;
+ np_psnr_setup("PlayerRetail",NULL);sceNpManagerGetNpId((void*)0x100);
+ assert(req()==0);cellSysutilCheckCallback();assert(callbacks==7);
+ /* The provider switch still governs: a ticket file alone grants nothing. */
+ setenv("PS3RECOMP_NP_TICKET_FILE",path,1);write_file(path,blob,142);
+ setenv("PS3RECOMP_NP_LOCAL_TICKET","0",1);assert((u32)req()==0x8002aa0c);
  sceNpTerm();free(vm_base);
- puts("NP local ticket: registration, account binding, deferred completion, retrieval and lifecycle PASS");
+ puts("NP local ticket: registration, account binding, deferred completion, retrieval, lifecycle and ticket file PASS");
 }

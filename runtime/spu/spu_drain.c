@@ -87,12 +87,16 @@ static SPU_DRAIN_COLD void spu_task_launch_slow(spu_context* ctx);
 /* Any of the step diagnostics below armed by the environment. */
 static int spu_task_launch_diagnostics(void)
 {
+    int d = g_spu_dispatch_gates.task_diag;
+    if (d >= 0) return d;
     static int s_on = -1;
     if (s_on < 0)
         s_on = getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
                getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN");
+    g_spu_dispatch_gates.task_diag = s_on;
     return s_on;
 }
+
 
 /* The caller may resolve the history TLS address once for its owning drain.
  * Keep every checkpoint here, in order: a stack reset can unwind before the
@@ -100,7 +104,10 @@ static int spu_task_launch_diagnostics(void)
 SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn,
                                                   spu_recent_history* recent)
 {
-    recent->pc[recent->n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    /* The recent-pc ring only feeds the reports of a run that ends badly
+     * (spu_recent_pcs); the compact form leaves it unwritten. */
+    if (!spu_fast_path_on())
+        recent->pc[recent->n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     if (spu_stack_reset_needed(ctx))
         spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);

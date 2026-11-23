@@ -1,15 +1,17 @@
-# Linux keyboard pad
+# Linux and Windows keyboard pad
 
-With the Vulkan backend's SDL2 game window (`PS3RECOMP_VK_WINDOW=1`), the
-keyboard drives virtual controller port zero while that window has keyboard
-focus and no game controller occupies the port. The layout is the macOS window
-pad's (`libs/input/pad_macos.m`), by physical key position (SDL scancodes,
-independent of the active text layout):
+With the Vulkan backend's SDL2 game window on Linux (`PS3RECOMP_VK_WINDOW=1`),
+and with the game window on Windows, the keyboard drives virtual controller
+port zero while that window has keyboard focus and no game controller occupies
+the port. Both hosts use one layout, `libs/input/pad_keyboard_layout.h`, which
+is also the macOS window pad's (`libs/input/pad_macos.m`). Keys are physical
+positions (USB HID usage IDs, as printed on a US keyboard), independent of the
+active text layout:
 
 | Keys | PS3 control |
 | --- | --- |
-| **W / S / A / D** | analog_ly / analog_lx (the left-stick report fields) |
-| **I / K / J / L** | analog_ry / analog_rx (the right-stick report fields) |
+| **W / S / A / D** | Left stick up / down / left / right (analog_ly / analog_lx) |
+| **I / K / J / L** | Right stick up / down / left / right (analog_ry / analog_rx) |
 | **Arrow keys** | D-pad only |
 | **X / Z / C / V** | Cross / Square / Circle / Triangle |
 | **Return** or **keypad Enter** | START |
@@ -19,7 +21,9 @@ independent of the active text layout):
 | **F / G** | L3 / R3 |
 
 Stick keys give full deflection (0 or 255) and opposing keys cancel to 128.
-Escape keeps its existing meaning (it closes the game window).
+On Linux, Escape keeps its existing meaning (it closes the game window).
+
+## Linux
 
 The window's event-pump thread publishes one atomic snapshot of the bound keys
 after each poll; cellPad reads it on guest threads and never calls SDL for the
@@ -30,9 +34,40 @@ Without a game window port zero is left exactly as before. Set
 `PAD_NO_KEYBOARD=1` to disable it and `PAD_KEYBOARD_TRACE=1` to log button-mask
 changes. The CMake option `PS3RECOMP_PAD_SDL_KEYBOARD` (ON) builds it.
 
+## Windows
+
+The XInput backend fills port zero first; the keyboard takes it only when no
+XInput device answers there. Any XInput device counts, including virtual pads
+created by Steam Input or by remote-desktop and streaming software, so with one
+of those present the keyboard does nothing. Keys are read with
+`GetAsyncKeyState` while a window of this process is in the foreground and the
+native OSK dialog does not own input. Each bound position is resolved to the
+virtual key it produces under the foreground window's keyboard layout (letters
+through their PC/AT scan code; Return, Space and the arrows are the same
+everywhere), again whenever that layout changes, so an AZERTY keyboard plays
+with the same physical keys. Keypad Enter shares Return's virtual key. Focus
+loss releases everything, and, as on Linux, a key still held when focus returns
+or the dialog closes is ignored until it is released. Without a controller,
+port zero is reported connected whether or not a key is held, as before.
+`PAD_NO_KEYBOARD=1` and `PAD_KEYBOARD_TRACE=1` work as on Linux.
+
+This replaces the earlier Windows-only layout (Z/X/A/S face buttons, Q/W
+shoulders, 1/2 triggers, Tab SELECT and a left stick that mirrored the d-pad).
+
+## Tests
+
 `python3 tools/test_pad_sdl_keyboard.py` drives synthetic scancode snapshots
 through the production publish step and real big-endian `cellPadGetData`
 reports: every button and stick key, aliases, simultaneous and opposing
 sticks, pressure, focus, the held-key latch, dialog ownership, controller
 priority, window loss, the no-window case and the opt-out, plus a real SDL
 window sampled under the dummy video driver.
+
+`python3 tools/test_pad_file_focus_windows.py` (Windows, clang-cl) builds the
+real Windows `cellPad.c` with deterministic focus, XInput, held-key and
+keyboard-layout providers. Its keyboard modes cover every button and stick key,
+both sticks, opposing keys, chords, the retired Windows-only keys, arrows not
+moving a stick, foreign and missing foreground, the held-key latch across focus
+and across the native dialog, digital pressure, controller priority and
+unplugging, physical positions under an AZERTY layout and a layout switch, and
+`PAD_NO_KEYBOARD`.

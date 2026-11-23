@@ -14,4 +14,5 @@ with tempfile.TemporaryDirectory(prefix='np-local-ticket-') as d:
  gc='-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'
  exe=p/'fixture';subprocess.run(['c++',str(gen),*objects,'-pthread',gc,'-o',str(exe)],check=True)
  env={k:v for k,v in os.environ.items() if not k.startswith(('PS3_','PS3RECOMP_','PSNR_'))}
- subprocess.run([str(exe)],check=True,timeout=10,env=env)
+ files=p/'tickets';files.mkdir()
+ subprocess.run([str(exe),str(files)],check=True,timeout=10,env=env)
