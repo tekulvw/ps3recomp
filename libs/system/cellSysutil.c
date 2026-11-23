@@ -225,6 +225,9 @@ s32 cellSysutilCheckCallback(void)
     { extern void np_psnr_pump(void); np_psnr_pump(); }
     { extern void ps3_np_eula_tick(void); ps3_np_eula_tick(); }
     { extern void ps3_np_ticket_tick(void); ps3_np_ticket_tick(); }
+    /* cellGameUpdate (cellNetCtl) answers a patch check here, never from
+     * inside the call that started it. */
+    { extern void cellGameUpdate_tick(void); cellGameUpdate_tick(); }
     drain_guest_completions();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
      * drain_guest_completions() above, deferring a dialog answer to this poll
