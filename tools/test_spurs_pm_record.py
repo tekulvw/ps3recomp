@@ -58,6 +58,10 @@ MUTANTS = {
     'gate-line-never-opened': ('        if (s_pmrec.any) __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);\n', ''),
     'nested-drain-target': ('spu_drain_call(ctx, link);     /* and the drain',
                             'spu_drain_call(ctx, link + 4); /* and the drain'),
+    'regs-armed-without-switch': ('          s_pmrec.regs = s_pmrec.record && rg && *rg && strcmp(rg, "0") != 0;',
+                                  '          s_pmrec.regs = s_pmrec.record;'),
+    'regs-not-at-entry': ('        spurs_pm_rec_regs_event(t, ctx, 1);\n', ''),
+    'halt-hook-not-installed': ('          if (s_pmrec.regs) g_spurs_pm_halt_hook = spurs_pm_record_halt; }', '          }'),
     'lsread-limit-ignored': ('    if (a >= s_pmrec.lsread_limit) return;\n', ''),
     'lsread-service-reported': ('    if (t->region != SPURS_PM_REGION_JOB || t->depth) return;',
                                 '    if (t->region == SPURS_PM_REGION_POLICY) return;'),
@@ -221,6 +225,7 @@ def check(binary: Path, tmp: Path) -> list[str]:
         expect(n == want_runs, f'{spec}: recorded {n} runs, expected {want_runs}')
 
     fails += check_lsread(binary, tmp, off, rec_dir, events_of)
+    fails += check_regs(binary, tmp, off, rec_dir, events_of)
 
     stats_dir = tmp / 'stats'; stats_dir.mkdir()
     st, st_err = run(binary, stats_dir, {'PS3RECOMP_SPURS_PM_STATS': '1'})
@@ -319,6 +324,40 @@ def check_lsread(binary: Path, tmp: Path, off: dict, base_dir: Path, events_of) 
     expect(st['mem'] == off['mem'] and st['lsread_sum'] == off['lsread_sum'], 'statistics + LS reads changed results')
     expect(not list(sd.iterdir()), 'statistics + LS reads wrote files')
     expect(sum(' lsq=' in l for l in st_err.splitlines()) == len(LS_LOW_READS), 'no aggregate rows on stderr')
+    return fails
+
+
+def check_regs(binary: Path, tmp: Path, off: dict, base_dir: Path, events_of) -> list[str]:
+    """PS3RECOMP_SPURS_PM_RECORD_REGS: the register file at each job entry, and at
+    a halt the register file and the local store from the halted function."""
+    fails = []
+
+    def expect(cond, msg):
+        if not cond:
+            fails.append(msg)
+
+    d = tmp / 'rec-regs'
+    on, _ = run(binary, tmp, {'PS3RECOMP_SPURS_PM_RECORD': str(d), 'PS3RECOMP_SPURS_PM_RECORD_BYTES': '16',
+                              'PS3RECOMP_SPURS_PM_RECORD_REGS': '1'})
+    for k in ('rc', 'putllc_ok', 'putllc_fail', 'service_r3', 'job_saw', 'select_wid', 'mem'):
+        expect(on[k] == off[k], f'register events changed {k}: {off[k]} -> {on[k]}')
+    got = events_of(d)
+    regs = [e for e in got if e['kind'] == 'regs']
+    expect([e for e in got if e['kind'] != 'regs'] == events_of(base_dir), 'the rest of the recording changed with REGS on')
+    expect(len(regs) == 4 and all(e['why'] == 'job_enter' for e in regs), f'entry register files: {[e["why"] for e in regs]}')
+    if regs:
+        e = regs[0]
+        expect(e['pc'] == JOB_ENTRY and e['gpr'][3][0] == LS_CTX and e['gpr'][1][0] == 0x3FF00 and e['entry'] == JOB_ENTRY,
+               f'entry registers: pc {e["pc"]:#x} r3 {e["gpr"][3]} r1 {e["gpr"][1]}')
+    # without the switch: no register events
+    expect(not [e for e in events_of(base_dir) if e['kind'] == 'regs'], 'register events without the switch')
+    # a halt: its register file and the local store at the halted function
+    hd = tmp / 'rec-regs-halt'
+    r = subprocess.run([str(binary), '1'], env=dict(BASE_ENV, PS3RECOMP_SPURS_PM_RECORD=str(hd), PS3RECOMP_SPURS_PM_RECORD_REGS='1',
+                                                     PMREC_FIXTURE_HALT='1'), capture_output=True, text=True, timeout=60, cwd=tmp)
+    halts = [e for e in events_of(hd) if e['kind'] == 'regs' and e['why'] == 'halt']
+    expect(len(halts) == 1 and halts[0]['pc'] == 0x4400 and halts[0]['gpr'][77][2] == 0xFEED and len(halts[0]['ls']) == 512,
+           f'halt register file: {[(h["pc"], h["gpr"][77], len(h["ls"])) for h in halts]} rc={r.returncode}')
     return fails
 
 

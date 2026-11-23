@@ -94,7 +94,18 @@ static void job(spu_context* c)
 }
 
 /* A second job: returns at once (`bi $r0`). */
-static void job2(spu_context* c) { SPU_RET(c); }
+static void job2(spu_context* c)
+{
+    /* PMREC_FIXTURE_HALT: the second job halts (a conditional-halt assert),
+     * with a marker in a high register, for the register-file events */
+    if (getenv("PMREC_FIXTURE_HALT")) {
+        c->gpr[77]._u32[2] = 0xFEEDu;
+        c->status = SPU_STATUS_STOPPED_BY_HALT;
+        spu_halt(c);
+        return;
+    }
+    SPU_RET(c);
+}
 
 static void policy(spu_context* c)
 {

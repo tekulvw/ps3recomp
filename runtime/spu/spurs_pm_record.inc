@@ -63,7 +63,7 @@ enum {
 enum {
     SPURS_PM_REC_RUN_BEGIN = 1, SPURS_PM_REC_RUN_END = 2, SPURS_PM_REC_COMMAND = 3,
     SPURS_PM_REC_TRANSFER = 4, SPURS_PM_REC_ATOMIC = 5, SPURS_PM_REC_BRANCH = 6,
-    SPURS_PM_REC_KERNEL = 7, SPURS_PM_REC_LSREAD = 8
+    SPURS_PM_REC_KERNEL = 7, SPURS_PM_REC_LSREAD = 8, SPURS_PM_REC_REGS = 9
 };
 /* Local-store read events (PS3RECOMP_SPURS_PM_RECORD_LSREAD): flags, and the
  * per-worker aggregate table. */
@@ -88,6 +88,7 @@ static struct {
     uint32_t every;
     uint64_t start_ns, stats_ns;
     uint32_t lsread_limit;   /* job-region LS reads below this are reported; 0 = off */
+    int regs;                /* PS3RECOMP_SPURS_PM_RECORD_REGS: register file at job entry and halt */
 } s_pmrec;
 static SRWLOCK s_pmrec_lock = SRWLOCK_INIT;
 
@@ -141,6 +142,8 @@ static uint32_t spurs_pm_rec_env_u32(const char* name, uint32_t dflt)
 
 static void spurs_pm_rec_print_stats(void);
 static void spurs_pm_rec_print_lsread(void);
+static void spurs_pm_record_halt(spu_context* ctx);
+extern void (*g_spurs_pm_halt_hook)(spu_context*);
 static void spurs_pm_rec_ls_read(const struct spu_context* ctx, uint32_t lsa);
 static void spurs_pm_rec_configure(void)
 {
@@ -183,6 +186,9 @@ static void spurs_pm_rec_configure(void)
         if (!s_pmrec.stats_ns) s_pmrec.stats_ns = 5000000000ull;
         s_pmrec.shadow = spurs_native_pm_mode() == SPURS_NATIVE_PM_SHADOW || spurs_native_pm_self_shadow();
         s_pmrec.any = s_pmrec.record || s_pmrec.stats || s_pmrec.shadow;
+        { const char* rg = getenv("PS3RECOMP_SPURS_PM_RECORD_REGS");
+          s_pmrec.regs = s_pmrec.record && rg && *rg && strcmp(rg, "0") != 0;
+          if (s_pmrec.regs) g_spurs_pm_halt_hook = spurs_pm_record_halt; }
         {
             /* "1" = below 0x4000; otherwise a hex limit (0x prefix optional).
              * Reported by the recording and the statistics only: a shadow
@@ -325,7 +331,7 @@ static void spurs_pm_rec_emit(struct spurs_pm_rec_thread* t, uint32_t kind,
     spurs_pm_rec_emit_file(t, kind, body, tail, tail_n);
 }
 /* The recording file only: diagnostic events a shadowing implementation does
- * not compare (local-store reads). */
+ * not compare (local-store reads, register files). */
 static void spurs_pm_rec_emit_file(struct spurs_pm_rec_thread* t, uint32_t kind,
                                    const struct spurs_pm_rec_buf* body,
                                    const uint8_t* tail, uint32_t tail_n)
@@ -550,6 +556,42 @@ static void spurs_pm_rec_note_slot(struct spurs_pm_rec_thread* t, uint32_t modul
 extern void spu_indirect_branch(spu_context*);
 extern void spu_drain_call(spu_context*, uint32_t);
 
+/* The whole register file and interrupt state (PS3RECOMP_SPURS_PM_RECORD_REGS):
+ * why = 1 at a job entry, 2 at a halt or stop of the observed context, which
+ * also carries the 512 bytes of local store from the halted function's entry
+ * (ctx->pc). 128 registers, four words each. */
+static void spurs_pm_rec_regs_event(struct spurs_pm_rec_thread* t, const spu_context* ctx, uint32_t why)
+{
+    if (!t->to_file || !s_pmrec.regs) return;   /* the file only, like the read events */
+    struct spurs_pm_rec_buf b; b.n = 0;
+    pmb_u32(&b, why); pmb_u32(&b, (uint32_t)ctx->pc & SPU_LS_MASK); pmb_u32(&b, ctx->int_enable);
+    pmb_u32(&b, ctx->event_mask); pmb_u32(&b, ctx->status); pmb_u32(&b, (uint32_t)t->region);
+    pmb_u32(&b, t->job_entry); pmb_u32(&b, t->job_module);
+    uint8_t* o = (uint8_t*)malloc(128 * 16 + 512);
+    if (!o) return;
+    for (int r = 0; r < 128; r++) for (int w = 0; w < 4; w++) {
+        const uint32_t v = ctx->gpr[r]._u32[w];
+        for (int i = 0; i < 4; i++) o[r * 16 + w * 4 + i] = (uint8_t)(v >> (8 * i));
+    }
+    uint32_t extra = 0;
+    if (why == 2) {
+        const uint32_t at = (uint32_t)ctx->pc & SPU_LS_MASK & ~15u;
+        extra = SPU_LS_SIZE - at < 512 ? SPU_LS_SIZE - at : 512;
+        memcpy(o + 128 * 16, ctx->ls + at, extra);
+    }
+    spurs_pm_rec_emit_file(t, SPURS_PM_REC_REGS, &b, o, 128 * 16 + extra);
+    free(o);
+}
+/* At an SPU halt or stop (spu_halt): the register file of the observed context. */
+static void spurs_pm_record_halt(spu_context* ctx)
+{
+    struct spurs_pm_rec_thread* t = t_pmrec;
+    if (!t || t->ctx != ctx || !s_pmrec.regs) return;
+    if (((uint32_t)ctx->pc & SPU_LS_MASK) == SPURS_PM_EXIT_TO_KERNEL_LS) return;   /* the run's normal end */
+    spurs_pm_rec_regs_event(t, ctx, 2);
+    if (t->file) fflush(t->file);
+}
+
 static int spurs_pm_rec_branch(spu_context* ctx)
 {
     struct spurs_pm_rec_thread* t = t_pmrec;
@@ -578,6 +620,7 @@ static int spurs_pm_rec_branch(spu_context* ctx)
         t->region = SPURS_PM_REGION_JOB;
         t->job_ctx_lsa = r3; t->job_link = link; t->job_host_depth = ctx->host_depth; t->run_jobs++;
         t->job_entry = pc; t->job_module = spurs_pm_rec_module_of(ctx, pc);
+        spurs_pm_rec_regs_event(t, ctx, 1);
         PMREC_ADD(t->st[t->wid].job_entries, 1);
         spurs_pm_rec_branch_event(t, ctx, SPURS_PM_REC_JOB_ENTER, pc, SPURS_PM_REC_NO_SLOT,
                                   spurs_pm_rec_module_of(ctx, pc), 0, block, n);

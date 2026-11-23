@@ -260,9 +260,14 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
  * installed, so a title with no SPU-built FIFO pays nothing. */
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 
+/* The policy-run recorder's halt hook (PS3RECOMP_SPURS_PM_RECORD_REGS); NULL unless set. */
+void (*g_spurs_pm_halt_hook)(spu_context*) = 0;
+
 void spu_halt(spu_context* ctx)
 {
     ctx->region_dispatch_valid=0;
+    if (g_spurs_pm_halt_hook && ctx->pm_observer)
+        g_spurs_pm_halt_hook(ctx);
     /* Register/context dump at halt-asserts: the WWS job's parameter guard
      * (heqi 0x1650 in job_wws_7BD900) checks (r12 bit0) & (r9 16-aligned) &
      * (r15 != 0) -- job descriptor/ABI values our execute path must supply.
