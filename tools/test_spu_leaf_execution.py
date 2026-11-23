@@ -19,6 +19,6 @@ with tempfile.TemporaryDirectory(prefix='spu-leaf-exec-')as td:
  for san in (False,True):
   exe=p/('ubsan'if san else'o2');cmd=['cc','-std=gnu17','-O2','-UNDEBUG','-ffp-contract=off','-I'+str(r/'include'),'-I'+str(s),'-I'+str(r/'runtime/platform'),'-I'+str(p),str(s/'tests/test_spu_leaf_execution.c'),*[str(s/(x+'.c'))for x in u],str(r/'runtime/platform/win32_compat.c'),str(p/'raw/spu_recomp.c'),str(p/'legacy/spu_recomp.c'),'-pthread','-lm','-o',str(exe)]
   if san:cmd[1:1]=['-fsanitize=undefined','-fno-sanitize-recover=all']
-  z=subprocess.run(cmd,capture_output=True,text=True,timeout=45);assert not z.returncode,z.stderr
+  z=subprocess.run(cmd,capture_output=True,text=True,timeout=300);assert not z.returncode,z.stderr
   for mode in ('0','1'):
    z=subprocess.run([str(exe),mode],env=dict(e,SPU_VERIFIED_LEAF_BLOCKS=mode,SPU_REGION_FRAMED="1"),capture_output=True,text=True,timeout=10);print(('UBSan'if san else'O2'),mode,z.stdout.strip(),flush=True);assert not z.returncode,z.stdout+z.stderr
