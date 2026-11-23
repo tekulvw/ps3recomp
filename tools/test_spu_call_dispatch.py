@@ -31,9 +31,13 @@ with tempfile.TemporaryDirectory(prefix='spu-call-dispatch-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(spu), '-I' + str(root / 'runtime/platform'),
                     str(spu / 'tests/bench_spu_call_dispatch.c'), *[str(spu / u) for u in units],
                     str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm', '-o', str(binary)], check=True)
-    for _ in range(args.runs):
-        r = subprocess.run([str(binary), str(args.calls)], env=env, capture_output=True, text=True, timeout=300)
-        if r.returncode:
-            sys.exit(f'FAIL\n{r.stdout}\n{r.stderr[-2000:]}')
-        print(r.stdout.strip())
-print('PASS: lifted-style call brackets returned through the drain')
+    # bisl_full_ns is the full resolver; with PS3RECOMP_SPU_IB_FAST=1 the same
+    # bracket is answered by the short dispatch entry after its first call.
+    for label, extra in (('full', {}), ('ib_fast', {'PS3RECOMP_SPU_IB_FAST': '1'})):
+        for _ in range(args.runs):
+            r = subprocess.run([str(binary), str(args.calls)], env=dict(env, **extra),
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode:
+                sys.exit(f'FAIL {label}\n{r.stdout}\n{r.stderr[-2000:]}')
+            print(label, r.stdout.strip())
+print('PASS: lifted-style call brackets returned through the drain, with and without the short dispatch entry')

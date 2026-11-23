@@ -22,6 +22,7 @@
 #include "spu_dma_source_trace.h"
 #include "spu_dma_publication.h"
 #include "../diagnostics/job_io_recorder.h"
+#include "spurs_pm_observer.h"
 #include "spu_dma_disposition.h"
 #include "../diagnostics/critical_write_trace.h"
 #include <stdint.h>
@@ -320,6 +321,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
          * follows the existing plain-MFC-write model; issuer reservation
          * behavior for storage controls is not separately modeled here. */
         if(ps3_jobio_is(spu))ps3_jobio_event(spu,PS3_JOBIO_ZERO,cmd,lsa,ea,size,NULL,0);
+        if (spu_pm_extras_on() && spu->pm_observer) spu->pm_observer->transfer(spu, SPURS_PM_XFER_ZERO, cmd, lsa, ea, size, NULL);
         if (g_spu_coh_ops) {   /* PS3RECOMP_COH_VERSIONS: each marked line under its count */
             g_spu_coh_ops->write((uint32_t)ea, vm_base + (uint32_t)ea, NULL, size, spu);
         } else {
@@ -868,6 +870,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
         spu_dma_disposition_after(&disposition, ls_ptr);
         copy_disposition = SPU_DMA_DISPOSITION_GET;
         if(ps3_jobio_is(spu))ps3_jobio_event(spu,PS3_JOBIO_GET,cmd,lsa,ea,size,ls_ptr,0);
+        if (spu_pm_extras_on() && spu->pm_observer) spu->pm_observer->transfer(spu, SPURS_PM_XFER_GET, cmd, lsa, ea, size, ls_ptr);
         if (armed) spu_dma_publication_observe(spu, lsa, ea, size, cmd);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
@@ -953,6 +956,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             if (armed) spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
             if(ps3_jobio_is(spu))ps3_jobio_event(spu,PS3_JOBIO_PUT,cmd,lsa,ea,size,ls_ptr,0);
+            if (spu_pm_extras_on() && spu->pm_observer) spu->pm_observer->transfer(spu, SPURS_PM_XFER_PUT, cmd, lsa, ea, size, ls_ptr);
             uint32_t a0 = (uint32_t)ea & ~127u;
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
             ps3_critical_write_token critical_write = {0};
@@ -1920,6 +1924,7 @@ SPU_DMA_BODY int mfc_submit_body(mfc_engine* mfc, spu_context* spu, uint32_t cmd
      * always on (policy runs are rare and their DMA pattern is the primary
      * bring-up signal: joblist fetch, job-module loads, output stores). */
     if (spu->policy_mode) {
+        if (spu_pm_extras_on() && spu->pm_observer) spu->pm_observer->command(spu, cmd, lsa, ea, size, tag);
         static int _pn = 0;
         /* Cap the boot-time flood, but reopen the trace once the PPU is at the
          * job barrier (g_barrier_sync_watch armed): the post-ticket DMA
@@ -2088,27 +2093,12 @@ static inline uint32_t mfc_tag_wait(const mfc_engine* mfc, uint32_t tag_mask,
 SPU_DMA_BODY void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
                                     uint32_t channel, uint32_t value)
 {
+    /* The parameter latches and the tag mask (spu_channel_inline.h). */
+    if (spu_mfc_latch_write(spu, channel, spu_make_preferred_u32(value)))
+        return;
     switch (channel) {
-    case MFC_LSA:
-        spu->mfc_lsa = value;
-        break;
-    case MFC_EAH:
-        spu->mfc_eah = value;
-        break;
-    case MFC_EAL:
-        spu->mfc_eal = value;
-        break;
-    case MFC_Size:
-        spu->mfc_size = value;
-        break;
-    case MFC_TagID:
-        spu->mfc_tag = value & 0x1F;
-        break;
     case MFC_Cmd:
         mfc_submit(mfc, spu, value);
-        break;
-    case MFC_WrTagMask:
-        spu->mfc_tag_mask = value;
         break;
     case MFC_WrTagUpdate:
         spu->mfc_tag_status = mfc_tag_wait(mfc, spu->mfc_tag_mask, value);
@@ -2138,11 +2128,11 @@ SPU_DMA_BODY void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
 static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
                                          uint32_t channel)
 {
+    /* Tag status, tag mask and atomic status: latched (spu_channel_inline.h). */
+    uint32_t latched;
+    if (spu_mfc_latched_read(spu, channel, &latched))
+        return latched;
     switch (channel) {
-    case MFC_RdTagStat:
-        return spu->mfc_tag_status;
-    case MFC_RdTagMask:
-        return spu->mfc_tag_mask;
     case MFC_RdListStallStat: {
         /* Accumulated tag-group mask of newly-stalled lists. Reading returns
          * the mask and clears it (RPCS3 ch_stall_stat semantics); the interrupt
@@ -2151,12 +2141,6 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
         spu->list_stall_stat = 0;
         return m;
     }
-    case MFC_RdAtomicStat:
-        /* Result of the last atomic line op (GETLLAR/PUTLLC/PUTLLUC), set by
-         * spu_mfc_atomic(): 0 = PUTLLC_SUCCESS, 1 = PUTLLC_FAILURE (line moved,
-         * SPU must retry). Honoring this is what keeps the SPURS lock-free queue
-         * consistent across concurrent SPU kernel threads. */
-        return spu->atomic_stat;
     default:
         return 0;
     }

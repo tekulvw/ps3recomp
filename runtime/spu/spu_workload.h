@@ -76,6 +76,14 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
                           uint32_t spu_num);
+/* The same dispatch through a native policy module (spurs_native_pm.h) when
+ * `native` is non-NULL; with NULL it is exactly spu_run_policy_module. */
+struct spurs_native_pm;
+int spu_run_policy_module_native(const struct spurs_native_pm* native,
+                                 spu_lifted_entry_fn entry, int image_id,
+                                 const uint8_t* pm_host, uint32_t pm_size,
+                                 uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
+                                 uint32_t spu_num);
 
 /* Stage and enter one SPURS jobchain job (spurs_job.c). Unlike a policy module
  * or a task, a job binary is a raw image built by the SDK's job_elf-to-bin and
