@@ -1,10 +1,13 @@
 # Native SPURS policy modules: the seam
 
 A generic, title-independent way to run a workload's SPURS policy module as host
-code instead of the lifted policy image. The runtime registers **no**
-implementation; with `PS3RECOMP_SPURS_NATIVE_PM` unset nothing here runs and
-behaviour is byte-identical to a build without the seam
-(`tools/test_spurs_native_pm.py`).
+code instead of the lifted policy image. With `PS3RECOMP_SPURS_NATIVE_PM` unset
+nothing here runs, no implementation is registered, and behaviour is
+byte-identical to a build without the seam (`tools/test_spurs_native_pm.py`).
+The runtime has one built-in implementation, the WWS job manager
+(`docs/SPURS_NATIVE_WWSJM.md`). It is registered the first time a selection is
+made with the switch set (`spurs_native_pm_register_builtins`), never while it
+is unset.
 
 API: `runtime/spu/spurs_native_pm.h`. Implementation:
 `runtime/spu/spurs_native_pm.inc` (included by `spurs_policy.c`), the resolver's
@@ -19,7 +22,7 @@ window intercept in `spu_channels.c`, selection in `libs/spurs/cellSpurs.c`.
 | unset, `0` | Lifted path (default). The registry is never consulted; no context gets a service table. |
 | `1` | A workload whose policy image has a registered implementation, with matching fingerprint **and** SHA-256, runs natively. |
 | `check` | As `1`; the implementation is told (`run->mode`) to run its self-checks. |
-| `shadow` | Lifted path. Reserved for an implementation's shadow comparison; none is wired yet. |
+| `shadow` | Lifted path. A workload an implementation would take (identity and `accept`) has its lifted runs' policy-run events handed to the implementation's `shadow` hook, which compares them with its own decisions. |
 | `<name>` | As `1`, restricted to the implementation registered under that name. |
 
 The decision is made once per workload id, when its policy image is first
@@ -29,14 +32,25 @@ fallback. Each decision prints one `[spurs-native-pm]` line. An image whose
 fingerprint matches but whose SHA-256 differs from the one the implementation
 was written for stays lifted, with a line saying so.
 
+`PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW=1`, with the switch at `1`, `check` or a
+name, also feeds native runs' events to their implementation's shadow hook.
+Fixtures and diagnostics use it to compare a native run with the decisions the
+comparison predicts.
+
 ## Registering
 
 ```c
 static const struct spurs_native_services services = { { svc0, svc1 /* ... */ } };
 static const struct spurs_native_pm impl = {
-    "name", /* fingerprint */ 0x..., /* sha256 */ { ... }, run, &services };
+    "name", /* fingerprint */ 0x..., /* sha256 */ { ... }, run, &services,
+    accept /* optional */, shadow /* optional */ };
 spurs_native_pm_register(&impl);   /* before the workload is first resolved */
 ```
+
+`accept(spurs_ea, wid, n_spus)`, when present, is asked once, at selection,
+after the identity gate. The resolver passes the workload's SPURS instance and
+its SPU count. A refusal keeps that workload on the lifted module, with one
+line saying so.
 
 `run(ctx, args)` performs one dispatch on the slot's resident context (the same
 context, LS persistence and worker thread a lifted run uses) and returns 0 when
@@ -48,9 +62,10 @@ lifted run that did not exit (`-2`). The run may poll the kernel with
 
 ## Entering job code and the service window
 
-`spurs_native_pm_enter_job(ctx, entry, stack, context, arg)` consults the payload
-hook (`spurs_native_pm_set_payload_hook`, NULL by default), else sets r0 = the
-job-return slot, r1, r3, r4 and runs the job in a call bracket that drains until
+`spurs_native_pm_enter_job(ctx, entry, stack, stack_bytes, context, arg)` consults
+the payload hook (`spurs_native_pm_set_payload_hook`, NULL by default), else sets
+r0 = the job-return slot, r1 = {stack, stack_bytes, 0, 0} (the SPU ABI stack pointer
+and the bytes-available word its stack check tests), r3, r4 and runs the job in a call bracket that drains until
 the job returns there. It returns 0 when the job returned (by host return or by a
 computed jump to its link).
 
@@ -73,9 +88,16 @@ policy extras (the recorder's hook shares it). `spu_dispatch_mt.c`'s fast path
 keeps its two kernel-service compares and sends window addresses to the full
 resolver only behind the same gate.
 
+## Shadow events
+
+In shadow mode the policy-run recorder (`spurs_pm_record.inc`) runs for the
+shadowed workloads without writing files. It hands each event of their runs to
+`shadow(ctx, kind, payload, n)`, on the worker thread that runs them, in the
+recorder's file format (`tools/spurs_pm_record.py`). File recording
+(`PS3RECOMP_SPURS_PM_RECORD`) can run at the same time.
+
 ## Not yet covered
 
-- Shadow comparison (`shadow`): an implementation-side hook is a later phase.
 - A job that restarts dispatch (a one-way guest stack reset) unwinds to the
   policy runner's halt bracket and abandons the native run's host frames; a
   native implementation must treat that as unsupported until handled.

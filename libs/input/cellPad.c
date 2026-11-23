@@ -182,14 +182,20 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
  *
  * Only fills in for port 0, only when XInput found nothing there, so a real
  * controller always wins and nothing changes for a port that has one. Keys are
- * read only while a window of THIS process is in the foreground, so typing in
- * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
- * disable it entirely.
+ * read only while a window of THIS process is in the foreground and no native
+ * dialog owns input, so typing in another application does not drive the
+ * game. Set PAD_NO_KEYBOARD=1 to disable it entirely.
  *
- * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
- * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
- * so a title that reads the stick instead is playable too. */
+ * The layout is the Linux SDL window's (pad_keyboard_layout.h): X/Z/C/V
+ * cross/square/circle/triangle, Return START, Space SELECT, Q/E L1/R1, R/T
+ * L2/R2, F/G L3/R3, arrows the d-pad, W/A/S/D the left stick and I/J/K/L the
+ * right stick. Keys are physical positions: each is looked up as the virtual
+ * key at that position under the foreground window's keyboard layout, so an
+ * AZERTY keyboard drives the same keys as a QWERTY one. A key still held when
+ * focus returns or a dialog closes is ignored until it is released. */
 #ifdef _WIN32
+#include "pad_keyboard_layout.h"
+
 static int pad_host_window_focused(void)
 {
 #ifdef OSK_NATIVE_HAS_WIN32_HOST
@@ -202,6 +208,30 @@ static int pad_host_window_focused(void)
     return pid == GetCurrentProcessId();
 }
 
+/* The virtual key at a HID usage's physical position under `layout`. Letter
+ * keys move between layouts, so they go through their PC/AT (set 1) scan
+ * code; the other bound keys have one virtual key everywhere. */
+static int pad_keyboard_virtual_key(uint8_t usage, HKL layout)
+{
+    /* Set 1 scan codes of the letters A..Z (HID usages 0x04..0x1D). */
+    static const unsigned char letter_scan[26] = {
+        0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32,
+        0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,
+    };
+    switch (usage) {
+    case PAD_KEY_RETURN: case PAD_KEY_KP_ENTER: return VK_RETURN;
+    case PAD_KEY_SPACE: return VK_SPACE;
+    case PAD_KEY_LEFT: return VK_LEFT;
+    case PAD_KEY_RIGHT: return VK_RIGHT;
+    case PAD_KEY_UP: return VK_UP;
+    case PAD_KEY_DOWN: return VK_DOWN;
+    default: break;
+    }
+    if (usage < PAD_KEY_A || usage > PAD_KEY_Z) return 0;
+    UINT vk = MapVirtualKeyExW(letter_scan[usage - PAD_KEY_A], MAPVK_VSC_TO_VK, layout);
+    return vk ? (int)vk : 'A' + (usage - PAD_KEY_A);   /* no layout answer: US position */
+}
+
 static void pad_poll_keyboard(void)
 {
     static int off = -1;
@@ -209,44 +239,55 @@ static void pad_poll_keyboard(void)
     if (off) return;
 
     PadHostState* hs = &s_host_state[0];
-    if (!pad_host_window_focused()) {
-        /* Release everything on focus loss, or a key held while alt-tabbing
-         * would stay down forever. */
-        hs->buttons = 0;
-        hs->analog_lx = hs->analog_ly = 128;
-        hs->analog_rx = hs->analog_ry = 128;
-        hs->connected = 1;
-        return;
+    static uint32_t blocked;
+    const int focused = pad_host_window_focused();
+
+    /* The layout that types into the game window: the foreground window's
+     * while it is ours, otherwise the last one seen (this thread's at first).
+     * The bound keys are resolved again only when it changes. */
+    static HKL resolved_layout;
+    static int resolved;
+    static int vk[PAD_KEYBOARD_BINDING_COUNT];
+    HKL layout = resolved ? resolved_layout : GetKeyboardLayout(0);
+    if (focused) {
+        DWORD pid = 0;
+        layout = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), &pid));
+    }
+    if (!resolved || layout != resolved_layout) {
+        for (unsigned i = 0; i < PAD_KEYBOARD_BINDING_COUNT; i++)
+            vk[i] = pad_keyboard_virtual_key(pad_keyboard_bindings[i].usage, layout);
+        resolved_layout = layout;
+        resolved = 1;
     }
 
-    static const struct { int vk; u16 btn; } map[] = {
-        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
-        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
-        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
-        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
-        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
-        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
-        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
-    };
+    /* Held keys are read while unfocused too, but only to remember which
+     * ones must be released before they count. Losing focus releases
+     * everything, or a key held while alt-tabbing would stay down forever. */
+    uint32_t held = 0;
+    for (unsigned i = 0; i < PAD_KEYBOARD_BINDING_COUNT; i++)
+        if (vk[i] && (GetAsyncKeyState(vk[i]) & 0x8000)) held |= 1u << i;
+    PadKeyboardReport report = pad_keyboard_report(pad_keyboard_latch(&blocked, held, focused));
 
-    u16 btns = 0;
-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
-
-    hs->buttons   = btns;
+    memset(hs, 0, sizeof(*hs));
     hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
-    hs->analog_rx = hs->analog_ry = 128;
-    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
-    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+    hs->buttons   = report.buttons;
+    hs->analog_lx = report.analog_lx;
+    hs->analog_ly = report.analog_ly;
+    hs->analog_rx = report.analog_rx;
+    hs->analog_ry = report.analog_ry;
 
     { static int said = 0;
-      if (!said && btns) { said = 1;
+      if (!said && report.buttons) { said = 1;
           printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
           fflush(stdout); } }
+    static int trace = -1;
+    static u16 previous = 0;
+    if (trace < 0) trace = getenv("PAD_KEYBOARD_TRACE") ? 1 : 0;
+    if (trace && report.buttons != previous) {
+        printf("[cellPad] Windows keyboard port 0 buttons=0x%04X\n", report.buttons);
+        fflush(stdout);
+    }
+    previous = report.buttons;
 }
 #endif
 

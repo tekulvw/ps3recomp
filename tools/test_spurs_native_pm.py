@@ -56,6 +56,10 @@ MUTANTS = {
     'sha-gate-skipped': ('runtime/spu/spurs_native_pm.inc', 'if (memcmp(sha, pm->sha256, 32) != 0) {', 'if (0) {'),
     'gate-line-never-opened': ('runtime/spu/spurs_native_pm.inc',
                                '        __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);\n', ''),
+    'far-job-return-refused': ('runtime/spu/spu_channels.c',
+                               '        spurs_native_pm_job_return_far(ctx);\n', ''),
+    'far-job-return-depth-kept': ('runtime/spu/spurs_native_pm.inc', '    c->host_depth = depth0; c->drain_ret_pc', '    c->drain_ret_pc'),
+    'far-job-return-not-ended': ('runtime/spu/spurs_native_pm.inc', '    if (halted && far_returned) {', '    if (0) {'),
     'services-left-installed': ('runtime/spu/spurs_native_pm.inc', '    c->native_services = NULL;\n    t_npm_pm = NULL;',
                                 '    t_npm_pm = NULL;'),
 }
@@ -162,8 +166,8 @@ def check(binary: Path, tmp: Path) -> list[str]:
 
     # --- the window, job returns, payload hook ---------------------------------
     r, err, _ = run(binary, ['direct'])
-    want = dict(rc0='0', rc1='-2', rc2='0', native='2', lifted='1', services='4', job_ok='4', job_bad='0',
-                hook='6', job_c='0', services_installed='2', lifted_saw_services='0', hook_default_null='1', count='3')
+    want = dict(rc0='0', rc1='-2', rc2='0', native='2', lifted='1', services='4', job_ok='6', job_bad='0',
+                hook='8', job_c='0', services_installed='2', lifted_saw_services='0', hook_default_null='1', count='3')
     for k, v in want.items():
         expect(r.get(k) == v, f'direct: {k}={r.get(k)} expected {v}')
     # the short dispatch entry (PS3RECOMP_SPU_IB_FAST) never answers a window slot:
@@ -177,8 +181,10 @@ def check(binary: Path, tmp: Path) -> list[str]:
     expect(rr == r, f'direct with the recorder differs: {rr} vs {r}')
     runs = rec.runs(recording(d))
     kinds = [[e.get('branch') or e.get('service') or e.get('op') or e['kind'] for e in run_] for run_ in runs]
+    # job D returns to the job-return slot from a deeper frame: the recorder sees
+    # a branch from job code into the window (a call) that never returns
     jobs = ['job_enter', 'service_call', 'service_return', 'service_call', 'service_return', 'job_return',
-            'job_enter']
+            'job_enter', 'job_return', 'job_enter', 'service_call']
     want = [['run_begin', 'getllar', 'putllc', 'select', *jobs, 'job_return', 'exit', 'run_end'],
             ['run_begin', 'getllar', 'putllc', 'select', *jobs, 'run_end'],      # the run that does not exit
             ['run_begin', 'getllar', 'putllc', 'select', 'exit', 'run_end']]     # the lifted run

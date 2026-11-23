@@ -147,7 +147,9 @@ s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path);
 s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path);
 
 /* Optional local development payload, not a signed Sony ticket. Enable with
- * PS3RECOMP_NP_LOCAL_TICKET=1 and configure identity via PS3_NP_ONLINE_ID. */
+ * PS3RECOMP_NP_LOCAL_TICKET=1 and configure identity via PS3_NP_ONLINE_ID.
+ * PS3RECOMP_NP_TICKET_FILE=<path> returns that file's exact bytes instead
+ * (docs/local-np-ticket.md). */
 s32 sceNpManagerRequestTicket2(const SceNpId* npId, const SceNpTicketVersion* version,
     const char* serviceId, const void* cookie, u32 cookieSize,
     const char* entitlementId, u32 consumedCount);

@@ -45,6 +45,9 @@ MUTANTS = {
     'S-always-set': ('    if (before16(wwsjm_be16(m), next))\n', '    if (1)\n'),
     # array switch modulus
     'switch-mod-3': ('(uint16_t)((cur + 1u) % WWSJM_ARRAYS)', '(uint16_t)((cur + 1u) % 3u)'),
+    # the switch counter decremented as a u16 (no borrow into +0x0C)
+    'switch-counter-u16': ('        wwsjm_put32(out + LINE_SWITCHES, wwsjm_be32(out + LINE_SWITCHES) - 1u);',
+                           '        wwsjm_put16(out + LINE_SWITCHES + 2, (uint16_t)(wwsjm_be16(out + LINE_SWITCHES + 2) - 1u));'),
     # header slot: AND with capacity - 1 instead of mod capacity
     'slot-and-mask': ('8u * ((uint32_t)index % capacity)', '8u * ((uint32_t)index & l->mask[a])'),
     # a capacity field of 0xFFFFFFFF accepted (raw-index fallback)
