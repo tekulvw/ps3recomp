@@ -74,13 +74,16 @@ enum {
 /* array 0: nop, 20 jobs (the first 8 decrement the gate), gate, 20 jobs, switch.
  * array 1 starts at index 0x2C: report gate, 20 jobs (slots 0x2D..0x2F, 0..0x10). */
 enum { A0_JOBS1 = 20, A0_DEPS = 8, A0_JOBS2 = 20, A1_START = 0x2C, A1_JOBS = 20, A1_CAP = 0x30 };
-/* After array 1's last job, RACE_JOBS more are published one at a time while
- * no job runs, at the moment a manager has just read the empty header at N
- * (spec 16): the first RACE_ORDERED in the PPU's order (header, S, ready kick)
- * inside that window, the rest with S first and the header and the kick a
- * little later (S seen late, R13). Only a manager that verifies after writing
- * ready := 0 (R12) still runs the ordered ones: the kick it overwrote is the
- * only one. The continuous PPU kick stops before the race. */
+/* After array 1's last job, RACE_JOBS more are published one at a time (spec
+ * 16). The first RACE_ORDERED go in the PPU's order (header, S, ready kick),
+ * inside a manager's exit window: after it decided nothing is claimable at N
+ * and before it writes ready := 0 (the run loop's wwsjm_test_exit_window hook),
+ * so that write always overwrites the kick. Only a manager that verifies after
+ * writing ready := 0 (R12) still runs them; one without the verify loses every
+ * one of these kicks, deterministically. The rest go with S first and the
+ * header and the kick a little later (S seen late, R13), at a read of their
+ * empty header while no job runs. The continuous PPU kick stops before the
+ * race. */
 enum { RACE_JOBS = 12, RACE_ORDERED = 8 };
 
 static struct { uint32_t array, index, module, sum, wid, list, pages; } s_job[MAX_JOBS];
@@ -289,25 +292,43 @@ void wwsjm_test_header_read(uint32_t list_ea, uint16_t index, unsigned type)
         __atomic_add_fetch(&g_verified_kicks, 1, __ATOMIC_ACQ_REL);
         t_race_state = 0;
     }
+    /* the late entries (S first; header and kick later), at a read of their empty header */
     unsigned i = __atomic_load_n(&g_race_next, __ATOMIC_ACQUIRE);
-    if (list_ea != LIST_EA || type != 0 || i >= RACE_JOBS || index != s_race[i].index ||
+    if (list_ea != LIST_EA || type != 0 || i < RACE_ORDERED || i >= RACE_JOBS || index != s_race[i].index ||
         __atomic_load_n(&g_running, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_late_pending, __ATOMIC_ACQUIRE))
         return;
     if (!__atomic_compare_exchange_n(&g_race_next, &i, i + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
     __atomic_add_fetch(&g_race_published, 1, __ATOMIC_ACQ_REL);
     g_last_pub = now_ns();
-    if (i < RACE_ORDERED) {                     /* the PPU's order: header, S, kick */
-        publish_header(i);
-        raise_s1();
-        s_race[i].kicked = now_ns();
-        vm_write8(SPURS_EA + SPURS_WKL_READY1 + WID, NSPUS);
-        t_race_state = 1;
-    } else {                                    /* S first; header and kick later */
-        raise_s1();
-        g_late_i = i;
-        g_late_due = now_ns() + 2000000ull;
-        __atomic_store_n(&g_late_pending, 1, __ATOMIC_RELEASE);
-    }
+    raise_s1();
+    g_late_i = i;
+    g_late_due = now_ns() + 2000000ull;
+    __atomic_store_n(&g_late_pending, 1, __ATOMIC_RELEASE);
+}
+
+/* Called by the run loop (WWSJM_TEST_HOOKS) after it decided nothing is
+ * claimable and before it writes ready := 0: the PPU-order entries (header, S,
+ * kick) are published exactly here, when the lane's own N is the next one. The
+ * ready := 0 that follows always overwrites that kick, so only the verify after
+ * it (R12) can still find the entry: a manager without it loses the kick on
+ * every one of these publications, deterministically. */
+void wwsjm_test_exit_window(uint32_t list_ea)
+{
+    unsigned i = __atomic_load_n(&g_race_next, __ATOMIC_ACQUIRE);
+    /* only while no job runs: no other lane is inside finish, whose claim and
+     * ready rule read the line at two moments of their own */
+    if (list_ea != LIST_EA || i >= RACE_ORDERED || be16r(LIST_EA + 0x0A) != 1 ||
+        be16r(LIST_EA + 0x52) != s_race[i].index || be16r(LIST_EA + 0x50) != s_race[i].index ||
+        __atomic_load_n(&g_running, __ATOMIC_ACQUIRE))
+        return;
+    if (!__atomic_compare_exchange_n(&g_race_next, &i, i + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    __atomic_add_fetch(&g_race_published, 1, __ATOMIC_ACQ_REL);
+    g_last_pub = now_ns();
+    publish_header(i);
+    raise_s1();
+    s_race[i].kicked = now_ns();
+    vm_write8(SPURS_EA + SPURS_WKL_READY1 + WID, NSPUS);
+    t_race_state = 1;
 }
 
 /* ---- job code (lifted-style C) ---------------------------------------------------- */
