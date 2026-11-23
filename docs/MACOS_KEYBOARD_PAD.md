@@ -21,8 +21,10 @@ same axis cancel to neutral; releasing one restores the other held direction.
 The arrow keys do not drive either analog stick. Codes follow the physical
 key positions of a US keyboard, independently of the active text layout.
 
-This fills an unoccupied SDL game-controller port; a real controller takes
-priority. Keys release when the view or window loses focus, on window close,
+Without an SDL game controller on port zero the keyboard is the port; with one,
+the two merge as on Linux and Windows ([LINUX_KEYBOARD_PAD.md](LINUX_KEYBOARD_PAD.md),
+"With a controller"): keyboard buttons add, and a stick with a held key follows
+the keys. Keys release when the view or window loses focus, on window close,
 or when a Command shortcut begins. Unbound ordinary keys are consumed rather
 than passed to Cocoa's default rejection beep. Application Command shortcuts
 remain in the standard responder path. No global keyboard monitor is installed.
@@ -40,7 +42,7 @@ the same layout ([LINUX_KEYBOARD_PAD.md](LINUX_KEYBOARD_PAD.md)).
 through the production view handlers and real big-endian cellPad reports. It
 covers all directions and buttons, two simultaneous sticks, opposing keys and
 release, digital pressure, repeated presses, the Return/keypad Enter alias,
-focus clear and ignored unfocused presses, SDL controller priority, and opt-out.
+focus clear and ignored unfocused presses, merging into an SDL controller, and opt-out.
 It requires macOS and SDL2 and creates no application or window; its focus
 source is a test double, while event handling and guest pad polling are real.
 The expanded layout regression failed against base
