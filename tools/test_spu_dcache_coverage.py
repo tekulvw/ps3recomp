@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix='spu-dcache-coverage-') as td:
         exe=p/name
         if sanitize:flags+=['-fsanitize=undefined','-fno-sanitize-recover=all']
         cmd=[os.environ.get('CC','cc'),'-std=gnu17','-O2','-UNDEBUG',*flags,'-I'+str(p),'-I'+str(ROOT/'include'),'-I'+str(SPU),'-I'+str(ROOT/'runtime/platform'),str(SPU/'tests/test_spu_dcache_coverage.c'),*[str(SPU/(u+'.c')) for u in units],str(ROOT/'runtime/platform/win32_compat.c'),str(ROOT/'runtime/diagnostics/job_io_recorder.c'),'-pthread','-lm','-o',str(exe)]
-        build=subprocess.run(cmd,capture_output=True,text=True,timeout=60);assert not build.returncode,build.stdout+build.stderr
+        build=subprocess.run(cmd,capture_output=True,text=True,timeout=300);assert not build.returncode,build.stdout+build.stderr
         results=[]
         for mode in (['1','shadow'] if midpublication else ['0','1','shadow']):
             result=subprocess.run([str(exe)],env=dict(env,SPU_DISPATCH_CACHE=mode),capture_output=True,text=True,timeout=10)

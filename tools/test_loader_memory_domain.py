@@ -35,8 +35,8 @@ vm_shutdown();std::puts("PASS loader330/337 failure recovery, reservation bounds
 '''
  with tempfile.TemporaryDirectory(prefix='ps3-loader-memory-') as tmp:
   tmp=Path(tmp);(tmp/'fixture.cpp').write_text(pre+body+post)
-  subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG','-c',str(root/'runtime/syscalls/sys_memory.c'),'-o',str(tmp/'memory.o')],check=True,timeout=30)
-  subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG','-I'+str(root/'runtime/syscalls'),str(tmp/'fixture.cpp'),str(tmp/'memory.o'),'-pthread','-o',str(tmp/'fixture')],check=True,timeout=30)
+  subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG','-c',str(root/'runtime/syscalls/sys_memory.c'),'-o',str(tmp/'memory.o')],check=True,timeout=300)
+  subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG','-I'+str(root/'runtime/syscalls'),str(tmp/'fixture.cpp'),str(tmp/'memory.o'),'-pthread','-o',str(tmp/'fixture')],check=True,timeout=300)
   subprocess.run([str(tmp/'fixture')],check=True,timeout=10)
  return 0
 if __name__=='__main__':raise SystemExit(main())

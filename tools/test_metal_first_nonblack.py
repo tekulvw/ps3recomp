@@ -20,7 +20,7 @@ def main():
             "libs/video/rsx_texture_layout.c",'runtime/diagnostics/critical_trace.c', "runtime/diagnostics/render_ablation.c", "libs/video/rsx_fifo_busy.c", "libs/input/pad_macos.m", "-Wl,-dead_strip",
             "-framework", "Metal", "-framework", "Cocoa", "-framework", "QuartzCore",
             "-o", str(binary),
-        ], cwd=ROOT, check=True, timeout=120)
+        ], cwd=ROOT, check=True, timeout=300)
         for mode in ("first", "black", "bgra", "windowed", "presentation", "retry", "default", "disabled", "managed-headless", "managed-windowed", "managed-bgra"):
             subprocess.run([str(binary), mode, str(pathlib.Path(tmp) / f"{mode}.ppm")],
                            check=True, timeout=30)

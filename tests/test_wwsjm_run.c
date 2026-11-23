@@ -274,10 +274,12 @@ static void publish_header(unsigned i)
  * run in state 2 without reading the line and header again has lost the kick
  * (spec 16.1); a header read in state 2 is the verify (R12). */
 static __thread int t_race_state;
-static volatile unsigned g_lost_kicks, g_verified_kicks;
+static volatile unsigned g_lost_kicks, g_verified_kicks, g_flag_ready;
 void wwsjm_test_ready_store(uint32_t list_ea, unsigned wid, uint8_t value)
 {
     if (list_ea == LIST_EA && wid == WID && t_race_state == 1 && value == 0) t_race_state = 2;
+    /* the second workload's flag was honoured: ready := 8 (6.1, U19) */
+    if (list_ea == LIST2_EA && wid == WID2 && value == 8) __atomic_add_fetch(&g_flag_ready, 1, __ATOMIC_ACQ_REL);
 }
 void wwsjm_test_run_end(uint32_t list_ea)
 {
@@ -482,7 +484,9 @@ static void job_common(spu_context* c, uint32_t module, uint32_t entry)
     if (call_service(c, ctx_ls, 0x48, 1, 0, 0, NULL) != 0xFFFFFFFFu) ERR(g_err_desc);
     if (s_job[k].wid == WID2) {
         /* the second workload's receiver flag is raised while its job runs: the
-         * poll inside finish reports it, and ready := 8 must follow (6.1, U19) */
+         * poll inside finish reports it, and ready := 8 must follow (6.1, U19).
+         * The workload's maximum contention is 1, so no other lane's entry can
+         * take the flag first. */
         vm_base[SPURS_EA + 0x74] &= (uint8_t)~0x40u;
         vm_write8(SPURS_EA + SPURS_WKL_FLAG_RECEIVER, WID2);
         vm_write32(SPURS_EA + SPURS_WKL_FLAG_VALUE, 0);
@@ -620,7 +624,11 @@ int main(int argc, char** argv)
     s_workloads[WID2].data = LIST2_EA;
     vm_write64(SPURS_EA + SPURS_WKL_INFO1 + WID2 * SPURS_WKL_INFO_SZ + 8, LIST2_EA);
     vm_base[SPURS_EA + SPURS_WKL_STATE1 + WID2] = 2;
-    vm_base[SPURS_EA + SPURS_WKL_MAXCONT + WID2] = NSPUS;
+    /* One run of the second workload at a time: the run executing its job is
+     * then the only one that can see the flag the job raises, so the poll
+     * inside finish always reports it (6.1, U19) and no other lane's entry can
+     * take it first. */
+    vm_base[SPURS_EA + SPURS_WKL_MAXCONT + WID2] = 1;
     for (unsigned i = 0; i < 8; i++) vm_base[SPURS_EA + SPURS_WKL_INFO1 + WID2 * SPURS_WKL_INFO_SZ + 0x18 + i] = 1;
     vm_write32(SPURS_EA + SPURS_WKL_ENABLED, (0x80000000u >> WID) | (0x80000000u >> WID2));
     pthread_t mon, brk;
@@ -657,11 +665,11 @@ int main(int argc, char** argv)
     for (unsigned a = 0; a < 2; a++) for (unsigned s = 0; s < 6; s++) lanes_busy += be16r(LIST_EA + 0x44 + 16 * a + 2 * s) != 0xFFFF;
     printf("result done=%d jobs=%u ran=%u dup=%u missing=%u bad_out=%u regs=%u ctx=%u ud=%u module=%u gather=%u desc=%u "
            "tag=%u finish=%u violations=%u lifted=%u current=%u n0=%u s0=%u n1=%u s1=%u lanes_busy=%u gate=%u "
-           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u irq=%u stack=%u listcopy=%u overlap=%u race=%u stalls=%u lost_kicks=%u verified_kicks=%u\n",
+           "switches=%04X consults=%lu finish_jobs=%u breaks=%u lowls=%u irq=%u stack=%u listcopy=%u overlap=%u race=%u stalls=%u lost_kicks=%u verified_kicks=%u flag_ready=%u\n",
            done, s_jobs, ran, dup, missing, bad_out, g_err_regs, g_err_ctx, g_err_ud, g_err_module, g_err_gather,
            g_err_desc, g_err_tag, g_err_finish, g_violations, g_lifted_runs, be16r(LIST_EA + 0x0A),
            be16r(LIST_EA + 0x42), be16r(LIST_EA + 0x40), be16r(LIST_EA + 0x52), be16r(LIST_EA + 0x50), lanes_busy,
-           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls, g_err_irq, g_err_stack, g_err_listcopy, g_err_overlap, g_race_published, g_stalls, g_lost_kicks, g_verified_kicks);
+           be16r(GATE_EA), be16r(LIST_EA + 0x0E), spurs_native_pm_consults(), g_finish_jobs, g_breaks, g_err_lowls, g_err_irq, g_err_stack, g_err_listcopy, g_err_overlap, g_race_published, g_stalls, g_lost_kicks, g_verified_kicks, g_flag_ready);
     fflush(stdout);
     if (native) spurs_wwsjm_print_stats();
     if (native && getenv("PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW")) spurs_wwsjm_shadow_print();

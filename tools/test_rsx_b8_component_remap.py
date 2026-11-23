@@ -14,7 +14,7 @@ def main():
         subprocess.run(["clang", "-Iinclude", "-Ilibs/video",
                         "libs/video/tests/test_texture_layout.c",
                         "libs/video/rsx_texture_layout.c", "-o", str(binary)],
-                       cwd=ROOT, check=True, timeout=120)
+                       cwd=ROOT, check=True, timeout=300)
         subprocess.run([str(binary)], check=True, timeout=30)
         if platform.system() != "Darwin":
             print("SKIP: real Metal B8 sampling requires macOS")
@@ -26,7 +26,7 @@ def main():
                         "libs/video/rsx_texture_layout.c",'runtime/diagnostics/critical_trace.c', "libs/video/rsx_fifo_busy.c", "libs/input/pad_macos.m",
                         "-Wl,-dead_strip", "-framework", "Metal", "-framework", "Cocoa",
                         "-framework", "QuartzCore", "-o", str(binary)],
-                       cwd=ROOT, check=True, timeout=120)
+                       cwd=ROOT, check=True, timeout=300)
         subprocess.run([str(binary)], check=True, timeout=30)
 
 

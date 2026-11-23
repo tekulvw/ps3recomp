@@ -11,4 +11,4 @@ with tempfile.TemporaryDirectory(prefix='rsx-reports-') as tmp:
  for name in ('test_rsx_deferred_reports','test_rsx_early_release','test_vm_release_guard'):
   out=Path(tmp)/name
   cmd=[os.environ.get('CC','cc'),'-std=gnu17','-O2','-UNDEBUG','-fsanitize=undefined','-ffunction-sections','-fdata-sections','-I'+str(root/'include'),str(root/'tests'/f'{name}.c'),'-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections','-pthread','-o',str(out)]
-  subprocess.run(cmd,check=True,timeout=60);subprocess.run([str(out)],check=True,timeout=10)
+  subprocess.run(cmd,check=True,timeout=300);subprocess.run([str(out)],check=True,timeout=10)

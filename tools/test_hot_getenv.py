@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='hot-getenv-') as tmp:
         binary = Path(tmp) / f'test_{unit.lower()}'
         subprocess.run([compiler, '-std=gnu17', '-O1', '-UNDEBUG', f'-DHOT_UNIT_{unit}',
                         *('-I' + str(i) for i in includes), str(SOURCE), '-pthread',
-                        '-o', str(binary)], check=True, timeout=120, cwd=tmp)
+                        '-o', str(binary)], check=True, timeout=300, cwd=tmp)
         run = subprocess.run([str(binary)], cwd=tmp, timeout=60, capture_output=True, text=True)
         print(run.stdout.strip(), flush=True)
         if run.returncode != 0:

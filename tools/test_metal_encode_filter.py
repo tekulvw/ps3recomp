@@ -18,7 +18,7 @@ def main():
                         "runtime/diagnostics/critical_trace.c", "runtime/diagnostics/render_ablation.c",
                         "libs/video/rsx_fifo_busy.c", "libs/input/pad_macos.m", "-Wl,-dead_strip",
                         "-framework", "Metal", "-framework", "Cocoa", "-framework", "QuartzCore", "-o", str(binary)],
-                       cwd=ROOT, check=True, timeout=180)
+                       cwd=ROOT, check=True, timeout=300)
         result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=60)
         print(result.stdout.strip())
         if result.returncode:

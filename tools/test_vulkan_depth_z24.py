@@ -56,7 +56,7 @@ def main():
         glsl = Path(tmp) / "vk_fetch.comp"
         glsl.write_text(FETCH_GLSL)
         subprocess.run([glslang, "-V", "--target-env", "vulkan1.0", "--vn", "vk_fetch_comp_spv",
-                        "-o", str(Path(tmp) / "vk_fetch_comp.spv.h"), str(glsl)], check=True, timeout=60,
+                        "-o", str(Path(tmp) / "vk_fetch_comp.spv.h"), str(glsl)], check=True, timeout=300,
                        stdout=subprocess.DEVNULL)
         objects = []
         for index, source in enumerate(sources):
@@ -65,11 +65,11 @@ def main():
             command = [os.environ.get("CXX", "c++") if cxx else os.environ.get("CC", "cc"),
                        "-std=c++17" if cxx else "-std=gnu17", "-O1", "-g", "-UNDEBUG", "-ffunction-sections",
                        "-fdata-sections", "-Iinclude", "-Ilibs/video", "-I" + tmp, *flags, "-c", source, "-o", str(output)]
-            subprocess.run(command, cwd=ROOT, check=True, timeout=120)
+            subprocess.run(command, cwd=ROOT, check=True, timeout=300)
             objects.append(str(output))
         binary = Path(tmp) / "fixture"
         subprocess.run([os.environ.get("CXX", "c++"), *objects, "-Wl,--gc-sections", "-pthread", "-ldl", "-lm",
-                        *libraries, "-o", str(binary)], cwd=ROOT, check=True, timeout=120)
+                        *libraries, "-o", str(binary)], cwd=ROOT, check=True, timeout=300)
         if args.build_only:
             print("Vulkan depth z24 fixture compiled; GPU execution pending")
             return

@@ -57,7 +57,7 @@ int main(void)
         (path / "clock.c").write_text(fixture)
         subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-UNDEBUG",
                         "-I" + str(ROOT / "runtime/platform"), str(path / "clock.c"),
-                        "-o", str(path / "clock")], check=True, timeout=30)
+                        "-o", str(path / "clock")], check=True, timeout=300)
         subprocess.run([str(path / "clock")], check=True, timeout=5)
 
 

@@ -3060,7 +3060,22 @@ typedef struct {
     uint32_t vepoch[SPU_VERIFIED_IMAGES];
     uint32_t vtotal;   /* bumped with any vepoch: the short dispatch entry's one epoch */
     spu_dcache_ent ent[512];
+    /* SPU_DCACHE_MISS_STATS=1: this thread's lookups and misses by reason. */
+    unsigned long long st_hits, st_miss[8], st_next_ms; unsigned st_thread;
+    /* Residency epoch bumps by cause: a GET over resident code from another
+     * source (slot cleared), a GET re-delivering a slot's own bytes
+     * (re-verify), a load into a slot that held the same image from the same
+     * source (same reload), and a load of other code (new). */
+    unsigned long long st_res[4];
 } spu_dcache_tls;
+/* Why a lookup missed, in the order the entry is tested: the slot was empty;
+ * it holds another target or context lifetime (conflict); the same target
+ * under another image/overlay/task/mode; a registry or verified-image
+ * registration changed; only the residency epoch moved; only a verified
+ * image's GET epoch moved; and resolutions that are not cached at all. */
+enum { DCM_EMPTY, DCM_CONFLICT, DCM_CONTEXT, DCM_REGISTRY, DCM_RESIDENCY, DCM_VEPOCH, DCM_UNCACHED, DCM_N };
+static const char* const s_dcm_name[DCM_N] = { "empty", "conflict", "context", "registry",
+                                               "residency", "vepoch", "uncached" };
 static SPU_TLS spu_dcache_tls t_dcache;   /* one TLS object: Darwin TLV access is a call */
 static atomic_ullong s_dcache_hits, s_dcache_misses, s_dcache_shadow_bad;
 static uint32_t s_dcache_next_id;
@@ -3097,6 +3112,36 @@ static void spu_dcache_note_get(uint32_t lsa, uint32_t size)
 /* Per context, not per thread: a context's resident code is what its cached
  * resolutions depend on, whichever thread changed it. */
 static void spu_dcache_residency_changed(spu_context* ctx) { ctx->dcache_residency++; }
+static int spu_dcache_miss_stats(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_DCACHE_MISS_STATS"); on = e && !strcmp(e, "1"); }
+    return on;
+}
+/* Cumulative counts, one line per thread at most once a second (checked every
+ * 4096 lookups), tagged with a thread number, the SPU the thread serves as a
+ * SPURS worker (-1 otherwise) and a millisecond clock. Shares stay per thread,
+ * so the counting itself never bounces a cache line between SPU threads. */
+static atomic_uint s_dcache_stat_threads;
+static void spu_dcache_miss_report(spu_dcache_tls* t)
+{
+    unsigned long long miss = 0;
+    for (int i = 0; i < DCM_N; ++i) miss += t->st_miss[i];
+    const unsigned long long n = t->st_hits + miss;
+    if (n & 4095u) return;
+    const unsigned long long now = GetTickCount64();
+    if (now < t->st_next_ms) return;
+    t->st_next_ms = now + 1000;
+    if (!t->st_thread) t->st_thread = atomic_fetch_add(&s_dcache_stat_threads, 1u) + 1u;
+    char line[640]; int k = snprintf(line, sizeof line, "[spu-dcache-miss] t_ms=%llu thread=%u spu=%d lookups=%llu hits=%llu",
+                                     now, t->st_thread, t_ft_spu, n, t->st_hits);
+    for (int i = 0; i < DCM_N && k > 0 && k < (int)sizeof line; ++i)
+        k += snprintf(line + k, sizeof line - (size_t)k, " %s=%llu", s_dcm_name[i], t->st_miss[i]);
+    if (k > 0 && k < (int)sizeof line)
+        snprintf(line + k, sizeof line - (size_t)k, " | residency bumps: cleared=%llu reverify=%llu same_reload=%llu new=%llu",
+                 t->st_res[0], t->st_res[1], t->st_res[2], t->st_res[3]);
+    fprintf(stderr, "%s\n", line);
+}
 static void spu_dcache_stats(void)
 {
     const unsigned long long n = atomic_fetch_add_explicit(&s_dcache_hits, 0, memory_order_relaxed) +
@@ -3154,6 +3199,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         e->vregistration==vregistration &&
         e->residency == c->dcache_residency && e->vmask == vmask && e->vsum == vsum &&
         __atomic_load_n(&s_verified_generation,__ATOMIC_ACQUIRE)==vregistration) {
+        if (spu_dcache_miss_stats()) { t->st_hits++; spu_dcache_miss_report(t); }
         if (mode == 2) {
             atomic_fetch_add_explicit(&s_dcache_hits, 1, memory_order_relaxed);
             spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa);
@@ -3173,6 +3219,16 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         atomic_fetch_add_explicit(&s_dcache_misses, 1, memory_order_relaxed);
         spu_dcache_stats();
     }
+    int why = -1;
+    if (spu_dcache_miss_stats()) {
+        why = !e->fn ? DCM_EMPTY
+            : (e->id != id || e->lsa != lsa) ? DCM_CONFLICT
+            : (e->image != ctx->image_id || e->ovl != ctx->resident_ovl ||
+               e->task != ctx->resident_task || e->flags != flags) ? DCM_CONTEXT
+            : (e->rgen != rgen || e->vgen != vgen || e->vregistration != vregistration) ? DCM_REGISTRY
+            : e->residency != c->dcache_residency ? DCM_RESIDENCY
+            : DCM_VEPOCH;
+    }
     /* The full resolver may verify a resident slot (pending -> verified);
      * read the epochs after it so the entry describes the state it saw. */
     spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa);
@@ -3182,7 +3238,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         e->ovl = ctx->resident_ovl; e->task = ctx->resident_task; e->flags = flags;
         e->rgen = rgen; e->vgen = vgen; e->vregistration=vregistration;
         e->residency = c->dcache_residency; e->vmask = vmask; e->vsum = vsum;
-    }
+    } else if (why >= 0) why = DCM_UNCACHED;
+    if (why >= 0) { t->st_miss[why]++; spu_dcache_miss_report(t); }
     return fn;
 }
 
@@ -3289,10 +3346,12 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                               ctx->resident_code[slot].source_ea, lsa, size, ea, (unsigned)(ctx->pc & SPU_LS_MASK)); }
                 ctx->resident_code[slot].image_id = 0;
                 spu_dcache_residency_changed(ctx);
+                if (spu_dcache_miss_stats()) t_dcache.st_res[0]++;
             }
             else if (ctx->resident_code[slot].verify_state) {
                 ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
                 spu_dcache_residency_changed(ctx);
+                if (spu_dcache_miss_stats()) t_dcache.st_res[1]++;
             }
         }
     }
@@ -3315,6 +3374,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 for (unsigned slot = 0; slot < 4; ++slot) {
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
                         continue;
+                    if (spu_dcache_miss_stats())
+                        t_dcache.st_res[ctx->resident_code[slot].image_id == o->image_id &&
+                                        ctx->resident_code[slot].source_ea == ea ? 2 : 3]++;
                     ctx->resident_code[slot].lsa = lsa;
                     ctx->resident_code[slot].size = o->span;
                     ctx->resident_code[slot].source_ea = ea;
@@ -4113,6 +4175,46 @@ static inline void spurs_kernel_select_workload_body(spu_context* ctx)
 }
 void spurs_kernel_select_workload(spu_context* ctx) { spurs_kernel_select_workload_body(ctx); }
 
+/* SPU_DISPATCH_KIND_STATS=1: what the indirect-branch lookups are. Lifted
+ * code already returns natively through a live brsl/bisl frame (SPU_RET with
+ * host_depth > 0 never gets here), so a lookup is one of:
+ *   ret_pc   the target is the innermost live call's planted return pc
+ *            (drain_ret_pc) -- a return the drain did not short-circuit;
+ *   link0    the target is the value in r0, the link register: a return
+ *            through r0, split by whether a host call frame is live (depth>0)
+ *            or gone (depth 0: task resume, restack, top-level drain);
+ *   other    any other target: indirect calls (bisl), computed jumps,
+ *            returns through another link register, interrupt returns.
+ * Counted per thread; one cumulative line per thread at most once a second. */
+static int spu_dispatch_kind_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_DISPATCH_KIND_STATS"); on = e && !strcmp(e, "1"); }
+    return on;
+}
+static SPU_TLS struct { unsigned long long n, ret_pc, link0_live, link0_gone, other_live, other_gone, next_ms; unsigned id; } t_dk;
+static unsigned s_dk_threads;
+static void spu_dispatch_kind_note(const spu_context* ctx)
+{
+    const uint32_t pc = ctx->pc & SPU_LS_MASK;
+    const int live = ctx->host_depth > 0;
+    if (ctx->drain_ret_pc && pc == (ctx->drain_ret_pc & SPU_LS_MASK)) t_dk.ret_pc++;
+    else if (pc == (ctx->gpr[0]._u32[0] & SPU_LS_MASK)) { if (live) t_dk.link0_live++; else t_dk.link0_gone++; }
+    else if (live) t_dk.other_live++;
+    else t_dk.other_gone++;
+    if ((++t_dk.n & 4095u) == 0) {
+        const unsigned long long now = GetTickCount64();
+        if (now >= t_dk.next_ms) {
+            t_dk.next_ms = now + 1000;
+            if (!t_dk.id) t_dk.id = __atomic_add_fetch(&s_dk_threads, 1u, __ATOMIC_RELAXED);
+            fprintf(stderr, "[spu-dispatch-kind] t_ms=%llu thread=%u spu=%d lookups=%llu ret_pc=%llu "
+                    "link0_live=%llu link0_gone=%llu other_live=%llu other_gone=%llu\n",
+                    now, t_dk.id, t_ft_spu, t_dk.n, t_dk.ret_pc, t_dk.link0_live, t_dk.link0_gone,
+                    t_dk.other_live, t_dk.other_gone);
+        }
+    }
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -4312,6 +4414,7 @@ void spu_indirect_branch(spu_context* ctx)
         if (ti) ctx->resident_task = ti;
     }
     /* Use the same ownership order as the interpreter's rejoin probe. */
+    if (spu_dispatch_kind_on()) spu_dispatch_kind_note(ctx);
     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
     const spu_fn ibf_plain = fn;   /* the short entry records only this answer */
     /* The job returned through the link register we planted: it is finished.

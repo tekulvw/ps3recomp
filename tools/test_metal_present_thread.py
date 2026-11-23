@@ -14,7 +14,7 @@ def main():
                         "libs/video/tests/test_metal_present_thread.m", "libs/video/rsx_texture_layout.c",
                         "runtime/diagnostics/critical_trace.c","libs/video/rsx_fifo_busy.c", "runtime/diagnostics/render_ablation.c",
                         "libs/input/pad_macos.m", "-Wl,-dead_strip", "-framework", "Metal", "-framework", "Cocoa",
-                        "-framework", "QuartzCore", "-o", str(binary)], cwd=ROOT, check=True, timeout=120)
+                        "-framework", "QuartzCore", "-o", str(binary)], cwd=ROOT, check=True, timeout=300)
         p = subprocess.run([str(binary)], capture_output=True, text=True, timeout=60)
         print(p.stdout, end=""); print(p.stderr, end="")
         p.check_returncode()

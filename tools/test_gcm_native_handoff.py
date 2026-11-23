@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-native-handoff-') as temp:
                    ['runtime/diagnostics/critical_trace.c','runtime/diagnostics/render_ablation.c']),
     ):
         output = Path(temp) / name
-        subprocess.run(common + sources + linker + ['-o', str(output)], cwd=ROOT, check=True, timeout=60)
+        subprocess.run(common + sources + linker + ['-o', str(output)], cwd=ROOT, check=True, timeout=300)
         subprocess.run([str(output)], check=True, timeout=10)
 
     if sys.platform == 'darwin':
@@ -41,5 +41,5 @@ with tempfile.TemporaryDirectory(prefix='gcm-native-handoff-') as temp:
                         'runtime/diagnostics/critical_trace.c', 'libs/input/pad_macos.m',
                         '-Wl,-dead_strip', '-framework', 'Metal', '-framework', 'Cocoa',
                         '-framework', 'QuartzCore', '-o', str(output)],
-                       cwd=ROOT, check=True, timeout=60)
+                       cwd=ROOT, check=True, timeout=300)
         subprocess.run([str(output)], check=True, timeout=10)

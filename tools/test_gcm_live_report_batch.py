@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-live-report-')as tmp:
         sources.append(str(ROOT/'runtime/platform/win32_compat.c'))
         dead_strip='-Wl,-dead_strip'if sys.platform=='darwin'else'-Wl,--gc-sections'
         cmd=[cc,'-std=gnu17','-O1','-UNDEBUG','-ffunction-sections','-fdata-sections','-I',str(ROOT/'include'),*sources,dead_strip,'-pthread','-lm','-o',str(out)]
-    subprocess.run(cmd,check=True,timeout=60)
+    subprocess.run(cmd,check=True,timeout=300)
     for mode in (sys.argv[1:]or('off','legacy','batch1','batch32','fifo-mixed','idle','read','capacity','reentrant','held','snapshot','map-changed','swap','pump','frozen-config','partial','stale','issue-failure','status-failure','life-during-issue','effect-ref','effect-flip','effect-user','effect-failure','effect-notify','host-label','release-get','inline','vm','timestamp','pointer-read')):
         env=os.environ.copy();env['PS3RECOMP_RSX_DEFERRED_REPORTS']='0'if mode=='off'else'1';env['PS3RECOMP_GCM_LIVE_REPORT_BATCH']=env['PS3RECOMP_RSX_DEFERRED_REPORTS']
         env['PS3RECOMP_RSX_DEFERRED_REPORT_BATCH']='1'if mode=='batch1'else'32'

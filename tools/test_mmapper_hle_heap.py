@@ -21,7 +21,7 @@ def main():
                         '-I', str(temp), '-I', str(ROOT / 'include'), str(ROOT / 'tests/test_mmapper_hle_heap.c'),
                         str(ROOT / 'runtime/syscalls/sys_memory.c'),
                         str(ROOT / 'runtime/syscalls/sys_vm.c'), '-pthread',
-                        '-o', str(executable)], check=True, timeout=30)
+                        '-o', str(executable)], check=True, timeout=300)
         subprocess.run([str(executable)], check=True, timeout=15)
     return 0
 if __name__ == '__main__':

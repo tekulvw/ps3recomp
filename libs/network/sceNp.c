@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <time.h>     /* timespec_get -- sceNpManagerGetNetworkTime */
 #include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "np_psnr.h"
@@ -516,6 +517,43 @@ s32 sceNpManagerGetChatRestrictionFlag(s32* isRestricted)
 {
     if (!np_is_initialized()) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (isRestricted) vm_write32((u32)(uintptr_t)isRestricted, 0);
+    return CELL_OK;
+}
+
+/* Signed-in account details a linked (ticket) title asks for next; see
+ * docs/cell-game-update.md, "Other imports on a linked account's online path". */
+s32 sceNpManagerGetMyLanguages(SceNpMyLanguages* langs) { return sceNpGetMyLanguages(langs); }
+
+s32 sceNpManagerGetAccountRegion(void* countryCode, s32* language)
+{
+    if (!np_is_initialized()) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!countryCode && !language) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (countryCode) {
+        u32 ea = (u32)(uintptr_t)countryCode;
+        vm_write8(ea + 0, 'u'); vm_write8(ea + 1, 's');
+        vm_write8(ea + 2, 0);   vm_write8(ea + 3, 0);
+    }
+    if (language) vm_write32((u32)(uintptr_t)language, SCE_NP_LANG_ENGLISH);
+    printf("[sceNp] ManagerGetAccountRegion() -> us, English\n");
+    return CELL_OK;
+}
+
+/* Microseconds from 0001-01-01 to 1970-01-01. */
+#define NP_RTC_UNIX_EPOCH_US 62135596800000000ull
+
+s32 sceNpManagerGetNetworkTime(void* tick)
+{
+    if (!np_is_initialized()) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!tick) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    if (!np_psnr_enabled() && !np_local_ticket_available()) {   /* as GetStatus */
+        printf("[sceNp] ManagerGetNetworkTime() -> OFFLINE\n");
+        return SCE_NP_ERROR_OFFLINE;
+    }
+    struct timespec now;
+    timespec_get(&now, TIME_UTC);
+    u64 us = (u64)now.tv_sec * 1000000ull + (u64)now.tv_nsec / 1000ull;
+    vm_write64((u32)(uintptr_t)tick, NP_RTC_UNIX_EPOCH_US + us);
+    printf("[sceNp] ManagerGetNetworkTime() -> host UTC\n");
     return CELL_OK;
 }
 

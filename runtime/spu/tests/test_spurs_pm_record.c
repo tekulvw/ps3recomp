@@ -8,6 +8,11 @@
  * a slot of the context it was handed, a job PUT on tag 31, and the exit to
  * the kernel. Every guest structure is generated here; no title data.
  *
+ * Quadword loads (spu_ls_read128, the lifted lqd/lqx/lqa) exercise the
+ * local-store read events (PS3RECOMP_SPURS_PM_RECORD_LSREAD): the job reads the
+ * block at its r3 (at and inside it), an absolute address below 0x4000, and
+ * one above; the service and the policy code each read one quadword too.
+ *
  * Prints the observed results and an FNV hash of guest memory so the script
  * can require identical behaviour with the recorder off, on, and statistics
  * only. argv[1] = runs. */
@@ -40,6 +45,7 @@ extern void spu_drain_call(spu_context*, uint32_t);
 extern void spu_begin_image(int);
 extern void spu_register_function(uint32_t, void (*)(spu_context*));
 
+static uint32_t st_lsread_sum;
 static uint32_t st_putllc_ok, st_putllc_fail, st_service_r3, st_job_saw, st_select_wid, st_observer;
 
 static void mfc(spu_context* c, uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size, uint32_t tag)
@@ -56,6 +62,7 @@ static uint32_t atomic_stat(spu_context* c) { return spu_rdch(c, MFC_RdAtomicSta
 /* The service the job calls back: one GET, a result in r3, return to r0. */
 static void service(spu_context* c)
 {
+    st_lsread_sum += spu_ls_read128(c, 0x1C80)._u32[1];   /* a service read: depth 1 */
     mfc(c, 0x40, LS_SVC, SVC_EA, 0x20, 3);
     c->gpr[3] = spu_splat_u32(SERVICE_RESULT + c->gpr[4]._u32[0]);
     SPU_RET(c);
@@ -66,6 +73,10 @@ static void service(spu_context* c)
 static void job(spu_context* c)
 {
     const uint32_t ctx_ls = c->gpr[3]._u32[0];
+    st_lsread_sum += spu_ls_read128(c, ctx_ls)._u32[0];          /* at r3        */
+    st_lsread_sum += spu_ls_read128(c, ctx_ls + 0x14)._u32[1];   /* inside r3's block */
+    st_lsread_sum += spu_ls_read128(c, 0x1C48)._u32[2];          /* absolute, low */
+    st_lsread_sum += spu_ls_read128(c, 0x5000)._u32[3];          /* above the limit */
     const uint32_t target = spu_ls_read32(c, ctx_ls + SLOT);
     const u128 link = c->gpr[0];
     uint32_t _tg = target; c->gpr[0] = spu_link(JOB_CALL_SITE + 4); int32_t _si = (int32_t)c->image_id;
@@ -88,6 +99,9 @@ static void job2(spu_context* c) { SPU_RET(c); }
 static void policy(spu_context* c)
 {
     st_observer = c->pm_observer != NULL;
+    for (uint32_t o = 0; o < 0x100; o += 4) spu_ls_write32(c, 0x1C00 + o, 0xC0FFEE00u + o);
+    spu_ls_write32(c, 0x5000 + 12, 0x0BADF00Du);
+    st_lsread_sum += spu_ls_read128(c, 0x1C00)._u32[0];   /* a policy-region read */
     /* claim-style line transaction: GETLLAR, PUTLLC (success), PUTLLC again (no reservation) */
     mfc(c, MFC_GETLLAR_CMD, LS_LINE, LIST_EA, 128, 0); (void)atomic_stat(c);
     spu_ls_write32(c, LS_LINE + 0x40, spu_ls_read32(c, LS_LINE + 0x40) + 1);
@@ -166,12 +180,16 @@ int main(int argc, char** argv)
     spu_register_function(PM_SERVICE, service);
     spu_register_function(JOB_ENTRY, job);
     spu_register_function(JOB2_ENTRY, job2);
+    /* Another SPU thread has already settled the read-diagnostic gate to "none
+     * armed" before the first policy run, as in a title. */
+    g_spu_ls_rdiag = 0;
     int rc = 0;
     for (int r = 0; r < runs; r++)
         rc |= spu_run_policy_module(policy, IMAGE, pm, sizeof(pm), LIST_EA, 6, SPURS_EA, 2);
-    printf("rc=%d putllc_ok=%u putllc_fail=%u service_r3=%08X job_saw=%08X select_wid=%u observer=%u mem=%016llX\n",
+    printf("rc=%d putllc_ok=%u putllc_fail=%u service_r3=%08X job_saw=%08X select_wid=%u observer=%u "
+           "lsread_sum=%08X pmread=%d rdiag=%d mem=%016llX\n",
            rc, st_putllc_ok, st_putllc_fail, st_service_r3, st_job_saw, st_select_wid, st_observer,
-           (unsigned long long)fnv(memory, sizeof(memory)));
+           st_lsread_sum, g_spu_ls_pmread != NULL, g_spu_ls_rdiag, (unsigned long long)fnv(memory, sizeof(memory)));
     return rc ? 1 : 0;
 }
 
