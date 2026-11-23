@@ -22,7 +22,9 @@
 #include <stdint.h>
 #include <math.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/audio_host_stats.h"
 #include <errno.h>
+#include <stdatomic.h>
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -156,8 +158,56 @@ static int           s_mix_thread_live = 0;
 #endif
 static mutex_t       s_audio_mutex;
 
+/* Host timing counters (include/ps3emu/audio_host_stats.h): always on, relaxed
+ * atomics, at most a few increments per period. Cumulative for the process. */
+static atomic_ullong s_stats_periods, s_stats_underruns, s_stats_starved_frames,
+                     s_stats_late_periods, s_stats_dropped_periods, s_stats_device_errors;
+static atomic_ullong s_stats_reads;           /* guest block reads */
+static atomic_ullong s_stats_first_read_ns;   /* 0 until the first read */
+static atomic_ullong s_stats_last_read_ns;
+static char          s_stats_backend[16];     /* set by cellAudioInit before the mixer starts */
+#define AUDIO_STAT_ADD(counter, n) atomic_fetch_add_explicit(&(counter), (unsigned long long)(n), memory_order_relaxed)
+
+/* One guest block read at now_ns (the mixing loop's own monotonic clock). */
+static void audio_stats_read(u64 now_ns)
+{
+    if (!now_ns) now_ns = 1;
+    unsigned long long none = 0;
+    atomic_compare_exchange_strong_explicit(&s_stats_first_read_ns, &none, now_ns,
+                                            memory_order_relaxed, memory_order_relaxed);
+    atomic_store_explicit(&s_stats_last_read_ns, now_ns, memory_order_relaxed);
+    AUDIO_STAT_ADD(s_stats_reads, 1);
+}
+
+int ps3recomp_audio_host_stats(struct ps3recomp_audio_host_stats* out)
+{
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->version = PS3RECOMP_AUDIO_HOST_STATS_VERSION;
+    const unsigned long long first = atomic_load_explicit(&s_stats_first_read_ns, memory_order_relaxed);
+    if (!first) return -1;
+    out->sample_rate = CELL_AUDIO_SAMPLE_RATE;
+    out->periods = atomic_load_explicit(&s_stats_periods, memory_order_relaxed);
+    out->underruns = atomic_load_explicit(&s_stats_underruns, memory_order_relaxed);
+    out->starved_frames = atomic_load_explicit(&s_stats_starved_frames, memory_order_relaxed);
+    out->late_periods = atomic_load_explicit(&s_stats_late_periods, memory_order_relaxed);
+    out->dropped_periods = atomic_load_explicit(&s_stats_dropped_periods, memory_order_relaxed);
+    out->device_errors = atomic_load_explicit(&s_stats_device_errors, memory_order_relaxed);
+    /* The read count and the latest read time are separate relaxed stores, so a
+     * concurrent read may pair a count with the previous time: at most one
+     * period of error in the drift, never a torn value. */
+    const unsigned long long reads = atomic_load_explicit(&s_stats_reads, memory_order_relaxed);
+    const unsigned long long last = atomic_load_explicit(&s_stats_last_read_ns, memory_order_relaxed);
+    out->clock_frames = reads ? (reads - 1) * CELL_AUDIO_BLOCK_SAMPLES : 0;
+    out->clock_ns = last > first ? last - first : 0;
+    snprintf(out->backend, sizeof(out->backend), "%s", s_stats_backend[0] ? s_stats_backend : "none");
+    return 0;
+}
+
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+/* Silence queued as the device cushion (defined with the pacer below). */
+static const float s_silence_block[CELL_AUDIO_BLOCK_SAMPLES * 2];
 static inline float ld_be_f32(const float* p);
 
 /* Mixer-thread-owned observation windows. Disabled unless explicitly requested;
@@ -395,6 +445,8 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
                        num_samples * 2 * sizeof(float));
         if (chronology) audio_chronology_backend(chronology_before,
             audio_backend_chronology_queue(), rc, num_samples);
+        if (rc < 0) AUDIO_STAT_ADD(s_stats_device_errors, 1);
+        else if (stereo_samples != s_silence_block) AUDIO_STAT_ADD(s_stats_periods, 1);
         if (s_audio_diag_on) {
             s_audio_diag_submit++;
             if (rc < 0) {
@@ -574,6 +626,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     UINT32 available = s_wasapi_buf_frames - padding;
     if (num_samples > available) {
         g_audio_dropped += num_samples - available;
+        AUDIO_STAT_ADD(s_stats_dropped_periods, 1);  /* a submission is at most one block */
         num_samples = available;
     }
     if (num_samples == 0) return;
@@ -590,6 +643,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
         memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
         s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
                                                mute ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+        if (stereo_samples != s_silence_block) AUDIO_STAT_ADD(s_stats_periods, 1);
     }
 }
 
@@ -599,6 +653,9 @@ static int audio_backend_room(void)
     if (!s_wasapi_client) return -1;
     UINT32 padding = 0;
     const HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    static int failing;  /* mixing thread only: one device error per failing spell */
+    if (FAILED(hr) && !failing) AUDIO_STAT_ADD(s_stats_device_errors, 1);
+    failing = FAILED(hr);
     if (FAILED(hr)) {
         /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED on a default-device
          * change, sleep, ...): pace on the clock rather than spin. */
@@ -676,6 +733,7 @@ static int audio_pace(AudioPacer* p, u64 now_ns, long long queued, unsigned* sil
     u64 due = p->epoch_ns + audio_pace_block_time(p->blocks);
     *silence = 0;
     if (now_ns < p->epoch_ns || (now_ns > due && now_ns - due > 4 * block_ns)) {
+        if (now_ns > due && now_ns >= p->epoch_ns) AUDIO_STAT_ADD(s_stats_dropped_periods, (now_ns - due) / block_ns);
         audio_pace_restart(p, now_ns);
         due = now_ns;
     }
@@ -689,6 +747,7 @@ static int audio_pace(AudioPacer* p, u64 now_ns, long long queued, unsigned* sil
             /* The device is slower than the clock, or stalled: one longer
              * period now, rather than two reads back to back later. */
             p->epoch_ns += block_ns;
+            AUDIO_STAT_ADD(s_stats_late_periods, 1);
             return 0;
         }
         if (!p->primed) {
@@ -698,8 +757,11 @@ static int audio_pace(AudioPacer* p, u64 now_ns, long long queued, unsigned* sil
             p->primed = 1;
         } else if (queued < (long long)p->low_frames) {
             *silence = 1; /* the device runs faster than the clock, or just returned */
+            AUDIO_STAT_ADD(s_stats_underruns, 1);
+            AUDIO_STAT_ADD(s_stats_starved_frames, CELL_AUDIO_BLOCK_SAMPLES);
         }
     }
+    if (now_ns - due >= block_ns) AUDIO_STAT_ADD(s_stats_late_periods, 1);  /* woken a period late */
     p->blocks++;
     p->last_read_ns = now_ns;
     return 1;
@@ -1004,6 +1066,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 continue;
             }
             while (silence--) audio_backend_submit(s_silence_block, CELL_AUDIO_BLOCK_SAMPLES);
+            audio_stats_read(now_ns);
             audio_mix_one_block();
             audio_win32_mixed_block_diagnostics();
             if (have_device) audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
@@ -1034,11 +1097,15 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             if (now.QuadPart < due) { Sleep(1); continue; }
             /* More than 50 ms behind (device just went away, a debugger
              * stop): drop the backlog instead of mixing it in a burst. */
-            if (now.QuadPart - due > qf.QuadPart / 20)
+            if (now.QuadPart - due > qf.QuadPart / 20) {
+                AUDIO_STAT_ADD(s_stats_dropped_periods, (unsigned long long)(now.QuadPart - due) *
+                               CELL_AUDIO_SAMPLE_RATE / (unsigned long long)qf.QuadPart / CELL_AUDIO_BLOCK_SAMPLES);
                 q0.QuadPart = now.QuadPart -
                     (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+            }
         }
         blocks++;
+        audio_stats_read(audio_win32_now_ns(qf));
         /* Mix and submit one block */
         audio_mix_one_block();
         audio_win32_mixed_block_diagnostics();
@@ -1119,6 +1186,7 @@ static void* audio_mix_thread_func(void* arg)
                 continue;
             }
             while (silence--) audio_backend_submit(s_silence_block, CELL_AUDIO_BLOCK_SAMPLES);
+            audio_stats_read(now_ns);
             audio_mix_one_block();
             if (have_device) audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
             audio_notify_event_queues();
@@ -1145,6 +1213,8 @@ static void* audio_mix_thread_func(void* arg)
          * nanosecond component to an unsigned elapsed duration. */
         if (have_device != had_device || now_ns < epoch_ns ||
             (now_ns > due_ns && now_ns - due_ns > 4 * block_ns)) {
+            if (now_ns > due_ns && now_ns - due_ns > 4 * block_ns)
+                AUDIO_STAT_ADD(s_stats_dropped_periods, (now_ns - due_ns) / block_ns);
             epoch_ns = due_ns = now_ns;
             blocks = lead = 0;
             had_device = have_device;
@@ -1155,6 +1225,7 @@ static void* audio_mix_thread_func(void* arg)
             continue;
         }
         blocks++;
+        audio_stats_read(now_ns);
         audio_mix_one_block();
         if (!pace_clock) audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
@@ -1239,6 +1310,16 @@ s32 cellAudioInit(void)
     if (audio_backend_init() < 0) {
         printf("[cellAudio] WARNING: Audio backend init failed, continuing silently\n");
         /* Don't fail -- games should still run without audio */
+        AUDIO_STAT_ADD(s_stats_device_errors, 1);
+        snprintf(s_stats_backend, sizeof(s_stats_backend), "none");
+    } else {
+#if AUDIO_BACKEND_SDL2
+        const char* driver = SDL_GetCurrentAudioDriver();
+        snprintf(s_stats_backend, sizeof(s_stats_backend), "%s",
+                 driver && !strcmp(driver, "dummy") ? "dummy" : "sdl2");
+#else
+        snprintf(s_stats_backend, sizeof(s_stats_backend), "wasapi");
+#endif
     }
 
 
