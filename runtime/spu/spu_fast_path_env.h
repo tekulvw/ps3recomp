@@ -85,6 +85,7 @@ static const char* const spu_ib_fast_env[] = {
     "PS3RECOMP_SPURS_PM_RECORD",   /* the policy-run recorder sees every branch */
     "PS3RECOMP_SPURS_PM_STATS",
     "SPU_DCACHE_MISS_STATS",       /* counts every lookup and its miss reason */
+    "SPU_DISPATCH_KIND_STATS",     /* counts every full-entry lookup */
     "SPU_DSPDESC",
     "SPU_DUMP_OVL",
     "SPU_IBCOV",
