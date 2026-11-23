@@ -52,7 +52,7 @@ before implementation; its layout, controller and opt-out modes pass afterward.
 `python3 tools/test_macos_window_pad.py` builds and runs the production Metal
 window, native input view and real cellPad implementation. It checks native
 first-responder routing, real window focus switching, close, Command exclusion,
-pressure data and controller arbitration. This test requires a GUI session,
+pressure data and merging into a controller. This test requires a GUI session,
 Metal and SDL2 and opens brief test windows. Use `--build-only` to compile the
 fixture without launching or activating windows. The original native content
 view fails the first-responder assertion before any synthetic key is delivered.
