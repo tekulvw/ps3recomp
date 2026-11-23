@@ -114,7 +114,8 @@ when it stopped". It makes two kinds of event:
   the halted function's entry, so the halting instruction and its operand register can be read.
 
 The halt event comes through a hook pointer in `spu_halt` that is NULL unless the switch is set.
-Each event is about 2 KiB, so use it with a run limit.
+Each event is about 2 KiB, so use it with a run limit. Like the local-store read events, these go
+to the recording file only, never to a native policy module's shadow comparison.
 
 ## Statistics
 
