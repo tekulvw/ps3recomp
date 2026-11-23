@@ -686,6 +686,13 @@ static int wj_run(spu_context* c, const struct spurs_native_pm_run* a)
             if (r.stop) break;
             /* nothing claimable on the claim's snapshot: ready := 0 (6.4), then
              * verify, and go on claiming if the verify finds work (6.5, R12) */
+#ifdef WWSJM_TEST_HOOKS
+            {   /* synthetic fixtures only: publish inside the exit window, after the
+                 * decision and before ready := 0 (the window a lost kick needs) */
+                extern void wwsjm_test_exit_window(uint32_t list_ea);
+                wwsjm_test_exit_window(r.list_ea);
+            }
+#endif
             wj_ready_store(&r, r.wid, 0);
             if (wj_verify(&r)) continue;
             goto verified;
