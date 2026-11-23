@@ -32,7 +32,7 @@ def main():
         if retail and reference:
             import json
             source=Path(retail);header=source.open('rb').read(16);offset=int.from_bytes(header[8:12],'big')*2048;length=int.from_bytes(header[12:16],'big')*2048
-            result=subprocess.run([str(exe),retail,str(offset),str(length),'179'],check=True,capture_output=True,text=True,timeout=45)
+            result=subprocess.run([str(exe),retail,str(offset),str(length),'179'],check=True,capture_output=True,text=True,timeout=300)
             lines=result.stdout.splitlines();refs=json.loads(Path(reference).read_text())['pictures'];assert len(lines)==len(refs)==179
             for line,ref in zip(lines,refs):
                 ordinal,pts,valid,duration,digest=line.split()

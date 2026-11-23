@@ -2,8 +2,7 @@
 
 With the Vulkan backend's SDL2 game window on Linux (`PS3RECOMP_VK_WINDOW=1`),
 and with the game window on Windows, the keyboard drives virtual controller
-port zero while that window has keyboard focus and no game controller occupies
-the port. Both hosts use one layout, `libs/input/pad_keyboard_layout.h`, which
+port zero while that window has keyboard focus. Both hosts use one layout, `libs/input/pad_keyboard_layout.h`, which
 is also the macOS window pad's (`libs/input/pad_macos.m`). Keys are physical
 positions (USB HID usage IDs, as printed on a US keyboard), independent of the
 active text layout:
@@ -21,6 +20,17 @@ active text layout:
 | **F / G** | L3 / R3 |
 
 Stick keys give full deflection (0 or 255) and opposing keys cancel to 128.
+
+## With a controller
+
+A controller on port zero does not turn the keyboard off; the two merge, on
+Linux, Windows and macOS alike (`pad_keyboard_merge` in `cellPad.c`). The
+keyboard's buttons add to the controller's. A stick follows the keyboard while
+any of its keys is held, opposing keys included (they hold it centred), and
+returns to the controller's stick when they are released. With nothing held the
+controller's report is exactly its own, pressure included; a keyboard button
+reads full pressure in pressure-enabled reports. Without a controller the
+keyboard is the port, as before.
 On Linux, Escape keeps its existing meaning (it closes the game window).
 
 ## Linux
@@ -36,10 +46,11 @@ changes. The CMake option `PS3RECOMP_PAD_SDL_KEYBOARD` (ON) builds it.
 
 ## Windows
 
-The XInput backend fills port zero first; the keyboard takes it only when no
-XInput device answers there. Any XInput device counts, including virtual pads
-created by Steam Input or by remote-desktop and streaming software, so with one
-of those present the keyboard does nothing. Keys are read with
+The XInput backend reads port zero first, and the keyboard merges into what it
+read. This matters on Windows in particular: an XInput device is often present
+without anyone holding it (a virtual pad from Steam Input or remote-desktop and
+streaming software, or an adapter that stays plugged in), and it used to turn
+the keyboard off entirely. Keys are read with
 `GetAsyncKeyState` while a window of this process is in the foreground and the
 native OSK dialog does not own input. Each bound position is resolved to the
 virtual key it produces under the foreground window's keyboard layout (letters
@@ -59,8 +70,8 @@ shoulders, 1/2 triggers, Tab SELECT and a left stick that mirrored the d-pad).
 `python3 tools/test_pad_sdl_keyboard.py` drives synthetic scancode snapshots
 through the production publish step and real big-endian `cellPadGetData`
 reports: every button and stick key, aliases, simultaneous and opposing
-sticks, pressure, focus, the held-key latch, dialog ownership, controller
-priority, window loss, the no-window case and the opt-out, plus a real SDL
+sticks, pressure, focus, the held-key latch, dialog ownership, merging into a
+controller (buttons, held and opposing stick keys, focus, release), window loss, the no-window case and the opt-out, plus a real SDL
 window sampled under the dummy video driver.
 
 `python3 tools/test_pad_file_focus_windows.py` (Windows, clang-cl) builds the
@@ -68,6 +79,7 @@ real Windows `cellPad.c` with deterministic focus, XInput, held-key and
 keyboard-layout providers. Its keyboard modes cover every button and stick key,
 both sticks, opposing keys, chords, the retired Windows-only keys, arrows not
 moving a stick, foreign and missing foreground, the held-key latch across focus
-and across the native dialog, digital pressure, controller priority and
+and across the native dialog, digital pressure, merging into an XInput
+controller (buttons, each stick, opposing keys, pressure, focus, release) and
 unplugging, physical positions under an AZERTY layout and a layout switch, and
-`PAD_NO_KEYBOARD`.
+`PAD_NO_KEYBOARD` with and without a controller.
