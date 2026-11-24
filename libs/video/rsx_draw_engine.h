@@ -439,6 +439,37 @@ int rsx_draw_engine_checked_ready(void);
  * on the renderer consumer; this conservative generation invalidates all hashes. */
 void rsx_draw_engine_mark_guest_dirty(u32 ea, u32 bytes);
 
+/* ---- texture source override ---------------------------------------------
+ *
+ * An embedding application may show its own picture in place of a guest
+ * texture, without writing guest memory: a game's button icons, for
+ * example, replaced by key caps for a keyboard player. With no override set
+ * (the default) nothing changes and the cost is one pointer test per decode.
+ *
+ * The override is asked each time a guest 2D texture is decoded (a cache
+ * miss, or guest bytes that changed), with the texture's registers and its
+ * guest source bytes. It returns 0 for "not mine". Otherwise it returns
+ * RSX_TEXTURE_OVERRIDE_INTEREST, and may set *replacement to `span` bytes in
+ * the same format and layout, which are decoded instead of the guest bytes
+ * (NULL keeps the guest bytes). The replacement must stay valid until the
+ * call that receives it returns to the engine's caller; the engine copies it
+ * out during the decode.
+ *
+ * Every call to rsx_draw_engine_set_texture_override, including one that
+ * sets the same function again, starts a new override generation: textures
+ * that the override took an interest in are decoded again, with a fresh
+ * question, the next time they are used. Others are not touched. Call it from
+ * any thread; the question is asked on the renderer thread. */
+typedef struct {
+    u32 location, offset, format, width, height, levels, pitch, remap;
+    u32 span;           /* bytes of the source, all levels */
+    const u8* bytes;    /* the guest source bytes */
+} rsx_texture_source;
+#define RSX_TEXTURE_OVERRIDE_INTEREST 1
+typedef int (*rsx_texture_override_fn)(void* user, const rsx_texture_source* source,
+                                       const u8** replacement);
+void rsx_draw_engine_set_texture_override(rsx_texture_override_fn fn, void* user);
+
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */
 void rsx_draw_engine_present(void);
