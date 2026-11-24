@@ -76,6 +76,7 @@ struct wj_job {
     unsigned array;
     uint16_t index;
     wwsjm_header h;
+    wwsjm_plan plan;          /* the record's plan, made and checked before the claim (wj_preflight) */
 };
 
 struct wj_run {
@@ -90,6 +91,11 @@ struct wj_run {
     unsigned tag_n;
     uint32_t released;
     int stop;                 /* the kernel asked for another workload */
+    /* A refusal met before a claim withdraws the implementation
+     * (spurs_native_pm_withdraw, wj_refuse) when the lifted module can take
+     * over and the mode is not `check`; the run then claims nothing more and
+     * ends once it holds no job. */
+    int fallback_ok, withdraw;
 };
 static SPU_THREAD_LOCAL struct wj_run* t_wj;
 
@@ -100,7 +106,7 @@ static SRWLOCK s_wj_lock = SRWLOCK_INIT;
 static struct {
     unsigned long long runs, idle_runs, jobs, claims, nonjob_claims, retires, decrements, wakes,
         ready_writes, putllc_retries, polls, loads, load_skips, gathers, nops, set0_moved, index_watch,
-        verifies, verify_work, flag_polls, flag_entries, gather_overlaps;
+        verifies, verify_work, flag_polls, flag_entries, gather_overlaps, withdrawals;
 } s_wj_stats;
 #define WJ_COUNT(f, n) __atomic_add_fetch(&s_wj_stats.f, (unsigned long long)(n), __ATOMIC_RELAXED)
 
@@ -110,10 +116,11 @@ static void wj_print_stats(void)
 #define L(f) __atomic_load_n(&s_wj_stats.f, __ATOMIC_RELAXED)
     fprintf(stderr, "[wwsjm] runs=%llu idle=%llu jobs=%llu claims=%llu nonjob=%llu retires=%llu decrements=%llu "
             "wakes=%llu ready_writes=%llu putllc_retries=%llu polls=%llu loads=%llu resident_skips=%llu "
-            "gathers=%llu nops=%llu set0_moved=%llu index_watch=%llu verifies=%llu verify_work=%llu flag_polls=%llu flag_entries=%llu gather_overlaps=%llu\n",
+            "gathers=%llu nops=%llu set0_moved=%llu index_watch=%llu verifies=%llu verify_work=%llu flag_polls=%llu flag_entries=%llu gather_overlaps=%llu withdrawals=%llu\n",
             L(runs), L(idle_runs), L(jobs), L(claims), L(nonjob_claims), L(retires), L(decrements), L(wakes),
             L(ready_writes), L(putllc_retries), L(polls), L(loads), L(load_skips), L(gathers), L(nops),
-            L(set0_moved), L(index_watch), L(verifies), L(verify_work), L(flag_polls), L(flag_entries), L(gather_overlaps));
+            L(set0_moved), L(index_watch), L(verifies), L(verify_work), L(flag_polls), L(flag_entries), L(gather_overlaps),
+            L(withdrawals));
 #undef L
     fflush(stderr);
 }
@@ -131,6 +138,43 @@ static void wj_fatal(const struct wj_run* r, const char* what, uint32_t a, uint3
     }
     fflush(stderr);
     _Exit(SPURS_NATIVE_PM_FATAL_EXIT);
+}
+
+/* Whether a refusal's report (the record or gather list, the line) should
+ * print: always when it stops the process; when it withdraws, only until the
+ * implementation is withdrawn, so concurrent lanes add at most a few. */
+static int wj_report_refusal(const struct wj_run* r)
+{
+    return !r->fallback_ok || (!r->withdraw && !spurs_native_pm_withdrawn(t_npm_pm));
+}
+
+/* Guest state outside the contract, met before the entry is claimed: nothing
+ * of it is done, and a job this run is already running finishes normally, so
+ * once the run holds no job the lifted module can take the job list over.
+ * Withdraws the implementation (one line, with the same report a stop prints)
+ * unless the mode is `check` or no lifted module exists, which stop as before.
+ * Returns 0, so callers can `return wj_refuse(...)` as "nothing claimable". */
+static int wj_refuse(struct wj_run* r, const char* what, uint32_t a, uint32_t b)
+{
+    if (!r->fallback_ok) wj_fatal(r, what, a, b);
+    if (!r->withdraw) {
+        static int s_reported;
+        r->withdraw = 1;
+        /* the implementation this thread is running (spurs_native_pm.inc); the
+         * first lane to refuse reports, once per process */
+        if (!spurs_native_pm_withdrawn(t_npm_pm) && !__atomic_exchange_n(&s_reported, 1, __ATOMIC_ACQ_REL)) {
+            char why[192];
+            snprintf(why, sizeof why, "%s (0x%X 0x%X) wid=%u lane=%u list=0x%08X", what, a, b, r->wid, r->lane,
+                     r->list_ea);
+            if (r->list_ea && vm_base) {
+                fprintf(stderr, "[wwsjm] refused before a claim: %s; line", why);
+                for (unsigned i = 0; i < 128; i += 4) fprintf(stderr, " %08X", wwsjm_be32(vm_base + r->list_ea + i));
+                fprintf(stderr, "\n");
+            }
+            spurs_native_pm_withdraw(t_npm_pm, why);
+        }
+    }
+    return 0;
 }
 
 /* ---- guest access ------------------------------------------------------------ */
@@ -161,6 +205,17 @@ static void wj_guest_read8(const struct wj_run* r, uint32_t ea, uint8_t out[8], 
         r->ctx->pm_observer->transfer(r->ctx, SPURS_PM_XFER_GET, MFC_GET_CMD, lsa, ea, 8, out);
 }
 
+
+/* A guest read for a check made before a claim (wj_preflight): never reported
+ * to an observer, since the run reads the same bytes again, reported, when it
+ * stages the job. Returns 0 when the range is outside guest memory. */
+static int wj_guest_peek(uint32_t ea, uint32_t n, uint8_t* out)
+{
+    uint64_t limit = ppu_vm_size ? ppu_vm_size : UINT64_C(0x100000000);
+    if (!vm_base || (uint64_t)ea + n > limit) return 0;
+    memcpy(out, vm_base + ea, n);
+    return 1;
+}
 
 static void wj_mfc(spu_context* c, uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size, uint32_t tag)
 {
@@ -223,14 +278,15 @@ static wwsjm_verdict wj_examine(struct wj_run* r, const uint8_t line[128], wwsjm
     wwsjm_line dl;
     wwsjm_line_decode(line, &dl);
     wwsjm_status st = wwsjm_cursor_of(&dl, cur);
-    if (st != WWSJM_OK) wj_fatal(r, "current array malformed", dl.current, st);
+    if (st != WWSJM_OK) return (wwsjm_verdict)wj_refuse(r, "current array malformed", dl.current, st);
     if (cur->index >= WWSJM_INDEX_WRAP_WATCH && __atomic_add_fetch(&s_wj_stats.index_watch, 1, __ATOMIC_RELAXED) <= 4)
         fprintf(stderr, "[wwsjm] index 0x%04X at or above 0x%04X on array %u (wid %u): the u16 wrap is unobserved\n",
                 cur->index, WWSJM_INDEX_WRAP_WATCH, cur->array, r->wid);
     uint8_t raw[8];
     wj_guest_read8(r, cur->header_ea, raw, WJ_READ_LS);
     st = wwsjm_header_decode(raw, h);
-    if (st != WWSJM_OK) wj_fatal(r, "entry header outside the contract", wwsjm_be32(raw), wwsjm_be32(raw + 4));
+    if (st != WWSJM_OK)
+        return (wwsjm_verdict)wj_refuse(r, "entry header outside the contract", wwsjm_be32(raw), wwsjm_be32(raw + 4));
 #ifdef WWSJM_TEST_HOOKS
     {   /* synthetic fixtures only: publish concurrently at this exact point */
         extern void wwsjm_test_header_read(uint32_t list_ea, uint16_t index, unsigned type);
@@ -313,6 +369,91 @@ static int wj_verify(struct wj_run* r)
     return 0;
 }
 
+/* The gather of load `l` with its (size, EA) list `list` (spec 17.1, 18.1): the
+ * list is copied to the last 16*L bytes of the buffer, where the job reads it;
+ * the elements land from the buffer's start under MFC list rules. An element
+ * may run into the copy over entries already consumed: element k must end at
+ * or before the copy's start + 8*(k+1), and inside the buffer. Fills `pc`
+ * (`cap` entries) and `*n`; `*overlap` says an element ran into the copy. */
+static wwsjm_status wj_gather_plan(const wwsjm_load* l, const uint8_t* list, wwsjm_piece* pc, unsigned cap,
+                                   unsigned* n, unsigned* overlap)
+{
+    const uint32_t list_ls = l->ls + l->limit - l->bytes;
+    *overlap = 0;
+    wwsjm_status st = wwsjm_gather_layout(list, l->bytes / 8, l->ls, l->limit, pc, cap, n);
+    if (st != WWSJM_OK) return st;
+    /* list entry k behind each piece (zero-size entries have none) */
+    unsigned piece = 0;
+    for (unsigned k = 0; k < l->bytes / 8 && piece < *n; k++) {
+        if (!wwsjm_be32(list + 8u * k)) continue;
+        const uint32_t end = pc[piece].ls + pc[piece].bytes;
+        if (end > list_ls) {
+            if (end > list_ls + 8u * (k + 1)) return WWSJM_E_GATHER;
+            *overlap = 1;
+        }
+        piece++;
+    }
+    return WWSJM_OK;
+}
+
+/* Everything about a job entry that can refuse it, checked before its claim so
+ * that a refusal leaves nothing held (wj_refuse): the record's commands, the
+ * module set, where the loads land, every gather list and the module entry.
+ * Reads guest memory without reporting it (the run reads the same bytes again,
+ * reported, when it stages the job). The plan is kept for the job. Returns 1
+ * when the job is within the contract. */
+static int wj_preflight(struct wj_run* r, const wwsjm_header* h, wwsjm_plan* plan)
+{
+    uint8_t rec[WWSJM_MAX_PORTION];
+    if (h->size > sizeof rec || !wj_guest_peek(h->ea, h->size, rec))
+        return wj_refuse(r, "job record outside guest memory", h->ea, h->size);
+    unsigned bad = 0;
+    const wwsjm_status st = wwsjm_plan_commands(rec, h->size, WJ_LS_LOW, WJ_LS_HIGH, plan, &bad);
+    if (st != WWSJM_OK) {
+        if (wj_report_refusal(r)) {
+            fprintf(stderr, "[wwsjm] refused record at 0x%08X (%u bytes, command %u):", h->ea, h->size, bad);
+            for (uint32_t o = 0; o + 4 <= h->size; o += 4) fprintf(stderr, "%s%08X", (o & 7) ? " " : "  ", wwsjm_be32(rec + o));
+            fprintf(stderr, "\n");
+        }
+        return wj_refuse(r, wwsjm_status_name(st), bad, wwsjm_be32(rec + 8 * (bad < 32 ? bad : 0)));
+    }
+    if (!plan->set[0].reserved || !plan->set[0].pages) return wj_refuse(r, "record without a module set", h->ea, 0);
+    wwsjm_plan_place(plan, NULL, 0);      /* nothing else holds LS: no job runs beside this one */
+    uint32_t set0_ls = 0, set0_bytes = 0, module_ea = 0;
+    wwsjm_buffer_span(plan, 0, plan->set[0].first_buffer, &set0_ls, &set0_bytes);
+    for (unsigned i = 0; i < plan->load_count; i++) {
+        const wwsjm_load* l = &plan->load[i];
+        if (l->ls < WJ_LS_LOW || l->ls >= WJ_LS_HIGH) return wj_refuse(r, "staged load outside the job window", l->ls, l->bytes);
+        if (l->fill == WWSJM_FILL_COPY) {
+            if (plan->use[l->use].set == 0 && l->ls == set0_ls) module_ea = l->ea;
+            continue;
+        }
+        uint8_t list[WJ_GATHER_LIST_MAX];
+        if (l->bytes > sizeof list) return wj_refuse(r, "gather list longer than supported", l->ea, l->bytes);
+        if (l->bytes > l->limit || (l->bytes & 15)) return wj_refuse(r, "gather list does not fit its buffer", l->bytes, l->limit);
+        if (!wj_guest_peek(l->ea, l->bytes, list)) return wj_refuse(r, "gather list outside guest memory", l->ea, l->bytes);
+        wwsjm_piece pc[sizeof list / 8];
+        unsigned n = 0, overlap = 0;
+        const wwsjm_status gs = wj_gather_plan(l, list, pc, sizeof pc / sizeof pc[0], &n, &overlap);
+        if (gs != WWSJM_OK && wj_report_refusal(r)) {
+            fprintf(stderr, "[wwsjm] refused gather list at 0x%08X (%u bytes) into LS 0x%05X, room 0x%X, %s:",
+                    l->ea, l->bytes, l->ls, l->limit, wwsjm_status_name(gs));
+            for (uint32_t o = 0; o + 8 <= l->bytes; o += 8) fprintf(stderr, " (%X, %08X)", wwsjm_be32(list + o), wwsjm_be32(list + o + 4));
+            fprintf(stderr, "\n");
+        }
+        if (gs != WWSJM_OK) return wj_refuse(r, "gather list outside the contract", l->ea, gs);
+    }
+    /* the module's entry, from the header of the image its set-0 copy loads */
+    if (module_ea) {
+        uint8_t off[4];
+        if (!wj_guest_peek(module_ea + 0x10, 4, off)) return wj_refuse(r, "module header outside guest memory", module_ea, 0);
+        const uint32_t entry = set0_ls + wwsjm_be32(off);
+        if (entry < set0_ls || entry >= set0_ls + set0_bytes || (entry & 3))
+            return wj_refuse(r, "module entry outside its set", entry, set0_ls);
+    }
+    return 1;
+}
+
 /* Claim entries at N until a job is claimed (returns 1, *job set) or the entry
  * at N is not claimable (returns 0). Non-job entries are claimed and passed.
  * Every decision is made on the line read just before it and the header read
@@ -321,11 +462,15 @@ static int wj_claim(struct wj_run* r, struct wj_job* job, int in_finish)
 {
     uint8_t old[128], now[128];
     for (;;) {
+        /* withdrawn (here or by another lane's refusal): claim nothing more */
+        if (r->withdraw) return 0;
+        if (r->fallback_ok && spurs_native_pm_withdrawn(t_npm_pm)) { r->withdraw = 1; return 0; }
         wj_getllar(r, WJ_LINE_LS, r->list_ea, old);
         wwsjm_cursor cur;
         wwsjm_header h;
         if (wj_examine(r, old, &cur, &h) != WWSJM_TAKE) return 0;
-        if (wwsjm_claim(old, r->lane, &h, now) != WWSJM_OK) wj_fatal(r, "claim refused", h.type, cur.index);
+        if (h.type == WWSJM_ENTRY_JOB && !wj_preflight(r, &h, &job->plan)) return 0;
+        if (wwsjm_claim(old, r->lane, &h, now) != WWSJM_OK) return wj_refuse(r, "claim refused", h.type, cur.index);
         if (r->check) wj_check_line(r, old, now, cur.array, h.type == WWSJM_ENTRY_SWITCH);
         if (!wj_putllc(r, WJ_LINE_LS, r->list_ea, now)) continue;   /* lost: re-read */
         WJ_COUNT(claims, 1);
@@ -361,11 +506,7 @@ static void wj_stage(struct wj_run* r)
             WJ_COUNT(loads, 1);
             continue;
         }
-        /* gather (spec 17.1, 18.1): the (size, EA) list is copied to the last
-         * 16*L bytes of the buffer, where the job reads it; the elements land
-         * from the buffer's start under MFC list rules. An element may run into
-         * the copy over entries already consumed: element k must end at or
-         * before the copy's start + 8*(k+1), and inside the buffer. */
+        /* gather (wj_gather_plan) */
         uint8_t list[WJ_GATHER_LIST_MAX];
         if (l->bytes > sizeof list) wj_fatal(r, "gather list longer than supported", l->ea, l->bytes);
         if (l->bytes > l->limit || (l->bytes & 15)) wj_fatal(r, "gather list does not fit its buffer", l->bytes, l->limit);
@@ -373,26 +514,13 @@ static void wj_stage(struct wj_run* r)
         wj_guest_read(r, l->ea, l->bytes, list, list_ls);
         memcpy(c->ls + list_ls, list, l->bytes);
         wwsjm_piece pc[sizeof list / 8];
-        unsigned n = 0;
-        wwsjm_status st = wwsjm_gather_layout(list, l->bytes / 8, l->ls, l->limit, pc, sizeof pc / sizeof pc[0], &n);
-        if (st == WWSJM_OK) {
-            /* list entry k behind each piece (zero-size entries have none) */
-            unsigned piece = 0, overlap = 0;
-            for (unsigned k = 0; k < l->bytes / 8 && piece < n; k++) {
-                if (!wwsjm_be32(list + 8u * k)) continue;
-                const uint32_t end = pc[piece].ls + pc[piece].bytes;
-                if (end > list_ls) {
-                    if (end > list_ls + 8u * (k + 1)) { st = WWSJM_E_GATHER; break; }
-                    overlap = 1;
-                }
-                piece++;
-            }
-            if (overlap && st == WWSJM_OK) {
-                WJ_COUNT(gather_overlaps, 1);
-                if (r->check)
-                    fprintf(stderr, "[wwsjm] check: gather at 0x%08X (%u bytes) runs into its list copy at LS 0x%05X (wid %u)\n",
-                            l->ea, l->bytes, list_ls, r->wid);
-            }
+        unsigned n = 0, overlap = 0;
+        wwsjm_status st = wj_gather_plan(l, list, pc, sizeof pc / sizeof pc[0], &n, &overlap);
+        if (overlap && st == WWSJM_OK) {
+            WJ_COUNT(gather_overlaps, 1);
+            if (r->check)
+                fprintf(stderr, "[wwsjm] check: gather at 0x%08X (%u bytes) runs into its list copy at LS 0x%05X (wid %u)\n",
+                        l->ea, l->bytes, list_ls, r->wid);
         }
         if (st != WWSJM_OK) {
             fprintf(stderr, "[wwsjm] refused gather list at 0x%08X (%u bytes) into LS 0x%05X, room 0x%X (list copy at 0x%05X), %s:",
@@ -437,24 +565,16 @@ static void wj_plant_low_ls(struct wj_run* r)
 static void wj_run_job(struct wj_run* r, const struct wj_job* job)
 {
     spu_context* c = r->ctx;
-    r->cur = *job;
+    r->cur.valid = job->valid; r->cur.array = job->array; r->cur.index = job->index; r->cur.h = job->h;
     uint8_t rec[WWSJM_MAX_PORTION];
     wj_guest_read(r, job->h.ea, job->h.size, rec, WJ_PORTION_LS);
-    unsigned bad = 0;
-    wwsjm_status st = wwsjm_plan_commands(rec, job->h.size, WJ_LS_LOW, WJ_LS_HIGH, &r->plan, &bad);
-    if (st != WWSJM_OK) {
-        /* the record the core refused, for the report (hex, 8-byte commands) */
-        fprintf(stderr, "[wwsjm] refused record at 0x%08X (%u bytes, command %u):", job->h.ea, job->h.size, bad);
-        for (uint32_t o = 0; o + 4 <= job->h.size; o += 4) fprintf(stderr, "%s%08X", (o & 7) ? " " : "  ", wwsjm_be32(rec + o));
-        fprintf(stderr, "\n");
-        wj_fatal(r, wwsjm_status_name(st), bad, wwsjm_be32(rec + 8 * (bad < 32 ? bad : 0)));
-    }
+    /* planned, placed and checked before the claim (wj_preflight) */
+    r->plan = job->plan;
     if (r->plan.nop_count) WJ_COUNT(nops, r->plan.nop_count);
     if (r->plan.set0_moved && __atomic_add_fetch(&s_wj_stats.set0_moved, 1, __ATOMIC_RELAXED) == 1)
         fprintf(stderr, "[wwsjm] set 0 reserved away from page %u (wid %u): allowed; the module may run interpreted\n",
                 WWSJM_MODULE_PAGE, r->wid);
     if (!r->plan.set[0].reserved || !r->plan.set[0].pages) wj_fatal(r, "record without a module set", 0, 0);
-    wwsjm_plan_place(&r->plan, NULL, 0);      /* nothing else holds LS: no job runs beside this one */
     wwsjm_plan_residency(&r->plan, &r->res);
     wj_stage(r);
 
@@ -657,15 +777,18 @@ static int wj_run(spu_context* c, const struct spurs_native_pm_run* a)
     r.spurs_ea = a->spurs_ea;
     r.list_ea = (uint32_t)a->wkl_data;
     r.check = a->mode == SPURS_NATIVE_PM_CHECK;
+    r.fallback_ok = !r.check && a->lifted_available;
     AcquireSRWLockShared(&s_wj_lock);
     for (unsigned i = 0; i < sizeof s_wj_inst / sizeof s_wj_inst[0]; i++)
         if (s_wj_inst[i].spurs_ea == a->spurs_ea) r.busy = s_wj_inst[i].n_spus;
     ReleaseSRWLockShared(&s_wj_lock);
-    if (!r.busy) wj_fatal(&r, "run on an instance the implementation did not accept", a->spurs_ea, 0);
-    if (a->wkl_data >> 32) wj_fatal(&r, "audit buffer requested (unsupported)", (uint32_t)(a->wkl_data >> 32), 0);
-    if (r.list_ea & 127) wj_fatal(&r, "job list not line aligned", r.list_ea, 0);
+    /* Refused before anything is touched: the dispatch ends at once; the
+     * workload is still ready, so its next dispatch runs the lifted module. */
+    if (!r.busy) return wj_refuse(&r, "run on an instance the implementation did not accept", a->spurs_ea, 0);
+    if (a->wkl_data >> 32) return wj_refuse(&r, "audit buffer requested (unsupported)", (uint32_t)(a->wkl_data >> 32), 0);
+    if (r.list_ea & 127) return wj_refuse(&r, "job list not line aligned", r.list_ea, 0);
     r.k_inst = 0x0A000000u;   /* the context constant of the instance this implementation takes (spec U11) */
-    if (r.lane >= WWSJM_LANES || r.wid >= 16) wj_fatal(&r, "lane or workload out of range", r.lane, r.wid);
+    if (r.lane >= WWSJM_LANES || r.wid >= 16) return wj_refuse(&r, "lane or workload out of range", r.lane, r.wid);
     wwsjm_residency_reset(&r.res);   /* every run reloads (spec R6) */
     struct wj_run* outer = t_wj;
     t_wj = &r;
@@ -683,6 +806,7 @@ static int wj_run(spu_context* c, const struct spurs_native_pm_run* a)
         } else if (r.stop) {
             break;
         } else if (!wj_claim(&r, &job, 0)) {
+            if (r.withdraw) goto withdrawn;
             if (r.stop) break;
             /* nothing claimable on the claim's snapshot: ready := 0 (6.4), then
              * verify, and go on claiming if the verify finds work (6.5, R12) */
@@ -695,13 +819,22 @@ static int wj_run(spu_context* c, const struct spurs_native_pm_run* a)
 #endif
             wj_ready_store(&r, r.wid, 0);
             if (wj_verify(&r)) continue;
+            if (r.withdraw) goto withdrawn;
             goto verified;
         }
         wj_run_job(&r, &job);
     }
     /* the kernel asked for another workload: the ready value from a fresh
      * snapshot (R10); a 0 is verified, and work seen there is advertised */
-    if (wj_ready_rule(&r) == 0 && wj_verify(&r)) wj_ready_store(&r, r.wid, (uint8_t)r.busy);
+    if (!r.withdraw && wj_ready_rule(&r) == 0 && wj_verify(&r)) wj_ready_store(&r, r.wid, (uint8_t)r.busy);
+withdrawn:
+    if (r.withdraw) {
+        /* Withdrawn (wj_refuse): the run holds no job. The workload stays
+         * ready, so the kernel dispatches it again, to the lifted module,
+         * which takes the job list over from the guest state as it is. */
+        wj_ready_store(&r, r.wid, (uint8_t)r.busy);
+        WJ_COUNT(withdrawals, 1);
+    }
 verified:
     c->int_enable = int_enable0;
     c->event_mask = event_mask0;

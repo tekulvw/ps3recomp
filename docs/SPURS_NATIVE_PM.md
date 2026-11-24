@@ -26,11 +26,34 @@ window intercept in `spu_channels.c`, selection in `libs/spurs/cellSpurs.c`.
 | `<name>` | As `1`, restricted to the implementation registered under that name. |
 
 The decision is made once per workload id, when its policy image is first
-resolved (`spurs_resolve_pm`), and holds for the process: a resident context
-never alternates between lifted and native runs, and there is no per-run
-fallback. Each decision prints one `[spurs-native-pm]` line. An image whose
-fingerprint matches but whose SHA-256 differs from the one the implementation
-was written for stays lifted, with a line saying so.
+resolved (`spurs_resolve_pm`). Each decision prints one `[spurs-native-pm]` line.
+An image whose fingerprint matches but whose SHA-256 differs from the one the
+implementation was written for stays lifted, with a line saying so.
+
+## Withdrawal: falling back to the lifted module
+
+An implementation that meets guest state outside its contract may **withdraw**
+itself, but only at a point where its run holds nothing half done (no job entered
+and not finished) and only when the dispatch has a lifted module to fall back to
+(`run->lifted_available`). It calls `spurs_native_pm_withdraw(pm, why)` and ends
+the run as an exit to the kernel. The seam prints one line, once per process:
+
+```
+[spurs-native-pm] wwsjm WITHDRAWN: <why>. Its workloads run the lifted policy module from their next dispatch, ...
+```
+
+From then on, `spu_run_policy_module_native` gives every dispatch of the
+implementation's workloads to the lifted module, on a fresh context (the
+persistent context a native run left is reset once, as on a workload-data
+change, with one `[spurs-pm] ... now runs the lifted policy module` line per
+lane). The lifted module takes the job list over from guest memory as it is, so
+nothing is lost provided the native run held no job. The switch does not go back.
+
+Inside a job there is no fallback. A job a native run entered depends on that
+run's services and state, which the lifted module cannot adopt, and abandoning
+it would leave its lane marker set (the PPU waits on it) and its outputs
+unwritten. Unsupported behaviour there (an empty or misaligned window slot, the
+interrupt vector, a service refusal) still stops the process with exit 86.
 
 `PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW=1`, with the switch at `1`, `check` or a
 name, also feeds native runs' events to their implementation's shadow hook.
@@ -46,6 +69,9 @@ static const struct spurs_native_pm impl = {
     accept /* optional */, shadow /* optional */ };
 spurs_native_pm_register(&impl);   /* before the workload is first resolved */
 ```
+
+`run->lifted_available` says whether this dispatch has a lifted module (an
+implementation may withdraw only then; see above).
 
 `accept(spurs_ea, wid, n_spus)`, when present, is asked once, at selection,
 after the identity gate. The resolver passes the workload's SPURS instance and
@@ -74,11 +100,25 @@ slots at LS `[0x900, 0x9C0)`, below the two kernel-service addresses and the
 policy image base. A native run hands job code slot addresses (for example in
 the context it passes in r3). While its table is installed (`ctx->native_services`,
 set by the seam for the run and cleared after), the resolver treats a branch to
-slot `i` as a call of `slot[i]`: arguments in r3..r6, result in r3, return to the
-r0 link like `bi $r0`. A service never touches r80-r127. The last slot is the job
+slot `i` as a call of `slot[i]`: arguments in r3..r6, result in r3, then pc = the
+r0 link with the transfer pending, so a lifted caller's drain bracket (waiting for
+that link) ends at once and any other caller dispatches the link instead of
+unwinding to a halt bracket. A service never touches r80-r127. The last slot is the job
 return address and is handled by the seam. A branch to an empty slot, the middle
 of a slot, or the job-return slot outside its drain stops the process (exit 86)
 with a message: unsupported behaviour is never skipped.
+
+Job code may run in the SPU interpreter: code with no lifted function, or a
+module whose residency check failed. The window holds no code, so the
+interpreter must not execute its bytes. It hands a window target to the
+resolver as it hands over a lifted entry (`spu_native_window_target`,
+`spu_context.h`), and the micro-interpreter treats that hand-over as a rejoin.
+The first four hand-overs print one line each, with the context's resident
+code records, because they show which code ran interpreted. Before this rule,
+an interpreted `bisl` to a slot executed the slot's zero word (`stop`) and
+continued 4 bytes in. The window then refused the mid-slot branch with exit 86:
+`unsupported branch to LS 0x00914 (window slot 1)`, after a `BRANCH-TO-0` at the
+same address.
 
 The window test sits behind `g_spu_dispatch_gates.pm_extras`, a word on the gate
 cache line the dispatch paths already load, predicted not taken. The seam opens it
@@ -112,6 +152,13 @@ recorder's file format (`tools/spurs_pm_record.py`). File recording
 - **Window contract.** The result comes back in r3, control returns to r0, and r80-r127 are left as they were.
 - **Job returns and hooks.** Jobs return by host return and by computed jump. The payload hook can claim an entry, and a run that does not exit returns -2.
 - **Recordings and failure.** Recordings of native runs are complete, and a branch to an empty slot stops the process with exit 86.
+- **Interpreted job code.** A job with no lifted function calls two services with `bisl` and returns with `bi $r0`; a lifted job calls such code as a subroutine and must get control back in its own live frame.
 
 `--mutants`: registry consulted while unset, a service clobbering r80, the window
-not returning to r0, the SHA gate skipped, the table left installed after a run.
+not returning to r0, the SHA gate skipped, the table left installed after a run,
+the interpreter executing the window, the micro-interpreter dropping the
+hand-over, and a service return that unwinds the caller instead of dispatching
+its link.
+
+Withdrawal is tested through the WWS job manager's fixture
+(`tools/test_wwsjm_run.py`, docs/SPURS_NATIVE_WWSJM.md).
