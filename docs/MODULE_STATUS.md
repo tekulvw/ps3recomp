@@ -37,7 +37,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellPad | Gamepad | **Complete** | XInput (Windows) / SDL2 backends, analog sticks, triggers, pressure buttons, rumble |
+| cellPad | Gamepad | **Complete** | XInput (Windows default) / SDL2 (elsewhere; Windows with `PS3RECOMP_PAD_USE_SDL2`) backends, analog sticks, triggers, pressure buttons, rumble |
 | cellKb | Keyboard | **Complete** | Key event injection, raw/ASCII modes, modifier/LED tracking |
 | cellMouse | Mouse | **Complete** | Delta accumulation, buttons, wheel, buffered ring-buffer mode |
 
