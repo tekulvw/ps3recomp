@@ -620,6 +620,15 @@ static inline int spu_pm_extras_on(void)
 {
     return __builtin_expect(g_spu_dispatch_gates.pm_extras != 0, 0);
 }
+/* Whether `pc` is a slot of the native-service window (spurs_native_pm.h:
+ * LS [0x900, 0x9C0)) while a native policy run has its table installed. The
+ * window holds no code: the resolver answers a branch there by calling the
+ * slot's host service. The interpreter hands such a target to the resolver
+ * instead of executing the window's bytes (spu_interp.c). */
+static inline int spu_native_window_target(const spu_context* ctx, uint32_t pc)
+{
+    return spu_pm_extras_on() && ctx->native_services && (pc & 0x3FFFFu) - 0x900u < 0xC0u;
+}
 
 /* PS3RECOMP_MFC_FAST=1 (opt-in): the MFC command path, the channel entries,
  * the overlay note and the drain hop run their compact form, which drops the

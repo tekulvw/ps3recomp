@@ -4032,7 +4032,7 @@ static int spu_smc_microstep_steps(spu_context* ctx)
          * stopped states and diagnostic exits keep their existing behavior. */
         if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
             (!return_pc || (ctx->pc & SPU_LS_MASK) != return_pc) &&
-            spu_lifted_lookup(ctx, ctx->pc)) {
+            (spu_lifted_lookup(ctx, ctx->pc) || spu_native_window_target(ctx, ctx->pc))) {
             g_spu_trampoline_fn = spu_indirect_branch;
             return 1;
         }
@@ -4111,8 +4111,10 @@ static int spu_ib_diagnostics_armed(void)
 
 /* A branch into the native-service window during a native policy run: call
  * the slot's host service; it reads r3..r6 and writes r3. Unless it says it
- * placed pc itself, return to the r0 link exactly as `bi $r0` does (a host
- * return while the caller's bracket is live, else a dispatch to the link).
+ * placed pc itself, continue at the r0 link: pc = link with the transfer
+ * pending, so a lifted caller's drain bracket (waiting for that link) ends at
+ * once and any other caller (a drain hop, interpreted code handed over by
+ * spu_interp.c) dispatches the link instead of unwinding to a halt bracket.
  * The job-return slot is normally reached by host return into the job's entry
  * bracket; a branch to it here comes from a frame deeper than that bracket and
  * ends the job by unwinding to it (spurs_native_pm_job_return_far). Outside a
@@ -4140,7 +4142,7 @@ static __attribute__((noinline, cold)) void spurs_native_window(spu_context* ctx
     }
     if (fn(ctx) == SPURS_NATIVE_SERVICE_RETURN) {
         ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
-        if (ctx->host_depth == 0) g_spu_trampoline_fn = spu_indirect_branch;
+        g_spu_trampoline_fn = spu_indirect_branch;
     }
 }
 

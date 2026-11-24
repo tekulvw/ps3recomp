@@ -74,11 +74,25 @@ slots at LS `[0x900, 0x9C0)`, below the two kernel-service addresses and the
 policy image base. A native run hands job code slot addresses (for example in
 the context it passes in r3). While its table is installed (`ctx->native_services`,
 set by the seam for the run and cleared after), the resolver treats a branch to
-slot `i` as a call of `slot[i]`: arguments in r3..r6, result in r3, return to the
-r0 link like `bi $r0`. A service never touches r80-r127. The last slot is the job
+slot `i` as a call of `slot[i]`: arguments in r3..r6, result in r3, then pc = the
+r0 link with the transfer pending, so a lifted caller's drain bracket (waiting for
+that link) ends at once and any other caller dispatches the link instead of
+unwinding to a halt bracket. A service never touches r80-r127. The last slot is the job
 return address and is handled by the seam. A branch to an empty slot, the middle
 of a slot, or the job-return slot outside its drain stops the process (exit 86)
 with a message: unsupported behaviour is never skipped.
+
+Job code may run in the SPU interpreter: code with no lifted function, or a
+module whose residency check failed. The window holds no code, so the
+interpreter must not execute its bytes. It hands a window target to the
+resolver as it hands over a lifted entry (`spu_native_window_target`,
+`spu_context.h`), and the micro-interpreter treats that hand-over as a rejoin.
+The first four hand-overs print one line each, with the context's resident
+code records, because they show which code ran interpreted. Before this rule,
+an interpreted `bisl` to a slot executed the slot's zero word (`stop`) and
+continued 4 bytes in. The window then refused the mid-slot branch with exit 86:
+`unsupported branch to LS 0x00914 (window slot 1)`, after a `BRANCH-TO-0` at the
+same address.
 
 The window test sits behind `g_spu_dispatch_gates.pm_extras`, a word on the gate
 cache line the dispatch paths already load, predicted not taken. The seam opens it
@@ -112,6 +126,10 @@ recorder's file format (`tools/spurs_pm_record.py`). File recording
 - **Window contract.** The result comes back in r3, control returns to r0, and r80-r127 are left as they were.
 - **Job returns and hooks.** Jobs return by host return and by computed jump. The payload hook can claim an entry, and a run that does not exit returns -2.
 - **Recordings and failure.** Recordings of native runs are complete, and a branch to an empty slot stops the process with exit 86.
+- **Interpreted job code.** A job with no lifted function calls two services with `bisl` and returns with `bi $r0`; a lifted job calls such code as a subroutine and must get control back in its own live frame.
 
 `--mutants`: registry consulted while unset, a service clobbering r80, the window
-not returning to r0, the SHA gate skipped, the table left installed after a run.
+not returning to r0, the SHA gate skipped, the table left installed after a run,
+the interpreter executing the window, the micro-interpreter dropping the
+hand-over, and a service return that unwinds the caller instead of dispatching
+its link.

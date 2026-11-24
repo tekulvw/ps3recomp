@@ -18,11 +18,16 @@ requires:
   * the service window: result in r3, return to r0, r80-r127 untouched, job
     returns by host return and by computed jump, the payload hook claims an
     entry, a run that does not exit reports -2, and a branch to an empty slot
-    stops the process (exit 86) with a message.
+    stops the process (exit 86) with a message;
+  * job code the interpreter runs (no lifted function) reaches the services
+    through the window like lifted code: the interpreter hands the branch to
+    the resolver instead of executing the window's (empty) local store.
 
 --mutants: the registry consulted while unset (M11), a service clobbering r80
 (M12), the window returning without pc = r0 (M10), the SHA gate skipped, the
-service table left installed after a native run; each must fail.
+service table left installed after a native run, the interpreter executing the
+window, the microstep dropping the interpreter's window hand-over; each must
+fail.
 Manufactured modules only; no title code or data.
 """
 import argparse
@@ -51,8 +56,8 @@ MUTANTS = {
     'M12-service-clobbers-r80': ('runtime/spu/spu_channels.c', '    if (fn(ctx) == SPURS_NATIVE_SERVICE_RETURN) {',
                                  '    ctx->gpr[80]._u32[0] += 1u;\n    if (fn(ctx) == SPURS_NATIVE_SERVICE_RETURN) {'),
     'M10-window-no-return-pc': ('runtime/spu/spu_channels.c',
-                                '        ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;\n        if (ctx->host_depth == 0) g_spu_trampoline_fn',
-                                '        if (ctx->host_depth == 0) g_spu_trampoline_fn'),
+                                '        ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;\n        g_spu_trampoline_fn = spu_indirect_branch;\n    }',
+                                '        g_spu_trampoline_fn = spu_indirect_branch;\n    }'),
     'sha-gate-skipped': ('runtime/spu/spurs_native_pm.inc', 'if (memcmp(sha, pm->sha256, 32) != 0) {', 'if (0) {'),
     'gate-line-never-opened': ('runtime/spu/spurs_native_pm.inc',
                                '        __atomic_store_n(&g_spu_dispatch_gates.pm_extras, 1, __ATOMIC_RELEASE);\n', ''),
@@ -60,6 +65,14 @@ MUTANTS = {
                                '        spurs_native_pm_job_return_far(ctx);\n', ''),
     'far-job-return-depth-kept': ('runtime/spu/spurs_native_pm.inc', '    c->host_depth = depth0; c->drain_ret_pc', '    c->drain_ret_pc'),
     'far-job-return-not-ended': ('runtime/spu/spurs_native_pm.inc', '    if (halted && far_returned) {', '    if (0) {'),
+    'interp-executes-window': ('runtime/spu/spu_interp.c', '        if (spu_native_window_target(ctx, ctx->pc)) {',
+                               '        if (0) {'),
+    'microstep-drops-window': ('runtime/spu/spu_channels.c',
+                               '(spu_lifted_lookup(ctx, ctx->pc) || spu_native_window_target(ctx, ctx->pc))',
+                               'spu_lifted_lookup(ctx, ctx->pc)'),
+    'window-return-unwinds': ('runtime/spu/spu_channels.c',
+                              '        ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;\n        g_spu_trampoline_fn = spu_indirect_branch;\n    }',
+                              '        ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;\n        if (ctx->host_depth == 0) g_spu_trampoline_fn = spu_indirect_branch;\n    }'),
     'services-left-installed': ('runtime/spu/spurs_native_pm.inc', '    c->native_services = NULL;\n    t_npm_pm = NULL;',
                                 '    t_npm_pm = NULL;'),
 }
@@ -191,6 +204,16 @@ def check(binary: Path, tmp: Path) -> list[str]:
     expect(kinds == want, f'recorded native/lifted runs: {kinds}')
     _, err, rc = run(binary, ['badslot'], expect_rc=None)
     expect(rc == 86 and 'no native service there' in err, f'empty slot: rc={rc} {err[-300:]}')
+    # job code the interpreter runs (no lifted function) calls services with
+    # `bisl` and returns with `bi $r0`: the window answers it as it answers
+    # lifted code (r11 = slot 1's answer, r3 = slot 0's), in both runs; and a
+    # lifted job's interpreted subroutine returns into the job's live frame
+    r, err, rc = run(binary, ['interp'], {'YDKJ_SPU_LSDUMP': str(tmp / 'interp-ls.bin')}, expect_rc=None)
+    want = dict(interp_rc='0', interp_r11='0xFFF8', interp_r3='0x107', job_f='2', services='10', job_bad='0',
+                rc0='0')
+    expect(rc == 0 and all(r.get(k) == v for k, v in want.items()),
+           f'interpreted job: rc={rc} {r} want {want}\n{err[-600:]}')
+    expect('BRANCH-TO-0' not in err and 'handed to the resolver' in err, f'interpreted job log: {err[-600:]}')
     return fails
 
 

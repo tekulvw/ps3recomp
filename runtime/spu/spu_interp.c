@@ -558,6 +558,26 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     return result;
 }
 
+/* The first few times interpreted code reaches the native-service window: the
+ * code calling a service had no lifted function (or its module failed its
+ * residency check), which is worth knowing when a job runs slowly. */
+static void spu_interp_native_window_note(const spu_context* ctx)
+{
+    static atomic_uint s_notes;
+    if (atomic_fetch_add_explicit(&s_notes, 1, memory_order_relaxed) < 4) {
+        fprintf(stderr, "[spurs-native-pm] interpreted code at lr=0x%05X branched to service window LS 0x%05X "
+                "(image %d): handed to the resolver; resident code:", ctx->gpr[0]._u32[0] & 0x3FFFFu,
+                ctx->pc & 0x3FFFFu, ctx->image_id);
+        for (unsigned i = 0; i < 4; i++)
+            if (ctx->resident_code[i].image_id)
+                fprintf(stderr, " image %d at 0x%05X+0x%X from 0x%08X state %d;", ctx->resident_code[i].image_id,
+                        ctx->resident_code[i].lsa, ctx->resident_code[i].size, ctx->resident_code[i].source_ea,
+                        ctx->resident_code[i].verify_state);
+        fprintf(stderr, " overlay %d\n", ctx->resident_ovl);
+        fflush(stderr);
+    }
+}
+
 static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
     /* Experimental same-binary switch. Cache the immutable environment once;
      * concurrent first callers may compute the same value without a data race. */
@@ -617,6 +637,15 @@ static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, 
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || ((prefilter != 2 || spu_lifted_entry_maybe(ctx->pc)) && spu_lifted_lookup(ctx, ctx->pc)))) { g_spu_interp_steps = steps; t_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        /* A native policy run's service window holds no code: hand the branch to
+         * the resolver, which calls the slot's service (spurs_native_pm.h).
+         * Executing the window's bytes instead stopped job code the
+         * interpreter ran at its first service call. */
+        if (spu_native_window_target(ctx, ctx->pc)) {
+            spu_interp_native_window_note(ctx);
+            g_spu_interp_steps = steps; t_interp_steps = steps; g_spu_interp_last_pc = ctx->pc;
+            return ctx->pc;
+        }
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);

@@ -72,6 +72,9 @@ typedef char spurs_npm_window_below_image[(SPURS_NATIVE_PM_WINDOW_END <= 0xA00u 
     SPURS_NATIVE_PM_WINDOW_END == SPURS_PM_EXIT_TO_KERNEL_LS &&
     SPURS_NATIVE_PM_WINDOW_LS + SPURS_NATIVE_PM_SLOTS * SPURS_NATIVE_PM_SLOT_BYTES == SPURS_NATIVE_PM_WINDOW_END)
     ? 1 : -1];
+/* spu_native_window_target (spu_context.h) tests the same range by value. */
+typedef char spurs_npm_window_target_range[(SPURS_NATIVE_PM_WINDOW_LS == 0x900u &&
+    SPURS_NATIVE_PM_WINDOW_END - SPURS_NATIVE_PM_WINDOW_LS == 0xC0u) ? 1 : -1];
 
 int spurs_native_pm_register(const struct spurs_native_pm* pm)
 {
