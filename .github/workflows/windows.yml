@@ -49,6 +49,20 @@ jobs:
       - name: Install Ninja
         run: choco install ninja -y --no-progress
 
+      # The official SDL2 Windows development package, for cellPad's SDL2
+      # controller backend (PS3RECOMP_PAD_USE_SDL2, built in the Release leg)
+      # and its synthetic-controller test (tools/test_pad_sdl_controllers.py).
+      - name: Fetch SDL2 (pinned)
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'SDL2-devel-2.32.10-VC.zip'
+          Invoke-WebRequest -Uri 'https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-devel-2.32.10-VC.zip' -OutFile $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($hash -ne 'af347939395a58b365846aaea27391e69f9ec9d4dd650d6ac40802159b418a6e') { throw "SDL2 package hash $hash" }
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'sdl2')
+          $dir = (Join-Path $env:RUNNER_TEMP 'sdl2/SDL2-2.32.10/cmake') -replace '\\', '/'
+          "SDL2_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Show toolchain
         run: |
           clang-cl --version
@@ -61,6 +75,8 @@ jobs:
           -DCMAKE_C_COMPILER=clang-cl
           -DCMAKE_CXX_COMPILER=clang-cl
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DPS3RECOMP_PAD_USE_SDL2=${{ matrix.build_type == 'Release' && 'ON' || 'OFF' }}
+          -DSDL2_DIR=${{ env.SDL2_DIR }}
 
       - name: Build
         run: cmake --build build
@@ -89,7 +105,7 @@ jobs:
           failed=""
           for t in tools/test_*.py; do
             # Explicit shader-bound native fixtures have dedicated workflows.
-            case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py|tools/test_vulkan_present_cost.py) continue ;; esac
+            case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py|tools/test_vulkan_present_cost.py|tools/test_vulkan_present_scale.py) continue ;; esac
             # Manual Windows GPU/desktop fixtures: they take a /MT runtime
             # library and need real D3D12 hardware or an interactive desktop
             # (docs/WINDOWS_REPORT_BATCHING.md, docs/WINDOWS_OSK_DIALOG.md).

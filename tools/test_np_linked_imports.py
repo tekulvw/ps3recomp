@@ -16,7 +16,8 @@ cxx = 'clang++' if 'clang' in cc else ('g++' if 'gcc' in cc else 'c++')
 sources = ['tests/test_np_linked_imports.c', 'libs/network/sceNp.c', 'libs/network/np_psnr.c',
            'libs/network/psnr/psnr.c', 'libs/system/cellSysutil.c',
            'libs/system/cellSysutilNpEula.c', 'libs/network/sceNpBasic.c',
-           'libs/network/sceNpSignaling.c', 'libs/network/cellHttp.c']
+           'libs/network/sceNpSignaling.c', 'libs/network/cellHttp.c',
+           'libs/network/np_social.c', 'libs/network/sceNpLookup.c']
 with tempfile.TemporaryDirectory(prefix='ps3-np-linked-') as tmp:
     work = Path(tmp)
     gen = work / 'nids.cpp'

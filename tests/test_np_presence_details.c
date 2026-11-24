@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stdio.h>
 static void* handler;
+/* The social-provider path (unused here) reads guest memory; nothing is installed. */
+uint8_t* vm_base;
+typedef struct ppu_context ppu_context;
+void ps3_hle_register_ctx(uint32_t nid,const char* name,void (*fn)(ppu_context*)){(void)nid;(void)name;(void)fn;}
 void ppu_hle_register_all(void);
 void ps3_hle_register(unsigned nid,const char* name,void* fn){(void)name;if(nid==0xBE81C71C)handler=fn;}
 int main(void){

@@ -130,6 +130,7 @@ cmake --install build --prefix /usr/local
 |---|---|---|
 | `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register runtime tests |
 | `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
+| `PS3RECOMP_PAD_USE_SDL2` | `OFF` | Windows: read controllers through SDL2's GameController API instead of XInput -- see [Windows controllers](#windows-controllers) |
 | `PS3RECOMP_FFMPEG_RUNTIME` | `OFF` | Decode video (cellVdec: H.264, MPEG-2) through FFmpeg loaded at run time -- see [FFmpeg](#ffmpeg-run-time-loaded-opt-in) |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
@@ -288,6 +289,17 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 | `RSX_ENGINE_PASS_DUMP=<dir>` | Capture draws pass by pass into an existing *dir*: each pass's colour targets as PPM, its zeta as PGM, and one line per pass in `passes.txt` (targets, depth range, clears, the first draw's state and textures). Starts after `RSX_ENGINE_PASS_DUMP_AFTER=<sec>` or on the frame after one of `RSX_ENGINE_PASS_DUMP_MINDRAWS=<n>` guest draws, and stops after `RSX_ENGINE_PASS_DUMP_MAX=<n>` passes (default 64). `RSX_ENGINE_PASS_DUMP_DRAWS=1` adds one line per draw to `draws.txt`. Every pass stalls the GPU for its readbacks |
 | `RSX_ENGINE_SHADER_DUMP=<dir>` | Write each new pipeline's translated programs to an existing *dir* as `pipe<handle>.vs.hlsl` and `.ps.hlsl`, the handles `passes.txt` names |
 
+A host that wraps the draw engine's backend to create its colour targets
+larger than the guest asks (a rendering-resolution option) can call
+`rsx_vulkan_backend_set_present_scale(percent)` (`rsx_vulkan_backend.h`,
+100 to 400) before or during init: the display image a flip is blitted into,
+the present thread's staging images, the read-back present and the
+`PS3RECOMP_VK_DUMP` frames then take that percentage of the display size, so
+the enlarged surface reaches the window at its own resolution. It applies on
+the draw engine path only; the fixed-function path keeps the display size and
+logs that. Without the call (or with 100) nothing changes.
+`python3 tools/test_vulkan_present_scale.py` checks it on any Vulkan device.
+
 Without a GPU, Mesa's lavapipe runs every check, e.g.
 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./build/ps3recomp_host --tex`
 (the ICD file name varies by distribution). Without guest programs, the modes
@@ -386,6 +398,7 @@ guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 **Link Libraries (auto-linked by CMake):**
 - `ws2_32` — Winsock2 for networking (sys_net, cellHttp, cellNet)
 - `xinput` — XInput for gamepad (cellPad)
+- `SDL2::SDL2` — only with `PS3RECOMP_PAD_USE_SDL2=ON` (below)
 - `ole32` — COM initialization for WASAPI audio (cellAudio)
 - `bcrypt` — BCryptGenRandom for cryptographic RNG (cellSsl)
 
@@ -406,6 +419,38 @@ guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 > path. `runtime/platform/win32_dirent.h` provides one (`FindFirstFileA`
 > behind the POSIX names, passing straight through to the system header off
 > Windows) — a port carrying its own copy can drop it.
+
+#### Windows controllers
+
+By default cellPad reads controllers with XInput, which sees Xbox-class pads
+only: a DualSense or DualShock 4 is invisible to it unless a wrapper such as
+Steam Input or DS4Windows presents it as an Xbox pad. `-DPS3RECOMP_PAD_USE_SDL2=ON`
+switches cellPad to its SDL2 GameController backend, the one Linux and macOS
+use. SDL reads XInput pads, PlayStation pads (through its HIDAPI drivers, with
+rumble) and other mapped controllers, and keeps one device from appearing
+twice across its drivers. Pass SDL2's CMake package with
+`-DSDL2_DIR=<dir with sdl2-config.cmake>` or `-DCMAKE_PREFIX_PATH`; the
+`cmake` folder of the official `SDL2-devel-<version>-VC.zip` works, and the
+program must ship that package's `SDL2.dll` beside its executable.
+
+The backend behaves the same on every host: a controller takes the lowest
+free port when it is connected and keeps it until it is unplugged; buttons go
+by position, so a PlayStation pad's Cross is Cross and Circle is Circle, and
+an Xbox pad's A is Cross; the title's rumble reaches the controller. On
+Windows a controller reads as connected and at rest while no window of the
+process is in the foreground (SDL applies that rule only to its own windows,
+and the game window is not one); a button still held when focus returns waits
+for a release. `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1` in the environment (or
+the SDL hint of that name) reads controllers in the background too.
+`PS3RECOMP_PAD_CLAIM_ON_INPUT=1` (environment, any host) lets a controller
+take a port only at its first press (a mapped button, or a stick or trigger
+past half way, while input counts) instead of when it connects. Some devices
+present a controller nobody plays with -- the XInput interface of a gaming
+keypad, a virtual pad -- and would otherwise sit on port 0 ahead of the
+controller that is actually used. The press that claims a port is reported in
+the same poll.
+`tools/test_pad_sdl_controllers.py` checks all of this with synthetic SDL
+virtual controllers.
 
 ### Linux
 

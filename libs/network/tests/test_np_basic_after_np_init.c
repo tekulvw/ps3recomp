@@ -10,7 +10,8 @@
  * built from the second file, test_np_basic_after_np_init_np.c:
  *   cc -std=gnu17 -I include -o test_np_basic_after_np_init \
  *      libs/network/tests/test_np_basic_after_np_init.c \
- *      libs/network/tests/test_np_basic_after_np_init_np.c
+ *      libs/network/tests/test_np_basic_after_np_init_np.c \
+ *      libs/network/np_social.c libs/network/sceNpLookup.c
  * Driven by tools/test_np_basic_after_np_init.py.
  */
 #include "../sceNpBasic.c"

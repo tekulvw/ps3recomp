@@ -171,6 +171,32 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+    # cellPad's controller backend. XInput sees only Xbox-class controllers; a
+    # DualSense or DualShock 4 needs a wrapper such as Steam Input. With this ON
+    # cellPad reads controllers through SDL2's GameController API instead, as it
+    # does on Linux and macOS: XInput pads, PlayStation pads (HIDAPI) and other
+    # mapped controllers. The program then ships SDL2.dll beside its executable.
+    option(PS3RECOMP_PAD_USE_SDL2 "Read Windows controllers through SDL2 instead of XInput" OFF)
+    if(PS3RECOMP_PAD_USE_SDL2)
+        find_package(SDL2 QUIET)
+        if(NOT SDL2_FOUND)
+            message(FATAL_ERROR
+                "PS3RECOMP_PAD_USE_SDL2 is ON but SDL2 was not found. Pass "
+                "-DCMAKE_PREFIX_PATH=<SDL2 prefix> or -DSDL2_DIR=<dir with sdl2-config.cmake>, "
+                "for example the cmake folder of the official SDL2 Windows development package.")
+        endif()
+        if(TARGET SDL2::SDL2)
+            target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
+        else()
+            target_include_directories(ps3recomp_runtime PRIVATE ${SDL2_INCLUDE_DIRS})
+            target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2_LIBRARIES})
+        endif()
+        set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/cellPad.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS PS3RECOMP_PAD_USE_SDL2=1)
+        message(STATUS "  Controllers:  SDL2 GameController (PS3RECOMP_PAD_USE_SDL2)")
+    else()
+        message(STATUS "  Controllers:  XInput (PS3RECOMP_PAD_USE_SDL2=OFF)")
+    endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required

@@ -37,6 +37,7 @@ void cellMsgDialog_tick(void) {}
 void np_psnr_pump(void) {}
 void ps3_np_ticket_tick(void) {}
 void cellGameUpdate_tick(void) {}
+void np_basic_social_tick(void) {}
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
 

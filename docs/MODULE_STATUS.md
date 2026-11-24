@@ -37,7 +37,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellPad | Gamepad | **Complete** | XInput (Windows) / SDL2 backends, analog sticks, triggers, pressure buttons, rumble |
+| cellPad | Gamepad | **Complete** | XInput (Windows default) / SDL2 (elsewhere; Windows with `PS3RECOMP_PAD_USE_SDL2`) backends, analog sticks, triggers, pressure buttons, rumble |
 | cellKb | Keyboard | **Complete** | Key event injection, raw/ASCII modes, modifier/LED tracking |
 | cellMouse | Mouse | **Complete** | Delta accumulation, buttons, wheel, buffered ring-buffer mode |
 
@@ -105,7 +105,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | sceNp | NP Core | **Complete** | Configurable username, fake NP IDs, account region/age |
-| sceNpBasic | NP Basic | **Complete** | Friends list, presence, messaging, invitations, block list (offline stub) |
+| sceNpBasic | NP Basic | **Complete** | Friends list, presence, messaging, invitations, block list (offline stub; an embedding host can supply friends and presence through the [social provider](np-social-provider.md)) |
 | sceNpCommerce | NP Commerce | **Complete** | Context management, store operations return NOT_CONNECTED (offline stub) |
 | sceNpClans | NP Clans | **Complete** | Create/join/leave/search clans, all return NOT_CONNECTED (offline stub) |
 | sceNpTus | NP TUS | **Complete** | Local variable/data storage, set/get/add/delete, per-slot with async polling |

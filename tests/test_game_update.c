@@ -23,6 +23,7 @@ void spu_coh_notify_write(uint32_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) {(void)a; (void)v; (void)w;}
 void cellOskDialog_tick(void) {}
 void cellMsgDialog_tick(void) {}
+void np_basic_social_tick(void) {}
 void np_psnr_pump(void) {}
 void ps3_np_eula_tick(void) {}
 void ps3_np_ticket_tick(void) {}

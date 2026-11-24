@@ -46,8 +46,8 @@ changes. The CMake option `PS3RECOMP_PAD_SDL_KEYBOARD` (ON) builds it.
 
 ## Windows
 
-The XInput backend reads port zero first, and the keyboard merges into what it
-read. This matters on Windows in particular: an XInput device is often present
+The controller backend (XInput, or SDL2 with `PS3RECOMP_PAD_USE_SDL2`) reads
+port zero first, and the keyboard merges into what it read. This matters on Windows in particular: an XInput device is often present
 without anyone holding it (a virtual pad from Steam Input or remote-desktop and
 streaming software, or an adapter that stays plugged in), and it used to turn
 the keyboard off entirely. Keys are read with

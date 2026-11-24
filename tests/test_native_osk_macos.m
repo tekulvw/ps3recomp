@@ -18,6 +18,7 @@ int spu_coh_is_reserved(uint32_t a){return 0;}void spu_lockline_lock(void){}void
 void cellMsgDialog_tick(void){}void np_psnr_pump(void){}
 void ps3_np_ticket_tick(void){}
 void cellGameUpdate_tick(void){}
+void np_basic_social_tick(void){}
 static unsigned events;static uint32_t codes[128];
 static void cb(u32 opd,u64 code,u64 param,u64 user,u64 d,u64 e,u64 f,u64 g,u64 h){assert(events<128);codes[events++]=(uint32_t)code;}
 static void run_ui(void){for(int i=0;i<100;i++){

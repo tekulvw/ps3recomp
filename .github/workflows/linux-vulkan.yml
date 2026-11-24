@@ -124,3 +124,16 @@ jobs:
           python3 tools/test_vulkan_batched_engine.py --draws 600 2>&1 | tee batched.log
           test "${PIPESTATUS[0]}" -eq 0
           grep -q "^PASS" batched.log
+
+      # The present scale fixture (tools/test_vulkan_present_scale.py): with
+      # rsx_vulkan_backend_set_present_scale the display image takes the
+      # requested percentage of the display size, a flipped target of that
+      # size reaches it pixel for pixel through the direct, read-back and
+      # present-thread presents, and the fixed-function path keeps the display
+      # size; every run clean under the validation layer.
+      - name: Present scale fixture, under the validation layer
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang CXX=clang++; else export CC=gcc CXX=g++; fi
+          python3 tools/test_vulkan_present_scale.py 2>&1 | tee present-scale.log
+          test "${PIPESTATUS[0]}" -eq 0
+          grep -q "^PASS" present-scale.log
