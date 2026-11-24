@@ -359,7 +359,9 @@ void np_basic_social_tick(void)
     if (!s_cs_registered || !caller) return;
     s_ticking = 1;
     int32_t event, ret;
+    static int said;
     while (s_cs_registered && np_social_announce(&event, &ret)) {
+        if (!said) { said = 1; fprintf(stderr, "[np-social] first event (%d) announced to the title's handler\n", (int)event); }
         caller(s_cs_handler, (u64)(s64)event, (u64)(s64)ret, 0, s_cs_arg, 0, 0, 0, 0);
     }
     s_ticking = 0;
@@ -370,6 +372,8 @@ static s32 np_basic_social_get_event(u32 event, u32 from, u32 data, u32 size)
     if (!event || !from || !size) return BASIC_INVALID_ARGUMENT;
     np_social_event e;
     if (!np_social_take(&e)) return (s32)SCE_NP_BASIC_ERROR_NO_EVENT;
+    static int said;
+    if (!said) { said = 1; fprintf(stderr, "[np-social] the title fetched its first event (%d, %u bytes of data)\n", (int)e.event, (unsigned)e.size); }
     u32 room = vm_read32(size);
     u32 n = e.size < room ? e.size : room;
     if (n && !data) n = 0;

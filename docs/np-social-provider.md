@@ -73,7 +73,8 @@ Delivery follows the SDK model of a registered event handler plus a fetch:
    (the returned size is 0) and still takes the event.
 
 A title may call `sceNpBasicGetEvent` inside its handler or later; both see the same order. An
-event is handed out once.
+event is handed out once. The first announcement and the first fetch of a process each print one
+`[np-social]` line on stderr, so a run's log shows that events reach the title.
 
 The provider is told when the title gains or loses its handler (`handler_changed`), so it can
 send the current state again (for example presence for every online friend) to a title that
