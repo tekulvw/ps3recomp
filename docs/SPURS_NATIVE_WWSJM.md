@@ -16,8 +16,8 @@ registered or runs.
 | `PS3RECOMP_SPURS_NATIVE_PM` | Effect for the job manager's workloads |
 |---|---|
 | unset, `0` | The lifted policy module (default). |
-| `1`, `wwsjm` | The native run loop. |
-| `check` | The native run loop plus self-checks: every line transaction changes only what the contract allows, other lanes' markers are untouched, finish is called exactly once per job, the stack is restored, and each staged GET has the right shape. A violation stops the process (exit 86) with the workload, lane and line. |
+| `1`, `wwsjm` | The native run loop. Guest state outside the contract met before a claim withdraws it: the lifted module takes over (see "Refusals"). |
+| `check` | The native run loop plus self-checks, and every refusal stops the process (exit 86): every line transaction changes only what the contract allows, other lanes' markers are untouched, finish is called exactly once per job, the stack is restored, and each staged GET has the right shape. A violation stops the process (exit 86) with the workload, lane and line. |
 | `shadow` | The lifted module. Its runs' events are compared with the core's decisions (see "Shadow comparison"). |
 
 The implementation is registered for one policy image identity: fingerprint
@@ -55,7 +55,12 @@ One dispatch on a slot's resident context, on its worker thread:
 - **Entry.** On a flag entry (poll status 4), the workload's ready count becomes 8. The job
   list line is read with GETLLAR.
 - **Claiming.** Entries at N are claimed with one PUTLLC each. A lost reservation re-reads and
-  retries. Non-job entries are claimed and passed, with a kernel poll after each; an answer
+  retries. Before a job entry is claimed, everything about it that can be refused is checked
+  (`wj_preflight`): its record's commands are planned and placed, every load must land in the job
+  window, every gather list must satisfy the gather rule below, and the module's entry (from the
+  header of the image its set-0 copy loads) must lie in set 0. These reads of guest memory are not
+  reported to observers; the run reads the same bytes again, reported, when it stages the job.
+  The plan made here is the one the job runs with. Non-job entries are claimed and passed, with a kernel poll after each; an answer
   naming another workload ends the run at the next entry boundary. The loop stops when the
   entry at N is not claimable.
 - **Staging a job.** The record's command portion is read from guest memory and planned by the
@@ -116,9 +121,29 @@ One dispatch on a slot's resident context, on its worker thread:
 
 Guest reads of headers, gate counters, records and gather lists go to guest memory directly.
 When a policy-run observer is armed they are reported as GETs, so recordings and the shadow
-comparison see them. Every refusal by the core (entry type, header, command, flags, ranges,
-gather list) stops the process loudly; unsupported behaviour is never skipped. Counters print
-as one `[wwsjm]` line at exit.
+comparison see them. Counters print as one `[wwsjm]` line at exit.
+
+## Refusals
+
+Unsupported behaviour is never skipped. What happens depends on where it is met:
+
+- **Before a claim:** a malformed current array, an entry header or entry type outside the
+  contract, a claim the core refuses, or a job whose record, placement, gather lists or module
+  entry the preflight refuses. Also a run on an instance or list the implementation cannot take.
+  Nothing of that entry is done. A job the run is already running (the refusal can come from the
+  claim inside finish) finishes and retires normally. In mode `1`, the run then claims nothing
+  more, sets the workload's ready count to its busy value, and ends as an exit to the kernel. The
+  implementation withdraws itself (`spurs_native_pm_withdraw`, docs/SPURS_NATIVE_PM.md): one
+  `[wwsjm] refused before a claim: ...` line with the job list line, the record or gather list
+  when there is one, and one `[spurs-native-pm] wwsjm WITHDRAWN: ...` line, once per process.
+  Other lanes stop claiming at their next claim. Every workload's next dispatch runs the lifted
+  policy module, which takes the job list over from guest memory. `withdrawals=` counts the runs
+  that ended this way. In `check` mode, or when no lifted module exists, the process stops
+  (exit 86) as before.
+- **Inside a job:** a service refusal, an empty or misaligned window slot, the interrupt vector,
+  a job that does not return to the job-return slot, a retire or decrement refused. The process
+  stops (exit 86) with the workload, lane, job and line. A half-run job cannot be handed to the
+  lifted module, and leaving it would hang the PPU on its lane marker.
 
 ## Shadow comparison
 
@@ -183,11 +208,19 @@ real SPURS initializer, coordinator, five workers, policy runner, resolver, MFC 
 - **The arms:** switch unset (inert), `1`, `check`, and `1` with
   `PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW=1`. The last must leave every run identical: no
   mismatch, no unverifiable event, and every comparison class exercised.
+- **Refusals:** a job whose gather list breaks the gather rule (job 0, refused at a lane's first
+  claim; job 5, typically refused by the claim inside finish while job 4 runs). In `check` the
+  process stops (exit 86). In `1` the implementation withdraws once, nothing is held (every lane
+  marker `0xFFFF`, N at the refused job, every earlier job retired exactly once), and the lifted
+  module is dispatched on fresh contexts.
 - **`--mutants`:** nine run-loop breaks. They are a reservation loss ignored, a retire that
   drops the held job, decrements or the wake skipped, the parameter data pointer at the command
   portion, modules never reloaded, the tag counter kept across jobs, finish claiming nothing,
   and the context's array dropped. Each must fail the fixture, and must also show as mismatches
-  in the shadow comparison.
+  in the shadow comparison. The other mutants each break one rule the fixture checks, among
+  them four for refusals: withdrawal in `check` mode, a withdrawn implementation still
+  dispatched, the preflight not checking gather lists (the refusal then comes after the claim and
+  stops the process), and a run that keeps claiming after its refusal.
 
 `python3 tools/test_wwsjm_core.py [--mutants]` builds `runtime/spu/tests/test_wwsjm_core.c`
 against the core. The test covers:

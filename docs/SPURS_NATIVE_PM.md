@@ -26,11 +26,34 @@ window intercept in `spu_channels.c`, selection in `libs/spurs/cellSpurs.c`.
 | `<name>` | As `1`, restricted to the implementation registered under that name. |
 
 The decision is made once per workload id, when its policy image is first
-resolved (`spurs_resolve_pm`), and holds for the process: a resident context
-never alternates between lifted and native runs, and there is no per-run
-fallback. Each decision prints one `[spurs-native-pm]` line. An image whose
-fingerprint matches but whose SHA-256 differs from the one the implementation
-was written for stays lifted, with a line saying so.
+resolved (`spurs_resolve_pm`). Each decision prints one `[spurs-native-pm]` line.
+An image whose fingerprint matches but whose SHA-256 differs from the one the
+implementation was written for stays lifted, with a line saying so.
+
+## Withdrawal: falling back to the lifted module
+
+An implementation that meets guest state outside its contract may **withdraw**
+itself, but only at a point where its run holds nothing half done (no job entered
+and not finished) and only when the dispatch has a lifted module to fall back to
+(`run->lifted_available`). It calls `spurs_native_pm_withdraw(pm, why)` and ends
+the run as an exit to the kernel. The seam prints one line, once per process:
+
+```
+[spurs-native-pm] wwsjm WITHDRAWN: <why>. Its workloads run the lifted policy module from their next dispatch, ...
+```
+
+From then on, `spu_run_policy_module_native` gives every dispatch of the
+implementation's workloads to the lifted module, on a fresh context (the
+persistent context a native run left is reset once, as on a workload-data
+change, with one `[spurs-pm] ... now runs the lifted policy module` line per
+lane). The lifted module takes the job list over from guest memory as it is, so
+nothing is lost provided the native run held no job. The switch does not go back.
+
+Inside a job there is no fallback. A job a native run entered depends on that
+run's services and state, which the lifted module cannot adopt, and abandoning
+it would leave its lane marker set (the PPU waits on it) and its outputs
+unwritten. Unsupported behaviour there (an empty or misaligned window slot, the
+interrupt vector, a service refusal) still stops the process with exit 86.
 
 `PS3RECOMP_SPURS_NATIVE_PM_SELF_SHADOW=1`, with the switch at `1`, `check` or a
 name, also feeds native runs' events to their implementation's shadow hook.
@@ -46,6 +69,9 @@ static const struct spurs_native_pm impl = {
     accept /* optional */, shadow /* optional */ };
 spurs_native_pm_register(&impl);   /* before the workload is first resolved */
 ```
+
+`run->lifted_available` says whether this dispatch has a lifted module (an
+implementation may withdraw only then; see above).
 
 `accept(spurs_ea, wid, n_spus)`, when present, is asked once, at selection,
 after the identity gate. The resolver passes the workload's SPURS instance and
@@ -133,3 +159,6 @@ not returning to r0, the SHA gate skipped, the table left installed after a run,
 the interpreter executing the window, the micro-interpreter dropping the
 hand-over, and a service return that unwinds the caller instead of dispatching
 its link.
+
+Withdrawal is tested through the WWS job manager's fixture
+(`tools/test_wwsjm_run.py`, docs/SPURS_NATIVE_WWSJM.md).
