@@ -211,9 +211,11 @@ static int svc_flip(spu_context* c)
 }
 static const struct spurs_native_services s_services = { { svc_add, svc_flip } };
 static int g_direct, g_direct_rc_mode;
+static spu_context* g_native_ctx;   /* the resident context the last native run used */
 static int native_run(spu_context* c, const struct spurs_native_pm_run* a)
 {
     __atomic_add_fetch(&g_native_runs, 1, __ATOMIC_ACQ_REL);
+    g_native_ctx = c;
     __atomic_or_fetch(&g_modes, 1u << a->mode, __ATOMIC_ACQ_REL);
     if (c->native_services == &s_services) __atomic_add_fetch(&g_observed_services, 1, __ATOMIC_ACQ_REL);
     assert(a->wid == WID && a->pm_size == PM_SIZE && (uint32_t)a->wkl_data == LIST_EA && a->image_id == IMAGE);
@@ -313,14 +315,16 @@ static int direct(int bad)
     g_direct_rc_mode = 1;
     int rc1 = spu_run_policy_module_native(&s_native, lifted_pm, IMAGE, pm, PM_SIZE, LIST_EA, WID, SPURS_EA, 0);
     g_direct_rc_mode = 0;
+    /* the service table is the run's only: removed when the run ends */
+    const int left_installed = g_native_ctx && g_native_ctx->native_services != NULL;
     /* the same resident context afterwards: a native run must leave no service table behind */
     int rc2 = spu_run_policy_module(lifted_pm, IMAGE, pm, PM_SIZE, LIST_EA, WID, SPURS_EA, 0);
     printf("result rc0=%d rc1=%d rc2=%d native=%u lifted=%u services=%u job_ok=%u job_bad=%u hook=%u job_c=%u "
            "services_installed=%u lifted_saw_services=%u hook_default_null=%d count=%u interp_rc=%d interp_r3=0x%X "
-           "interp_r11=0x%X job_f=%u\n",
+           "interp_r11=0x%X job_f=%u left_installed=%d\n",
            rc0, rc1, rc2, g_native_runs, g_lifted_runs, g_services, g_job_ok, g_job_bad, g_hook_calls, g_job_c_ran,
            g_observed_services, g_lifted_saw_services, dflt, vm_read32(LIST_EA), (int)g_interp_rc, g_interp_r3,
-           g_interp_r11, g_job_f);
+           g_interp_r11, g_job_f, left_installed);
     fflush(stdout);
     return 0;
 }

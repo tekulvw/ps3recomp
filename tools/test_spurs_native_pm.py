@@ -180,7 +180,8 @@ def check(binary: Path, tmp: Path) -> list[str]:
     # --- the window, job returns, payload hook ---------------------------------
     r, err, _ = run(binary, ['direct'])
     want = dict(rc0='0', rc1='-2', rc2='0', native='2', lifted='1', services='4', job_ok='6', job_bad='0',
-                hook='8', job_c='0', services_installed='2', lifted_saw_services='0', hook_default_null='1', count='3')
+                hook='8', job_c='0', services_installed='2', lifted_saw_services='0', hook_default_null='1', count='3',
+                left_installed='0')
     for k, v in want.items():
         expect(r.get(k) == v, f'direct: {k}={r.get(k)} expected {v}')
     # the short dispatch entry (PS3RECOMP_SPU_IB_FAST) never answers a window slot:

@@ -220,7 +220,7 @@ real SPURS initializer, coordinator, five workers, policy runner, resolver, MFC 
   in the shadow comparison. The other mutants each break one rule the fixture checks, among
   them four for refusals: withdrawal in `check` mode, a withdrawn implementation still
   dispatched, the preflight not checking gather lists (the refusal then comes after the claim and
-  stops the process), and a run that keeps claiming after its refusal.
+  stops the process), and a run that does not end after its refusal.
 
 `python3 tools/test_wwsjm_core.py [--mutants]` builds `runtime/spu/tests/test_wwsjm_core.c`
 against the core. The test covers:

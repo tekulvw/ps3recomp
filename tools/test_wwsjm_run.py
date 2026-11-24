@@ -104,7 +104,7 @@ MUTANTS = {
     'withdrawn-still-native': ('runtime/spu/spurs_policy.c',
                                '    if (native && entry && spurs_native_pm_withdrawn(native)) native = NULL;\n', ''),
     'preflight-gather-unchecked': (RUN, '        if (gs != WWSJM_OK) return wj_refuse(r, "gather list outside the contract", l->ea, gs);\n', ''),
-    'withdraw-keeps-claiming': (RUN, '        if (r->withdraw) return 0;\n        if (r->fallback_ok', '        if (r->fallback_ok'),
+    'withdraw-exit-skipped': (RUN, '            if (r.withdraw) goto withdrawn;\n            if (r.stop) break;', '            if (r.stop) break;'),
     'stack-bytes-zero': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
                          'spurs_native_pm_enter_job(c, entry, WJ_STACK, 0, WJ_CTX_LS, 0)'),
     'stack-bytes-too-few': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
@@ -133,10 +133,13 @@ def build(tmp: Path, name: str, mutant=None) -> Path:
         (shadow / 'wwsjm').mkdir()
         for f in ('wwsjm_core.c', 'wwsjm_core.h', 'wwsjm_run.inc', 'wwsjm_shadow.inc'):
             shutil.copy(SPU / 'wwsjm' / f, shadow / 'wwsjm' / f)
-        (shadow / 'wwsjm' / src.name).write_text(text.replace(old, new))
         shutil.copy(SPU / 'spurs_native_pm.inc', shadow / 'spurs_native_pm.inc')
         shutil.copy(SPU / 'spurs_policy.c', shadow / 'spurs_policy.c')
         sources['spurs_policy.c'] = shadow / 'spurs_policy.c'
+        # the mutated file replaces its shadow copy (the run loop's chain, or the policy runner)
+        dest = shadow / 'wwsjm' / src.name if src.parent.name == 'wwsjm' else shadow / src.name
+        assert dest.exists(), f'{name}: {rel} is not shadowed by this fixture'
+        dest.write_text(text.replace(old, new))
     out = tmp / name
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O2', '-UNDEBUG', '-w', '-DWWSJM_TEST_HOOKS',
                     '-ffunction-sections', '-fdata-sections',
