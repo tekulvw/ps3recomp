@@ -303,6 +303,57 @@ static void test_focus(void)
     poll();
 }
 
+/* PS3RECOMP_PAD_CLAIM_ON_INPUT=1: an idle controller (here a keypad's
+ * XInput interface, connected first) never takes port 0 from the one that
+ * is played with; each takes a port at its first use. */
+static void test_claim_on_input(void)
+{
+    pad_shutdown_backend();
+    while (SDL_NumJoysticks() > 0) CHECK(SDL_JoystickDetachVirtual(0) == 0);
+    poll();
+    s_sdl_claim_on_input = 1;
+    pad_init_backend();
+
+    Motors keypad_motors = {0}, pad_motors = {0};
+    const SDL_JoystickID keypad = attach("Synthetic keypad XInput interface", 0x045E, 0x028E, &keypad_motors);
+    const SDL_JoystickID dualsense = attach("Synthetic DualSense", 0x054C, 0x0CE6, &pad_motors);
+    poll();
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) CHECK(!s_host_state[i].connected);
+    CHECK(pad_sdl_waiting_of(keypad) >= 0 && pad_sdl_waiting_of(dualsense) >= 0);
+
+    SDL_Joystick* keypad_js = SDL_JoystickFromInstanceID(keypad);
+    SDL_Joystick* pad_js = SDL_JoystickFromInstanceID(dualsense);
+    CHECK(keypad_js && pad_js);
+    /* Stick noise is not use. */
+    CHECK(SDL_JoystickSetVirtualAxis(keypad_js, SDL_CONTROLLER_AXIS_LEFTX, 3000) == 0);
+    poll();
+    CHECK(port_of_id(keypad) < 0);
+
+    /* Not while another application is in front. */
+    CHECK(SDL_JoystickSetVirtualButton(pad_js, SDL_CONTROLLER_BUTTON_B, 1) == 0);
+    s_focused = 0;
+    poll();
+    CHECK(port_of_id(dualsense) < 0);
+    s_focused = 1;
+    poll();
+    /* The press that claims port 0 is reported at once. */
+    CHECK(port_of_id(dualsense) == 0 && pad_sdl_waiting_of(dualsense) < 0);
+    CHECK(s_host_state[0].connected && s_host_state[0].buttons == CELL_PAD_CTRL_CIRCLE);
+    CHECK(SDL_GameControllerGetPlayerIndex(s_sdl_controllers[0]) == 0);
+    CHECK(port_of_id(keypad) < 0 && !s_host_state[1].connected);
+    set_act(0, 0, 255);
+    CHECK(pad_motors.lo == 65535 && keypad_motors.calls == 0);
+    set_act(0, 0, 0);
+
+    /* A waiting controller that leaves is closed; ports are unchanged. */
+    CHECK(SDL_JoystickDetachVirtual(0) == 0);   /* the keypad: device 0 */
+    poll();
+    CHECK(pad_sdl_waiting_of(keypad) < 0 && port_of_id(dualsense) == 0);
+    CHECK(SDL_JoystickSetVirtualButton(pad_js, SDL_CONTROLLER_BUTTON_B, 0) == 0);
+    poll();
+    s_sdl_claim_on_input = 0;
+}
+
 #endif
 
 int main(void)
@@ -337,6 +388,7 @@ int main(void)
     test_rumble(&dualsense_motors);
     test_hot_plug(dualsense);
     test_focus();
+    test_claim_on_input();
 
     /* Nothing drains SDL's event queue here (no SDL window): the backend
      * must not let controller events pile up in it. */

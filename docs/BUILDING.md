@@ -431,6 +431,13 @@ process is in the foreground (SDL applies that rule only to its own windows,
 and the game window is not one); a button still held when focus returns waits
 for a release. `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1` in the environment (or
 the SDL hint of that name) reads controllers in the background too.
+`PS3RECOMP_PAD_CLAIM_ON_INPUT=1` (environment, any host) lets a controller
+take a port only at its first press (a mapped button, or a stick or trigger
+past half way, while input counts) instead of when it connects. Some devices
+present a controller nobody plays with -- the XInput interface of a gaming
+keypad, a virtual pad -- and would otherwise sit on port 0 ahead of the
+controller that is actually used. The press that claims a port is reported in
+the same poll.
 `tools/test_pad_sdl_controllers.py` checks all of this with synthetic SDL
 virtual controllers.
 

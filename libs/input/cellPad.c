@@ -150,6 +150,13 @@ static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static SDL_JoystickID      s_sdl_instance[PAD_MAX_HOST_PORTS];
 static u16                 s_sdl_blocked[PAD_MAX_HOST_PORTS];   /* see pad_sdl_focus_gate */
 static int s_sdl_inited = 0;
+/* PS3RECOMP_PAD_CLAIM_ON_INPUT=1: a controller takes a port at its first
+ * press instead of when it connects (pad_sdl_claim). Until then it waits
+ * here, open but on no port. -1 = not read yet. */
+#define PAD_SDL_MAX_WAITING 8
+static int                 s_sdl_claim_on_input = -1;
+static SDL_GameController* s_sdl_waiting[PAD_SDL_MAX_WAITING];
+static SDL_JoystickID      s_sdl_waiting_id[PAD_SDL_MAX_WAITING];
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -521,6 +528,20 @@ static int pad_sdl_port_of(SDL_JoystickID id)
     return -1;
 }
 
+static int pad_sdl_waiting_of(SDL_JoystickID id)
+{
+    for (int k = 0; k < PAD_SDL_MAX_WAITING; k++)
+        if (s_sdl_waiting[k] && s_sdl_waiting_id[k] == id) return k;
+    return -1;
+}
+
+static int pad_sdl_free_port(void)
+{
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+        if (!s_sdl_controllers[i]) return i;
+    return -1;
+}
+
 static void pad_sdl_close_port(int i)
 {
     SDL_GameControllerClose(s_sdl_controllers[i]);
@@ -533,21 +554,50 @@ static void pad_sdl_close_port(int i)
     fflush(stdout);
 }
 
+static void pad_sdl_take_port(int port, SDL_GameController* gc, SDL_JoystickID id)
+{
+    s_sdl_controllers[port] = gc;
+    s_sdl_instance[port] = id;
+    s_sdl_blocked[port] = 0;
+    memset(&s_rumble[port], 0, sizeof s_rumble[port]);
+    /* Player LEDs and light bars show the port. */
+    SDL_GameControllerSetPlayerIndex(gc, port);
+    const char* name = SDL_GameControllerName(gc);
+    printf("[cellPad] port %d: %s controller \"%s\"\n", port, pad_sdl_type_name(gc), name ? name : "?");
+    fflush(stdout);
+}
+
+static int pad_sdl_claim_on_input(void)
+{
+    if (s_sdl_claim_on_input < 0) {
+        const char* e = getenv("PS3RECOMP_PAD_CLAIM_ON_INPUT");
+        s_sdl_claim_on_input = e && !strcmp(e, "1");
+    }
+    return s_sdl_claim_on_input;
+}
+
 /* Hot-plug: every attached game controller not on a port yet takes the
- * lowest free one, in device order. A joystick SDL has no controller mapping
- * for is reported once and left alone. */
+ * lowest free one, in device order -- or, with PS3RECOMP_PAD_CLAIM_ON_INPUT,
+ * waits for its first press (pad_sdl_claim). A joystick SDL has no controller
+ * mapping for is reported once and left alone. */
 static void pad_sdl_open_new(void)
 {
     static SDL_JoystickID said_unmapped[8];
     static int said_count = 0;
+    const int claim = pad_sdl_claim_on_input();
     const int count = SDL_NumJoysticks();
     for (int d = 0; d < count; d++) {
-        int port = -1;
-        for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
-            if (!s_sdl_controllers[i]) { port = i; break; }
-        if (port < 0) return;
+        const int port = pad_sdl_free_port();
+        int slot = -1;
+        if (claim) {
+            for (int k = 0; k < PAD_SDL_MAX_WAITING && slot < 0; k++)
+                if (!s_sdl_waiting[k]) slot = k;
+            if (slot < 0) return;
+        } else if (port < 0) {
+            return;
+        }
         const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(d);
-        if (id < 0 || pad_sdl_port_of(id) >= 0) continue;
+        if (id < 0 || pad_sdl_port_of(id) >= 0 || pad_sdl_waiting_of(id) >= 0) continue;
         if (!SDL_IsGameController(d)) {
             int said = 0;
             for (int k = 0; k < said_count; k++) said |= said_unmapped[k] == id;
@@ -567,15 +617,58 @@ static void pad_sdl_open_new(void)
             fflush(stdout);
             continue;
         }
-        s_sdl_controllers[port] = gc;
-        s_sdl_instance[port] = id;
-        s_sdl_blocked[port] = 0;
-        memset(&s_rumble[port], 0, sizeof s_rumble[port]);
-        /* Player LEDs and light bars show the port. */
-        SDL_GameControllerSetPlayerIndex(gc, port);
-        const char* name = SDL_GameControllerName(gc);
-        printf("[cellPad] port %d: %s controller \"%s\"\n", port, pad_sdl_type_name(gc), name ? name : "?");
-        fflush(stdout);
+        if (claim) {
+            s_sdl_waiting[slot] = gc;
+            s_sdl_waiting_id[slot] = id;
+            const char* name = SDL_GameControllerName(gc);
+            printf("[cellPad] %s controller \"%s\" connected; it takes a port at its first press\n",
+                   pad_sdl_type_name(gc), name ? name : "?");
+            fflush(stdout);
+        } else {
+            pad_sdl_take_port(port, gc, id);
+        }
+    }
+}
+
+/* PS3RECOMP_PAD_CLAIM_ON_INPUT: a waiting controller takes the lowest free
+ * port once it is used -- a mapped button pressed, or a stick or trigger
+ * past half way -- while input counts (focus). A device that presents an
+ * idle controller and is never used as one (a keypad's XInput interface, a
+ * virtual pad nobody holds) then never takes port 0 from the controller that
+ * is played with. The press that claims the port is reported in the same
+ * poll. */
+static int pad_sdl_used(SDL_GameController* gc)
+{
+    static const SDL_GameControllerButton buttons[] = {
+        SDL_CONTROLLER_BUTTON_A, SDL_CONTROLLER_BUTTON_B, SDL_CONTROLLER_BUTTON_X, SDL_CONTROLLER_BUTTON_Y,
+        SDL_CONTROLLER_BUTTON_BACK, SDL_CONTROLLER_BUTTON_START, SDL_CONTROLLER_BUTTON_LEFTSTICK,
+        SDL_CONTROLLER_BUTTON_RIGHTSTICK, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+        SDL_CONTROLLER_BUTTON_DPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_DOWN, SDL_CONTROLLER_BUTTON_DPAD_LEFT,
+        SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
+    };
+    for (size_t b = 0; b < sizeof buttons / sizeof buttons[0]; b++)
+        if (SDL_GameControllerGetButton(gc, buttons[b])) return 1;
+    for (int a = 0; a < SDL_CONTROLLER_AXIS_MAX; a++) {
+        const int v = SDL_GameControllerGetAxis(gc, (SDL_GameControllerAxis)a);
+        if (v > 16384 || v < -16384) return 1;
+    }
+    return 0;
+}
+
+static void pad_sdl_claim(int allowed)
+{
+    for (int k = 0; k < PAD_SDL_MAX_WAITING; k++) {
+        SDL_GameController* gc = s_sdl_waiting[k];
+        if (!gc) continue;
+        if (!SDL_GameControllerGetAttached(gc)) {
+            SDL_GameControllerClose(gc);
+            s_sdl_waiting[k] = NULL;
+            continue;
+        }
+        const int port = pad_sdl_free_port();
+        if (port < 0 || !allowed || !pad_sdl_used(gc)) continue;
+        s_sdl_waiting[k] = NULL;
+        pad_sdl_take_port(port, gc, s_sdl_waiting_id[k]);
     }
 }
 
@@ -597,6 +690,7 @@ static void pad_poll_sdl2(void)
     pad_sdl_open_new();
 
     const int allowed = pad_sdl_input_allowed();
+    pad_sdl_claim(allowed);
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         SDL_GameController* gc = s_sdl_controllers[i];
         if (!gc) {
@@ -699,6 +793,10 @@ static void pad_shutdown_backend(void)
             s_sdl_controllers[i] = NULL;
             s_sdl_instance[i] = -1;
         }
+    }
+    for (int k = 0; k < PAD_SDL_MAX_WAITING; k++) {
+        if (s_sdl_waiting[k]) SDL_GameControllerClose(s_sdl_waiting[k]);
+        s_sdl_waiting[k] = NULL;
     }
     memset(s_rumble, 0, sizeof s_rumble);
     SDL_UnlockJoysticks();
