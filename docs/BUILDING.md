@@ -289,6 +289,17 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 | `RSX_ENGINE_PASS_DUMP=<dir>` | Capture draws pass by pass into an existing *dir*: each pass's colour targets as PPM, its zeta as PGM, and one line per pass in `passes.txt` (targets, depth range, clears, the first draw's state and textures). Starts after `RSX_ENGINE_PASS_DUMP_AFTER=<sec>` or on the frame after one of `RSX_ENGINE_PASS_DUMP_MINDRAWS=<n>` guest draws, and stops after `RSX_ENGINE_PASS_DUMP_MAX=<n>` passes (default 64). `RSX_ENGINE_PASS_DUMP_DRAWS=1` adds one line per draw to `draws.txt`. Every pass stalls the GPU for its readbacks |
 | `RSX_ENGINE_SHADER_DUMP=<dir>` | Write each new pipeline's translated programs to an existing *dir* as `pipe<handle>.vs.hlsl` and `.ps.hlsl`, the handles `passes.txt` names |
 
+A host that wraps the draw engine's backend to create its colour targets
+larger than the guest asks (a rendering-resolution option) can call
+`rsx_vulkan_backend_set_present_scale(percent)` (`rsx_vulkan_backend.h`,
+100 to 400) before or during init: the display image a flip is blitted into,
+the present thread's staging images, the read-back present and the
+`PS3RECOMP_VK_DUMP` frames then take that percentage of the display size, so
+the enlarged surface reaches the window at its own resolution. It applies on
+the draw engine path only; the fixed-function path keeps the display size and
+logs that. Without the call (or with 100) nothing changes.
+`python3 tools/test_vulkan_present_scale.py` checks it on any Vulkan device.
+
 Without a GPU, Mesa's lavapipe runs every check, e.g.
 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./build/ps3recomp_host --tex`
 (the ICD file name varies by distribution). Without guest programs, the modes

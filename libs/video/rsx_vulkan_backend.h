@@ -68,6 +68,21 @@ extern "C" {
  * Returns 0 on success, -1 on any failure (reason printed to stderr). */
 int  rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
 
+/* Optional, for a host that wraps the draw engine's backend and creates its
+ * colour targets larger than the guest asks (a rendering-resolution option):
+ * the display image -- the one a flip is blitted into and the window is
+ * blitted from -- and the present thread's staging images become `percent`
+ * of the display size (each side rounded to the nearest pixel, halves up),
+ * so a flipped surface of that size reaches the window at its own
+ * resolution rather than through a display-sized copy. The readback
+ * present, rsx_vulkan_backend_presented_center() and PS3RECOMP_VK_DUMP then
+ * read that image too. Applies on the register-file draw engine path only;
+ * the fixed-function path keeps the display size and says so. Takes effect
+ * at the next init, or at the current one when called before it returns
+ * (from the engine backend's registration, say). 100, the default, changes
+ * nothing. Returns 0, or -1 for a percentage outside 100..400. */
+int rsx_vulkan_backend_set_present_scale(u32 percent);
+
 /* Requires explicit PS3RECOMP_VK_FRONTEND=1 before init (Vulkan1.1), an
  * existing compute-capable graphics queue, and no implicit device creation. */
 int rsx_vulkan_backend_frontend_available(void);

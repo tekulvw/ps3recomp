@@ -198,6 +198,10 @@ typedef struct vk_state {
     VkPhysicalDeviceMemoryProperties memprops;
 
     u32              width, height;
+    /* The display image's own extent: `color`, the readback buffer and the
+     * present thread's staging images. The display size (width x height)
+     * unless a host asked for a larger present (rsx_vulkan_backend_set_present_scale). */
+    u32              out_w, out_h;
     vk_image         color;           /* R8G8B8A8_UNORM                 */
     vk_image         depth;           /* D32_SFLOAT or fallback         */
     VkFormat         depth_format;
@@ -2874,7 +2878,7 @@ static void vk_dump_ppm(const unsigned char* rgba)
 {
     FILE* f = fopen(s_vk.dump_path, "wb");
     if (!f) { VK_LOG("cannot open %s for the frame dump\n", s_vk.dump_path); return; }
-    if (rsx_ppm_write_rgba(f, rgba, s_vk.width, s_vk.height))
+    if (rsx_ppm_write_rgba(f, rgba, s_vk.out_w, s_vk.out_h))
         VK_LOG("frame dump to %s incomplete\n", s_vk.dump_path);
     fclose(f);
 }
@@ -3068,7 +3072,7 @@ static void vk_present_complete_locked(void)
 
     vk_invalidate(&s_vk.readback);
     const unsigned char* px = (const unsigned char*)s_vk.readback.ptr;
-    size_t c = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
+    size_t c = ((size_t)(s_vk.out_h / 2) * s_vk.out_w + s_vk.out_w / 2) * 4;
     s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
     s_vk.presented++;
     s_vk.present_readback_count++;
@@ -3125,7 +3129,7 @@ static void vk_record_window_blit(VkCommandBuffer cb, u32 idx)
                           0, 0, NULL, 0, NULL, 1, &b);
     VkImageBlit blit = {
         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+        .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.out_w, (int32_t)s_vk.out_h, 1 } },
         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .dstOffsets = { { 0, 0, 0 },
                         { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
@@ -3219,7 +3223,7 @@ static void vk_present_record_end(VkCommandBuffer cb)
     vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     VkBufferImageCopy region = {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageExtent = { s_vk.width, s_vk.height, 1 },
+        .imageExtent = { s_vk.out_w, s_vk.out_h, 1 },
     };
     pvkCmdCopyImageToBuffer(cb, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
                             s_vk.readback.buf, 1, &region);
@@ -3915,7 +3919,7 @@ static int vk_pt_stage(void* user, uint32_t slot, uint32_t surface)
     /* The offscreen target's size, which the window blit reads. A slot whose
      * image no longer matches gets a new one; the queue goes idle first, since
      * a show submitted earlier may still read the old one. */
-    if (s_vpt.img[slot].img && (s_vpt.img_w[slot] != s_vk.width || s_vpt.img_h[slot] != s_vk.height)) {
+    if (s_vpt.img[slot].img && (s_vpt.img_w[slot] != s_vk.out_w || s_vpt.img_h[slot] != s_vk.out_h)) {
         vk_device_idle();
         vk_pt_destroy_image(slot);
     }
@@ -3924,14 +3928,14 @@ static int vk_pt_stage(void* user, uint32_t slot, uint32_t surface)
          * makes a view, and a view needs a usage it can serve (VUID-
          * VkImageViewCreateInfo-image-04441): SAMPLED, as the offscreen
          * target's own images have, costs nothing here. */
-        if (vk_create_image(&s_vpt.img[slot], s_vk.color.format, s_vk.width, s_vk.height,
+        if (vk_create_image(&s_vpt.img[slot], s_vk.color.format, s_vk.out_w, s_vk.out_h,
                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                             VK_IMAGE_USAGE_SAMPLED_BIT,
                             VK_IMAGE_ASPECT_COLOR_BIT)) {
             vk_pt_destroy_image(slot);
             return 0;
         }
-        s_vpt.img_w[slot] = s_vk.width; s_vpt.img_h[slot] = s_vk.height;
+        s_vpt.img_w[slot] = s_vk.out_w; s_vpt.img_h[slot] = s_vk.out_h;
         s_vpt.img_fresh[slot] = 1;
     }
     const u32 c = s_vpt.stage_next;
@@ -3957,11 +3961,11 @@ static int vk_pt_stage(void* user, uint32_t slot, uint32_t surface)
         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .srcOffsets = { { 0, 0, 0 }, { (int32_t)o->w, (int32_t)o->h, 1 } },
         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+        .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.out_w, (int32_t)s_vk.out_h, 1 } },
     };
     pvkCmdBlitImage(cb, o->im.img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vpt.img[slot].img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                    (o->w == s_vk.width && o->h == s_vk.height) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+                    (o->w == s_vk.out_w && o->h == s_vk.out_h) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
     /* PS3RECOMP_VK_DUMP: every dump_every-th staged frame is also copied
      * from its staging image into `readback` (which only a read-back present
      * uses, and there is none in this mode) and written out once the stage
@@ -3972,7 +3976,7 @@ static int vk_pt_stage(void* user, uint32_t slot, uint32_t surface)
         vk_barrier_image_on(cb, s_vpt.img[slot].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy region = {
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .imageExtent = { s_vk.width, s_vk.height, 1 },
+            .imageExtent = { s_vk.out_w, s_vk.out_h, 1 },
         };
         pvkCmdCopyImageToBuffer(cb, s_vpt.img[slot].img, VK_IMAGE_LAYOUT_GENERAL,
                                 s_vk.readback.buf, 1, &region);
@@ -4014,7 +4018,7 @@ static int vk_pt_stage(void* user, uint32_t slot, uint32_t surface)
         vk_fence_wait(s_vpt.stage_fences[c]);   /* a dump frame waits, as before */
         vk_invalidate(&s_vk.readback);
         const unsigned char* px = (const unsigned char*)s_vk.readback.ptr;
-        const size_t centre = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
+        const size_t centre = ((size_t)(s_vk.out_h / 2) * s_vk.out_w + s_vk.out_w / 2) * 4;
         s_vk.last_center = ((u32)px[centre] << 16) | ((u32)px[centre + 1] << 8) | (u32)px[centre + 2];
         s_vk.present_readback_count++;
         vk_dump_ppm(px);
@@ -4080,11 +4084,11 @@ static int vk_pt_show(void* user, uint32_t slot, rsx_present_show_timing* timing
         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_vpt.img_w[slot], (int32_t)s_vpt.img_h[slot], 1 } },
         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+        .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.out_w, (int32_t)s_vk.out_h, 1 } },
     };
     pvkCmdBlitImage(cb, s_vpt.img[slot].img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                    (s_vpt.img_w[slot] == s_vk.width && s_vpt.img_h[slot] == s_vk.height)
+                    (s_vpt.img_w[slot] == s_vk.out_w && s_vpt.img_h[slot] == s_vk.out_h)
                         ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
     if (window) vk_record_window_blit(cb, idx);
     if (pvkEndCommandBuffer(cb) != VK_SUCCESS) { VK_LOG("present thread: vkEndCommandBuffer (show) failed\n"); return 0; }
@@ -4225,11 +4229,11 @@ static void vk_eng_present(void* user, u32 surface)
                 .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                 .srcOffsets = { { 0, 0, 0 }, { (int32_t)o->w, (int32_t)o->h, 1 } },
                 .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+                .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.out_w, (int32_t)s_vk.out_h, 1 } },
             };
             pvkCmdBlitImage(cb, o->im.img, VK_IMAGE_LAYOUT_GENERAL,
                             s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                            (o->w == s_vk.width && o->h == s_vk.height) ? VK_FILTER_NEAREST
+                            (o->w == s_vk.out_w && o->h == s_vk.out_h) ? VK_FILTER_NEAREST
                                                                         : VK_FILTER_LINEAR);
         }
         vk_present_record_end(cb);
@@ -6998,6 +7002,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     pthread_mutex_init(&s_vk.present_mu, NULL);
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
+    s_vk.out_w = s_vk.width; s_vk.out_h = s_vk.height;
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
     /* Writing a full frame to disk on every present costs more than the
      * present itself and slows a title enough to change what it does; a
@@ -7115,13 +7120,13 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.window_fence), "vkCreateFence");
 
     if (vk_pick_depth_format()) return -1;
-    if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
+    if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.out_w, s_vk.out_h,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return -1;
     if (vk_create_image(&s_vk.depth, s_vk.depth_format, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, s_vk.depth_aspect)) return -1;
-    if (vk_create_host_buffer(&s_vk.readback, (VkDeviceSize)s_vk.width * s_vk.height * 4u,
+    if (vk_create_host_buffer(&s_vk.readback, (VkDeviceSize)s_vk.out_w * s_vk.out_h * 4u,
                               VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return -1;
     if (vk_create_render_pass()) return -1;
     if (vk_create_pipeline_objects()) return -1;
@@ -7155,6 +7160,71 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     return 0;
 }
 
+/* rsx_vulkan_backend_set_present_scale: the display image's extent as a
+ * percentage of the display size, 100 (the display size) unless a host asks. */
+static u32 s_vk_present_scale = 100;
+
+int rsx_vulkan_backend_set_present_scale(u32 percent)
+{
+    if (percent < 100u || percent > 400u) return -1;
+    s_vk_present_scale = percent;
+    return 0;
+}
+
+/* Init, once the path is known: the display image (and the readback buffer
+ * that copies it) at the requested percentage of the display size, before
+ * anything is presented. Only the engine path presents a colour target by
+ * blitting it into this image; the fixed-function path draws into it at the
+ * display size, so there the request is refused and said so. Any failure
+ * leaves the display-sized image as it was. */
+static void vk_apply_present_scale(void)
+{
+    const u32 percent = s_vk_present_scale;
+    if (percent == 100u) return;
+    const u32 w = (u32)(((u64)s_vk.width * percent + 50u) / 100u);
+    const u32 h = (u32)(((u64)s_vk.height * percent + 50u) / 100u);
+    if (!s_vk.eng_active) {
+        VK_LOG("present scale %u%%: needs the register-file draw engine; the display image stays %ux%u\n",
+               percent, s_vk.out_w, s_vk.out_h);
+        return;
+    }
+    if (w > vk_max_dim() || h > vk_max_dim()) {
+        VK_LOG("present scale %u%%: %ux%u exceeds the device's image size limit %u; the display image stays %ux%u\n",
+               percent, w, h, vk_max_dim(), s_vk.out_w, s_vk.out_h);
+        return;
+    }
+    vk_image color = {0};
+    vk_buffer readback = {0};
+    if (vk_create_image(&color, VK_FORMAT_R8G8B8A8_UNORM, w, h,
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT) ||
+        vk_create_host_buffer(&readback, (VkDeviceSize)w * h * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+        vk_destroy_image(&color);
+        vk_destroy_buffer(&readback);
+        VK_LOG("present scale %u%%: the %ux%u display image could not be created; it stays %ux%u\n",
+               percent, w, h, s_vk.out_w, s_vk.out_h);
+        return;
+    }
+    vk_device_idle();
+    vk_image old_color = s_vk.color;
+    vk_buffer old_readback = s_vk.readback;
+    s_vk.color = color;
+    s_vk.readback = readback;
+    s_vk.out_w = w; s_vk.out_h = h;
+    vk_destroy_image(&old_color);
+    vk_destroy_buffer(&old_readback);
+    /* Opaque black, as init leaves the display-sized one. */
+    if (!vk_begin()) {
+        vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+        VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+        VkImageSubresourceRange cr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        pvkCmdClearColorImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &cr);
+        (void)vk_submit_and_wait();
+    }
+    VK_LOG("present scale %u%%: display image %ux%u for the %ux%u display\n",
+           percent, w, h, s_vk.width, s_vk.height);
+}
+
 static int vulkan_original_init(u32 width, u32 height, const char* title)
 {
     memset(&s_vk, 0, sizeof s_vk);
@@ -7180,6 +7250,7 @@ static int vulkan_original_init(u32 width, u32 height, const char* title)
         if (rsx_present_thread_requested())
             rsx_present_thread_unsupported("vulkan fixed-function path", "the draw engine is off");
     }
+    vk_apply_present_scale();
     VK_LOG("%s path\n", s_vk.eng_active ? "register-file draw engine" : "vtable");
     VK_LOG("offscreen target %ux%u ready, depth format %d (%s)\n",
            s_vk.width, s_vk.height, (int)s_vk.depth_format, title ? title : "");
