@@ -18,6 +18,7 @@ void cellOskDialog_tick(void) {}
 void ps3_np_eula_tick(void) {}     /* cellSysutil pumps these; no NP here */
 void ps3_np_ticket_tick(void) {}
 void cellGameUpdate_tick(void) {}
+void np_basic_social_tick(void) {}
 
 static unsigned calls;
 static int waiting;

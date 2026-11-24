@@ -24,6 +24,7 @@ void cellMsgDialog_tick(void){}
 void np_psnr_pump(void){}
 void ps3_np_ticket_tick(void){}
 void cellGameUpdate_tick(void){}
+void np_basic_social_tick(void){}
 static uint32_t statuses[16]; static unsigned events;
 static void cb(u32 opd,u64 status,u64 param,u64 user,u64 d,u64 e,u64 f,u64 g,u64 h){
  (void)opd;(void)param;(void)user;(void)d;(void)e;(void)f;(void)g;(void)h;statuses[events++]=(uint32_t)status;

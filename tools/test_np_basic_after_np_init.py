@@ -25,7 +25,9 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
 TESTS = os.path.join(ROOT, "libs", "network", "tests")
 SOURCES = [os.path.join(TESTS, "test_np_basic_after_np_init.c"),
-           os.path.join(TESTS, "test_np_basic_after_np_init_np.c")]
+           os.path.join(TESTS, "test_np_basic_after_np_init_np.c"),
+           os.path.join(ROOT, "libs", "network", "np_social.c"),
+           os.path.join(ROOT, "libs", "network", "sceNpLookup.c")]
 
 
 def _cc():
