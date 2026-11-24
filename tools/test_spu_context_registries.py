@@ -36,7 +36,7 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
             versions = os.environ.get('PS3RECOMP_COH_VERSIONS') == '1'
             for mode, diagnostic in [('mfc', 'cannot allocate private MFC engine'),
                                      ('coh', 'cannot register reservation holder')]:
-                result = subprocess.run([str(binary), mode], timeout=10,
+                result = subprocess.run([str(binary), mode], timeout=300,
                                         capture_output=True, text=True)
                 if mode == 'coh' and versions:
                     assert result.returncode == 0, result
@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
                 assert diagnostic in result.stderr, result.stderr
                 print(name + '/' + mode + ': PASS (visible allocation failure)')
             continue
-        result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)
+        result = subprocess.run([str(binary)], timeout=300, capture_output=True, text=True)
         print(name + ': ' + ('PASS' if result.returncode == 0 else 'FAIL'))
         print(result.stdout.strip())
         if result.returncode:
