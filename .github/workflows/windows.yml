@@ -14,7 +14,10 @@ name: Windows
 on:
   push:
     branches: [ master, main ]
+  # Pull requests that change only documentation skip this; pushes to main
+  # and manual runs always build everything.
   pull_request:
+    paths-ignore: ['docs/**', '**/*.md']
   workflow_dispatch:
 
 # Cancel a pull request's superseded runs; pushes and manual runs each keep

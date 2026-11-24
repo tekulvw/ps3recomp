@@ -2,7 +2,34 @@ name: Explicit Metal frontend
 on:
   push:
     branches: [main, master, codex/render-frontend-api]
+  # Pull requests run this only when they change the video backends, the code
+  # those compile against, their fixtures, the build or this file. When unsure
+  # whether a path is read here, list it. Pushes to main and manual runs
+  # always run it.
   pull_request:
+    paths:
+      - 'libs/video/**'
+      - 'libs/input/**'
+      - 'libs/misc/**'
+      - 'include/**'
+      - 'runtime/diagnostics/**'
+      - 'runtime/platform/**'
+      - 'runtime/memory/**'
+      - 'runtime/host/**'
+      - 'runtime/ppu/**'
+      - 'runtime/syscalls/**'
+      - 'tests/test_gcm_*'
+      - 'tests/gcm_*/**'
+      - 'tools/test_frontend_*'
+      - 'tools/test_vulkan_*'
+      - 'tools/test_native_owner_gate.py'
+      - 'tools/test_original_owner_ingress.py'
+      - 'tools/test_gcm_*'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - '.github/scripts/**'
+      - '.github/actions/**'
+      - '.github/workflows/frontend-metal.yml'
   workflow_dispatch:
     inputs:
       require_hardware:

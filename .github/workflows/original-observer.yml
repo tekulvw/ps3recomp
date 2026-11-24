@@ -2,7 +2,22 @@ name: Original execution observer
 on:
   push:
     branches: [main, master, codex/render-frontend-api]
+  # Pull requests run this only when they change the runtime, its headers,
+  # the lifter tools, the observer fixtures, the build or this file. When
+  # unsure whether a path is read here, list it. Pushes to main and manual
+  # runs always run it.
   pull_request:
+    paths:
+      - 'runtime/**'
+      - 'include/**'
+      - 'tools/**'
+      - 'tests/test_original_work*'
+      - 'tests/test_ppu_original_work*'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - '.github/scripts/**'
+      - '.github/actions/**'
+      - '.github/workflows/original-observer.yml'
   workflow_dispatch:
 permissions:
   contents: read
