@@ -164,7 +164,8 @@ static int policy_service_retire_unused(spu_context* const* contexts, unsigned c
 #define SPURS_PM_INSTANCES 4
 struct PmInstance;
 struct PmSlot { SRWLOCK lock; spu_context* ctx; uint64_t data; struct PmInstance* owner;
-    const uint8_t* pm; uint32_t size, wid; spu_lifted_entry_fn entry; int image_id; };
+    const uint8_t* pm; uint32_t size, wid; spu_lifted_entry_fn entry; int image_id;
+    const struct spurs_native_pm* native; /* the implementation the context last ran, or NULL */ };
 static struct PmInstance {
     int used, retiring;
     unsigned users, workload_users[16];
@@ -297,6 +298,9 @@ int spu_run_policy_module_native(const struct spurs_native_pm* native,
 {
     if ((!entry && !native) || !pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
         return -1;
+    /* A withdrawn native implementation (spurs_native_pm_withdraw) hands its
+     * workloads to the lifted module from their next dispatch. */
+    if (native && entry && spurs_native_pm_withdrawn(native)) native = NULL;
 
     /* Reuse one context per thread: this runs per policy dispatch (thousands
      * per second with the SPURS workload churn live), and a fresh 260KB
@@ -353,8 +357,17 @@ int spu_run_policy_module_native(const struct spurs_native_pm* native,
         spu_context_init(ctx, 0);
     } else if (s_fresh || resident->data != wkl_data ||
                resident->pm != pm_host || resident->size != pm_size ||
-               resident->entry != entry || resident->image_id != image_id) {
-        if (!s_fresh) {
+               resident->entry != entry || resident->image_id != image_id ||
+               resident->native != native) {
+        /* A context a native run left is not the lifted module's: switching
+         * (a withdrawn implementation) starts the lifted module fresh, which
+         * it supports (its local store carries nothing across dispatches). */
+        if (!s_fresh && resident->native != native) {
+            static SPU_THREAD_LOCAL int _w = 0;
+            if (PS3_LOG_FIRST(_w, 4))
+                fprintf(stderr, "[spurs-pm] wid=%u spu=%u now runs the %s policy module: fresh PM context\n",
+                        wid, spu_num, native ? "native" : "lifted");
+        } else if (!s_fresh) {
             static SPU_THREAD_LOCAL int _n = 0;
             if (PS3_LOG_FIRST(_n, 8))
                 fprintf(stderr, "[spurs-pm] wid=%u spu=%u workload data changed "
@@ -374,7 +387,7 @@ int spu_run_policy_module_native(const struct spurs_native_pm* native,
     }
     resident->data = wkl_data;
     resident->pm = pm_host; resident->size = pm_size;
-    resident->entry = entry; resident->image_id = image_id;
+    resident->entry = entry; resident->image_id = image_id; resident->native = native;
     ctx->image_id    = image_id;
     ctx->policy_mode = 1;
 
@@ -540,6 +553,7 @@ int spu_run_policy_module_native(const struct spurs_native_pm* native,
         native_run.wkl_data = wkl_data; native_run.poll_status = ctx->gpr[5]._u32[0];
         native_run.image_id = image_id; native_run.pm_host = pm_host; native_run.pm_size = pm_size;
         native_run.fresh = first; native_run.mode = spurs_native_pm_mode();
+        native_run.lifted_available = entry != NULL;
     }
     const int pm_halted = native ? spurs_native_pm_invoke(native, ctx, &native_run)
                                  : spu_run_with_halt(entry, ctx);

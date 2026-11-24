@@ -72,6 +72,9 @@ typedef char spurs_npm_window_below_image[(SPURS_NATIVE_PM_WINDOW_END <= 0xA00u 
     SPURS_NATIVE_PM_WINDOW_END == SPURS_PM_EXIT_TO_KERNEL_LS &&
     SPURS_NATIVE_PM_WINDOW_LS + SPURS_NATIVE_PM_SLOTS * SPURS_NATIVE_PM_SLOT_BYTES == SPURS_NATIVE_PM_WINDOW_END)
     ? 1 : -1];
+/* spu_native_window_target (spu_context.h) tests the same range by value. */
+typedef char spurs_npm_window_target_range[(SPURS_NATIVE_PM_WINDOW_LS == 0x900u &&
+    SPURS_NATIVE_PM_WINDOW_END - SPURS_NATIVE_PM_WINDOW_LS == 0xC0u) ? 1 : -1];
 
 int spurs_native_pm_register(const struct spurs_native_pm* pm)
 {
@@ -177,6 +180,36 @@ const struct spurs_native_pm* spurs_native_pm_select_instance(uint32_t wid, uint
     fprintf(stderr, "[spurs-native-pm] wid=%u runs native %s (fp=0x%016llX size=%u)%s\n", wid, pm->name,
             (unsigned long long)fingerprint, size, mode == SPURS_NATIVE_PM_CHECK ? " with self-checks" : "");
     return pm;
+}
+
+/* Withdrawn implementations (spurs_native_pm_withdraw). */
+static const struct spurs_native_pm* s_npm_withdrawn[SPURS_NPM_MAX];
+static unsigned s_npm_withdrawn_n;
+void spurs_native_pm_withdraw(const struct spurs_native_pm* pm, const char* why)
+{
+    if (!pm) return;
+    int first = 0;
+    AcquireSRWLockExclusive(&s_npm_lock);
+    unsigned i = 0;
+    while (i < s_npm_withdrawn_n && s_npm_withdrawn[i] != pm) i++;
+    if (i == s_npm_withdrawn_n && i < SPURS_NPM_MAX) {
+        s_npm_withdrawn[i] = pm;
+        __atomic_store_n(&s_npm_withdrawn_n, i + 1, __ATOMIC_RELEASE);
+        first = 1;
+    }
+    ReleaseSRWLockExclusive(&s_npm_lock);
+    if (first) {
+        fprintf(stderr, "[spurs-native-pm] %s WITHDRAWN: %s. Its workloads run the lifted policy module from their "
+                "next dispatch, for the rest of the process (PS3RECOMP_SPURS_NATIVE_PM=check stops here instead)\n",
+                pm->name, why ? why : "unsupported guest state");
+        fflush(stderr);
+    }
+}
+int spurs_native_pm_withdrawn(const struct spurs_native_pm* pm)
+{
+    const unsigned n = __atomic_load_n(&s_npm_withdrawn_n, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < n; i++) if (s_npm_withdrawn[i] == pm) return 1;
+    return 0;
 }
 
 int spurs_native_pm_self_shadow(void) { return spurs_native_pm_mode() != SPURS_NATIVE_PM_OFF && s_npm_self_shadow; }

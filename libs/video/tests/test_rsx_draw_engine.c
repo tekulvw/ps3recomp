@@ -69,6 +69,7 @@ typedef struct {
     u8  alive[STUB_MAX_OBJECTS];
 
     int n_texture_create, n_texture_release, n_texture_upload;
+    u8 last_upload_byte;
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
@@ -128,8 +129,9 @@ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
                                 const void* src, u32 row, u32 rows)
 {
     (void)u; (void)t; (void)face; (void)mip; (void)w; (void)h;
-    (void)src; (void)row; (void)rows;
+    (void)row; (void)rows;
     stub.n_texture_upload++;
+    stub.last_upload_byte = src ? *(const u8*)src : 0;
 }
 
 static void stub_release(void* u, u32 handle)
@@ -691,6 +693,73 @@ static void test_texture_cache(void)
     CHECK(stub.n_texture_create == creates + 1,
           "the least recently used entry was the one evicted");
 
+    engine_down();
+}
+
+/* The texture source override: a picture of the embedder's own in place of a
+ * guest texture it recognises, never written to guest memory. */
+static u8 s_override_bytes[4 * 4 * 4];
+static int s_override_calls, s_override_replace;
+static rsx_texture_source s_override_seen;
+static int test_override(void* user, const rsx_texture_source* source, const u8** replacement)
+{
+    (void)user;
+    s_override_calls++;
+    s_override_seen = *source;
+    if (source->offset != TEX_OFFSET) return 0;          /* not ours */
+    *replacement = s_override_replace ? s_override_bytes : NULL;
+    return RSX_TEXTURE_OVERRIDE_INTEREST;
+}
+
+static void test_texture_override(void)
+{
+    printf("-- texture override\n");
+    engine_up();
+    memset(s_override_bytes, 0x77, sizeof s_override_bytes);
+    s_override_calls = 0; s_override_replace = 1;
+    rsx_draw_engine_set_texture_override(test_override, NULL);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    memset(vm_base + TEX_OFFSET, 0x11, 4 * 4 * 4);
+    draw_triangle();
+    CHECK(s_override_calls == 1 && stub.last_upload_byte == 0x77,
+          "the override's bytes are decoded in place of the guest's (byte 0x%02X)", stub.last_upload_byte);
+    CHECK(vm_base[TEX_OFFSET] == 0x11, "guest memory is not written");
+    CHECK(s_override_seen.width == 4 && s_override_seen.height == 4 && s_override_seen.span == 64 &&
+          s_override_seen.format == (0x85u | 0x20u) && s_override_seen.bytes[0] == 0x11,
+          "the override sees the texture's registers and guest bytes");
+
+    rsx_draw_engine_present();
+    draw_triangle();
+    CHECK(s_override_calls == 1, "an unchanged texture is not asked again");
+
+    /* A new generation: the override changed its mind and gives the guest bytes back. */
+    s_override_replace = 0;
+    rsx_draw_engine_set_texture_override(test_override, NULL);
+    rsx_draw_engine_present();
+    draw_triangle();
+    CHECK(s_override_calls == 2 && stub.last_upload_byte == 0x11,
+          "a new generation decodes again with the guest bytes (byte 0x%02X)", stub.last_upload_byte);
+    rsx_draw_engine_present();
+    draw_triangle();
+    CHECK(s_override_calls == 2, "and is then left alone");
+
+    /* A texture the override declined is not asked again after a new generation. */
+    rsx_draw_engine_present();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET + 0x1000u);
+    draw_triangle();
+    const int asked = s_override_calls;
+    rsx_draw_engine_set_texture_override(test_override, NULL);
+    rsx_draw_engine_present();
+    draw_triangle();
+    CHECK(s_override_calls == asked, "a declined texture keeps its decode across generations");
+
+    /* Cleared: decodes see guest bytes, no question asked. */
+    rsx_draw_engine_set_texture_override(NULL, NULL);
+    rsx_draw_engine_present();
+    memset(vm_base + TEX_OFFSET, 0x22, 4 * 4 * 4);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(s_override_calls == asked && stub.last_upload_byte == 0x22, "no override, no question");
     engine_down();
 }
 
@@ -2104,6 +2173,7 @@ int main(int argc, char** argv)
     test_mrt_set();
     test_texture_cache();
     test_texture_sparse_rehash();
+    test_texture_override();
     test_pipeline_key();
     test_restart_expansion();
     test_indexed_runs();

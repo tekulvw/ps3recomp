@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <time.h>     /* timespec_get -- sceNpManagerGetNetworkTime */
 #include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
@@ -77,7 +78,27 @@ static u32 np_local_account(const char* name, char out[16])
  * read at each request, so a launcher can replace it before every sign-in. A
  * missing, unreadable, empty or oversized file fails the request visibly; it
  * never falls back to the account payload. Returns the size, or 0 on failure. */
-static u32 np_read_ticket_file(const char* path, unsigned char* out)
+#define NP_TICKET_CLAIM_SUFFIX ".claimed"
+#ifdef _WIN32
+/* The wide path (any Unicode characters), or its claimed sibling. */
+static int np_ticket_wide_path(wchar_t* out, size_t capacity, int claimed)
+{
+    DWORD length = GetEnvironmentVariableW(L"PS3RECOMP_NP_TICKET_FILE", out, (DWORD)capacity);
+    size_t extra = claimed ? sizeof(NP_TICKET_CLAIM_SUFFIX) - 1 : 0;
+    if (!length || length + extra >= capacity) return 0;
+    for (size_t i = 0; i < extra; i++) out[length + i] = (wchar_t)NP_TICKET_CLAIM_SUFFIX[i];
+    out[length + extra] = 0;
+    return 1;
+}
+#else
+static int np_ticket_claimed_path(const char* path, char* out, size_t capacity)
+{
+    int n = snprintf(out, capacity, "%s" NP_TICKET_CLAIM_SUFFIX, path);
+    return n > 0 && (size_t)n < capacity;
+}
+#endif
+
+static u32 np_read_ticket_file(const char* path, int claimed, unsigned char* out)
 {
     if (!*path) {
         fprintf(stderr, "[sceNp] RequestTicket2: PS3RECOMP_NP_TICKET_FILE is set but empty\n");
@@ -86,11 +107,13 @@ static u32 np_read_ticket_file(const char* path, unsigned char* out)
 #ifdef _WIN32
     /* Open by the wide value so a path outside the ANSI code page still works. */
     wchar_t wide[2048];
-    DWORD length = GetEnvironmentVariableW(L"PS3RECOMP_NP_TICKET_FILE", wide, 2048);
     FILE* f = NULL;
-    if (length && length < 2048 && _wfopen_s(&f, wide, L"rb")) f = NULL;
+    if (np_ticket_wide_path(wide, 2048, claimed) && _wfopen_s(&f, wide, L"rb")) f = NULL;
 #else
-    FILE* f = fopen(path, "rb");
+    char claimed_path[4096];
+    FILE* f = NULL;
+    if (!claimed) f = fopen(path, "rb");
+    else if (np_ticket_claimed_path(path, claimed_path, sizeof(claimed_path))) f = fopen(claimed_path, "rb");
 #endif
     if (!f) {
         fprintf(stderr, "[sceNp] RequestTicket2: cannot open ticket file %s\n", path);
@@ -119,6 +142,100 @@ static u32 np_read_ticket_file(const char* path, unsigned char* out)
         return 0;
     }
     return (u32)n;
+}
+
+/* PS3RECOMP_NP_TICKET_REFILL=1: every ticket file is used for one request only.
+ * The launcher keeps the file filled with a fresh ticket (fetching another once
+ * one is taken, and before one expires); the request claims it by renaming it
+ * aside, reads it and deletes it, so a ticket is never presented twice and a
+ * reconnect always gets a fresh one. While no file is there the request waits
+ * for one, up to PS3RECOMP_NP_TICKET_WAIT_MS (default 30000), then fails
+ * visibly rather than reuse an old ticket. */
+static int np_ticket_refill(void)
+{
+    const char* flag = getenv("PS3RECOMP_NP_TICKET_REFILL");
+    return flag && strcmp(flag, "1") == 0;
+}
+
+static unsigned np_ticket_wait_ms(void)
+{
+    const char* value = getenv("PS3RECOMP_NP_TICKET_WAIT_MS");
+    if (!value || !*value) return 30000;
+    char* end = NULL;
+    unsigned long ms = strtoul(value, &end, 10);
+    if (*end || ms > 600000) return 30000;
+    return (unsigned)ms;
+}
+
+static void np_sleep_ms(unsigned ms)
+{
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    struct timespec t = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
+    nanosleep(&t, NULL);
+#endif
+}
+
+/* 1: claimed (renamed to the claimed sibling); 0: no file yet; -1: an error. */
+static int np_claim_ticket_file(const char* path)
+{
+#ifdef _WIN32
+    wchar_t from[2048], to[2048];
+    if (!np_ticket_wide_path(from, 2048, 0) || !np_ticket_wide_path(to, 2048, 1)) return -1;
+    if (MoveFileExW(from, to, MOVEFILE_REPLACE_EXISTING)) return 1;
+    DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? 0 : -1;
+#else
+    char to[4096];
+    if (!np_ticket_claimed_path(path, to, sizeof(to))) return -1;
+    if (rename(path, to) == 0) return 1;
+    return errno == ENOENT ? 0 : -1;
+#endif
+}
+
+static void np_drop_claimed_ticket(const char* path)
+{
+#ifdef _WIN32
+    (void)path;
+    wchar_t wide[2048];
+    if (np_ticket_wide_path(wide, 2048, 1)) DeleteFileW(wide);
+#else
+    char claimed[4096];
+    if (np_ticket_claimed_path(path, claimed, sizeof(claimed))) remove(claimed);
+#endif
+}
+
+/* Take the launcher's current ticket, waiting for it to be refilled if needed. */
+static u32 np_take_ticket_file(const char* path, unsigned char* out)
+{
+    if (!*path) return np_read_ticket_file(path, 0, out);   /* reports the empty variable */
+    const unsigned wait = np_ticket_wait_ms();
+    unsigned waited = 0;
+    int said = 0;
+    for (;;) {
+        int claim = np_claim_ticket_file(path);
+        if (claim > 0) {
+            u32 size = np_read_ticket_file(path, 1, out);
+            np_drop_claimed_ticket(path);
+            if (size && said) fprintf(stderr, "[sceNp] RequestTicket2: fresh ticket after %u ms\n", waited);
+            return size;
+        }
+        if (claim < 0) {
+            fprintf(stderr, "[sceNp] RequestTicket2: cannot claim ticket file %s\n", path);
+            return 0;
+        }
+        if (waited >= wait) {
+            fprintf(stderr, "[sceNp] RequestTicket2: no fresh ticket in %s within %u ms; "
+                            "an old ticket is never reused\n", path, wait);
+            return 0;
+        }
+        if (!said) {
+            fprintf(stderr, "[sceNp] RequestTicket2: waiting for a fresh ticket in %s\n", path);
+            said = 1;
+        }
+        np_sleep_ms(20); waited += 20;
+    }
 }
 
 static void np_clear_ticket(void)
@@ -427,7 +544,8 @@ s32 sceNpManagerRequestTicket2(const SceNpId* npId, const SceNpTicketVersion* ve
     const char* file = getenv("PS3RECOMP_NP_TICKET_FILE");
     const unsigned char* payload = (const unsigned char*)requested;
     if (file) {
-        size = np_read_ticket_file(file, file_ticket);
+        size = np_ticket_refill() ? np_take_ticket_file(file, file_ticket)
+                                  : np_read_ticket_file(file, 0, file_ticket);
         if (!size) {
             /* Never leave an earlier sign-in's ticket for GetTicket to return. */
             TICKET_LOCK();
