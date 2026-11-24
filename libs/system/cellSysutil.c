@@ -228,6 +228,9 @@ s32 cellSysutilCheckCallback(void)
     /* cellGameUpdate (cellNetCtl) answers a patch check here, never from
      * inside the call that started it. */
     { extern void cellGameUpdate_tick(void); cellGameUpdate_tick(); }
+    /* NP Basic events from an installed social provider reach the title's
+     * handler here (docs/np-social-provider.md); a no-op without one. */
+    { extern void np_basic_social_tick(void); np_basic_social_tick(); }
     drain_guest_completions();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
      * drain_guest_completions() above, deferring a dialog answer to this poll

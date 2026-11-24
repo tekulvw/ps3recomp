@@ -24,6 +24,7 @@ void spu_lockline_unlock(void){}
 void cellOskDialog_tick(void){}
 void cellMsgDialog_tick(void){}
 void cellGameUpdate_tick(void){}
+void np_basic_social_tick(void){}
 static void *request_handler,*get_handler;
 void ppu_hle_register_all(void);
 void ps3_hle_register(unsigned nid,const char* name,void* fn){

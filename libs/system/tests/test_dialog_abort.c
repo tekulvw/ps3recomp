@@ -17,6 +17,7 @@ void np_psnr_pump(void) {}
 void ps3_np_eula_tick(void) {}
 void ps3_np_ticket_tick(void) {}
 void cellGameUpdate_tick(void) {}
+void np_basic_social_tick(void) {}
 void cellOskDialog_tick(void) {}
 
 static unsigned failures, calls;

@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../../runtime/ppu/ppu_context.h"
+#include "ps3emu/guest_call.h"
+#include "ps3emu/nid.h"
+#include "np_social_internal.h"                /* the opt-in social provider */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -30,6 +34,10 @@ static SceNpBasicPresence s_own_presence;
  * stays outside the cell/sys/sce prefixes gen_hle_nids.py exports). */
 int np_is_initialized(void);
 static int basic_ready(void) { return s_initialized || np_is_initialized(); }
+extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+/* The opt-in social provider's parts (end of this file). */
+static s32 np_basic_social_get_event(u32 event, u32 from, u32 data, u32 size);
+static void np_basic_social_drop_handler(void);
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -62,6 +70,7 @@ s32 sceNpBasicTerm(void)
     s_initialized = 0;
     s_event_handler = NULL;
     s_presence_handler = NULL;
+    np_basic_social_drop_handler();
     return CELL_OK;
 }
 
@@ -79,8 +88,10 @@ s32 sceNpBasicGetEvent(u32* event, void* from, void* data, u32* size)
 {
     /* out-params are GUEST EAs; the game checks the return (0x8002A66A) and
      * exits the drain BEFORE reading them, so we leave them untouched. */
-    (void)event; (void)from; (void)data; (void)size;
-    return (s32)SCE_NP_BASIC_ERROR_NO_EVENT;
+    if (!np_social_get())
+        return (s32)SCE_NP_BASIC_ERROR_NO_EVENT;
+    return np_basic_social_get_event((u32)(uintptr_t)event, (u32)(uintptr_t)from,
+                                     (u32)(uintptr_t)data, (u32)(uintptr_t)size);
 }
 
 s32 sceNpBasicRegisterHandler(SceNpBasicEventHandler handler,
@@ -108,6 +119,7 @@ s32 sceNpBasicUnregisterHandler(void)
     s_event_handler = NULL;
     s_presence_handler = NULL;
     s_handler_arg = NULL;
+    np_basic_social_drop_handler();
     return CELL_OK;
 }
 
@@ -161,6 +173,7 @@ s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
     return CELL_OK;
 }
 
+static s32 np_basic_social_set_presence(const ps3_np_social_provider* social, u32 details, u32 options);
 s32 sceNpBasicSetPresenceDetails(const void* presence, u32 options)
 {
     /* Retail imports this independently of the older local presence cache.
@@ -168,6 +181,11 @@ s32 sceNpBasicSetPresenceDetails(const void* presence, u32 options)
      * Do not fabricate a successful publication or dereference unused payloads. */
     if (!presence || options < 1 || options > 3)
         return (s32)0x8002a665u; /* SCE_NP_BASIC_ERROR_INVALID_ARGUMENT */
+    {
+        const ps3_np_social_provider* social = np_social_get();
+        if (social && social->set_presence)
+            return np_basic_social_set_presence(social, (u32)(uintptr_t)presence, options);
+    }
     printf("[sceNpBasic] SetPresenceDetails: publishing unavailable (options=%u)\n", options);
     return (s32)0x8002a663u; /* SCE_NP_BASIC_ERROR_NOT_SUPPORTED */
 }
@@ -285,8 +303,196 @@ s32 sceNpBasicAddPlayersHistoryAsync(const void* npids, u32 count, const void* d
     return CELL_OK;
 }
 
+/* The handler is recorded for the social provider (docs/np-social-provider.md).
+ * Without a provider nothing ever reads it, so the title sees no change. */
+static u32 s_cs_handler;      /* guest OPD */
+static u32 s_cs_arg;          /* guest pointer, passed back */
+static int s_cs_registered;
+
 s32 sceNpBasicRegisterContextSensitiveHandler(const void* context, void* handler, void* arg)
 {
-    (void)context; (void)handler; (void)arg;
+    (void)context;
+    s_cs_handler = (u32)(uintptr_t)handler;
+    s_cs_arg = (u32)(uintptr_t)arg;
+    s_cs_registered = handler != NULL;
+    np_social_handler(s_cs_registered);
     return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Social provider (docs/np-social-provider.md). Everything below is reached
+ * only once ps3_np_social_set_provider() has installed a provider.
+ * -----------------------------------------------------------------------*/
+
+#define BASIC_INVALID_ARGUMENT ((s32)0x8002a665u)
+#define BASIC_NOT_SUPPORTED    ((s32)0x8002a663u)
+#define BASIC_EXCEEDS_MAX      ((s32)0x8002a66bu)
+
+/* SDK guest layouts (big-endian). */
+#define NPID_SIZE            36   /* SceNpId: handle (16 + NUL + 3 pad), opt 8, reserved 8 */
+#define USER_INFO_SIZE       216  /* SceNpUserInfo: SceNpId, online name (48 + NUL + 3), avatar URL 128 */
+#define USER_INFO_NAME       36
+#define PRESENCE_STATUS      0x80   /* SceNpBasicPresenceDetails: title 128, status 64, comment 64, */
+#define PRESENCE_STATUS_SIZE 64     /* data 128, size u32, state s32 */
+#define PRESENCE_DATA        0x100
+#define PRESENCE_SIZE        0x180
+#define BODY_MAX             512
+#define SUBJECT_MAX          18
+#define ATTACHMENT_MAX       (1024u * 1024u)
+
+static void np_basic_social_drop_handler(void)
+{
+    if (s_cs_registered) {
+        s_cs_registered = 0;
+        np_social_handler(0);
+    }
+}
+
+/* At each cellSysutilCheckCallback: announce queued events to the title's
+ * handler, one call per event, outside every lock (the handler may fetch). */
+static int s_ticking;
+void np_basic_social_tick(void)
+{
+    if (!np_social_get() || s_ticking) return;
+    if (!basic_ready()) { np_basic_social_drop_handler(); return; }
+    ps3_guest_caller_fn caller = g_ps3_guest_caller;
+    if (!s_cs_registered || !caller) return;
+    s_ticking = 1;
+    int32_t event, ret;
+    while (s_cs_registered && np_social_announce(&event, &ret)) {
+        caller(s_cs_handler, (u64)(s64)event, (u64)(s64)ret, 0, s_cs_arg, 0, 0, 0, 0);
+    }
+    s_ticking = 0;
+}
+
+static s32 np_basic_social_get_event(u32 event, u32 from, u32 data, u32 size)
+{
+    if (!event || !from || !size) return BASIC_INVALID_ARGUMENT;
+    np_social_event e;
+    if (!np_social_take(&e)) return (s32)SCE_NP_BASIC_ERROR_NO_EVENT;
+    u32 room = vm_read32(size);
+    u32 n = e.size < room ? e.size : room;
+    if (n && !data) n = 0;
+    vm_write32(event, (u32)e.event);
+    vm_memset(from, 0, USER_INFO_SIZE);
+    size_t id_len = strnlen(e.online_id, PS3_NP_SOCIAL_ONLINE_ID_MAX);
+    vm_memcpy_to(from, e.online_id, id_len);                   /* NP ID handle */
+    vm_memcpy_to(from + USER_INFO_NAME, e.online_id, id_len);  /* online name */
+    if (n) vm_memcpy_to(data, e.data, n);
+    vm_write32(size, n);
+    return CELL_OK;
+}
+
+static s32 np_basic_social_set_presence(const ps3_np_social_provider* social, u32 details, u32 options)
+{
+    uint8_t bytes[PS3_NP_SOCIAL_PRESENCE_MAX];
+    char status[PRESENCE_STATUS_SIZE];
+    u32 n = 0;
+    int has_data = (options & 1) != 0, has_status = (options & 2) != 0;
+    if (has_data) {
+        n = vm_read32(details + PRESENCE_SIZE);
+        if (n > PS3_NP_SOCIAL_PRESENCE_MAX) return BASIC_EXCEEDS_MAX;
+        if (n) vm_memcpy_from(bytes, details + PRESENCE_DATA, n);
+    }
+    status[0] = 0;
+    if (has_status) {
+        vm_memcpy_from(status, details + PRESENCE_STATUS, PRESENCE_STATUS_SIZE);
+        status[PRESENCE_STATUS_SIZE - 1] = 0;
+    }
+    social->set_presence(social->user, has_data, has_data ? bytes : NULL, n, has_status,
+                         has_status ? status : NULL);
+    return CELL_OK;
+}
+
+/* A guest NUL-terminated string of at most `max` bytes into `out` (max + 1).
+ * 1 on success, 0 when it is longer. A zero address is the empty string. */
+static int guest_string(u32 ea, char* out, size_t max)
+{
+    out[0] = 0;
+    if (!ea) return 1;
+    for (size_t i = 0; i <= max; i++) {
+        char c = (char)vm_read8(ea + (u32)i);
+        if (i == max) return c == 0;
+        out[i] = c;
+        if (!c) return 1;
+    }
+    return 0;
+}
+
+/* An SceNpId's handle: 1..16 bytes terminated within its 17. */
+static int guest_npid_handle(u32 npid, char out[PS3_NP_SOCIAL_ONLINE_ID_MAX + 1])
+{
+    if (!npid) return 0;
+    if (!guest_string(npid, out, PS3_NP_SOCIAL_ONLINE_ID_MAX)) return 0;
+    return out[0] != 0;
+}
+
+/* sceNpBasicAddFriend(const SceNpId* contact, const char* body, u32 container) */
+static void hle_add_friend(ppu_context* ctx)
+{
+    const ps3_np_social_provider* social = np_social_get();
+    char id[PS3_NP_SOCIAL_ONLINE_ID_MAX + 1];
+    static char body[BODY_MAX + 1];
+    s32 rc;
+    if (!basic_ready()) rc = (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
+    else if (!guest_npid_handle((u32)ctx->gpr[3], id)) rc = BASIC_INVALID_ARGUMENT;
+    else if (!guest_string((u32)ctx->gpr[4], body, BODY_MAX)) rc = BASIC_EXCEEDS_MAX;
+    else if (!social || !social->add_friend) rc = BASIC_NOT_SUPPORTED;
+    else rc = social->add_friend(social->user, id, body);
+    printf("[sceNpBasic] AddFriend(%s) -> 0x%08x\n", rc == BASIC_INVALID_ARGUMENT ? "(invalid)" : id, (u32)rc);
+    ctx->gpr[3] = (u64)(s64)rc;
+}
+
+/* sceNpBasicSendMessageGui(const SceNpBasicMessageDetails* msg, u32 container)
+ * SceNpBasicMessageDetails: msgId u64 @0, mainType u16 @8, subType u16 @10,
+ * msgFeatures u32 @12, npids @16, count @20, subject @24, body @28, data @32,
+ * size @36. */
+static void hle_send_message_gui(ppu_context* ctx)
+{
+    const ps3_np_social_provider* social = np_social_get();
+    u32 msg = (u32)ctx->gpr[3];
+    static char ids[PS3_NP_SOCIAL_MESSAGE_RECIPIENTS][PS3_NP_SOCIAL_ONLINE_ID_MAX + 1];
+    static char subject[SUBJECT_MAX + 1], body[BODY_MAX + 1];
+    ps3_np_social_message m;
+    memset(&m, 0, sizeof(m));
+    s32 rc = CELL_OK;
+    if (!basic_ready()) rc = (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
+    else if (!msg) rc = BASIC_INVALID_ARGUMENT;
+    if (rc == CELL_OK) {
+        m.msg_id = vm_read64(msg);
+        m.main_type = vm_read16(msg + 8);
+        m.sub_type = vm_read16(msg + 10);
+        m.features = vm_read32(msg + 12);
+        u32 npids = vm_read32(msg + 16);
+        m.recipient_count = vm_read32(msg + 20);
+        m.data_size = vm_read32(msg + 36);
+        if (!npids || m.recipient_count < 1 || m.recipient_count > PS3_NP_SOCIAL_MESSAGE_RECIPIENTS)
+            rc = BASIC_INVALID_ARGUMENT;
+        for (u32 i = 0; rc == CELL_OK && i < m.recipient_count; i++) {
+            if (!guest_npid_handle(npids + i * NPID_SIZE, ids[i])) rc = BASIC_INVALID_ARGUMENT;
+            else m.recipients[i] = ids[i];
+        }
+        if (rc == CELL_OK && (!guest_string(vm_read32(msg + 24), subject, SUBJECT_MAX) ||
+                              !guest_string(vm_read32(msg + 28), body, BODY_MAX) ||
+                              m.data_size > ATTACHMENT_MAX))
+            rc = BASIC_EXCEEDS_MAX;
+        u32 data = vm_read32(msg + 32);
+        if (rc == CELL_OK && m.data_size && !data) rc = BASIC_INVALID_ARGUMENT;
+        if (rc == CELL_OK) {
+            m.subject = subject;
+            m.body = body;
+            m.data = m.data_size ? vm_ptr8(data) : NULL;
+            rc = social && social->send_message ? social->send_message(social->user, &m) : BASIC_NOT_SUPPORTED;
+        }
+    }
+    printf("[sceNpBasic] SendMessageGui(type=%u, recipients=%u) -> 0x%08x\n",
+           (unsigned)m.main_type, (unsigned)m.recipient_count, (u32)rc);
+    ctx->gpr[3] = (u64)(s64)rc;
+}
+
+void np_basic_social_register(void)
+{
+    ps3_hle_register_ctx(ps3_compute_nid("sceNpBasicAddFriend"), "sceNpBasicAddFriend", hle_add_friend);
+    ps3_hle_register_ctx(ps3_compute_nid("sceNpBasicSendMessageGui"), "sceNpBasicSendMessageGui",
+                         hle_send_message_gui);
 }
