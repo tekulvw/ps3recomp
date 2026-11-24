@@ -130,6 +130,7 @@ cmake --install build --prefix /usr/local
 |---|---|---|
 | `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register runtime tests |
 | `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
+| `PS3RECOMP_PAD_USE_SDL2` | `OFF` | Windows: read controllers through SDL2's GameController API instead of XInput -- see [Windows controllers](#windows-controllers) |
 | `PS3RECOMP_FFMPEG_RUNTIME` | `OFF` | Decode video (cellVdec: H.264, MPEG-2) through FFmpeg loaded at run time -- see [FFmpeg](#ffmpeg-run-time-loaded-opt-in) |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
@@ -386,6 +387,7 @@ guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 **Link Libraries (auto-linked by CMake):**
 - `ws2_32` — Winsock2 for networking (sys_net, cellHttp, cellNet)
 - `xinput` — XInput for gamepad (cellPad)
+- `SDL2::SDL2` — only with `PS3RECOMP_PAD_USE_SDL2=ON` (below)
 - `ole32` — COM initialization for WASAPI audio (cellAudio)
 - `bcrypt` — BCryptGenRandom for cryptographic RNG (cellSsl)
 
@@ -406,6 +408,31 @@ guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 > path. `runtime/platform/win32_dirent.h` provides one (`FindFirstFileA`
 > behind the POSIX names, passing straight through to the system header off
 > Windows) — a port carrying its own copy can drop it.
+
+#### Windows controllers
+
+By default cellPad reads controllers with XInput, which sees Xbox-class pads
+only: a DualSense or DualShock 4 is invisible to it unless a wrapper such as
+Steam Input or DS4Windows presents it as an Xbox pad. `-DPS3RECOMP_PAD_USE_SDL2=ON`
+switches cellPad to its SDL2 GameController backend, the one Linux and macOS
+use. SDL reads XInput pads, PlayStation pads (through its HIDAPI drivers, with
+rumble) and other mapped controllers, and keeps one device from appearing
+twice across its drivers. Pass SDL2's CMake package with
+`-DSDL2_DIR=<dir with sdl2-config.cmake>` or `-DCMAKE_PREFIX_PATH`; the
+`cmake` folder of the official `SDL2-devel-<version>-VC.zip` works, and the
+program must ship that package's `SDL2.dll` beside its executable.
+
+The backend behaves the same on every host: a controller takes the lowest
+free port when it is connected and keeps it until it is unplugged; buttons go
+by position, so a PlayStation pad's Cross is Cross and Circle is Circle, and
+an Xbox pad's A is Cross; the title's rumble reaches the controller. On
+Windows a controller reads as connected and at rest while no window of the
+process is in the foreground (SDL applies that rule only to its own windows,
+and the game window is not one); a button still held when focus returns waits
+for a release. `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1` in the environment (or
+the SDL hint of that name) reads controllers in the background too.
+`tools/test_pad_sdl_controllers.py` checks all of this with synthetic SDL
+virtual controllers.
 
 ### Linux
 

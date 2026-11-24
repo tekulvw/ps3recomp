@@ -4,10 +4,12 @@
  * Reads real gamepad input from the host and translates to PS3 pad format.
  *
  * Backend selection:
- *   - Windows default: XInput (no extra dependencies)
- *   - Everywhere else / if PS3RECOMP_PAD_USE_SDL2 is defined: SDL2 GameController
- *
- * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
+ *   - Windows default: XInput (no extra dependencies). XInput sees Xbox-class
+ *     pads only: a DualSense or DualShock 4 reaches it only through a wrapper
+ *     such as Steam Input or DS4Windows.
+ *   - Everywhere else, and on Windows when PS3RECOMP_PAD_USE_SDL2 is defined
+ *     (CMake option of the same name): SDL2 GameController, which reads
+ *     XInput, PlayStation (through HIDAPI) and other mapped controllers alike.
  */
 
 #include <time.h>
@@ -61,24 +63,41 @@ static double pad_clock(unsigned long long t0_ms)
   #define PAD_BACKEND_XINPUT 0
 #endif
 
-#if PAD_BACKEND_XINPUT
+#ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
   #endif
   #include <windows.h>
+#endif
+
+#if PAD_BACKEND_XINPUT
   #include <xinput.h>
   #pragma comment(lib, "xinput.lib")
 #endif
 
 #if PAD_BACKEND_SDL2
-  #include <SDL2/SDL.h>
+  /* cellPad is a library: the embedding program owns main(). */
+  #ifndef SDL_MAIN_HANDLED
+    #define SDL_MAIN_HANDLED
+  #endif
+  /* Installed SDL2 prefixes put the headers in include/SDL2/; the official
+   * Windows development packages put them directly in include/. */
+  #if defined(__has_include)
+    #if __has_include(<SDL2/SDL.h>)
+      #include <SDL2/SDL.h>
+    #else
+      #include <SDL.h>
+    #endif
+  #else
+    #include <SDL2/SDL.h>
+  #endif
 #endif
 
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
 
-#define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
+#define PAD_MAX_HOST_PORTS  4  /* XInput's limit; SDL controllers past the fourth wait for a free port */
 
 typedef struct {
     int  connected;
@@ -124,7 +143,12 @@ static void pad_keyboard_merge(PadHostState* hs, u16 buttons, u8 lx, u8 ly, u8 r
 #endif
 
 #if PAD_BACKEND_SDL2
+/* One open controller per host port. A port is identified by the joystick's
+ * instance ID, not its device index: device indices shift whenever a
+ * controller is unplugged, instance IDs never do. */
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
+static SDL_JoystickID      s_sdl_instance[PAD_MAX_HOST_PORTS];
+static u16                 s_sdl_blocked[PAD_MAX_HOST_PORTS];   /* see pad_sdl_focus_gate */
 static int s_sdl_inited = 0;
 #endif
 
@@ -160,41 +184,15 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
     *hi = small_on ? 0xFFFFu : 0u;
 }
 
-/* ---------------------------------------------------------------------------
- * XInput backend
- * -----------------------------------------------------------------------*/
-
-#if PAD_BACKEND_XINPUT
-
-/* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
-#define PAD_STICK_DEADZONE  7849
-#define PAD_TRIGGER_THRESHOLD 30
-
-static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
-{
-    float normalized;
-    if (raw > deadzone)
-        normalized = (float)(raw - deadzone) / (float)(32767 - deadzone);
-    else if (raw < -deadzone)
-        normalized = (float)(raw + deadzone) / (float)(32767 - deadzone);
-    else
-        normalized = 0.0f;
-
-    /* Map -1.0..1.0 to 0..255 with center at 128 */
-    int val = (int)(normalized * 127.0f) + 128;
-    if (val < 0) val = 0;
-    if (val > 255) val = 255;
-    return (u8)val;
-}
-
 /* Keyboard fallback for port 0.
  *
- * The only backend here is XInput, so on a machine with no controller plugged
- * in a title gets a pad that is reported present and never presses anything --
- * it can be watched but not played. That is what The Simpsons Arcade Game hit:
- * it reached its attract loop and no input existed to start a game.
+ * On a machine with no controller plugged in, a title gets a pad that is
+ * reported present and never presses anything -- it can be watched but not
+ * played. That is what The Simpsons Arcade Game hit: it reached its attract
+ * loop and no input existed to start a game.
  *
- * Port 0 only. When XInput found nothing there, the keyboard is the port; when
+ * Port 0 only. When the controller backend (XInput, or SDL2 with
+ * PS3RECOMP_PAD_USE_SDL2) found nothing there, the keyboard is the port; when
  * a controller (real, or a virtual one from Steam Input or a streaming client)
  * drives it, the keyboard merges into it (pad_keyboard_merge), so both work.
  * Keys are read only while a window of THIS process is in the foreground and
@@ -283,7 +281,7 @@ static void pad_poll_keyboard(void)
         if (vk[i] && (GetAsyncKeyState(vk[i]) & 0x8000)) held |= 1u << i;
     PadKeyboardReport report = pad_keyboard_report(pad_keyboard_latch(&blocked, held, focused));
 
-    const int controller = hs->connected;   /* this poll's XInput reading */
+    const int controller = hs->connected;   /* this poll's controller reading */
     if (controller) {
         pad_keyboard_merge(hs, report.buttons, report.analog_lx, report.analog_ly, report.analog_rx,
                            report.analog_ry, report.left_held, report.right_held);
@@ -300,7 +298,7 @@ static void pad_poll_keyboard(void)
     { static int said = 0;
       if (!said && (report.buttons || report.left_held || report.right_held)) { said = 1;
           printf("[cellPad] keyboard active on port 0 (%s)\n",
-                 controller ? "merged with the XInput controller" : "no XInput device");
+                 controller ? "merged with the controller" : "no controller");
           fflush(stdout); } }
     static int trace = -1;
     static u16 previous = 0;
@@ -312,6 +310,33 @@ static void pad_poll_keyboard(void)
     previous = report.buttons;
 }
 #endif
+
+/* ---------------------------------------------------------------------------
+ * XInput backend
+ * -----------------------------------------------------------------------*/
+
+#if PAD_BACKEND_XINPUT
+
+/* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
+#define PAD_STICK_DEADZONE  7849
+#define PAD_TRIGGER_THRESHOLD 30
+
+static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
+{
+    float normalized;
+    if (raw > deadzone)
+        normalized = (float)(raw - deadzone) / (float)(32767 - deadzone);
+    else if (raw < -deadzone)
+        normalized = (float)(raw + deadzone) / (float)(32767 - deadzone);
+    else
+        normalized = 0.0f;
+
+    /* Map -1.0..1.0 to 0..255 with center at 128 */
+    int val = (int)(normalized * 127.0f) + 128;
+    if (val < 0) val = 0;
+    if (val > 255) val = 255;
+    return (u8)val;
+}
 
 static void pad_poll_xinput(void)
 {
@@ -423,26 +448,159 @@ static void pad_sdl_rumble_send(int i)
     r->sent_ms = on ? pad_now_ms() : 0;
 }
 
+/* Focus. SDL holds back controller input while none of ITS windows has
+ * keyboard focus, unless SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS is set.
+ * The Windows game window is a native one SDL knows nothing about, so SDL
+ * would read the controller while another application is in front. The same
+ * policy is applied here instead: on Windows a controller counts only while a
+ * window of this process is in the foreground and no native dialog owns input
+ * (the keyboard fallback's rule), and the hint -- an SDL hint or the
+ * environment variable SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 -- lets it be
+ * read in the background. Elsewhere the game window is SDL's own (Linux) or
+ * the backend's behaviour is unchanged (macOS).
+ *
+ * PAD_SDL_FOCUS_OVERRIDE() replaces the window check in tests. */
+static int pad_sdl_window_focused(void)
+{
+#if defined(PAD_SDL_FOCUS_OVERRIDE)
+    return PAD_SDL_FOCUS_OVERRIDE();
+#elif defined(_WIN32)
+    return pad_host_window_focused();
+#else
+    return 1;
+#endif
+}
+
+static int pad_sdl_input_allowed(void)
+{
+    return SDL_GetHintBoolean(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, SDL_FALSE) ||
+           pad_sdl_window_focused();
+}
+
+/* Without focus a port reads as a connected controller at rest. A button
+ * still held when focus returns stays released until it is let go, as SDL
+ * does for its own windows, so the click or Alt+Tab that brought the game back
+ * does not also press anything. */
+static void pad_sdl_focus_gate(int i, int allowed)
+{
+    PadHostState* hs = &s_host_state[i];
+    if (!allowed) {
+        s_sdl_blocked[i] = hs->buttons;
+    } else {
+        s_sdl_blocked[i] &= hs->buttons;
+    }
+    const u16 pass = allowed ? (u16)~s_sdl_blocked[i] : 0;
+    hs->buttons &= pass;
+    if (!allowed) {
+        hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+    }
+    if (!(pass & CELL_PAD_CTRL_L2)) hs->trigger_l2 = 0;
+    if (!(pass & CELL_PAD_CTRL_R2)) hs->trigger_r2 = 0;
+}
+
+static const char* pad_sdl_type_name(SDL_GameController* gc)
+{
+    switch (SDL_GameControllerGetType(gc)) {
+    case SDL_CONTROLLER_TYPE_XBOX360:  return "Xbox 360";
+    case SDL_CONTROLLER_TYPE_XBOXONE:  return "Xbox One";
+    case SDL_CONTROLLER_TYPE_PS3:      return "PS3";
+    case SDL_CONTROLLER_TYPE_PS4:      return "PS4";
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO: return "Switch Pro";
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    case SDL_CONTROLLER_TYPE_PS5:      return "PS5";
+    case SDL_CONTROLLER_TYPE_VIRTUAL:  return "virtual";
+#endif
+    default:                           return "other";
+    }
+}
+
+static int pad_sdl_port_of(SDL_JoystickID id)
+{
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+        if (s_sdl_controllers[i] && s_sdl_instance[i] == id) return i;
+    return -1;
+}
+
+static void pad_sdl_close_port(int i)
+{
+    SDL_GameControllerClose(s_sdl_controllers[i]);
+    s_sdl_controllers[i] = NULL;
+    s_sdl_instance[i] = -1;
+    s_sdl_blocked[i] = 0;
+    memset(&s_rumble[i], 0, sizeof s_rumble[i]);
+    s_host_state[i].connected = 0;
+    printf("[cellPad] port %d: controller disconnected\n", i);
+    fflush(stdout);
+}
+
+/* Hot-plug: every attached game controller not on a port yet takes the
+ * lowest free one, in device order. A joystick SDL has no controller mapping
+ * for is reported once and left alone. */
+static void pad_sdl_open_new(void)
+{
+    static SDL_JoystickID said_unmapped[8];
+    static int said_count = 0;
+    const int count = SDL_NumJoysticks();
+    for (int d = 0; d < count; d++) {
+        int port = -1;
+        for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+            if (!s_sdl_controllers[i]) { port = i; break; }
+        if (port < 0) return;
+        const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(d);
+        if (id < 0 || pad_sdl_port_of(id) >= 0) continue;
+        if (!SDL_IsGameController(d)) {
+            int said = 0;
+            for (int k = 0; k < said_count; k++) said |= said_unmapped[k] == id;
+            if (!said) {
+                if (said_count < (int)(sizeof said_unmapped / sizeof said_unmapped[0]))
+                    said_unmapped[said_count++] = id;
+                const char* name = SDL_JoystickNameForIndex(d);
+                printf("[cellPad] ignoring joystick \"%s\": SDL has no controller mapping for it\n",
+                       name ? name : "?");
+                fflush(stdout);
+            }
+            continue;
+        }
+        SDL_GameController* gc = SDL_GameControllerOpen(d);
+        if (!gc) {
+            printf("[cellPad] controller %d could not be opened: %s\n", d, SDL_GetError());
+            fflush(stdout);
+            continue;
+        }
+        s_sdl_controllers[port] = gc;
+        s_sdl_instance[port] = id;
+        s_sdl_blocked[port] = 0;
+        memset(&s_rumble[port], 0, sizeof s_rumble[port]);
+        /* Player LEDs and light bars show the port. */
+        SDL_GameControllerSetPlayerIndex(gc, port);
+        const char* name = SDL_GameControllerName(gc);
+        printf("[cellPad] port %d: %s controller \"%s\"\n", port, pad_sdl_type_name(gc), name ? name : "?");
+        fflush(stdout);
+    }
+}
+
 static void pad_poll_sdl2(void)
 {
+    /* Guest threads poll concurrently; SDL's joystick lock (recursive) keeps
+     * opening, closing and rumbling a controller to one thread at a time. */
+    SDL_LockJoysticks();
     SDL_GameControllerUpdate();
+    /* SDL queues an event for every controller change. With no SDL window
+     * (Windows, macOS, headless) nothing drains that queue, so drop them
+     * here: the backend reads controller state, not events. */
+    if (SDL_WasInit(SDL_INIT_VIDEO) == 0)
+        SDL_FlushEvents(SDL_JOYAXISMOTION, SDL_FINGERDOWN - 1);
 
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+        if (s_sdl_controllers[i] && !SDL_GameControllerGetAttached(s_sdl_controllers[i]))
+            pad_sdl_close_port(i);
+    pad_sdl_open_new();
+
+    const int allowed = pad_sdl_input_allowed();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        if (!s_sdl_controllers[i]) {
-            /* Try to open newly connected controllers */
-            if (SDL_IsGameController(i)) {
-                s_sdl_controllers[i] = SDL_GameControllerOpen(i);
-            }
-        }
-
         SDL_GameController* gc = s_sdl_controllers[i];
-        if (!gc || !SDL_GameControllerGetAttached(gc)) {
+        if (!gc) {
             s_host_state[i].connected = 0;
-            if (gc) {
-                SDL_GameControllerClose(gc);
-                s_sdl_controllers[i] = NULL;
-            }
-            memset(&s_rumble[i], 0, sizeof s_rumble[i]);
             continue;
         }
 
@@ -452,6 +610,8 @@ static void pad_poll_sdl2(void)
         if (s_rumble[i].sent_ms && pad_now_ms() - s_rumble[i].sent_ms >= PAD_RUMBLE_RENEW_MS)
             pad_sdl_rumble_send(i);
 
+        /* SDL names buttons by position, as an Xbox pad labels them: A is the
+         * bottom face button, which is Cross on a DualShock or DualSense. */
         u16 btns = 0;
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK))          btns |= CELL_PAD_CTRL_SELECT;
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSTICK))     btns |= CELL_PAD_CTRL_L3;
@@ -486,6 +646,9 @@ static void pad_poll_sdl2(void)
         s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);
         s_host_state[i].trigger_r2 = pad_sdl_trigger_to_u8(rt);
 
+        pad_sdl_focus_gate(i, allowed);
+        btns = s_host_state[i].buttons;
+
         /* Pressure: SDL has digital buttons, so 0 or 255 */
         s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
         s_host_state[i].press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
@@ -498,37 +661,47 @@ static void pad_poll_sdl2(void)
         s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
     }
+    SDL_UnlockJoysticks();
 }
 
 static void pad_init_backend(void)
 {
     if (!s_sdl_inited) {
-        if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
-            SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+        if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0 &&
+            SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+            /* Visible, not silent: without it no controller is ever read. */
+            printf("[cellPad] SDL game controller support failed to start: %s\n", SDL_GetError());
+            fflush(stdout);
         }
         s_sdl_inited = 1;
     }
+    SDL_LockJoysticks();
     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
-
-    /* Open any controllers already connected */
-    int num = SDL_NumJoysticks();
-    for (int i = 0; i < num && i < PAD_MAX_HOST_PORTS; i++) {
-        if (SDL_IsGameController(i)) {
-            s_sdl_controllers[i] = SDL_GameControllerOpen(i);
-        }
-    }
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) s_sdl_instance[i] = -1;
+    memset(s_sdl_blocked, 0, sizeof(s_sdl_blocked));
+    SDL_version linked;
+    SDL_GetVersion(&linked);
+    printf("[cellPad] SDL %d.%d.%d game controller backend, %d joystick(s) attached\n",
+           linked.major, linked.minor, linked.patch, SDL_NumJoysticks());
+    fflush(stdout);
+    /* Controllers already connected take ports now; later ones on a poll. */
+    pad_sdl_open_new();
+    SDL_UnlockJoysticks();
 }
 
 static void pad_shutdown_backend(void)
 {
+    SDL_LockJoysticks();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         if (s_sdl_controllers[i]) {
             SDL_GameControllerRumble(s_sdl_controllers[i], 0, 0, 0);
             SDL_GameControllerClose(s_sdl_controllers[i]);
             s_sdl_controllers[i] = NULL;
+            s_sdl_instance[i] = -1;
         }
     }
     memset(s_rumble, 0, sizeof s_rumble);
+    SDL_UnlockJoysticks();
 }
 
 #endif /* PAD_BACKEND_SDL2 */
@@ -1432,7 +1605,9 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 #endif
 
 #if PAD_BACKEND_SDL2
+    SDL_LockJoysticks();
     pad_sdl_rumble_send((int)port_no);
+    SDL_UnlockJoysticks();
 #endif
 
     return CELL_OK;
