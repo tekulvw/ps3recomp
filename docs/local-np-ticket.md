@@ -28,6 +28,25 @@ names the file and the reason. It never falls back to the online ID payload,
 and it clears any ticket cached from an earlier request. On Windows the path is
 read from the wide environment, so it may contain any Unicode characters.
 
+## Single-use ticket files
+
+A replacement service's tickets expire and may allow only a few uses, so a
+reconnect must never present the ticket the launch started with.
+`PS3RECOMP_NP_TICKET_REFILL=1` makes each ticket file serve one request:
+
+- The request claims the file by renaming it to `<file>.claimed`, reads it and
+  deletes it. A ticket is never presented twice.
+- While there is no file, the request waits for one, up to
+  `PS3RECOMP_NP_TICKET_WAIT_MS` milliseconds (default 30000; at most 600000).
+  The launcher that owns the file refills it: once a ticket is taken, and
+  before the ticket in place expires.
+- With no fresh ticket in time, the request fails with `SCE_NP_ERROR_INTERNAL`
+  and says so on stderr. It never falls back to an old ticket or the online ID.
+
+Without the switch the file is read and left in place, as above, so a fixed
+ticket file keeps working. Run `python3 tools/test_np_ticket_refill.py` for the
+single use, the wait for a refill, the refusal after the wait and the default.
+
 ## Requests
 
 The requested guest NP ID must match the configured identity. A mismatched ID
