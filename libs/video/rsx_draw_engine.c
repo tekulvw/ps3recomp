@@ -159,6 +159,8 @@ typedef struct {
     u64 last_use_serial;
     u32 depth;                  /* slices of a 3D texture, else 1 */
     int rewritten;              /* guest bytes rewritten by the engine itself */
+    int override_interest;      /* the texture override answered for it */
+    u64 override_generation;    /* the override generation it was decoded under */
 } eng_texture;
 
 typedef struct {
@@ -370,6 +372,36 @@ static void original_rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn re
 {
     s_guest_reader = reader;
     s_guest_user = user;
+}
+
+/* The texture source override (rsx_draw_engine.h). Setting it publishes the
+ * user pointer, then the function, then a new generation; a decode that runs
+ * while it changes asks one of the two and is asked again at the next use. */
+static _Atomic(rsx_texture_override_fn) s_override_fn;
+static _Atomic(void*) s_override_user;
+static atomic_uint_fast64_t s_override_generation;
+static int s_override_answered;   /* set by eng_texture_upload, read by its caller */
+
+void rsx_draw_engine_set_texture_override(rsx_texture_override_fn fn, void* user)
+{
+    atomic_store_explicit(&s_override_user, user, memory_order_release);
+    atomic_store_explicit(&s_override_fn, fn, memory_order_release);
+    atomic_fetch_add_explicit(&s_override_generation, 1, memory_order_acq_rel);
+}
+
+static const u8* eng_texture_override(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                                      u32 levels, u32 pitch, u32 remap, const u8* src,
+                                      u32 span)
+{
+    rsx_texture_override_fn fn = atomic_load_explicit(&s_override_fn, memory_order_acquire);
+    if (!fn) return src;
+    void* user = atomic_load_explicit(&s_override_user, memory_order_acquire);
+    const rsx_texture_source source = { location, offset, fmt, w, h, levels, pitch, remap, span, src };
+    const u8* replacement = NULL;
+    const int answer = fn(user, &source, &replacement);
+    if (!(answer & RSX_TEXTURE_OVERRIDE_INTEREST)) return src;
+    s_override_answered = 1;
+    return replacement ? replacement : src;
 }
 
 static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
@@ -1428,6 +1460,8 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     const u8* src = identity ? rsx_picture_data(identity,location,offset,span) : eng_guest_ptr(NULL, location, offset, span);
     if (!src) return 0;
+    if (!identity && !cube)
+        src = eng_texture_override(location, offset, fmt, w, h, levels, pitch, remap, src, span);
 
     const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                             w, h, nlv, faces, remap, fmt);
@@ -1486,6 +1520,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     }
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
     const u64 generation = atomic_load_explicit(&s_dirty_generation, memory_order_acquire);
+    const u64 override_generation = atomic_load_explicit(&s_override_generation, memory_order_acquire);
     if (!depth) depth = 1;
     const u32 span = depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
                                : eng_texture_span(fmt, w, h, levels, pitch, cube);
@@ -1526,13 +1561,14 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                 s_dirty_skips++;
             } else s_dirty_hits++;
         }
-        if (e->handle && (e->last_hash_frame != g.frames || e->dirty_generation != generation)) {
+        if (e->handle && (e->last_hash_frame != g.frames || e->dirty_generation != generation ||
+                          (e->override_interest && e->override_generation != override_generation))) {
             /* Every cached texture used to be hashed in full every frame;
              * in a big scene that is hundreds of MB a second for the few
              * that change. Now the sparse check every frame, and the full
              * hash when it differs, when this entry's turn has come, for a
              * small texture, or after a write the engine saw. */
-            int readable = 0;
+            int readable = 0, override_again = 0;
             u64 hash = e->content_hash;
             /* Picture-backed contents are not in guest memory: hash them in
              * full; guest textures use the sparse per-frame check. */
@@ -1546,6 +1582,11 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             if (e->rewritten && !identity && readable) {
                 hash = ~e->content_hash;
                 e->rewritten = 0;
+            } else if (e->override_interest && !identity && readable &&
+                       e->override_generation != override_generation) {
+                /* A new override generation: decode again and ask afresh. */
+                hash = eng_texture_content_hash(location, offset, span, identity, &readable);
+                override_again = 1;
             } else if (identity || (readable && (sparse != e->sparse_hash ||
                              eng_texture_full_rehash(span, e->last_full_frame)))) {
                 ENG_PH_BEGIN(ph_hash);
@@ -1558,11 +1599,16 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             e->last_hash_frame = g.frames;
             e->dirty_generation = generation;
             if(!readable){ENG_CHECKED_FAIL();return 0;}
-            if (readable && hash != e->content_hash) {
+            if (readable && (hash != e->content_hash || override_again)) {
                 ENG_PH_BEGIN(ph_up);
+                s_override_answered = 0;
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap, depth, identity);
                 ENG_PH_END(ENG_PH_TEX_UPLOAD, ph_up);
+                if (fresh) {
+                    e->override_interest = s_override_answered;
+                    e->override_generation = override_generation;
+                }
                 s_tcs.uploads++; s_tcs.upload_bytes += span;
                 if (s_tcs.on > 0) { static unsigned logged; if (logged < 24 && span > 1u << 20) { logged++;
                     fprintf(stderr, "[texcache] reupload loc=%u off=0x%08X fmt=0x%02X %ux%u levels=%u pitch=%u cube=%d depth=%u span=%u frame=%u\n",
@@ -1604,9 +1650,12 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       e.content_hash = eng_texture_content_hash(location, offset, span, identity, &readable);
       if (!identity) e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
     ENG_PH_BEGIN(ph_up);
+    s_override_answered = 0;
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap, depth, identity);
     ENG_PH_END(ENG_PH_TEX_UPLOAD, ph_up);
+    e.override_interest = s_override_answered;
+    e.override_generation = override_generation;
     if (!e.handle) ENG_CHECKED_FAIL();
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) g.textures[index] = e;
