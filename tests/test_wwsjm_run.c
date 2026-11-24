@@ -171,12 +171,13 @@ static uint32_t record(unsigned k, int dep)
     }
     s_job[k].sum = sum;
     /* set 6's list: eight 16-aligned elements whose last one ends 0x20 bytes into
-     * the list copy, over entries already consumed (spec 18.1); job 0's list is
-     * illegal when WWSJM_FIXTURE_BAD_GATHER is set */
+     * the list copy, over entries already consumed (spec 18.1); job n-1's list is
+     * illegal when WWSJM_FIXTURE_BAD_GATHER=n */
     {
         const uint32_t gl2 = GLIST2_EA + 0x40u * k, in2 = IN2_EA + 0x400u * k;
         static const uint32_t size[8] = { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x60 };
-        const int bad = k == 0 && getenv("WWSJM_FIXTURE_BAD_GATHER");
+        const char* bad_job = getenv("WWSJM_FIXTURE_BAD_GATHER");
+        const int bad = bad_job && k + 1 == (unsigned)atoi(bad_job);
         for (uint32_t i = 0; i < 0x400; i++) vm_base[in2 + i] = (uint8_t)(i * 7u + k * 3u + 5u);
         for (unsigned i = 0, at = 0; i < 8; i++) {
             /* the illegal list fits the buffer (0x3D0 < 0x400) but its first
@@ -648,6 +649,7 @@ int main(int argc, char** argv)
             vm_read8(SPURS_EA + SPURS_WKL_CURCONT + WID) == 0 && vm_read8(SPURS_EA + SPURS_WKL_CURCONT + WID2) == 0) {
             done = 1; break; }
         if (!native && now_ns() - t0 > 500000000ull) break;
+        if (getenv("WWSJM_FIXTURE_BAD_GATHER") && now_ns() - t0 > 1500000000ull) break;   /* never completes */
         const struct timespec d = { 0, 200000 }; nanosleep(&d, NULL);
     }
     const struct timespec settle = { 0, 30000000 }; nanosleep(&settle, NULL);

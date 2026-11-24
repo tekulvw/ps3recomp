@@ -97,8 +97,14 @@ MUTANTS = {
                      '        i = r->tag_n;'),
     'tag-per-set': (RUN, '        while (i < r->tag_n && (r->tag_of[i].set != set || r->tag_of[i].buf != buf)) i++;',
                     '        while (i < r->tag_n && r->tag_of[i].set != set) i++;'),
-    'overlap-rule-off': (RUN, '                    if (end > list_ls + 8u * (k + 1)) { st = WWSJM_E_GATHER; break; }\n', ''),
-    'overlap-refused': (RUN, '                    overlap = 1;\n', '                    st = WWSJM_E_GATHER; break;\n'),
+    'overlap-rule-off': (RUN, '            if (end > list_ls + 8u * (k + 1)) return WWSJM_E_GATHER;\n', ''),
+    'overlap-refused': (RUN, '            *overlap = 1;\n', '            return WWSJM_E_GATHER;\n'),
+    # refusals before a claim withdraw the implementation (mode 1) or stop (check)
+    'fallback-in-check-mode': (RUN, '    r.fallback_ok = !r.check && a->lifted_available;', '    r.fallback_ok = a->lifted_available;'),
+    'withdrawn-still-native': ('runtime/spu/spurs_policy.c',
+                               '    if (native && entry && spurs_native_pm_withdrawn(native)) native = NULL;\n', ''),
+    'preflight-gather-unchecked': (RUN, '        if (gs != WWSJM_OK) return wj_refuse(r, "gather list outside the contract", l->ea, gs);\n', ''),
+    'withdraw-exit-skipped': (RUN, '            if (r.withdraw) goto withdrawn;\n            if (r.stop) break;', '            if (r.stop) break;'),
     'stack-bytes-zero': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
                          'spurs_native_pm_enter_job(c, entry, WJ_STACK, 0, WJ_CTX_LS, 0)'),
     'stack-bytes-too-few': (RUN, 'spurs_native_pm_enter_job(c, entry, WJ_STACK, WJ_STACK_BYTES, WJ_CTX_LS, 0)',
@@ -127,10 +133,13 @@ def build(tmp: Path, name: str, mutant=None) -> Path:
         (shadow / 'wwsjm').mkdir()
         for f in ('wwsjm_core.c', 'wwsjm_core.h', 'wwsjm_run.inc', 'wwsjm_shadow.inc'):
             shutil.copy(SPU / 'wwsjm' / f, shadow / 'wwsjm' / f)
-        (shadow / 'wwsjm' / src.name).write_text(text.replace(old, new))
         shutil.copy(SPU / 'spurs_native_pm.inc', shadow / 'spurs_native_pm.inc')
         shutil.copy(SPU / 'spurs_policy.c', shadow / 'spurs_policy.c')
         sources['spurs_policy.c'] = shadow / 'spurs_policy.c'
+        # the mutated file replaces its shadow copy (the run loop's chain, or the policy runner)
+        dest = shadow / 'wwsjm' / src.name if src.parent.name == 'wwsjm' else shadow / src.name
+        assert dest.exists(), f'{name}: {rel} is not shadowed by this fixture'
+        dest.write_text(text.replace(old, new))
     out = tmp / name
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O2', '-UNDEBUG', '-w', '-DWWSJM_TEST_HOOKS',
                     '-ffunction-sections', '-fdata-sections',
@@ -194,11 +203,32 @@ def check(binary: Path) -> list[str]:
         # overwrote with ready := 0 was followed by its verify (R12)
         expect(int(r.get('verified_kicks', 0)) >= 1, f'native {mode}: no kick was overwritten and verified: {r}')
         expect('FATAL' not in err, f'native {mode}: {err[-600:]}')
-    # a gather element that overwrites a list entry not yet consumed halts (spec 18.1)
-    rb = subprocess.run([str(binary), 'native'], env=dict(BASE_ENV, PS3RECOMP_SPURS_NATIVE_PM='1', WWSJM_FIXTURE_BAD_GATHER='1'),
-                        capture_output=True, text=True, timeout=60)
-    expect(rb.returncode == 86 and 'refused gather list' in rb.stderr,
-           f'an illegal overlap was not refused: rc={rb.returncode} {rb.stderr[-300:]}')
+    # a gather element that overwrites a list entry not yet consumed (spec 18.1)
+    # is refused before its job is claimed: `check` stops the process; `1`
+    # withdraws the implementation with nothing held (no lane marker, N at the
+    # refused job, every earlier job retired) and the lifted module is
+    # dispatched instead, on a fresh context. Job 0 is refused at a lane's
+    # first claim; job 5 typically inside finish, while job 4 still runs.
+    for mode, bad, ran, n0 in (('check', '1', None, None), ('1', '1', '0', '1'), ('1', '6', '5', '6')):
+        rb = subprocess.run([str(binary), 'native'], env=dict(BASE_ENV, PS3RECOMP_SPURS_NATIVE_PM=mode,
+                                                              WWSJM_FIXTURE_BAD_GATHER=bad),
+                            capture_output=True, text=True, timeout=60)
+        if mode == 'check':
+            expect(rb.returncode == 86 and 'FATAL gather list outside the contract' in rb.stderr and
+                   'refused gather list' in rb.stderr,
+                   f'check: an illegal overlap was not refused: rc={rb.returncode} {rb.stderr[-300:]}')
+            continue
+        line = [l for l in rb.stdout.splitlines() if l.startswith('result ')]
+        r = dict(f.split('=', 1) for f in line[0].split()[1:]) if line else {}
+        stats = [l for l in rb.stderr.splitlines() if l.startswith('[wwsjm] runs=')]
+        st = dict(f.split('=', 1) for f in stats[-1].split()[1:]) if stats else {}
+        expect(rb.returncode == 0 and r.get('ran') == ran and r.get('n0') == n0 and r.get('lanes_busy') == '0' and
+               r.get('dup') == '0' and r.get('bad_out') == '0' and int(r.get('lifted', 0)) > 0 and
+               st.get('retires') == ran and int(st.get('withdrawals', 0)) >= 1,
+               f'withdraw at job {int(bad) - 1}: rc={rb.returncode} {r} {st} {rb.stderr[-600:]}')
+        expect(rb.stderr.count('wwsjm-fixture WITHDRAWN: gather list outside the contract') == 1 and
+               'FATAL' not in rb.stderr and 'now runs the lifted policy module' in rb.stderr,
+               f'withdraw at job {int(bad) - 1}: log {rb.stderr[-600:]}')
     # a job that halts: check mode names it as claimed and unretired, and the halt
     # reaches the run's bracket (no FATAL)
     rh = subprocess.run([str(binary), 'native'], env=dict(BASE_ENV, PS3RECOMP_SPURS_NATIVE_PM='check', WWSJM_FIXTURE_JOB_HALT='1',

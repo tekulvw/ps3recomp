@@ -13,6 +13,12 @@
  *       host return and by a computed jump, the payload hook, a run that does
  *       not exit, and the inert payload hook default.
  *   badslot -- job code branches to an empty window slot (must stop the process).
+ *   interp -- job code with no lifted function, so the interpreter runs it,
+ *       calls two services through the window with `bisl` and returns with
+ *       `bi $r0`: the window must answer the interpreter's branches as it
+ *       answers lifted code's. Then a lifted job calls such code as a
+ *       subroutine (`bisl`): the service's answer must come back to the
+ *       interpreted code and its return to the lifted caller's own frame.
  * Prints one "result" line of key=value fields. */
 #include <assert.h>
 #include <pthread.h>
@@ -44,11 +50,11 @@ unsigned long long ps3_ms_now(void)
 
 enum { GUEST = 16u << 20, SPURS_EA = 0x100000, PM_EA = 0x200000, PM_SIZE = 0x180, LIST_EA = 0x300000,
        WID = 3, RUNS = 6, IMAGE = 61,
-       LS_LINE = 0x1000, LS_CTX = 0x1400, JOB_A = 0x4000, JOB_B = 0x4100, JOB_C = 0x4200, JOB_BAD = 0x4300, JOB_D = 0x4500,
+       LS_LINE = 0x1000, LS_CTX = 0x1400, JOB_A = 0x4000, JOB_B = 0x4100, JOB_C = 0x4200, JOB_BAD = 0x4300, JOB_D = 0x4500, JOB_E = 0x4600, JOB_E2 = 0x4680, JOB_F = 0x4700,
        JOB_SITE = 0x4800, STACK = 0x3FF00, MARK = 0x7E57AB1Eu };
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static volatile uint32_t g_lifted_runs, g_native_runs, g_services, g_job_ok, g_job_bad, g_hook_calls,
-    g_job_c_ran, g_observed_services, g_modes, g_lifted_saw_services, g_poll_answer;
+    g_job_c_ran, g_observed_services, g_modes, g_lifted_saw_services, g_poll_answer, g_interp_r3, g_interp_r11, g_interp_rc, g_job_f;
 
 static void mfc(spu_context* c, uint32_t cmd, uint32_t lsa, uint32_t ea)
 {
@@ -142,6 +148,54 @@ static void job_bad(spu_context* c)   /* calls an empty window slot */
     SPU_RET(c);
 }
 
+/* ---- job code with no lifted function: raw SPU words the interpreter runs -- */
+static uint32_t spu_ri16(uint32_t op9, uint32_t i16, uint32_t rt) { return op9 << 23 | (i16 & 0xFFFFu) << 7 | rt; }
+static uint32_t spu_ri10(uint32_t op8, uint32_t i10, uint32_t ra, uint32_t rt) { return op8 << 24 | (i10 & 0x3FFu) << 14 | ra << 7 | rt; }
+static uint32_t spu_rr(uint32_t op11, uint32_t rb, uint32_t ra, uint32_t rt) { return op11 << 21 | rb << 14 | ra << 7 | rt; }
+static void plant_job_e(spu_context* c)
+{
+    const uint32_t code[] = {
+        spu_ri16(0x083, 0x1234, 9),                     /* ilh  $9, 0x1234: outside the microstep set */
+        spu_ri10(0x04, 0, 0, 10),                       /* ori  $10, $0, 0: keep the job's link */
+        spu_ri16(0x081, 7, 4),                          /* il   $4, 7 */
+        spu_ri16(0x081, SPURS_NATIVE_PM_SLOT_LS(1), 7), /* il   $7, window slot 1 */
+        spu_rr(0x1A9, 0, 7, 0),                         /* bisl $0, $7 */
+        spu_ri10(0x04, 0, 3, 11),                       /* ori  $11, $3, 0 */
+        spu_ri16(0x081, SPURS_NATIVE_PM_SLOT_LS(0), 7), /* il   $7, window slot 0 */
+        spu_rr(0x1A9, 0, 7, 0),                         /* bisl $0, $7 */
+        spu_ri10(0x04, 0, 10, 0),                       /* ori  $0, $10, 0 */
+        spu_rr(0x1A8, 0, 0, 0),                         /* bi   $0 */
+    };
+    for (unsigned i = 0; i < sizeof code / sizeof code[0]; i++) spu_ls_write32(c, JOB_E + 4 * i, code[i]);
+}
+/* an interpreted subroutine: one service call, then `bi $r0` to its caller */
+static void plant_job_e2(spu_context* c)
+{
+    const uint32_t code[] = {
+        spu_ri16(0x083, 0x1234, 9),                     /* ilh  $9, 0x1234 */
+        spu_ri10(0x04, 0, 0, 10),                       /* ori  $10, $0, 0 */
+        spu_ri16(0x081, 0x55, 4),                       /* il   $4, 0x55 */
+        spu_ri16(0x081, SPURS_NATIVE_PM_SLOT_LS(0), 7), /* il   $7, window slot 0 */
+        spu_rr(0x1A9, 0, 7, 0),                         /* bisl $0, $7 */
+        spu_ri10(0x04, 0, 10, 0),                       /* ori  $0, $10, 0 */
+        spu_rr(0x1A8, 0, 0, 0),                         /* bi   $0 */
+    };
+    for (unsigned i = 0; i < sizeof code / sizeof code[0]; i++) spu_ls_write32(c, JOB_E2 + 4 * i, code[i]);
+}
+/* lifted job code calling the interpreted subroutine through a bracket: its
+ * own frame must still be live when the subroutine returns */
+static void job_f(spu_context* c)
+{
+    const u128 link = c->gpr[0];
+    c->gpr[0] = spu_link(JOB_SITE + 4); int32_t si = (int32_t)c->image_id;
+    c->pc = JOB_E2; c->host_depth++;
+    spu_indirect_branch(c); spu_drain_call(c, JOB_SITE + 4);
+    c->host_depth--; spu_img_restore(c, si);
+    if ((c->pc & SPU_LS_MASK) == JOB_SITE + 4 && c->gpr[3]._u32[0] == 0x155) __atomic_add_fetch(&g_job_f, 1, __ATOMIC_ACQ_REL);
+    c->gpr[0] = link;
+    SPU_RET(c);
+}
+
 /* ---- the native module ---------------------------------------------------- */
 static int svc_add(spu_context* c)
 {
@@ -157,9 +211,11 @@ static int svc_flip(spu_context* c)
 }
 static const struct spurs_native_services s_services = { { svc_add, svc_flip } };
 static int g_direct, g_direct_rc_mode;
+static spu_context* g_native_ctx;   /* the resident context the last native run used */
 static int native_run(spu_context* c, const struct spurs_native_pm_run* a)
 {
     __atomic_add_fetch(&g_native_runs, 1, __ATOMIC_ACQ_REL);
+    g_native_ctx = c;
     __atomic_or_fetch(&g_modes, 1u << a->mode, __ATOMIC_ACQ_REL);
     if (c->native_services == &s_services) __atomic_add_fetch(&g_observed_services, 1, __ATOMIC_ACQ_REL);
     assert(a->wid == WID && a->pm_size == PM_SIZE && (uint32_t)a->wkl_data == LIST_EA && a->image_id == IMAGE);
@@ -175,6 +231,14 @@ static int native_run(spu_context* c, const struct spurs_native_pm_run* a)
         if (spurs_native_pm_enter_job(c, JOB_C, STACK, 0x1000, LS_CTX, 0) != 0) g_job_bad++;   /* hook claims it */
         if (spurs_native_pm_enter_job(c, JOB_D, STACK, 0x1000, LS_CTX, 0) != 0) g_job_bad++;   /* returns from deeper */
         if (g_direct == 2) spurs_native_pm_enter_job(c, JOB_BAD, STACK, 0x1000, LS_CTX, 0);
+        if (g_direct == 3) {
+            plant_job_e(c);
+            g_interp_rc = (uint32_t)spurs_native_pm_enter_job(c, JOB_E, STACK, 0x1000, LS_CTX, 0);
+            g_interp_r3 = c->gpr[3]._u32[0];
+            g_interp_r11 = c->gpr[11]._u32[0];
+            plant_job_e2(c);
+            if (spurs_native_pm_enter_job(c, JOB_F, STACK, 0x1000, LS_CTX, 0) != 0) g_job_bad++;
+        }
         if (g_direct_rc_mode) return 1;
     }
     return 0;
@@ -200,6 +264,7 @@ static void setup_image(void)
     spu_register_function(JOB_C, job_c);
     spu_register_function(JOB_BAD, job_bad);
     spu_register_function(JOB_D, job_d);
+    spu_register_function(JOB_F, job_f);
 }
 
 static int sched(const char* reg)
@@ -242,7 +307,7 @@ static int sched(const char* reg)
 
 static int direct(int bad)
 {
-    g_direct = bad ? 2 : 1;
+    g_direct = bad == 2 ? 3 : bad ? 2 : 1;
     const uint8_t* pm = vm_base + PM_EA;
     int dflt = spurs_native_pm_payload_hook() == NULL;
     spurs_native_pm_set_payload_hook(hook);
@@ -250,12 +315,16 @@ static int direct(int bad)
     g_direct_rc_mode = 1;
     int rc1 = spu_run_policy_module_native(&s_native, lifted_pm, IMAGE, pm, PM_SIZE, LIST_EA, WID, SPURS_EA, 0);
     g_direct_rc_mode = 0;
+    /* the service table is the run's only: removed when the run ends */
+    const int left_installed = g_native_ctx && g_native_ctx->native_services != NULL;
     /* the same resident context afterwards: a native run must leave no service table behind */
     int rc2 = spu_run_policy_module(lifted_pm, IMAGE, pm, PM_SIZE, LIST_EA, WID, SPURS_EA, 0);
     printf("result rc0=%d rc1=%d rc2=%d native=%u lifted=%u services=%u job_ok=%u job_bad=%u hook=%u job_c=%u "
-           "services_installed=%u lifted_saw_services=%u hook_default_null=%d count=%u\n",
+           "services_installed=%u lifted_saw_services=%u hook_default_null=%d count=%u interp_rc=%d interp_r3=0x%X "
+           "interp_r11=0x%X job_f=%u left_installed=%d\n",
            rc0, rc1, rc2, g_native_runs, g_lifted_runs, g_services, g_job_ok, g_job_bad, g_hook_calls, g_job_c_ran,
-           g_observed_services, g_lifted_saw_services, dflt, vm_read32(LIST_EA));
+           g_observed_services, g_lifted_saw_services, dflt, vm_read32(LIST_EA), (int)g_interp_rc, g_interp_r3,
+           g_interp_r11, g_job_f, left_installed);
     fflush(stdout);
     return 0;
 }
@@ -269,5 +338,6 @@ int main(int argc, char** argv)
     if (!strcmp(mode, "sched")) return sched(argc > 2 ? argv[2] : "none");
     if (!strcmp(mode, "direct")) return direct(0);
     if (!strcmp(mode, "badslot")) return direct(1);
+    if (!strcmp(mode, "interp")) return direct(2);
     return 2;
 }

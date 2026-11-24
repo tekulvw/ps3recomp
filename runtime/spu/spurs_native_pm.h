@@ -18,8 +18,11 @@
  *   <name>       as 1, restricted to the implementation of that name.
  *
  * The choice is made once per workload id, when its policy image is first
- * resolved, and holds for the process: one context never alternates between
- * a lifted and a native run. There is no per-run fallback.
+ * resolved. An implementation that meets guest state outside its contract
+ * while its run holds no job may withdraw itself (spurs_native_pm_withdraw):
+ * from their next dispatch its workloads run the lifted policy module, on a
+ * fresh context, for the rest of the process. There is no fallback inside a
+ * job: the job a native run entered finishes native or stops the process.
  *
  * Job code a native run enters calls back into it through the native-service
  * window: 16-byte LS slots in [SPURS_NATIVE_PM_WINDOW_LS, _END) below the two
@@ -78,6 +81,7 @@ struct spurs_native_pm_run {
     uint32_t pm_size;
     int fresh;                  /* the context was (re)initialised for this run   */
     int mode;                   /* enum spurs_native_pm_mode in force              */
+    int lifted_available;       /* a lifted module exists to withdraw to          */
 };
 
 struct spurs_native_pm {
@@ -99,6 +103,15 @@ struct spurs_native_pm {
      * on the worker thread running it. Used only in shadow mode. */
     void (*shadow)(struct spu_context*, uint32_t kind, const uint8_t* payload, uint32_t n);
 };
+
+/* Withdraw an implementation for the rest of the process: one visible line
+ * (the first call only, with `why`), and every later dispatch of a workload
+ * it ran takes the lifted policy module on a fresh context. Called by the
+ * implementation from a run that holds no job and then returns 0 (an exit to
+ * the kernel); only when that run's lifted_available is set. */
+void spurs_native_pm_withdraw(const struct spurs_native_pm*, const char* why);
+/* Whether `pm` was withdrawn (one relaxed load while nothing is withdrawn). */
+int spurs_native_pm_withdrawn(const struct spurs_native_pm* pm);
 
 /* Registration (any time before the workload is first resolved). Returns 0, or
  * -1 for a full registry, a duplicate fingerprint, or a malformed descriptor. */
