@@ -67,6 +67,7 @@ typedef struct {
     u32         readyCount;
     int         started;       /* its SPU program has been dispatched        */
     u32         name_ea;       /* taskset workload name, guest string EA */
+    int         join_releases; /* legacy taskset: a successful Join frees the slot */
 } SpursWorkload;
 
 typedef struct {
@@ -580,6 +581,25 @@ static void spurs_api_unlock(struct SpursInst* si)
     ReleaseSRWLockExclusive(&si->lock);
 }
 
+/* A taskset's workload id field once its slot is gone (Join, Destroy2): no slot has it. */
+#define SPURS_TASKSET_WID_RELEASED 32u
+
+/* Registry lock held. Running out of the 16 workload slots stays an error, but
+ * a title may not check it (MAG did not), so say what holds every slot. */
+static void spurs_report_full_table(const char* what, u32 ea)
+{
+    static int s_n = 0;
+    if (s_n >= 16) return;
+    s_n++;
+    fprintf(stderr, "[cellSpurs] %s ea=0x%08X: no free workload slot (all %u in use); returning NOMEM. Slots:",
+            what, ea, (unsigned)CELL_SPURS_MAX_WORKLOAD);
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++)
+        fprintf(stderr, " %u=%s0x%08X", i, s_workloads[i].is_taskset ? "taskset:" : "",
+                (u32)s_workloads[i].data);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
 
 static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
@@ -1080,7 +1100,10 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
     u32 wid;
     for (wid = 0; wid < CELL_SPURS_MAX_WORKLOAD; ++wid)
         if (!s_workloads[wid].in_use) break;
-    if (wid == CELL_SPURS_MAX_WORKLOAD) { spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_NOMEM; }
+    if (wid == CELL_SPURS_MAX_WORKLOAD) {
+        spurs_report_full_table(taskset2 ? "CreateTaskset2" : "CreateTaskset", taskset_ea);
+        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_NOMEM;
+    }
     /* No fallible guest operation remains after the valid creation gate. Do
      * not reuse bytes while an earlier generation still has a worker/reference,
      * including one removed by the legacy Taskset destructor. */
@@ -1104,6 +1127,7 @@ static s32 spurs_create_taskset(u32 spurs_ea, u32 taskset_ea, u64 args,
     w->data = taskset_ea;
     w->spurs_ea = spurs_ea;
     w->name_ea = name_ea;
+    w->join_releases = !taskset2;   /* docs/SPURS_JOIN_TASKSET_RELEASE.md */
     w->minContention = 8;
     w->maxContention = maxContention;
     if (priority) memcpy(w->priority, priority, sizeof(w->priority));
@@ -1257,7 +1281,7 @@ static s32 spurs_destroy_taskset2(CellSpursTaskset2* taskset)
     w->started=0; w->name_ea=0;
     s32 rc=spurs_remove_workload_locked(si,(CellSpurs*)(uintptr_t)owner,wid,1);
     if (rc) { spurs_api_unlock(si); return TASKSET2_ERROR((u32)rc & 0xFF); }
-    vm_write32(ea+CSTS_WID,32); /* firmware invalidates the workload id */
+    vm_write32(ea+CSTS_WID,SPURS_TASKSET_WID_RELEASED); /* firmware invalidates the workload id */
     spurs_api_unlock(si);
     return CELL_OK;
 }
@@ -1293,6 +1317,9 @@ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
     if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     u32 wid = vm_read32(ea + CSTS_WID);
     u32 spurs_ea = (u32)vm_read64(ea + CSTS_SPURS);
+    /* Join already gave the slot back (docs/SPURS_JOIN_TASKSET_RELEASE.md);
+     * whatever holds that slot now is not this taskset's to remove. */
+    if (wid == SPURS_TASKSET_WID_RELEASED) return CELL_OK;
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_TASK_ERROR_SRCH;
     struct SpursInst* si;
     s32 admission=spurs_api_lock(spurs_ea,&si);
@@ -1320,18 +1347,62 @@ s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
     return CELL_OK;
 }
 
+/* A legacy taskset's workload slot after a successful Join.
+ *
+ * A title ends a legacy taskset with Shutdown then Join and may then free its
+ * memory or create another taskset in it, so the slot must be free again. A
+ * level-loading title creates and joins one per level; keeping the slot leaked
+ * one of the 16 per level until creation failed (docs/SPURS_JOIN_TASKSET_RELEASE.md).
+ * Generation-2 tasksets keep theirs for cellSpursDestroyTaskset2. */
+static void spurs_join_release_workload(u32 ea)
+{
+    u32 wid = vm_read32(ea + CSTS_WID);
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return;
+    u32 owner = (u32)vm_read64(ea + CSTS_SPURS);
+    struct SpursInst* si;
+    if (spurs_api_lock(owner, &si)) {
+        fprintf(stderr, "[cellSpurs] JoinTaskset ea=0x%08X: SPURS 0x%08X not accepting calls; "
+                "workload %u stays registered\n", ea, owner, wid);
+        return;
+    }
+    SpursWorkload* w = &s_workloads[wid];
+    if (!w->in_use || !w->is_taskset || !w->join_releases || w->data != ea || w->spurs_ea != owner) {
+        spurs_api_unlock(si); return;   /* not this taskset's, or released by Destroy2 */
+    }
+    if (si->active[wid]) {
+        fprintf(stderr, "[cellSpurs] JoinTaskset ea=0x%08X: a SPURS worker is in workload %u; "
+                "it stays registered\n", ea, wid);
+        spurs_api_unlock(si); return;
+    }
+    vm_write64(owner + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8, 0);
+    w->pm = NULL; w->sizePm = 0; w->data = 0;
+    memset(w->priority, 0, sizeof(w->priority));
+    w->minContention = 0; w->maxContention = 0; w->readyCount = 0;
+    w->started = 0; w->name_ea = 0; w->join_releases = 0;
+    s32 rc = spurs_remove_workload_locked(si, (CellSpurs*)(uintptr_t)owner, wid, 1);
+    if (rc) {
+        fprintf(stderr, "[cellSpurs] JoinTaskset ea=0x%08X: releasing workload %u failed rc=0x%08X\n",
+                ea, wid, (u32)rc);
+        spurs_api_unlock(si); return;
+    }
+    vm_write32(ea + CSTS_WID, SPURS_TASKSET_WID_RELEASED);
+    spurs_api_unlock(si);
+}
+
 /* Join returns once the taskset has retired: every task has exited and every
- * worker has dropped its reference, so Destroy and a same-address Create that
- * follow it cannot see BUSY. The wait is bounded; on expiry Join reports BUSY
- * and says what is still outstanding. */
+ * worker has dropped its reference, so a same-address Create that follows it
+ * cannot see BUSY. A legacy taskset's workload slot is then released. The wait
+ * is bounded; on expiry Join reports BUSY, says what is still outstanding and
+ * releases nothing. */
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset)
 {
     u32 ea = (u32)(uintptr_t)taskset;
     if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     if (!spurs_guest_range_valid(ea, CSTS_TASKINFO)) return (s32)0x8041090Du;
     u32 wid = vm_read32(ea + CSTS_WID);
-    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use ||
-        !s_workloads[wid].is_taskset || s_workloads[wid].data != ea)
+    if (wid != SPURS_TASKSET_WID_RELEASED &&
+        (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use ||
+         !s_workloads[wid].is_taskset || s_workloads[wid].data != ea))
         fprintf(stderr, "[cellSpurs] JoinTaskset ea=0x%08X wid=%u: no live taskset workload; "
                 "waiting only for worker references\n", ea, wid);
     printf("[cellSpurs] JoinTaskset() ea=0x%08X\n", ea);
@@ -1342,6 +1413,7 @@ s32 cellSpursJoinTaskset(CellSpursTaskset* taskset)
                 spu_taskset_lifecycle_active(ea));
         return (s32)0x8041090Au;
     }
+    spurs_join_release_workload(ea);
     return CELL_OK;
 }
 
@@ -1378,6 +1450,26 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
  * `wrch $ch18, f(r3.word3)`), so a zero argument makes it GET from EA 0 and
  * stall. lsPattern/argument arrive as guest EAs (generic adapter forwards r3..r10). */
 static s32 spurs_create_task(CellSpursTaskset*, CellSpursTaskId*, void*, void*, u32, u32, u32, u32);
+/* A refused CreateTask leaves the caller waiting for work that never starts
+ * if it does not check the result, so say so, and whether the taskset was
+ * ever registered (a creation that ran out of workload slots, say). */
+static void spurs_report_task_refused(u32 taskset_ea, s32 rc)
+{
+    static int s_n = 0;
+    if (s_n >= 16) return;
+    s_n++;
+    int live = 0;
+    if (spurs_guest_range_valid(taskset_ea, CSTS_TASKINFO)) {
+        u32 wid = vm_read32(taskset_ea + CSTS_WID);
+        AcquireSRWLockExclusive(&s_workload_registry_lock);
+        live = wid < CELL_SPURS_MAX_WORKLOAD && s_workloads[wid].in_use &&
+               s_workloads[wid].is_taskset && s_workloads[wid].data == taskset_ea;
+        ReleaseSRWLockExclusive(&s_workload_registry_lock);
+    }
+    fprintf(stderr, "[cellSpurs] CreateTask on taskset 0x%08X refused rc=0x%08X%s\n", taskset_ea,
+            (u32)rc, live ? "" : " (the taskset has no live workload)");
+    fflush(stderr);
+}
 static s32 spurs_create_task_admitted(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                                        void* elf, void* context, u32 sizeContext,
                                        u32 lsPattern_ea, u32 argument_ea,
@@ -1390,6 +1482,7 @@ static s32 spurs_create_task_admitted(CellSpursTaskset* taskset, CellSpursTaskId
     if (admission<0) return TASKSET2_ERROR(0x0F);
     s32 rc=spurs_create_task(taskset,taskId,elf,context,sizeContext,lsPattern_ea,argument_ea,exit_container_ea);
     if (admission>0) spu_taskset_lifecycle_leave((u32)address);
+    if (rc) spurs_report_task_refused((u32)address, rc);
     return rc;
 }
 
@@ -1863,6 +1956,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
     for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
         if (!s_workloads[i].in_use) {
             s_workloads[i].is_taskset = 0;
+            s_workloads[i].join_releases = 0;
             spurs_scheduler_forget(i);
             si->idle[i] = 0;
             spu_coh_write_begin(spurs_ea, 0x80);
@@ -1912,6 +2006,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
         }
     }
 
+    spurs_report_full_table("AddWorkload", (u32)data);
     spurs_api_unlock(si);
     return CELL_SPURS_CORE_ERROR_NOMEM;
 }
