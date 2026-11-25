@@ -1747,11 +1747,14 @@ static int gcm_report_publish_now(const rsx_deferred_report *r) {
  * cannot rewrite words the walker has yet to fetch from it. All of it runs
  * under the FIFO consumer lock, like every other report operation. */
 #define GCM_RELEASE_FETCH_WINDOW 0x100000u
-#define GCM_RELEASE_HOLD_N 1024u
+/* Grown on demand: a segment may hold thousands of releases before its
+ * branch (a report or texture-read release per draw). The fetch window
+ * bounds it: every release takes at least two words. */
+#define GCM_RELEASE_HOLD_MAX (GCM_RELEASE_FETCH_WINDOW / 8u)
 static int s_release_after_fetch = -1;       /* PS3RECOMP_GCM_RELEASE_AFTER_FETCH, read once */
 static int s_release_hold_active;            /* inside a walker pass */
-static u32 s_release_hold_n, s_release_hold_from, s_release_hold_published_at;
-static rsx_deferred_report s_release_hold[GCM_RELEASE_HOLD_N];
+static u32 s_release_hold_n, s_release_hold_cap, s_release_hold_from, s_release_hold_published_at;
+static rsx_deferred_report *s_release_hold;
 static unsigned long long s_release_hold_forced;
 static int gcm_release_after_fetch(void){
     if(s_release_after_fetch<0){const char *e=getenv("PS3RECOMP_GCM_RELEASE_AFTER_FETCH");
@@ -1790,7 +1793,12 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
     /* A completion receipt carries no guest effect of its own. */
     if(r->operation==2||!s_release_hold_active)return gcm_report_publish_now(r);
     if(!gcm_report_publish_valid(r))return 0;
-    if(s_release_hold_n==GCM_RELEASE_HOLD_N)gcm_release_hold_force("hold full");
+    if(s_release_hold_n==s_release_hold_cap){
+        const u32 cap=s_release_hold_cap?s_release_hold_cap*2u:256u;
+        rsx_deferred_report *grown=cap<=GCM_RELEASE_HOLD_MAX?realloc(s_release_hold,(size_t)cap*sizeof *grown):NULL;
+        if(grown){s_release_hold=grown;s_release_hold_cap=cap;}
+        else gcm_release_hold_force("hold full");
+    }
     if(!s_release_hold_n)s_release_hold_from=s_fifo_getoff;
     s_release_hold[s_release_hold_n++]=*r;
     return 1;

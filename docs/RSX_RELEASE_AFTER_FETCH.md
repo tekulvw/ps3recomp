@@ -51,11 +51,16 @@ order and exactly as they would have been, at the first of:
 4. the pass ends for any reason: `put` reached, a park, an acquire that
    blocks, a failure, the word budget.
 
-The held queue holds 1024 writes. A 1025th applies the held writes first.
-Real streams branch long before either bound. Both of these forced flushes
-land releases before the walker has left their segment, so they reopen the
-race for those releases. Each one is counted and reported, up to eight
-times, as `[release hold] fetch window …` or `[release hold] hold full …`.
+The held queue grows on demand. A segment can release thousands of times
+before its branch: MAG's Training stream overflowed a fixed queue of 1024.
+Every release takes at least two words, so the fetch window bounds the queue
+at 128 Ki entries. If the queue cannot grow, the held writes are applied
+first.
+
+A forced flush, at the fetch window or when the queue cannot grow, lands
+releases before the walker has left their segment. That reopens the race for
+those releases. Each forced flush is counted and reported, up to eight times,
+as `[release hold] fetch window …` or `[release hold] hold full …`.
 
 Nothing else changes:
 

@@ -149,6 +149,23 @@ int main(void) {
     assert(producer_runs==1&&vm_read32(label_ea(0x980))==0x22&&s_fifo_getoff==0x800);
     producer_clear_to=0;
 
+    /* 1c. A segment that releases thousands of times before its branch (a
+     * release per draw) is held as a whole: none of it lands, and nothing
+     * is forced, until the JUMP is taken. */
+    reset();
+    { u32 io=0x1000;
+      for(u32 i=0;i<3000;i++){ const u32 rel[]={0x41d6c,0x900+(i&1)*0x80,0x41d74,i+1}; put_words(io,rel,4); io+=16; }
+      raw32(IO_EA(io),JUMP(0x100)); producer_patch_io=io; }
+    { const u32 a[]={0x41d6c,0xA80,0x41d74,0x22,JUMP(0x400)};   put_words(0x100,a,5); }
+    { const u32 junk[]={0x41d6c,0xA00,0x41d74,0x33,JUMP(0x400)};put_words(0x200,junk,5); }
+    producer_label=label_ea(0x900);producer_value=1;producer_patch_word=JUMP(0x200);
+    { const unsigned long long forced=s_release_hold_forced;
+      cellGcm_rsx_consumer_begin();cellGcm_syscall_set_fifo_consumer_body(0x400,0x1000);cellGcm_rsx_consumer_end();
+      cellGcm_rsx_process_fifo();
+      assert(s_release_hold_forced==forced); }
+    assert(producer_runs==1&&vm_read32(label_ea(0xA80))==0x22&&vm_read32(label_ea(0xA00))==UNTOUCHED);
+    assert(vm_read32(label_ea(0x900))==2999&&vm_read32(label_ea(0x980))==3000);
+
     /* 2. The same with NV406E (0x6C) releases and a CALL/RET pair: the
      * release before the CALL is not visible until the CALL is taken, and
      * the one inside the called block not until the RET is. */
@@ -214,5 +231,5 @@ int main(void) {
 
     s_deferred_reports=0;s_early_release=s_early_fifo_sync=0;
     munmap(vm_base,0x100000000ULL);
-    puts("PASS release after fetch: segment-tail JUMP, CALL and RET recycled on their release, stream order, acquire, fetch window, switch off");
+    puts("PASS release after fetch: segment-tail JUMP, CALL and RET recycled on their release, cleared segment, thousands of releases before a branch, stream order, acquire, fetch window, switch off");
 }
