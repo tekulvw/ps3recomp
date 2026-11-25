@@ -81,6 +81,14 @@ jobs:
             ninja-build libsdl2-dev clang libclang-rt-dev glslang-dev glslang-tools spirv-tools \
             libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
 
+      - uses: ./.github/actions/sccache
+        with:
+          prefix: ps3recomp/linux-vulkan
+          access-key-id: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+          # The test suites call cc/gcc/clang by name.
+          wrap-compilers: 'true'
+
       - name: Configure
         run: |
           if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang CXX=clang++; else export CC=gcc CXX=g++; fi
@@ -164,3 +172,7 @@ jobs:
           python3 tools/test_vulkan_present_scale.py 2>&1 | tee present-scale.log
           test "${PIPESTATUS[0]}" -eq 0
           grep -q "^PASS" present-scale.log
+
+      - name: Compiler cache statistics
+        if: always() && env.SCCACHE_BIN != ''
+        run: '"$SCCACHE_BIN" --show-stats && "$SCCACHE_BIN" --stop-server'

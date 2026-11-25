@@ -60,6 +60,14 @@ jobs:
             ninja-build libsdl2-dev clang libclang-rt-dev glslang-dev glslang-tools \
             spirv-tools libspirv-cross-c-shared-dev
 
+      - uses: ./.github/actions/sccache
+        with:
+          prefix: ps3recomp/linux
+          access-key-id: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+          # The test suites call cc/gcc/clang by name.
+          wrap-compilers: 'true'
+
       # Minimal runner images need compiler-rt for the UBSan fixtures.
       - name: Verify Clang UBSan runtime
         run: |
@@ -651,3 +659,7 @@ jobs:
             echo "--- $t"
             /tmp/$t
           done
+
+      - name: Compiler cache statistics
+        if: always() && env.SCCACHE_BIN != ''
+        run: '"$SCCACHE_BIN" --show-stats && "$SCCACHE_BIN" --stop-server'
