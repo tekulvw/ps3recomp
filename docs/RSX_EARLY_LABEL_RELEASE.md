@@ -15,6 +15,10 @@ without deferred reports.
 | `PS3RECOMP_RSX_EARLY_LABEL_RELEASE=1` | `NV406E` semaphore release (`0x6C`) and `NV4097` texture-read and backend releases (`0x1D70`, `0x1D74`) write their label at the FIFO position of the method. `GET_REPORT` (`0x1800`) does too. The value encodings are unchanged. |
 | `PS3RECOMP_RSX_EARLY_FIFO_SYNC=1` | Requires the variable above. A checked `SET_REFERENCE` (`PS3RECOMP_GCM_CHECKED_REF=1`) commits the work recorded so far without waiting and queues its value at once. `NV406E` acquire and the `NV0039` copy keep their report ordering but no longer wait for the GPU. |
 
+Within a FIFO pass, an early write is held until the walker has fetched past
+the next branch, as the hardware front end has by the time a release lands.
+See `RSX_RELEASE_AFTER_FETCH.md`.
+
 ## Why this is safe for this renderer
 
 The deferral protects two kinds of guest memory: memory the GPU may still read,

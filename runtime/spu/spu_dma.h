@@ -1756,10 +1756,14 @@ SPU_DMA_BODY int mfc_submit_body(mfc_engine* mfc, spu_context* spu, uint32_t cmd
               if (now - s_since >= s_secs * 1000u) {
                   s_rep = 0; s_since = 0;   /* re-arm: the chain may run this job again */
                   extern void spu_halt(spu_context*);
-                  fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
-                          "transfers to ea=0x%08X -- halting the SPU\n",
-                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
-                          (uint32_t)ea);
+                  /* Both conditions held: say so, so the line is not read as
+                   * "256 polls were too many" -- the value did not change
+                   * for the whole wall-time window. */
+                  fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: identical "
+                          "transfers to ea=0x%08X for %llu s (>= %u repeats, "
+                          "SPU_DMA_REPEAT_SECS) -- halting the SPU\n",
+                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+                          (uint32_t)ea, (unsigned long long)s_secs, s_limit);
                   fflush(stderr);
                   spu_halt(spu);
               }

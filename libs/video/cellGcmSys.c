@@ -1703,8 +1703,8 @@ static int gcm_report_spurs_kick(void){
     return on;
 }
 static u32 s_lag_ea;   /* PS3RECOMP_RSX_LABEL_LAG target, defined below */
-static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
-    (void)user;u32 ea;
+static int gcm_report_publish_now(const rsx_deferred_report *r) {
+    u32 ea;
     /* A completion receipt carries no guest effect of its own. */
     if(r->operation==2)return r->vm==(uintptr_t)vm_base;
     if(r->operation&&s_gph_on>0)gph_label_published(r);
@@ -1735,6 +1735,72 @@ static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
         if(s_lag_ea&&ea<=s_lag_ea&&s_lag_ea-ea<16u){static unsigned rn;if(rn++<20000u)fprintf(stderr,"[label-lag] t=%llu publish ea=0x%08X method=0x1800 value=0x%08X early=%u\n",(unsigned long long)ps3_critical_now_ns(),s_lag_ea,r->argument,(unsigned)r->early);}
     }
     if(r->start_ns){uint64_t w[5]={r->start_ns,ea,r->argument,r->context,1};ps3_critical_emit_capture(r->capture,PS3_CRITICAL_REPORT,ea,r->index,w,5);}
+    return 1;
+}
+/* Releases land after the walker has fetched past them
+ * (docs/RSX_RELEASE_AFTER_FETCH.md). During a FIFO pass a label or report
+ * write is validated and queued here instead of written, and the walker
+ * applies the queue, in stream order, once it has taken the next branch,
+ * before anything that reads label memory or orders against it, after
+ * GCM_RELEASE_FETCH_WINDOW bytes without a branch, and when the pass ends.
+ * A guest producer that recycles the segment holding a release therefore
+ * cannot rewrite words the walker has yet to fetch from it. All of it runs
+ * under the FIFO consumer lock, like every other report operation. */
+#define GCM_RELEASE_FETCH_WINDOW 0x100000u
+/* Grown on demand: a segment may hold thousands of releases before its
+ * branch (a report or texture-read release per draw). The fetch window
+ * bounds it: every release takes at least two words. */
+#define GCM_RELEASE_HOLD_MAX (GCM_RELEASE_FETCH_WINDOW / 8u)
+static int s_release_after_fetch = -1;       /* PS3RECOMP_GCM_RELEASE_AFTER_FETCH, read once */
+static int s_release_hold_active;            /* inside a walker pass */
+static u32 s_release_hold_n, s_release_hold_cap, s_release_hold_from, s_release_hold_published_at;
+static rsx_deferred_report *s_release_hold;
+static unsigned long long s_release_hold_forced;
+static int gcm_release_after_fetch(void){
+    if(s_release_after_fetch<0){const char *e=getenv("PS3RECOMP_GCM_RELEASE_AFTER_FETCH");
+        s_release_after_fetch=!(e&&!strcmp(e,"0"));
+        if(!s_release_after_fetch)fprintf(stderr,"[release hold] PS3RECOMP_GCM_RELEASE_AFTER_FETCH=0: labels and reports land at their FIFO position, before the walker fetches past them\n");}
+    return s_release_after_fetch;
+}
+/* The checks gcm_report_publish_now makes before it writes anything. */
+static int gcm_report_publish_valid(const rsx_deferred_report *r){
+    if(!vm_base||r->vm!=(uintptr_t)vm_base)return 0;
+    if(r->operation){u64 limit=ppu_vm_size?(u64)ppu_vm_size:UINT64_C(0x100000000);return (u64)r->ea+4u<=limit;}
+    u32 ea;return gcm_report_destination(r->argument,r->context,&ea)&&ea==r->ea;
+}
+static void gcm_release_hold_flush(void){
+    if(!s_release_hold_n)return;
+    const int active=s_release_hold_active;s_release_hold_active=0;
+    s_release_hold_published_at=s_fifo_getoff;
+    for(u32 i=0;i<s_release_hold_n;i++)
+        if(!gcm_report_publish_now(&s_release_hold[i])&&!s_reports.failed){
+            s_reports.failed=1;
+            fprintf(stderr,"[release hold] held write to %08X failed after validation; publication stopped\n",s_release_hold[i].ea);
+        }
+    s_release_hold_n=0;s_release_hold_active=active;
+}
+/* A forced flush lands a release before the walker has left its segment:
+ * the race this hold exists for is open again for that release. Say so. */
+static void gcm_release_hold_force(const char *why){
+    ++s_release_hold_forced;
+    { static int n; if(PS3_LOG_FIRST(n,8))
+        fprintf(stderr,"[release hold] %s at io %08X: %u held write(s) land before the next branch (forced=%llu)\n",
+                why,s_fifo_getoff,s_release_hold_n,s_release_hold_forced); }
+    gcm_release_hold_flush();
+}
+static int gcm_report_publish(void *user,const rsx_deferred_report *r) {
+    (void)user;
+    /* A completion receipt carries no guest effect of its own. */
+    if(r->operation==2||!s_release_hold_active)return gcm_report_publish_now(r);
+    if(!gcm_report_publish_valid(r))return 0;
+    if(s_release_hold_n==s_release_hold_cap){
+        const u32 cap=s_release_hold_cap?s_release_hold_cap*2u:256u;
+        rsx_deferred_report *grown=cap<=GCM_RELEASE_HOLD_MAX?realloc(s_release_hold,(size_t)cap*sizeof *grown):NULL;
+        if(grown){s_release_hold=grown;s_release_hold_cap=cap;}
+        else gcm_release_hold_force("hold full");
+    }
+    if(!s_release_hold_n)s_release_hold_from=s_fifo_getoff;
+    s_release_hold[s_release_hold_n++]=*r;
     return 1;
 }
 static uint64_t gcm_report_issue(void *user){
@@ -3551,7 +3617,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
 {
     const char* e = getenv("PS3RECOMP_GCM_CHECKED_REF");
     s_checked_ref_pass = e && !strcmp(e, "1");
+    /* Hold release writes until the walker has fetched past them; whatever
+     * is still held when the pass ends, for any reason, lands here. */
+    s_release_hold_active = s_deferred_reports && gcm_release_after_fetch();
     gcm_rsx_process_fifo_pass();
+    s_release_hold_active = 0;
+    gcm_release_hold_flush();
     s_checked_ref_pass = -1;
 }
 
@@ -3798,6 +3869,8 @@ static void gcm_rsx_process_fifo_pass(void)
     int producer_waiting=0;
     while (s_fifo_getoff != put && budget-- > 0) {
         if(checked && atomic_load(&s_checked_ref_failed))break;
+        if (s_release_hold_n && s_fifo_getoff - s_release_hold_from >= GCM_RELEASE_FETCH_WINDOW)
+            gcm_release_hold_force("fetch window");
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
             /* get is sitting on an IO offset with no mapping -- the title
@@ -3877,6 +3950,8 @@ static void gcm_rsx_process_fifo_pass(void)
             s_nv0039.active=0; /* Control flow ends contiguous packet inference. */
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
+            /* A flip is guest-visible progress: releases before it land first. */
+            gcm_release_hold_flush();
             if(gcm_reports_live()&&!gcm_reports_dependency())return;
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
              * this word into the FIFO instead of calling any import. Fire the
@@ -3996,7 +4071,10 @@ static void gcm_rsx_process_fifo_pass(void)
                * The end of the pass, where get is otherwise published, can
                * come tens of milliseconds later. GCM_GET_EQ_PUT keeps its
                * own value. */
-              if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt); }
+              if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt);
+              /* The branch out of the segment is fetched: held releases
+               * from it may land now. */
+              gcm_release_hold_flush(); }
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
@@ -4004,13 +4082,15 @@ static void gcm_rsx_process_fifo_pass(void)
               if (!gcm_io2ea(tgt)) { gcm_observer_branch(s_fifo_getoff,"unmapped-call",tgt); gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
               gcm_observer_branch(s_fifo_getoff,"call",tgt);
               s_fifo_calloff = s_fifo_getoff + 4;
-              s_fifo_getoff  = tgt; }
+              s_fifo_getoff  = tgt;
+              gcm_release_hold_flush(); }
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
             gcm_observer_branch(s_fifo_getoff,"return",s_fifo_calloff);
             s_fifo_getoff = s_fifo_calloff;
             s_fifo_calloff = 0;
+            gcm_release_hold_flush();
             continue;
         }
         if (type == 0 || type == 2) {          /* method (incrementing / NI) */
@@ -4093,6 +4173,8 @@ static void gcm_rsx_process_fifo_pass(void)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     /* Early FIFO sync: every release an ACQUIRE can depend on
                      * has already been applied, so no GPU wait is needed. */
+                    /* An acquire reads label memory: held releases land first. */
+                    if(m==0x68u)gcm_release_hold_flush();
                     if(m==0x68u&&!(s_early_fifo_sync?gcm_reports_dependency():gcm_reports_sync_barrier())){sem_blocked=1;break;}
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
                     if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
@@ -4333,8 +4415,10 @@ static void gcm_rsx_process_fifo_pass(void)
                  * the draw-engine call above does. */
                 { const u32 mfull = (subch << 13) | m;
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                    gcm_release_hold_flush();   /* guest-visible, like a flip */
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
+                    gcm_release_hold_flush();
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     /* A method this branch acts on must be in gcm_walk_special
@@ -4363,6 +4447,8 @@ static void gcm_rsx_process_fifo_pass(void)
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
                     if (m == 0x50) {
+                        /* A reference publishes progress: releases before it land first. */
+                        gcm_release_hold_flush();
                         if(checked && (count!=1 || method!=0x50)){gcm_checked_ref_fail("malformed-reference",s_fifo_getoff);continue;}
                         if (checked &&
                             !(s_early_fifo_sync ? gcm_early_reference_receipt() : gcm_checked_backend_flush()))
