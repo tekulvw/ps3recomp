@@ -95,7 +95,7 @@ static void fs_normalize_sep(char* p) {
  * only weak reference to it: under COFF each one emits its own fallback. */
 extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
 
-void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+static void vfs_ps3game_layout_fallback(char* path, size_t cap)
 {
     struct stat st;
     if (!path || !*path || stat(path, &st) == 0)
@@ -149,6 +149,127 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     if (stat(alt, &st) != 0)
         return;
     snprintf(path, cap, "%s", alt);
+}
+
+/* Optional file overlay over the VFS root (PS3_VFS_OVERLAY; docs/VFS_OVERLAY.md).
+ * Off unless PS3_VFS_OVERLAY names a directory. A translated path under
+ * PS3_VFS_ROOT becomes <overlay>/<same relative path> when the overlay holds an
+ * ordinary file there; directories and every other path keep the root's own. */
+#ifdef _WIN32
+#define VFS_OVERLAY_SEP(c) ((c) == '/' || (c) == '\\')
+#else
+#define VFS_OVERLAY_SEP(c) ((c) == '/')
+#endif
+static int vfs_overlay_same_char(char a, char b)
+{
+#ifdef _WIN32
+    if (a == '\\') a = '/';
+    if (b == '\\') b = '/';
+    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+#endif
+    return a == b;
+}
+
+/* '/' separators, runs of them collapsed, trailing ones dropped (a lone "/"
+ * stays). Used only to compare; returns the length, or -1 when it does not fit. */
+static int vfs_overlay_normalize(const char* src, char* dst, size_t cap)
+{
+    size_t n = 0;
+    for (const char* p = src; *p; p++) {
+        const char c = VFS_OVERLAY_SEP(*p) ? '/' : *p;
+        if (c == '/' && n && dst[n - 1] == '/') continue;
+        if (n + 1 >= cap) return -1;
+        dst[n++] = c;
+    }
+    while (n > 1 && dst[n - 1] == '/') n--;
+    dst[n] = 0;
+    return (int)n;
+}
+
+static void vfs_overlay_apply(char* path, size_t cap)
+{
+    const char* overlay = getenv("PS3_VFS_OVERLAY");
+    if (!overlay || !*overlay || !path || !*path) return;
+    static int s_announced = 0;
+    const char* root = getenv("PS3_VFS_ROOT");
+    if (!root || !*root) {
+        if (!__atomic_exchange_n(&s_announced, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[vfs] PS3_VFS_OVERLAY is set without PS3_VFS_ROOT; no overlay is used\n");
+        return;
+    }
+    if (!__atomic_exchange_n(&s_announced, 1, __ATOMIC_RELAXED)) {
+        struct stat dir;
+        if (stat(overlay, &dir) != 0 || !S_ISDIR(dir.st_mode))
+            fprintf(stderr, "[vfs] PS3_VFS_OVERLAY %s is not a directory; the root's files are used\n", overlay);
+        else
+            fprintf(stderr, "[vfs] overlay: files in %s replace the same paths under %s\n", overlay, root);
+    }
+
+    char norm_root[1024], norm_path[2048];
+    const int root_len = vfs_overlay_normalize(root, norm_root, sizeof norm_root);
+    if (root_len <= 0 || vfs_overlay_normalize(path, norm_path, sizeof norm_path) < 0) return;
+    for (int i = 0; i < root_len; i++)
+        if (!vfs_overlay_same_char(norm_path[i], norm_root[i])) return;
+    const char* rest = norm_path + root_len;
+    if (norm_root[root_len - 1] != '/') {
+        if (*rest != '/') return;          /* "<root>2/..." is not under <root> */
+        rest++;
+    }
+
+    /* The relative part, without "." components; a ".." never resolves. */
+    char rel[2048];
+    size_t rel_len = 0;
+    while (*rest) {
+        const char* end = strchr(rest, '/');
+        const size_t n = end ? (size_t)(end - rest) : strlen(rest);
+        if (n == 2 && rest[0] == '.' && rest[1] == '.') return;
+        if (n && !(n == 1 && rest[0] == '.')) {
+            if (rel_len + n + 2 > sizeof rel) return;
+            if (rel_len) rel[rel_len++] = '/';
+            memcpy(rel + rel_len, rest, n);
+            rel_len += n;
+        }
+        rest += n;
+        if (*rest == '/') rest++;
+    }
+    if (!rel_len) return;
+    rel[rel_len] = 0;
+
+    /* Built from the overlay as given (a UNC prefix keeps its two separators),
+     * in the separator style of the path it replaces. */
+#ifdef _WIN32
+    const char sep = strchr(path, '\\') ? '\\' : '/';
+#else
+    const char sep = '/';
+#endif
+    char candidate[2048];
+    size_t base = strlen(overlay);
+    while (base > 1 && VFS_OVERLAY_SEP(overlay[base - 1])) base--;
+    if (base + 1 + rel_len + 1 > sizeof candidate) return;
+    memcpy(candidate, overlay, base);
+    candidate[base] = sep;
+    for (size_t i = 0; i <= rel_len; i++)
+        candidate[base + 1 + i] = rel[i] == '/' ? sep : rel[i];
+
+    struct stat st;
+    if (stat(candidate, &st) != 0 || !S_ISREG(st.st_mode)) return;
+    if (strlen(candidate) + 1 > cap) {
+        fprintf(stderr, "[vfs] overlay path for %s is too long; the root's file is used\n", rel);
+        return;
+    }
+    static int s_logged = 0;
+    if (__atomic_fetch_add(&s_logged, 1, __ATOMIC_RELAXED) < 16)
+        fprintf(stderr, "[vfs] overlay file: %s\n", rel);
+    snprintf(path, cap, "%s", candidate);
+}
+
+/* The shared tail of all three path translators: the disc-layout fallback, then
+ * the optional file overlay. */
+void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+{
+    vfs_ps3game_layout_fallback(path, cap);
+    vfs_overlay_apply(path, cap);
 }
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
