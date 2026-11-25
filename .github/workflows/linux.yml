@@ -39,8 +39,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc, clang]
-        build_type: [Debug, Release]
+        # Pull requests build two legs that still cover both compilers and both
+        # configurations; pushes to main and manual runs build all four.
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"compiler":"gcc","build_type":"Debug"},{"compiler":"clang","build_type":"Release"}]' || '[{"compiler":"gcc","build_type":"Debug"},{"compiler":"gcc","build_type":"Release"},{"compiler":"clang","build_type":"Debug"},{"compiler":"clang","build_type":"Release"}]') }}
 
     steps:
       - uses: actions/checkout@v4
@@ -118,14 +119,16 @@ jobs:
       - name: Run the lifter test suites
         env:
           CI: "1"          # makes a skipped conformance run fail instead of passing
+        # In parallel on half the runner's CPUs, each suite with a TMPDIR of its
+        # own and its output printed as one block. Every suite runs and the step
+        # fails at the end with the full list. The slowest suites start first.
         run: |
-          set -e
           for t in tools/test_*.py; do
             # Explicit shader-bound native fixtures have dedicated workflows.
             case "$t" in tools/test_frontend_metal.py|tools/test_frontend_vulkan.py|tools/test_vulkan_depth_z24.py|tools/test_vulkan_batched_engine.py|tools/test_vulkan_present_cost.py|tools/test_vulkan_present_scale.py) continue ;; esac
-            echo "--- $t"
-            python "$t"
-          done
+            echo "$t :: python $t"
+          done | python .github/scripts/run_parallel.py --title 'lifter test suites' \
+            --first tools/test_spu_channel_inline.py,tools/test_coh_versions_suites.py,tools/test_spu_promote_regs.py,tools/test_spu_dcache_coverage.py,tools/test_spu_drain_launch.py,tools/test_spu_byte_permute.py
 
       - name: Run self-contained SPU helper tests
         run: |
@@ -356,18 +359,22 @@ jobs:
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
       - name: Run self-contained RSX tests
+        # In parallel, each test compiled into a TMPDIR of its own, its output
+        # printed as one block; every test runs and the step fails at the end
+        # with the full list.
+        env:
+          CC: ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }}
         run: |
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_texture_layout libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c
-          /tmp/test_texture_layout
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
-          /tmp/test_rsx_primitives
+          python .github/scripts/run_parallel.py --title 'self-contained RSX tests' \
+            --first test_wwsjm_run.py,test_wwsjm_core.py,test_spurs_native_pm.py,test_spurs_pm_record.py,test_engine_pipeline_reuse.py,test_rsx_dispatch_plain.py,test_vertex_fetch_simd.py <<'TASKS'
+          test_texture_layout :: "$CC" -std=gnu17 -Wall -Wextra -I include -I libs/video -o "$TMPDIR/test_texture_layout" libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c && "$TMPDIR/test_texture_layout"
+          test_rsx_primitives :: "$CC" -std=gnu17 -Wall -Wextra -I include -I libs/video -o "$TMPDIR/test_rsx_primitives" libs/video/tests/test_rsx_primitives.c && "$TMPDIR/test_rsx_primitives"
           # The fragment-program decoder on its own: the word swap, source
           # swizzles and types, the dest mask, inline constants, which
           # register file the colour export comes from, and how many
           # SV_TARGETs a program that writes more than one export gets. It
           # had rotted to the point of not compiling while nothing ran it.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
-          /tmp/test_fp_decompiler
+          test_fp_decompiler :: "$CC" -std=gnu17 -Wall -Wextra -I include -o "$TMPDIR/test_fp_decompiler" libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c && "$TMPDIR/test_fp_decompiler"
           # The register-file draw engine's platform-neutral halves, driven
           # through its dispatch sink against a stub backend: the surface set's
           # keying and reallocation, a texture unit that names a render target
@@ -376,58 +383,51 @@ jobs:
           # holding still while constants change, and restart cuts bounding
           # every topology expansion. No GPU and no host graphics API, so this
           # is where those get checked at all.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_fifo_busy.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread
-          /tmp/test_rsx_draw_engine
+          test_rsx_draw_engine :: "$CC" -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o "$TMPDIR/test_rsx_draw_engine" libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_fifo_busy.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread && "$TMPDIR/test_rsx_draw_engine"
           # Pipeline identity across guest program pairs, and the fragment
           # program products the engine keeps between draws (a constant
           # patched into the program in place must still reach the draw).
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_engine_program_identity libs/video/tests/test_engine_program_identity.c libs/video/rsx_draw_engine.c libs/video/rsx_fifo_busy.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread
-          /tmp/test_engine_program_identity
+          test_engine_program_identity :: "$CC" -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o "$TMPDIR/test_engine_program_identity" libs/video/tests/test_engine_program_identity.c libs/video/rsx_draw_engine.c libs/video/rsx_fifo_busy.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread && "$TMPDIR/test_engine_program_identity"
           # The vertex fetch plan's stable ranges against the per-attribute
           # walk they are now computed without.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
-          /tmp/test_vertex_fetch_plan
+          test_vertex_fetch_plan :: "$CC" -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o "$TMPDIR/test_vertex_fetch_plan" libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c && "$TMPDIR/test_vertex_fetch_plan"
           # PS3RECOMP_RSX_VERTEX_SIMD: the vector decode against the scalar
           # loop, bit for bit, and its mutants.
-          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_vertex_fetch_simd.py --mutants
+          test_vertex_fetch_simd.py :: python3 tools/test_vertex_fetch_simd.py --mutants
           # The dispatcher's plain-register mirror against rsx_dispatch_method for
           # every register index and state, and its mutants: the draw engine skips
           # the call for a plain register, so a case added to the dispatcher
           # without a line in the mirror must fail here.
-          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_rsx_dispatch_plain.py --mutants
+          test_rsx_dispatch_plain.py :: python3 tools/test_rsx_dispatch_plain.py --mutants
           # The native WWS job manager's pure core: the specification's vectors,
           # generated cases and the mutants each must fail.
-          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_wwsjm_core.py --mutants
+          test_wwsjm_core.py :: python3 tools/test_wwsjm_core.py --mutants
           # The native WWS job manager's run loop on the real scheduler (five lanes,
           # gates, a wake, an array switch, lost reservations), its shadow
           # comparison, and the run-loop mutants each must fail.
-          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_wwsjm_run.py --mutants
+          test_wwsjm_run.py :: python3 tools/test_wwsjm_run.py --mutants
           # PS3RECOMP_RSX_PIPELINE_REUSE: off/on/verify equivalence, the register-class
           # table against its reference logic, and its mutants.
-          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_engine_pipeline_reuse.py --mutants
+          test_engine_pipeline_reuse.py :: python3 tools/test_engine_pipeline_reuse.py --mutants
           # PS3RECOMP_SPURS_PM_RECORD / _STATS: the policy-run recorder is inert when
           # unset, observes without effect, decodes to the performed events, and its
           # mutants (dropped PUTLLC outcome, armed while unset, lost service return,
           # wrong nested drain target) fail.
-          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_spurs_pm_record.py --mutants
+          test_spurs_pm_record.py :: python3 tools/test_spurs_pm_record.py --mutants
           # PS3RECOMP_SPURS_NATIVE_PM: the native policy-module seam is inert when unset
           # (byte-identical runs and recordings), gated by fingerprint and SHA-256, and
           # its service window holds its contract; its mutants must fail.
-          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_spurs_native_pm.py --mutants
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_fifo_busy.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread
-          /tmp/test_color_feedback_engine
+          test_spurs_native_pm.py :: python3 tools/test_spurs_native_pm.py --mutants
+          test_color_feedback_engine :: "$CC" -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o "$TMPDIR/test_color_feedback_engine" libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_fifo_busy.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread && "$TMPDIR/test_color_feedback_engine"
           # The texture cache's content hash: sensitivity, the cache, its speed.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_texture_content_hash libs/video/tests/test_texture_content_hash.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_fifo_busy.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread
-          /tmp/test_texture_content_hash
+          test_texture_content_hash :: "$CC" -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o "$TMPDIR/test_texture_content_hash" libs/video/tests/test_texture_content_hash.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c libs/video/rsx_fifo_busy.c runtime/diagnostics/render_ablation.c libs/video/tests/gcm_deferred_fixture_stubs.c -pthread && "$TMPDIR/test_texture_content_hash"
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
-          /tmp/test_rsx_transform_constants
+          test_rsx_transform_constants :: "$CC" -std=gnu17 -Wall -Wextra -I include -I libs/video -o "$TMPDIR/test_rsx_transform_constants" libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c && "$TMPDIR/test_rsx_transform_constants"
           # Texture offsets are 31 bits; bit 31 is not an address bit.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c
-          /tmp/test_rsx_texture_offset
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_command_texture_offset libs/video/tests/test_rsx_command_texture_offset.c libs/video/rsx_commands.c
-          /tmp/test_rsx_command_texture_offset
+          test_rsx_texture_offset :: "$CC" -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o "$TMPDIR/test_rsx_texture_offset" libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c && "$TMPDIR/test_rsx_texture_offset"
+          test_rsx_command_texture_offset :: "$CC" -std=gnu17 -Wall -Wextra -I include -I libs/video -o "$TMPDIR/test_rsx_command_texture_offset" libs/video/tests/test_rsx_command_texture_offset.c libs/video/rsx_commands.c && "$TMPDIR/test_rsx_command_texture_offset"
+          TASKS
 
       # The Win32 shim every POSIX host runs the runtime through: interlocked
       # widths and return conventions, SRW/CS/condition variables, events,
