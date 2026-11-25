@@ -4,6 +4,8 @@
 #include <set>
 #include <string>
 extern "C" { uint8_t* vm_base = nullptr; uint32_t ppu_vm_size = 65536; }
+// The real shared translator tail lives in sys_fs.c (tools/test_vfs_overlay.py runs it).
+extern "C" void ps3_vfs_ps3game_fallback(char*, size_t) {}
 extern "C" void vm_write32(uint64_t a, uint32_t v) {
     assert(a + 4 <= ppu_vm_size);
     for (int i=0;i<4;i++) vm_base[a+i]=uint8_t(v >> (24-i*8));

@@ -782,6 +782,10 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
         }
         char path[1300];
         snprintf(path, sizeof path, "%s/%s", g_dir_path[fd], entry->d_name);
+        /* The translators' shared tail: the entry exists, so the layout fallback
+         * keeps it, and a file overlay (PS3_VFS_OVERLAY) supplies the size the
+         * same path reports through cellFsStat. */
+        ps3_vfs_ps3game_fallback(path, sizeof path);
         struct stat st;
         if (stat(path, &st) != 0) {
             ctx->gpr[3] = 0x8001002Bu; // entry disappeared or cannot be inspected
