@@ -24,6 +24,7 @@ ignored).
 Manufactured modules and lists only; no title code or data.
 """
 import argparse
+import concurrent.futures
 import os
 import platform
 import shutil
@@ -289,6 +290,29 @@ def shadow_detects(binary: Path, attempts: int = 5) -> bool:
     return False
 
 
+def judge(tmp: Path, name: str, m) -> tuple[list[str], list[str]]:
+    """One mutant: its report lines and the names it failed under."""
+    try:
+        binary = build(tmp, f'mutant-{name}', m)
+    except AssertionError as e:          # a stale anchor is a broken test, not a catch
+        return [f'[FAIL] mutant {name}: {e}'], [name]
+    except subprocess.SubprocessError:   # refused at compile time (a static assertion)
+        return [f'[PASS] mutant {name} caught (does not compile)'], []
+    try:
+        caught = bool(check(binary))
+    except (AssertionError, subprocess.SubprocessError):
+        caught = True
+    lines = [f"[{'PASS' if caught else 'FAIL'}] mutant {name} {'caught' if caught else 'NOT caught'}"]
+    bad = [] if caught else [name]
+    # the shadow comparison must see the same break on its own
+    if name in SHADOW_SEES:
+        seen = shadow_detects(binary)
+        lines.append(f"[{'PASS' if seen else 'FAIL'}] mutant {name} {'seen' if seen else 'NOT seen'} by the shadow comparison")
+        if not seen:
+            bad.append(name + ' (shadow)')
+    return lines, bad
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--mutants', action='store_true')
@@ -304,30 +328,15 @@ def main() -> int:
               'non-power-of-two wrap, concurrent publication and late headers, an in-run flag, variable reserves; contract held on five '
               'lanes (1 and check)')
         if a.mutants:
+            # Each mutant builds and runs in a folder of its own, so they are judged in parallel
+            # (WWSJM_MUTANT_JOBS, default half the CPUs) and reported in their listed order.
+            jobs = int(os.environ.get('WWSJM_MUTANT_JOBS') or max(1, (os.cpu_count() or 2) // 2))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+                verdicts = list(pool.map(lambda item: judge(tmp, *item), MUTANTS.items()))
             bad = []
-            for name, m in MUTANTS.items():
-                try:
-                    binary = build(tmp, f'mutant-{name}', m)
-                except AssertionError as e:          # a stale anchor is a broken test, not a catch
-                    print(f'[FAIL] mutant {name}: {e}')
-                    bad.append(name)
-                    continue
-                except subprocess.SubprocessError:   # refused at compile time (a static assertion)
-                    print(f'[PASS] mutant {name} caught (does not compile)')
-                    continue
-                try:
-                    caught = bool(check(binary))
-                except (AssertionError, subprocess.SubprocessError):
-                    caught = True
-                print(f"[{'PASS' if caught else 'FAIL'}] mutant {name} {'caught' if caught else 'NOT caught'}")
-                if not caught:
-                    bad.append(name)
-                # the shadow comparison must see the same break on its own
-                if name in SHADOW_SEES:
-                    seen = shadow_detects(tmp / f'mutant-{name}')
-                    print(f"[{'PASS' if seen else 'FAIL'}] mutant {name} {'seen' if seen else 'NOT seen'} by the shadow comparison")
-                    if not seen:
-                        bad.append(name + ' (shadow)')
+            for lines, failed in verdicts:
+                print(*lines, sep='\n')
+                bad += failed
             if bad:
                 return 1
     return 0
