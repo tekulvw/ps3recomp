@@ -63,6 +63,13 @@ jobs:
           bash .github/scripts/install-linux-dependencies.sh \
             clang libclang-rt-dev pkg-config libsdl2-dev libvulkan-dev mesa-vulkan-drivers \
             vulkan-validationlayers glslang-tools
+      - uses: ./.github/actions/sccache
+        with:
+          prefix: ps3recomp/frontend-vulkan
+          access-key-id: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+          # The test suites call cc/gcc/clang by name.
+          wrap-compilers: 'true'
       - name: CPU-only injected driver-fault contract
         run: python tools/test_frontend_vulkan.py --contract-only
       - name: Engine GPU depth conversion, views and completion tickets (software device, validation)
@@ -97,3 +104,6 @@ jobs:
             build/frontend-software-report.json
             build/frontend-software.log
           if-no-files-found: error
+      - name: Compiler cache statistics
+        if: always() && env.SCCACHE_BIN != ''
+        run: '"$SCCACHE_BIN" --stop-server' # prints the job's final counters
