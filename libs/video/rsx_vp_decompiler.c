@@ -134,7 +134,9 @@ static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
 /* ---- flow control -------------------------------------------------------- */
 #define RSX_VP_MAX_INSTR 512
 
-static u32 s_vp_branch_base = 0;   /* VP slot the program being decompiled starts at */
+/* The slot the legacy entry points take as the program's start
+ * (rsx_vp_set_branch_base); rsx_vp_decompile_compact_base_ex takes its own. */
+static u32 s_vp_branch_base = 0;
 void rsx_vp_set_branch_base(u32 start_slot) { s_vp_branch_base = start_slot; }
 
 /* BRA BRI CAL CLI RET BRB CLB (scalar opcodes). */
@@ -145,11 +147,11 @@ static int vp_is_flow(u32 sca_op)
 }
 
 /* Branch target (NV40 layout, RPCS3 as oracle): D0[23] << 9 | D2[0:5] << 3 |
- * D3[29:31], an absolute VP slot; made relative to the program start. */
-static u32 vp_branch_target(u32 d0, u32 d2, u32 d3)
+ * D3[29:31], an absolute VP slot; made relative to the program start `base`. */
+static u32 vp_branch_target(u32 base, u32 d0, u32 d2, u32 d3)
 {
     const u32 t = (((d0 >> 23) & 1u) << 9) | ((d2 & 0x3Fu) << 3) | ((d3 >> 29) & 7u);
-    return t >= s_vp_branch_base ? t - s_vp_branch_base : t;
+    return t >= base ? t - base : t;
 }
 
 /* Condition-code state for one instruction (D0). The NV40 VP has two CC
@@ -303,7 +305,7 @@ int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes, rsx_vp_constant_ran
 
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
-    u32 input_mask, char* out, u32 out_size);
+    u32 input_mask, u32 branch_base, char* out, u32 out_size);
 
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
 {
@@ -314,12 +316,20 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
                         char* out, u32 out_size)
 {
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, out, out_size);
+        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, s_vp_branch_base, out, out_size);
 }
 
 int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size)
+{
+    return rsx_vp_decompile_compact_base_ex(ucode, max_bytes, vtex_mask, input_mask,
+                                            s_vp_branch_base, out, out_size);
+}
+
+int rsx_vp_decompile_compact_base_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
+    u32 branch_base, char* out, u32 out_size)
 {
     rsx_vp_input_analysis analysis;
     if (rsx_vp_analyze_inputs(ucode, max_bytes, &analysis) < 0 ||
@@ -329,12 +339,12 @@ int rsx_vp_decompile_compact_ex(
     else
         input_mask = analysis.input_mask;
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 1, input_mask, out, out_size);
+        ucode, max_bytes, vtex_mask, 1, input_mask, branch_base, out, out_size);
 }
 
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
-    u32 input_mask, char* out, u32 out_size)
+    u32 input_mask, u32 branch_base, char* out, u32 out_size)
 {
     if (!ucode || !out || out_size < 256) return -1;
 
@@ -356,7 +366,7 @@ static int rsx_vp_decompile_impl(
      * each block is "if (_pc == N) { ... _pc = next-or-target; }" inside a
      * bounded loop, with a small call stack for CAL/RET. Branch-free programs
      * are emitted exactly as before. Targets are VP slot addresses; the slot
-     * the program starts at comes from rsx_vp_set_branch_base(). */
+     * the program starts at is `branch_base`. */
     static u8 leader[RSX_VP_MAX_INSTR + 1];
     memset(leader, 0, sizeof leader);
     int has_flow = 0;
@@ -368,7 +378,7 @@ static int rsx_vp_decompile_impl(
             const u32 so = (e1 >> 27) & 0x1F;
             if (vp_is_flow(so)) {
                 has_flow = 1;
-                const u32 t = vp_branch_target(e0, e2, e3);
+                const u32 t = vp_branch_target(branch_base, e0, e2, e3);
                 if (t < RSX_VP_MAX_INSTR) leader[t] = 1;
                 leader[k + 1] = 1;
             }
@@ -513,7 +523,7 @@ static int rsx_vp_decompile_impl(
          * program branches. */
         char flow_term[256] = "";
         if (vp_is_flow(sca_op)) {
-            const u32 tgt = vp_branch_target(d0, d2, d3);
+            const u32 tgt = vp_branch_target(branch_base, d0, d2, d3);
             char line[160];
             snprintf(line, sizeof line, "    /* FLOW %s @%d -> %u cond=%u test=%d swz=%c%c%c%c */\n",
                      rsx_vp_sca_name(sca_op), instrs - 1, tgt, cond, cond_test,
