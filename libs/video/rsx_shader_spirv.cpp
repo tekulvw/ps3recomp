@@ -26,6 +26,7 @@
  */
 
 #include "rsx_shader_spirv.h"
+#include "rsx_build_counters.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,6 +147,7 @@ const std::string& cache_dir(Cache& c)
         const char* e = getenv("PS3RECOMP_SPIRV_CACHE");
         c.dir = (e && *e) ? e : "";
         c.dir_read = true;
+        if (!c.dir.empty()) rsx_build_set_flag(RSX_BUILD_FLAG_SPIRV_DISK_CACHE);
     }
     return c.dir;
 }
@@ -250,14 +252,19 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
     auto it = c.map.find(key);
     if (it != c.map.end()) {
         c.stats.memory_hits++;
+        rsx_build_note_shader_hit(0);
     } else {
         std::vector<unsigned int> spirv;
         const std::string& dir = cache_dir(c);
         const std::string path = dir.empty() ? std::string() : cache_path(dir, key);
         if (!dir.empty() && cache_load(path, key, spirv)) {
             c.stats.disk_hits++;
+            rsx_build_note_shader_hit(1);
         } else {
-            if (translate(hlsl, stage, spirv, log, log_size)) return -1;
+            const uint64_t t0 = rsx_build_now_ns();
+            const int failed = translate(hlsl, stage, spirv, log, log_size);
+            rsx_build_note(RSX_BUILD_TRANSLATION, rsx_build_now_ns() - t0, 0);
+            if (failed) return -1;
             c.stats.translations++;
             if (!dir.empty()) cache_store(path, key, spirv);
         }

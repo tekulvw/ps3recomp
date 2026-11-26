@@ -73,6 +73,7 @@
 #include "rsx_texture_layout.h"
 #include "rsx_vp_decompiler.h"
 #include "rsx_fp_decompiler.h"
+#include "rsx_build_counters.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
 #include "rsx_present_thread.h"
@@ -515,6 +516,7 @@ static unsigned long long s_pcache_loaded_bytes, s_pcache_saves;
 static void vk_pcache_save(void)
 {
     if (!s_vk.pcache || !s_vk.pcache_path) return;
+    const uint64_t save_t0 = rsx_build_now_ns();
     size_t size = 0;
     if (pvkGetPipelineCacheData(s_vk.device, s_vk.pcache, &size, NULL) != VK_SUCCESS || !size ||
         size > VK_PCACHE_MAX_BYTES)
@@ -541,6 +543,7 @@ static void vk_pcache_save(void)
     }
     free(data);
     s_vk.pcache_new = 0;
+    rsx_build_note_pipeline_cache_save(rsx_build_now_ns() - save_t0);
 }
 
 /* A pipeline is about to be created through the cache. */
@@ -593,6 +596,10 @@ static void vk_pcache_open(void)
     }
     free(data);
     s_pcache_loaded_bytes = size;
+    if (s_vk.pcache) {
+        rsx_build_set_flag(RSX_BUILD_FLAG_VK_PIPELINE_CACHE);
+        rsx_build_set_pipeline_cache_loaded(size);
+    }
     if (s_vk.pcache)
         VK_LOG("pipeline cache %s: %s (%zu bytes)\n", s_vk.pcache_path, size ? "loaded" : "new", size);
 }
@@ -607,6 +614,16 @@ static void vk_pcache_close(void)
     free(s_vk.pcache_path);
     s_vk.pcache_path = NULL;
     s_vk.pcache_new = 0;
+}
+
+/* Every graphics pipeline is created here, so the build counters
+ * (rsx_build_counters.h) see each driver compile and its time. */
+static VkResult vk_create_graphics_pipeline(const VkGraphicsPipelineCreateInfo* gci, VkPipeline* out)
+{
+    const uint64_t t0 = rsx_build_now_ns();
+    const VkResult r = pvkCreateGraphicsPipelines(s_vk.device, s_vk.pcache, 1, gci, NULL, out);
+    rsx_build_note(RSX_BUILD_PIPELINE, rsx_build_now_ns() - t0, 0);
+    return r;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1813,7 +1830,7 @@ static VkPipeline vk_get_pipeline(int ztest, int zwrite, u32 cmp)
         .pDynamicState = &dy, .layout = s_vk.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, s_vk.pcache, 1, &gci, NULL, &p);
+    VkResult r = vk_create_graphics_pipeline(&gci, &p);
     vk_pcache_created();
     if (r != VK_SUCCESS) { VK_LOG("vkCreateGraphicsPipelines failed (%d)\n", (int)r); return VK_NULL_HANDLE; }
     s_vk.pipelines[slot] = p;
@@ -2155,7 +2172,7 @@ static VkPipeline vk_guest_pipeline(int vs, int fs, int ztest, int zwrite, u32 c
         .pDynamicState = &dy, .layout = s_g.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, s_vk.pcache, 1, &gci, NULL, &p);
+    VkResult r = vk_create_graphics_pipeline(&gci, &p);
     vk_pcache_created();
     if (r != VK_SUCCESS) {
         VK_LOG("guest pipeline: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
@@ -5137,8 +5154,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = layout, .renderPass = rp, .subpass = 0 };
     vk_pcache_created();
-    if (pvkCreateGraphicsPipelines(s_vk.device, s_vk.pcache, 1, &gci, NULL,
-                                   &P->variant[topo_idx]) != VK_SUCCESS) {
+    if (vk_create_graphics_pipeline(&gci, &P->variant[topo_idx]) != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
         P->variant[topo_idx] = VK_NULL_HANDLE;
     }
@@ -7093,6 +7109,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed && vk_load_wsi_device_functions())
         vk_window_drop("the driver has no swapchain functions");
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
+    rsx_build_set_backend("vulkan");
     vk_pcache_open();
 
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,

@@ -23,6 +23,7 @@ void rsx_draw_engine_set_owner_hooks(const rsx_original_owner_hooks* hooks){
 #include "rsx_picture_identity.inc"
 
 #include "rsx_fp_decompiler.h"
+#include "rsx_build_counters.h"
 #include "rsx_primitives.h"
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_formats.h"
@@ -1601,9 +1602,11 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             if(!readable){ENG_CHECKED_FAIL();return 0;}
             if (readable && (hash != e->content_hash || override_again)) {
                 ENG_PH_BEGIN(ph_up);
+                const uint64_t up_t0 = rsx_build_now_ns();
                 s_override_answered = 0;
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap, depth, identity);
+                rsx_build_note(RSX_BUILD_TEXTURE_UPLOAD, rsx_build_now_ns() - up_t0, span);
                 ENG_PH_END(ENG_PH_TEX_UPLOAD, ph_up);
                 if (fresh) {
                     e->override_interest = s_override_answered;
@@ -1650,9 +1653,11 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       e.content_hash = eng_texture_content_hash(location, offset, span, identity, &readable);
       if (!identity) e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
     ENG_PH_BEGIN(ph_up);
+    const uint64_t up_t0 = rsx_build_now_ns();
     s_override_answered = 0;
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap, depth, identity);
+    rsx_build_note(RSX_BUILD_TEXTURE_UPLOAD, rsx_build_now_ns() - up_t0, span);
     ENG_PH_END(ENG_PH_TEX_UPLOAD, ph_up);
     e.override_interest = s_override_answered;
     e.override_generation = override_generation;
@@ -2947,6 +2952,9 @@ static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout,
     }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
+    /* A new key: the build counters time everything from here to the
+     * backend's pipeline_create (rsx_build_counters.h). */
+    const uint64_t build_t0 = rsx_build_now_ns(), build_inner0 = rsx_build_inner_ns();
     u32 handle = 0;
     int vi = 1, fi = 1;
     u32 nconst = 0;
@@ -2980,6 +2988,8 @@ static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout,
                                          host_formats, rt_fmt, rt_count)
             : g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                     layout, layout->stride, rt_fmt, rt_count);
+    rsx_build_note(RSX_BUILD_PROGRAM,
+                   (rsx_build_now_ns() - build_t0) - (rsx_build_inner_ns() - build_inner0), 0);
     const u64 fp_hash = fixed ? 0 : eng_fp_debug_hash(fp_uc, fp_size);
     /* RSX_ENGINE_SHADER_DUMP=<existing dir>: each new pipeline's two programs
      * as <dir>/pipe<handle>.vs.hlsl and .ps.hlsl, the handle being the one

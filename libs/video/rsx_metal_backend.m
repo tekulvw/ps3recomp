@@ -65,6 +65,7 @@
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 #include "rsx_fifo_busy.h"
+#include "rsx_build_counters.h"
 #include "rsx_frontend_internal.h"
 #include "rsx_draw_engine.h"
 #include "rsx_present_thread.h"
@@ -3701,8 +3702,9 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
 {
     const u64 hash = fnv1a64(hlsl, (u32)strlen(hlsl), 1469598103934665603ull);
     for (u32 i = 0; i < s_eng_func_count; i++)
-        if (s_eng_func[i].hash == hash) return s_eng_func[i].fn;
+        if (s_eng_func[i].hash == hash) { rsx_build_note_shader_hit(0); return s_eng_func[i].fn; }
     if (s_eng_func_count >= ENG_MAX_FUNCS) return nil;
+    const uint64_t build_t0 = rsx_build_now_ns();
 
     id<MTLFunction> fn = nil;
     char name[64];
@@ -3717,6 +3719,7 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
         snprintf(name, sizeof name, "%s %016llx", what, (unsigned long long)hash);
         fn = compile_guest_function(s_msl, name);
     }
+    rsx_build_note(RSX_BUILD_TRANSLATION, rsx_build_now_ns() - build_t0, 0);
     s_eng_func[s_eng_func_count].hash = hash;
     s_eng_func[s_eng_func_count].fn   = fn;
     s_eng_func_count++;
@@ -3870,8 +3873,10 @@ static u32 eng_pipeline_create_vd(const char* vs_hlsl, const char* ps_hlsl,
     }
 
     NSError* err = nil;
+    const uint64_t pso_t0 = rsx_build_now_ns();
     id<MTLRenderPipelineState> pso =
         [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    rsx_build_note(RSX_BUILD_PIPELINE, rsx_build_now_ns() - pso_t0, 0);
     if (!pso) {
         fprintf(stderr, "[rsx engine/metal] pipeline state failed: %s\n",
                 [[err localizedDescription] UTF8String]);
@@ -6452,6 +6457,7 @@ static int metal_original_init(u32 width, u32 height, const char* title)
          * both live would record every draw twice. */
         s_ready  = 1;
         s_eng_pt_start = eng_pt_start;
+        rsx_build_set_backend("metal");
         rsx_draw_engine_set_backend(&s_engine_backend);
         /* The engine is this backend's default now that every host mode
          * passes both ways. PS3RECOMP_RSX_ENGINE=vtable is the way back, and
