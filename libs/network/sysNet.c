@@ -255,6 +255,36 @@ static int set_nonblocking(host_socket_t fd, int on)
 #endif
 }
 
+/* A datagram socket must not hear ICMP errors for what it sent
+ * (docs/SYS_NET_UDP_ICMP.md). The console's BSD stack drops them for an
+ * unconnected socket, and so do POSIX hosts. Winsock instead fails the next
+ * recvfrom with WSAECONNRESET (port unreachable) or WSAENETRESET (TTL), which
+ * a title reads as its server connection being reset. */
+static void quiet_datagram_icmp(host_socket_t fd)
+{
+#ifdef _WIN32
+#  ifndef SIO_UDP_CONNRESET
+#    define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#  endif
+#  ifndef SIO_UDP_NETRESET
+#    define SIO_UDP_NETRESET _WSAIOW(IOC_VENDOR, 15)
+#  endif
+    static const DWORD controls[2] = { SIO_UDP_CONNRESET, SIO_UDP_NETRESET };
+    static int told;
+    for (int i = 0; i < 2; i++) {
+        BOOL report = FALSE;
+        DWORD returned = 0;
+        if (WSAIoctl(fd, controls[i], &report, sizeof(report), NULL, 0, &returned, NULL, NULL) != 0 && !told) {
+            told = 1;
+            printf("[sys_net] datagram ICMP reports stay on (WSAIoctl 0x%08lX failed, error %d): "
+                   "a refused datagram may surface as a reset\n", (unsigned long)controls[i], WSAGetLastError());
+        }
+    }
+#else
+    (void)fd;
+#endif
+}
+
 /* ---------------------------------------------------------------------------
  * Init / shutdown
  * -----------------------------------------------------------------------*/
@@ -300,6 +330,7 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
 
     host_socket_t fd = socket(AF_INET, host_type, (type >= SYS_NET_SOCK_DGRAM_P2P) ? 0 : protocol);
     if (fd == HOST_INVALID_SOCKET) return host_fail();
+    if (host_type == SOCK_DGRAM) quiet_datagram_icmp(fd);
 
     int slot = alloc_slot(fd);
     if (slot < 0) {
