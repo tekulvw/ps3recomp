@@ -2739,12 +2739,14 @@ static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consu
  * a title spinning on ctrl->ref waits forever with no indication why. Tokyo
  * Jungle did exactly this -- get left the 1 MB ring for IO 0x00F00000, which it
  * never mapped, while put sat at 0x604. Stop at the bad word and say so. */
+static void gcm_acquire_note_derail(void);
 static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
 {
-    static int n = 0;
+    static int n = 0, n2 = 0;
     if (PS3_LOG_FIRST(n, 8))
         fprintf(stderr, "[cellGcmSys] FIFO %s to unmapped IO 0x%08X (word 0x%08X) "
                 "-- not taken, drain stops here\n", kind, target, word);
+    if (PS3_LOG_FIRST(n2, 8)) gcm_acquire_note_derail();
 }
 
 /* A bad branch nearly always means the walker mis-counted a method batch a few
@@ -2811,6 +2813,7 @@ static void gcm_checked_ref_stand_down(u32 io, u32 word)
         fprintf(stderr, " %08X:%08X", io + 4 * k, vm_read32(ea));
     }
     fprintf(stderr, "\n");
+    gcm_acquire_note_derail();
 }
 static void gcm_checked_ref_fail(const char* why, u32 io)
 {
@@ -3109,7 +3112,8 @@ static unsigned s_acq_bound_ms;
 static _Atomic u32 s_acq_wait_ea;            /* label word a stopped pass waits on; 0: none */
 static u32 s_acq_off, s_acq_val;             /* the acquire being waited on */
 static unsigned long long s_acq_t0;          /* first pass that found it unsatisfied; 0: none */
-static unsigned long long s_acq_waits, s_acq_timeouts, s_acq_wait_ms;
+static unsigned long long s_acq_waits, s_acq_timeouts, s_acq_wait_ms, s_acq_passed;
+static u32 s_acq_passed_io, s_acq_passed_off;   /* the last unsatisfied acquire consumed */
 static _Atomic unsigned long long s_acq_kicks;
 static int gcm_acquire_blocking(void)
 {
@@ -3144,7 +3148,15 @@ static int gcm_acquire_evaluate(u32 la, u32 v)
         s_acq_t0 = 0;
         return 0;
     }
-    if (!gcm_acquire_blocking()) return 0;      /* the old path: consumed unsatisfied */
+    if (!gcm_acquire_blocking()) {
+        /* The old path: consumed unsatisfied. Say so, so a derail that follows
+         * can be told apart from one that does not. */
+        ++s_acq_passed; s_acq_passed_io = s_fifo_getoff; s_acq_passed_off = s_sema_offset;
+        if (s_acq_passed <= 32u || (s_acq_passed % 256u) == 0u)
+            fprintf(stderr, "[gcm acquire] passed an unsatisfied acquire (GCM_SEMA_ACQUIRE off): label off=0x%X == %08X "
+                    "holds %08X at io %08X (passed=%llu)\n", s_sema_offset, v, vm_read32(la), s_fifo_getoff, s_acq_passed);
+        return 0;
+    }
     extern unsigned long long ps3_ms_now(void);
     const unsigned long long now = ps3_ms_now();
     if (!s_acq_t0 || s_acq_off != s_sema_offset || s_acq_val != v) {
@@ -3165,6 +3177,12 @@ static int gcm_acquire_evaluate(u32 la, u32 v)
     atomic_store(&s_acq_wait_ea, la);
     if (vm_read32(la) == v && atomic_exchange(&s_acq_wait_ea, 0u)) cellGcm_fifo_kick_notify();
     return 1;
+}
+/* At a bad branch: was an acquire consumed unsatisfied, and where. */
+static void gcm_acquire_note_derail(void)
+{
+    fprintf(stderr, "[gcm acquire] at this derail: unsatisfied acquires passed=%llu (last label off=0x%X at io %08X), "
+            "waits=%llu timeouts=%llu\n", s_acq_passed, s_acq_passed_off, s_acq_passed_io, s_acq_waits, s_acq_timeouts);
 }
 static void gcm_acquire_kick_put(u32 ea, u32 size)
 {
