@@ -723,3 +723,28 @@ static int rsx_vp_decompile_impl(
     if (o.overflow) return -1;
     return instrs;
 }
+
+/* Vertex-texture units a TXL (vector opcode 0x19) names, D2[8:9]. */
+u32 rsx_vp_texture_units(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 0;
+    u32 units = 0;
+    for (u32 off = 0; off + 16 <= max_bytes; off += 16) {
+        const u32 d1 = rd_le(ucode + off + 4), d2 = rd_le(ucode + off + 8);
+        const u32 d3 = rd_le(ucode + off + 12);
+        if (((d1 >> 22) & 0x1Fu) == 0x19u) units |= 1u << ((d2 >> 8) & 3u);
+        if (d3 & 1u) break;
+    }
+    return units;
+}
+
+/* The draw engine's vertex text: only the vertex-texture units the program
+ * fetches are declared, so a unit left enabled that it never reads does not
+ * change its text. */
+int rsx_vp_build_text(const u8* ucode, u32 max_bytes, u32 branch_base, u32 vtex_mask,
+                      u32 input_mask, char* out, u32 out_size)
+{
+    return rsx_vp_decompile_compact_base_ex(ucode, max_bytes,
+        vtex_mask & rsx_vp_texture_units(ucode, max_bytes), input_mask, branch_base,
+        out, out_size);
+}

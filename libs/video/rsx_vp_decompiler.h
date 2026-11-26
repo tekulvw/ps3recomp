@@ -95,6 +95,17 @@ int rsx_vp_decompile_compact_base_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     u32 branch_base, char* out, u32 out_size);
 
+/* The vertex-texture units the program's TXL instructions name. */
+u32 rsx_vp_texture_units(const u8* ucode, u32 max_bytes);
+
+/* The text the draw engine compiles for a vertex program: `branch_base` is
+ * the slot it was loaded at, `vtex_mask` the enabled vertex-texture units
+ * (only those the program fetches are declared), `input_mask` the vertex
+ * layout (0xFFFF: let the program's own analysis decide, as
+ * rsx_vp_decompile_compact_ex does). Same return as the decompilers. */
+int rsx_vp_build_text(const u8* ucode, u32 max_bytes, u32 branch_base, u32 vtex_mask,
+                      u32 input_mask, char* out, u32 out_size);
+
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);
 const char* rsx_vp_sca_name(u32 op);

@@ -249,6 +249,39 @@ const char* rsx_fp_opcode_name(u32 opcode);
  * the decompiler on where a program ends. */
 u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
 
+/* Everything besides its own bytes that a fragment program's text depends
+ * on, as the draw state gives it. Per-unit fields may describe every bound
+ * unit: rsx_fp_build_text keeps only what the program samples, so a texture
+ * left bound on a unit the program never reads does not change its text.
+ *   ctrl          : SET_SHADER_CONTROL (only its export bits reach the text)
+ *   cube_mask     : units bound to a cube map
+ *   vol_mask      : units bound to a 3D texture
+ *   shadow        : depth-comparison descriptors, per unit
+ *   gamma_masks   : rsx_texture_gamma_mask of each unit's texture
+ *   expand_masks  : rsx_texture_expand_mask of each unit's texture
+ *   unnorm_mask   : units addressed in texels, with unnorm_dim {w, h}
+ *   wpos_sx/sy    : the surface's sample grid (0 or 1: none)
+ *   srgb_output   : rsx_fp_srgb_output_enabled for the draw
+ *   alpha_test    : alpha test enabled, with alpha_func (0x200..0x207) */
+typedef struct rsx_fp_text_state {
+    u32 ctrl;
+    u32 cube_mask, vol_mask;
+    rsx_fp_shadow_desc shadow[16];
+    u8 gamma_masks[16], expand_masks[16];
+    u32 unnorm_mask;
+    u32 unnorm_dim[16][2];
+    u32 wpos_sx, wpos_sy;
+    u32 srgb_output;
+    u32 alpha_test, alpha_func;
+} rsx_fp_text_state;
+
+/* The buffered-constant HLSL the draw engine compiles for this program in
+ * this state: the decompiled program with the sample-grid, texel-scale, sRGB
+ * export and alpha-test wrappers applied. Same return as the decompilers;
+ * `out_constant_count` (may be NULL) gets the PSConstants slot count. */
+int rsx_fp_build_text(const u8* ucode, u32 max_bytes, const rsx_fp_text_state* st,
+                      char* out, u32 out_size, u32* out_constant_count);
+
 #ifdef __cplusplus
 }
 #endif

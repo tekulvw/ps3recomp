@@ -2819,12 +2819,16 @@ static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout,
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
         rsx_dsp_reg(&g.rsx, 0x1FECu), fp_ctrl,
         rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu);
-    const u32 cube_mask = eng_cube_mask();
-    const u32 vol_mask = eng_volume_mask();
+    const u32 sampled_units = fixed ? 0 : eng_fp_texture_units(fpm, fp_uc, fp_size);
+    /* Cube and 3D units the program samples. A cube or 3D texture left
+     * enabled on a unit it does not sample cannot change what it draws, so
+     * it does not change its text (rsx_fp_build_text) or its key either: the
+     * backends lay out and bind each unit by the kind its text declares. */
+    const u32 cube_mask = eng_cube_mask() & sampled_units;
+    const u32 vol_mask = eng_volume_mask() & sampled_units;
     const u32 vtex_mask = eng_vtex_mask();
     rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
     u32 shadow_mask = 0;
-    const u32 sampled_units = fixed ? 0 : eng_fp_texture_units(fpm, fp_uc, fp_size);
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         if (!(sampled_units & (1u << u))) continue;
         rsx_dsp_texture t;
@@ -2969,25 +2973,24 @@ static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout,
         snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
     } else {
-        vi = rsx_vp_decompile_compact_base_ex(vp_uc, vp_instrs * 16u, vtex_mask,
-                                              layout->mask, vp_start, s_vs_hlsl,
-                                              sizeof s_vs_hlsl);
-        fi = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp_uc, fp_size, fp_ctrl, cube_mask, vol_mask,
-                shadow_mask ? shadow : NULL, gamma_masks, expand_units ? expand_masks : NULL,
-                s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        /* The shared text builders: an offline warm-up that gives them the
+         * same program and state gets the same text, so the same cache file. */
+        vi = rsx_vp_build_text(vp_uc, vp_instrs * 16u, vp_start, vtex_mask,
+                               layout->mask, s_vs_hlsl, sizeof s_vs_hlsl);
+        rsx_fp_text_state ts;
+        memset(&ts, 0, sizeof ts);
+        ts.ctrl = fp_ctrl;
+        ts.cube_mask = cube_mask; ts.vol_mask = vol_mask;
+        memcpy(ts.shadow, shadow, sizeof ts.shadow);
+        memcpy(ts.gamma_masks, gamma_masks, sizeof ts.gamma_masks);
+        memcpy(ts.expand_masks, expand_masks, sizeof ts.expand_masks);
+        ts.unnorm_mask = unnorm_mask;
+        memcpy(ts.unnorm_dim, unnorm_dim, sizeof ts.unnorm_dim);
+        if (wpos_grid) { ts.wpos_sx = surface.aa_sx; ts.wpos_sy = surface.aa_sy; }
+        ts.srgb_output = srgb_output;
+        ts.alpha_test = rs->alpha_test_enable ? 1u : 0u; ts.alpha_func = rs->alpha_func;
+        fi = rsx_fp_build_text(fp_uc, fp_size, &ts, s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
-        if (fi > 0 && wpos_grid && rsx_fp_apply_wpos_scale(s_ps_hlsl,
-                sizeof s_ps_hlsl, surface.aa_sx, surface.aa_sy) < 0) fi = -1;
-        if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
-                                                (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
-            fi = -1;
-        if (fi > 0 && srgb_output &&
-            rsx_fp_apply_srgb_output(s_ps_hlsl, sizeof s_ps_hlsl) < 0)
-            fi = -1;
-        if (fi > 0 && rs->alpha_test_enable &&
-            rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
-                                             rs->alpha_func) < 0)
-            fi = -1;
     }
     if (vi > 0 && fi > 0)
         handle = host_formats
