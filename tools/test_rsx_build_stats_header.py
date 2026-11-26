@@ -80,11 +80,16 @@ def main():
         (tmp / 'caller.cpp').write_text(CALLER)
         includes = ['-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'libs/video')]
         warn = ['-Wall', '-Wextra', '-Werror']
-        subprocess.run([cc, '-std=gnu17', *warn, *includes, '-c', str(ROOT / 'libs/video/rsx_fifo_busy.c'),
+        windows = os.name == 'nt'
+        # The MSVC C runtime marks getenv deprecated; rsx_fifo_busy.c reads its switches with it.
+        platform = ['-D_CRT_SECURE_NO_WARNINGS'] if windows else []
+        threads = [] if windows else ['-pthread']
+        caller = tmp / ('caller.exe' if windows else 'caller')
+        subprocess.run([cc, '-std=gnu17', *warn, *platform, *includes, '-c', str(ROOT / 'libs/video/rsx_fifo_busy.c'),
                         '-o', str(tmp / 'counters.o')], check=True, timeout=300)
-        subprocess.run([cxx, '-std=c++17', *warn, '-pedantic', *includes, str(tmp / 'caller.cpp'),
-                        str(tmp / 'counters.o'), '-pthread', '-o', str(tmp / 'caller')], check=True, timeout=300)
-        result = subprocess.run([str(tmp / 'caller')], capture_output=True, text=True, timeout=60)
+        subprocess.run([cxx, '-std=c++17', *warn, *platform, '-pedantic', *includes, str(tmp / 'caller.cpp'),
+                        str(tmp / 'counters.o'), *threads, '-o', str(caller)], check=True, timeout=300)
+        result = subprocess.run([str(caller)], capture_output=True, text=True, timeout=60)
         print(result.stdout, end='')
         if result.returncode:
             raise SystemExit(f'FAIL caller exited {result.returncode}')
