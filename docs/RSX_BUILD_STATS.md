@@ -52,6 +52,12 @@ Both are opt-in and off by default.
 
 - `PS3RECOMP_SPIRV_CACHE=<existing directory>`: glslang's output, one file per shader, keyed by the
   stage and the whole HLSL text. A file from another glslang version or translator build is a miss.
+  When the Vulkan backend's guest programs come up, a worker reads every usable file into memory
+  (`rsx_hlsl_to_spirv_cache_preload_start`), so a shader an earlier session translated is a memory
+  hit at first draw instead of a file read on the FIFO thread; a draw that comes before the worker
+  reaches its file reads it as before. It logs `[RSX spirv] cache preload: N shaders (K KB) in M ms,
+  S skipped`. `PS3RECOMP_SPIRV_CACHE_PRELOAD=0` turns it off. `RsxSpirvCacheStats` counts what it
+  loaded, which entries requests then used, and the time requests still spent reading files.
 - `PS3RECOMP_VK_PIPELINE_CACHE=<existing directory>`: one `VkPipelineCache`, in
   `vk-pipelines-<vendor>-<device>.bin`. A file from another device or driver build is not loaded.
 
@@ -59,6 +65,7 @@ Both are opt-in and off by default.
 
 - `tools/test_rsx_build_stats_header.py`: the struct layout from C and C++, C linkage, and each
   counting rule against the real counters.
-- `libs/video/tests/test_shader_spirv.c`: glslang runs, memory and disk hits and the disk-cache flag.
+- `libs/video/tests/test_shader_spirv.c`: glslang runs, memory and disk hits and the disk-cache flag;
+  the preload (used, skipped and racing files, entries already in memory, the off switch).
 - `libs/video/tests/test_rsx_draw_engine.c`, "build counters": through the engine, one program
   and one upload for a first draw, nothing for repeats, and another program for a new key.

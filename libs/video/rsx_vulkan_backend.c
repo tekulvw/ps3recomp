@@ -2263,6 +2263,10 @@ static int vk_guest_init(void)
     }
     s_g.on = 1;
     VK_LOG("guest programs: on (HLSL -> SPIR-V through glslang)\n");
+    /* With PS3RECOMP_SPIRV_CACHE set, read the earlier sessions' translations
+     * into memory on a worker now, so first draws do not read files on the
+     * FIFO thread (rsx_shader_spirv.h). */
+    rsx_hlsl_to_spirv_cache_preload_start();
     return 0;
 }
 
