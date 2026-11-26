@@ -33,6 +33,9 @@ pair and a `JUMP` (`IO 0x1B75B8` release, `0x1B75C0` `JUMP` into data at
 label at `0xB00004C0` was halted. It happened only under heavy host load
 (load average 8–10 on an 8+4-core Mac).
 
+The same symptoms have a second cause, a walker that catches up with an SPU
+write still in progress. `SPU_PUT_LINE_ORDER.md` describes it and its rule.
+
 ## Rule
 
 During a FIFO pass, the guest-visible write of a label or report is **held**:

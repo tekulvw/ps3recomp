@@ -203,8 +203,10 @@ void spu_cohv_copy_line(void* dst, const void* src)
     if ((((uintptr_t)dst | (uintptr_t)src) & 7u) == 0) {
         uint64_t* d = (uint64_t*)dst;
         const uint64_t* s = (const uint64_t*)src;
-        for (unsigned i = 0; i < 16; i++)
+        /* The first 8 bytes last (docs/SPU_PUT_LINE_ORDER.md). */
+        for (unsigned i = 1; i < 16; i++)
             __atomic_store_n(&d[i], __atomic_load_n(&s[i], __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+        __atomic_store_n(&d[0], __atomic_load_n(&s[0], __ATOMIC_RELAXED), __ATOMIC_RELEASE);
     } else {
         unsigned char* d = (unsigned char*)dst;
         const unsigned char* s = (const unsigned char*)src;

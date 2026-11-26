@@ -1083,7 +1083,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
             if(ps3_critical_write_watched(ea,128))ps3_critical_write_begin(&critical_write,(uint64_t)(uintptr_t)ctx,ea,128,mem,ls,9,cmd|((uint32_t)ctx->image_id<<16),ctx->pc,ctx->gpr[0]._u32[0],critical_generation,1);
-            memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            spu_line_store_piece(mem, ls, MFC_ATOMIC_LINE);   /* commit local store, first word last */
             if(critical_write.capture)ps3_critical_write_end(&critical_write,mem);
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
@@ -1201,7 +1201,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         if(ps3_critical_write_watched(ea,128))ps3_critical_write_begin(&critical_write,(uint64_t)(uintptr_t)ctx,ea,128,mem,ls,9,cmd|((uint32_t)ctx->image_id<<16),ctx->pc,ctx->gpr[0]._u32[0],critical_generation,1);
-        memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        spu_line_store_piece(mem, ls, MFC_ATOMIC_LINE);   /* unconditional store, first word last */
         if(critical_write.capture)ps3_critical_write_end(&critical_write,mem);
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the

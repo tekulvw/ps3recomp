@@ -3867,6 +3867,8 @@ static void gcm_rsx_process_fifo_pass(void)
     const char* why = "caught-up";
     /* Recognized producer waits must not become stuck-GET recovery faults. */
     int producer_waiting=0;
+    /* EA of the command word this pass read last (docs/SPU_PUT_LINE_ORDER.md). */
+    u32 prev_word_ea = 0xFFFFFFFFu;
     while (s_fifo_getoff != put && budget-- > 0) {
         if(checked && atomic_load(&s_checked_ref_failed))break;
         if (s_release_hold_n && s_fifo_getoff - s_release_hold_from >= GCM_RELEASE_FETCH_WINDOW)
@@ -3902,7 +3904,17 @@ static void gcm_rsx_process_fifo_pass(void)
         if (gcm_native_handoff_consume(ea, s_fifo_getoff, put)) {
             why = "native-source-publication"; producer_waiting = 1; break;
         }
-        u32 w = vm_read32(ea);
+        /* An SPU write stores a line's first word last, with release
+         * ordering. Acquiring the first word read in each line means a
+         * changed word comes with the rest of that write's bytes in the line;
+         * an unchanged park parks. Later words of the line are ordered
+         * after this load. A branch back into a line acquires again. */
+        u32 w;
+        if ((ea >> 7) != (prev_word_ea >> 7) || ea <= prev_word_ea)
+            w = ps3_bswap32(__atomic_load_n((const uint32_t*)vm_ptr8(ea), __ATOMIC_ACQUIRE));
+        else
+            w = vm_read32(ea);
+        prev_word_ea = ea;
         /* Only remember offsets BELOW put -- those are positions in the
          * ring the title is writing. A park in another region is where the
          * walker gave up, not how far it got through the ring. */
