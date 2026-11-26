@@ -86,6 +86,15 @@ int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size);
 
+/* As rsx_vp_decompile_compact_ex, with the VP slot `ucode` was loaded at
+ * given here rather than by rsx_vp_set_branch_base. Branch targets are
+ * absolute slots, so a branching program's text names its blocks relative to
+ * that slot: the same program loaded at another slot (its targets moved with
+ * it) decompiles to the same text. */
+int rsx_vp_decompile_compact_base_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
+    u32 branch_base, char* out, u32 out_size);
+
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);
 const char* rsx_vp_sca_name(u32 op);

@@ -2813,6 +2813,9 @@ static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout,
         eng_fp_uses_wpos(fpm, fp_uc, fp_size) ? surface.aa_sx | (surface.aa_sy << 8) : 0;
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
+    /* The slot the vertex program starts at: eng_guest_programs hands its
+     * bytes from there, and its branch targets are absolute slots. */
+    const u32 vp_start = fixed ? 0 : rsx_dsp_vp_start(&g.rsx);
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
         rsx_dsp_reg(&g.rsx, 0x1FECu), fp_ctrl,
         rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu);
@@ -2876,6 +2879,10 @@ static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
     } else {
         key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
+        /* A branching program's text depends on the slot it starts at (its
+         * targets are absolute slots), so a program off slot 0 keys it too;
+         * at slot 0 the key is what it always was. */
+        if (vp_start) key = eng_fnv1a(&vp_start, sizeof vp_start, key);
         key = eng_fp_structural_hash(fpm, fp_uc, fp_size, key);
         if (!key) return 0;
     }
@@ -2962,9 +2969,9 @@ static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout,
         snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
     } else {
-        vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
-                                         layout->mask, s_vs_hlsl,
-                                         sizeof s_vs_hlsl);
+        vi = rsx_vp_decompile_compact_base_ex(vp_uc, vp_instrs * 16u, vtex_mask,
+                                              layout->mask, vp_start, s_vs_hlsl,
+                                              sizeof s_vs_hlsl);
         fi = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp_uc, fp_size, fp_ctrl, cube_mask, vol_mask,
                 shadow_mask ? shadow : NULL, gamma_masks, expand_units ? expand_masks : NULL,
                 s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
