@@ -26,7 +26,7 @@ Nothing is counted per draw or per FIFO method. The counters are cumulative for 
 | field | counted where | when |
 |---|---|---|
 | `programs`, `program_ns` | `rsx_draw_engine.c` | a new pipeline key: decompile plus the backend's `pipeline_create` |
-| `shader_translations`, `shader_translation_ns` | `rsx_shader_spirv.cpp`, `rsx_metal_backend.m` | a shader actually translated (not a cache hit) |
+| `shader_translations`, `shader_translation_ns` | `rsx_shader_spirv.cpp`, `rsx_metal_backend.m` | a shader actually translated, failures included (not a cache hit) |
 | `shader_memory_hits`, `shader_disk_hits` | same | a translation served from memory, or from `PS3RECOMP_SPIRV_CACHE` |
 | `pipelines`, `pipeline_ns`, `pipeline_worst_ns` | `rsx_vulkan_backend.c` (every graphics pipeline), `rsx_metal_backend.m` (guest program pipelines) | one host pipeline object created |
 | `texture_uploads`, `texture_upload_bytes`, `texture_upload_ns`, `slow_texture_uploads` | `rsx_draw_engine.c` | a texture decoded and uploaded (new, or its contents changed); slow is 4 ms or more |
@@ -59,5 +59,6 @@ Both are opt-in and off by default.
 
 - `tools/test_rsx_build_stats_header.py`: the struct layout from C and C++, C linkage, and each
   counting rule against the real counters.
+- `libs/video/tests/test_shader_spirv.c`: glslang runs, memory and disk hits and the disk-cache flag.
 - `libs/video/tests/test_rsx_draw_engine.c`, "build counters": through the engine, one program
   and one upload for a first draw, nothing for repeats, and another program for a new key.

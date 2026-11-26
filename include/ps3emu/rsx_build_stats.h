@@ -14,8 +14,8 @@
  *                      out the translations and pipeline creations inside the build, which count
  *                      in their own fields: the *_ns fields are exclusive and add up.
  *   shader_translations  shaders actually translated: HLSL -> SPIR-V through glslang (Vulkan) or
- *                      HLSL -> MSL plus the Metal library compile (Metal). A shader served from
- *                      the translator's own caches is not a translation.
+ *                      HLSL -> MSL plus the Metal library compile (Metal), failed attempts
+ *                      included. A shader served from the translator's own caches is not one.
  *   shader_memory_hits, shader_disk_hits  the SPIR-V translator's in-memory and on-disk
  *                      (PS3RECOMP_SPIRV_CACHE) cache hits. Metal counts a reused function as a
  *                      memory hit; it has no disk cache.

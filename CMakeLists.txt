@@ -739,6 +739,7 @@ if(UNIX)
         add_executable(test_shader_spirv
             libs/video/tests/test_shader_spirv.c
             libs/video/rsx_shader_spirv.cpp
+            libs/video/rsx_fifo_busy.c          # the build counters
         )
         target_include_directories(test_shader_spirv PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
