@@ -1871,3 +1871,59 @@ int rsx_fp_decompile_buffered_color_ex(
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask, 0,
         1, NULL, gamma_masks, NULL, out, out_size, out_constant_count);
 }
+
+/* ---- program and draw state -> text --------------------------------------
+ * The one place a fragment program's final text is made, for the draw engine
+ * and for anything that wants the same text without a draw (an offline
+ * translation-cache warm-up). The state is first reduced to what the program
+ * can observe -- per-unit state only on units it samples -- then the program
+ * is decompiled and the source wrappers applied in a fixed order: sample
+ * grid, texel addressing, sRGB export, alpha test. */
+int rsx_fp_build_text(const u8* ucode, u32 max_bytes, const rsx_fp_text_state* st,
+                      char* out, u32 out_size, u32* out_constant_count)
+{
+    if (out_constant_count) *out_constant_count = 0;
+    if (!ucode || !st || !out || !out_size) return -1;
+    const u32 sampled = rsx_fp_texture_units(ucode, max_bytes);
+    const u32 cube = st->cube_mask & sampled;
+    const u32 vol = st->vol_mask & sampled & ~cube;
+    rsx_fp_shadow_desc shadow[16];
+    memset(shadow, 0, sizeof shadow);
+    u32 shadow_mask = 0;
+    for (u32 u = 0; u < 16; u++) {
+        if (!((sampled >> u) & 1u)) continue;
+        shadow[u] = st->shadow[u];
+        if (shadow[u].enabled) shadow_mask |= 1u << u;
+    }
+    u8 gamma[16], expand[16];
+    memcpy(gamma, st->gamma_masks, sizeof gamma);
+    memcpy(expand, st->expand_masks, sizeof expand);
+    const u32 gamma_units = rsx_fp_texture_gamma_units(ucode, max_bytes, gamma);
+    const u32 expand_units = rsx_fp_texture_expand_units(ucode, max_bytes, expand);
+    for (u32 u = 0; u < 16; u++) {
+        if (!((gamma_units >> u) & 1u)) gamma[u] = 0;
+        if (!((expand_units >> u) & 1u)) expand[u] = 0;
+    }
+    /* Depth comparison normalises against the bound resource itself, so
+     * only ordinary sampled texel-addressed units carry their size. */
+    const u32 unnorm = st->unnorm_mask & sampled & ~shadow_mask;
+    u32 dim[16][2];
+    for (u32 u = 0; u < 16; u++) {
+        dim[u][0] = ((unnorm >> u) & 1u) ? st->unnorm_dim[u][0] : 0;
+        dim[u][1] = ((unnorm >> u) & 1u) ? st->unnorm_dim[u][1] : 0;
+    }
+    const u32 sx = st->wpos_sx ? st->wpos_sx : 1u, sy = st->wpos_sy ? st->wpos_sy : 1u;
+    const int wpos = (sx != 1u || sy != 1u) && rsx_fp_uses_wpos(ucode, max_bytes);
+
+    u32 nconst = 0;
+    int n = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(ucode, max_bytes, st->ctrl,
+        cube, vol, shadow_mask ? shadow : NULL, gamma, expand_units ? expand : NULL,
+        out, out_size, &nconst);
+    if (n > 0 && wpos && rsx_fp_apply_wpos_scale(out, out_size, sx, sy) < 0) n = -1;
+    if (n > 0 && rsx_fp_apply_unnorm_scale(out, out_size, unnorm, (const u32 (*)[2])dim, cube) < 0) n = -1;
+    if (n > 0 && st->srgb_output && rsx_fp_apply_srgb_output(out, out_size) < 0) n = -1;
+    if (n > 0 && st->alpha_test &&
+        rsx_fp_apply_alpha_test_buffered(out, out_size, st->alpha_func) < 0) n = -1;
+    if (out_constant_count) *out_constant_count = nconst;
+    return n;
+}

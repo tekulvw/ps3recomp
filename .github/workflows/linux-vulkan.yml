@@ -108,6 +108,13 @@ jobs:
           cmake --build build --target test_shader_spirv
           ./build/test_shader_spirv
 
+      # The install-time warm-up (rsx_shader_prewarm.h) writes the files the
+      # draw engine's text names, and a later process reads them.
+      - name: SPIR-V cache warm-up test
+        run: |
+          cmake --build build --target test_shader_prewarm
+          ./build/test_shader_prewarm
+
       - name: Fixed-function path (no guest programs)
         run: |
           fail=0

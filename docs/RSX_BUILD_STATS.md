@@ -61,11 +61,24 @@ Both are opt-in and off by default.
 - `PS3RECOMP_VK_PIPELINE_CACHE=<existing directory>`: one `VkPipelineCache`, in
   `vk-pipelines-<vendor>-<device>.bin`. A file from another device or driver build is not loaded.
 
+A port can fill the SPIR-V cache before a title runs (`rsx_shader_prewarm.h`, Vulkan builds):
+`rsx_shader_prewarm_vertex` and `rsx_shader_prewarm_fragment` take a program and a described draw
+state, make the text with the same builders the engine uses (`rsx_vp_build_text`,
+`rsx_fp_build_text`) and translate it through `rsx_hlsl_to_spirv`, so the file they write is the
+one the engine's draw of that program in that state reads. Per-unit state reaches the text only on
+units the program samples, so a texture left bound on another unit names the same file.
+`rsx_hlsl_to_spirv_cache_name` gives a text's file name and `rsx_hlsl_to_spirv_cache_file_current`
+says whether a file is this translator's (a file from another translator is safe to delete).
+
 ## Tests
 
 - `tools/test_rsx_build_stats_header.py`: the struct layout from C and C++, C linkage, and each
   counting rule against the real counters.
 - `libs/video/tests/test_shader_spirv.c`: glslang runs, memory and disk hits and the disk-cache flag;
   the preload (used, skipped and racing files, entries already in memory, the off switch).
+- `libs/video/tests/test_shader_prewarm.c`: a warmed program's file is the one its text names, the
+  next process reads it, and stale and foreign files are told apart.
+- `libs/video/tests/test_engine_shader_text.c`: the engine's text equals the builders' text from the
+  raw draw state, and unsampled cube, sRGB and vertex-texture state change neither text nor key.
 - `libs/video/tests/test_rsx_draw_engine.c`, "build counters": through the engine, one program
   and one upload for a first draw, nothing for repeats, and another program for a new key.

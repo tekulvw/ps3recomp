@@ -51,7 +51,7 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
 option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux; opt-in on Windows)" OFF)
-list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_(vulkan_backend|frontend_vulkan)\\.c$")
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_(vulkan_backend|frontend_vulkan|shader_prewarm)\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
     # Windows: a Win32 window and vulkan-1.dll loaded at run time; the D3D12
     # backend is still built and stays the host default.
@@ -68,6 +68,9 @@ if(PS3RECOMP_RSX_VULKAN)
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_frontend_vulkan.c")
     # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
+    # The translation cache warm-up a port can run without the title
+    # (rsx_shader_prewarm.h): the engine's text builders and this translator.
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_prewarm.c")
 endif()
 
 # The Metal backend is Objective-C and Apple-only, so it is added explicitly
@@ -762,6 +765,26 @@ if(UNIX)
                 glslang::glslang-default-resource-limits)
         endif()
         set_target_properties(test_shader_spirv PROPERTIES LINKER_LANGUAGE CXX)
+
+        # The warm-up writes the files the draw engine's text would look up.
+        add_executable(test_shader_prewarm
+            libs/video/tests/test_shader_prewarm.c
+            libs/video/rsx_shader_prewarm.c
+            libs/video/rsx_shader_spirv.cpp
+            libs/video/rsx_vp_decompiler.c
+            libs/video/rsx_fp_decompiler.c
+            libs/video/rsx_fifo_busy.c          # the build counters
+        )
+        target_include_directories(test_shader_prewarm PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_link_libraries(test_shader_prewarm PRIVATE glslang::glslang glslang::SPIRV)
+        if(TARGET glslang::glslang-default-resource-limits)
+            target_link_libraries(test_shader_prewarm PRIVATE
+                glslang::glslang-default-resource-limits)
+        endif()
+        set_target_properties(test_shader_prewarm PROPERTIES LINKER_LANGUAGE CXX)
     endif()
 endif()
 

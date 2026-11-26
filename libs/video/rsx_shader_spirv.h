@@ -77,6 +77,18 @@ typedef struct RsxSpirvCacheStats {
 
 void rsx_hlsl_to_spirv_cache_stats(RsxSpirvCacheStats* out);
 
+/* The name a translation of `hlsl` for `stage` has in the disk cache: the
+ * file is "<16 lowercase hex digits>.spv" of this value (FNV-1a 64 of the
+ * stage digit and the text). Available without glslang. */
+u64 rsx_hlsl_to_spirv_cache_name(const char* hlsl, int stage);
+
+/* Whether the file at `path` is one this translator would read: 1 when its
+ * header (magic, format, glslang version, translator key) is this build's and
+ * its sizes add up, 0 when it is a cache file another translator wrote (a
+ * guaranteed miss, safe to delete), -1 when it cannot be read or is not a
+ * cache file at all. Without glslang, always -1. */
+int rsx_hlsl_to_spirv_cache_file_current(const char* path);
+
 /* Empties the memory cache, zeroes the counters and reads
  * PS3RECOMP_SPIRV_CACHE again on the next request. A preload still running
  * is stopped and waited for first. Disk files stay. */
