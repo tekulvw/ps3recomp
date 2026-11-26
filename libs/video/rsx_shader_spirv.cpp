@@ -21,8 +21,11 @@
  * text, so a hit returns exactly the words that text translated to. With
  * PS3RECOMP_SPIRV_CACHE=<existing directory> the cache is also kept on disk,
  * one file per shader, and the next run starts warm. A file whose key,
- * glslang version or translator build differs from the request is a miss,
- * and is rewritten.
+ * glslang version or translator key differs from the request is a miss,
+ * and is rewritten. The translator key is PS3RECOMP_SPIRV_TRANSLATOR_KEY,
+ * which CMake sets to a digest of this file and rsx_shader_spirv.h, so a
+ * rebuild of the same translator keeps the cache; a build without it (a
+ * test compiling this file directly) uses its build time instead.
  */
 
 #include "rsx_shader_spirv.h"
@@ -121,10 +124,19 @@ int translate(const char* hlsl, int stage, std::vector<unsigned int>& spirv,
 
 const u32 kCacheFormat = 1;
 const u32 kCacheMagic = 0x56505352u;   /* "RSPV" */
-/* This file's compile time stands for translate()'s options and the binding
- * contract in rsx_shader_spirv.h: when either changes, this file is rebuilt,
- * and the files an older build wrote become misses. */
+/* The translator key stands for translate()'s options and the binding
+ * contract in rsx_shader_spirv.h: when either changes, the files an older
+ * translator wrote become misses. CMake passes a digest of both files
+ * ("k" and 22 hex digits); without it, this file's compile time stands in,
+ * which also makes every rebuild start cold. */
+#if defined(PS3RECOMP_SPIRV_TRANSLATOR_KEY)
+#define RSX_SPV_KEY_STR2(x) #x
+#define RSX_SPV_KEY_STR(x) RSX_SPV_KEY_STR2(x)
+const char kTranslatorBuild[24] = RSX_SPV_KEY_STR(PS3RECOMP_SPIRV_TRANSLATOR_KEY);
+static_assert(sizeof(RSX_SPV_KEY_STR(PS3RECOMP_SPIRV_TRANSLATOR_KEY)) == 24, "k and 22 hex digits");
+#else
 const char kTranslatorBuild[24] = __DATE__ " " __TIME__;
+#endif
 
 struct Cache {
     std::mutex lock;
