@@ -47,6 +47,7 @@
 #endif
 
 #include "host_socket_send.h"
+#include "../../include/ps3emu/net_host_observer.h"
 #include "../../runtime/memory/vm_watch.h"
 #include "sysNet.h"
 #include "../../runtime/ppu/ppu_context.h"
@@ -57,6 +58,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 
@@ -1069,6 +1071,107 @@ uint32_t sys_net_errno_loc(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * The socket observer (include/ps3emu/net_host_observer.h, docs/network-observer.md)
+ *
+ * The guest-facing handlers below report each call that opened, closed or
+ * moved data, once it has returned. Without an observer they make the call and
+ * nothing else: one atomic load.
+ * -----------------------------------------------------------------------*/
+
+static _Atomic(ps3recomp_net_observer_fn) s_observer;
+
+ps3recomp_net_observer_fn ps3recomp_net_set_observer(ps3recomp_net_observer_fn fn)
+{
+    return atomic_exchange_explicit(&s_observer, fn, memory_order_acq_rel);
+}
+
+static ps3recomp_net_observer_fn net_observer(void)
+{
+    return atomic_load_explicit(&s_observer, memory_order_acquire);
+}
+
+static uint64_t monotonic_ns(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER frequency;
+    LARGE_INTEGER now;
+    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(now.QuadPart / frequency.QuadPart) * 1000000000ull +
+           (uint64_t)(now.QuadPart % frequency.QuadPart) * 1000000000ull / (uint64_t)frequency.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+/* The libnet errno in a handler's result (SYS_NET_RET_BASE | errno), or 0. */
+static int32_t result_errno(int32_t r)
+{
+    if (r >= 0) return 0;
+    if (((uint32_t)r & 0xFFFFFF00u) == SYS_NET_RET_BASE) return (int32_t)((uint32_t)r & 0xFFu);
+    return SYS_NET_EINVAL;
+}
+
+/* An event for guest socket `s` as it is now (transport and host handle). */
+static void event_for(struct ps3recomp_net_event* e, uint32_t kind, int32_t s)
+{
+    memset(e, 0, sizeof(*e));
+    e->version = PS3RECOMP_NET_OBSERVER_VERSION;
+    e->kind = kind;
+    e->socket = s;
+    e->host_socket = -1;
+    if (valid_socket(s)) {
+        e->transport = s_sockets[s].stream ? PS3RECOMP_NET_STREAM : PS3RECOMP_NET_DATAGRAM;
+        e->host_socket = (int64_t)s_sockets[s].host_fd;
+    }
+}
+
+/* The peer of a guest sockaddr_in (address and port in network order at +4
+ * and +2), when there is one. */
+static void event_peer(struct ps3recomp_net_event* e, uint32_t sockaddr_ea)
+{
+    const uint8_t* p = sockaddr_ea ? GUEST_PTR(sockaddr_ea, const uint8_t*) : NULL;
+    if (!p) return;
+    memcpy(e->peer_addr, p + 4, 4);
+    e->peer_port = (uint16_t)((p[2] << 8) | p[3]);
+}
+
+static void event_result(struct ps3recomp_net_event* e, int32_t r, int moves_data)
+{
+    e->error = result_errno(r);
+    e->bytes = e->error ? -1 : (moves_data ? r : 0);
+}
+
+/* connect, send and sendto: timed, with the peer the guest named. */
+static int32_t observed_out(ps3recomp_net_observer_fn fn, uint32_t kind, int32_t s, uint32_t peer_ea, int32_t r,
+                            uint64_t started)
+{
+    struct ps3recomp_net_event e;
+    const uint64_t elapsed = monotonic_ns() - started;
+    event_for(&e, kind, s);
+    event_peer(&e, peer_ea);
+    event_result(&e, r, kind == PS3RECOMP_NET_SEND);
+    e.elapsed_ns = elapsed;
+    fn(&e);
+    return r;
+}
+
+/* recv and recvfrom: the source the call wrote, if any. A receive that would
+ * block is the empty poll of a nonblocking socket and is not reported. */
+static int32_t observed_in(ps3recomp_net_observer_fn fn, int32_t s, uint32_t from_ea, int32_t r)
+{
+    struct ps3recomp_net_event e;
+    if (result_errno(r) == SYS_NET_EWOULDBLOCK) return r;
+    event_for(&e, PS3RECOMP_NET_RECV, s);
+    if (r >= 0) event_peer(&e, from_ea);
+    event_result(&e, r, 1);
+    fn(&e);
+    return r;
+}
+
+/* ---------------------------------------------------------------------------
  * Registration: libnet export names -> ctx handlers
  * -----------------------------------------------------------------------*/
 
@@ -1078,17 +1181,59 @@ uint32_t sys_net_errno_loc(void)
 #define RET_S(v) (ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)(v))
 #define RET_U(v) (ctx->gpr[3] = (uint64_t)(uint32_t)(v))
 
+static void h_close(ppu_context* ctx)
+{
+    ps3recomp_net_observer_fn fn = net_observer();
+    struct ps3recomp_net_event e;
+    if (fn) event_for(&e, PS3RECOMP_NET_CLOSE, S32(3));   /* before the slot is freed */
+    int32_t r = sys_net_bnet_close(S32(3));
+    if (fn) { event_result(&e, r, 0); fn(&e); }
+    RET_S(r);
+}
+
+static void h_accept(ppu_context* ctx)
+{
+    ps3recomp_net_observer_fn fn = net_observer();
+    const uint32_t addr = R32(4);
+    int32_t r = sys_net_bnet_accept(S32(3), PTR(4), PTR(5));
+    if (fn && r > 0) {
+        struct ps3recomp_net_event e;
+        event_for(&e, PS3RECOMP_NET_ACCEPT, r);
+        event_peer(&e, addr);
+        fn(&e);
+    }
+    RET_S(r);
+}
+
+#define OBSERVED_OUT(kind, peer_ea, call)                                         \
+    do {                                                                          \
+        ps3recomp_net_observer_fn fn = net_observer();                            \
+        const int32_t s = S32(3);                                                 \
+        const uint32_t peer = (peer_ea);                                          \
+        const uint64_t started = fn ? monotonic_ns() : 0;                         \
+        int32_t r = (call);                                                       \
+        RET_S(fn ? observed_out(fn, (kind), s, peer, r, started) : r);            \
+    } while (0)
+
+#define OBSERVED_IN(from_ea, call)                                                \
+    do {                                                                          \
+        ps3recomp_net_observer_fn fn = net_observer();                            \
+        const int32_t s = S32(3);                                                 \
+        const uint32_t from = (from_ea);                                          \
+        int32_t r = (call);                                                       \
+        RET_S(fn ? observed_in(fn, s, from, r) : r);                              \
+    } while (0)
+
+static void h_connect(ppu_context* ctx)  { OBSERVED_OUT(PS3RECOMP_NET_CONNECT, R32(4), sys_net_bnet_connect(S32(3), PTR(4), R32(5))); }
+static void h_send(ppu_context* ctx)     { OBSERVED_OUT(PS3RECOMP_NET_SEND, 0, sys_net_bnet_send(S32(3), PTR(4), R32(5), S32(6))); }
+static void h_sendto(ppu_context* ctx)   { OBSERVED_OUT(PS3RECOMP_NET_SEND, R32(7), sys_net_bnet_sendto(S32(3), PTR(4), R32(5), S32(6), PTR(7), R32(8))); }
+static void h_recv(ppu_context* ctx)     { OBSERVED_IN(0, sys_net_bnet_recv(S32(3), PTR(4), R32(5), S32(6))); }
+static void h_recvfrom(ppu_context* ctx) { OBSERVED_IN(R32(7), sys_net_bnet_recvfrom(S32(3), PTR(4), R32(5), S32(6), PTR(7), PTR(8))); }
+
 static void h_socket(ppu_context* ctx)      { RET_S(sys_net_bnet_socket(S32(3), S32(4), S32(5))); }
-static void h_close(ppu_context* ctx)       { RET_S(sys_net_bnet_close(S32(3))); }
 static void h_bind(ppu_context* ctx)        { RET_S(sys_net_bnet_bind(S32(3), PTR(4), R32(5))); }
 static void h_listen(ppu_context* ctx)      { RET_S(sys_net_bnet_listen(S32(3), S32(4))); }
-static void h_accept(ppu_context* ctx)      { RET_S(sys_net_bnet_accept(S32(3), PTR(4), PTR(5))); }
-static void h_connect(ppu_context* ctx)     { RET_S(sys_net_bnet_connect(S32(3), PTR(4), R32(5))); }
 static void h_shutdown(ppu_context* ctx)    { RET_S(sys_net_bnet_shutdown(S32(3), S32(4))); }
-static void h_send(ppu_context* ctx)        { RET_S(sys_net_bnet_send(S32(3), PTR(4), R32(5), S32(6))); }
-static void h_sendto(ppu_context* ctx)      { RET_S(sys_net_bnet_sendto(S32(3), PTR(4), R32(5), S32(6), PTR(7), R32(8))); }
-static void h_recv(ppu_context* ctx)        { RET_S(sys_net_bnet_recv(S32(3), PTR(4), R32(5), S32(6))); }
-static void h_recvfrom(ppu_context* ctx)    { RET_S(sys_net_bnet_recvfrom(S32(3), PTR(4), R32(5), S32(6), PTR(7), PTR(8))); }
 static void h_setsockopt(ppu_context* ctx)  { RET_S(sys_net_bnet_setsockopt(S32(3), S32(4), S32(5), PTR(6), R32(7))); }
 static void h_getsockopt(ppu_context* ctx)  { RET_S(sys_net_bnet_getsockopt(S32(3), S32(4), S32(5), PTR(6), PTR(7))); }
 static void h_getsockname(ppu_context* ctx) { RET_S(sys_net_bnet_getsockname(S32(3), PTR(4), PTR(5))); }
