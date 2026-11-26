@@ -21,6 +21,7 @@ uint64_t g_spu_atomic_observe_state;
 #include "ps3emu/log_first.h"
 #include "spu_coh_version.h"
 #include "spu_coh_ops.h"
+#include "spu_line_store.h"
 
 /* PS3RECOMP_COH_VERSIONS: the version counter scheme's side of the entry points
  * below (defined at the end of this file). */
@@ -1127,11 +1128,12 @@ static void cohv_wait_end(void* storage)
 }
 
 /* ---- writes of any length ----------------------------------------------- */
+/* `d..d+n` lies inside one line. Larger pieces store their first word last
+ * (docs/SPU_PUT_LINE_ORDER.md). */
 static inline void cohv_copy(void* d, const void* s, uint32_t n)
 {
-    if (!s) memset(d, 0, n);
-    else if (n <= 8u) spu_cohv_store_bytes(d, s, n);
-    else memcpy(d, s, n);
+    if (s && n <= 8u) spu_cohv_store_bytes(d, s, n);
+    else spu_line_store_piece((uint8_t*)d, (const uint8_t*)s, n);
 }
 
 static void cohv_write(uint32_t ea, void* dst, const void* src, uint32_t n, const void* self)

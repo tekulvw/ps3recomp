@@ -25,6 +25,7 @@
 #include "spurs_pm_observer.h"
 #include "spu_dma_disposition.h"
 #include "../diagnostics/critical_write_trace.h"
+#include "spu_line_store.h"   /* line-ordered guest writes (docs/SPU_PUT_LINE_ORDER.md) */
 #include <stdint.h>
 #include <time.h>
 #include <string.h>
@@ -326,7 +327,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
             g_spu_coh_ops->write((uint32_t)ea, vm_base + (uint32_t)ea, NULL, size, spu);
         } else {
             spu_lockline_lock();
-            memset(vm_base + (uint32_t)ea, 0, size);
+            spu_line_store(vm_base + (uint32_t)ea, (uint32_t)ea, NULL, size);
             for (uint32_t offset = 0; offset < size; offset += 128u)
                 spu_coh_notify_write_except((uint32_t)ea + offset, spu);
             spu_lockline_unlock();
@@ -997,7 +998,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
                     const uint32_t lo = a > ea32 ? a - ea32 : 0u;
                     const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
                     if (spu_coh_is_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
-                    else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                    else spu_line_store_piece(ea_ptr + lo, ls_ptr + lo, hi - lo);
                     if (a == a1) break;
                 }
                 spu_lockline_lock();
@@ -1006,7 +1007,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
                     const uint32_t lo = a > ea32 ? a - ea32 : 0u;
                     const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
                     if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
-                        memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                        spu_line_store_piece(ea_ptr + lo, ls_ptr + lo, hi - lo);
                         spu_coh_notify_write_except(a, spu);
                     } else if (spu_coh_is_reserved(a)) {
                         spu_coh_notify_write_except(a, spu);   /* reserved after its copy */
@@ -1020,7 +1021,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
                 spu_lockline_lock();
                 spu_dma_disposition_before(&disposition, ls_ptr, ea, size);
                 if(ps3_critical_write_watched(ea,size))ps3_critical_write_begin(&critical_write,(uint64_t)(uintptr_t)spu,ea,size,ea_ptr,ls_ptr,9,cmd|((uint32_t)spu->image_id<<16),spu->pc,spu->gpr[0]._u32[0],critical_generation,1);
-                memcpy(ea_ptr, ls_ptr, size);
+                spu_line_store(ea_ptr, (uint32_t)ea, ls_ptr, size);
                 if(critical_write.capture)ps3_critical_write_end(&critical_write,ea_ptr);
                 spu_dma_disposition_after(&disposition, ea_ptr);
                 copy_disposition = SPU_DMA_DISPOSITION_PUT;
@@ -1032,7 +1033,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
             } else {
                 spu_dma_disposition_before(&disposition, ls_ptr, ea, size);
                 if(ps3_critical_write_watched(ea,size))ps3_critical_write_begin(&critical_write,(uint64_t)(uintptr_t)spu,ea,size,ea_ptr,ls_ptr,9,cmd|((uint32_t)spu->image_id<<16),spu->pc,spu->gpr[0]._u32[0],critical_generation,0);
-                memcpy(ea_ptr, ls_ptr, size);
+                spu_line_store(ea_ptr, (uint32_t)ea, ls_ptr, size);
                 if(critical_write.capture)ps3_critical_write_end(&critical_write,ea_ptr);
                 spu_dma_disposition_after(&disposition, ea_ptr);
                 copy_disposition = SPU_DMA_DISPOSITION_PUT;
