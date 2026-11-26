@@ -65,6 +65,16 @@ static void* late_sink(void* u) { (void)u; usleep(200 * 1000); s_sink(s_late.fd,
 static void start_late_sink(void) { pthread_t t; pthread_create(&t, NULL, late_sink, NULL); pthread_detach(t); }
 #endif
 
+/* The socket observer's events (include/ps3emu/net_host_observer.h). */
+static struct ps3recomp_net_event s_events[32];
+static int s_nevents;
+static void record_event(const struct ps3recomp_net_event* e)
+{
+    if (s_nevents < 32) s_events[s_nevents] = *e;
+    s_nevents++;
+}
+static const struct ps3recomp_net_event* last_event(void) { return s_nevents ? &s_events[s_nevents - 1] : NULL; }
+
 static unsigned int bump_alloc(unsigned int size, unsigned int align)
 {
     static unsigned int top = 0x80000;
@@ -359,6 +369,83 @@ int main(void)
     assert((uint32_t)C1("socketclose", 99) == 0x80010209u && errno_cell() == SYS_NET_EBADF);
     assert(C1("socketclose", a) == 0 && C1("socketclose", b) == 0);
     assert(C1("socketclose", c) == 0 && C1("socketclose", srv) == 0 && C1("socketclose", l) == 0);
+
+    /* The socket observer: nothing until installed; then one event per call
+     * that opened, closed or moved data, with its peer, bytes and error; an
+     * empty poll is not one; removing it stops the events. */
+    {
+        const uint32_t LOOP_BE = 0x7F000001u;
+        int32_t u1 = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+        int32_t u2 = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+        put_sockaddr(ADDR_A, LOOP_BE, 0);
+        assert(C3("bind", u1, ADDR_A, 16) == 0);
+        vm_write32(LEN, 16);
+        assert(C3("getsockname", u1, ADDR_A, LEN) == 0);
+        const uint16_t port_u1 = vm_read16(ADDR_A + 2);
+        memcpy(vm_base + BUF, "seen", 4);
+        assert(call("sendto", u2, BUF, 4, 0, ADDR_A, 16) == 4);
+        assert(s_nevents == 0);                            /* not installed yet */
+
+        assert(ps3recomp_net_set_observer(record_event) == NULL);
+        assert(call("sendto", u2, BUF, 4, 0, ADDR_A, 16) == 4);
+        const struct ps3recomp_net_event* e = last_event();
+        assert(s_nevents == 1 && e->version == PS3RECOMP_NET_OBSERVER_VERSION);
+        assert(e->kind == PS3RECOMP_NET_SEND && e->socket == u2 && e->transport == PS3RECOMP_NET_DATAGRAM);
+        assert(e->bytes == 4 && e->error == 0 && e->peer_port == port_u1 && e->host_socket >= 0);
+        assert(e->peer_addr[0] == 127 && e->peer_addr[3] == 1);
+
+        vm_write32(LEN, 16);
+        assert(call("recvfrom", u1, BUF, 64, 0, ADDR_B, LEN) == 4);   /* the first datagram */
+        e = last_event();
+        assert(s_nevents == 2 && e->kind == PS3RECOMP_NET_RECV && e->socket == u1 && e->bytes == 4);
+        assert(e->peer_addr[0] == 127 && e->peer_port != 0 && e->elapsed_ns == 0);
+        assert(call("recvfrom", u1, BUF, 64, 0, 0, 0) == 4);           /* the second, no source asked */
+        assert(s_nevents == 3 && last_event()->peer_port == 0 && last_event()->peer_addr[0] == 0);
+        assert((uint32_t)call("recvfrom", u1, BUF, 64, SYS_NET_MSG_DONTWAIT, 0, 0) == 0x80010223u);
+        assert(s_nevents == 3);                            /* an empty poll is not reported */
+
+        /* TCP: connect (timed, with the destination), accept (the peer),
+         * send and recv on the connected pair, a failure, close. */
+        int32_t tl = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_STREAM, 0);
+        put_sockaddr(ADDR_A, LOOP_BE, 0);
+        assert(C3("bind", tl, ADDR_A, 16) == 0 && C3("listen", tl, 4, 0) == 0);
+        vm_write32(LEN, 16);
+        assert(C3("getsockname", tl, ADDR_A, LEN) == 0);
+        const uint16_t port_tl = vm_read16(ADDR_A + 2);
+        int32_t tc = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_STREAM, 0);
+        assert(C3("connect", tc, ADDR_A, 16) == 0);
+        e = last_event();
+        assert(e->kind == PS3RECOMP_NET_CONNECT && e->socket == tc && e->transport == PS3RECOMP_NET_STREAM);
+        assert(e->error == 0 && e->bytes == 0 && e->peer_port == port_tl && e->peer_addr[0] == 127);
+        vm_write32(LEN, 16);
+        int32_t ts = C3("accept", tl, ADDR_B, LEN);
+        e = last_event();
+        assert(ts > 0 && e->kind == PS3RECOMP_NET_ACCEPT && e->socket == ts && e->peer_addr[0] == 127 && e->peer_port != 0);
+        memcpy(vm_base + BUF, "data", 4);
+        assert(call("send", tc, BUF, 4, 0, 0, 0) == 4);
+        e = last_event();
+        assert(e->kind == PS3RECOMP_NET_SEND && e->socket == tc && e->bytes == 4 && e->peer_port == 0);
+        assert(call("recv", ts, BUF, 64, 0, 0, 0) == 4);
+        e = last_event();
+        assert(e->kind == PS3RECOMP_NET_RECV && e->socket == ts && e->bytes == 4 && e->transport == PS3RECOMP_NET_STREAM);
+        const int before = s_nevents;
+        assert((uint32_t)call("send", 99, BUF, 4, 0, 0, 0) == 0x80010209u);
+        e = last_event();
+        assert(s_nevents == before + 1 && e->error == SYS_NET_EBADF && e->bytes == -1 && e->host_socket == -1);
+        assert(C1("socketclose", tc) == 0);
+        e = last_event();
+        assert(e->kind == PS3RECOMP_NET_CLOSE && e->socket == tc && e->transport == PS3RECOMP_NET_STREAM && e->error == 0);
+        assert(call("recv", ts, BUF, 64, 0, 0, 0) == 0);  /* the peer's end of stream */
+        e = last_event();
+        assert(e->kind == PS3RECOMP_NET_RECV && e->bytes == 0 && e->error == 0);
+
+        assert(ps3recomp_net_set_observer(NULL) == record_event);
+        const int after = s_nevents;
+        (void)call("sendto", u2, BUF, 4, 0, ADDR_A, 16);
+        assert(C1("socketclose", ts) == 0 && C1("socketclose", tl) == 0);
+        assert(C1("socketclose", u1) == 0 && C1("socketclose", u2) == 0);
+        assert(s_nevents == after);                        /* removed: no more events */
+    }
 
     printf("test_sys_net: all passed\n");
     return 0;
