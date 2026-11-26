@@ -68,12 +68,18 @@ def main():
         (tmp / 'driver.cpp').write_text(DRIVER)
         cache = tmp / 'cache'
         cache.mkdir()
+        # The translator reports to the build counters (libs/video/rsx_build_counters.h), which
+        # live in rsx_fifo_busy.c.
+        cc = shutil.which(os.environ.get('CC', 'cc')) or shutil.which('clang') or shutil.which('gcc')
+        counters = tmp / 'counters.o'
+        subprocess.run([cc, '-std=gnu17', '-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'libs/video'), '-c',
+                        str(ROOT / 'libs/video/rsx_fifo_busy.c'), '-o', str(counters)], check=True, timeout=300)
 
         def build(name, key):
             out = tmp / name
             defines = ['-DPS3RECOMP_HAVE_SPIRV_TRANSLATION=1'] + ([f'-DPS3RECOMP_SPIRV_TRANSLATOR_KEY={key}'] if key else [])
             subprocess.run([cxx, '-std=c++17', *defines, '-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'libs/video'), *cflags,
-                            str(ROOT / 'libs/video/rsx_shader_spirv.cpp'), str(tmp / 'driver.cpp'), *lflags, '-pthread',
+                            str(ROOT / 'libs/video/rsx_shader_spirv.cpp'), str(tmp / 'driver.cpp'), str(counters), *lflags, '-pthread',
                             '-o', str(out)], check=True, timeout=600)
             time.sleep(1.1)   # the next build gets another __TIME__
             return out
