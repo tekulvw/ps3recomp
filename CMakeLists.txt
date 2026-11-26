@@ -361,9 +361,20 @@ if(PS3RECOMP_RSX_VULKAN)
         find_package(glslang CONFIG QUIET)
     endif()
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
-        set_source_files_properties(
-            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
-            PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_HAVE_SPIRV_TRANSLATION=1)
+        # The disk cache's translator key (PS3RECOMP_SPIRV_CACHE): a digest of the
+        # translator's source and its binding contract. A rebuild of the same
+        # translator -- every rebuild of a title that pins this runtime -- keeps
+        # the cache warm; any change to either file makes every stored file a
+        # miss. Without it the translator falls back to its build time.
+        set(_spv_src "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
+        set(_spv_hdr "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.h")
+        file(SHA256 "${_spv_src}" _spv_src_sha)
+        file(SHA256 "${_spv_hdr}" _spv_hdr_sha)
+        string(SHA256 _spv_key "${_spv_src_sha}${_spv_hdr_sha}")
+        string(SUBSTRING "${_spv_key}" 0 22 _spv_key)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_spv_src}" "${_spv_hdr}")
+        set_source_files_properties("${_spv_src}" PROPERTIES COMPILE_DEFINITIONS
+            "PS3RECOMP_HAVE_SPIRV_TRANSLATION=1;PS3RECOMP_SPIRV_TRANSLATOR_KEY=k${_spv_key}")
         target_link_libraries(ps3recomp_runtime PRIVATE glslang::glslang glslang::SPIRV)
         if(TARGET glslang::glslang-default-resource-limits)
             target_link_libraries(ps3recomp_runtime PRIVATE
