@@ -26,6 +26,14 @@
  * which CMake sets to a digest of this file and rsx_shader_spirv.h, so a
  * rebuild of the same translator keeps the cache; a build without it (a
  * test compiling this file directly) uses its build time instead.
+ *
+ * Reading those files one at a time, as draws first ask for them, puts small
+ * file reads on the FIFO thread (usually well under a millisecond each, but
+ * one Windows load frame spent 348 ms on 63 of them). The Vulkan backend
+ * therefore starts rsx_hlsl_to_spirv_cache_preload_start when its guest
+ * programs come up: a worker reads every usable file into memory, taking the
+ * lock only to insert each entry, so by the time the game draws they are
+ * memory hits. PS3RECOMP_SPIRV_CACHE_PRELOAD=0 turns it off.
  */
 
 #include "rsx_shader_spirv.h"
@@ -41,8 +49,12 @@
 #include <glslang/Public/ResourceLimits.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
 
+#include <atomic>
+#include <chrono>
+#include <filesystem>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -139,18 +151,37 @@ static_assert(sizeof(RSX_SPV_KEY_STR(PS3RECOMP_SPIRV_TRANSLATOR_KEY)) == 24, "k 
 const char kTranslatorBuild[24] = __DATE__ " " __TIME__;
 #endif
 
+struct Entry {
+    std::vector<unsigned int> words;
+    bool preloaded = false;   /* put here by the preload, and not used yet */
+};
+
 struct Cache {
     std::mutex lock;
-    std::unordered_map<std::string, std::vector<unsigned int>> map;
+    std::unordered_map<std::string, Entry> map;
     std::string dir;
     bool dir_read = false;
     RsxSpirvCacheStats stats = {};
+    /* The preload worker. It is joined by reset and preload_wait; at process
+     * exit it may still be running, which is why the cache is never
+     * destroyed (cache()). */
+    std::thread preload;
+    bool preload_started = false;
+    std::atomic<bool> preload_stop{false};
 };
 
+/* Never destroyed: a preload still running at exit keeps a valid cache, and a
+ * joinable std::thread is never destroyed. */
 Cache& cache()
 {
-    static Cache c;
-    return c;
+    static Cache* c = new Cache;
+    return *c;
+}
+
+uint64_t now_ns()
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 const std::string& cache_dir(Cache& c)
@@ -172,13 +203,19 @@ std::string cache_key(const char* hlsl, int stage)
     return key;
 }
 
-std::string cache_path(const std::string& dir, const std::string& key)
+/* "<16 hex digits>.spv": FNV-1a 64 of the key. */
+std::string cache_name(const std::string& key)
 {
-    unsigned long long h = 0xcbf29ce484222325ull;       /* FNV-1a 64 */
+    unsigned long long h = 0xcbf29ce484222325ull;
     for (unsigned char ch : key) { h ^= ch; h *= 0x100000001b3ull; }
     char name[40];
-    snprintf(name, sizeof name, "/%016llx.spv", h);
-    return dir + name;
+    snprintf(name, sizeof name, "%016llx.spv", h);
+    return name;
+}
+
+std::string cache_path(const std::string& dir, const std::string& key)
+{
+    return dir + "/" + cache_name(key);
 }
 
 /* Header: magic, format, glslang major/minor/patch, translator build (six
@@ -238,6 +275,126 @@ void cache_store(const std::string& path, const std::string& key,
     if (!ok || rename(tmp.c_str(), path.c_str()) != 0) remove(tmp.c_str());
 }
 
+/* ---- preload ------------------------------------------------------------ */
+
+/* One file's contents as an entry, or false. The same checks as cache_load,
+ * made without a request to compare against: the header must be this
+ * translator's, the sizes must add up to the file, the stage must be one
+ * there is, and the file must be named for the key it holds (so the request
+ * path would have read this same file). */
+bool preload_parse(const std::string& name, const std::vector<unsigned char>& bytes,
+                   std::string& key, std::vector<unsigned int>& words)
+{
+    const size_t hdr_bytes = kHeaderWords * sizeof(u32);
+    if (bytes.size() < hdr_bytes) return false;
+    u32 hdr[kHeaderWords], want[kHeaderWords];
+    memcpy(hdr, bytes.data(), hdr_bytes);
+    cache_header(want, std::string(), 0);
+    if (memcmp(hdr, want, (kHeaderWords - 2) * sizeof(u32)) != 0) return false;
+    const u32 key_bytes = hdr[kHeaderWords - 2], nwords = hdr[kHeaderWords - 1];
+    if (key_bytes < 2 || nwords == 0 || nwords > (1u << 24)) return false;
+    if (bytes.size() != hdr_bytes + (size_t)key_bytes + (size_t)nwords * sizeof(u32)) return false;
+    key.assign((const char*)bytes.data() + hdr_bytes, key_bytes);
+    if (key[0] != (char)('0' + RSX_SHADER_STAGE_VERTEX) &&
+        key[0] != (char)('0' + RSX_SHADER_STAGE_FRAGMENT)) return false;
+    if (key.find('\0') != std::string::npos) return false;   /* the HLSL is a C string */
+    if (cache_name(key) != name) return false;
+    words.resize(nwords);
+    memcpy(words.data(), bytes.data() + hdr_bytes + key_bytes, (size_t)nwords * sizeof(u32));
+    return true;
+}
+
+bool preload_is_name(const std::string& name)
+{
+    if (name.size() != 20 || name.compare(16, 4, ".spv") != 0) return false;
+    for (size_t i = 0; i < 16; i++) {
+        const char ch = name[i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+    }
+    return true;
+}
+
+bool read_file(const std::filesystem::path& path, std::vector<unsigned char>& out, size_t limit)
+{
+    FILE* f = fopen(path.string().c_str(), "rb");
+    if (!f) return false;
+    bool ok = fseek(f, 0, SEEK_END) == 0;
+    const long size = ok ? ftell(f) : -1;
+    ok = ok && size >= 0 && (size_t)size <= limit && fseek(f, 0, SEEK_SET) == 0;
+    if (ok) {
+        out.resize((size_t)size);
+        ok = size == 0 || fread(out.data(), 1, out.size(), f) == out.size();
+    }
+    fclose(f);
+    return ok;
+}
+
+void preload_files(Cache* c, const std::string& dir);
+
+/* An exception leaving a thread ends the process, so none does: a failure
+ * here (a path that does not convert, no memory) only ends the preload, and
+ * requests read the files as before. */
+void preload_run(Cache* c, std::string dir)
+{
+    try {
+        preload_files(c, dir);
+    } catch (...) {
+        fprintf(stderr, "[RSX spirv] cache preload: stopped by an error, files are read as draws need them\n");
+        std::lock_guard<std::mutex> guard(c->lock);
+        c->stats.preload_done = 1;
+    }
+}
+
+void preload_files(Cache* c, const std::string& dir)
+{
+    const uint64_t t0 = now_ns();
+    u32 used = 0, skipped = 0, files = 0;
+    uint64_t bytes_used = 0;
+    bool capped = false;
+    std::error_code ec;
+    std::filesystem::directory_iterator it(dir, ec), end;
+    std::vector<unsigned char> bytes;
+    std::string key;
+    std::vector<unsigned int> words;
+    for (; !ec && it != end && !c->preload_stop.load(std::memory_order_relaxed); it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (!preload_is_name(name)) continue;    /* temporaries and anything else */
+        if (files >= RSX_SPIRV_PRELOAD_MAX_FILES || bytes_used >= RSX_SPIRV_PRELOAD_MAX_BYTES) {
+            capped = true;
+            break;
+        }
+        files++;
+        if (!read_file(it->path(), bytes, RSX_SPIRV_PRELOAD_MAX_BYTES - bytes_used) ||
+            !preload_parse(name, bytes, key, words)) {
+            skipped++;
+            continue;
+        }
+        std::lock_guard<std::mutex> guard(c->lock);
+        if (c->preload_stop.load(std::memory_order_relaxed)) break;
+        Entry e;
+        e.words = std::move(words);
+        e.preloaded = true;
+        if (c->map.emplace(std::move(key), std::move(e)).second) {
+            used++;
+            bytes_used += bytes.size();
+            c->stats.preloaded = used;
+            c->stats.preload_bytes = bytes_used;
+        }
+        key.clear();
+        words.clear();
+    }
+    const uint64_t ns = now_ns() - t0;
+    {
+        std::lock_guard<std::mutex> guard(c->lock);
+        c->stats.preload_skipped = skipped;
+        c->stats.preload_ns = ns;
+        c->stats.preload_done = 1;
+    }
+    fprintf(stderr, "[RSX spirv] cache preload: %u shaders (%llu KB) in %.1f ms, %u skipped%s\n",
+            used, (unsigned long long)(bytes_used >> 10), (double)ns / 1e6, skipped,
+            capped ? ", stopped at the size cap" : (ec ? ", directory listing failed" : ""));
+}
+
 } // namespace
 
 extern "C" int rsx_hlsl_to_spirv_available(void) { return 1; }
@@ -264,12 +421,16 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
     auto it = c.map.find(key);
     if (it != c.map.end()) {
         c.stats.memory_hits++;
+        if (it->second.preloaded) { it->second.preloaded = false; c.stats.preload_hits++; }
         rsx_build_note_shader_hit(0);
     } else {
         std::vector<unsigned int> spirv;
         const std::string& dir = cache_dir(c);
         const std::string path = dir.empty() ? std::string() : cache_path(dir, key);
-        if (!dir.empty() && cache_load(path, key, spirv)) {
+        const uint64_t read0 = dir.empty() ? 0 : now_ns();
+        const bool loaded = !dir.empty() && cache_load(path, key, spirv);
+        if (!dir.empty()) c.stats.disk_read_ns += now_ns() - read0;
+        if (loaded) {
             c.stats.disk_hits++;
             rsx_build_note_shader_hit(1);
         } else {
@@ -280,9 +441,11 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
             c.stats.translations++;
             if (!dir.empty()) cache_store(path, key, spirv);
         }
-        it = c.map.emplace(key, std::move(spirv)).first;
+        Entry e;
+        e.words = std::move(spirv);
+        it = c.map.emplace(key, std::move(e)).first;
     }
-    const std::vector<unsigned int>& spirv = it->second;
+    const std::vector<unsigned int>& spirv = it->second.words;
     if (spirv.size() > max_words) {
         char n[64];
         snprintf(n, sizeof n, "%zu words, room for %u", spirv.size(), max_words);
@@ -322,10 +485,50 @@ extern "C" int rsx_hlsl_to_spirv_cache_file_current(const char* path)
 extern "C" void rsx_hlsl_to_spirv_cache_reset(void)
 {
     Cache& c = cache();
+    c.preload_stop.store(true, std::memory_order_relaxed);
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> guard(c.lock);
+        worker = std::move(c.preload);
+    }
+    if (worker.joinable()) worker.join();
     std::lock_guard<std::mutex> guard(c.lock);
     c.map.clear();
     c.dir_read = false;
     c.stats = {};
+    c.preload_started = false;
+    c.preload_stop.store(false, std::memory_order_relaxed);
+}
+
+extern "C" void rsx_hlsl_to_spirv_cache_preload_start(void)
+{
+    Cache& c = cache();
+    std::lock_guard<std::mutex> guard(c.lock);
+    if (c.preload_started) return;
+    c.preload_started = true;
+    const char* off = getenv("PS3RECOMP_SPIRV_CACHE_PRELOAD");
+    if (off && strcmp(off, "0") == 0) {
+        fprintf(stderr, "[RSX spirv] cache preload: off (PS3RECOMP_SPIRV_CACHE_PRELOAD=0)\n");
+        return;
+    }
+    const std::string& dir = cache_dir(c);
+    if (dir.empty()) return;
+    try {
+        c.preload = std::thread(preload_run, &c, dir);
+    } catch (...) {
+        fprintf(stderr, "[RSX spirv] cache preload: no thread, files are read as draws need them\n");
+    }
+}
+
+extern "C" void rsx_hlsl_to_spirv_cache_preload_wait(void)
+{
+    Cache& c = cache();
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> guard(c.lock);
+        worker = std::move(c.preload);
+    }
+    if (worker.joinable()) worker.join();
 }
 
 #else /* !PS3RECOMP_HAVE_SPIRV_TRANSLATION */
@@ -355,6 +558,8 @@ extern "C" int rsx_hlsl_to_spirv_cache_file_current(const char* path)
 }
 
 extern "C" void rsx_hlsl_to_spirv_cache_reset(void) {}
+extern "C" void rsx_hlsl_to_spirv_cache_preload_start(void) {}
+extern "C" void rsx_hlsl_to_spirv_cache_preload_wait(void) {}
 
 #endif
 
