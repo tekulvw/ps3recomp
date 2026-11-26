@@ -14,6 +14,8 @@
  */
 #include "rsx_draw_engine.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
+#include "rsx_build_counters.h"
+#include "ps3emu/rsx_build_stats.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -953,6 +955,38 @@ static void test_pipeline_key(void)
 }
 
 /* ---- 5. restart cuts and topology expansion ------------------------------ */
+
+/* The first-use build counters (include/ps3emu/rsx_build_stats.h): one
+ * program per new pipeline key, one upload per new or changed texture,
+ * nothing for a repeat draw. */
+static void test_build_counters(void)
+{
+    printf("-- build counters\n");
+    engine_up();
+    rsx_build_stats_reset();
+    struct ps3recomp_rsx_build_stats st;
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    memset(vm_base + TEX_OFFSET, 0x23, 4 * 4 * 4);
+    draw_triangle();
+    ps3recomp_rsx_build_stats(&st);
+    CHECK(st.version == PS3RECOMP_RSX_BUILD_STATS_VERSION && st.programs == 1 && st.texture_uploads == 1 &&
+          st.texture_upload_bytes == 4 * 4 * 4,
+          "the first draw counts one program and one 64-byte upload (%llu, %llu, %llu bytes)",
+          (unsigned long long)st.programs, (unsigned long long)st.texture_uploads,
+          (unsigned long long)st.texture_upload_bytes);
+    draw_triangle();
+    draw_triangle();
+    ps3recomp_rsx_build_stats(&st);
+    CHECK(st.programs == 1 && st.texture_uploads == 1, "repeat draws count nothing (%llu, %llu)",
+          (unsigned long long)st.programs, (unsigned long long)st.texture_uploads);
+    m(M_DEPTH_BOUNDS_ENABLE, 1u);
+    draw_triangle();
+    ps3recomp_rsx_build_stats(&st);
+    CHECK(st.programs == 2 && st.program_ns > 0 && st.pipelines == 0,
+          "a new pipeline key counts a second program; a stub backend creates no host pipeline (%llu, %llu)",
+          (unsigned long long)st.programs, (unsigned long long)st.pipelines);
+    m(M_DEPTH_BOUNDS_ENABLE, 0u);
+}
 
 static void test_restart_expansion(void)
 {
@@ -2175,6 +2209,7 @@ int main(int argc, char** argv)
     test_texture_sparse_rehash();
     test_texture_override();
     test_pipeline_key();
+    test_build_counters();
     test_restart_expansion();
     test_indexed_runs();
     test_indexed_draws();
