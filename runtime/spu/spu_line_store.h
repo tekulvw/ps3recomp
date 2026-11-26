@@ -17,6 +17,12 @@
  * stores zeros. */
 static inline void spu_line_store_piece(uint8_t* dst, const uint8_t* src, uint32_t n)
 {
+    if (n == 4u && !((uintptr_t)dst & 3u)) {   /* one word, stored whole */
+        uint32_t v = 0;
+        if (src) memcpy(&v, src, 4);
+        __atomic_store_n((uint32_t*)dst, v, __ATOMIC_RELEASE);
+        return;
+    }
     if (n < 8u || ((uintptr_t)dst & 3u)) {
         if (src) memcpy(dst, src, n); else memset(dst, 0, n);
         return;

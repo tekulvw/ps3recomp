@@ -57,10 +57,10 @@ the coherence-version write) and `SDCRZ`. It also applies to a whole-line
 commit (`PUTLLC`/`PUTLLUC` under coherence versions), whose first 8 bytes
 are stored last.
 
-A segment shorter than 8 bytes, or one whose start is not 4-byte aligned,
-is stored as before. One aligned store of at most 8 bytes is already
-single-copy atomic on every supported host, and the MFC's own small
-transfers are naturally aligned.
+An aligned 4-byte segment, such as the head word MAG's header job writes
+last, is stored as one release store of the whole word. Other segments
+shorter than 8 bytes, or ones whose start is not 4-byte aligned, are stored
+as before. The MFC's own small transfers are naturally aligned.
 
 The FIFO walker loads the first command word it reads in each line with
 acquire ordering. If it sees a line's first word changed, it therefore also
