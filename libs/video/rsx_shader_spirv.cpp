@@ -301,6 +301,24 @@ extern "C" void rsx_hlsl_to_spirv_cache_stats(RsxSpirvCacheStats* out)
     if (out) *out = c.stats;
 }
 
+extern "C" int rsx_hlsl_to_spirv_cache_file_current(const char* path)
+{
+    if (!path) return -1;
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    u32 hdr[kHeaderWords], want[kHeaderWords];
+    const bool whole = fread(hdr, sizeof hdr, 1, f) == 1;
+    long size = -1;
+    if (whole && fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+    fclose(f);
+    if (!whole || size < 0 || hdr[0] != kCacheMagic) return -1;
+    cache_header(want, std::string(), 0);
+    if (memcmp(hdr, want, (kHeaderWords - 2) * sizeof(u32)) != 0) return 0;
+    const unsigned long long expect = sizeof hdr + (unsigned long long)hdr[kHeaderWords - 2] +
+                                      (unsigned long long)hdr[kHeaderWords - 1] * sizeof(u32);
+    return hdr[kHeaderWords - 1] != 0 && (unsigned long long)size == expect ? 1 : 0;
+}
+
 extern "C" void rsx_hlsl_to_spirv_cache_reset(void)
 {
     Cache& c = cache();
@@ -330,6 +348,21 @@ extern "C" void rsx_hlsl_to_spirv_cache_stats(RsxSpirvCacheStats* out)
     if (out) memset(out, 0, sizeof *out);
 }
 
+extern "C" int rsx_hlsl_to_spirv_cache_file_current(const char* path)
+{
+    (void)path;
+    return -1;
+}
+
 extern "C" void rsx_hlsl_to_spirv_cache_reset(void) {}
 
 #endif
+
+/* Outside the glslang build too: the name is only arithmetic. */
+extern "C" u64 rsx_hlsl_to_spirv_cache_name(const char* hlsl, int stage)
+{
+    unsigned long long h = 0xcbf29ce484222325ull;       /* FNV-1a 64, as cache_path */
+    h ^= (unsigned char)('0' + stage); h *= 0x100000001b3ull;
+    for (const char* p = hlsl ? hlsl : ""; *p; ++p) { h ^= (unsigned char)*p; h *= 0x100000001b3ull; }
+    return (u64)h;
+}

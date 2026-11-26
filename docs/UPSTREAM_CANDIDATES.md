@@ -66,6 +66,7 @@ test that passes there; the user opens the upstream PRs.
 | Q27 | cellSpursJoinTaskset waits for the taskset's tasks to exit | PR open #809 (branch `upstream/spurs-join-taskset` aee876a9; from fork #98) |
 | Q28 | Weak header-defined globals are misbound in MinGW builds: use selectany on every PE target | not started (fork #127 fixes it for SPU_GATE; upstream has the same pattern) |
 | Q29 | Joining a legacy taskset releases its workload slot | not started (builds on Q27; fork fix/spurs-join-releases-workload) |
+| Q30 | Engine shader text: only sampled cube/3D/vertex-texture units, and a VP branch base | not started (fork #185 and perf/shader-prewarm) |
 | M1 | Guest write watch and preservation sessions | PR open #727 (write watch), #728 (preservation sessions, stacked on #727); Windows paths not yet run |
 | M2 | Coherence fast paths (series) | PR open #731 (live holder counts only). Shard, interest bitmap and no-LR store fast path dropped: they only pay off with fork-only 91df812a (see M15); 1ef14852 already upstream (#484); 9192f907 dropped (neutral) |
 | M3 | Fast guest accessors, inline stores from the lifter | dropped (superseded by upstream 27745b54, which already inlines stores under its own gate) |
@@ -743,3 +744,9 @@ The user approved sending architectural changes that bring generic performance g
 - **Where upstream is:** `cellSpursJoinTaskset` is a no-op stub, so upstream leaks the slot the same way once Q27 lands.
 - **Contents:** after a successful Join, a legacy taskset's workload slot is removed through the ordinary removal path and the taskset's workload id becomes 32; Taskset2 keeps its slot for DestroyTaskset2. Slot exhaustion and refused CreateTask calls are logged. A title that creates and joins a taskset per level ran out of the 16 slots on its fifth level and froze loading it.
 - **Upstream port:** depends on Q27's wait; needs no lifecycle tracking.
+
+**Q30. Engine shader text: only sampled cube/3D/vertex-texture units, and a VP branch base**
+- **Source:** fork #185 (`fix/rsx-vp-branch-base`) and fork `perf/shader-prewarm`.
+- **Where upstream is:** check `rsx_draw_engine.c` on `master`; the engine there may still key cube and 3D declarations on every enabled unit and decompile vertex programs without a branch base.
+- **Contents:** the fragment program's cube and 3D masks (and the vertex program's vertex-texture declarations) come only from units the program samples, so a texture left bound elsewhere no longer forks the pipeline key or the translated text; a branching vertex program loaded off slot 0 is decompiled relative to its start slot (it jumped to the wrong block before). The text is built by `rsx_fp_build_text`/`rsx_vp_build_text`, shared with the SPIR-V cache warm-up (`rsx_shader_prewarm.h`).
+- **Upstream port:** the two engine changes stand alone, each with its synthetic test (`test_engine_vp_branch_base`, `test_engine_shader_text`); the warm-up depends on the fork's disk cache.
