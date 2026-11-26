@@ -1,5 +1,6 @@
 /* Opt-in RSX FIFO consumer busy accounting; see rsx_fifo_busy.h. */
 #include "rsx_fifo_busy.h"
+#include "rsx_build_counters.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -285,4 +286,108 @@ void rsx_fifo_busy_idle_end(void)
     if (top >= 0 && is_idle(top)) pop(top);
     else charge();
     if (s.depth == 0 && !s.ignored && s.last_ns - s.period_start_ns >= s_period_ns) report(s.last_ns);
+}
+
+/* ---- First-use build counters (rsx_build_counters.h) --------------------
+ * Always on, unlike the busy accounting above: relaxed atomic adds, at most a
+ * few per pipeline build, shader translation or texture upload. They live here
+ * because every program that links the draw engine or a backend links this
+ * file. */
+static _Atomic uint64_t s_build_n[RSX_BUILD_EVENT_COUNT], s_build_ns[RSX_BUILD_EVENT_COUNT];
+static _Atomic uint64_t s_build_upload_bytes, s_build_slow_uploads, s_build_pipeline_worst_ns;
+static _Atomic uint64_t s_build_shader_memory_hits, s_build_shader_disk_hits, s_build_pcache_bytes;
+static _Atomic uint64_t s_build_pcache_saves, s_build_pcache_save_ns;
+static _Atomic uint32_t s_build_flags;
+static _Atomic int s_build_backend_set;
+static char s_build_backend[8];
+
+static FB_TLS uint64_t t_build_inner_ns;   /* this thread's translation + pipeline time */
+
+uint64_t rsx_build_now_ns(void) { return default_clock(); }
+uint64_t rsx_build_inner_ns(void) { return t_build_inner_ns; }
+
+void rsx_build_note(int event, uint64_t ns, uint64_t bytes)
+{
+    if (event < 0 || event >= RSX_BUILD_EVENT_COUNT) return;
+    atomic_fetch_add_explicit(&s_build_n[event], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_build_ns[event], ns, memory_order_relaxed);
+    if (event == RSX_BUILD_TRANSLATION || event == RSX_BUILD_PIPELINE) t_build_inner_ns += ns;
+    if (event == RSX_BUILD_TEXTURE_UPLOAD) {
+        atomic_fetch_add_explicit(&s_build_upload_bytes, bytes, memory_order_relaxed);
+        if (ns >= RSX_BUILD_SLOW_UPLOAD_NS)
+            atomic_fetch_add_explicit(&s_build_slow_uploads, 1, memory_order_relaxed);
+    } else if (event == RSX_BUILD_PIPELINE) {
+        uint64_t worst = atomic_load_explicit(&s_build_pipeline_worst_ns, memory_order_relaxed);
+        while (ns > worst && !atomic_compare_exchange_weak_explicit(&s_build_pipeline_worst_ns, &worst, ns,
+                                                                    memory_order_relaxed, memory_order_relaxed)) {}
+    }
+}
+
+void rsx_build_note_shader_hit(int disk)
+{
+    atomic_fetch_add_explicit(disk ? &s_build_shader_disk_hits : &s_build_shader_memory_hits, 1,
+                              memory_order_relaxed);
+}
+
+void rsx_build_note_pipeline_cache_save(uint64_t ns)
+{
+    atomic_fetch_add_explicit(&s_build_pcache_saves, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_build_pcache_save_ns, ns, memory_order_relaxed);
+}
+
+void rsx_build_set_flag(uint32_t flag) { atomic_fetch_or_explicit(&s_build_flags, flag, memory_order_relaxed); }
+
+void rsx_build_set_backend(const char* name)
+{
+    int expected = 0;
+    if (!name || !atomic_compare_exchange_strong(&s_build_backend_set, &expected, 1)) return;
+    size_t i = 0;
+    for (; i + 1 < sizeof s_build_backend && name[i]; i++) s_build_backend[i] = name[i];
+    s_build_backend[i] = '\0';
+    atomic_store(&s_build_backend_set, 2);   /* the name is complete */
+}
+
+void rsx_build_set_pipeline_cache_loaded(uint64_t bytes)
+{
+    atomic_store_explicit(&s_build_pcache_bytes, bytes, memory_order_relaxed);
+}
+
+void rsx_build_stats_reset(void)
+{
+    for (int i = 0; i < RSX_BUILD_EVENT_COUNT; i++) { atomic_store(&s_build_n[i], 0); atomic_store(&s_build_ns[i], 0); }
+    atomic_store(&s_build_upload_bytes, 0); atomic_store(&s_build_slow_uploads, 0);
+    atomic_store(&s_build_pipeline_worst_ns, 0); atomic_store(&s_build_shader_memory_hits, 0);
+    atomic_store(&s_build_shader_disk_hits, 0); atomic_store(&s_build_pcache_bytes, 0);
+    atomic_store(&s_build_pcache_saves, 0); atomic_store(&s_build_pcache_save_ns, 0);
+    atomic_store(&s_build_flags, 0); atomic_store(&s_build_backend_set, 0);
+    memset(s_build_backend, 0, sizeof s_build_backend);
+    t_build_inner_ns = 0;
+}
+
+int ps3recomp_rsx_build_stats(struct ps3recomp_rsx_build_stats* out)
+{
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    out->version = PS3RECOMP_RSX_BUILD_STATS_VERSION;
+    out->flags = atomic_load_explicit(&s_build_flags, memory_order_relaxed);
+#define BUILD_LOAD(v) atomic_load_explicit(&(v), memory_order_relaxed)
+    out->programs = BUILD_LOAD(s_build_n[RSX_BUILD_PROGRAM]);
+    out->program_ns = BUILD_LOAD(s_build_ns[RSX_BUILD_PROGRAM]);
+    out->shader_translations = BUILD_LOAD(s_build_n[RSX_BUILD_TRANSLATION]);
+    out->shader_translation_ns = BUILD_LOAD(s_build_ns[RSX_BUILD_TRANSLATION]);
+    out->shader_memory_hits = BUILD_LOAD(s_build_shader_memory_hits);
+    out->shader_disk_hits = BUILD_LOAD(s_build_shader_disk_hits);
+    out->pipelines = BUILD_LOAD(s_build_n[RSX_BUILD_PIPELINE]);
+    out->pipeline_ns = BUILD_LOAD(s_build_ns[RSX_BUILD_PIPELINE]);
+    out->pipeline_worst_ns = BUILD_LOAD(s_build_pipeline_worst_ns);
+    out->texture_uploads = BUILD_LOAD(s_build_n[RSX_BUILD_TEXTURE_UPLOAD]);
+    out->texture_upload_bytes = BUILD_LOAD(s_build_upload_bytes);
+    out->texture_upload_ns = BUILD_LOAD(s_build_ns[RSX_BUILD_TEXTURE_UPLOAD]);
+    out->slow_texture_uploads = BUILD_LOAD(s_build_slow_uploads);
+    out->pipeline_cache_loaded_bytes = BUILD_LOAD(s_build_pcache_bytes);
+    out->pipeline_cache_saves = BUILD_LOAD(s_build_pcache_saves);
+    out->pipeline_cache_save_ns = BUILD_LOAD(s_build_pcache_save_ns);
+#undef BUILD_LOAD
+    if (atomic_load(&s_build_backend_set) == 2) memcpy(out->backend, s_build_backend, sizeof out->backend);
+    return 0;
 }

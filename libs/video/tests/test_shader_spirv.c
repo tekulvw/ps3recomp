@@ -16,6 +16,7 @@
  * POSIX only (mkdtemp). Needs no GPU.
  */
 #include "../rsx_shader_spirv.h"
+#include "../rsx_build_counters.h"   /* the build counters see the same events */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,6 +94,7 @@ int main(void)
     }
     unsetenv("PS3RECOMP_SPIRV_CACHE");
     rsx_hlsl_to_spirv_cache_reset();
+    rsx_build_stats_reset();
 
     /* Memory. */
     check("vertex program translates", translate(kVS, RSX_SHADER_STAGE_VERTEX, g_a, &na) == 0 && na > 5);
@@ -121,6 +123,15 @@ int main(void)
     check("... and again (not cached)", translate("float4 main( {", RSX_SHADER_STAGE_FRAGMENT, g_a, &na) != 0);
     s = stats();
     check("... counted as no translation", s.translations == 4);
+    {
+        struct ps3recomp_rsx_build_stats b;
+        ps3recomp_rsx_build_stats(&b);
+        /* A failed translation still took glslang's time, so it counts as one; the
+         * too-small buffer request was the second memory hit. */
+        check("build counters: every glslang run, timed, and the memory hit",
+              b.shader_translations == 6 && b.shader_translation_ns > 0 && b.shader_memory_hits == 2 &&
+              b.shader_disk_hits == 0 && !(b.flags & RSX_BUILD_FLAG_SPIRV_DISK_CACHE));
+    }
 
     /* Disk. */
     char dir[] = "/tmp/ps3recomp_spirv_cache_XXXXXX";
@@ -143,6 +154,12 @@ int main(void)
     translate(kPS, RSX_SHADER_STAGE_FRAGMENT, g_b, &nb);
     s = stats();
     check("... then from memory", s.memory_hits == 1 && s.disk_hits == 1);
+    {
+        struct ps3recomp_rsx_build_stats b;
+        ps3recomp_rsx_build_stats(&b);
+        check("build counters: the disk hit, and the disk cache flag",
+              b.shader_disk_hits == 1 && (b.flags & RSX_BUILD_FLAG_SPIRV_DISK_CACHE));
+    }
 
     /* Damage the stored key: the file no longer matches the request. */
     if (path[0]) {
