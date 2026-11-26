@@ -34,7 +34,8 @@ PER_PASS = {
     # once per pass
     'GCM_RATE', 'GCM_CTXDBG', 'GCM_DRAINDBG_EVERY', 'GCM_SCANREF', 'GCM_FIFO_SNAP', 'RSX_TRACE',
     # in a branch the stream rarely takes: flip, jump, semaphore, unknown word, 2D subchannel
-    'GCM_FLIPCOUNT', 'GCM_RECDBG', 'GCM_SEMA_ACQUIRE', 'GCM_SEMA_ACQUIRE_MS', 'RTT_DUMP', 'GCM_SUBCH7',
+    # (GCM_SEMA_ACQUIRE[_MS] moved out of the pass, into gcm_acquire_blocking)
+    'GCM_FLIPCOUNT', 'GCM_RECDBG', 'RTT_DUMP', 'GCM_SUBCH7',
     # at the circling recovery report
     'GCM_FIFO_CIRCLE_PASSES',
     # the general (non-plain) per-word path's own diagnostics; any of them

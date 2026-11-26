@@ -2223,6 +2223,7 @@ unsigned long long ps3_ms_now(void)
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
+static int gcm_acquire_evaluate(u32 la, u32 v);
 static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park */
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
@@ -2738,12 +2739,14 @@ static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consu
  * a title spinning on ctrl->ref waits forever with no indication why. Tokyo
  * Jungle did exactly this -- get left the 1 MB ring for IO 0x00F00000, which it
  * never mapped, while put sat at 0x604. Stop at the bad word and say so. */
+static void gcm_acquire_note_derail(void);
 static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
 {
-    static int n = 0;
+    static int n = 0, n2 = 0;
     if (PS3_LOG_FIRST(n, 8))
         fprintf(stderr, "[cellGcmSys] FIFO %s to unmapped IO 0x%08X (word 0x%08X) "
                 "-- not taken, drain stops here\n", kind, target, word);
+    if (PS3_LOG_FIRST(n2, 8)) gcm_acquire_note_derail();
 }
 
 /* A bad branch nearly always means the walker mis-counted a method batch a few
@@ -2810,6 +2813,7 @@ static void gcm_checked_ref_stand_down(u32 io, u32 word)
         fprintf(stderr, " %08X:%08X", io + 4 * k, vm_read32(ea));
     }
     fprintf(stderr, "\n");
+    gcm_acquire_note_derail();
 }
 static void gcm_checked_ref_fail(const char* why, u32 io)
 {
@@ -3097,6 +3101,99 @@ static int gcm_spu_put_kick_on(void)
     return s_spu_put_kick;
 }
 
+/* NV406E semaphore acquire (docs/RSX_SEMAPHORE_ACQUIRE.md). GCM_SEMA_ACQUIRE=1
+ * makes an unsatisfied acquire stop the pass without consuming it, as the
+ * hardware front end waits; GCM_SEMA_ACQUIRE_MS bounds one wait (0: none),
+ * after which the acquire is consumed as without the switch. Off by default:
+ * a title whose label nothing ever writes must not wedge the drain. Both are
+ * read once. Returns 1 when the pass must stop here. */
+static int s_acq_block = -1;
+static unsigned s_acq_bound_ms;
+static _Atomic u32 s_acq_wait_ea;            /* label word a stopped pass waits on; 0: none */
+static u32 s_acq_off, s_acq_val;             /* the acquire being waited on */
+static unsigned long long s_acq_t0;          /* first pass that found it unsatisfied; 0: none */
+static unsigned long long s_acq_waits, s_acq_timeouts, s_acq_wait_ms, s_acq_passed;
+static u32 s_acq_passed_io, s_acq_passed_off;   /* the last unsatisfied acquire consumed */
+static _Atomic unsigned long long s_acq_kicks;
+static int gcm_acquire_blocking(void)
+{
+    if (s_acq_block < 0) {
+        const char* e = getenv("GCM_SEMA_ACQUIRE");
+        const char* t = getenv("GCM_SEMA_ACQUIRE_MS");
+        s_acq_block = e ? atoi(e) != 0 : 0;
+        s_acq_bound_ms = t ? (unsigned)atoi(t) : 0u;
+        if (s_acq_block)
+            fprintf(stderr, "[gcm acquire] semaphore acquires wait for their label (bound %u ms%s)\n",
+                    s_acq_bound_ms, s_acq_bound_ms ? "" : ": none");
+    }
+    return s_acq_block;
+}
+static uint64_t s_ft_sema_t0;          /* defined with PS3_FTRACE below */
+static int gcm_acquire_evaluate(u32 la, u32 v)
+{
+    if (vm_read32(la) == v) {
+        /* The commands behind the acquire are read after the label that
+         * released them, also on a weakly ordered host. */
+        atomic_thread_fence(memory_order_acquire);
+        if (s_acq_t0 && s_acq_off == s_sema_offset && s_acq_val == v) {
+            extern unsigned long long ps3_ms_now(void);
+            const unsigned long long waited = ps3_ms_now() - s_acq_t0;
+            ++s_acq_waits; s_acq_wait_ms += waited;
+            if (s_acq_waits <= 32u || (s_acq_waits % 256u) == 0u)
+                fprintf(stderr, "[gcm acquire] waited %llu ms for label off=0x%X value=%08X at io %08X "
+                        "(waits=%llu total_ms=%llu timeouts=%llu woken_by_spu=%llu)\n",
+                        waited, s_sema_offset, v, s_fifo_getoff, s_acq_waits, s_acq_wait_ms,
+                        s_acq_timeouts, (unsigned long long)atomic_load(&s_acq_kicks));
+        }
+        s_acq_t0 = 0;
+        return 0;
+    }
+    if (!gcm_acquire_blocking()) {
+        /* The old path: consumed unsatisfied. Say so, so a derail that follows
+         * can be told apart from one that does not. */
+        ++s_acq_passed; s_acq_passed_io = s_fifo_getoff; s_acq_passed_off = s_sema_offset;
+        if (s_acq_passed <= 32u || (s_acq_passed % 256u) == 0u)
+            fprintf(stderr, "[gcm acquire] passed an unsatisfied acquire (GCM_SEMA_ACQUIRE off): label off=0x%X == %08X "
+                    "holds %08X at io %08X (passed=%llu)\n", s_sema_offset, v, vm_read32(la), s_fifo_getoff, s_acq_passed);
+        return 0;
+    }
+    extern unsigned long long ps3_ms_now(void);
+    const unsigned long long now = ps3_ms_now();
+    if (!s_acq_t0 || s_acq_off != s_sema_offset || s_acq_val != v) {
+        s_acq_off = s_sema_offset; s_acq_val = v; s_acq_t0 = now ? now : 1;
+    }
+    if (s_acq_bound_ms && now - s_acq_t0 >= s_acq_bound_ms) {
+        ++s_acq_timeouts;
+        fprintf(stderr, "[gcm acquire] gave up after %llu ms on label off=0x%X == %08X (label holds %08X) at io %08X: "
+                "consumed without it, the commands behind it may not be ready (timeouts=%llu)\n",
+                now - s_acq_t0, s_sema_offset, v, vm_read32(la), s_fifo_getoff, s_acq_timeouts);
+        s_acq_t0 = 0;
+        return 0;
+    }
+    if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
+    /* Wake on the label's write: an SPU transfer kicks nothing otherwise. A
+     * write that landed between the read above and this store is caught by
+     * reading the label again. */
+    atomic_store(&s_acq_wait_ea, la);
+    if (vm_read32(la) == v && atomic_exchange(&s_acq_wait_ea, 0u)) cellGcm_fifo_kick_notify();
+    return 1;
+}
+/* At a bad branch: was an acquire consumed unsatisfied, and where. */
+static void gcm_acquire_note_derail(void)
+{
+    fprintf(stderr, "[gcm acquire] at this derail: unsatisfied acquires passed=%llu (last label off=0x%X at io %08X), "
+            "waits=%llu timeouts=%llu\n", s_acq_passed, s_acq_passed_off, s_acq_passed_io, s_acq_waits, s_acq_timeouts);
+}
+static void gcm_acquire_kick_put(u32 ea, u32 size)
+{
+    atomic_thread_fence(memory_order_seq_cst);
+    u32 we = atomic_load_explicit(&s_acq_wait_ea, memory_order_relaxed);
+    if (!we || we - ea >= size) return;
+    if (!atomic_compare_exchange_strong(&s_acq_wait_ea, &we, 0u)) return;
+    atomic_fetch_add(&s_acq_kicks, 1ull);
+    cellGcm_fifo_kick_notify();
+}
+
 static void gcm_kick_stats_spu_put(u32 ea, u32 size);
 void gcm_note_spu_put(u32 ea, u32 size)
 {
@@ -3106,6 +3203,7 @@ void gcm_note_spu_put(u32 ea, u32 size)
         cellGcm_fifo_kick_notify();
     }
     if (s_park_kick > 0 && size) gcm_park_kick_put(ea, size);
+    if (size && atomic_load_explicit(&s_acq_wait_ea, memory_order_relaxed)) gcm_acquire_kick_put(ea, size);
     if (!size || size > 0x40000u) return;
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
@@ -3759,6 +3857,7 @@ static void gcm_rsx_process_fifo_pass(void)
     const int diag = gcm_fifo_diag_armed();
     /* This pass looks at the stream again: a park it ends on is armed anew. */
     if (s_park_kick > 0) atomic_store(&s_park_wait_ea, 0u);
+    atomic_store_explicit(&s_acq_wait_ea, 0u, memory_order_relaxed);   /* likewise an acquire wait */
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
     /* rsx_state feeds only the legacy vtable backend. With the draw engine
      * up and no vtable registered, the state it builds is never read, and
@@ -4203,35 +4302,10 @@ static void gcm_rsx_process_fifo_pass(void)
                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
                             fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
                     }
-                    else if (m == 0x68u && vm_read32(la) != v) {
-            /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
-             * the hardware does. Off by default: a title whose label nothing
-             * ever writes would wedge the drain permanently, and RELEASE on
-             * its own is the half that unblocks a waiting guest. */
-            static int blk = -1; static unsigned blk_ms;
-            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0;
-                           const char* t = getenv("GCM_SEMA_ACQUIRE_MS"); blk_ms = t ? (unsigned)atoi(t) : 0; }
-            if (blk) {
-                /* GCM_SEMA_ACQUIRE_MS=<ms>: a bounded wait. The hardware waits
-                 * for ever; an emulated producer that never comes (a boot-time
-                 * label nobody services yet) would wedge the drain, so after
-                 * <ms> on the same acquire it is consumed and said so. inFAMOUS 2
-                 * acquires a label its SPU lighting writes each frame: waiting
-                 * here is what orders the RSX's sampling after that write. */
-                static u32 b_off, b_val; static unsigned long long b_t0;
-                extern unsigned long long ps3_ms_now(void);
-                const unsigned long long now = ps3_ms_now();
-                if (!b_t0 || b_off != s_sema_offset || b_val != v) { b_off = s_sema_offset; b_val = v; b_t0 = now; }
-                if (!blk_ms || now - b_t0 < blk_ms) {
-                    if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
-                    sem_blocked = 1; break;
-                }
-                { static int tn; if (PS3_LOG_FIRST(tn, 12))
-                    fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
-                            s_sema_offset, v, blk_ms, vm_read32(la)); }
-                b_t0 = 0;
-            }
-        }
+                    else if (m == 0x68u) {
+                        /* docs/RSX_SEMAPHORE_ACQUIRE.md */
+                        if (gcm_acquire_evaluate(la, v)) { sem_blocked = 1; break; }
+                    }
                 }
                 if (sem_blocked) { s_sema_blocked_pass = 1; break; }
                 s_fifo_getoff += 4 + count * 4;
