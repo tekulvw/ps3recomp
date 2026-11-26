@@ -152,6 +152,41 @@ int main(void)
     assert(C5("getsockopt", a, SYS_NET_SOL_SOCKET, SYS_NET_SO_NBIO, OPT, LEN) == 0);
     assert(vm_read32(OPT) == 1);
 
+    /* A datagram that draws ICMP (docs/SYS_NET_UDP_ICMP.md): sent to a
+     * loopback port nobody listens on, it is answered with port unreachable.
+     * As on the console's BSD stack, the unconnected socket must not hear of
+     * it: the next read says EWOULDBLOCK, never ECONNRESET (Winsock's default),
+     * and later traffic still arrives. */
+    {
+        int32_t gone = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+        put_sockaddr(ADDR_B, LOOP, 0);
+        assert(C3("bind", gone, ADDR_B, 16) == 0);
+        vm_write32(LEN, 16);
+        assert(C3("getsockname", gone, ADDR_B, LEN) == 0);
+        assert(C1("socketclose", gone) == 0);   /* ADDR_B: a port with no listener */
+        for (int i = 0; i < 3; i++) {
+            memcpy(vm_base + BUF, "lost", 4);
+            assert(call("sendto", a, BUF, 4, 0, ADDR_B, 16) == 4);
+        }
+        vm_write32(POLLFD, (uint32_t)a);
+        vm_write16(POLLFD + 4, SYS_NET_POLLIN);
+        vm_write16(POLLFD + 6, 0);
+        (void)C3("socketpoll", POLLFD, 1, 200);   /* let the ICMP replies land */
+        for (int i = 0; i < 3; i++) {
+            int32_t r = (int32_t)call("recvfrom", a, BUF, 64, 0, 0, 0);
+            if ((uint32_t)r != 0x80010223u)
+                fprintf(stderr, "datagram after ICMP: recvfrom -> 0x%08X errno %u\n", (uint32_t)r, errno_cell());
+            assert((uint32_t)r == 0x80010223u && errno_cell() == SYS_NET_EWOULDBLOCK);
+        }
+        memcpy(vm_base + BUF, "after", 5);
+        assert(call("sendto", b, BUF, 5, 0, ADDR_A, 16) == 5);
+        vm_write16(POLLFD + 6, 0);
+        assert(C3("socketpoll", POLLFD, 1, 1000) == 1);
+        memset(vm_base + BUF, 0, 16);
+        assert(call("recvfrom", a, BUF, 64, 0, 0, 0) == 5);
+        assert(memcmp(vm_base + BUF, "after", 5) == 0);
+    }
+
     /* TCP: listen, connect, accept, select for readability, round-trip. */
     int32_t l = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_STREAM, 0);
     put_sockaddr(ADDR_A, LOOP, 0);
