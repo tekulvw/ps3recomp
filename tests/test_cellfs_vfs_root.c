@@ -6,6 +6,10 @@
 /* sys_fs.c asks cellGame whether the booted title is an HDD game; this fixture
  * has no cellGame, and ld64 will not leave a weak reference undefined. */
 const char* cellGame_get_hdd_title_id(void) { return 0; }
+/* The open handlers report to the file-open observer (runtime/syscalls/fs_host_observer.cpp,
+ * C++); this C-only fixture installs none, so a no-op stands in. */
+#include "ps3emu/fs_host_observer.h"
+void ps3recomp_fs_report_open(const char* path, int32_t fd, int32_t error) { (void)path; (void)fd; (void)error; }
 
 static unsigned checks;
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)

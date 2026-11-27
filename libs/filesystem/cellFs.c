@@ -17,6 +17,7 @@
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#include "ps3emu/fs_host_observer.h"
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
@@ -437,8 +438,19 @@ static void ensure_parent_dirs(const char* path)
  * File operations
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x718BF5F8 */
+static s32 cellFsOpen_body(const char* path, s32 flags, CellFsFd* fd, CellFsFd* opened);
+
+/* NID: 0x718BF5F8 -- each open is reported to the file-open observer (ps3emu/fs_host_observer.h). */
 s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 size)
+{
+    (void)arg; (void)size;
+    CellFsFd opened = -1;
+    const s32 result = cellFsOpen_body(path, flags, fd, &opened);
+    ps3recomp_fs_report_open(path ? gpath(path) : "", (int32_t)opened, (int32_t)result);
+    return result;
+}
+
+static s32 cellFsOpen_body(const char* path, s32 flags, CellFsFd* fd, CellFsFd* opened)
 {
     printf("[cellFs] Open(path='%s', flags=0x%X)\n", gpath(path) ? gpath(path) : "<null>", flags);
     { extern char* getenv(const char*); static int _bt=-1; if(_bt<0){ const char* e=getenv("PS3_FSLOG_BT"); _bt=(e&&*e&&*e!='0')?1:0; } if(_bt){ extern unsigned int ppu_prof_resolve_host(void*); void* fr[24]; unsigned short n=RtlCaptureStackBackTrace(0,24,fr,0); char ln[600]; int p=snprintf(ln,sizeof ln,"[FSBT]"); unsigned int prev=0; for(unsigned short i=0;i<n;i++){ unsigned int g=ppu_prof_resolve_host(fr[i]); if(g&&g!=prev){ prev=g; p+=snprintf(ln+p,sizeof(ln)-p," %08X",g); } } fprintf(stderr,"%s%c",ln,10); } }
@@ -491,6 +503,7 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
     s_files[slot].host_fp = fp;
 
     *(CellFsFd*)gptr(fd) = (CellFsFd)ps3_bswap32((u32)slot);   /* guest reads the fd big-endian */
+    *opened = slot;
     printf("[cellFs] Open: fd=%d -> '%s'\n", slot, host_path);
     return CELL_OK;
 }

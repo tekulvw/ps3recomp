@@ -37,6 +37,10 @@ with tempfile.TemporaryDirectory(prefix='dma-range-') as tmp:
     assert len(logged) == 8 and len(census) == 1, p.stderr
     c = dict(re.findall(r'(\w+)=(\S+)', census[0]))
     assert c['pc'] == '0x02340' and c['cmd'] == '0x40' and c['n'] == '9' and c['res'] == '224', census
+    # Then ever more rarely: at 1024, 2048 and 4096 rejections (ps3_log_sparse), not at every 1024.
+    p = subprocess.run([str(binary), 'census-many'], env=env, capture_output=True, text=True, check=True, timeout=10)
+    totals = [int(l.split()[3]) for l in p.stderr.splitlines() if l.startswith('[mfc] rejected census')]
+    assert totals == [9, 1024, 2048, 4096], totals
     # SPU_DMA_IMAGES_DUMP=1: a listed image's small transfers carry their
     # payload -- a GET's source words from main memory (0x55 fill), a PUT's
     # source words from local store (0x3F800000+i).

@@ -1342,7 +1342,13 @@ u32 cellGcmGetCurrentField(void)
 /* NID: 0xA53D12AE */
 void cellGcmSetFlipMode(u32 mode)
 {
-    printf("[cellGcmSys] SetFlipMode(mode=%u)\n", mode);
+    /* Titles call this every frame with the same mode (MAG: 80 lines a second,
+     * a quarter of a long session's log, printed to stdout where they tore the
+     * stderr lines around them). Log the first call and each change only. */
+    static int s_logged = 0;
+    if (!s_logged || mode != s_flip_mode)
+        fprintf(stderr, "[cellGcmSys] SetFlipMode(mode=%u)\n", mode);
+    s_logged = 1;
     s_flip_mode = mode;
 }
 
