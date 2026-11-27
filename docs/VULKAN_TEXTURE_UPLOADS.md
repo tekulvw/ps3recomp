@@ -59,6 +59,24 @@ Both are read at the first texture miss after engine init, which logs
 `[rsx engine] texture cache: ...`. The Vulkan backend's object table holds 8,192 objects and its
 texture heap up to 64 blocks, so a full cache still fits in both.
 
+## Surfaces read through guest memory
+
+A texture may read a render target's bytes in a format the target was not rendered in (a depth
+format over an RGBA8 target, say). The engine then stores the target into guest memory after each
+write to it and decodes the texture from there. MAG's options overlay does this every frame with
+a 2048x1024 target sampled as DEPTH24_D8, and the stored pixels don't change while the overlay
+is open. Two changes stop that from repeating every frame:
+
+- **Rewritten-surface hashing.** The engine hashes the stored bytes in full and decodes and
+  uploads them only when they differ from the bytes last uploaded. The counter is
+  `rsx_draw_engine_texture_rewrites_unchanged()`. `PS3RECOMP_RSX_TEXTURE_REWRITE_HASH=0` (engine
+  init) uploads every store, as before.
+- **Readback buffer reuse.** Colour and depth readbacks wait for their copy, so they share one kept
+  host buffer, grown to the next power of two when needed, instead of allocating and freeing one
+  each. `PS3RECOMP_VK_READBACK_REUSE=0` (device creation) allocates one per readback, as before.
+
+The readback itself, a GPU-to-CPU wait for each store, is unchanged.
+
 ## Counters
 
 Build stats version 2 (`docs/RSX_BUILD_STATS.md`) counts uploads as new or changed (and in
