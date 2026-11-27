@@ -907,10 +907,25 @@ static void emit_depthtex_draws(void)
  * the store presents saturated red. Each frame clears again. */
 static void emit_depthtex_clear_draws(void)
 {
-    emit(NV4097_SET_CONTEXT_DMA_ZETA,      CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
-    emit(NV4097_SET_SURFACE_ZETA_OFFSET,   DTEX_OFFSET);
-    emit(NV4097_SET_ZSTENCIL_CLEAR_VALUE,  0x40000000u);   /* depth 0x400000, stencil 0 */
-    emit(NV4097_CLEAR_SURFACE,             0x3u);          /* depth + stencil */
+    /* The clear's surface set is the zeta's own size and pitch, with colour
+     * moved off the display buffer, so a store of the zeta into guest memory
+     * (the path with PS3RECOMP_RSX_DEPTH_SNAPSHOT_CLEARED=0) fits the bytes
+     * behind DTEX_OFFSET. */
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   RTT_OFFSET);
+    emit(NV4097_SET_SURFACE_PITCH_A,         DTEX_DIM * 4u);
+    emit(NV4097_SET_CONTEXT_DMA_ZETA,        CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
+    emit(NV4097_SET_SURFACE_ZETA_OFFSET,     DTEX_OFFSET);
+    emit(NV4097_SET_SURFACE_PITCH_Z,         DTEX_DIM * 4u);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, DTEX_DIM << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   DTEX_DIM << 16);
+    emit(NV4097_SET_ZSTENCIL_CLEAR_VALUE,    0x40000000u);   /* depth 0x400000, stencil 0 */
+    emit(NV4097_CLEAR_SURFACE,               0x3u);          /* depth + stencil */
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   0u);
+    emit(NV4097_SET_SURFACE_PITCH_A,         1280u * 4u);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
     emit(NV4097_SET_SURFACE_ZETA_OFFSET, 0u);
     emit(NV4097_SET_DEPTH_TEST_ENABLE,   0u);
     emit(NV4097_SET_DEPTH_MASK,          0u);
