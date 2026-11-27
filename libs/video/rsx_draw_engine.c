@@ -137,6 +137,7 @@ typedef struct {
     int cleared;
     u32 queued_clear_planes; /* depth2/stencil4, not arbitrary draw writes */
     int had_write;
+    int cleared_since_store; /* the guest cleared the depth after the last store */
     int snapshot_valid;
     u64 depth_serial;      /* g.write_serial of the last depth write or clear */
     int guest_dirty;       /* written since guest memory last got a copy     */
@@ -1155,6 +1156,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->cleared = 0;
     z->queued_clear_planes = 0;
     z->had_write = 0;
+    z->cleared_since_store = 0;
     z->snapshot_valid = 0;
     z->depth_serial = 0;
     z->guest_dirty = 0;
@@ -1162,20 +1164,27 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     return slot;
 }
 
-/* A depth target read back as a texture, but only once the pass has executed
- * a depth-WRITING draw: a write-enable bit alone does not prove the pass
- * produced a usable depth map, and a clear-only zeta falls through to guest
- * memory instead (rsx_live_draw.c:6016-6018, 6265-6269). */
+/* A depth target read back as a texture, from the backend's GPU copy, once
+ * the host depth defines its contents (docs/DEPTH_READS_FROM_THE_GPU.md): a
+ * depth-writing draw ran since the last clear, or the guest cleared it since
+ * guest memory last got a copy -- the store would copy exactly that host
+ * depth. A zeta the guest never cleared or drew into falls through to guest
+ * memory. PS3RECOMP_RSX_DEPTH_SNAPSHOT_CLEARED=0 (read at engine init) keeps
+ * the old rule: a depth-writing draw only. */
+static int s_snapshot_cleared = 1;
+static unsigned long long s_cleared_snapshots;
 static u32 eng_zdepth_snapshot(u32 slot)
 {
     eng_zdepth* z = &g.zdepths[slot];
-    if (!z->handle || !z->had_write) return 0;
+    const int cleared_only = s_snapshot_cleared && !z->had_write && z->cleared_since_store && z->guest_dirty;
+    if (!z->handle || !(z->had_write || cleared_only)) return 0;
     { static int off = -1; if (off < 0) off = getenv("RSX_ENG_NO_DEPTH_SNAPSHOT") ? 1 : 0;
       if (off) return 0; }
     if (z->snapshot_valid && z->snapshot) return z->snapshot;
     if (!g.be->depth_snapshot) return 0;
     const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
     if (!tex) return 0;
+    if (cleared_only) s_cleared_snapshots++;
     /* The previous snapshot is stale (a clear invalidated it): release it.
      * Overwriting the handle leaked one backend object per depth pass that a
      * later pass sampled, and after some minutes of play the backend's object
@@ -1915,6 +1924,7 @@ static void eng_depth_unstored(const rsx_dsp_texture* t, u32 base_fmt, int reaso
 }
 u64 rsx_draw_engine_depth_unstored_count(void) { return atomic_load(&s_depth_unstored); }
 unsigned long long rsx_draw_engine_texture_rewrites_unchanged(void) { return s_rewrites_unchanged; }
+unsigned long long rsx_draw_engine_cleared_depth_snapshots(void) { return s_cleared_snapshots; }
 /* A texture reads a colour target the same draw renders to, and the backend
  * has no color_snapshot to give it a copy: the texture reads guest memory as
  * it is, which does not hold what the GPU rendered. Counted, reported once. */
@@ -1975,6 +1985,7 @@ static int eng_zdepth_to_guest(u32 slot)
     ENG_PH_END(ENG_PH_ZD_STORE, ph_store);
 stored:
     z->guest_dirty = 0;
+    z->cleared_since_store = 0;
     eng_textures_touch(z->location, z->offset, z->pitch * h);
     if (eng_coherence_log())
         fprintf(stderr, "[rsx engine] depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
@@ -5169,6 +5180,9 @@ static void sink_end_core(void* user, const rsx_dispatch* r)
     if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
         g.zdepths[zslot].had_write = 1;
+        /* A snapshot taken before this write (one of a cleared target, say)
+         * no longer shows the depth: the next fetch copies again. */
+        if (s_snapshot_cleared) g.zdepths[zslot].snapshot_valid = 0;
         eng_zdepth_wrote(zslot, &sf);
     }
 }
@@ -5251,6 +5265,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
              * texture consumer resolves the newly written pass exactly once. */
             g.zdepths[zslot].had_write = 0;
             g.zdepths[zslot].snapshot_valid = 0;
+            g.zdepths[zslot].cleared_since_store = 1;
             eng_zdepth_wrote(zslot, &sf);
         }
     }
@@ -5384,6 +5399,8 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
     draw_observer_reset();
     g.width  = width  ? width  : 1280;
     g.height = height ? height : 720;
+    { const char* e = getenv("PS3RECOMP_RSX_DEPTH_SNAPSHOT_CLEARED");
+      s_snapshot_cleared = !(e && !strcmp(e, "0")); }
     { const char* e = getenv("PS3RECOMP_RSX_TEXTURE_IN_PLACE");
       s_texture_in_place = !(e && !strcmp(e, "0")); }
     { const char* e = getenv("PS3RECOMP_RSX_TEXTURE_REWRITE_HASH");

@@ -228,6 +228,13 @@ jobs:
           # those bytes instead, which is exactly the failure above.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex --frames=60
+          # The same zeta only CLEARED (to about 0.25), never drawn into, then
+          # sampled as DEPTH24_D8: served from a GPU snapshot of the host depth
+          # (docs/DEPTH_READS_FROM_THE_GPU.md), and through guest memory with
+          # PS3RECOMP_RSX_DEPTH_SNAPSHOT_CLEARED=0. Both must present the same
+          # pixel, every frame.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex-clear --frames=60
+          PS3RECOMP_METAL_HEADLESS=1 PS3RECOMP_RSX_DEPTH_SNAPSHOT_CLEARED=0 ./build/ps3recomp_host --depthtex-clear --frames=60
           # Multiple render targets: an MRT1 set at two offscreen offsets,
           # both members written by ONE draw whose fragment program exports
           # r0 and r2 -- a deferred renderer's G-buffer pass. The display

@@ -416,6 +416,9 @@ int rsx_draw_engine_async_available(void);
  * same pixels, which therefore were not decoded or uploaded again
  * (PS3RECOMP_RSX_TEXTURE_REWRITE_HASH). */
 unsigned long long rsx_draw_engine_texture_rewrites_unchanged(void);
+/* Depth snapshots taken of a target the guest had only cleared since its
+ * last store (docs/DEPTH_READS_FROM_THE_GPU.md). */
+unsigned long long rsx_draw_engine_cleared_depth_snapshots(void);
 /* Texture reads of depth that reached neither a snapshot, a GPU view nor a
  * guest-memory store (see the engine's one-time report). */
 u64 rsx_draw_engine_depth_unstored_count(void);

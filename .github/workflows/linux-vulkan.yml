@@ -135,8 +135,17 @@ jobs:
           # before any backend exists (the first pass still runs it).
           for m in "" "--draw" "--depth" "--quads" "--shader" \
                    "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube" \
-                   "--depthbounds" "--split-present" "--feedback"; do
-            rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
+                   "--depthbounds" "--split-present" "--feedback" "--depthtex-clear" "--depthtex-clear-off"; do
+            # --depthtex-clear-off: the cleared zeta through guest memory, as
+            # before PS3RECOMP_RSX_DEPTH_SNAPSHOT_CLEARED; same pixel required.
+            rc=0
+            if [ "$m" = "--depthtex-clear-off" ]; then
+              PS3RECOMP_RSX_DEPTH_SNAPSHOT_CLEARED=0 ./build/ps3recomp_host --depthtex-clear --frames=8 > run.log 2>&1 || rc=$?
+            elif [ "$m" = "--depthtex-clear" ]; then
+              ./build/ps3recomp_host --depthtex-clear --frames=8 > run.log 2>&1 || rc=$?
+            else
+              ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
+            fi
             name=${m:-default}
             echo "::group::ps3recomp_host $name -> exit $rc"; cat run.log; echo "::endgroup::"
             [ "$rc" -eq 0 ] || { echo "::error::$name: exit $rc"; fail=1; }
