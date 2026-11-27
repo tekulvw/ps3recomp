@@ -973,7 +973,7 @@ static void vkpt_commit(int host)
  * reuse; further empty ones are freed. PS3RECOMP_VK_TEXTURE_HEAP=0 (read at
  * device creation) gives every texture its own allocation again. */
 #define VK_TH_BLOCK      ((VkDeviceSize)64 << 20)
-#define VK_TH_MAX_BLOCKS 32u
+#define VK_TH_MAX_BLOCKS 64u
 #define VK_TH_LARGEST    (VK_TH_BLOCK / 4)
 #define VK_TH_RANGES     1024u
 typedef struct { VkDeviceSize off, size; } vk_th_range;
@@ -3529,7 +3529,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
  * Pipelines, draws and textures are the next stages; until then
  * pipeline_create reports 0, which the engine caches as "cannot build".
  * -------------------------------------------------------------------------*/
-#define VK_ENG_MAX_OBJ 2048          /* the engine's texture cache is 1024 */
+#define VK_ENG_MAX_OBJ 8192          /* the engine's texture cache is up to 4096 */
 
 enum { VK_ENG_FREE = 0, VK_ENG_COLOR, VK_ENG_DEPTH, VK_ENG_TEXTURE, VK_ENG_VIEW };
 
@@ -4596,6 +4596,25 @@ static int vk_eng_texture_reusable(void* user, u32 texture, rsx_be_format fmt, u
     u32 bpp;
     return vk_eng_format(fmt, &bpp) == o->fmt && w == o->w && h == o->h && (mips ? mips : 1u) == o->mips &&
            (faces == 6u) == (o->cube != 0) && remap == o->remap && rsx_fmt == o->rsx_fmt;
+}
+
+/* texture_cache_budget: a quarter of the largest device-local heap. The
+ * engine keeps its 1,024 textures whatever this says and grows past them
+ * only while their decoded size fits, so the budget only bites on small
+ * heaps (a 4 GB card, an integrated GPU's carve-out); on a larger card the
+ * engine's entry cap is the limit. The heap's size, not VK_EXT_memory_budget:
+ * that needs an instance and a device extension enabled at creation for a
+ * number this coarse a rule does not need. PS3RECOMP_RSX_TEXTURE_CACHE_MB
+ * overrides it (engine). */
+static u64 vk_eng_texture_cache_budget(void* user)
+{
+    (void)user;
+    VkDeviceSize best = 0;
+    for (u32 i = 0; i < s_vk.memprops.memoryHeapCount; i++)
+        if ((s_vk.memprops.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+            s_vk.memprops.memoryHeaps[i].size > best)
+            best = s_vk.memprops.memoryHeaps[i].size;
+    return (u64)(best / 4u);
 }
 
 /* Where the view for a (surface, crossbar, format) was last found. The engine
@@ -7165,6 +7184,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .texture_upload       = owner_vk_eng_texture_upload,
     .texture_release      = owner_vk_eng_texture_release,
     .texture_reusable     = vk_eng_texture_reusable,
+    .texture_cache_budget = vk_eng_texture_cache_budget,
     .color_target_create  = owner_vk_eng_color_target_create,
     .color_target_release = owner_vk_eng_color_target_release,
     .surface_view         = owner_vk_eng_surface_view,

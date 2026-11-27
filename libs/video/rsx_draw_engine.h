@@ -115,9 +115,14 @@ typedef struct rsx_be_render_state {
 #define RSX_BE_MAX_COLOR_TARGETS   4
 
 /* How many distinct guest textures the engine keeps before it evicts the
- * least recently used one. Public so the eviction test can be exact about
- * where the boundary is rather than assuming a number. */
+ * least recently used one: always at least this many, and exactly this many
+ * when the backend gives no memory budget (texture_cache_budget). Public so
+ * the eviction test can be exact about where the boundary is rather than
+ * assuming a number. */
 #define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
+/* With a budget, the cache grows past RSX_DRAW_ENGINE_TEXTURE_CACHE entries
+ * while their textures fit in it, up to this many. */
+#define RSX_DRAW_ENGINE_TEXTURE_CACHE_MAX 4096
 
 /* ---- the backend interface ---------------------------------------------- */
 
@@ -333,6 +338,13 @@ typedef struct rsx_draw_backend {
      * one. 0, or NULL, keeps creating a new one. */
     int  (*texture_reusable)(void* user, u32 texture, rsx_be_format fmt, u32 w, u32 h,
                              u32 mips, u32 faces, u32 remap, u32 rsx_fmt);
+    /* Optional. How many bytes of host texture data the engine's texture
+     * cache may keep resident, asked once, after init: the cache then keeps
+     * more than RSX_DRAW_ENGINE_TEXTURE_CACHE textures while the decoded
+     * size of all of them fits (never fewer, never more than
+     * RSX_DRAW_ENGINE_TEXTURE_CACHE_MAX). 0, or NULL, keeps the fixed
+     * RSX_DRAW_ENGINE_TEXTURE_CACHE entries. */
+    u64  (*texture_cache_budget)(void* user);
 } rsx_draw_backend;
 
 /* The next run of set rows in a 512-row mask at or after *row: its first row

@@ -143,6 +143,10 @@ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
     stub.last_upload_texture = t;
 }
 
+static u64 s_stub_budget;
+static int s_stub_budget_asks;
+static u64 stub_texture_cache_budget(void* u) { (void)u; s_stub_budget_asks++; return s_stub_budget; }
+
 static int stub_texture_reusable(void* u, u32 t, rsx_be_format f, u32 w, u32 h, u32 mips,
                                  u32 faces, u32 remap, u32 rsx_fmt)
 {
@@ -807,6 +811,120 @@ static void test_texture_in_place(void)
     CHECK(stub.n_texture_create == 2 && stub.n_texture_release == 1,
           "a backend without texture_reusable gets a new texture per change");
     engine_down();
+}
+
+/* Bind unit 0 to a w x h A8R8G8B8 linear texture with one level. */
+static void bind_texture_sized(u32 offset, u32 w, u32 h)
+{
+    m(M_TEX_UNIT + 0x00, offset);
+    m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16));
+    m(M_TEX_UNIT + 0x0C, 0x80000000u);
+    m(M_TEX_UNIT + 0x10, 0xAAE4u);
+    m(M_TEX_UNIT + 0x18, (w << 16) | h);
+}
+
+/* How many distinct textures stay resident when `count` are drawn once each
+ * in order, then the first is drawn again: the creates that last draw costs
+ * (0 when the first is still cached). */
+static int texture_cache_refetch(u32 count, u32 side)
+{
+    const u32 stride = side * side * 4u;
+    for (u32 i = 0; i < count; i++) {
+        rsx_draw_engine_present();
+        bind_texture_sized(TEX_OFFSET + i * stride, side, side);
+        draw_triangle();
+    }
+    const int before = stub.n_texture_create;
+    rsx_draw_engine_present();
+    bind_texture_sized(TEX_OFFSET, side, side);
+    draw_triangle();
+    return stub.n_texture_create - before;
+}
+
+/* The cache's size. Without a budget it holds RSX_DRAW_ENGINE_TEXTURE_CACHE
+ * entries. With one it holds more while their decoded size fits, never
+ * fewer than that and never more than RSX_DRAW_ENGINE_TEXTURE_CACHE_MAX,
+ * evicting the least recently used when either limit is reached.
+ * PS3RECOMP_RSX_TEXTURE_CACHE_ENTRIES fixes the count and ignores the
+ * budget; PS3RECOMP_RSX_TEXTURE_CACHE_MB overrides the backend's budget. */
+static void test_texture_cache_budget(void)
+{
+    printf("-- texture cache budget\n");
+    const u32 floor = RSX_DRAW_ENGINE_TEXTURE_CACHE, cap = RSX_DRAW_ENGINE_TEXTURE_CACHE_MAX;
+    const u64 small = 4u * 4u * 4u;                       /* a 4x4 texture, decoded */
+
+    /* No hook: the fixed count, as before. */
+    engine_up();
+    CHECK(texture_cache_refetch(floor + 1, 4) == 1, "no budget: %u entries, the first of %u evicted", floor, floor + 1);
+    engine_down();
+
+    /* A budget that fits everything: the cache grows past the old count. */
+    g_stub_backend.texture_cache_budget = stub_texture_cache_budget;
+    s_stub_budget = (u64)cap * small; s_stub_budget_asks = 0;
+    engine_up();
+    CHECK(texture_cache_refetch(floor + 500, 4) == 0 && s_stub_budget_asks == 1,
+          "a budget that fits keeps %u textures (asked %d time)", floor + 500, s_stub_budget_asks);
+    engine_down();
+
+    /* ... but never more than the cap (count eviction). */
+    engine_up();
+    CHECK(texture_cache_refetch(cap + 1, 4) == 1, "never more than %u entries", cap);
+    engine_down();
+
+    /* A budget of 1,200 small textures: 1,201 evict the oldest (budget eviction). */
+    s_stub_budget = 1200u * small;
+    engine_up();
+    CHECK(texture_cache_refetch(1200, 4) == 0, "1,200 textures fit a 1,200-texture budget");
+    engine_down();
+    engine_up();
+    CHECK(texture_cache_refetch(1201, 4) == 1, "the 1,201st evicts the least recently used");
+    { struct ps3recomp_rsx_build_stats st; ps3recomp_rsx_build_stats(&st);
+      CHECK(st.texture_evictions >= 1, "budget evictions are counted"); }
+    engine_down();
+
+    /* A budget too small for even the guaranteed entries: still the old count. */
+    s_stub_budget = 1;
+    engine_up();
+    CHECK(texture_cache_refetch(floor, 4) == 0, "a tiny budget still keeps %u entries", floor);
+    engine_down();
+    engine_up();
+    CHECK(texture_cache_refetch(floor + 1, 4) == 1, "... and evicts past them");
+    engine_down();
+
+    /* The budget counts decoded bytes: 1,100 4x4 textures fit a budget of
+     * 1,050 16x16 ones, 1,100 16x16 textures do not. */
+    s_stub_budget = 1050u * 16u * small;
+    engine_up();
+    CHECK(texture_cache_refetch(1100, 4) == 0, "small textures fit a budget sized for fewer large ones");
+    engine_down();
+    engine_up();
+    CHECK(texture_cache_refetch(1100, 16) == 1, "large ones past it evict");
+    engine_down();
+
+    /* The switches. */
+    s_stub_budget = (u64)cap * small;
+    setenv("PS3RECOMP_RSX_TEXTURE_CACHE_ENTRIES", "1024", 1);
+    engine_up();
+    CHECK(texture_cache_refetch(floor + 1, 4) == 1, "PS3RECOMP_RSX_TEXTURE_CACHE_ENTRIES=1024 restores the old cache");
+    engine_down();
+    setenv("PS3RECOMP_RSX_TEXTURE_CACHE_ENTRIES", "2000", 1);
+    engine_up();
+    CHECK(texture_cache_refetch(2000, 4) == 0, "PS3RECOMP_RSX_TEXTURE_CACHE_ENTRIES=2000 keeps 2,000");
+    engine_down();
+    engine_up();
+    CHECK(texture_cache_refetch(2001, 4) == 1, "... and no more");
+    engine_down();
+    unsetenv("PS3RECOMP_RSX_TEXTURE_CACHE_ENTRIES");
+    setenv("PS3RECOMP_RSX_TEXTURE_CACHE_MB", "0", 1);
+    engine_up();
+    CHECK(texture_cache_refetch(floor + 1, 4) == 1, "PS3RECOMP_RSX_TEXTURE_CACHE_MB=0 turns the budget off");
+    engine_down();
+    g_stub_backend.texture_cache_budget = NULL;
+    setenv("PS3RECOMP_RSX_TEXTURE_CACHE_MB", "1", 1);
+    engine_up();
+    CHECK(texture_cache_refetch(floor + 500, 4) == 0, "PS3RECOMP_RSX_TEXTURE_CACHE_MB=1 gives a budget without the hook");
+    engine_down();
+    unsetenv("PS3RECOMP_RSX_TEXTURE_CACHE_MB");
 }
 
 /* The texture source override: a picture of the embedder's own in place of a
@@ -2318,6 +2436,7 @@ int main(int argc, char** argv)
     test_mrt_set();
     test_texture_cache();
     test_texture_in_place();
+    test_texture_cache_budget();
     test_texture_sparse_rehash();
     test_texture_override();
     test_pipeline_key();

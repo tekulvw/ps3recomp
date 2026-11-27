@@ -63,7 +63,7 @@ extern u32 ppu_vm_size;
 
 #define ENG_MAX_SURFACES   64
 #define ENG_MAX_ZDEPTHS    64
-#define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
+#define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE_MAX
 #define ENG_MAX_VTEXTURES  64
 #define ENG_MAX_PIPELINES  8192
 #define ENG_PIPELINE_INDEX 16384u        /* open-addressed key index, 2x the table */
@@ -162,6 +162,7 @@ typedef struct {
     int rewritten;              /* guest bytes rewritten by the engine itself */
     int override_interest;      /* the texture override answered for it */
     u64 override_generation;    /* the override generation it was decoded under */
+    u64 host_bytes;             /* decoded size, what the cache budget counts */
 } eng_texture;
 
 typedef struct {
@@ -203,6 +204,13 @@ static struct {
     u32 n_zdepths;
     eng_texture textures[ENG_MAX_TEXTURES];
     u32 n_textures;
+    /* The texture cache's limits (eng_texture_cache_limits): at most
+     * tex_limit entries; past RSX_DRAW_ENGINE_TEXTURE_CACHE of them only
+     * while tex_bytes, their decoded size, stays within tex_budget (0: no
+     * budget, tex_limit is the fixed count). */
+    u32 tex_limit;
+    int tex_limits_set;
+    u64 tex_budget, tex_bytes;
     eng_pipeline pipelines[ENG_MAX_PIPELINES];
     u32 n_pipelines;
     u16 pipeline_index[ENG_PIPELINE_INDEX];   /* pipelines[] slot + 1, 0 = empty */
@@ -1521,6 +1529,80 @@ static void eng_texcache_stats_tick(void)
             s_tcs.misses * 1000 / (now - s_tcs.t0), s_tcs.picture * 1000 / (now - s_tcs.t0), g.n_textures);
     memset(&s_tcs, 0, offsetof(__typeof__(s_tcs), t0)); s_tcs.t0 = now;
 }
+/* The texture cache's limits, settled at the first miss after init (the
+ * backend's device is up by then):
+ *   PS3RECOMP_RSX_TEXTURE_CACHE_ENTRIES=N  exactly N entries, no budget
+ *                                          (1024 is the old fixed cache);
+ *   PS3RECOMP_RSX_TEXTURE_CACHE_MB=M       a budget of M MiB, whatever the
+ *                                          backend says (0: no budget);
+ *   otherwise the backend's texture_cache_budget, if it has one.
+ * With a budget the cache keeps at least RSX_DRAW_ENGINE_TEXTURE_CACHE
+ * entries, and more, up to RSX_DRAW_ENGINE_TEXTURE_CACHE_MAX, while their
+ * decoded size fits; without one it keeps RSX_DRAW_ENGINE_TEXTURE_CACHE. */
+static void eng_texture_cache_limits(void)
+{
+    if (g.tex_limits_set) return;
+    g.tex_limits_set = 1;
+    g.tex_limit = RSX_DRAW_ENGINE_TEXTURE_CACHE;
+    g.tex_budget = 0;
+    const char* n = getenv("PS3RECOMP_RSX_TEXTURE_CACHE_ENTRIES");
+    const char* mb = getenv("PS3RECOMP_RSX_TEXTURE_CACHE_MB");
+    if (n && *n) {
+        long v = strtol(n, NULL, 0);
+        g.tex_limit = v < 64 ? 64u : v > ENG_MAX_TEXTURES ? (u32)ENG_MAX_TEXTURES : (u32)v;
+    } else {
+        if (mb && *mb) {
+            const long long v = strtoll(mb, NULL, 0);
+            g.tex_budget = v > 0 ? (u64)v << 20 : 0;
+        } else if (g.be && g.be->texture_cache_budget) {
+            g.tex_budget = g.be->texture_cache_budget(g.be->user);
+        }
+        if (g.tex_budget) g.tex_limit = ENG_MAX_TEXTURES;
+    }
+    fprintf(stderr, "[rsx engine] texture cache: %u entries%s", g.tex_limit,
+            g.tex_budget ? ", decoded size budget " : " (fixed)\n");
+    if (g.tex_budget)
+        fprintf(stderr, "%llu MiB past the first %u\n", (unsigned long long)(g.tex_budget >> 20),
+                (unsigned)RSX_DRAW_ENGINE_TEXTURE_CACHE);
+}
+
+/* Bytes the backend holds for a texture: every level of every face (or
+ * slice) as decoded, which is what texture_upload hands over. */
+static u64 eng_texture_host_bytes(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cube, u32 depth)
+{
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    const u32 n = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
+    u64 bytes = 0;
+    u32 d = depth > 1 ? depth : 1u;
+    for (u32 m = 0; m < n; m++) {
+        bytes += (u64)lv[m].tl.dst_row_bytes * lv[m].tl.rows * (cube ? 6u : d);
+        if (d > 1) d >>= 1;
+    }
+    return bytes;
+}
+
+/* Drop cache entry i (its handle released) by moving the last entry into
+ * its place. */
+static void eng_texture_drop(u32 i)
+{
+    eng_texture* e = &g.textures[i];
+    if (e->handle) g.be->texture_release(g.be->user, e->handle);
+    g.tex_bytes -= e->host_bytes;
+    rsx_build_note_texture_eviction();
+    if (i != g.n_textures - 1) g.textures[i] = g.textures[g.n_textures - 1];
+    memset(&g.textures[g.n_textures - 1], 0, sizeof g.textures[0]);
+    g.n_textures--;
+}
+
+static u32 eng_texture_lru(void)
+{
+    u32 index = 0;
+    for (u32 i = 1; i < g.n_textures; i++)
+        if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)
+            index = i;
+    return index;
+}
+
 static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                             u32 levels, u32 pitch, int cube, u32 remap, u32 depth, u64 identity)
 {
@@ -1643,16 +1725,22 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     }
 
     s_tcs.misses++; s_tcs.uploads++; s_tcs.upload_bytes += span;
+    eng_texture_cache_limits();
+    const u64 host_bytes = eng_texture_host_bytes(fmt, w, h, levels, pitch, cube, depth);
+    /* Past the guaranteed entries, make room in the budget first: the least
+     * recently used go (a texture this draw bound is the most recent). */
+    while (g.tex_budget && g.n_textures >= RSX_DRAW_ENGINE_TEXTURE_CACHE &&
+           g.tex_bytes + host_bytes > g.tex_budget)
+        eng_texture_drop(eng_texture_lru());
     u32 index;
     u32 evicted = 0;
-    if (g.n_textures < ENG_MAX_TEXTURES) {
+    u64 evicted_bytes = 0;
+    if (g.n_textures < g.tex_limit) {
         index = g.n_textures++;
     } else {
-        index = 0;
-        for (u32 i = 1; i < g.n_textures; i++)
-            if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)
-                index = i;
+        index = eng_texture_lru();
         evicted = g.textures[index].handle;
+        evicted_bytes = g.textures[index].host_bytes;
         rsx_build_note_texture_eviction();
     }
 
@@ -1679,9 +1767,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     ENG_PH_END(ENG_PH_TEX_UPLOAD, ph_up);
     e.override_interest = s_override_answered;
     e.override_generation = override_generation;
+    e.host_bytes = e.handle ? host_bytes : 0;
     if (!e.handle) ENG_CHECKED_FAIL();
-    if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
-    if (e.handle || !evicted) g.textures[index] = e;
+    if (e.handle && evicted) { g.be->texture_release(g.be->user, evicted); g.tex_bytes -= evicted_bytes; }
+    if (e.handle || !evicted) { g.textures[index] = e; g.tex_bytes += e.host_bytes; }
     return e.handle;
 }
 
