@@ -14,6 +14,7 @@
  *               warning on stderr).
  */
 #include "ppu_fs.cpp"
+#include "../../../runtime/syscalls/fs_host_observer.cpp"   /* the file-open observer the open handlers report to */
 #include "../../../libs/filesystem/edat.c"
 #include "../../../runtime/memory/vm_watch.c"
 #include <set>

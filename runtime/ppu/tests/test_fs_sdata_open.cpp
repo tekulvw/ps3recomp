@@ -21,6 +21,7 @@
  *   test_fs_sdata_open DIR | write-and-die DIR
  */
 #include "ppu_fs.cpp"
+#include "../../../runtime/syscalls/fs_host_observer.cpp"   /* the file-open observer the open handlers report to */
 #include "../../../libs/filesystem/edat.c"
 #include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
 
