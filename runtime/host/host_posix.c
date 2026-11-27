@@ -899,6 +899,24 @@ static void emit_depthtex_draws(void)
     emit_textured_draw_fmt(DTEX_OFFSET, DTEX_DIM, DTEX_DIM, 0x90u | 0x20u);
 }
 
+/* --depthtex-clear: the same zeta, only CLEARED (to depth 0x400000 of
+ * 0xFFFFFF, about 0.25), never drawn into, then sampled as DEPTH24_D8 from a
+ * pass with another zeta bound. The sampled depth is the clear's, read from
+ * the host depth (a GPU snapshot, or a store of it into guest memory); the
+ * guest bytes behind the address hold depth 1.0, so a read of them without
+ * the store presents saturated red. Each frame clears again. */
+static void emit_depthtex_clear_draws(void)
+{
+    emit(NV4097_SET_CONTEXT_DMA_ZETA,      CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
+    emit(NV4097_SET_SURFACE_ZETA_OFFSET,   DTEX_OFFSET);
+    emit(NV4097_SET_ZSTENCIL_CLEAR_VALUE,  0x40000000u);   /* depth 0x400000, stencil 0 */
+    emit(NV4097_CLEAR_SURFACE,             0x3u);          /* depth + stencil */
+    emit(NV4097_SET_SURFACE_ZETA_OFFSET, 0u);
+    emit(NV4097_SET_DEPTH_TEST_ENABLE,   0u);
+    emit(NV4097_SET_DEPTH_MASK,          0u);
+    emit_textured_draw_fmt(DTEX_OFFSET, DTEX_DIM, DTEX_DIM, 0x90u | 0x20u);
+}
+
 /* Bind the two-level texture on unit 0 and draw the small quad through the
  * same passthrough vertex program and TEX r0, TC0 fragment program --tex uses,
  * so the only thing that differs is the texture's mip state.
@@ -1062,6 +1080,7 @@ static void submit_frame(int with_draw)
     else if (with_draw == 10) emit_mrt_draws(0);
     else if (with_draw == 9) emit_mrt_draws(1);
     else if (with_draw == 8) emit_depthtex_draws();
+    else if (with_draw == 16) emit_depthtex_clear_draws();
     else if (with_draw == 7) emit_quad_draws();
     else if (with_draw == 14) emit_feedback_draws();
     else if (with_draw == 6) emit_rtt_draws();
@@ -1270,7 +1289,7 @@ static int run_audio_pad_check(void)
 static int mode_needs_translator(int mode)
 {
     return mode == 3 || mode == 5 || mode == 6 || mode == 8 || mode == 14 ||
-           mode == 9 || mode == 10 || mode == 11 || mode == 15;
+           mode == 9 || mode == 10 || mode == 11 || mode == 15 || mode == 16;
 }
 
 /* ...and which ones must, on a backend that has a translator, have run the
@@ -1292,6 +1311,7 @@ static const char* mode_flag_name(int mode)
     case 10: return "--mrt-a";
     case 11: return "--cube";
     case 15: return "--border";
+    case 16: return "--depthtex-clear";
     default: return "(mode)";
     }
 }
@@ -1400,6 +1420,8 @@ int main(int argc, char** argv)
         /* --border: see emit_border_draw. Metal only for now: the Vulkan
          * backend still samples every border as transparent black. */
         else if (strcmp(argv[i], "--border") == 0) do_draw = 15;
+        /* --depthtex-clear: see emit_depthtex_clear_draws. */
+        else if (strcmp(argv[i], "--depthtex-clear") == 0) do_draw = 16;
     }
 #if !defined(__APPLE__)
     if (do_draw == 15) {
@@ -1472,6 +1494,7 @@ int main(int argc, char** argv)
         upload_textured_quad();
         upload_depthtex_backing();
     }
+    if (do_draw == 16) { upload_textured_quad(); upload_depthtex_backing(); }
     /* --mrt draws both halves as well: the triangle into the set, the quad
      * out of one of its members. */
     if (do_draw == 9 || do_draw == 10) {
@@ -1574,6 +1597,7 @@ int main(int argc, char** argv)
                  : (do_draw == 10) ? MRT_A_ARGB
                  : (do_draw == 9) ? MRT_B_ARGB
                  : (do_draw == 8) ? DTEX_ARGB     /* the sampled depth as a byte */
+                 : (do_draw == 16) ? DTEX_ARGB    /* the cleared depth, 0x400000 ~ 0.25 */
                  : (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
                  : (do_draw == 14) ? 0xFFFF0000u  /* the copy kept the triangle  */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */

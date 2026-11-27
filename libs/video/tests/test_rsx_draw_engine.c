@@ -2062,6 +2062,102 @@ static void test_depth_snapshot_released(void)
     engine_down();
 }
 
+/* A depth target the guest only clears (no depth-writing draw) and a later
+ * pass samples as DEPTH24_D8 (docs/DEPTH_READS_FROM_THE_GPU.md). It is
+ * served from the backend's GPU snapshot, which holds exactly the host depth
+ * the store into guest memory would have copied, instead of a readback, a
+ * store and a decode every time. Not: when the switch is off; a target the
+ * guest never cleared; the bound zeta (a feedback loop); a format with no
+ * GPU path; a clear the store already copied. A depth-writing draw after a
+ * snapshot makes the next fetch copy again. */
+static void cleared_zeta(int clear)
+{
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    m(M_COLOR_MASK, 0u);
+    if (clear) m(M_CLEAR_BUFFERS, RSX_CLEAR_DEPTH);
+}
+/* Sample the zeta at ZETA_OFFSET as `fmt` (linear), with another zeta bound
+ * unless `bound`; the snapshots and readbacks that draw cost. */
+static void sample_zeta(u32 fmt, int bound, int* snapshots, int* readbacks)
+{
+    if (!bound) m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_MASK, 0x01010101u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((fmt | 0x20u) << 8) | (1u << 16));
+    const int s0 = stub.n_depth_snapshot, r0 = stub.n_depth_readback;
+    draw_triangle();
+    *snapshots = stub.n_depth_snapshot - s0;
+    *readbacks = stub.n_depth_readback - r0;
+}
+static void test_cleared_depth_snapshot(void)
+{
+    printf("-- cleared depth target sampled from the GPU\n");
+    int sn = 0, rb = 0;
+    engine_up();
+    const unsigned long long c0 = rsx_draw_engine_cleared_depth_snapshots();
+    cleared_zeta(1);
+    sample_zeta(RSX_TEX_FMT_DEPTH24_D8, 0, &sn, &rb);
+    CHECK(sn == 1 && rb == 0 && rsx_draw_engine_cleared_depth_snapshots() == c0 + 1 &&
+          stub.bound_tex[0] == g_snapshot_kept,
+          "a cleared, unwritten zeta read as DEPTH24_D8 samples a snapshot (%d snapshots, %d readbacks)", sn, rb);
+    sample_zeta(RSX_TEX_FMT_DEPTH24_D8, 0, &sn, &rb);
+    CHECK(sn == 0 && rb == 0, "a second read reuses it (%d, %d)", sn, rb);
+    /* Back on the zeta: a depth-writing draw, then read again: a new copy. */
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_DEPTH_TEST, 1u); m(M_DEPTH_WRITE, 1u); m(M_COLOR_MASK, 0u);
+    m(M_TEX_UNIT + 0x0C, 0u);                 /* unit 0 off for the depth pass */
+    draw_triangle();
+    m(M_TEX_UNIT + 0x0C, 0x80000000u);
+    sample_zeta(RSX_TEX_FMT_DEPTH24_D8, 0, &sn, &rb);
+    CHECK(sn == 1 && rb == 0, "a depth write after the snapshot makes the next read copy again (%d, %d)", sn, rb);
+    engine_down();
+
+    /* The bound zeta (a feedback loop) keeps the store. */
+    engine_up();
+    cleared_zeta(1);
+    sample_zeta(RSX_TEX_FMT_DEPTH24_D8, 1, &sn, &rb);
+    CHECK(sn == 0, "the bound zeta is not served from a snapshot (%d)", sn);
+    engine_down();
+
+    /* A zeta the guest never cleared: guest memory. */
+    engine_up();
+    cleared_zeta(0);
+    m(M_DEPTH_TEST, 1u); m(M_DEPTH_WRITE, 0u);
+    draw_triangle();                              /* binds it: the engine's own first clear */
+    sample_zeta(RSX_TEX_FMT_DEPTH24_D8, 0, &sn, &rb);
+    CHECK(sn == 0, "a zeta the guest never cleared or drew into is not snapshotted (%d)", sn);
+    engine_down();
+
+    /* After the store copied the clear (an A8R8G8B8 read stores it), the
+     * same bytes are in guest memory: no snapshot until the next clear. */
+    engine_up();
+    cleared_zeta(1);
+    sample_zeta(0x85u, 0, &sn, &rb);
+    const int stored = rb;
+    sample_zeta(RSX_TEX_FMT_DEPTH24_D8, 0, &sn, &rb);
+    CHECK(stored == 1 && sn == 0, "a clear already stored to guest memory is read from there (%d store, %d snapshots)", stored, sn);
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_CLEAR_BUFFERS, RSX_CLEAR_DEPTH);
+    sample_zeta(RSX_TEX_FMT_DEPTH24_D8, 0, &sn, &rb);
+    CHECK(sn == 1 && rb == 0, "... and the next clear is snapshotted again (%d, %d)", sn, rb);
+    engine_down();
+
+    /* The switch: the old rule. */
+    setenv("PS3RECOMP_RSX_DEPTH_SNAPSHOT_CLEARED", "0", 1);
+    engine_up();
+    cleared_zeta(1);
+    sample_zeta(RSX_TEX_FMT_DEPTH24_D8, 0, &sn, &rb);
+    CHECK(sn == 0 && rb == 1, "PS3RECOMP_RSX_DEPTH_SNAPSHOT_CLEARED=0 stores the cleared zeta as before (%d, %d)", sn, rb);
+    engine_down();
+    unsetenv("PS3RECOMP_RSX_DEPTH_SNAPSHOT_CLEARED");
+}
+
 /* The same passes against a backend that refills one texture in place: the
  * handle it returns again must stay alive for the draw that samples it. The
  * engine used to release its previous snapshot unconditionally, which here is
@@ -2510,6 +2606,7 @@ int main(int argc, char** argv)
     test_depth_read_without_store();
     test_depth_read_as_color_gpu_view();
     test_depth_snapshot_released();
+    test_cleared_depth_snapshot();
     test_depth_snapshot_refilled_in_place();
     test_color_read_as_float();
     test_immediate_compositor();
