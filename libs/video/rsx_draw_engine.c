@@ -4730,7 +4730,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         else why = 6;   /* target format/count or host formats */
         s_preuse.why[why]++;
     }
-    if (!((s_preuse.hits + s_preuse.misses) % 50000u))
+    /* At 50K, 100K, 200K ... 1.6M draws, then every 3.2M (about once a minute
+     * in a busy match): every 50K draws was more than a line a second. */
+    if (ps3_log_sparse(s_preuse.hits + s_preuse.misses, 50000u, 64u))
     {
         fprintf(stderr, "[rsx engine] pipeline reuse: %llu kept, %llu gathered, %llu mismatches; gathered because: "
                 "none-kept %llu, register %llu, program-moved %llu, program-bytes %llu, layout %llu, render-state %llu, target %llu\n",

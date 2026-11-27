@@ -1,5 +1,6 @@
 // Real directory stream and guest-memory ABI, without game data or a GPU.
 #include "../ppu_fs.cpp"
+#include "../../syscalls/fs_host_observer.cpp"   /* the file-open observer the open handlers report to */
 #include <cassert>
 #include <set>
 #include <string>

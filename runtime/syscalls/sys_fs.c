@@ -4,6 +4,7 @@
 
 #include "sys_fs.h"
 #include "../../libs/filesystem/edat.h"
+#include "../../include/ps3emu/fs_host_observer.h"
 #include "../memory/vm.h"
 #include "../memory/vm_watch.h"
 #include <errno.h>
@@ -434,7 +435,19 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
  * r6 = mode (permissions, ignored on Windows)
  * r7 = arg (unused)
  * -----------------------------------------------------------------------*/
+static int64_t sys_fs_open_body(ppu_context* ctx, int32_t* opened);
+
+/* Reports each open to the file-open observer (ps3emu/fs_host_observer.h). */
 int64_t sys_fs_open(ppu_context* ctx)
+{
+    int32_t opened = -1;
+    const int64_t result = sys_fs_open_body(ctx, &opened);
+    uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
+    ps3recomp_fs_report_open(path_addr ? (const char*)vm_to_host(path_addr) : "", opened, (int32_t)result);
+    return result;
+}
+
+static int64_t sys_fs_open_body(ppu_context* ctx, int32_t* opened)
 {
     uint32_t path_addr  = LV2_ARG_PTR(ctx, 0);
     int32_t  flags      = LV2_ARG_S32(ctx, 1);
@@ -602,6 +615,7 @@ int64_t sys_fs_open(ppu_context* ctx)
     /* FD is slot + 3 (reserve 0=stdin, 1=stdout, 2=stderr) */
     int32_t fd = slot + 3;
     write_be32(fd_out, (uint32_t)fd);
+    *opened = fd;
 
     return CELL_OK;
 }

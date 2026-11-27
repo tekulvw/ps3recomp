@@ -498,9 +498,12 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
               /* Past those 8 lines a rejection is silent, and a title whose
                * startup spends them (MAG's job manager issues 8 size-0 GETs)
                * hides every later one. A census by issue site, printed at
-               * the first rejection past the cap and then every 1024, keeps
-               * a producer whose output is refused visible: the resident job
-               * images name it when the context's id is the policy's. */
+               * the first rejection past the cap, keeps a producer whose
+               * output is refused visible: the resident job images name it
+               * when the context's id is the policy's. After that it prints
+               * at 1Ki, 2Ki, 4Ki ... 512Ki rejections and then every 1Mi
+               * (ps3_log_sparse): at every 1024 MAG's steady thousands a
+               * second filled 70% of a session's log with it. */
               { static struct { uint32_t pc, cmd, size, ea; int img; char res[24]; unsigned long long n; } s_site[16];
                 static unsigned long long s_total; static int s_sites;
                 const uint32_t pc = (uint32_t)spu->pc & SPU_LS_MASK;
@@ -513,7 +516,7 @@ SPU_DMA_BODY int mfc_do_transfer_body(spu_context* spu, uint32_t lsa, uint64_t e
                     s_sites++;
                 }
                 if (j < 16) s_site[j].n++;
-                if (++s_total == 9 || s_total % 1024 == 0) {
+                if (++s_total == 9 || ps3_log_sparse(s_total, 1024, 1024)) {
                     fprintf(stderr, "[mfc] rejected census: %llu rejections by (pc,cmd):", s_total);
                     for (int k = 0; k < s_sites; k++)
                         fprintf(stderr, " pc=0x%05X cmd=0x%X n=%llu img=%d res=%s first(ea/size)=0x%08X/%u",
