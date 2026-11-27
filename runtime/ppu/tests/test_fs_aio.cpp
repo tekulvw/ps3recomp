@@ -6,13 +6,16 @@
  * threads, audio streamers) issue them on one fd at once. The fixture writes
  * a file whose every 4-byte word holds its own offset, then checks both:
  * a cellFsRead after an AIO read continues from the fd's position, and
- * reads racing from four threads each get the words they asked for.
+ * reads racing from four threads each get the words they asked for. It also
+ * checks the file-open observer (ps3emu/fs_host_observer.h): each open, and a
+ * failed one, is reported with its guest path, fd and error.
  *
  *   tools/test_ppu_fs_aio.py
  *   test_fs_aio [DIR]     (DIR: where the file goes; default the temp dir)
  */
 #include "ppu_fs.cpp"
 #include "../../../runtime/memory/vm_watch.c"   /* the announced OS writes (default-off write watch) */
+#include "../../../runtime/syscalls/fs_host_observer.cpp"   /* the file-open observer */
 #include <thread>
 #include <vector>
 
@@ -41,6 +44,17 @@ static int fails = 0;
                            if (!(c)) fails++; } while (0)
 
 static const uint32_t WORDS = 1u << 16;   /* 256 KiB file */
+
+/* The file-open observer's latest event, and how many it saw. */
+static int s_opens = 0;
+static ps3recomp_fs_event s_last;
+static char s_last_path[256];
+static void on_open(const ps3recomp_fs_event* e)
+{
+    ++s_opens; s_last = *e;
+    snprintf(s_last_path, sizeof s_last_path, "%s", e->path);
+    s_last.path = s_last_path;
+}
 
 /* One AIO read of `len` bytes at `off` into guest `buf`, through a CellFsAio
  * at guest `aio`: {fd u32, pad, offset u64, buf u32, pad, size u64}. */
@@ -78,13 +92,32 @@ int main(int argc, char** argv)
     }
 
     ppu_vfs_root = dir;
-    strcpy((char*)mem + 0x100, "/dev_hdd1/ps3recomp_fs_aio.bin");
     ppu_context ctx;
+    /* 0. Without an observer an open reports nothing; with one, each open is
+     *    reported once, with its path and fd, or its error. */
+    strcpy((char*)mem + 0x100, "/dev_hdd1/ps3recomp_fs_missing.bin");
+    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = 0x100; ctx.gpr[4] = 0; ctx.gpr[5] = 0x200;
+    cellFsOpen(&ctx);
+    CHECK(s_opens == 0, "no observer: nothing reported");
+    /* CHECK evaluates its condition twice: call the setter outside it. */
+    const ps3recomp_fs_observer_fn none = ps3recomp_fs_set_observer(on_open);
+    CHECK(none == nullptr, "installing the observer returns no previous one");
+    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = 0x100; ctx.gpr[4] = 0; ctx.gpr[5] = 0x200;
+    cellFsOpen(&ctx);
+    CHECK(s_opens == 1 && s_last.version == PS3RECOMP_FS_OBSERVER_VERSION && s_last.kind == PS3RECOMP_FS_OPEN &&
+          s_last.fd == -1 && s_last.error == (int32_t)CELL_FS_ENOENT && !strcmp(s_last_path, "/dev_hdd1/ps3recomp_fs_missing.bin"),
+          "a failed open is reported with its path and error (fd %d, error 0x%08X)", s_last.fd, (uint32_t)s_last.error);
+
+    strcpy((char*)mem + 0x100, "/dev_hdd1/ps3recomp_fs_aio.bin");
     memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = 0x100; ctx.gpr[4] = 0 /* O_RDONLY */; ctx.gpr[5] = 0x200;
     cellFsOpen(&ctx);
     const uint32_t fd = rd32(0x200);
     CHECK((uint32_t)ctx.gpr[3] == 0, "cellFsOpen returns CELL_OK (fd %u)", fd);
     if ((uint32_t)ctx.gpr[3] != 0) { remove(host); return 1; }
+    CHECK(s_opens == 2 && s_last.fd == (int32_t)fd && s_last.error == 0 && !strcmp(s_last_path, "/dev_hdd1/ps3recomp_fs_aio.bin"),
+          "a successful open is reported with its path and guest fd (%d)", s_last.fd);
+    const ps3recomp_fs_observer_fn removed = ps3recomp_fs_set_observer(nullptr);
+    CHECK(removed == on_open, "removing the observer returns it");
 
     /* 1. The fd's position survives an AIO read. */
     memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd; ctx.gpr[4] = 0x40; ctx.gpr[5] = 0 /* SET */; ctx.gpr[6] = 0x208;

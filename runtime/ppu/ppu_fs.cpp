@@ -20,6 +20,7 @@
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
+#include "ps3emu/fs_host_observer.h" /* the guest file-open observer */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -242,10 +243,13 @@ static DIR* fd_dir(int fd)
 }
 
 /* ---- handlers ---- */
-static void cellFsOpen(ppu_context* ctx)
+/* The open handlers' bodies set *opened to the guest fd they hand out; the
+ * wrappers below report each open to the file-open observer
+ * (ps3emu/fs_host_observer.h) once the body has returned. */
+static void cellFsOpen_body(ppu_context* ctx, char* gpath, size_t gpath_size, int* opened)
 {
-    char gpath[1024], hpath[1100];
-    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    char hpath[1100];
+    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], gpath_size);
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
@@ -300,6 +304,7 @@ static void cellFsOpen(ppu_context* ctx)
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+    *opened = fd;
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
      * streaming layer opens a file and never reads it (You Don't Know Jack's
@@ -325,6 +330,13 @@ static void cellFsOpen(ppu_context* ctx)
     }
     ctx->gpr[3] = CELL_OK;
 }
+static void cellFsOpen(ppu_context* ctx)
+{
+    char gpath[1024];
+    int opened = -1;
+    cellFsOpen_body(ctx, gpath, sizeof gpath, &opened);
+    ps3recomp_fs_report_open(gpath, opened, (int32_t)(uint32_t)ctx->gpr[3]);
+}
 
 /* cellFsSdataOpen(path, flags, fd*, arg*, size): opens a PS3 SDATA/EDAT
  * encrypted-data file and returns an fd whose reads yield the DECRYPTED
@@ -339,10 +351,10 @@ static void cellFsOpen(ppu_context* ctx)
  * no EDAT decryption needed. (A title supplying a still-encrypted NPD .sdat
  * would need the SDATA block cipher; not required here.) The license `arg`
  * (gpr[6]) and its size (gpr[7]) are ignored. */
-static void cellFsSdataOpen(ppu_context* ctx)
+static void cellFsSdataOpen_body(ppu_context* ctx, char* gpath, size_t gpath_size, int* opened)
 {
-    char gpath[1024], hpath[1100];
-    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    char hpath[1100];
+    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], gpath_size);
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
 
@@ -398,6 +410,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         int fd = fd_alloc_file(tf);
         if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
         if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+        *opened = fd;
         fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
                 gpath, fd, dec_sz,
                 dmagic[0]?dmagic[0]:'?', dmagic[1]?dmagic[1]:'?',
@@ -408,9 +421,18 @@ static void cellFsSdataOpen(ppu_context* ctx)
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+        *opened = fd;
     fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
             magic[0]?magic[0]:'?', magic[1]?magic[1]:'?', magic[2]?magic[2]:'?', magic[3]?magic[3]:'?');
     ctx->gpr[3] = CELL_OK;
+}
+
+static void cellFsSdataOpen(ppu_context* ctx)
+{
+    char gpath[1024];
+    int opened = -1;
+    cellFsSdataOpen_body(ctx, gpath, sizeof gpath, &opened);
+    ps3recomp_fs_report_open(gpath, opened, (int32_t)(uint32_t)ctx->gpr[3]);
 }
 
 static void cellFsClose(ppu_context* ctx)

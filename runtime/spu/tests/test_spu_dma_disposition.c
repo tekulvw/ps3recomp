@@ -101,6 +101,13 @@ int main(int argc,char** argv) {
         s.pc=0x2400; assert(mfc_do_transfer(&s,0x104,0x12000,32,0x20)==0);
         return 0;
     }
+    if(argc>1 && !strcmp(argv[1],"census-many")) {
+        /* 4096 malformed transfers from one site: the census opens at the 9th
+         * and then repeats ever more rarely (1024, 2048, 4096), not every 1024. */
+        s.resident_code[1].image_id=224; s.resident_code[1].lsa=0x4000; s.resident_code[1].size=0x1000;
+        for(int i=0;i<4096;i++){ s.pc=0x2340; assert(mfc_do_transfer(&s,0x100,0x12000,0,0x40)==0); }
+        return 0;
+    }
     if(argc>1 && !strcmp(argv[1],"resident")) {
         /* A WWS job's PUT: the context keeps the policy's image id while the
          * job's code is resident (SPU_DMA_IMAGES attribution). */
