@@ -412,6 +412,10 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
 int rsx_draw_engine_async_available(void);
+/* Surfaces the engine stored over a cached texture's bytes again with the
+ * same pixels, which therefore were not decoded or uploaded again
+ * (PS3RECOMP_RSX_TEXTURE_REWRITE_HASH). */
+unsigned long long rsx_draw_engine_texture_rewrites_unchanged(void);
 /* Texture reads of depth that reached neither a snapshot, a GPU view nor a
  * guest-memory store (see the engine's one-time report). */
 u64 rsx_draw_engine_depth_unstored_count(void);

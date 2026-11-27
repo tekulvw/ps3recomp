@@ -3933,6 +3933,7 @@ static void vk_eng_release(void* user, u32 handle)
 
 static void vk_eng_snapshot_pool_drain(void);
 
+static void vk_rb_shutdown(void);
 static void vk_eng_shutdown(void* user)
 {
     vk_pt_stop();   /* joins the show thread before anything it uses goes */
@@ -3941,6 +3942,7 @@ static void vk_eng_shutdown(void* user)
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
     vk_eng_snapshot_pool_drain();
     vk_bat_shutdown();
+    vk_rb_shutdown();
     vk_e5_shutdown();
 }
 
@@ -4475,6 +4477,42 @@ static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
     vk_eng_upload_region(o->im.img, 0, 0, x, y, w, h, (size_t)w * o->bpp, h, rows, row_bytes);
 }
 
+/* The buffer colour and depth readbacks copy into. Both wait for their copy
+ * before they read it, so one buffer serves every readback: it is kept and
+ * grown (to the next power of two) when a readback needs more, instead of a
+ * host allocation and free for each. A title that samples a target through
+ * guest memory reads it back every frame. PS3RECOMP_VK_READBACK_REUSE=0
+ * (read at device creation) allocates one per readback, as before. */
+static vk_buffer s_rb;
+static int s_rb_reuse = 1;
+static unsigned long long s_rb_grows, s_rb_reused;
+static int vk_rb_acquire(vk_buffer* out, VkDeviceSize size)
+{
+    if (!s_rb_reuse) {
+        memset(out, 0, sizeof *out);
+        if (vk_create_host_buffer(out, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) { vk_destroy_buffer(out); return -1; }
+        return 0;
+    }
+    if (s_rb.buf && s_rb.size >= size) { *out = s_rb; s_rb_reused++; return 0; }
+    /* The old one was last used by a readback that waited for its copy. */
+    if (s_rb.buf) vk_destroy_buffer_now(&s_rb);
+    VkDeviceSize want = (VkDeviceSize)1 << 20;
+    while (want < size) want <<= 1;
+    if (vk_create_host_buffer(&s_rb, want, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) { vk_destroy_buffer_now(&s_rb); return -1; }
+    s_rb_grows++;
+    *out = s_rb;
+    return 0;
+}
+/* After the readback: `ok` when its copy completed; otherwise the GPU may
+ * still write the buffer, so it is dropped (destroyed once no batch can use it). */
+static void vk_rb_release(vk_buffer* b, int ok)
+{
+    if (!s_rb_reuse) { vk_destroy_buffer(b); return; }
+    if (!ok && s_rb.buf == b->buf) { vk_destroy_buffer(&s_rb); }
+    memset(b, 0, sizeof *b);
+}
+static void vk_rb_shutdown(void) { if (s_rb.buf) vk_destroy_buffer_now(&s_rb); }
+
 static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                             void* out, u32 out_pitch)
 {
@@ -4483,9 +4521,8 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
     if (!o || !out || !out_pitch || !w || !h || x + w > o->w || y + h > o->h) return;
     const size_t tight = (size_t)w * o->bpp;
     vk_buffer st = {0};
-    if (vk_create_host_buffer(&st, (VkDeviceSize)tight * h, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
-        vk_destroy_buffer(&st); return;
-    }
+    if (vk_rb_acquire(&st, (VkDeviceSize)tight * h)) return;
+    int done = 0;
     if (!vk_begin()) {
         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy region = {
@@ -4505,9 +4542,10 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
             vk_invalidate(&st);
             for (u32 row = 0; row < h; row++)
                 memcpy((u8*)out + (size_t)row * out_pitch, (const u8*)st.ptr + (size_t)row * tight, tight);
+            done = 1;
         }
     }
-    vk_destroy_buffer(&st);
+    vk_rb_release(&st, done);
 }
 
 /* ---- E3: textures ---------------------------------------------------------
@@ -4834,9 +4872,7 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
                                   s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT))
         return -1;
     vk_buffer st = {0};
-    if (vk_create_host_buffer(&st, (VkDeviceSize)w * h * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
-        vk_destroy_buffer(&st); return -1;
-    }
+    if (vk_rb_acquire(&st, (VkDeviceSize)w * h * 4u)) return -1;
     int rc = vk_begin();
     if (!rc) {
         vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
@@ -4861,7 +4897,7 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
                        (const u8*)st.ptr + (size_t)row * w * 4u, (size_t)w * 4u);
         }
     }
-    vk_destroy_buffer(&st);
+    vk_rb_release(&st, !rc);
     return rc ? -1 : 0;
 }
 /* ---- E2: pipelines and draws ---------------------------------------------
@@ -7362,6 +7398,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         vk_window_drop("the driver has no swapchain functions");
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
     { const char* t = getenv("PS3RECOMP_VK_TEXTURE_HEAP"); s_th_on = !(t && !strcmp(t, "0")); }
+    { const char* r = getenv("PS3RECOMP_VK_READBACK_REUSE"); s_rb_reuse = !(r && !strcmp(r, "0")); }
     rsx_build_set_backend("vulkan");
     vk_pcache_open();
 

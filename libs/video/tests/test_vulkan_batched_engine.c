@@ -391,6 +391,7 @@ int main(int argc, char** argv)
     static u8 out[2 * TW * TH * 4 + TW * TH * 4];
     vk_eng_readback(NULL, rt, 0, 0, TW, TH, out, TW * 4);
     vk_eng_readback(NULL, rt2, 0, 0, TW, TH, out + TW * TH * 4, TW * 4);
+    CHECK(s_rb_reuse && s_rb.buf && s_rb_reused >= 1, "readbacks share one kept buffer");
     float* d = (float*)(out + 2 * TW * TH * 4);
     CHECK(vk_eng_depth_readback(NULL, z, 0, 0, TW, TH, d, TW * 4) == 0, "depth readback");
     int lit = 0;
