@@ -72,6 +72,12 @@ typedef struct {
 
     int n_texture_create, n_texture_release, n_texture_upload;
     u8 last_upload_byte;
+    u32 last_upload_texture;
+    /* texture_reusable: what it answers, how often it was asked, and the
+     * arguments of the last question. */
+    int reusable_answer, n_reusable;
+    u32 reusable_texture, reusable_w, reusable_h, reusable_mips, reusable_faces, reusable_remap, reusable_rsx_fmt;
+    rsx_be_format reusable_fmt;
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
@@ -134,6 +140,18 @@ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
     (void)row; (void)rows;
     stub.n_texture_upload++;
     stub.last_upload_byte = src ? *(const u8*)src : 0;
+    stub.last_upload_texture = t;
+}
+
+static int stub_texture_reusable(void* u, u32 t, rsx_be_format f, u32 w, u32 h, u32 mips,
+                                 u32 faces, u32 remap, u32 rsx_fmt)
+{
+    (void)u;
+    stub.n_reusable++;
+    stub.reusable_texture = t; stub.reusable_fmt = f; stub.reusable_w = w; stub.reusable_h = h;
+    stub.reusable_mips = mips; stub.reusable_faces = faces; stub.reusable_remap = remap;
+    stub.reusable_rsx_fmt = rsx_fmt;
+    return stub.reusable_answer && t < STUB_MAX_OBJECTS && stub.alive[t];
 }
 
 static void stub_release(void* u, u32 handle)
@@ -683,6 +701,9 @@ static void test_texture_cache(void)
     CHECK(stub.n_texture_release >= 1,
           "the full cache evicts rather than giving up (%d evictions)",
           stub.n_texture_release);
+    { struct ps3recomp_rsx_build_stats st; ps3recomp_rsx_build_stats(&st);
+      CHECK(st.texture_evictions >= 1 && st.texture_evictions <= (u64)stub.n_texture_release,
+            "evictions are counted (%llu)", (unsigned long long)st.texture_evictions); }
     const u32 newest = stub.last_created_texture;
     const int creates = stub.n_texture_create;
     draw_triangle();
@@ -695,6 +716,96 @@ static void test_texture_cache(void)
     CHECK(stub.n_texture_create == creates + 1,
           "the least recently used entry was the one evicted");
 
+    engine_down();
+}
+
+/* A texture whose guest bytes changed goes into the handle it has when the
+ * backend says that handle takes new contents (texture_reusable): the same
+ * levels are decoded and uploaded, nothing is created or released, and the
+ * draw binds the same handle. A backend that says no, or no hook, or
+ * PS3RECOMP_RSX_TEXTURE_IN_PLACE=0, keeps the old path: a new texture, and
+ * the old one released. Only a content change asks; a new descriptor or a
+ * first bind never does. */
+static void test_texture_in_place(void)
+{
+    printf("-- texture re-upload in place\n");
+    g_stub_backend.texture_reusable = stub_texture_reusable;
+    engine_up();
+    rsx_build_stats_reset();
+    struct ps3recomp_rsx_build_stats st;
+    stub.reusable_answer = 1;
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    memset(vm_base + TEX_OFFSET, 0x31, 4 * 4 * 4);
+    draw_triangle();
+    const u32 first = stub.last_created_texture;
+    CHECK(stub.n_texture_create == 1 && stub.n_reusable == 0,
+          "a first bind creates and does not ask (%d creates, %d asks)", stub.n_texture_create, stub.n_reusable);
+
+    rsx_draw_engine_present();
+    memset(vm_base + TEX_OFFSET, 0x42, 4 * 4 * 4);
+    draw_triangle();
+    CHECK(stub.n_reusable == 1 && stub.reusable_texture == first && stub.reusable_w == 4 &&
+          stub.reusable_h == 4 && stub.reusable_mips == 1 && stub.reusable_faces == 1 &&
+          stub.reusable_remap == 0xAAE4u && stub.reusable_rsx_fmt == (0x85u | 0x20u) &&
+          stub.reusable_fmt == RSX_BE_FMT_R8G8B8A8,
+          "a content change asks about the handle it has, with the arguments it was made with");
+    CHECK(stub.n_texture_create == 1 && stub.n_texture_release == 0 && stub.alive[first] &&
+          stub.n_texture_upload == 2 && stub.last_upload_texture == first && stub.bound_tex[0] == first,
+          "a reusable handle takes the new contents: no create, no release, the same handle bound "
+          "(%d creates, %d releases, %d uploads)", stub.n_texture_create, stub.n_texture_release, stub.n_texture_upload);
+    CHECK(stub.last_upload_byte == 0x42, "the uploaded bytes are the new ones (0x%02X)", stub.last_upload_byte);
+    ps3recomp_rsx_build_stats(&st);
+    CHECK(st.texture_uploads == 2 && st.texture_upload_new == 1 && st.texture_upload_new_bytes == 64 &&
+          st.texture_upload_changed == 1 && st.texture_upload_changed_bytes == 64 && st.texture_upload_in_place == 1 &&
+          st.texture_upload_size_n[0] == 2 && st.texture_evictions == 0,
+          "the counters say one new upload and one changed in place (%llu new, %llu changed, %llu in place)",
+          (unsigned long long)st.texture_upload_new, (unsigned long long)st.texture_upload_changed,
+          (unsigned long long)st.texture_upload_in_place);
+
+    rsx_draw_engine_present();
+    draw_triangle();
+    CHECK(stub.n_texture_upload == 2 && stub.n_reusable == 1,
+          "unchanged bytes afterwards neither upload nor ask");
+
+    /* The backend declines: the old path. */
+    stub.reusable_answer = 0;
+    rsx_draw_engine_present();
+    memset(vm_base + TEX_OFFSET, 0x53, 4 * 4 * 4);
+    draw_triangle();
+    CHECK(stub.n_reusable == 2 && stub.n_texture_create == 2 && stub.alive[first] == 0 &&
+          stub.bound_tex[0] == stub.last_created_texture && stub.last_upload_texture == stub.last_created_texture,
+          "a declined handle is replaced by a new texture and released");
+    ps3recomp_rsx_build_stats(&st);
+    CHECK(st.texture_upload_changed == 2 && st.texture_upload_in_place == 1,
+          "a declined change counts as changed, not in place");
+    engine_down();
+
+    /* The switch: never asked, always a new texture. */
+    setenv("PS3RECOMP_RSX_TEXTURE_IN_PLACE", "0", 1);
+    engine_up();
+    stub.reusable_answer = 1;
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    const u32 off_first = stub.last_created_texture;
+    rsx_draw_engine_present();
+    memset(vm_base + TEX_OFFSET, 0x64, 4 * 4 * 4);
+    draw_triangle();
+    CHECK(stub.n_reusable == 0 && stub.n_texture_create == 2 && stub.alive[off_first] == 0,
+          "PS3RECOMP_RSX_TEXTURE_IN_PLACE=0 keeps creating a new texture (%d asks, %d creates)",
+          stub.n_reusable, stub.n_texture_create);
+    engine_down();
+    unsetenv("PS3RECOMP_RSX_TEXTURE_IN_PLACE");
+
+    /* No hook: as before. */
+    g_stub_backend.texture_reusable = NULL;
+    engine_up();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    rsx_draw_engine_present();
+    memset(vm_base + TEX_OFFSET, 0x75, 4 * 4 * 4);
+    draw_triangle();
+    CHECK(stub.n_texture_create == 2 && stub.n_texture_release == 1,
+          "a backend without texture_reusable gets a new texture per change");
     engine_down();
 }
 
@@ -2206,6 +2317,7 @@ int main(int argc, char** argv)
     test_surface_aliasing();
     test_mrt_set();
     test_texture_cache();
+    test_texture_in_place();
     test_texture_sparse_rehash();
     test_texture_override();
     test_pipeline_key();

@@ -324,6 +324,15 @@ typedef struct rsx_draw_backend {
      * Without it the engine calls bind_vs_constants. */
     void (*bind_vs_constant_rows)(void* user, const void* data, u32 bytes,
                                   const u32* row_mask);
+    /* Optional. 1 when `texture`, which texture_create made with exactly these
+     * arguments, can take new contents through texture_upload of every face
+     * and level into the same handle: every use recorded before those uploads
+     * still reads the old contents and every use after them the new ones. The
+     * engine then re-uploads a texture whose guest bytes changed into the
+     * handle it has, instead of creating a new texture and releasing the old
+     * one. 0, or NULL, keeps creating a new one. */
+    int  (*texture_reusable)(void* user, u32 texture, rsx_be_format fmt, u32 w, u32 h,
+                             u32 mips, u32 faces, u32 remap, u32 rsx_fmt);
 } rsx_draw_backend;
 
 /* The next run of set rows in a 512-row mask at or after *row: its first row

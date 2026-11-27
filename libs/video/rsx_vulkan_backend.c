@@ -394,6 +394,7 @@ static struct {
     int merge;
     u64 passes, merged_draws, feedback_breaks, binds_skipped;
 } s_bat;
+static u64 s_bat_begun;   /* operations begun (vk_bat_begin_op), ever */
 
 /* The render pass a merged draw left open in the open batch (only with
  * s_bat.merge), and the dynamic state already recorded in it. Anything other
@@ -3402,6 +3403,9 @@ typedef struct vk_eng_obj {
     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
+    u8       plain;                  /* TEXTURE: made by texture_create; remap,
+                                      * rsx_fmt and mips are what it was made with */
+    u32      mips;
     u8       snapshot;               /* COLOR: a feedback copy, never a target */
 } vk_eng_obj;
 
@@ -3548,6 +3552,21 @@ static vk_eng_obj* vk_eng_get(u32 handle, int kind)
     return (o->kind == kind) ? o : NULL;
 }
 
+/* The upload that was recorded last (vk_eng_upload_region): its image, the
+ * levels and faces written since that image's full dependency, and where the
+ * recording stood after it. PS3RECOMP_VK_TEXTURE_LEVEL_CHAIN=0 (read at
+ * init) gives every upload its own dependency, as before. */
+static struct {
+    int on;
+    VkImage img;
+    u64 begun, batch, written[2];
+    u32 ops;
+    unsigned long long chained;
+} s_up_chain;
+#define VK_STAGE_ARENA_LIMIT ((VkDeviceSize)4 << 20)
+static int s_stage_arena = 1;
+static unsigned long long s_stage_arena_uses;
+
 /* Copy `rows` rows of `w` texels from host memory into a w x h rectangle at
  * (x, y) of one level / layer of an image that is in GENERAL. */
 static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
@@ -3555,20 +3574,60 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
                                 const void* src, u32 row_bytes)
 {
     if (tight > row_bytes) tight = row_bytes;
+    /* Staging: under batched recording, up to VK_STAGE_ARENA_LIMIT bytes come
+     * from the open batch's arena, which is reused when its slot is recycled,
+     * so an upload allocates nothing. Larger ones, the per-operation path, and
+     * PS3RECOMP_VK_TEXTURE_STAGE_ARENA=0 (read at init) take a pooled host
+     * buffer, as before. Reserving may submit a full batch first; the copy
+     * is then recorded in the next one, whose arena holds its bytes. */
+    const VkDeviceSize bytes = (VkDeviceSize)tight * rows;
     vk_buffer st = {0};
-    if (vk_stage_acquire(&st, (VkDeviceSize)tight * rows)) return -1;
+    VkBuffer src_buf = VK_NULL_HANDLE;
+    VkDeviceSize src_off = 0;
+    u8* dst = NULL;
+    if (s_bat_on && s_stage_arena && bytes <= VK_STAGE_ARENA_LIMIT) {
+        if (vk_bat_reserve(bytes, 0)) return -1;
+        dst = (u8*)vk_bat_alloc(bytes, &src_buf, &src_off);
+        if (!dst) return -1;
+        s_stage_arena_uses++;
+    } else {
+        if (vk_stage_acquire(&st, bytes)) return -1;
+        dst = (u8*)st.ptr; src_buf = st.buf;
+    }
     for (u32 y = 0; y < rows; y++)
-        memcpy((u8*)st.ptr + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
-    int rc = vk_begin();
+        memcpy(dst + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
+    /* A texture's faces and levels arrive one upload each, back to back.
+     * The first records the full dependency (vk_begin) and the image barrier;
+     * one that follows it into another level or face of the same image, with
+     * nothing recorded between them, writes texels nothing since then has
+     * read or written, so it records only its copy. A second write to the
+     * same level and face, or anything else recorded in between, takes the
+     * full path again. Batched recording only. */
+    const u32 sub = layer * 16u + mip;
+    const int chained = s_bat_on && s_bat.open && !s_pass.open && s_up_chain.on && s_up_chain.img == img &&
+                        s_up_chain.begun == s_bat_begun && s_up_chain.batch == s_bat.batches &&
+                        s_up_chain.ops == s_bat.ops && sub < 128u &&
+                        !((s_up_chain.written[sub >> 6] >> (sub & 63u)) & 1u);
+    int rc = chained ? 0 : vk_begin();
     if (!rc) {
-        vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        if (chained) s_up_chain.chained++;
+        else {
+            vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+            s_up_chain.written[0] = s_up_chain.written[1] = 0;
+        }
         VkBufferImageCopy region = {
+            .bufferOffset = src_off,
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
             .imageOffset = { (int32_t)x, (int32_t)y, 0 },
             .imageExtent = { w, h, 1 },
         };
-        pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        pvkCmdCopyBufferToImage(s_vk.cmd, src_buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         rc = vk_submit_and_wait();
+        if (s_bat_on && s_up_chain.on && !rc && s_bat.open && sub < 128u) {
+            s_up_chain.img = img; s_up_chain.begun = s_bat_begun;
+            s_up_chain.batch = s_bat.batches; s_up_chain.ops = s_bat.ops;
+            s_up_chain.written[sub >> 6] |= 1ull << (sub & 63u);
+        } else s_up_chain.img = VK_NULL_HANDLE;
     }
     vk_stage_release(&st);
     return rc;
@@ -4356,6 +4415,7 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
         goto fail;
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->cube = (u8)cube;
     o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
+    o->plain = 1; o->mips = mips; o->remap = remap; o->rsx_fmt = rsx_fmt;
     /* UNDEFINED -> GENERAL for every level and face before the uploads arrive. */
     if (vk_begin()) goto fail;
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -4376,6 +4436,24 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
     /* A BC row is a row of 4x4 blocks; the engine's `rows` already counts them. */
     const size_t tight = o->block ? (size_t)((w + 3u) / 4u) * o->block : (size_t)w * o->bpp;
     vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);
+}
+
+/* texture_reusable: new contents for a texture texture_create made can go
+ * into the same image. Every upload is recorded on the one queue after a
+ * full dependency on everything recorded and submitted before it, so draws
+ * recorded earlier still read the old texels and later ones read the new; a
+ * waited submission (the per-operation path) is ordered the same way. Not
+ * for an image the native side may hold (pins, owner mode), which has to keep
+ * its contents, nor across any change of shape, format or crossbar. */
+static int vk_eng_texture_reusable(void* user, u32 texture, rsx_be_format fmt, u32 w, u32 h,
+                                   u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    const vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
+    if (!o || !o->plain || s_eobj_native_pins[texture] || vulkan_owner_enabled()) return 0;
+    u32 bpp;
+    return vk_eng_format(fmt, &bpp) == o->fmt && w == o->w && h == o->h && (mips ? mips : 1u) == o->mips &&
+           (faces == 6u) == (o->cube != 0) && remap == o->remap && rsx_fmt == o->rsx_fmt;
 }
 
 /* Where the view for a (surface, crossbar, format) was last found. The engine
@@ -6124,7 +6202,10 @@ static int vk_bat_open(void)
     vk_bat_slot* sl = &s_bat.s[s_bat.cur];
     if (sl->ticket && sl->ticket > s_e5.completed) {
         s_bat.slot_waits++;
-        if (vk_e5_reap(sl->ticket, 1)) return -1;
+        const uint64_t w0 = rsx_build_now_ns();
+        const int failed = vk_e5_reap(sl->ticket, 1);
+        rsx_build_note_gpu_wait(rsx_build_now_ns() - w0);
+        if (failed) return -1;
     }
     vk_bat_reap();
     if (pvkResetCommandBuffer(sl->cb, 0) != VK_SUCCESS || pvkResetDescriptorPool(s_vk.device, sl->dpool, 0) != VK_SUCCESS) {
@@ -6143,6 +6224,7 @@ static int vk_bat_open(void)
 
 static int vk_bat_begin_op(void)
 {
+    s_bat_begun++;
     if (vk_bat_open()) return -1;
     vk_pass_close(s_vk.cmd);
     vk_cmd_after_everything(s_vk.cmd);
@@ -6289,6 +6371,9 @@ static int vk_bat_init(void)
     { const char* r = getenv("PS3RECOMP_VK_DESCRIPTOR_REUSE"); s_bat.desc_reuse = r && !strcmp(r, "1"); }
     s_e2.dyn_last.valid = 0;
     { const char* m = getenv("PS3RECOMP_VK_MERGE_PASSES"); s_bat.merge = m && !strcmp(m, "1"); }
+    { const char* c = getenv("PS3RECOMP_VK_TEXTURE_LEVEL_CHAIN");
+      memset(&s_up_chain, 0, sizeof s_up_chain); s_up_chain.on = !(c && !strcmp(c, "0")); }
+    { const char* a = getenv("PS3RECOMP_VK_TEXTURE_STAGE_ARENA"); s_stage_arena = !(a && !strcmp(a, "0")); }
     memset(&s_pass, 0, sizeof s_pass);
     s_e2.vs_last_valid = 0;
     VkPhysicalDeviceProperties p; pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
@@ -6937,6 +7022,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .texture_create       = owner_vk_eng_texture_create,
     .texture_upload       = owner_vk_eng_texture_upload,
     .texture_release      = owner_vk_eng_texture_release,
+    .texture_reusable     = vk_eng_texture_reusable,
     .color_target_create  = owner_vk_eng_color_target_create,
     .color_target_release = owner_vk_eng_color_target_release,
     .surface_view         = owner_vk_eng_surface_view,
