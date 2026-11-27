@@ -29,6 +29,17 @@ void rsx_build_note(int event, uint64_t ns, uint64_t bytes);
  * later, at the first draw of each topology). This is the calling thread's translation and
  * pipeline time so far; a program notes its wall time minus what this grew by during it. */
 uint64_t rsx_build_inner_ns(void);
+/* What a RSX_BUILD_TEXTURE_UPLOAD was, noted next to it: a texture the cache did not hold
+ * (changed == 0) or one whose guest bytes changed (changed != 0, in_place != 0 when it went
+ * into the texture the cache already had). */
+void rsx_build_note_texture_upload_kind(int changed, int in_place, uint64_t bytes);
+/* The texture cache evicted an entry to make room. */
+void rsx_build_note_texture_eviction(void);
+/* The calling thread waited `ns` for the GPU to free a recording slot. */
+void rsx_build_note_gpu_wait(uint64_t ns);
+/* This thread's GPU waits so far; a texture upload notes what this grew by during it. */
+uint64_t rsx_build_gpu_wait_ns(void);
+void rsx_build_note_texture_upload_wait(uint64_t ns);
 /* A shader the translator served from its cache: disk != 0 for the on-disk cache. */
 void rsx_build_note_shader_hit(int disk);
 /* The VkPipelineCache written to its file once, which took `ns`. */

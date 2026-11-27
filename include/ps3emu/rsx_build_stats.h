@@ -32,6 +32,19 @@
  *                      32 new pipelines and at shutdown, on the thread that created the 32nd) and
  *                      the time it took, data read-back and file write included.
  *   backend            "vulkan" or "metal" once that backend's device is up, else "".
+ * Version 2 appends, after backend, what the texture uploads were (docs/RSX_BUILD_STATS.md):
+ *   texture_upload_new, texture_upload_new_bytes  uploads of a texture the cache did not hold: its
+ *                      first use, or a use after it was evicted (texture_evictions counts those).
+ *   texture_upload_changed, texture_upload_changed_bytes  uploads because a cached texture's guest
+ *                      bytes changed; texture_upload_in_place of them went into the texture the
+ *                      cache already had instead of a new one (the backend's texture_reusable).
+ *   texture_upload_size_n/_bytes[4]  every upload by its guest size: up to 64 KiB, up to 1 MiB, up
+ *                      to 4 MiB, larger.
+ *   texture_upload_wait_ns  of texture_upload_ns, the time those uploads waited for the GPU to
+ *                      free a recording slot (Vulkan batched recording; 0 elsewhere).
+ *   gpu_slot_waits, gpu_slot_wait_ns  every such wait, on any work, uploads included.
+ * Fields of a newer version are only ever appended; a caller built against version 1 reads the
+ * same first 144 bytes.
  * The D3D12 backend is not instrumented: under it only the draw engine's programs and texture
  * uploads count, and backend stays "".
  */
@@ -44,7 +57,7 @@
 extern "C" {
 #endif
 
-#define PS3RECOMP_RSX_BUILD_STATS_VERSION 1
+#define PS3RECOMP_RSX_BUILD_STATS_VERSION 2
 #define RSX_BUILD_SLOW_UPLOAD_NS 4000000ull         /* 4 ms */
 #define RSX_BUILD_FLAG_SPIRV_DISK_CACHE    0x1u     /* PS3RECOMP_SPIRV_CACHE is set */
 #define RSX_BUILD_FLAG_VK_PIPELINE_CACHE   0x2u     /* a VkPipelineCache is in use (PS3RECOMP_VK_PIPELINE_CACHE) */
@@ -62,6 +75,13 @@ struct ps3recomp_rsx_build_stats {
     uint64_t pipeline_cache_loaded_bytes;
     uint64_t pipeline_cache_saves, pipeline_cache_save_ns;
     char backend[8];
+    /* version 2 */
+    uint64_t texture_upload_new, texture_upload_new_bytes;
+    uint64_t texture_upload_changed, texture_upload_changed_bytes, texture_upload_in_place;
+    uint64_t texture_evictions;
+    uint64_t texture_upload_size_n[4], texture_upload_size_bytes[4];
+    uint64_t texture_upload_wait_ns;
+    uint64_t gpu_slot_waits, gpu_slot_wait_ns;
 };
 
 /* Fills *out (always returns 0). Thread-safe, lock-free and cheap: a few relaxed loads. */
