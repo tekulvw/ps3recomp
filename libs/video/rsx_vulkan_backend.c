@@ -184,6 +184,9 @@ typedef struct vk_image {
     u32 levels,layers,samples;
     u32 w, h;                        /* extent of level 0 */
     u8  pooled;                      /* returns to the image pool when destroyed */
+    u8  heap;                        /* mem is a texture heap block: heap_off/size of it */
+    u16 heap_block;
+    VkDeviceSize heap_off, heap_size;
 } vk_image;
 
 #define VK_SAMPLER_CACHE 32
@@ -394,6 +397,7 @@ static struct {
     int merge;
     u64 passes, merged_draws, feedback_breaks, binds_skipped;
 } s_bat;
+static u64 s_bat_begun;   /* operations begun (vk_bat_begin_op), ever */
 
 /* The render pass a merged draw left open in the open batch (only with
  * s_bat.merge), and the dynamic state already recorded in it. Anything other
@@ -955,6 +959,142 @@ static void vkpt_commit(int host)
     s_vkpt_n[host] = 0;
 }
 
+/* ---- texture heap -------------------------------------------------------
+ * Engine textures used to get one vkAllocateMemory each, freed with the
+ * texture: a new texture, a changed one and an eviction each cost a driver
+ * allocation or free, which some drivers make expensive. They now take a
+ * range of a large device-local block instead (first fit, ranges merged when
+ * freed), and only an image larger than a quarter block, a full heap or a
+ * failed block allocation falls back to its own allocation, as before. A
+ * range is returned when the image is destroyed, which happens only once no
+ * submitted work can still use it (vk_destroy_image), so it is never reused
+ * under a reader. Blocks hold only optimal-tiling images, so no linear
+ * resource shares one (bufferImageGranularity). One empty block is kept for
+ * reuse; further empty ones are freed. PS3RECOMP_VK_TEXTURE_HEAP=0 (read at
+ * device creation) gives every texture its own allocation again. */
+#define VK_TH_BLOCK      ((VkDeviceSize)64 << 20)
+#define VK_TH_MAX_BLOCKS 32u
+#define VK_TH_LARGEST    (VK_TH_BLOCK / 4)
+#define VK_TH_RANGES     1024u
+typedef struct { VkDeviceSize off, size; } vk_th_range;
+typedef struct {
+    VkDeviceMemory mem;
+    u32 type, nfree;
+    VkDeviceSize used;
+    vk_th_range free[VK_TH_RANGES];  /* sorted by offset, never adjacent */
+} vk_th_block;
+static vk_th_block* s_th[VK_TH_MAX_BLOCKS];
+static pthread_mutex_t s_th_mu = PTHREAD_MUTEX_INITIALIZER;
+static int s_th_on = 1;
+static unsigned long long s_th_ranges, s_th_own, s_th_blocks;
+
+/* First fit of `size` at `align` in block b: its offset, or -1. */
+static int vk_th_take(vk_th_block* b, VkDeviceSize size, VkDeviceSize align, VkDeviceSize* off)
+{
+    if (!align) align = 1;
+    for (u32 i = 0; i < b->nfree; i++) {
+        vk_th_range* r = &b->free[i];
+        const VkDeviceSize a = (r->off + align - 1) / align * align;
+        if (a + size > r->off + r->size) continue;
+        const VkDeviceSize head = a - r->off, tail = r->off + r->size - (a + size);
+        if (head && tail) {
+            if (b->nfree == VK_TH_RANGES) continue;     /* no room to split */
+            memmove(&b->free[i + 2], &b->free[i + 1], (b->nfree - i - 1) * sizeof b->free[0]);
+            b->free[i + 1] = (vk_th_range){ a + size, tail };
+            r->size = head;
+            b->nfree++;
+        } else if (head) r->size = head;
+        else if (tail) { r->off = a + size; r->size = tail; }
+        else { memmove(r, r + 1, (b->nfree - i - 1) * sizeof b->free[0]); b->nfree--; }
+        b->used += size;
+        *off = a;
+        return 0;
+    }
+    return -1;
+}
+/* Return [off, off + size) to block b, merged with its neighbours. 0, or -1
+ * when the range list is full (the range is then lost to the block). */
+static int vk_th_give(vk_th_block* b, VkDeviceSize off, VkDeviceSize size)
+{
+    u32 i = 0;
+    while (i < b->nfree && b->free[i].off < off) i++;
+    const int prev = i > 0 && b->free[i - 1].off + b->free[i - 1].size == off;
+    const int next = i < b->nfree && off + size == b->free[i].off;
+    b->used -= size;
+    if (prev && next) {
+        b->free[i - 1].size += size + b->free[i].size;
+        memmove(&b->free[i], &b->free[i + 1], (b->nfree - i - 1) * sizeof b->free[0]);
+        b->nfree--;
+    } else if (prev) b->free[i - 1].size += size;
+    else if (next) { b->free[i].off = off; b->free[i].size += size; }
+    else {
+        if (b->nfree == VK_TH_RANGES) return -1;
+        memmove(&b->free[i + 1], &b->free[i], (b->nfree - i) * sizeof b->free[0]);
+        b->free[i] = (vk_th_range){ off, size };
+        b->nfree++;
+    }
+    return 0;
+}
+/* Memory for an image with requirements `req` in memory type `type`: a heap
+ * range (im->heap set) or 0 when the caller should allocate on its own. */
+static int vk_th_alloc(vk_image* im, const VkMemoryRequirements* req, u32 type)
+{
+    if (!s_th_on || req->size > VK_TH_LARGEST || vulkan_owner_enabled()) return 0;
+    pthread_mutex_lock(&s_th_mu);
+    int got = 0;
+    for (u32 pass = 0; pass < 2 && !got; pass++) {
+        for (u32 i = 0; i < VK_TH_MAX_BLOCKS && !got; i++) {
+            vk_th_block* b = s_th[i];
+            if (pass == 1 && !b) {
+                /* No block had room: make one. */
+                b = (vk_th_block*)calloc(1, sizeof *b);
+                if (!b) break;
+                VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                             .allocationSize = VK_TH_BLOCK, .memoryTypeIndex = type };
+                if (pvkAllocateMemory(s_vk.device, &mai, NULL, &b->mem) != VK_SUCCESS) { free(b); break; }
+                b->type = type; b->nfree = 1; b->free[0] = (vk_th_range){ 0, VK_TH_BLOCK };
+                s_th[i] = b; s_th_blocks++;
+            }
+            if (!b || b->type != type || !((req->memoryTypeBits >> type) & 1u)) continue;
+            VkDeviceSize off;
+            if (vk_th_take(b, req->size, req->alignment, &off)) continue;
+            im->mem = b->mem; im->heap = 1; im->heap_block = (u16)i; im->heap_off = off; im->heap_size = req->size;
+            got = 1;
+        }
+    }
+    pthread_mutex_unlock(&s_th_mu);
+    if (got) s_th_ranges++;
+    return got;
+}
+/* An image's memory: its heap range back to the block, or its own freed. */
+static void vk_image_free_memory(vk_image* im)
+{
+    if (!im->mem) return;
+    if (!im->heap) { pvkFreeMemory(s_vk.device, im->mem, NULL); return; }
+    pthread_mutex_lock(&s_th_mu);
+    vk_th_block* b = im->heap_block < VK_TH_MAX_BLOCKS ? s_th[im->heap_block] : NULL;
+    if (b && b->mem == im->mem) {
+        (void)vk_th_give(b, im->heap_off, im->heap_size);
+        if (!b->used) {
+            u32 empty = 0;
+            for (u32 i = 0; i < VK_TH_MAX_BLOCKS; i++) if (s_th[i] && !s_th[i]->used) empty++;
+            if (empty > 1) {
+                pvkFreeMemory(s_vk.device, b->mem, NULL);
+                free(b); s_th[im->heap_block] = NULL;
+            }
+        }
+    }
+    pthread_mutex_unlock(&s_th_mu);
+}
+/* Device teardown: every block (all images are gone by then). */
+static void vk_th_shutdown(void)
+{
+    pthread_mutex_lock(&s_th_mu);
+    for (u32 i = 0; i < VK_TH_MAX_BLOCKS; i++)
+        if (s_th[i]) { pvkFreeMemory(s_vk.device, s_th[i]->mem, NULL); free(s_th[i]); s_th[i] = NULL; }
+    pthread_mutex_unlock(&s_th_mu);
+}
+
 static void vk_present_wait_image(VkImage img);
 static void vk_destroy_image_now(vk_image* im)
 {
@@ -963,7 +1103,7 @@ static void vk_destroy_image_now(vk_image* im)
     if (vk_img_pool_keep(im)) return;
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
-    if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
+    vk_image_free_memory(im);
     memset(im, 0, sizeof *im);
 }
 
@@ -3402,6 +3542,9 @@ typedef struct vk_eng_obj {
     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
+    u8       plain;                  /* TEXTURE: made by texture_create; remap,
+                                      * rsx_fmt and mips are what it was made with */
+    u32      mips;
     u8       snapshot;               /* COLOR: a feedback copy, never a target */
 } vk_eng_obj;
 
@@ -3436,7 +3579,7 @@ static void vk_image_destroy_unused(vk_image* im)
 {
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
-    if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
+    vk_image_free_memory(im);
     memset(im, 0, sizeof *im);
 }
 static void vk_pin_retire_reap(u64 completed, int all)
@@ -3548,6 +3691,21 @@ static vk_eng_obj* vk_eng_get(u32 handle, int kind)
     return (o->kind == kind) ? o : NULL;
 }
 
+/* The upload that was recorded last (vk_eng_upload_region): its image, the
+ * levels and faces written since that image's full dependency, and where the
+ * recording stood after it. PS3RECOMP_VK_TEXTURE_LEVEL_CHAIN=0 (read at
+ * init) gives every upload its own dependency, as before. */
+static struct {
+    int on;
+    VkImage img;
+    u64 begun, batch, written[2];
+    u32 ops;
+    unsigned long long chained;
+} s_up_chain;
+#define VK_STAGE_ARENA_LIMIT ((VkDeviceSize)4 << 20)
+static int s_stage_arena = 1;
+static unsigned long long s_stage_arena_uses;
+
 /* Copy `rows` rows of `w` texels from host memory into a w x h rectangle at
  * (x, y) of one level / layer of an image that is in GENERAL. */
 static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
@@ -3555,20 +3713,60 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
                                 const void* src, u32 row_bytes)
 {
     if (tight > row_bytes) tight = row_bytes;
+    /* Staging: under batched recording, up to VK_STAGE_ARENA_LIMIT bytes come
+     * from the open batch's arena, which is reused when its slot is recycled,
+     * so an upload allocates nothing. Larger ones, the per-operation path, and
+     * PS3RECOMP_VK_TEXTURE_STAGE_ARENA=0 (read at init) take a pooled host
+     * buffer, as before. Reserving may submit a full batch first; the copy
+     * is then recorded in the next one, whose arena holds its bytes. */
+    const VkDeviceSize bytes = (VkDeviceSize)tight * rows;
     vk_buffer st = {0};
-    if (vk_stage_acquire(&st, (VkDeviceSize)tight * rows)) return -1;
+    VkBuffer src_buf = VK_NULL_HANDLE;
+    VkDeviceSize src_off = 0;
+    u8* dst = NULL;
+    if (s_bat_on && s_stage_arena && bytes <= VK_STAGE_ARENA_LIMIT) {
+        if (vk_bat_reserve(bytes, 0)) return -1;
+        dst = (u8*)vk_bat_alloc(bytes, &src_buf, &src_off);
+        if (!dst) return -1;
+        s_stage_arena_uses++;
+    } else {
+        if (vk_stage_acquire(&st, bytes)) return -1;
+        dst = (u8*)st.ptr; src_buf = st.buf;
+    }
     for (u32 y = 0; y < rows; y++)
-        memcpy((u8*)st.ptr + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
-    int rc = vk_begin();
+        memcpy(dst + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
+    /* A texture's faces and levels arrive one upload each, back to back.
+     * The first records the full dependency (vk_begin) and the image barrier;
+     * one that follows it into another level or face of the same image, with
+     * nothing recorded between them, writes texels nothing since then has
+     * read or written, so it records only its copy. A second write to the
+     * same level and face, or anything else recorded in between, takes the
+     * full path again. Batched recording only. */
+    const u32 sub = layer * 16u + mip;
+    const int chained = s_bat_on && s_bat.open && !s_pass.open && s_up_chain.on && s_up_chain.img == img &&
+                        s_up_chain.begun == s_bat_begun && s_up_chain.batch == s_bat.batches &&
+                        s_up_chain.ops == s_bat.ops && sub < 128u &&
+                        !((s_up_chain.written[sub >> 6] >> (sub & 63u)) & 1u);
+    int rc = chained ? 0 : vk_begin();
     if (!rc) {
-        vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        if (chained) s_up_chain.chained++;
+        else {
+            vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+            s_up_chain.written[0] = s_up_chain.written[1] = 0;
+        }
         VkBufferImageCopy region = {
+            .bufferOffset = src_off,
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
             .imageOffset = { (int32_t)x, (int32_t)y, 0 },
             .imageExtent = { w, h, 1 },
         };
-        pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        pvkCmdCopyBufferToImage(s_vk.cmd, src_buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         rc = vk_submit_and_wait();
+        if (s_bat_on && s_up_chain.on && !rc && s_bat.open && sub < 128u) {
+            s_up_chain.img = img; s_up_chain.begun = s_bat_begun;
+            s_up_chain.batch = s_bat.batches; s_up_chain.ops = s_bat.ops;
+            s_up_chain.written[sub >> 6] |= 1ull << (sub & 63u);
+        } else s_up_chain.img = VK_NULL_HANDLE;
     }
     vk_stage_release(&st);
     return rc;
@@ -4350,12 +4548,16 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
         vk_find_memory_type(req.memoryTypeBits, 0, &type)) goto fail;
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                  .allocationSize = req.size, .memoryTypeIndex = type };
-    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS ||
-        pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, 0) != VK_SUCCESS ||
+    if (!vk_th_alloc(&o->im, &req, type)) {
+        s_th_own++;
+        if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS) goto fail;
+    }
+    if (pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, o->im.heap ? o->im.heap_off : 0) != VK_SUCCESS ||
         vk_eng_make_view(o->im.img, vf, mips, vk_remap(remap, rsx_fmt), cube, &o->im.view))
         goto fail;
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->cube = (u8)cube;
     o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
+    o->plain = 1; o->mips = mips; o->remap = remap; o->rsx_fmt = rsx_fmt;
     /* UNDEFINED -> GENERAL for every level and face before the uploads arrive. */
     if (vk_begin()) goto fail;
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -4376,6 +4578,24 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
     /* A BC row is a row of 4x4 blocks; the engine's `rows` already counts them. */
     const size_t tight = o->block ? (size_t)((w + 3u) / 4u) * o->block : (size_t)w * o->bpp;
     vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);
+}
+
+/* texture_reusable: new contents for a texture texture_create made can go
+ * into the same image. Every upload is recorded on the one queue after a
+ * full dependency on everything recorded and submitted before it, so draws
+ * recorded earlier still read the old texels and later ones read the new; a
+ * waited submission (the per-operation path) is ordered the same way. Not
+ * for an image the native side may hold (pins, owner mode), which has to keep
+ * its contents, nor across any change of shape, format or crossbar. */
+static int vk_eng_texture_reusable(void* user, u32 texture, rsx_be_format fmt, u32 w, u32 h,
+                                   u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    const vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
+    if (!o || !o->plain || s_eobj_native_pins[texture] || vulkan_owner_enabled()) return 0;
+    u32 bpp;
+    return vk_eng_format(fmt, &bpp) == o->fmt && w == o->w && h == o->h && (mips ? mips : 1u) == o->mips &&
+           (faces == 6u) == (o->cube != 0) && remap == o->remap && rsx_fmt == o->rsx_fmt;
 }
 
 /* Where the view for a (surface, crossbar, format) was last found. The engine
@@ -6124,7 +6344,10 @@ static int vk_bat_open(void)
     vk_bat_slot* sl = &s_bat.s[s_bat.cur];
     if (sl->ticket && sl->ticket > s_e5.completed) {
         s_bat.slot_waits++;
-        if (vk_e5_reap(sl->ticket, 1)) return -1;
+        const uint64_t w0 = rsx_build_now_ns();
+        const int failed = vk_e5_reap(sl->ticket, 1);
+        rsx_build_note_gpu_wait(rsx_build_now_ns() - w0);
+        if (failed) return -1;
     }
     vk_bat_reap();
     if (pvkResetCommandBuffer(sl->cb, 0) != VK_SUCCESS || pvkResetDescriptorPool(s_vk.device, sl->dpool, 0) != VK_SUCCESS) {
@@ -6143,6 +6366,7 @@ static int vk_bat_open(void)
 
 static int vk_bat_begin_op(void)
 {
+    s_bat_begun++;
     if (vk_bat_open()) return -1;
     vk_pass_close(s_vk.cmd);
     vk_cmd_after_everything(s_vk.cmd);
@@ -6289,6 +6513,9 @@ static int vk_bat_init(void)
     { const char* r = getenv("PS3RECOMP_VK_DESCRIPTOR_REUSE"); s_bat.desc_reuse = r && !strcmp(r, "1"); }
     s_e2.dyn_last.valid = 0;
     { const char* m = getenv("PS3RECOMP_VK_MERGE_PASSES"); s_bat.merge = m && !strcmp(m, "1"); }
+    { const char* c = getenv("PS3RECOMP_VK_TEXTURE_LEVEL_CHAIN");
+      memset(&s_up_chain, 0, sizeof s_up_chain); s_up_chain.on = !(c && !strcmp(c, "0")); }
+    { const char* a = getenv("PS3RECOMP_VK_TEXTURE_STAGE_ARENA"); s_stage_arena = !(a && !strcmp(a, "0")); }
     memset(&s_pass, 0, sizeof s_pass);
     s_e2.vs_last_valid = 0;
     VkPhysicalDeviceProperties p; pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
@@ -6937,6 +7164,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .texture_create       = owner_vk_eng_texture_create,
     .texture_upload       = owner_vk_eng_texture_upload,
     .texture_release      = owner_vk_eng_texture_release,
+    .texture_reusable     = vk_eng_texture_reusable,
     .color_target_create  = owner_vk_eng_color_target_create,
     .color_target_release = owner_vk_eng_color_target_release,
     .surface_view         = owner_vk_eng_surface_view,
@@ -7113,6 +7341,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed && vk_load_wsi_device_functions())
         vk_window_drop("the driver has no swapchain functions");
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
+    { const char* t = getenv("PS3RECOMP_VK_TEXTURE_HEAP"); s_th_on = !(t && !strcmp(t, "0")); }
     rsx_build_set_backend("vulkan");
     vk_pcache_open();
 
@@ -7365,6 +7594,7 @@ static void vulkan_original_shutdown(void)
         if (s_vk.window_fence)  pvkDestroyFence(s_vk.device, s_vk.window_fence, NULL);
         if (s_vk.present_pool)  pvkDestroyCommandPool(s_vk.device, s_vk.present_pool, NULL);
         vk_pcache_close();
+        vk_th_shutdown();
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
@@ -7725,7 +7955,7 @@ static void vulkan_image_release(void *user,uint64_t life,uint64_t id,uint64_t g
             }
             if(image->view)pvkDestroyImageView(s_vk.device,image->view,NULL);
             if(image->img)pvkDestroyImage(s_vk.device,image->img,NULL);
-            if(image->mem)pvkFreeMemory(s_vk.device,image->mem,NULL);
+            vk_image_free_memory(image);
             memset(&s_eobj[id],0,sizeof s_eobj[id]);
             memset(&s_eobj_native_image[id],0,sizeof s_eobj_native_image[id]);
             s_eobj_retired[id]=0;

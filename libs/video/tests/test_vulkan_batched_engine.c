@@ -164,6 +164,28 @@ int main(int argc, char** argv)
     CHECK(s_g.on, "guest programs (glslang) available");
     if (!s_g.on) { rsx_vulkan_backend_shutdown(); return 1; }
 
+    /* The texture heap's range list (no device needed): first fit with
+     * alignment, splits, merges on return, and every byte back at the end. */
+    {
+        static vk_th_block blk;
+        memset(&blk, 0, sizeof blk); blk.nfree = 1; blk.free[0] = (vk_th_range){ 0, 1000 };
+        VkDeviceSize o1 = 1, o2 = 1, o3 = 1, o4 = 1;
+        CHECK(!vk_th_take(&blk, 100, 1, &o1) && o1 == 0 && !vk_th_take(&blk, 50, 64, &o2) && o2 == 128 &&
+              !vk_th_take(&blk, 10, 1, &o3) && o3 == 100 && blk.nfree == 2 && blk.used == 160,
+              "heap ranges: first fit, aligned, the gap before an aligned range reused");
+        CHECK(vk_th_take(&blk, 900, 1, &o4) != 0, "heap ranges: a range that fits nowhere is refused");
+        CHECK(!vk_th_give(&blk, o2, 50) && !vk_th_give(&blk, o1, 100) && !vk_th_give(&blk, o3, 10) &&
+              blk.nfree == 1 && blk.free[0].off == 0 && blk.free[0].size == 1000 && blk.used == 0,
+              "heap ranges: returned ranges merge back into one");
+        /* 2,048 two-byte ranges, then every other one back: with the tail
+         * still free that is one hole more than the list holds. */
+        memset(&blk, 0, sizeof blk); blk.nfree = 1; blk.free[0] = (vk_th_range){ 0, (VkDeviceSize)VK_TH_RANGES * 4 + 100 };
+        int ok = 1, refused = 0;
+        for (u32 i = 0; i < VK_TH_RANGES * 2; i++) { VkDeviceSize o = 1; ok &= !vk_th_take(&blk, 2, 1, &o) && o == 2u * i; }
+        for (u32 i = 0; i < VK_TH_RANGES * 2; i += 2) refused += vk_th_give(&blk, 2u * i, 2) != 0;
+        CHECK(ok && refused == 1 && blk.nfree == VK_TH_RANGES,
+              "heap ranges: a full range list refuses one more hole instead of overflowing");
+    }
     u8 seed[TW * TH * 4]; texels(seed, TW, TH, 7);
     u32 rt = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, TW, TH, seed, TW * 4);
     u32 rt2 = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, TW, TH, NULL, 0);
@@ -188,6 +210,35 @@ int main(int argc, char** argv)
     rsx_be_sampler_desc samp; memset(&samp, 0, sizeof samp);
     samp.wrap_s = samp.wrap_t = samp.wrap_r = 1; samp.max_lod = 0;
     rsx_be_sampler_desc samps[16]; for (int i = 0; i < 16; i++) samps[i] = samp;
+    /* A five-level texture whose levels are uploaded back to back (the
+     * batched path records one dependency for the run) and re-uploaded in
+     * place, all levels, mid-stream; some draws sample its level 2 only. */
+    enum { ML = 5 };
+    static u8 mtex[16 * 16 * 4];
+    const u32 t1 = vk_eng_texture_create(NULL, RSX_BE_FMT_R8G8B8A8, 16, 16, ML, 1, 0xAAE4u, 0x85u);
+    for (u32 m = 0; m < ML; m++) { texels(mtex, 16u >> m, 16u >> m, 100 + m); vk_eng_texture_upload(NULL, t1, 0, m, 16u >> m, 16u >> m, mtex, (16u >> m) * 4, 16u >> m); }
+    CHECK(t1 && vk_eng_texture_reusable(NULL, t1, RSX_BE_FMT_R8G8B8A8, 16, 16, ML, 1, 0xAAE4u, 0x85u),
+          "a texture takes new contents of the shape it was made with");
+    CHECK(!vk_eng_texture_reusable(NULL, t1, RSX_BE_FMT_R8G8B8A8, 16, 16, ML - 1, 1, 0xAAE4u, 0x85u) &&
+          !vk_eng_texture_reusable(NULL, t1, RSX_BE_FMT_R8G8B8A8, 16, 8, ML, 1, 0xAAE4u, 0x85u) &&
+          !vk_eng_texture_reusable(NULL, t1, RSX_BE_FMT_R8G8, 16, 16, ML, 1, 0xAAE4u, 0x85u) &&
+          !vk_eng_texture_reusable(NULL, t1, RSX_BE_FMT_R8G8B8A8, 16, 16, ML, 1, 0x1234u, 0x85u) &&
+          !vk_eng_texture_reusable(NULL, t1, RSX_BE_FMT_R8G8B8A8, 16, 16, ML, 1, 0xAAE4u, 0x81u) &&
+          !vk_eng_texture_reusable(NULL, rt, RSX_BE_FMT_R8G8B8A8, TW, TH, 1, 1, 0xAAE4u, 0x85u),
+          "nor any other shape, format, crossbar or object");
+    /* A level larger than the arena takes (VK_STAGE_ARENA_LIMIT): a pooled
+     * staging buffer, in either mode. */
+    {
+        static u8 big[2048 * 1024 * 4];
+        texels(big, 2048, 1024, 9);
+        const u32 tb = vk_eng_texture_create(NULL, RSX_BE_FMT_R8G8B8A8, 2048, 1024, 1, 1, 0xAAE4u, 0x85u);
+        const unsigned long long arena0 = s_stage_arena_uses;
+        vk_eng_texture_upload(NULL, tb, 0, 0, 2048, 1024, big, 2048 * 4, 1024);
+        CHECK(tb && s_stage_arena_uses == arena0, "a level over the arena limit stages in a pooled buffer");
+        vk_eng_release(NULL, tb);
+    }
+    rsx_be_sampler_desc lod2[16]; for (int i = 0; i < 16; i++) lod2[i] = samp;
+    lod2[0].mip_present = 1; lod2[0].min_lod = lod2[0].max_lod = 2.0f;
     const float clear[4] = { 0.1f, 0.2f, 0.3f, 1.0f };
     vk_eng_clear_depth_stencil(NULL, z, RSX_BE_CLEAR_DEPTH, 1.0f, 0);
 
@@ -199,6 +250,12 @@ int main(int argc, char** argv)
         if (i % 41 == 13) {                         /* in-place re-upload: later draws see it */
             texels(tex, 16, 16, i);
             vk_eng_texture_upload(NULL, t0, 0, 0, 16, 16, tex, 16 * 4, 16);
+        }
+        if (i % 59 == 21) {                         /* every level again, in place */
+            for (u32 m = 0; m < ML; m++) {
+                texels(mtex, 16u >> m, 16u >> m, i + m);
+                vk_eng_texture_upload(NULL, t1, 0, m, 16u >> m, 16u >> m, mtex, (16u >> m) * 4, 16u >> m);
+            }
         }
         if (i % 173 == 50) {                        /* release a sampled texture, make another */
             vk_eng_release(NULL, t0);
@@ -241,7 +298,9 @@ int main(int argc, char** argv)
         memcpy(prev_vc, vc, sizeof vc);
         const float pc[8] = { 1, 1, 1, 0.5f + 0.5f * (float)(i % 2), 0.3f, 0.3f, 0.3f, 0.25f };
         vk_eng_bind_ps_constants(NULL, pc, sizeof pc);
-        vk_eng_bind_textures(NULL, &bound_tex, samps, 1u);
+        const int level2 = i % 9 == 4 && bound_tex == t0;
+        if (level2) bound_tex = t1;
+        vk_eng_bind_textures(NULL, &bound_tex, level2 ? lod2 : samps, 1u);
         vk_eng_set_viewport(NULL, 0, 0, TW, TH);
         vk_eng_set_scissor(NULL, 0, 0, TW, TH);
         const float col[4] = { (float)(i % 17) / 16.0f, (float)(i % 11) / 10.0f, (float)(i % 5) / 4.0f, 0.6f };
@@ -264,6 +323,11 @@ int main(int argc, char** argv)
     }
     CHECK(vk_eng_submit_and_wait_checked(NULL, RSX_BE_FLUSH_GUEST_REFERENCE) == 1, "checked flush");
     const double t_ms = now_ms() - t_start;
+    if (batched) CHECK(s_up_chain.on && s_up_chain.chained > 0, "back-to-back level uploads share one dependency");
+    else CHECK(s_up_chain.chained == 0, "per-operation recording gives every upload its own submission");
+    CHECK(s_th_ranges > 0 && s_th_blocks >= 1, "textures take heap ranges");
+    if (batched) CHECK(s_stage_arena_uses > 0, "batched uploads stage in the batch arena");
+    else CHECK(s_stage_arena_uses == 0, "per-operation uploads stage in pooled buffers");
 
     /* Behind foreign GPU work on the queue: per-operation submissions wait for
      * it at the first draw; batched recording returns while it still runs.

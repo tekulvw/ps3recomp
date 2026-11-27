@@ -30,10 +30,22 @@ Nothing is counted per draw or per FIFO method. The counters are cumulative for 
 | `shader_memory_hits`, `shader_disk_hits` | same | a translation served from memory, or from `PS3RECOMP_SPIRV_CACHE` |
 | `pipelines`, `pipeline_ns`, `pipeline_worst_ns` | `rsx_vulkan_backend.c` (every graphics pipeline), `rsx_metal_backend.m` (guest program pipelines) | one host pipeline object created |
 | `texture_uploads`, `texture_upload_bytes`, `texture_upload_ns`, `slow_texture_uploads` | `rsx_draw_engine.c` | a texture decoded and uploaded (new, or its contents changed); slow is 4 ms or more |
+| `texture_upload_new`, `texture_upload_new_bytes` | `rsx_draw_engine.c` | an upload of a texture the cache did not hold: its first use, or a use after eviction |
+| `texture_upload_changed`, `texture_upload_changed_bytes`, `texture_upload_in_place` | `rsx_draw_engine.c` | an upload because a cached texture's guest bytes changed; in place when it went into the texture the cache already had (`texture_reusable`, below) |
+| `texture_evictions` | `rsx_draw_engine.c` | the texture cache (1024 entries) evicted its least recently used entry |
+| `texture_upload_size_n[4]`, `texture_upload_size_bytes[4]` | `rsx_fifo_busy.c` | every upload by guest size: up to 64 KiB, up to 1 MiB, up to 4 MiB, larger |
+| `texture_upload_wait_ns` | `rsx_draw_engine.c` | of `texture_upload_ns`, the time those uploads waited for the GPU to free a recording slot |
+| `gpu_slot_waits`, `gpu_slot_wait_ns` | `rsx_vulkan_backend.c` | every wait for a batch slot under batched recording, whatever the work |
 | `pipeline_cache_saves`, `pipeline_cache_save_ns` | `rsx_vulkan_backend.c` | the `PS3RECOMP_VK_PIPELINE_CACHE` file written (every 32 new pipelines, and at shutdown) |
 | `pipeline_cache_loaded_bytes` | `rsx_vulkan_backend.c` | cache bytes loaded at device creation (0: empty, refused or off) |
 | `flags` | | `RSX_BUILD_FLAG_SPIRV_DISK_CACHE`, `RSX_BUILD_FLAG_VK_PIPELINE_CACHE` |
 | `backend` | | `"vulkan"` or `"metal"` once that device is up |
+
+Version 2 appended the texture fields after `backend`; a caller built against version 1 reads the
+same first 144 bytes. `texture_uploads` is `texture_upload_new` plus `texture_upload_changed`.
+`texture_upload_wait_ns` is part of `texture_upload_ns`, not added to it: an upload that opens a new
+Vulkan batch while every slot is still on the GPU waits there, which is GPU backpressure rather than
+upload work.
 
 The `*_ns` fields are exclusive and add up. A program's time leaves out the translations and
 pipeline creations inside it, which a per-thread accumulator subtracts (`rsx_build_inner_ns`). On

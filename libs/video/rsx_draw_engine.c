@@ -1399,8 +1399,16 @@ static int eng_staging_reserve(u32 bytes)
  * from the backend's copy instead of decoded here. */
 static struct { int valid; u32 location, offset, pitch, w, h; } s_z24_stored;
 
+/* A changed texture's new contents go into the handle it has (`reuse`, 0 for
+ * none) when the backend says that handle takes them in place
+ * (texture_reusable); otherwise into a new texture, as before. The caller
+ * releases the old handle only when the one returned differs.
+ * PS3RECOMP_RSX_TEXTURE_IN_PLACE=0 (read at engine init) always creates. */
+static int s_texture_in_place = 1;
+static unsigned long long s_texture_in_place_uploads;
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                              u32 levels, u32 pitch, int cube, u32 remap, u32 depth, u64 identity)
+                              u32 levels, u32 pitch, int cube, u32 remap, u32 depth, u64 identity,
+                              u32 reuse)
 {
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
@@ -1464,16 +1472,20 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     if (!identity && !cube)
         src = eng_texture_override(location, offset, fmt, w, h, levels, pitch, remap, src, span);
 
-    const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
-                                            w, h, nlv, faces, remap, fmt);
+    const rsx_be_format be_fmt = eng_texfmt(lv[0].tl.fmt);
+    const int in_place = reuse && s_texture_in_place && g.be->texture_reusable &&
+                         g.be->texture_reusable(g.be->user, reuse, be_fmt, w, h, nlv, faces, remap, fmt);
+    const u32 handle = in_place ? reuse
+                                : g.be->texture_create(g.be->user, be_fmt, w, h, nlv, faces, remap, fmt);
     if (!handle) return 0;
+    if (in_place) s_texture_in_place_uploads++;
 
     for (u32 f = 0; f < faces; f++) {
         const u8* face = src + (size_t)f * face_stride;
         for (u32 m = 0; m < nlv; m++) {
             const rsx_tex_layout* tl = &lv[m].tl;
             if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows)) {
-                g.be->texture_release(g.be->user, handle);
+                if (!in_place) g.be->texture_release(g.be->user, handle);
                 return 0;
             }
             rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
@@ -1602,11 +1614,14 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             if(!readable){ENG_CHECKED_FAIL();return 0;}
             if (readable && (hash != e->content_hash || override_again)) {
                 ENG_PH_BEGIN(ph_up);
-                const uint64_t up_t0 = rsx_build_now_ns();
+                const uint64_t up_t0 = rsx_build_now_ns(), up_w0 = rsx_build_gpu_wait_ns();
                 s_override_answered = 0;
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
-                                                     levels, pitch, cube, remap, depth, identity);
+                                                     levels, pitch, cube, remap, depth, identity,
+                                                     e->handle);
                 rsx_build_note(RSX_BUILD_TEXTURE_UPLOAD, rsx_build_now_ns() - up_t0, span);
+                rsx_build_note_texture_upload_kind(1, fresh && fresh == e->handle, span);
+                rsx_build_note_texture_upload_wait(rsx_build_gpu_wait_ns() - up_w0);
                 ENG_PH_END(ENG_PH_TEX_UPLOAD, ph_up);
                 if (fresh) {
                     e->override_interest = s_override_answered;
@@ -1617,7 +1632,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                     fprintf(stderr, "[texcache] reupload loc=%u off=0x%08X fmt=0x%02X %ux%u levels=%u pitch=%u cube=%d depth=%u span=%u frame=%u\n",
                             location, offset, fmt, w, h, levels, pitch, cube, depth, span, g.frames); } }
                 if (fresh) {
-                    g.be->texture_release(g.be->user, e->handle);
+                    if (fresh != e->handle) g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
                     e->content_hash = hash;
                 } else {ENG_CHECKED_FAIL();return 0;}
@@ -1638,6 +1653,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)
                 index = i;
         evicted = g.textures[index].handle;
+        rsx_build_note_texture_eviction();
     }
 
     eng_texture e;
@@ -1653,11 +1669,13 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       e.content_hash = eng_texture_content_hash(location, offset, span, identity, &readable);
       if (!identity) e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
     ENG_PH_BEGIN(ph_up);
-    const uint64_t up_t0 = rsx_build_now_ns();
+    const uint64_t up_t0 = rsx_build_now_ns(), up_w0 = rsx_build_gpu_wait_ns();
     s_override_answered = 0;
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
-                                  cube, remap, depth, identity);
+                                  cube, remap, depth, identity, 0);
     rsx_build_note(RSX_BUILD_TEXTURE_UPLOAD, rsx_build_now_ns() - up_t0, span);
+    rsx_build_note_texture_upload_kind(0, 0, span);
+    rsx_build_note_texture_upload_wait(rsx_build_gpu_wait_ns() - up_w0);
     ENG_PH_END(ENG_PH_TEX_UPLOAD, ph_up);
     e.override_interest = s_override_answered;
     e.override_generation = override_generation;
@@ -5262,6 +5280,8 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
     draw_observer_reset();
     g.width  = width  ? width  : 1280;
     g.height = height ? height : 720;
+    { const char* e = getenv("PS3RECOMP_RSX_TEXTURE_IN_PLACE");
+      s_texture_in_place = !(e && !strcmp(e, "0")); }
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_RSX_GPU_DEPTH_VIEW");

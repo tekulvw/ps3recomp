@@ -297,11 +297,16 @@ static _Atomic uint64_t s_build_n[RSX_BUILD_EVENT_COUNT], s_build_ns[RSX_BUILD_E
 static _Atomic uint64_t s_build_upload_bytes, s_build_slow_uploads, s_build_pipeline_worst_ns;
 static _Atomic uint64_t s_build_shader_memory_hits, s_build_shader_disk_hits, s_build_pcache_bytes;
 static _Atomic uint64_t s_build_pcache_saves, s_build_pcache_save_ns;
+static _Atomic uint64_t s_build_tex_new, s_build_tex_new_bytes, s_build_tex_changed, s_build_tex_changed_bytes;
+static _Atomic uint64_t s_build_tex_in_place, s_build_tex_evictions, s_build_tex_wait_ns;
+static _Atomic uint64_t s_build_tex_size_n[4], s_build_tex_size_bytes[4];
+static _Atomic uint64_t s_build_gpu_waits, s_build_gpu_wait_ns;
 static _Atomic uint32_t s_build_flags;
 static _Atomic int s_build_backend_set;
 static char s_build_backend[8];
 
 static FB_TLS uint64_t t_build_inner_ns;   /* this thread's translation + pipeline time */
+static FB_TLS uint64_t t_build_gpu_wait_ns;   /* this thread's waits for a GPU recording slot */
 
 uint64_t rsx_build_now_ns(void) { return default_clock(); }
 uint64_t rsx_build_inner_ns(void) { return t_build_inner_ns; }
@@ -314,6 +319,9 @@ void rsx_build_note(int event, uint64_t ns, uint64_t bytes)
     if (event == RSX_BUILD_TRANSLATION || event == RSX_BUILD_PIPELINE) t_build_inner_ns += ns;
     if (event == RSX_BUILD_TEXTURE_UPLOAD) {
         atomic_fetch_add_explicit(&s_build_upload_bytes, bytes, memory_order_relaxed);
+        const int bin = bytes <= (64u << 10) ? 0 : bytes <= (1u << 20) ? 1 : bytes <= (4u << 20) ? 2 : 3;
+        atomic_fetch_add_explicit(&s_build_tex_size_n[bin], 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_build_tex_size_bytes[bin], bytes, memory_order_relaxed);
         if (ns >= RSX_BUILD_SLOW_UPLOAD_NS)
             atomic_fetch_add_explicit(&s_build_slow_uploads, 1, memory_order_relaxed);
     } else if (event == RSX_BUILD_PIPELINE) {
@@ -321,6 +329,33 @@ void rsx_build_note(int event, uint64_t ns, uint64_t bytes)
         while (ns > worst && !atomic_compare_exchange_weak_explicit(&s_build_pipeline_worst_ns, &worst, ns,
                                                                     memory_order_relaxed, memory_order_relaxed)) {}
     }
+}
+
+void rsx_build_note_texture_upload_kind(int changed, int in_place, uint64_t bytes)
+{
+    atomic_fetch_add_explicit(changed ? &s_build_tex_changed : &s_build_tex_new, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(changed ? &s_build_tex_changed_bytes : &s_build_tex_new_bytes, bytes,
+                              memory_order_relaxed);
+    if (changed && in_place) atomic_fetch_add_explicit(&s_build_tex_in_place, 1, memory_order_relaxed);
+}
+
+void rsx_build_note_texture_eviction(void)
+{
+    atomic_fetch_add_explicit(&s_build_tex_evictions, 1, memory_order_relaxed);
+}
+
+void rsx_build_note_gpu_wait(uint64_t ns)
+{
+    atomic_fetch_add_explicit(&s_build_gpu_waits, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_build_gpu_wait_ns, ns, memory_order_relaxed);
+    t_build_gpu_wait_ns += ns;
+}
+
+uint64_t rsx_build_gpu_wait_ns(void) { return t_build_gpu_wait_ns; }
+
+void rsx_build_note_texture_upload_wait(uint64_t ns)
+{
+    atomic_fetch_add_explicit(&s_build_tex_wait_ns, ns, memory_order_relaxed);
 }
 
 void rsx_build_note_shader_hit(int disk)
@@ -361,7 +396,14 @@ void rsx_build_stats_reset(void)
     atomic_store(&s_build_pcache_saves, 0); atomic_store(&s_build_pcache_save_ns, 0);
     atomic_store(&s_build_flags, 0); atomic_store(&s_build_backend_set, 0);
     memset(s_build_backend, 0, sizeof s_build_backend);
+    atomic_store(&s_build_tex_new, 0); atomic_store(&s_build_tex_new_bytes, 0);
+    atomic_store(&s_build_tex_changed, 0); atomic_store(&s_build_tex_changed_bytes, 0);
+    atomic_store(&s_build_tex_in_place, 0); atomic_store(&s_build_tex_evictions, 0);
+    atomic_store(&s_build_tex_wait_ns, 0);
+    for (int i = 0; i < 4; i++) { atomic_store(&s_build_tex_size_n[i], 0); atomic_store(&s_build_tex_size_bytes[i], 0); }
+    atomic_store(&s_build_gpu_waits, 0); atomic_store(&s_build_gpu_wait_ns, 0);
     t_build_inner_ns = 0;
+    t_build_gpu_wait_ns = 0;
 }
 
 int ps3recomp_rsx_build_stats(struct ps3recomp_rsx_build_stats* out)
@@ -387,6 +429,19 @@ int ps3recomp_rsx_build_stats(struct ps3recomp_rsx_build_stats* out)
     out->pipeline_cache_loaded_bytes = BUILD_LOAD(s_build_pcache_bytes);
     out->pipeline_cache_saves = BUILD_LOAD(s_build_pcache_saves);
     out->pipeline_cache_save_ns = BUILD_LOAD(s_build_pcache_save_ns);
+    out->texture_upload_new = BUILD_LOAD(s_build_tex_new);
+    out->texture_upload_new_bytes = BUILD_LOAD(s_build_tex_new_bytes);
+    out->texture_upload_changed = BUILD_LOAD(s_build_tex_changed);
+    out->texture_upload_changed_bytes = BUILD_LOAD(s_build_tex_changed_bytes);
+    out->texture_upload_in_place = BUILD_LOAD(s_build_tex_in_place);
+    out->texture_evictions = BUILD_LOAD(s_build_tex_evictions);
+    for (int i = 0; i < 4; i++) {
+        out->texture_upload_size_n[i] = BUILD_LOAD(s_build_tex_size_n[i]);
+        out->texture_upload_size_bytes[i] = BUILD_LOAD(s_build_tex_size_bytes[i]);
+    }
+    out->texture_upload_wait_ns = BUILD_LOAD(s_build_tex_wait_ns);
+    out->gpu_slot_waits = BUILD_LOAD(s_build_gpu_waits);
+    out->gpu_slot_wait_ns = BUILD_LOAD(s_build_gpu_wait_ns);
 #undef BUILD_LOAD
     if (atomic_load(&s_build_backend_set) == 2) memcpy(out->backend, s_build_backend, sizeof out->backend);
     return 0;

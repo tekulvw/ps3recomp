@@ -19,17 +19,22 @@ CALLER = r'''
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
-static_assert(sizeof(struct ps3recomp_rsx_build_stats) == 144, "size");
+static_assert(sizeof(struct ps3recomp_rsx_build_stats) == 144 + 17 * 8, "size");
 static_assert(offsetof(struct ps3recomp_rsx_build_stats, programs) == 8, "programs");
 static_assert(offsetof(struct ps3recomp_rsx_build_stats, pipelines) == 56, "pipelines");
 static_assert(offsetof(struct ps3recomp_rsx_build_stats, texture_uploads) == 80, "texture_uploads");
 static_assert(offsetof(struct ps3recomp_rsx_build_stats, pipeline_cache_save_ns) == 128, "save_ns");
 static_assert(offsetof(struct ps3recomp_rsx_build_stats, backend) == 136, "backend");
-static_assert(PS3RECOMP_RSX_BUILD_STATS_VERSION == 1, "version");
+/* Version 2 appends; version 1's 144 bytes keep their layout. */
+static_assert(offsetof(struct ps3recomp_rsx_build_stats, texture_upload_new) == 144, "texture_upload_new");
+static_assert(offsetof(struct ps3recomp_rsx_build_stats, texture_upload_size_n) == 192, "size_n");
+static_assert(offsetof(struct ps3recomp_rsx_build_stats, texture_upload_wait_ns) == 256, "wait_ns");
+static_assert(offsetof(struct ps3recomp_rsx_build_stats, gpu_slot_wait_ns) == 272, "gpu_slot_wait_ns");
+static_assert(PS3RECOMP_RSX_BUILD_STATS_VERSION == 2, "version");
 #define T(c) do { if (!(c)) { std::printf("FAIL %s (line %d)\n", #c, __LINE__); return 1; } } while (0)
 int main() {
     struct ps3recomp_rsx_build_stats s;
-    T(ps3recomp_rsx_build_stats(&s) == 0 && s.version == 1 && s.programs == 0 && s.backend[0] == 0);
+    T(ps3recomp_rsx_build_stats(&s) == 0 && s.version == 2 && s.programs == 0 && s.backend[0] == 0);
     const uint64_t a = rsx_build_now_ns(), b = rsx_build_now_ns();
     T(a > 0 && b >= a);
     rsx_build_note(RSX_BUILD_PROGRAM, 30000000, 0);
@@ -40,6 +45,18 @@ int main() {
     rsx_build_note(RSX_BUILD_PIPELINE, 1000000, 0);
     rsx_build_note(RSX_BUILD_TEXTURE_UPLOAD, RSX_BUILD_SLOW_UPLOAD_NS - 1, 4096);
     rsx_build_note(RSX_BUILD_TEXTURE_UPLOAD, RSX_BUILD_SLOW_UPLOAD_NS, 1u << 20);
+    rsx_build_note(RSX_BUILD_TEXTURE_UPLOAD, 1000, 64u << 10);         /* the size bins' edges */
+    rsx_build_note(RSX_BUILD_TEXTURE_UPLOAD, 1000, (64u << 10) + 1);
+    rsx_build_note(RSX_BUILD_TEXTURE_UPLOAD, 1000, 4u << 20);
+    rsx_build_note(RSX_BUILD_TEXTURE_UPLOAD, 1000, (4u << 20) + 1);
+    rsx_build_note_texture_upload_kind(0, 1, 4096);      /* new: in_place means nothing */
+    rsx_build_note_texture_upload_kind(1, 0, 1u << 20);
+    rsx_build_note_texture_upload_kind(1, 1, 300);
+    rsx_build_note_texture_eviction(); rsx_build_note_texture_eviction();
+    const uint64_t w0 = rsx_build_gpu_wait_ns();
+    rsx_build_note_gpu_wait(5000); rsx_build_note_gpu_wait(7000);
+    T(rsx_build_gpu_wait_ns() - w0 == 12000);
+    rsx_build_note_texture_upload_wait(5000);
     rsx_build_note(RSX_BUILD_EVENT_COUNT, 1, 1);   /* not an event: ignored */
     rsx_build_note(-1, 1, 1);
     rsx_build_note_shader_hit(0); rsx_build_note_shader_hit(0); rsx_build_note_shader_hit(1);
@@ -54,8 +71,17 @@ int main() {
     T(s.shader_translations == 2 && s.shader_translation_ns == 25000000);
     T(s.shader_memory_hits == 2 && s.shader_disk_hits == 1);
     T(s.pipelines == 3 && s.pipeline_ns == 98000000 && s.pipeline_worst_ns == 90000000);
-    T(s.texture_uploads == 2 && s.texture_upload_bytes == 4096 + (1u << 20) && s.slow_texture_uploads == 1);
-    T(s.texture_upload_ns == 2 * RSX_BUILD_SLOW_UPLOAD_NS - 1);
+    T(s.texture_uploads == 6 && s.slow_texture_uploads == 1);
+    T(s.texture_upload_bytes == 4096 + (1u << 20) + (64u << 10) + (64u << 10) + 1 + (4u << 20) + (4u << 20) + 1);
+    T(s.texture_upload_ns == 2 * RSX_BUILD_SLOW_UPLOAD_NS - 1 + 4000);
+    T(s.texture_upload_size_n[0] == 2 && s.texture_upload_size_bytes[0] == 4096 + (64u << 10));
+    T(s.texture_upload_size_n[1] == 2 && s.texture_upload_size_bytes[1] == (1u << 20) + (64u << 10) + 1);
+    T(s.texture_upload_size_n[2] == 1 && s.texture_upload_size_bytes[2] == (4u << 20));
+    T(s.texture_upload_size_n[3] == 1 && s.texture_upload_size_bytes[3] == (4u << 20) + 1);
+    T(s.texture_upload_new == 1 && s.texture_upload_new_bytes == 4096);
+    T(s.texture_upload_changed == 2 && s.texture_upload_changed_bytes == (1u << 20) + 300 && s.texture_upload_in_place == 1);
+    T(s.texture_evictions == 2 && s.texture_upload_wait_ns == 5000);
+    T(s.gpu_slot_waits == 2 && s.gpu_slot_wait_ns == 12000);
     T(s.pipeline_cache_saves == 1 && s.pipeline_cache_save_ns == 3000000);
     T(rsx_build_inner_ns() == 25000000 + 98000000);   /* translations + pipelines, this thread */
     T(s.pipeline_cache_loaded_bytes == 123456);
@@ -65,6 +91,9 @@ int main() {
     rsx_build_set_backend("a-name-longer-than-seven");
     ps3recomp_rsx_build_stats(&s);
     T(s.programs == 0 && s.pipelines == 0 && s.pipeline_worst_ns == 0 && s.flags == 0 && rsx_build_inner_ns() == 0);
+    T(s.texture_upload_new == 0 && s.texture_upload_changed == 0 && s.texture_upload_in_place == 0 &&
+      s.texture_evictions == 0 && s.texture_upload_size_n[3] == 0 && s.texture_upload_wait_ns == 0 &&
+      s.gpu_slot_waits == 0 && rsx_build_gpu_wait_ns() == 0);
     T(std::strcmp(s.backend, "a-name-") == 0);
     std::puts("PASS rsx build stats: C and C++ layout, C linkage, counting rules");
     return 0;
