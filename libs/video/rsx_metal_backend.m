@@ -2558,7 +2558,7 @@ static void release_surfaces(void)
 #define RSX_RING_PROGRESS_OPTIONAL 1
 #include "rsx_ring_progress_observer.h"
 
-#define ENG_MAX_OBJECTS  4096
+#define ENG_MAX_OBJECTS  8192   /* the engine's texture cache is up to 4096 */
 #define ENG_MAX_PIPES    4096
 #define ENG_MAX_RECORDS  8192
 #define ENG_MAX_VIEWS    256
@@ -6336,6 +6336,17 @@ static int owner_eng_capture_texture_rgba8(void* user, u32 handle, const char* p
     int result=eng_capture_texture_rgba8(user,handle,path);metal_owner_finish(0);return result;
 }
 
+/* texture_cache_budget: a quarter of the memory Metal recommends the
+ * process keep resident on this device (recommendedMaxWorkingSetSize; on
+ * Apple silicon, a share of unified memory). The engine keeps its 1,024
+ * textures regardless and grows past them only while they fit. Read once,
+ * on the engine's thread, with no GPU work. */
+static u64 eng_texture_cache_budget(void* user)
+{
+    (void)user;
+    return s_dev ? (u64)s_dev.recommendedMaxWorkingSetSize / 4u : 0;
+}
+
 static const rsx_draw_backend s_engine_backend = {
     .user                 = NULL,
     .init                 = owner_eng_init,
@@ -6381,6 +6392,7 @@ static const rsx_draw_backend s_engine_backend = {
     .present              = owner_eng_present,
     .readback             = owner_eng_readback,
     .capture_texture_rgba8 = owner_eng_capture_texture_rgba8,
+    .texture_cache_budget = eng_texture_cache_budget,
 };
 
 /* ---- public API ---------------------------------------------------------- */

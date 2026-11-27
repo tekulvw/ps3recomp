@@ -34,6 +34,31 @@ merging, a full list) and that each path is the one taken.
 `libs/video/tests/test_rsx_draw_engine.c` ("texture re-upload in place") checks the engine side:
 it asks only on a content change, uses the answer, and honours the switch.
 
+## Cache size
+
+The texture cache keeps at least 1,024 textures. A backend that reports a memory budget
+(`texture_cache_budget`) lets the cache grow past that, up to 4,096 textures, while their decoded
+size stays within the budget. When either limit is reached, the least recently used texture is
+evicted. A fixed 1,024 entries used to evict textures that came straight back with the same bytes,
+which was 4-11% of a match's uploads.
+
+| Backend | Budget |
+|---|---|
+| Vulkan | a quarter of the largest device-local heap |
+| Metal | a quarter of `recommendedMaxWorkingSetSize` |
+| D3D12 and others without the hook | none: the fixed 1,024 entries |
+
+On a large card, the 4,096-entry cap is the limit. The budget matters on small or shared heaps.
+
+| Switch | Effect |
+|---|---|
+| `PS3RECOMP_RSX_TEXTURE_CACHE_ENTRIES=N` | exactly N entries, with no budget; `1024` is the old cache |
+| `PS3RECOMP_RSX_TEXTURE_CACHE_MB=M` | replaces the backend's budget; `0` turns the budget off, which leaves 1,024 entries |
+
+Both are read at the first texture miss after engine init, which logs
+`[rsx engine] texture cache: ...`. The Vulkan backend's object table holds 8,192 objects and its
+texture heap up to 64 blocks, so a full cache still fits in both.
+
 ## Counters
 
 Build stats version 2 (`docs/RSX_BUILD_STATS.md`) counts uploads as new or changed (and in
