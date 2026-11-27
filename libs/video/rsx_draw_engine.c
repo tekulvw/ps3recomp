@@ -1413,6 +1413,8 @@ static struct { int valid; u32 location, offset, pitch, w, h; } s_z24_stored;
  * releases the old handle only when the one returned differs.
  * PS3RECOMP_RSX_TEXTURE_IN_PLACE=0 (read at engine init) always creates. */
 static int s_texture_in_place = 1;
+static int s_rewrite_hash = 1;
+static unsigned long long s_rewrites_unchanged;
 static unsigned long long s_texture_in_place_uploads;
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap, u32 depth, u64 identity,
@@ -1671,12 +1673,24 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                                                       &readable);
             if (!identity) s_tcs.sparse++;
             /* The engine just stored a surface or depth target over these
-             * bytes: they are new, so upload without hashing them all. The
-             * stored hash becomes unknown and the next ordinary check
-             * re-uploads once rather than miss a change. */
+             * bytes. A title that samples a target through guest memory
+             * every frame often stores the same pixels again (a paused
+             * scene behind a menu), so they are hashed in full and decoded
+             * and uploaded only when they differ from the bytes last
+             * uploaded. PS3RECOMP_RSX_TEXTURE_REWRITE_HASH=0 (read at engine
+             * init) uploads every store unhashed, as before; the hash then
+             * becomes unknown and the next ordinary check re-uploads once
+             * rather than miss a change. */
             if (e->rewritten && !identity && readable) {
-                hash = ~e->content_hash;
                 e->rewritten = 0;
+                if (s_rewrite_hash) {
+                    ENG_PH_BEGIN(ph_hash);
+                    hash = eng_texture_content_hash(location, offset, span, identity, &readable);
+                    e->last_full_frame = g.frames;
+                    s_tcs.full++;
+                    ENG_PH_END(ENG_PH_TEX_HASH, ph_hash);
+                    if (readable && hash == e->content_hash) s_rewrites_unchanged++;
+                } else hash = ~e->content_hash;
             } else if (e->override_interest && !identity && readable &&
                        e->override_generation != override_generation) {
                 /* A new override generation: decode again and ask afresh. */
@@ -1900,6 +1914,7 @@ static void eng_depth_unstored(const rsx_dsp_texture* t, u32 base_fmt, int reaso
             g.be && g.be->depth_z24_view != NULL);
 }
 u64 rsx_draw_engine_depth_unstored_count(void) { return atomic_load(&s_depth_unstored); }
+unsigned long long rsx_draw_engine_texture_rewrites_unchanged(void) { return s_rewrites_unchanged; }
 /* A texture reads a colour target the same draw renders to, and the backend
  * has no color_snapshot to give it a copy: the texture reads guest memory as
  * it is, which does not hold what the GPU rendered. Counted, reported once. */
@@ -5371,6 +5386,8 @@ static int original_rsx_draw_engine_init(u32 width, u32 height)
     g.height = height ? height : 720;
     { const char* e = getenv("PS3RECOMP_RSX_TEXTURE_IN_PLACE");
       s_texture_in_place = !(e && !strcmp(e, "0")); }
+    { const char* e = getenv("PS3RECOMP_RSX_TEXTURE_REWRITE_HASH");
+      s_rewrite_hash = !(e && !strcmp(e, "0")); }
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_RSX_GPU_DEPTH_VIEW");

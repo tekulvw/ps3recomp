@@ -2127,6 +2127,56 @@ static void test_color_read_as_float(void)
     engine_down();
 }
 
+/* A colour target a texture reads through guest memory is stored there
+ * again after every write to it. When the store leaves the same pixels the
+ * texture is neither decoded nor uploaded again; changed pixels still are;
+ * PS3RECOMP_RSX_TEXTURE_REWRITE_HASH=0 uploads every store, as before. */
+static int rewrite_round(void)
+{
+    /* Draw into the target again (a write), then sample it through guest
+     * memory from another target: the engine stores it and re-checks. */
+    m(M_COLOR_A_OFFSET, 0x40000u);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    const int before = stub.n_texture_upload + stub.n_texture_create;
+    draw_triangle();
+    return stub.n_texture_upload + stub.n_texture_create - before;
+}
+static void test_rewritten_surface_identical(void)
+{
+    printf("-- rewritten surface with the same pixels\n");
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass) setenv("PS3RECOMP_RSX_TEXTURE_REWRITE_HASH", "0", 1);
+        engine_up();
+        const u8 keep[4] = { g_stub_pixel[0], g_stub_pixel[1], g_stub_pixel[2], g_stub_pixel[3] };
+        m(M_COLOR_A_PITCH, 256u * 4u);
+        m(M_CLEAR_BUFFERS, 0xF0u);
+        m(M_COLOR_A_OFFSET, 0x90000u);
+        bind_texture_unit(RSX_LOCATION_LOCAL, 0x40000u);
+        m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((0x9Cu | 0x20u) << 8) | (1u << 16));
+        draw_triangle();
+        const unsigned long long same0 = rsx_draw_engine_texture_rewrites_unchanged();
+        const int identical = rewrite_round();
+        g_stub_pixel[0] ^= 0x5Au;
+        const int changed = rewrite_round();
+        const int identical_again = rewrite_round();
+        memcpy(g_stub_pixel, keep, 4);
+        const unsigned long long same = rsx_draw_engine_texture_rewrites_unchanged() - same0;
+        if (!pass) {
+            CHECK(identical == 0 && identical_again == 0 && same == 2,
+                  "a store of the same pixels is not uploaded again (%d, %d uploads; %llu unchanged)",
+                  identical, identical_again, same);
+            CHECK(changed > 0, "a store of changed pixels is uploaded (%d)", changed);
+        } else {
+            CHECK(identical > 0 && changed > 0 && identical_again > 0 && same == 0,
+                  "PS3RECOMP_RSX_TEXTURE_REWRITE_HASH=0 uploads every store (%d, %d, %d)",
+                  identical, changed, identical_again);
+        }
+        engine_down();
+    }
+    unsetenv("PS3RECOMP_RSX_TEXTURE_REWRITE_HASH");
+}
+
 /* The register-based fullscreen compositor has no array or inline stream.
  * Capture each position completion with the attributes current at that time. */
 static void immediate_vertex(float x, float y, float u, float v)
@@ -2437,6 +2487,7 @@ int main(int argc, char** argv)
     test_texture_cache();
     test_texture_in_place();
     test_texture_cache_budget();
+    test_rewritten_surface_identical();
     test_texture_sparse_rehash();
     test_texture_override();
     test_pipeline_key();
