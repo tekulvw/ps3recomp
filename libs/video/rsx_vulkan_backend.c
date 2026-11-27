@@ -184,6 +184,9 @@ typedef struct vk_image {
     u32 levels,layers,samples;
     u32 w, h;                        /* extent of level 0 */
     u8  pooled;                      /* returns to the image pool when destroyed */
+    u8  heap;                        /* mem is a texture heap block: heap_off/size of it */
+    u16 heap_block;
+    VkDeviceSize heap_off, heap_size;
 } vk_image;
 
 #define VK_SAMPLER_CACHE 32
@@ -956,6 +959,142 @@ static void vkpt_commit(int host)
     s_vkpt_n[host] = 0;
 }
 
+/* ---- texture heap -------------------------------------------------------
+ * Engine textures used to get one vkAllocateMemory each, freed with the
+ * texture: a new texture, a changed one and an eviction each cost a driver
+ * allocation or free, which some drivers make expensive. They now take a
+ * range of a large device-local block instead (first fit, ranges merged when
+ * freed), and only an image larger than a quarter block, a full heap or a
+ * failed block allocation falls back to its own allocation, as before. A
+ * range is returned when the image is destroyed, which happens only once no
+ * submitted work can still use it (vk_destroy_image), so it is never reused
+ * under a reader. Blocks hold only optimal-tiling images, so no linear
+ * resource shares one (bufferImageGranularity). One empty block is kept for
+ * reuse; further empty ones are freed. PS3RECOMP_VK_TEXTURE_HEAP=0 (read at
+ * device creation) gives every texture its own allocation again. */
+#define VK_TH_BLOCK      ((VkDeviceSize)64 << 20)
+#define VK_TH_MAX_BLOCKS 32u
+#define VK_TH_LARGEST    (VK_TH_BLOCK / 4)
+#define VK_TH_RANGES     1024u
+typedef struct { VkDeviceSize off, size; } vk_th_range;
+typedef struct {
+    VkDeviceMemory mem;
+    u32 type, nfree;
+    VkDeviceSize used;
+    vk_th_range free[VK_TH_RANGES];  /* sorted by offset, never adjacent */
+} vk_th_block;
+static vk_th_block* s_th[VK_TH_MAX_BLOCKS];
+static pthread_mutex_t s_th_mu = PTHREAD_MUTEX_INITIALIZER;
+static int s_th_on = 1;
+static unsigned long long s_th_ranges, s_th_own, s_th_blocks;
+
+/* First fit of `size` at `align` in block b: its offset, or -1. */
+static int vk_th_take(vk_th_block* b, VkDeviceSize size, VkDeviceSize align, VkDeviceSize* off)
+{
+    if (!align) align = 1;
+    for (u32 i = 0; i < b->nfree; i++) {
+        vk_th_range* r = &b->free[i];
+        const VkDeviceSize a = (r->off + align - 1) / align * align;
+        if (a + size > r->off + r->size) continue;
+        const VkDeviceSize head = a - r->off, tail = r->off + r->size - (a + size);
+        if (head && tail) {
+            if (b->nfree == VK_TH_RANGES) continue;     /* no room to split */
+            memmove(&b->free[i + 2], &b->free[i + 1], (b->nfree - i - 1) * sizeof b->free[0]);
+            b->free[i + 1] = (vk_th_range){ a + size, tail };
+            r->size = head;
+            b->nfree++;
+        } else if (head) r->size = head;
+        else if (tail) { r->off = a + size; r->size = tail; }
+        else { memmove(r, r + 1, (b->nfree - i - 1) * sizeof b->free[0]); b->nfree--; }
+        b->used += size;
+        *off = a;
+        return 0;
+    }
+    return -1;
+}
+/* Return [off, off + size) to block b, merged with its neighbours. 0, or -1
+ * when the range list is full (the range is then lost to the block). */
+static int vk_th_give(vk_th_block* b, VkDeviceSize off, VkDeviceSize size)
+{
+    u32 i = 0;
+    while (i < b->nfree && b->free[i].off < off) i++;
+    const int prev = i > 0 && b->free[i - 1].off + b->free[i - 1].size == off;
+    const int next = i < b->nfree && off + size == b->free[i].off;
+    b->used -= size;
+    if (prev && next) {
+        b->free[i - 1].size += size + b->free[i].size;
+        memmove(&b->free[i], &b->free[i + 1], (b->nfree - i - 1) * sizeof b->free[0]);
+        b->nfree--;
+    } else if (prev) b->free[i - 1].size += size;
+    else if (next) { b->free[i].off = off; b->free[i].size += size; }
+    else {
+        if (b->nfree == VK_TH_RANGES) return -1;
+        memmove(&b->free[i + 1], &b->free[i], (b->nfree - i) * sizeof b->free[0]);
+        b->free[i] = (vk_th_range){ off, size };
+        b->nfree++;
+    }
+    return 0;
+}
+/* Memory for an image with requirements `req` in memory type `type`: a heap
+ * range (im->heap set) or 0 when the caller should allocate on its own. */
+static int vk_th_alloc(vk_image* im, const VkMemoryRequirements* req, u32 type)
+{
+    if (!s_th_on || req->size > VK_TH_LARGEST || vulkan_owner_enabled()) return 0;
+    pthread_mutex_lock(&s_th_mu);
+    int got = 0;
+    for (u32 pass = 0; pass < 2 && !got; pass++) {
+        for (u32 i = 0; i < VK_TH_MAX_BLOCKS && !got; i++) {
+            vk_th_block* b = s_th[i];
+            if (pass == 1 && !b) {
+                /* No block had room: make one. */
+                b = (vk_th_block*)calloc(1, sizeof *b);
+                if (!b) break;
+                VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                             .allocationSize = VK_TH_BLOCK, .memoryTypeIndex = type };
+                if (pvkAllocateMemory(s_vk.device, &mai, NULL, &b->mem) != VK_SUCCESS) { free(b); break; }
+                b->type = type; b->nfree = 1; b->free[0] = (vk_th_range){ 0, VK_TH_BLOCK };
+                s_th[i] = b; s_th_blocks++;
+            }
+            if (!b || b->type != type || !((req->memoryTypeBits >> type) & 1u)) continue;
+            VkDeviceSize off;
+            if (vk_th_take(b, req->size, req->alignment, &off)) continue;
+            im->mem = b->mem; im->heap = 1; im->heap_block = (u16)i; im->heap_off = off; im->heap_size = req->size;
+            got = 1;
+        }
+    }
+    pthread_mutex_unlock(&s_th_mu);
+    if (got) s_th_ranges++;
+    return got;
+}
+/* An image's memory: its heap range back to the block, or its own freed. */
+static void vk_image_free_memory(vk_image* im)
+{
+    if (!im->mem) return;
+    if (!im->heap) { pvkFreeMemory(s_vk.device, im->mem, NULL); return; }
+    pthread_mutex_lock(&s_th_mu);
+    vk_th_block* b = im->heap_block < VK_TH_MAX_BLOCKS ? s_th[im->heap_block] : NULL;
+    if (b && b->mem == im->mem) {
+        (void)vk_th_give(b, im->heap_off, im->heap_size);
+        if (!b->used) {
+            u32 empty = 0;
+            for (u32 i = 0; i < VK_TH_MAX_BLOCKS; i++) if (s_th[i] && !s_th[i]->used) empty++;
+            if (empty > 1) {
+                pvkFreeMemory(s_vk.device, b->mem, NULL);
+                free(b); s_th[im->heap_block] = NULL;
+            }
+        }
+    }
+    pthread_mutex_unlock(&s_th_mu);
+}
+/* Device teardown: every block (all images are gone by then). */
+static void vk_th_shutdown(void)
+{
+    pthread_mutex_lock(&s_th_mu);
+    for (u32 i = 0; i < VK_TH_MAX_BLOCKS; i++)
+        if (s_th[i]) { pvkFreeMemory(s_vk.device, s_th[i]->mem, NULL); free(s_th[i]); s_th[i] = NULL; }
+    pthread_mutex_unlock(&s_th_mu);
+}
+
 static void vk_present_wait_image(VkImage img);
 static void vk_destroy_image_now(vk_image* im)
 {
@@ -964,7 +1103,7 @@ static void vk_destroy_image_now(vk_image* im)
     if (vk_img_pool_keep(im)) return;
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
-    if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
+    vk_image_free_memory(im);
     memset(im, 0, sizeof *im);
 }
 
@@ -3440,7 +3579,7 @@ static void vk_image_destroy_unused(vk_image* im)
 {
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
-    if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
+    vk_image_free_memory(im);
     memset(im, 0, sizeof *im);
 }
 static void vk_pin_retire_reap(u64 completed, int all)
@@ -4409,8 +4548,11 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
         vk_find_memory_type(req.memoryTypeBits, 0, &type)) goto fail;
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                  .allocationSize = req.size, .memoryTypeIndex = type };
-    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS ||
-        pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, 0) != VK_SUCCESS ||
+    if (!vk_th_alloc(&o->im, &req, type)) {
+        s_th_own++;
+        if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS) goto fail;
+    }
+    if (pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, o->im.heap ? o->im.heap_off : 0) != VK_SUCCESS ||
         vk_eng_make_view(o->im.img, vf, mips, vk_remap(remap, rsx_fmt), cube, &o->im.view))
         goto fail;
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->cube = (u8)cube;
@@ -7199,6 +7341,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed && vk_load_wsi_device_functions())
         vk_window_drop("the driver has no swapchain functions");
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
+    { const char* t = getenv("PS3RECOMP_VK_TEXTURE_HEAP"); s_th_on = !(t && !strcmp(t, "0")); }
     rsx_build_set_backend("vulkan");
     vk_pcache_open();
 
@@ -7451,6 +7594,7 @@ static void vulkan_original_shutdown(void)
         if (s_vk.window_fence)  pvkDestroyFence(s_vk.device, s_vk.window_fence, NULL);
         if (s_vk.present_pool)  pvkDestroyCommandPool(s_vk.device, s_vk.present_pool, NULL);
         vk_pcache_close();
+        vk_th_shutdown();
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
@@ -7811,7 +7955,7 @@ static void vulkan_image_release(void *user,uint64_t life,uint64_t id,uint64_t g
             }
             if(image->view)pvkDestroyImageView(s_vk.device,image->view,NULL);
             if(image->img)pvkDestroyImage(s_vk.device,image->img,NULL);
-            if(image->mem)pvkFreeMemory(s_vk.device,image->mem,NULL);
+            vk_image_free_memory(image);
             memset(&s_eobj[id],0,sizeof s_eobj[id]);
             memset(&s_eobj_native_image[id],0,sizeof s_eobj_native_image[id]);
             s_eobj_retired[id]=0;

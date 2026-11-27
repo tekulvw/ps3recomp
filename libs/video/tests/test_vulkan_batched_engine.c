@@ -164,6 +164,28 @@ int main(int argc, char** argv)
     CHECK(s_g.on, "guest programs (glslang) available");
     if (!s_g.on) { rsx_vulkan_backend_shutdown(); return 1; }
 
+    /* The texture heap's range list (no device needed): first fit with
+     * alignment, splits, merges on return, and every byte back at the end. */
+    {
+        static vk_th_block blk;
+        memset(&blk, 0, sizeof blk); blk.nfree = 1; blk.free[0] = (vk_th_range){ 0, 1000 };
+        VkDeviceSize o1 = 1, o2 = 1, o3 = 1, o4 = 1;
+        CHECK(!vk_th_take(&blk, 100, 1, &o1) && o1 == 0 && !vk_th_take(&blk, 50, 64, &o2) && o2 == 128 &&
+              !vk_th_take(&blk, 10, 1, &o3) && o3 == 100 && blk.nfree == 2 && blk.used == 160,
+              "heap ranges: first fit, aligned, the gap before an aligned range reused");
+        CHECK(vk_th_take(&blk, 900, 1, &o4) != 0, "heap ranges: a range that fits nowhere is refused");
+        CHECK(!vk_th_give(&blk, o2, 50) && !vk_th_give(&blk, o1, 100) && !vk_th_give(&blk, o3, 10) &&
+              blk.nfree == 1 && blk.free[0].off == 0 && blk.free[0].size == 1000 && blk.used == 0,
+              "heap ranges: returned ranges merge back into one");
+        /* 2,048 two-byte ranges, then every other one back: with the tail
+         * still free that is one hole more than the list holds. */
+        memset(&blk, 0, sizeof blk); blk.nfree = 1; blk.free[0] = (vk_th_range){ 0, (VkDeviceSize)VK_TH_RANGES * 4 + 100 };
+        int ok = 1, refused = 0;
+        for (u32 i = 0; i < VK_TH_RANGES * 2; i++) { VkDeviceSize o = 1; ok &= !vk_th_take(&blk, 2, 1, &o) && o == 2u * i; }
+        for (u32 i = 0; i < VK_TH_RANGES * 2; i += 2) refused += vk_th_give(&blk, 2u * i, 2) != 0;
+        CHECK(ok && refused == 1 && blk.nfree == VK_TH_RANGES,
+              "heap ranges: a full range list refuses one more hole instead of overflowing");
+    }
     u8 seed[TW * TH * 4]; texels(seed, TW, TH, 7);
     u32 rt = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, TW, TH, seed, TW * 4);
     u32 rt2 = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, TW, TH, NULL, 0);
@@ -303,6 +325,7 @@ int main(int argc, char** argv)
     const double t_ms = now_ms() - t_start;
     if (batched) CHECK(s_up_chain.on && s_up_chain.chained > 0, "back-to-back level uploads share one dependency");
     else CHECK(s_up_chain.chained == 0, "per-operation recording gives every upload its own submission");
+    CHECK(s_th_ranges > 0 && s_th_blocks >= 1, "textures take heap ranges");
     if (batched) CHECK(s_stage_arena_uses > 0, "batched uploads stage in the batch arena");
     else CHECK(s_stage_arena_uses == 0, "per-operation uploads stage in pooled buffers");
 
