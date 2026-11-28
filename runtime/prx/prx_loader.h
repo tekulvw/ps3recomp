@@ -46,12 +46,12 @@ typedef struct {
     const char* name;            /* symbol name (for diagnostics) */
 } prx_func_entry;
 
-/* One exported symbol: a NID and the OPD/function vaddr it points at, both
- * base-0 as read from the PRX export table. The loader rebases the vaddr to the
- * module's load base when it registers the export. */
+/* Legacy function export: NID and base-0 OPD vaddr. The loader rebases the
+ * vaddr; publish variable storage through the typed loaded-library API below.
+ * This two-word structure is kept ABI-compatible with existing integrations. */
 typedef struct {
     uint32_t nid;          /* import/export hash */
-    uint32_t vaddr;        /* base-0 OPD vaddr (function) or data vaddr (var) */
+    uint32_t vaddr;        /* base-0 function OPD vaddr */
 } prx_export;
 
 typedef struct {
@@ -110,6 +110,47 @@ uint8_t* prx_image_load_file(const char* path, uint32_t* out_size);
  * loaded module exports it.
  */
 uint32_t prx_resolve_export(uint32_t nid);
+
+#define PRX_LOADED_EXPORT_LIMIT 65536u
+#define PRX_LOADED_LIBRARY_LIMIT 4096u
+#define PRX_LOADED_LIBRARY_NAME_MAX 128u
+
+/* An already-loaded guest library: functions name OPDs; variables name data.
+ * The batch owns no image and never copies or executes guest code. */
+typedef enum {
+    PRX_EXPORT_FUNCTION = 0,
+    PRX_EXPORT_VARIABLE = 1
+} prx_export_kind;
+typedef struct {
+    uint32_t nid;
+    uint32_t guest_addr;
+    uint32_t kind;
+} prx_loaded_export;
+/* Registration is idempotent for the identical owner/name/symbol batch.
+ * A conflicting owner/name, duplicate (kind,NID), or invalid address fails
+ * without changing the registry. guest_size is explicit, in (0, 2^32].
+ * All public operations synchronize with registration/unregistration.
+ * Legacy prx_resolve_export is function-only; typed lookup includes globals. */
+typedef enum {
+    PRX_REG_OK = 0,
+    PRX_REG_INVALID,
+    PRX_REG_CAPACITY,
+    PRX_REG_NO_MEMORY,
+    PRX_REG_CONFLICT,
+    PRX_REG_NOT_FOUND
+} prx_registry_status;
+
+/* owner is a stable nonzero identity (a guest descriptor address is suitable).
+ * guest_size is the actual address-space bound, in 1..2^32. All names/entries
+ * are copied. Invalid/conflicting/allocation-failed batches publish nothing.
+ * Repeating the identical owner/name/batch is idempotent; changing an owner or
+ * registering a second owner of the same library name is an explicit conflict.
+ * Publication, removal, lookup and counts are synchronized. */
+prx_registry_status prx_register_loaded_library(uint64_t owner, const char* name,
+    const prx_loaded_export* exports, uint32_t count, uint64_t guest_size);
+prx_registry_status prx_unregister_loaded_library(uint64_t owner);
+uint32_t prx_resolve_library_export(const char* library, uint32_t nid,
+                                  prx_export_kind kind);
 
 /* Number of exports currently registered (diagnostics/tests). */
 uint32_t prx_export_registry_count(void);

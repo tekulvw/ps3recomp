@@ -167,6 +167,8 @@ s32   _sys_heap_free(sys_heap_t heap, void* ptr);
  * PRX utilities
  * -----------------------------------------------------------------------*/
 
+s32 sys_prx_register_library(const void* lib_entry);
+s32 sys_prx_unregister_library(const void* lib_entry);
 s32 sys_prx_exitspawn_with_level(void);
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id);
 

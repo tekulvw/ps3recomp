@@ -8,6 +8,7 @@
 
 #include "../../runtime/memory/vm_watch.h"
 #include "sysPrxForUser.h"
+#include "../../runtime/prx/prx_loader.h"
 #include "../../runtime/memory/vm.h"
 #include <ps3emu/guest_call.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
@@ -1036,6 +1037,85 @@ s32 _sys_heap_free(sys_heap_t heap, void* ptr)
 /* ---------------------------------------------------------------------------
  * PRX utilities
  * -----------------------------------------------------------------------*/
+
+/* Register an already-loaded 0x1c guest export descriptor. The first count
+ * names function OPDs; the next names variable storage. Keep these kinds
+ * distinct so an imported global can never become an indirect function call.
+ * Guest callers own the descriptor/tables until this synchronous call returns. */
+static int prx_guest_range(uint64_t address, uint64_t length)
+{
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : UINT64_C(0x100000000);
+    return VM_READY && address && address < limit && length <= limit - address;
+}
+static const uint8_t* prx_guest_bytes(uint32_t address)
+{
+    return (const uint8_t*)((uintptr_t)vm_base + address);
+}
+static uint16_t prx_be16(const uint8_t* p)
+{
+    return (uint16_t)((uint16_t)p[0] << 8 | p[1]);
+}
+static uint32_t prx_be32(const uint8_t* p)
+{
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+static s32 prx_registry_error(prx_registry_status status)
+{
+    switch (status) {
+    case PRX_REG_OK: return CELL_OK;
+    case PRX_REG_CAPACITY: case PRX_REG_NO_MEMORY: return (s32)CELL_ENOMEM;
+    case PRX_REG_CONFLICT: return (s32)CELL_EEXIST;
+    case PRX_REG_NOT_FOUND: return (s32)CELL_ENOENT;
+    default: return (s32)CELL_EINVAL;
+    }
+}
+s32 sys_prx_register_library(const void* lib_entry)
+{
+    uint64_t address = (uintptr_t)lib_entry;
+    if (address > UINT32_MAX || !prx_guest_range(address, 28)) return (s32)CELL_EFAULT;
+    uint8_t descriptor[28];
+    memcpy(descriptor, prx_guest_bytes((uint32_t)address), sizeof(descriptor));
+    if ((descriptor[0] && descriptor[0] != sizeof(descriptor)) ||
+        !(prx_be16(descriptor + 4) & 1) || prx_be16(descriptor + 10)) {
+        fprintf(stderr, "[sysPrxForUser] unsupported guest library format or TLS exports\n");
+        return (s32)CELL_ENOSYS;
+    }
+    const uint32_t functions = prx_be16(descriptor + 6);
+    const uint32_t count = functions + prx_be16(descriptor + 8);
+    const uint32_t name_ea = prx_be32(descriptor + 16);
+    const uint32_t nids_ea = prx_be32(descriptor + 20);
+    const uint32_t addresses_ea = prx_be32(descriptor + 24);
+    if (count > PRX_LOADED_EXPORT_LIMIT) return (s32)CELL_ENOMEM;
+    if (!count) return (s32)CELL_EINVAL;
+    if (!prx_guest_range(nids_ea, count * 4u) ||
+        !prx_guest_range(addresses_ea, count * 4u)) return (s32)CELL_EFAULT;
+    char name[PRX_LOADED_LIBRARY_NAME_MAX];
+    uint32_t length;
+    for (length = 0; length < sizeof(name); ++length) {
+        if (!prx_guest_range((uint64_t)name_ea + length, 1)) return (s32)CELL_EFAULT;
+        name[length] = (char)*prx_guest_bytes(name_ea + length);
+        if (!name[length]) break;
+    }
+    if (!length || length == sizeof(name)) return (s32)CELL_EINVAL;
+    prx_loaded_export* exports = (prx_loaded_export*)malloc(count * sizeof(*exports));
+    if (!exports) return (s32)CELL_ENOMEM;
+    for (uint32_t i = 0; i < count; ++i) {
+        exports[i].nid = prx_be32(prx_guest_bytes(nids_ea + i * 4));
+        exports[i].guest_addr = prx_be32(prx_guest_bytes(addresses_ea + i * 4));
+        exports[i].kind = i < functions ? PRX_EXPORT_FUNCTION : PRX_EXPORT_VARIABLE;
+    }
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : UINT64_C(0x100000000);
+    prx_registry_status result = prx_register_loaded_library(address, name, exports, count, limit);
+    free(exports);
+    return prx_registry_error(result);
+}
+
+s32 sys_prx_unregister_library(const void* lib_entry)
+{
+    const uint64_t address = (uintptr_t)lib_entry;
+    if (address > UINT32_MAX || !prx_guest_range(address, 28)) return (s32)CELL_EFAULT;
+    return prx_registry_error(prx_unregister_loaded_library(address));
+}
 
 s32 sys_prx_exitspawn_with_level(void)
 {

@@ -16,39 +16,144 @@
 extern uint8_t* vm_base;
 
 /* ---- export registry ---------------------------------------------------- *
- * Flat NID -> guest-address table, filled as modules load. A handful of system
- * PRXs export a few hundred symbols total, so a linear array with linear lookup
- * is plenty (lookups happen once per import resolution, not per call). */
-typedef struct { uint32_t nid; uint32_t guest_addr; } prx_export_reg_entry;
-#define PRX_EXPORT_REG_CAP 2048
-static prx_export_reg_entry s_export_reg[PRX_EXPORT_REG_CAP];
-static uint32_t             s_export_reg_n = 0;
+ * Libraries retain separate ownership and symbol kinds. Dynamic allocation is
+ * bounded; a complete validated batch is published under one writer lock. */
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+static SRWLOCK s_export_lock = SRWLOCK_INIT;
+#define EXPORT_READ_LOCK() AcquireSRWLockShared(&s_export_lock)
+#define EXPORT_READ_UNLOCK() ReleaseSRWLockShared(&s_export_lock)
+#define EXPORT_WRITE_LOCK() AcquireSRWLockExclusive(&s_export_lock)
+#define EXPORT_WRITE_UNLOCK() ReleaseSRWLockExclusive(&s_export_lock)
+#else
+#include <pthread.h>
+static pthread_rwlock_t s_export_lock = PTHREAD_RWLOCK_INITIALIZER;
+#define EXPORT_READ_LOCK() pthread_rwlock_rdlock(&s_export_lock)
+#define EXPORT_READ_UNLOCK() pthread_rwlock_unlock(&s_export_lock)
+#define EXPORT_WRITE_LOCK() pthread_rwlock_wrlock(&s_export_lock)
+#define EXPORT_WRITE_UNLOCK() pthread_rwlock_unlock(&s_export_lock)
+#endif
 
-static void prx_export_register(uint32_t nid, uint32_t guest_addr)
+typedef struct {
+    uint64_t owner;
+    char name[PRX_LOADED_LIBRARY_NAME_MAX];
+    prx_loaded_export* exports;
+    uint32_t count;
+} prx_loaded_library;
+static prx_loaded_library* s_libraries;
+static uint32_t s_library_count, s_library_capacity, s_export_count;
+
+static int export_compare(const void* a, const void* b)
 {
-    /* Last writer wins if two modules export the same NID (matches the PS3
-     * loader's link order). Overwrite an existing entry rather than duplicate. */
-    for (uint32_t i = 0; i < s_export_reg_n; i++) {
-        if (s_export_reg[i].nid == nid) {
-            s_export_reg[i].guest_addr = guest_addr;
-            return;
+    const prx_loaded_export* x = (const prx_loaded_export*)a;
+    const prx_loaded_export* y = (const prx_loaded_export*)b;
+    if (x->kind != y->kind) return x->kind < y->kind ? -1 : 1;
+    return x->nid < y->nid ? -1 : x->nid != y->nid;
+}
+
+prx_registry_status prx_register_loaded_library(uint64_t owner, const char* name,
+    const prx_loaded_export* exports, uint32_t count, uint64_t guest_size)
+{
+    if (count > PRX_LOADED_EXPORT_LIMIT) return PRX_REG_CAPACITY;
+    if (!owner || !name || !*name || !exports || !count ||
+        !guest_size || guest_size > UINT64_C(0x100000000)) return PRX_REG_INVALID;
+    size_t name_length = 0;
+    while (name_length < PRX_LOADED_LIBRARY_NAME_MAX && name[name_length]) ++name_length;
+    if (name_length == PRX_LOADED_LIBRARY_NAME_MAX) return PRX_REG_INVALID;
+    prx_loaded_export* copy = (prx_loaded_export*)malloc(count * sizeof(*copy));
+    if (!copy) return PRX_REG_NO_MEMORY;
+    memcpy(copy, exports, count * sizeof(*copy));
+    for (uint32_t i = 0; i < count; ++i) {
+        const prx_loaded_export* e = &copy[i];
+        uint32_t width = e->kind == PRX_EXPORT_FUNCTION ? 8 : 1;
+        if (!e->nid || !e->guest_addr || e->kind > PRX_EXPORT_VARIABLE ||
+            (e->kind == PRX_EXPORT_FUNCTION && (e->guest_addr & 3)) ||
+            e->guest_addr >= guest_size || width > guest_size - e->guest_addr) {
+            free(copy); return PRX_REG_INVALID;
         }
     }
-    if (s_export_reg_n < PRX_EXPORT_REG_CAP)
-        s_export_reg[s_export_reg_n++] = (prx_export_reg_entry){ nid, guest_addr };
-    else
-        fprintf(stderr, "[prx] export registry full, dropping NID 0x%08X\n", nid);
+    qsort(copy, count, sizeof(*copy), export_compare);
+    for (uint32_t i = 1; i < count; ++i) {
+        if (!export_compare(&copy[i-1], &copy[i])) { free(copy); return PRX_REG_INVALID; }
+    }
+    EXPORT_WRITE_LOCK();
+    for (uint32_t i = 0; i < s_library_count; ++i) {
+        const prx_loaded_library* lib = &s_libraries[i];
+        if (lib->owner == owner || !strcmp(lib->name, name)) {
+            int same = lib->owner == owner && !strcmp(lib->name, name) && lib->count == count &&
+                       !memcmp(lib->exports, copy, count * sizeof(*copy));
+            EXPORT_WRITE_UNLOCK(); free(copy);
+            return same ? PRX_REG_OK : PRX_REG_CONFLICT;
+        }
+    }
+    if (count > PRX_LOADED_EXPORT_LIMIT - s_export_count ||
+        s_library_count == PRX_LOADED_LIBRARY_LIMIT) {
+        EXPORT_WRITE_UNLOCK(); free(copy); return PRX_REG_CAPACITY;
+    }
+    if (s_library_count == s_library_capacity) {
+        uint32_t capacity = s_library_capacity ? s_library_capacity * 2 : 8;
+        if (capacity > PRX_LOADED_LIBRARY_LIMIT) capacity = PRX_LOADED_LIBRARY_LIMIT;
+        prx_loaded_library* grown = (prx_loaded_library*)realloc(s_libraries, capacity * sizeof(*grown));
+        if (!grown) { EXPORT_WRITE_UNLOCK(); free(copy); return PRX_REG_NO_MEMORY; }
+        s_libraries = grown; s_library_capacity = capacity;
+    }
+    prx_loaded_library* lib = &s_libraries[s_library_count++];
+    lib->owner = owner; memcpy(lib->name, name, name_length + 1);
+    lib->exports = copy; lib->count = count; s_export_count += count;
+    EXPORT_WRITE_UNLOCK();
+    return PRX_REG_OK;
+}
+
+prx_registry_status prx_unregister_loaded_library(uint64_t owner)
+{
+    EXPORT_WRITE_LOCK();
+    for (uint32_t i = 0; i < s_library_count; ++i) {
+        if (s_libraries[i].owner != owner) continue;
+        free(s_libraries[i].exports); s_export_count -= s_libraries[i].count;
+        memmove(s_libraries + i, s_libraries + i + 1,
+                (s_library_count - i - 1) * sizeof(*s_libraries));
+        --s_library_count;
+        EXPORT_WRITE_UNLOCK(); return PRX_REG_OK;
+    }
+    EXPORT_WRITE_UNLOCK(); return PRX_REG_NOT_FOUND;
+}
+
+static uint32_t library_find(const prx_loaded_library* lib, uint32_t nid, uint32_t kind)
+{
+    const prx_loaded_export wanted = {nid, 0, kind};
+    const prx_loaded_export* found = (const prx_loaded_export*)bsearch(&wanted,
+        lib->exports, lib->count, sizeof(wanted), export_compare);
+    return found ? found->guest_addr : 0;
+}
+
+uint32_t prx_resolve_library_export(const char* library, uint32_t nid, prx_export_kind kind)
+{
+    uint32_t result = 0;
+    if (!library || kind > PRX_EXPORT_VARIABLE) return 0;
+    EXPORT_READ_LOCK();
+    for (uint32_t i = s_library_count; i; --i) {
+        if (!strcmp(s_libraries[i-1].name, library)) {
+            result = library_find(&s_libraries[i-1], nid, kind); break;
+        }
+    }
+    EXPORT_READ_UNLOCK(); return result;
 }
 
 uint32_t prx_resolve_export(uint32_t nid)
 {
-    for (uint32_t i = 0; i < s_export_reg_n; i++)
-        if (s_export_reg[i].nid == nid)
-            return s_export_reg[i].guest_addr;
-    return 0;
+    uint32_t result = 0;
+    EXPORT_READ_LOCK();
+    for (uint32_t i = s_library_count; i && !result; --i)
+        result = library_find(&s_libraries[i-1], nid, PRX_EXPORT_FUNCTION);
+    EXPORT_READ_UNLOCK(); return result;
 }
 
-uint32_t prx_export_registry_count(void) { return s_export_reg_n; }
+uint32_t prx_export_registry_count(void)
+{
+    EXPORT_READ_LOCK(); uint32_t result = s_export_count;
+    EXPORT_READ_UNLOCK(); return result;
+}
 
 prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
 {
@@ -65,6 +170,10 @@ prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
         return r;
     }
 
+    if ((uint64_t)m->base + m->image_size > UINT64_C(0x100000000) ||
+        (m->func_count && !m->funcs)) {
+        fprintf(stderr, "[prx] load range/function table invalid\n"); return r;
+    }
     r.base       = m->base;
     r.image_size = m->image_size;
 
@@ -88,17 +197,30 @@ prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
         }
     }
 
-    /* Step C — publish exports as NID -> (base + vaddr) so a title's import
-     * resolver can dispatch into this module by NID. Function exports point at
-     * an OPD in the freshly-placed image; ps3_indirect_call walks it. */
+    /* Legacy prx_module exports are function OPDs. Use the typed loaded-library
+     * API for variable exports; never dispatch a variable as executable code. */
     uint32_t exports_published = 0;
-    if (m->exports) {
-        for (uint32_t i = 0; i < m->export_count; i++) {
+    if (m->export_count > PRX_LOADED_EXPORT_LIMIT || (m->export_count && !m->exports)) {
+        fprintf(stderr, "[prx] invalid export table\n"); return r;
+    }
+    if (m->export_count) {
+        prx_loaded_export* entries = (prx_loaded_export*)malloc(m->export_count * sizeof(*entries));
+        if (!entries) return r;
+        for (uint32_t i = 0; i < m->export_count; ++i) {
             const prx_export* e = &m->exports[i];
-            if (e->nid == 0)
-                continue;
-            prx_export_register(e->nid, m->base + e->vaddr);
-            exports_published++;
+            if (!e->nid) continue;
+            if ((uint64_t)e->vaddr + 8 > m->image_size ||
+                (uint64_t)m->base + e->vaddr > UINT32_MAX) {
+                free(entries); fprintf(stderr, "[prx] export outside module image\n"); return r;
+            }
+            entries[exports_published++] = (prx_loaded_export){e->nid, m->base + e->vaddr, PRX_EXPORT_FUNCTION};
+        }
+        prx_registry_status status = exports_published ? prx_register_loaded_library(
+            UINT64_C(0x8000000000000000) | m->base, m->name ? m->name : "anonymous-prx",
+            entries, exports_published, UINT64_C(0x100000000)) : PRX_REG_OK;
+        free(entries);
+        if (status != PRX_REG_OK) {
+            fprintf(stderr, "[prx] export batch rejected: %u\n", (unsigned)status); return r;
         }
     }
 
